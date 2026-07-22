@@ -13,12 +13,15 @@ helper. Network access is denied for ordinary commands.
 ```sh
 cargo build --release
 
-# Start a session in the project directory:
+# Run one persistent MCP server (for example through a tunnel):
+local-mcp mcp
+
+# In another terminal, start a session in the project directory:
 cd ./some-project
 local-mcp start
 
-# Give the printed session ID to the agent and use it in the MCP command:
-local-mcp mcp <SESSION_ID>
+# Give the printed session ID to the agent in your prompt. The agent includes it
+# in each local-mcp tool call.
 
 # In the approvals UI, allow every unsandboxed call until it exits:
 /permissions yolo
@@ -46,8 +49,10 @@ runs with the service user's full host permissions and network access, so it ask
 the approvals process before every call. `/permissions yolo` disables those
 prompts only for the lifetime of that session; `/permissions ask`
 turns prompts back on. The singular `/permission ...` spelling is also accepted.
-The agent can call `session_info` to confirm the session ID, working directory,
-and sandbox roots associated with its MCP connection.
+Every tool takes a `session_id`. The agent can call `session_info` with the ID
+from the prompt to confirm the working directory and sandbox roots. One
+`local-mcp mcp` process can therefore serve multiple independently configured
+sessions.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 
