@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub permitted_directories: Vec<PathBuf>,
+    #[serde(default)]
+    pub default_cwd: Option<PathBuf>,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -64,6 +66,10 @@ pub async fn revoke(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn is_permitted(path: &Path, permitted: &[PathBuf]) -> bool {
-    permitted.iter().any(|root| path.starts_with(root))
+pub async fn set_default_cwd(path: &Path) -> Result<PathBuf> {
+    let path = canonical_directory(path)?;
+    let mut config = load().await?;
+    config.default_cwd = Some(path.clone());
+    save(&config).await?;
+    Ok(path)
 }

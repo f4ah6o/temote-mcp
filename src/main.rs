@@ -27,6 +27,8 @@ enum Command {
     Revoke { directory: PathBuf },
     /// Show permanently permitted directories.
     Permits,
+    /// Set the default working directory used by the MCP server.
+    SetCwd { directory: PathBuf },
 }
 
 #[tokio::main]
@@ -49,6 +51,11 @@ async fn main() -> Result<()> {
             for path in config::load().await?.permitted_directories {
                 println!("{}", path.display());
             }
+            Ok(())
+        }
+        Command::SetCwd { directory } => {
+            let path = config::set_default_cwd(&directory).await?;
+            println!("default cwd {}", path.display());
             Ok(())
         }
     }

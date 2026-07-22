@@ -7,6 +7,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::{approvals, config, sandbox};
 
 pub async fn serve() -> Result<()> {
+    if let Some(default_cwd) = config::load().await?.default_cwd {
+        std::env::set_current_dir(&default_cwd)
+            .with_context(|| format!("cannot use default cwd {}", default_cwd.display()))?;
+    }
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
@@ -66,9 +70,9 @@ fn tools() -> Value {
     json!([
         {"name":"read_file","description":"Read a UTF-8 file from the local machine.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
         {"name":"list_directory","description":"List entries in a local directory.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-        {"name":"write_file","description":"Write a UTF-8 file. Requires approval unless its parent is permitted.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
-        {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Network is disabled. Requires approval unless cwd is permitted.","inputSchema":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["command"]}},
-        {"name":"network_request","description":"Perform an HTTP request with curl in the Codex sandbox. Always requires approval.","inputSchema":{"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","default":"GET"},"body":{"type":"string"},"cwd":{"type":"string"}},"required":["url"]}}
+        {"name":"write_file","description":"Write a UTF-8 file in the Codex sandbox. Sandboxed calls do not require approval.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
+        {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["command"]}},
+        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires user approval unless approvals is in yolo mode.","inputSchema":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["command"]}}
     ])
 }
 
@@ -86,7 +90,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "list_directory" => list_directory(&required_path(&args, "path")?).await?,
         "write_file" => write_file(&args).await?,
         "execute" => execute(&args).await?,
-        "network_request" => network_request(&args).await?,
+        "without_sandbox" => without_sandbox(&args).await?,
         _ => anyhow::bail!("unknown tool: {name}"),
     };
     Ok(json!({"content":[{"type":"text","text":result}]}))
@@ -133,12 +137,6 @@ async fn write_file(args: &Value) -> Result<String> {
     let parent = absolute.parent().context("file has no parent directory")?;
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("parent does not exist: {}", parent.display()))?;
-    let config = config::load().await?;
-    if !config::is_permitted(&parent, &config.permitted_directories)
-        && !approvals::request("write_file", absolute.display().to_string(), parent.clone()).await?
-    {
-        anyhow::bail!("user denied write_file")
-    }
     let content = args
         .get("content")
         .and_then(Value::as_str)
@@ -154,7 +152,6 @@ async fn write_file(args: &Value) -> Result<String> {
         &command,
         &parent,
         &[parent.clone()],
-        false,
         Some(content.as_bytes()),
     )
     .await?;
@@ -175,43 +172,30 @@ async fn execute(args: &Value) -> Result<String> {
         .collect::<Result<Vec<_>>>()?;
     let cwd = cwd(args)?;
     let config = config::load().await?;
-    let permitted = config::is_permitted(&cwd, &config.permitted_directories);
-    if !permitted
-        && !approvals::request("execute", format!("argv: {command:?}"), cwd.clone()).await?
-    {
-        anyhow::bail!("user denied execute")
+    let mut roots = config.permitted_directories;
+    if !roots.iter().any(|root| cwd.starts_with(root)) {
+        roots.push(cwd.clone());
     }
-    let roots = if permitted {
-        config.permitted_directories
-    } else {
-        vec![cwd.clone()]
-    };
-    render_output(sandbox::run(&command, &cwd, &roots, false, None).await?)
+    render_output(sandbox::run(&command, &cwd, &roots, None).await?)
 }
 
-async fn network_request(args: &Value) -> Result<String> {
-    let url = args
-        .get("url")
-        .and_then(Value::as_str)
-        .context("missing url")?;
-    let method = args.get("method").and_then(Value::as_str).unwrap_or("GET");
+async fn without_sandbox(args: &Value) -> Result<String> {
+    let command = args
+        .get("command")
+        .and_then(Value::as_array)
+        .context("missing command")?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .context("command entries must be strings")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let cwd = cwd(args)?;
-    if !approvals::request("network_request", format!("{method} {url}"), cwd.clone()).await? {
-        anyhow::bail!("user denied network_request")
+    if !approvals::request("without_sandbox", format!("argv: {command:?}"), cwd.clone()).await? {
+        anyhow::bail!("user denied without_sandbox")
     }
-    let mut command = vec![
-        "curl".to_owned(),
-        "--fail-with-body".to_owned(),
-        "--silent".to_owned(),
-        "--show-error".to_owned(),
-        "--request".to_owned(),
-        method.to_owned(),
-        url.to_owned(),
-    ];
-    if let Some(body) = args.get("body").and_then(Value::as_str) {
-        command.extend(["--data-binary".to_owned(), body.to_owned()]);
-    }
-    render_output(sandbox::run(&command, &cwd, &[], true, None).await?)
+    render_output(sandbox::run_unrestricted(&command, &cwd, None).await?)
 }
 
 fn render_output(output: sandbox::Output) -> Result<String> {
