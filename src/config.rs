@@ -2,13 +2,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-#[derive(Default, Serialize, Deserialize)]
-pub struct Config {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: Uuid,
+    pub cwd: PathBuf,
     #[serde(default)]
     pub permitted_directories: Vec<PathBuf>,
-    #[serde(default)]
-    pub default_cwd: Option<PathBuf>,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -18,58 +19,45 @@ pub fn state_dir() -> Result<PathBuf> {
         .context("could not determine a local state directory")
 }
 
-fn config_path() -> Result<PathBuf> {
-    Ok(state_dir()?.join("config.json"))
+pub fn session_path(id: Uuid) -> Result<PathBuf> {
+    Ok(state_dir()?.join("sessions").join(format!("{id}.json")))
 }
 
-pub async fn load() -> Result<Config> {
-    let path = config_path()?;
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid local-mcp config"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(error) => Err(error).context("failed to read local-mcp config"),
-    }
+pub fn socket_path(id: Uuid) -> Result<PathBuf> {
+    Ok(state_dir()?.join("sessions").join(format!("{id}.sock")))
 }
 
-async fn save(config: &Config) -> Result<()> {
-    let path = config_path()?;
+pub async fn create_session(cwd: &Path) -> Result<Session> {
+    let cwd = canonical_directory(cwd)?;
+    let session = Session {
+        id: Uuid::new_v4(),
+        cwd: cwd.clone(),
+        permitted_directories: vec![cwd],
+    };
+    save_session(&session).await?;
+    Ok(session)
+}
+
+pub async fn load_session(id: Uuid) -> Result<Session> {
+    let path = session_path(id)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("session {id} was not found; run `local-mcp start` first"))?;
+    serde_json::from_slice(&bytes).context("invalid local-mcp session")
+}
+
+pub async fn save_session(session: &Session) -> Result<()> {
+    let path = session_path(session.id)?;
     tokio::fs::create_dir_all(path.parent().unwrap()).await?;
     let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    tokio::fs::write(&temporary, serde_json::to_vec_pretty(config)?).await?;
+    tokio::fs::write(&temporary, serde_json::to_vec_pretty(session)?).await?;
     tokio::fs::rename(temporary, path).await?;
     Ok(())
 }
 
-fn canonical_directory(path: &Path) -> Result<PathBuf> {
+pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve {}", path.display()))?;
     anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
-    Ok(path)
-}
-
-pub async fn permit(path: &Path) -> Result<PathBuf> {
-    let path = canonical_directory(path)?;
-    let mut config = load().await?;
-    if !config.permitted_directories.contains(&path) {
-        config.permitted_directories.push(path.clone());
-        config.permitted_directories.sort();
-        save(&config).await?;
-    }
-    Ok(path)
-}
-
-pub async fn revoke(path: &Path) -> Result<PathBuf> {
-    let path = canonical_directory(path)?;
-    let mut config = load().await?;
-    config.permitted_directories.retain(|item| item != &path);
-    save(&config).await?;
-    Ok(path)
-}
-
-pub async fn set_default_cwd(path: &Path) -> Result<PathBuf> {
-    let path = canonical_directory(path)?;
-    let mut config = load().await?;
-    config.default_cwd = Some(path.clone());
-    save(&config).await?;
     Ok(path)
 }

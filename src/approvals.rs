@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-use crate::config;
+use crate::config::{self, Session};
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -19,24 +19,22 @@ pub struct Request {
     pub cwd: PathBuf,
 }
 
-fn socket_path() -> Result<PathBuf> {
-    Ok(config::state_dir()?.join("approvals.sock"))
-}
-
-pub async fn request(operation: &str, detail: String, cwd: PathBuf) -> Result<bool> {
+pub async fn request(
+    session_id: Uuid,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+) -> Result<bool> {
     let request = Request {
         id: Uuid::new_v4(),
         operation: operation.to_owned(),
         detail,
         cwd,
     };
-    let path = socket_path()?;
-    let mut stream = UnixStream::connect(&path).await.with_context(|| {
-        format!(
-            "approval service is unavailable; run `local-mcp approvals` (socket: {})",
-            path.display()
-        )
-    })?;
+    let path = config::socket_path(session_id)?;
+    let mut stream = UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
     stream.write_all(&serde_json::to_vec(&request)?).await?;
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
@@ -46,41 +44,34 @@ pub async fn request(operation: &str, detail: String, cwd: PathBuf) -> Result<bo
     match response.trim() {
         "allow" => Ok(true),
         "deny" => Ok(false),
-        value => anyhow::bail!("invalid response from approval service: {value:?}"),
+        value => anyhow::bail!("invalid response from session: {value:?}"),
     }
 }
 
-pub async fn run_ui() -> Result<()> {
-    let path = socket_path()?;
-    let state_dir = path.parent().context("approval socket has no parent")?;
+pub async fn start() -> Result<()> {
+    let mut session = config::create_session(&std::env::current_dir()?).await?;
+    let path = config::socket_path(session.id)?;
+    let state_dir = path.parent().context("session socket has no parent")?;
     tokio::fs::create_dir_all(state_dir).await?;
     tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
-
-    if UnixStream::connect(&path).await.is_ok() {
-        anyhow::bail!(
-            "another approval service is already listening at {}",
-            path.display()
-        );
-    }
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("failed to remove stale approval socket"),
-    }
+    remove_stale_socket(&path).await?;
 
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     eprintln!(
-        "Waiting for local-mcp approval requests at {}.\n\
-         Commands: /permissions yolo (allow all), /permissions ask (ask each time).\n\
+        "local-mcp session: {}\ncwd: {}\n\
+         Give this session ID to the agent and run: local-mcp mcp {}\n\
+         Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
          Press Ctrl-C to stop.",
-        path.display()
+        session.id,
+        session.cwd.display(),
+        session.id
     );
+
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<(Request, UnixStream)>::new();
     let mut yolo = false;
-
     loop {
         tokio::select! {
             connection = listener.accept() => {
@@ -97,37 +88,110 @@ pub async fn run_ui() -> Result<()> {
                 }
             }
             line = input.next_line() => {
-                let Some(line) = line? else {
-                    anyhow::bail!("approval input closed");
-                };
-                match line.trim() {
-                    "/permissions yolo" | "/permission yolo" => {
-                        yolo = true;
-                        eprintln!("Permissions: yolo (all unsandboxed calls are allowed until this process exits)");
-                        while let Some((request, mut stream)) = pending.pop_front() {
-                            eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
-                            stream.write_all(b"allow\n").await?;
-                        }
-                    }
-                    "/permissions ask" | "/permission ask" => {
-                        yolo = false;
-                        eprintln!("Permissions: ask");
-                    }
-                    "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
-                        let (_, mut stream) = pending.pop_front().unwrap();
-                        stream.write_all(b"allow\n").await?;
-                        show_next(&pending)?;
-                    }
-                    _ if !pending.is_empty() => {
-                        let (_, mut stream) = pending.pop_front().unwrap();
-                        stream.write_all(b"deny\n").await?;
-                        show_next(&pending)?;
-                    }
-                    "" => {}
-                    command => eprintln!("Unknown command: {command}"),
-                }
+                let Some(line) = line? else { anyhow::bail!("session input closed") };
+                handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
             }
         }
+    }
+}
+
+async fn remove_stale_socket(path: &PathBuf) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("failed to remove stale session socket"),
+    }
+}
+
+async fn handle_input(
+    input: &str,
+    session: &mut Session,
+    yolo: &mut bool,
+    pending: &mut VecDeque<(Request, UnixStream)>,
+) -> Result<()> {
+    match input {
+        "/permissions yolo" | "/permission yolo" => {
+            *yolo = true;
+            eprintln!("Permissions: yolo (all unsandboxed calls are allowed for this session)");
+            while let Some((request, mut stream)) = pending.pop_front() {
+                eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+                stream.write_all(b"allow\n").await?;
+            }
+        }
+        "/permissions ask" | "/permission ask" => {
+            *yolo = false;
+            eprintln!("Permissions: ask");
+        }
+        "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
+            let (_, mut stream) = pending.pop_front().unwrap();
+            stream.write_all(b"allow\n").await?;
+            show_next(pending)?;
+        }
+        "n" | "N" | "no" | "NO" if !pending.is_empty() => {
+            let (_, mut stream) = pending.pop_front().unwrap();
+            stream.write_all(b"deny\n").await?;
+            show_next(pending)?;
+        }
+        "/permission list" | "/permissions list" => show_permissions(session),
+        "/permission status" | "/permissions status" => {
+            eprintln!("Permissions: {}", if *yolo { "yolo" } else { "ask" });
+            show_permissions(session);
+        }
+        command if permission_arg(command, "allow").is_some() => {
+            let directory = config::canonical_directory(
+                PathBuf::from(permission_arg(command, "allow").unwrap()).as_path(),
+            )?;
+            if !session.permitted_directories.contains(&directory) {
+                session.permitted_directories.push(directory.clone());
+                session.permitted_directories.sort();
+                config::save_session(session).await?;
+            }
+            eprintln!("Allowed sandbox root: {}", directory.display());
+        }
+        command if permission_arg(command, "revoke").is_some() => {
+            let directory = config::canonical_directory(
+                PathBuf::from(permission_arg(command, "revoke").unwrap()).as_path(),
+            )?;
+            if directory == session.cwd {
+                eprintln!("Cannot revoke the session cwd");
+            } else {
+                session
+                    .permitted_directories
+                    .retain(|item| item != &directory);
+                config::save_session(session).await?;
+                eprintln!("Revoked sandbox root: {}", directory.display());
+            }
+        }
+        "/permission" | "/permissions" | "/permission help" | "/permissions help" => {
+            eprintln!("/permission ask|yolo|allow <directory>|revoke <directory>|list|status");
+        }
+        "" => {}
+        command if !pending.is_empty() => {
+            let (_, mut stream) = pending.pop_front().unwrap();
+            stream.write_all(b"deny\n").await?;
+            eprintln!("Denied request (unrecognized response: {command})");
+            show_next(pending)?;
+        }
+        command => eprintln!("Unknown command: {command}"),
+    }
+    Ok(())
+}
+
+fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
+    ["/permission", "/permissions"]
+        .into_iter()
+        .find_map(|prefix| {
+            command
+                .strip_prefix(&format!("{prefix} {action} "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn show_permissions(session: &Session) {
+    eprintln!("Sandbox roots:");
+    for path in &session.permitted_directories {
+        eprintln!("  {}", path.display());
     }
 }
 

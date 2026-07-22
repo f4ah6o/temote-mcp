@@ -2228,6 +2228,7 @@ name = "local-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "codex-linux-sandbox",
  "codex-protocol",
