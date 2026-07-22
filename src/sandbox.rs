@@ -75,6 +75,7 @@ pub async fn run(
         { anyhow::bail!("sandboxed execution is currently implemented for Linux only") };
 
     process
+        .kill_on_drop(true)
         .current_dir(&cwd)
         .env_clear()
         .envs(safe_environment())
@@ -111,6 +112,7 @@ pub async fn run_unrestricted(
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
     let mut process = Command::new(&command[0]);
     process
+        .kill_on_drop(true)
         .args(&command[1..])
         .current_dir(cwd)
         .stdin(if stdin.is_some() {

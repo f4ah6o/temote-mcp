@@ -19,6 +19,18 @@ pub struct Request {
     pub cwd: PathBuf,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Message {
+    Approval {
+        request: Request,
+    },
+    Activity {
+        title: String,
+        detail: Option<String>,
+    },
+}
+
 pub async fn request(
     session_id: Uuid,
     operation: &str,
@@ -35,7 +47,9 @@ pub async fn request(
     let mut stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
-    stream.write_all(&serde_json::to_vec(&request)?).await?;
+    stream
+        .write_all(&serde_json::to_vec(&Message::Approval { request })?)
+        .await?;
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
 
@@ -46,6 +60,28 @@ pub async fn request(
         "deny" => Ok(false),
         value => anyhow::bail!("invalid response from session: {value:?}"),
     }
+}
+
+/// Sends a one-way activity update to the `start` screen. Activity reporting is
+/// deliberately best-effort: an MCP operation must not fail just because its UI
+/// was closed between loading the session and completing the operation.
+pub async fn activity(session_id: Uuid, title: impl Into<String>, detail: Option<String>) {
+    let Ok(path) = config::socket_path(session_id) else {
+        return;
+    };
+    let Ok(mut stream) = UnixStream::connect(path).await else {
+        return;
+    };
+    let message = Message::Activity {
+        title: title.into(),
+        detail,
+    };
+    let Ok(bytes) = serde_json::to_vec(&message) else {
+        return;
+    };
+    let _ = stream.write_all(&bytes).await;
+    let _ = stream.write_all(b"\n").await;
+    let _ = stream.shutdown().await;
 }
 
 pub async fn start() -> Result<()> {
@@ -77,19 +113,32 @@ pub async fn start() -> Result<()> {
                 let (mut stream, _) = connection?;
                 let mut line = String::new();
                 BufReader::new(&mut stream).read_line(&mut line).await?;
-                let request: Request = serde_json::from_str(&line).context("invalid approval request")?;
-                if yolo {
-                    eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
-                    stream.write_all(b"allow\n").await?;
-                } else {
-                    show_request(&request)?;
-                    pending.push_back((request, stream));
+                let message: Message = serde_json::from_str(&line).context("invalid session message")?;
+                match message {
+                    Message::Activity { title, detail } => show_activity(&title, detail.as_deref()),
+                    Message::Approval { request } if yolo => {
+                        eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+                        stream.write_all(b"allow\n").await?;
+                    }
+                    Message::Approval { request } => {
+                        show_request(&request)?;
+                        pending.push_back((request, stream));
+                    }
                 }
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
                 handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
             }
+        }
+    }
+}
+
+fn show_activity(title: &str, detail: Option<&str>) {
+    eprintln!("\n• {title}");
+    if let Some(detail) = detail.filter(|value| !value.is_empty()) {
+        for line in detail.lines() {
+            eprintln!("  {line}");
         }
     }
 }
