@@ -144,7 +144,7 @@ async fn write_file(args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .context("missing content")?;
     let command = vec![
-        "/bin/sh".to_owned(),
+        "sh".to_owned(),
         "-c".to_owned(),
         "cat > \"$1\"".to_owned(),
         "local-mcp-write".to_owned(),

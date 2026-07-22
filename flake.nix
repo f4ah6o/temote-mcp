@@ -37,6 +37,7 @@
               wrapProgram $out/bin/local-mcp \
                 --prefix PATH : ${
                   pkgs.lib.makeBinPath [
+                    pkgs.bash
                     pkgs.bubblewrap
                     pkgs.curl
                   ]

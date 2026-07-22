@@ -6,6 +6,9 @@ license = "Apache-2.0"
 description = "A sandboxed local-machine MCP server with out-of-band approvals"
 default-run = "local-mcp"
 
+[build]
+jobs = 4
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
