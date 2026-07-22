@@ -60,6 +60,15 @@ Each session uses its own permission-restricted Unix domain socket. Both the MCP
 server and the start UI block on I/O, so idle operation and pending approvals
 do not use polling timers.
 
+The `start` screen also receives live activity from MCP calls. It shows file and
+image reads, directory listings, file edits with unified diffs and line counts,
+and command start/completion with output, in a compact Codex-style timeline.
+`execute` returns its normal result for commands that finish within 30 seconds.
+Longer commands continue in the background and return a `job_id`; use `poll_job`
+to check for completion or `stop_job` to terminate them. Use `start_command`
+when a command should run in the background immediately without the 30-second
+foreground wait.
+
 The build produces `local-mcp` and its sibling `codex-linux-sandbox`; install or
 copy both into the same directory. On Linux, `bwrap` (bubblewrap) must be
 available in `PATH`. macOS/Windows support is not implemented yet.
