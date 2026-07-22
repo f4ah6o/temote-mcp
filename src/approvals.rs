@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -71,30 +72,81 @@ pub async fn run_ui() -> Result<()> {
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     eprintln!(
-        "Waiting for local-mcp approval requests at {}. Press Ctrl-C to stop.",
+        "Waiting for local-mcp approval requests at {}.\n\
+         Commands: /permissions yolo (allow all), /permissions ask (ask each time).\n\
+         Press Ctrl-C to stop.",
         path.display()
     );
     let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut pending = VecDeque::<(Request, UnixStream)>::new();
+    let mut yolo = false;
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let mut line = String::new();
-        BufReader::new(&mut stream).read_line(&mut line).await?;
-        let request: Request = serde_json::from_str(&line).context("invalid approval request")?;
-        eprintln!(
-            "\n[{}] {}\ncwd: {}\n{}",
-            request.id,
-            request.operation,
-            request.cwd.display(),
-            request.detail
-        );
-        eprint!("Allow once? [y/N] ");
-        std::io::stderr().flush()?;
-        let allowed = input.next_line().await?.is_some_and(|line| {
-            line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
-        });
-        stream
-            .write_all(if allowed { b"allow\n" } else { b"deny\n" })
-            .await?;
+        tokio::select! {
+            connection = listener.accept() => {
+                let (mut stream, _) = connection?;
+                let mut line = String::new();
+                BufReader::new(&mut stream).read_line(&mut line).await?;
+                let request: Request = serde_json::from_str(&line).context("invalid approval request")?;
+                if yolo {
+                    eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+                    stream.write_all(b"allow\n").await?;
+                } else {
+                    show_request(&request)?;
+                    pending.push_back((request, stream));
+                }
+            }
+            line = input.next_line() => {
+                let Some(line) = line? else {
+                    anyhow::bail!("approval input closed");
+                };
+                match line.trim() {
+                    "/permissions yolo" | "/permission yolo" => {
+                        yolo = true;
+                        eprintln!("Permissions: yolo (all unsandboxed calls are allowed until this process exits)");
+                        while let Some((request, mut stream)) = pending.pop_front() {
+                            eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+                            stream.write_all(b"allow\n").await?;
+                        }
+                    }
+                    "/permissions ask" | "/permission ask" => {
+                        yolo = false;
+                        eprintln!("Permissions: ask");
+                    }
+                    "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
+                        let (_, mut stream) = pending.pop_front().unwrap();
+                        stream.write_all(b"allow\n").await?;
+                        show_next(&pending)?;
+                    }
+                    _ if !pending.is_empty() => {
+                        let (_, mut stream) = pending.pop_front().unwrap();
+                        stream.write_all(b"deny\n").await?;
+                        show_next(&pending)?;
+                    }
+                    "" => {}
+                    command => eprintln!("Unknown command: {command}"),
+                }
+            }
+        }
     }
+}
+
+fn show_request(request: &Request) -> Result<()> {
+    eprintln!(
+        "\n[{}] {}\ncwd: {}\n{}",
+        request.id,
+        request.operation,
+        request.cwd.display(),
+        request.detail
+    );
+    eprint!("Allow without sandbox? [y/N] ");
+    std::io::stderr().flush()?;
+    Ok(())
+}
+
+fn show_next(pending: &VecDeque<(Request, UnixStream)>) -> Result<()> {
+    if let Some((request, _)) = pending.front() {
+        show_request(request)?;
+    }
+    Ok(())
 }

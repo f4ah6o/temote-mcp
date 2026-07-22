@@ -1,8 +1,9 @@
 # local-mcp
 
 `local-mcp` exposes basic local-machine capabilities as MCP tools: file reads,
-directory listings, sandboxed file writes, sandboxed command execution, and
-explicitly approved HTTP requests. It intentionally does not provide web search.
+directory listings, sandboxed file writes and commands, plus explicitly approved
+unsandboxed command execution. It intentionally does not provide web search or a
+dedicated network-request tool.
 
 Commands are isolated with OpenAI Codex's `codex-rs/sandboxing` and Linux sandbox
 helper. Network access is denied for ordinary commands.
@@ -15,13 +16,19 @@ cargo build --release
 # Add this command as a stdio MCP server (the `mcp` argument is optional):
 local-mcp mcp
 
-# In another terminal, handle calls which need one-time approval:
+# In another terminal, approve unsandboxed calls:
 local-mcp approvals
+
+# In the approvals UI, allow every unsandboxed call until it exits:
+/permissions yolo
 
 # Trust sandboxed writes/commands rooted in a directory without prompting:
 local-mcp permit ./some-project
 local-mcp permits
 local-mcp revoke ./some-project
+
+# Set the cwd used when tools omit cwd and for relative file paths:
+local-mcp set-cwd ./some-project
 ```
 
 With Nix, `bwrap` and `curl` are included in the runtime environment:
@@ -32,10 +39,11 @@ nix develop
 nix build
 ```
 
-Permanent permits are canonical directory paths stored under the platform's
-local state directory. They do not enable network access. `network_request`
-always asks the `approvals` process and executes `curl` with network enabled only
-for that one sandboxed process.
+Sandboxed calls are always allowed and have no network access. `without_sandbox`
+runs with the service user's full host permissions and network access, so it asks
+the approvals process before every call. `/permissions yolo` disables those
+prompts only for the lifetime of that approvals process; `/permissions ask`
+turns prompts back on. The singular `/permission ...` spelling is also accepted.
 
 Approval requests use a permission-restricted Unix domain socket. Both the MCP
 server and the approval UI block on I/O, so idle operation and pending approvals

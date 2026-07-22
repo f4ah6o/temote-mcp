@@ -4,7 +4,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::{FileSystemSandboxPolicy, NetworkSandboxPolicy};
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -28,7 +28,6 @@ pub async fn run(
     command: &[String],
     cwd: &Path,
     writable_roots: &[PathBuf],
-    network: bool,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
@@ -38,20 +37,13 @@ pub async fn run(
         .iter()
         .map(|path| absolute(path))
         .collect::<Result<Vec<_>>>()?;
-    let network_policy = if network {
-        NetworkSandboxPolicy::Enabled
-    } else {
-        NetworkSandboxPolicy::Restricted
-    };
-    let permissions = if network {
-        PermissionProfile::from_runtime_permissions(
-            &FileSystemSandboxPolicy::default(),
-            network_policy,
-        )
-    } else {
-        PermissionProfile::workspace_write_with(&roots, network_policy, true, true)
-            .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?])
-    };
+    let permissions = PermissionProfile::workspace_write_with(
+        &roots,
+        NetworkSandboxPolicy::Restricted,
+        true,
+        true,
+    )
+    .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
 
     #[cfg(target_os = "linux")]
     let mut process = {
@@ -62,7 +54,7 @@ pub async fn run(
                 &permissions,
                 &cwd,
                 false,
-                network,
+                false,
             );
         let executable = std::env::current_exe()?
             .parent()
@@ -96,6 +88,41 @@ pub async fn run(
     let mut child = process
         .spawn()
         .context("failed to start sandboxed command")?;
+    if let Some(bytes) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+    {
+        child_stdin.write_all(bytes).await?;
+    }
+    let output = child.wait_with_output().await?;
+    Ok(Output {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+pub async fn run_unrestricted(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    let mut process = Command::new(&command[0]);
+    process
+        .args(&command[1..])
+        .current_dir(cwd)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process
+        .spawn()
+        .context("failed to start unsandboxed command")?;
     if let Some(bytes) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
     {
