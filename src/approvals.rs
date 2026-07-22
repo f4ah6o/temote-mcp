@@ -61,12 +61,11 @@ pub async fn start() -> Result<()> {
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     eprintln!(
         "local-mcp session: {}\ncwd: {}\n\
-         Give this session ID to the agent and run: local-mcp mcp {}\n\
+         Give this session ID to the agent so it can include it in local-mcp tool calls.\n\
          Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
          Press Ctrl-C to stop.",
         session.id,
-        session.cwd.display(),
-        session.id
+        session.cwd.display()
     );
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();

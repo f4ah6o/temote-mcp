@@ -8,10 +8,7 @@ use uuid::Uuid;
 
 use crate::{approvals, config, sandbox};
 
-pub async fn serve(session_id: Uuid) -> Result<()> {
-    let session = config::load_session(session_id).await?;
-    std::env::set_current_dir(&session.cwd)
-        .with_context(|| format!("cannot use session cwd {}", session.cwd.display()))?;
+pub async fn serve() -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
@@ -29,7 +26,7 @@ pub async fn serve(session_id: Uuid) -> Result<()> {
             continue;
         }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let response = match dispatch(&request, session_id).await {
+        let response = match dispatch(&request).await {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
             Err(error) => {
                 json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":format!("{error:#}")}})
@@ -49,7 +46,7 @@ async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Resul
     Ok(())
 }
 
-async fn dispatch(request: &Value, session_id: Uuid) -> Result<Value> {
+async fn dispatch(request: &Value) -> Result<Value> {
     match request
         .get("method")
         .and_then(Value::as_str)
@@ -59,28 +56,28 @@ async fn dispatch(request: &Value, session_id: Uuid) -> Result<Value> {
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": format!("This local-mcp connection belongs to session {session_id}. Call session_info to inspect its working directory and sandbox roots.")
+            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null), session_id).await,
+        "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null)).await,
         method => anyhow::bail!("method not found: {method}"),
     }
 }
 
 fn tools() -> Value {
     json!([
-        {"name":"session_info","description":"Show the current local-mcp session ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"read_file","description":"Read a UTF-8 file from the local machine.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-        {"name":"get_image","description":"Read a local image and return it as MCP image content.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["path"],"additionalProperties":false}},
-        {"name":"list_directory","description":"List entries in a local directory.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
-        {"name":"write_file","description":"Write a UTF-8 file in the Codex sandbox. Sandboxed calls do not require approval.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
-        {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["command"]}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires user approval unless approvals is in yolo mode.","inputSchema":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["command"]}}
+        {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
+        {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
+        {"name":"write_file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
+        {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
+        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
     ])
 }
 
-async fn call_tool(params: &Value, session_id: Uuid) -> Result<Value> {
+async fn call_tool(params: &Value) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -89,19 +86,21 @@ async fn call_tool(params: &Value, session_id: Uuid) -> Result<Value> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let session_id = required_session_id(&args)?;
+    let session = config::load_session(session_id).await?;
     match name {
-        "session_info" => text_result(serde_json::to_string_pretty(
-            &config::load_session(session_id).await?,
-        )?),
-        "get_image" => {
-            let session = config::load_session(session_id).await?;
-            get_image(&required_path(&args, "path")?, &session.cwd).await
-        }
-        "read_file" => text_result(tokio::fs::read_to_string(required_path(&args, "path")?).await?),
-        "list_directory" => text_result(list_directory(&required_path(&args, "path")?).await?),
-        "write_file" => text_result(write_file(&args).await?),
-        "execute" => text_result(execute(&args, session_id).await?),
-        "without_sandbox" => text_result(without_sandbox(&args, session_id).await?),
+        "session_info" => text_result(serde_json::to_string_pretty(&session)?),
+        "get_image" => get_image(&resolve_path(&session.cwd, required_path(&args, "path")?)).await,
+        "read_file" => text_result(
+            tokio::fs::read_to_string(resolve_path(&session.cwd, required_path(&args, "path")?))
+                .await?,
+        ),
+        "list_directory" => text_result(
+            list_directory(&resolve_path(&session.cwd, required_path(&args, "path")?)).await?,
+        ),
+        "write_file" => text_result(write_file(&args, &session.cwd).await?),
+        "execute" => text_result(execute(&args, &session).await?),
+        "without_sandbox" => text_result(without_sandbox(&args, &session).await?),
         _ => anyhow::bail!("unknown tool: {name}"),
     }
 }
@@ -110,12 +109,7 @@ fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
 }
 
-async fn get_image(path: &Path, session_cwd: &Path) -> Result<Value> {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        session_cwd.join(path)
-    };
+async fn get_image(path: &Path) -> Result<Value> {
     let path = tokio::fs::canonicalize(&path)
         .await
         .with_context(|| format!("cannot resolve image {}", path.display()))?;
@@ -169,12 +163,29 @@ fn required_path(args: &Value, name: &str) -> Result<PathBuf> {
         .context(format!("missing {name}"))
 }
 
-fn cwd(args: &Value) -> Result<PathBuf> {
+fn required_session_id(args: &Value) -> Result<Uuid> {
+    let value = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("missing session_id; ask the user to run `local-mcp start` and provide its ID")?;
+    Uuid::parse_str(value).context("invalid session_id")
+}
+
+fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        session_cwd.join(path)
+    }
+}
+
+fn cwd(args: &Value, session_cwd: &Path) -> Result<PathBuf> {
     let path = args
         .get("cwd")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+        .map(|path| resolve_path(session_cwd, path))
+        .unwrap_or_else(|| session_cwd.to_owned());
     std::fs::canonicalize(&path).with_context(|| format!("cannot resolve cwd {}", path.display()))
 }
 
@@ -193,13 +204,8 @@ async fn list_directory(path: &Path) -> Result<String> {
     Ok(names.join("\n"))
 }
 
-async fn write_file(args: &Value) -> Result<String> {
-    let path = required_path(args, "path")?;
-    let absolute = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+async fn write_file(args: &Value, session_cwd: &Path) -> Result<String> {
+    let absolute = resolve_path(session_cwd, required_path(args, "path")?);
     let parent = absolute.parent().context("file has no parent directory")?;
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("parent does not exist: {}", parent.display()))?;
@@ -224,7 +230,7 @@ async fn write_file(args: &Value) -> Result<String> {
     render_output(output)
 }
 
-async fn execute(args: &Value, session_id: Uuid) -> Result<String> {
+async fn execute(args: &Value, session: &config::Session) -> Result<String> {
     let command = args
         .get("command")
         .and_then(Value::as_array)
@@ -236,16 +242,15 @@ async fn execute(args: &Value, session_id: Uuid) -> Result<String> {
                 .context("command entries must be strings")
         })
         .collect::<Result<Vec<_>>>()?;
-    let cwd = cwd(args)?;
-    let session = config::load_session(session_id).await?;
-    let mut roots = session.permitted_directories;
+    let cwd = cwd(args, &session.cwd)?;
+    let mut roots = session.permitted_directories.clone();
     if !roots.iter().any(|root| cwd.starts_with(root)) {
         roots.push(cwd.clone());
     }
     render_output(sandbox::run(&command, &cwd, &roots, None).await?)
 }
 
-async fn without_sandbox(args: &Value, session_id: Uuid) -> Result<String> {
+async fn without_sandbox(args: &Value, session: &config::Session) -> Result<String> {
     let command = args
         .get("command")
         .and_then(Value::as_array)
@@ -257,9 +262,9 @@ async fn without_sandbox(args: &Value, session_id: Uuid) -> Result<String> {
                 .context("command entries must be strings")
         })
         .collect::<Result<Vec<_>>>()?;
-    let cwd = cwd(args)?;
+    let cwd = cwd(args, &session.cwd)?;
     if !approvals::request(
-        session_id,
+        session.id,
         "without_sandbox",
         format!("argv: {command:?}"),
         cwd.clone(),
@@ -300,7 +305,7 @@ mod tests {
         let bytes = b"\x89PNG\r\n\x1a\nexample";
         tokio::fs::write(&path, bytes).await.unwrap();
 
-        let result = get_image(&path, Path::new("/")).await.unwrap();
+        let result = get_image(&path).await.unwrap();
         tokio::fs::remove_file(path).await.unwrap();
 
         assert_eq!(result["content"][0]["type"], "image");
@@ -315,7 +320,9 @@ mod tests {
         let path = directory.join("image.gif");
         tokio::fs::write(&path, b"GIF89a").await.unwrap();
 
-        let result = get_image(Path::new("image.gif"), &directory).await.unwrap();
+        let result = get_image(&resolve_path(&directory, PathBuf::from("image.gif")))
+            .await
+            .unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");

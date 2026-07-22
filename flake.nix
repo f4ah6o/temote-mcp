@@ -24,7 +24,7 @@
             version = "0.1.0";
             src = self;
 
-            cargoHash = "sha256-2ub6LqGq4kOr6rXTcPuo4ND0RMoy82Ccl1rGPHpVza8=";
+            cargoHash = "sha256-NKZJzA/ZmIw7J0gKRjDe3+4ccLa9kTlpGv7oWrnfZ6o=";
 
             nativeBuildInputs = with pkgs; [
               cmake
