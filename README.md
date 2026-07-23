@@ -23,7 +23,7 @@ local-mcp start
 # Give the printed session ID to the agent in your prompt. The agent includes it
 # in each local-mcp tool call.
 
-# In the approvals UI, allow every unsandboxed call until it exits:
+# In the approvals UI, allow every unsandboxed call for the session:
 /permissions yolo
 
 # Manage the current session from the start screen:
@@ -32,9 +32,10 @@ local-mcp start
 /permission allow ../another-project
 /permission revoke ../another-project
 /permission list
+/permission status
 ```
 
-With Nix, `bwrap` and `curl` are included in the runtime environment:
+With Nix, `bwrap`, `curl`, and `bash` are included in the runtime environment:
 
 ```sh
 nix run github:OWNER/local-mcp
