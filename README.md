@@ -20,6 +20,9 @@ local-mcp mcp
 cd ./some-project
 local-mcp start
 
+# Or choose a stable session ID (letters, numbers, "-", "_", and "."):
+local-mcp start my-project
+
 # Give the printed session ID to the agent in your prompt. The agent includes it
 # in each local-mcp tool call.
 

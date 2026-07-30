@@ -32,7 +32,7 @@ enum Message {
 }
 
 pub async fn request(
-    session_id: Uuid,
+    session_id: &str,
     operation: &str,
     detail: String,
     cwd: PathBuf,
@@ -65,7 +65,7 @@ pub async fn request(
 /// Sends a one-way activity update to the `start` screen. Activity reporting is
 /// deliberately best-effort: an MCP operation must not fail just because its UI
 /// was closed between loading the session and completing the operation.
-pub async fn activity(session_id: Uuid, title: impl Into<String>, detail: Option<String>) {
+pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option<String>) {
     let Ok(path) = config::socket_path(session_id) else {
         return;
     };
@@ -84,9 +84,9 @@ pub async fn activity(session_id: Uuid, title: impl Into<String>, detail: Option
     let _ = stream.shutdown().await;
 }
 
-pub async fn start() -> Result<()> {
-    let mut session = config::create_session(&std::env::current_dir()?).await?;
-    let path = config::socket_path(session.id)?;
+pub async fn start(session_id: Option<&str>) -> Result<()> {
+    let mut session = config::create_session(&std::env::current_dir()?, session_id).await?;
+    let path = config::socket_path(&session.id)?;
     let state_dir = path.parent().context("session socket has no parent")?;
     tokio::fs::create_dir_all(state_dir).await?;
     tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;

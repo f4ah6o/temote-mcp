@@ -16,7 +16,7 @@ use crate::{approvals, config, sandbox};
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Job {
-    session_id: Uuid,
+    session_id: String,
     command: String,
     handle: JoinHandle<Result<String>>,
 }
@@ -84,7 +84,7 @@ async fn dispatch(request: &Value) -> Result<Value> {
 }
 
 fn tools() -> Value {
-    json!([
+    let mut tools = json!([
         {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
         {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
@@ -95,7 +95,16 @@ fn tools() -> Value {
         {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
-    ])
+    ]);
+    for tool in tools.as_array_mut().unwrap() {
+        if let Some(session_id) = tool
+            .pointer_mut("/inputSchema/properties/session_id")
+            .and_then(Value::as_object_mut)
+        {
+            session_id.remove("format");
+        }
+    }
+    tools
 }
 
 async fn call_tool(params: &Value) -> Result<Value> {
@@ -108,17 +117,17 @@ async fn call_tool(params: &Value) -> Result<Value> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let session_id = required_session_id(&args)?;
-    let session = config::load_session(session_id).await?;
+    let session = config::load_session(&session_id).await?;
     match name {
         "session_info" => {
-            approvals::activity(session.id, "Read session info", None).await;
+            approvals::activity(&session.id, "Read session info", None).await;
             text_result(serde_json::to_string_pretty(&session)?)
         }
         "get_image" => {
             let path = resolve_path(&session.cwd, required_path(&args, "path")?);
             let result = get_image(&path).await;
             report_result(
-                session.id,
+                &session.id,
                 format!("Read image {}", display_path(&path, &session.cwd)),
                 &result,
             )
@@ -131,7 +140,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
                 .await
                 .context("failed to read file");
             report_result(
-                session.id,
+                &session.id,
                 format!("Read {}", display_path(&path, &session.cwd)),
                 &result,
             )
@@ -142,7 +151,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
             let path = resolve_path(&session.cwd, required_path(&args, "path")?);
             let result = list_directory(&path).await;
             report_result(
-                session.id,
+                &session.id,
                 format!("Listed {}", display_path(&path, &session.cwd)),
                 &result,
             )
@@ -159,7 +168,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
     }
 }
 
-async fn report_result<T>(session_id: Uuid, title: String, result: &Result<T>) {
+async fn report_result<T>(session_id: &str, title: String, result: &Result<T>) {
     let detail = result
         .as_ref()
         .err()
@@ -231,12 +240,13 @@ fn required_path(args: &Value, name: &str) -> Result<PathBuf> {
         .context(format!("missing {name}"))
 }
 
-fn required_session_id(args: &Value) -> Result<Uuid> {
+fn required_session_id(args: &Value) -> Result<String> {
     let value = args
         .get("session_id")
         .and_then(Value::as_str)
         .context("missing session_id; ask the user to run `local-mcp start` and provide its ID")?;
-    Uuid::parse_str(value).context("invalid session_id")
+    config::validate_session_id(value)?;
+    Ok(value.to_owned())
 }
 
 fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
@@ -308,7 +318,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         Ok(_) => (!diff.is_empty()).then_some(diff),
         Err(error) => Some(format!("└ Error: {error:#}")),
     };
-    approvals::activity(session.id, title, detail).await;
+    approvals::activity(&session.id, title, detail).await;
     text_result(result?)
 }
 
@@ -337,8 +347,8 @@ async fn spawn_sandboxed_command(
         roots.push(cwd.clone());
     }
     let rendered_command = render_command(&command);
-    approvals::activity(session.id, format!("Running {rendered_command}"), None).await;
-    let session_id = session.id;
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    let session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
         let result = sandbox::run(&command, &cwd, &roots, None)
@@ -360,13 +370,13 @@ async fn store_job(
     jobs().lock().unwrap().insert(
         job_id,
         Job {
-            session_id: session.id,
+            session_id: session.id.clone(),
             command: rendered_command.clone(),
             handle,
         },
     );
     approvals::activity(
-        session.id,
+        &session.id,
         format!("{activity} {rendered_command}"),
         Some(format!("└ job {job_id}")),
     )
@@ -408,7 +418,7 @@ async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     job.handle.abort();
     let _ = job.handle.await;
     approvals::activity(
-        session.id,
+        &session.id,
         format!("Stopped {}", job.command),
         Some(format!("└ job {job_id}")),
     )
@@ -441,7 +451,7 @@ async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Valu
     let command = required_command(args)?;
     let cwd = cwd(args, &session.cwd)?;
     if !approvals::request(
-        session.id,
+        &session.id,
         "without_sandbox",
         format!("argv: {command:?}"),
         cwd.clone(),
@@ -450,18 +460,18 @@ async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Valu
     {
         anyhow::bail!("user denied without_sandbox")
     }
-    run_and_report(session.id, command, cwd, true, &[]).await
+    run_and_report(session.id.clone(), command, cwd, true, &[]).await
 }
 
 async fn run_and_report(
-    session_id: Uuid,
+    session_id: String,
     command: Vec<String>,
     cwd: PathBuf,
     unrestricted: bool,
     roots: &[PathBuf],
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
-    approvals::activity(session_id, format!("Running {rendered_command}"), None).await;
+    approvals::activity(&session_id, format!("Running {rendered_command}"), None).await;
     let output = if unrestricted {
         sandbox::run_unrestricted(&command, &cwd, None).await
     } else {
@@ -480,12 +490,12 @@ fn render_command(command: &[String]) -> String {
         .join(" ")
 }
 
-async fn report_command_finished(session_id: Uuid, command: &str, result: &Result<String>) {
+async fn report_command_finished(session_id: String, command: &str, result: &Result<String>) {
     let detail = match result {
         Ok(text) => command_summary(text),
         Err(error) => Some(format!("└ Error: {error:#}")),
     };
-    approvals::activity(session_id, format!("Ran {command}"), detail).await;
+    approvals::activity(&session_id, format!("Ran {command}"), detail).await;
 }
 
 fn shell_word(value: &str) -> String {
