@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub id: Uuid,
+    pub id: String,
     pub cwd: PathBuf,
     #[serde(default)]
     pub permitted_directories: Vec<PathBuf>,
@@ -19,18 +19,24 @@ pub fn state_dir() -> Result<PathBuf> {
         .context("could not determine a local state directory")
 }
 
-pub fn session_path(id: Uuid) -> Result<PathBuf> {
+pub fn session_path(id: &str) -> Result<PathBuf> {
+    validate_session_id(id)?;
     Ok(state_dir()?.join("sessions").join(format!("{id}.json")))
 }
 
-pub fn socket_path(id: Uuid) -> Result<PathBuf> {
+pub fn socket_path(id: &str) -> Result<PathBuf> {
+    validate_session_id(id)?;
     Ok(state_dir()?.join("sessions").join(format!("{id}.sock")))
 }
 
-pub async fn create_session(cwd: &Path) -> Result<Session> {
+pub async fn create_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
     let cwd = canonical_directory(cwd)?;
+    let id = id
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    validate_session_id(&id)?;
     let session = Session {
-        id: Uuid::new_v4(),
+        id,
         cwd: cwd.clone(),
         permitted_directories: vec![cwd],
     };
@@ -38,7 +44,7 @@ pub async fn create_session(cwd: &Path) -> Result<Session> {
     Ok(session)
 }
 
-pub async fn load_session(id: Uuid) -> Result<Session> {
+pub async fn load_session(id: &str) -> Result<Session> {
     let path = session_path(id)?;
     let bytes = tokio::fs::read(&path)
         .await
@@ -47,11 +53,23 @@ pub async fn load_session(id: Uuid) -> Result<Session> {
 }
 
 pub async fn save_session(session: &Session) -> Result<()> {
-    let path = session_path(session.id)?;
+    let path = session_path(&session.id)?;
     tokio::fs::create_dir_all(path.parent().unwrap()).await?;
     let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
     tokio::fs::write(&temporary, serde_json::to_vec_pretty(session)?).await?;
     tokio::fs::rename(temporary, path).await?;
+    Ok(())
+}
+
+pub fn validate_session_id(id: &str) -> Result<()> {
+    anyhow::ensure!(!id.is_empty(), "session ID must not be empty");
+    anyhow::ensure!(id.len() <= 64, "session ID must be at most 64 bytes");
+    anyhow::ensure!(
+        id.chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character)),
+        "session ID may contain only ASCII letters, numbers, '-', '_', and '.'"
+    );
+    anyhow::ensure!(id != "." && id != "..", "invalid session ID");
     Ok(())
 }
 
@@ -60,4 +78,18 @@ pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve {}", path.display()))?;
     anyhow::ensure!(path.is_dir(), "{} is not a directory", path.display());
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_custom_session_ids() {
+        assert!(validate_session_id("my-project_1.dev").is_ok());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("../escape").is_err());
+        assert!(validate_session_id("contains spaces").is_err());
+        assert!(validate_session_id(&"x".repeat(65)).is_err());
+    }
 }

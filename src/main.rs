@@ -16,7 +16,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start a session in the current directory and show its permission UI.
-    Start,
+    Start {
+        /// Session ID to use instead of generating a UUID.
+        session_id: Option<String>,
+    },
     /// Run the session-independent MCP server over stdin/stdout.
     Mcp,
 }
@@ -24,8 +27,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Start) {
-        Command::Start => approvals::start().await,
+    match cli.command.unwrap_or(Command::Start { session_id: None }) {
+        Command::Start { session_id } => approvals::start(session_id.as_deref()).await,
         Command::Mcp => mcp::serve().await,
     }
 }
