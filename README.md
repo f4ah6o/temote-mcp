@@ -39,6 +39,43 @@ local-mcp start my-project
 /permission status
 ```
 
+## Remote clients over HTTP
+
+`local-mcp serve` runs the same MCP server over HTTP behind OAuth, for clients
+that can only reach a public HTTPS URL, such as ChatGPT custom connectors:
+
+```sh
+# Terminal 1: the server, behind a tunnel that terminates TLS for the public URL.
+local-mcp serve --public-url https://local-mcp.example.com
+
+# Terminal 2: the tunnel.
+cloudflared tunnel --url http://127.0.0.1:8791 run my-tunnel
+
+# Terminal 3: a session, as usual.
+cd ./some-project
+local-mcp start my-project
+```
+
+Register `https://local-mcp.example.com/mcp` in the client and pick OAuth. The
+client registers itself (RFC 7591), the browser lands on an approval page, and
+the **admin token** printed by `local-mcp serve` authorizes the grant. Access
+tokens last an hour and are renewed with rotating refresh tokens.
+
+Only redirect URIs on the allow list may register. ChatGPT and Claude are
+allowed by default; add more with `--allow-redirect-prefix` (a trailing `/`
+makes the value a prefix). The admin token comes from `--admin-token`,
+`LOCAL_MCP_OAUTH_ADMIN_TOKEN`, or a generated file in the state directory;
+delete `oauth-admin-token` there to roll it, and `oauth.json` to drop every
+issued token.
+
+The endpoint publishes `/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-authorization-server` (also under `/mcp`), and answers
+unauthenticated MCP calls with `401` and a `WWW-Authenticate` challenge.
+`--addr` defaults to `127.0.0.1:8791`, so nothing is exposed beyond the tunnel.
+Remember that a reachable connector can read files and run sandboxed commands
+under the session's roots, so keep `/permission ask` and stop the tunnel when
+it is not in use.
+
 With Nix, `curl` and `bash` are included in the runtime environment. Linux builds
 also include `bwrap`:
 
@@ -57,8 +94,8 @@ prompts only for the lifetime of that session; `/permissions ask`
 turns prompts back on. The singular `/permission ...` spelling is also accepted.
 Every tool takes a `session_id`. The agent can call `session_info` with the ID
 from the prompt to confirm the working directory and sandbox roots. One
-`local-mcp mcp` process can therefore serve multiple independently configured
-sessions.
+`local-mcp mcp` or `local-mcp serve` process can therefore serve multiple
+independently configured sessions.
 `get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
 image content. Relative image paths are resolved from the session working directory.
 

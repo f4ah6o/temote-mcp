@@ -64,7 +64,7 @@ async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Resul
     Ok(())
 }
 
-async fn dispatch(request: &Value) -> Result<Value> {
+pub(crate) async fn dispatch(request: &Value) -> Result<Value> {
     match request
         .get("method")
         .and_then(Value::as_str)

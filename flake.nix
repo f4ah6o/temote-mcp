@@ -26,7 +26,9 @@
             version = "0.1.0";
             src = self;
 
-            cargoHash = "sha256-oOZrW9kqHT/R/fO+EFfBWOGhA9Y2dznRPQHBc5HivIg=";
+            # Refresh after every Cargo.lock change: run `nix build`, then copy
+            # the "got:" hash from the mismatch error.
+            cargoHash = pkgs.lib.fakeHash;
 
             nativeBuildInputs = with pkgs; [
               cmake
