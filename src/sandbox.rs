@@ -1,18 +1,23 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub struct Output {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+    pub truncated: bool,
 }
 
 fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
@@ -115,12 +120,7 @@ pub async fn run(
     {
         child_stdin.write_all(bytes).await?;
     }
-    let output = child.wait_with_output().await?;
-    Ok(Output {
-        status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    wait_with_limited_output(child).await
 }
 
 pub async fn run_unrestricted(
@@ -151,12 +151,86 @@ pub async fn run_unrestricted(
     {
         child_stdin.write_all(bytes).await?;
     }
-    let output = child.wait_with_output().await?;
+    wait_with_limited_output(child).await
+}
+
+async fn wait_with_limited_output(mut child: tokio::process::Child) -> Result<Output> {
+    let stdout = child
+        .stdout
+        .take()
+        .context("sandbox command stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("sandbox command stderr was not captured")?;
+    let remaining = Arc::new(AtomicUsize::new(MAX_COMMAND_OUTPUT_BYTES));
+    let (stdout, stderr) = tokio::join!(
+        read_limited(stdout, remaining.clone()),
+        read_limited(stderr, remaining)
+    );
+    let (stdout, stdout_truncated) = stdout?;
+    let (stderr, stderr_truncated) = stderr?;
+    let status = child.wait().await?;
     Ok(Output {
-        status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status: status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        truncated: stdout_truncated || stderr_truncated,
     })
+}
+
+async fn read_limited<R>(mut reader: R, remaining: Arc<AtomicUsize>) -> Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK_SIZE: usize = 8192;
+    let mut output = Vec::new();
+    let mut truncated = false;
+    loop {
+        let allowance = reserve_bytes(&remaining, CHUNK_SIZE);
+        if allowance == 0 {
+            let mut discard = [0_u8; CHUNK_SIZE];
+            loop {
+                let read = reader.read(&mut discard).await?;
+                if read == 0 {
+                    break;
+                }
+                truncated = true;
+            }
+            break;
+        }
+
+        let mut buffer = vec![0_u8; allowance];
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            remaining.fetch_add(allowance, Ordering::SeqCst);
+            break;
+        }
+        if read < allowance {
+            remaining.fetch_add(allowance - read, Ordering::SeqCst);
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+    Ok((output, truncated))
+}
+
+fn reserve_bytes(remaining: &AtomicUsize, maximum: usize) -> usize {
+    let mut current = remaining.load(Ordering::SeqCst);
+    loop {
+        if current == 0 {
+            return 0;
+        }
+        let reserved = current.min(maximum);
+        match remaining.compare_exchange(
+            current,
+            current - reserved,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return reserved,
+            Err(next) => current = next,
+        }
+    }
 }
 
 fn safe_environment() -> HashMap<String, String> {
@@ -168,6 +242,26 @@ fn safe_environment() -> HashMap<String, String> {
                 .map(|value| (name.to_owned(), value))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn limits_a_stream_and_drains_the_rest() {
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"0123456789abcdef").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let remaining = Arc::new(AtomicUsize::new(8));
+        let (output, truncated) = read_limited(reader, remaining).await.unwrap();
+        writer_task.await.unwrap();
+
+        assert_eq!(output, b"01234567");
+        assert!(truncated);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
