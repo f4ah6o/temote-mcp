@@ -1,118 +1,224 @@
 # local-mcp
 
-`local-mcp` exposes basic local-machine capabilities as MCP tools: file reads,
-image reads, directory listings, sandboxed file writes and commands, plus explicitly approved
-unsandboxed command execution. It intentionally does not provide web search or a
-dedicated network-request tool.
+local-mcp exposes local files and sandboxed commands as MCP tools. It does
+not provide web search or a general network-request tool. Sandboxed commands
+run with Codex Landlock/Seatbelt isolation and network access disabled.
 
-Commands are isolated with OpenAI Codex's `codex-rs/sandboxing`: Landlock and the
-Linux sandbox helper on Linux, and Seatbelt (`sandbox-exec`) on macOS. Network
-access is denied for ordinary commands.
+The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
 
-## Usage
+    ChatGPT Plus
+        | Managed OAuth
+        v
+    Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
+                                                   |
+                                                   v
+                                            local-mcp serve
 
-```sh
-cargo build --release
+## Build
 
-# Run one persistent MCP server (for example through a tunnel):
-local-mcp mcp
+    cargo build --release
+    cargo install --path . --locked
 
-# In another terminal, start a session in the project directory:
-cd ./some-project
-local-mcp start
+On Linux, install both local-mcp and the sibling codex-linux-sandbox binary
+in the same directory, and make sure bwrap is available in PATH. macOS uses
+the system Seatbelt sandbox. Windows is not supported.
 
-# Or choose a stable session ID (letters, numbers, "-", "_", and "."):
-local-mcp start my-project
+Keep `--locked` when installing. The Codex sandbox dependency is pinned to a
+Git revision, and resolving its transitive pre-release dependencies without
+the committed lockfile can select incompatible `rama` or `starlark` versions.
 
-# Give the printed session ID to the agent in your prompt. The agent includes it
-# in each local-mcp tool call.
+## Local sessions
 
-# In the approvals UI, allow every unsandboxed call for the session:
-/permissions yolo
+Start each session from the project directory whose files it may access:
 
-# Manage the current session from the start screen:
-/permission ask
-/permission yolo
-/permission allow ../another-project
-/permission revoke ../another-project
-/permission list
-/permission status
-```
+    cd ~/src/local-mcp
+    local-mcp start local-mcp
 
-## Remote clients over HTTP
+    cd ~/src/shuttle-rs
+    local-mcp start shuttle-rs
 
-`local-mcp serve` runs the same MCP server over HTTP behind OAuth, for clients
-that can only reach a public HTTPS URL, such as ChatGPT custom connectors:
+The session ID is explicit in every tool call. session_list discovers active
+sessions; session_info shows a session's working directory and sandbox roots.
+Session IDs contain only ASCII letters, numbers, -, _, and .. A duplicate
+active ID is rejected.
 
-```sh
-# Terminal 1: the server, behind a tunnel that terminates TLS for the public URL.
-local-mcp serve --public-url https://local-mcp.example.com
+The initial sandbox root is the startup directory. Add another existing
+directory from that session's local terminal:
 
-# Terminal 2: the tunnel.
-cloudflared tunnel --url http://127.0.0.1:8791 run my-tunnel
+    /permission allow ../another-project
+    /permission revoke ../another-project
+    /permission list
+    /permission status
 
-# Terminal 3: a session, as usual.
-cd ./some-project
-local-mcp start my-project
-```
+When the start process exits, its Unix socket is removed and active sandbox
+jobs are cancelled. The public endpoint never exposes without_sandbox. The
+local stdio server retains that explicitly approved tool for local-only
+workflows.
 
-Register `https://local-mcp.example.com/mcp` in the client and pick OAuth. The
-client registers itself (RFC 7591), the browser lands on an approval page, and
-the **admin token** printed by `local-mcp serve` authorizes the grant. Access
-tokens last an hour and are renewed with rotating refresh tokens.
+## Public HTTP endpoint
 
-Only redirect URIs on the allow list may register. ChatGPT and Claude are
-allowed by default; add more with `--allow-redirect-prefix` (a trailing `/`
-makes the value a prefix). The admin token comes from `--admin-token`,
-`LOCAL_MCP_OAUTH_ADMIN_TOKEN`, or a generated file in the state directory;
-delete `oauth-admin-token` there to roll it, and `oauth.json` to drop every
-issued token.
+Copy .env.example to a file outside the repository, such as
+~/.config/local-mcp/public.env, and set the Cloudflare Access values. Keep
+the file mode 0600; the Tunnel token is a credential.
 
-The endpoint publishes `/.well-known/oauth-protected-resource` and
-`/.well-known/oauth-authorization-server` (also under `/mcp`), and answers
-unauthenticated MCP calls with `401` and a `WWW-Authenticate` challenge.
-`--addr` defaults to `127.0.0.1:8791`, so nothing is exposed beyond the tunnel.
-Remember that a reachable connector can read files and run sandboxed commands
-under the session's roots, so keep `/permission ask` and stop the tunnel when
-it is not in use.
+    install -d -m 700 ~/.config/local-mcp
+    cp .env.example ~/.config/local-mcp/public.env
+    chmod 600 ~/.config/local-mcp/public.env
+    vi ~/.config/local-mcp/public.env
 
-With Nix, `curl` and `bash` are included in the runtime environment. Linux builds
-also include `bwrap`:
+Use separate terminals when the service is needed:
 
-```sh
-nix run github:OWNER/local-mcp
-nix develop
-nix build
-```
+    # Terminal 1: the local origin
+    set -a
+    . ~/.config/local-mcp/public.env
+    set +a
+    local-mcp serve
 
-The session working directory is the directory where `local-mcp start` was run;
-there is no separate persistent cwd setting. Sandboxed calls are always allowed
-and have no network access. `without_sandbox`
-runs with the service user's full host permissions and network access, so it asks
-the approvals process before every call. `/permissions yolo` disables those
-prompts only for the lifetime of that session; `/permissions ask`
-turns prompts back on. The singular `/permission ...` spelling is also accepted.
-Every tool takes a `session_id`. The agent can call `session_info` with the ID
-from the prompt to confirm the working directory and sandbox roots. One
-`local-mcp mcp` or `local-mcp serve` process can therefore serve multiple
-independently configured sessions.
-`get_image` returns PNG, JPEG, GIF, WebP, BMP, TIFF, and AVIF files as native MCP
-image content. Relative image paths are resolved from the session working directory.
+    # Terminal 2: the on-demand remotely managed Tunnel
+    set -a
+    . ~/.config/local-mcp/public.env
+    set +a
+    cloudflared tunnel run --token "$LOCAL_MCP_TUNNEL_TOKEN"
 
-Each session uses its own permission-restricted Unix domain socket. Both the MCP
-server and the start UI block on I/O, so idle operation and pending approvals
-do not use polling timers.
+    # Terminal 3+: one local session per project
+    cd ~/src/local-mcp
+    local-mcp start local-mcp
 
-The `start` screen also receives live activity from MCP calls. It shows file and
-image reads, directory listings, file edits with unified diffs and line counts,
-and command start/completion with output, in a compact Codex-style timeline.
-`execute` returns its normal result for commands that finish within 30 seconds.
-Longer commands continue in the background and return a `job_id`; use `poll_job`
-to check for completion or `stop_job` to terminate them. Use `start_command`
-when a command should run in the background immediately without the 30-second
-foreground wait.
+The repository also includes a `justfile` for these commands. After installing
+`just`, the equivalent workflow is:
 
-On Linux, the build produces `local-mcp` and its sibling `codex-linux-sandbox`;
-install or copy both into the same directory, and ensure `bwrap` (bubblewrap) is
-available in `PATH`. On macOS, only `local-mcp` is needed; sandboxed commands use
-the system `/usr/bin/sandbox-exec`. Windows support is not implemented yet.
+    just install
+    just env-check
+
+    # Origin + on-demand Tunnel in one terminal (Ctrl-C stops both)
+    just up
+
+    # If a previous run left a child process behind
+    just down
+
+    # Or run them separately when independent logs are preferable:
+    just serve
+    just tunnel
+
+    # Terminal 3+: one session per project
+    just start local-mcp
+    just start shuttle-rs ~/src/shuttle-rs
+
+The `start` recipe takes the session ID as its first argument and an optional
+working directory as its second argument. Run one `just start` command per
+project/session in its own terminal; the origin and Tunnel recipes are also
+foreground processes.
+
+The public route is:
+
+    https://temotemcp.example.com/mcp
+
+Cloudflare configuration must provide:
+
+1. A remotely managed Tunnel named local-mcp with
+   temotemcp.example.com routed to http://127.0.0.1:8791.
+2. A **self-hosted Cloudflare Access application** that directly protects the
+   public hostname. Create it under Zero Trust > Access controls >
+   Applications > Add application > Self-hosted. Use a name such as
+   `localmcp-direct`, the public hostname `temotemcp.example.com`, and leave the
+   path empty so the whole host is protected. Do not restrict the application
+   to `/mcp`: Managed OAuth discovery is served at the host-root `/.well-known/`
+   paths, while the MCP request URL remains `/mcp`.
+3. An Allow policy on that application for only the intended email account.
+   Do not add a Bypass or Service Auth policy for this public endpoint.
+4. Managed OAuth enabled in the self-hosted application's Advanced settings:
+   dynamic client registration enabled, a 15-minute access token lifetime, and
+   a 14-day grant session duration. The ChatGPT redirect URIs are:
+   https://chatgpt.com/connector/oauth/*
+   and
+   https://chatgpt.com/connector_platform_oauth_redirect.
+   The working setup also enabled the localhost and loopback client options
+   for local OAuth clients; ChatGPT itself is covered by the explicit HTTPS
+   redirect URIs, so disable those options when no local OAuth client needs
+   them.
+
+The `AI controls > MCP servers` page serves a different purpose. An entry
+created there is a portal registration (often shown as an Access application
+with `type: mcp` and a `via_mcp_server_portal` destination); it does not protect
+`temotemcp.example.com` when ChatGPT connects directly to that hostname. Such an
+entry can remain if the portal is used separately, but it is not part of this
+direct Tunnel path.
+
+See the [Cloudflare Managed OAuth documentation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
+and [Cloudflare MCP security guidance](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/secure-mcp-servers/)
+for the current Access terminology and API fields.
+
+Managed OAuth is handled by Cloudflare Access. The Rust origin validates the
+Cf-Access-Jwt-Assertion signature, issuer, audience, expiry, subject, and
+configured email allow list. `LOCAL_MCP_ACCESS_AUDIENCE` must contain the AUD
+of the self-hosted application that protects `temotemcp.example.com`; do not
+reuse the AUD of the portal-only `type: mcp` entry. If the self-hosted
+application is recreated, update `~/.config/local-mcp/public.env` and restart
+`local-mcp serve`. The old built-in local OAuth server is not part of the
+public path.
+
+In ChatGPT, add a custom MCP app in Developer mode and use the public /mcp
+URL. The account's available Plus features are verified at connection time;
+the server advertises write and command tools with MCP action annotations so
+the client can request confirmation.
+
+Before connecting, check that Access intercepts the request before it reaches
+the Rust origin:
+
+    curl -i -X POST https://temotemcp.example.com/mcp \
+      -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0"}}}'
+    curl -i https://temotemcp.example.com/.well-known/oauth-authorization-server
+    curl -i https://temotemcp.example.com/.well-known/oauth-protected-resource
+
+The unauthenticated MCP request should return `401` with a Cloudflare
+`WWW-Authenticate` header, and both discovery endpoints should return `200`
+with JSON metadata. A `530` means the on-demand Tunnel or local origin is not
+running. A Rust JSON `401` without `WWW-Authenticate`, or a discovery `404`,
+means the self-hosted Access application is missing, has the wrong hostname or
+path, or is not the application on which Managed OAuth was enabled.
+
+If the origin log says `Cloudflare Access JWT audience is invalid`, copy the
+`AUD` value from the self-hosted application (not the portal-only `type: mcp`
+entry) into `LOCAL_MCP_ACCESS_AUDIENCE`, then restart `local-mcp serve`. The
+Allow policy decides whether Access forwards the request; the Rust origin still
+validates the forwarded JWT audience.
+
+If OAuth succeeds but ChatGPT shows no tools, refresh the MCP connection after
+restarting `local-mcp serve` (especially after changing the self-hosted
+application AUD). The direct connection URL is still exactly
+`https://temotemcp.example.com/mcp`; the host root is only used for OAuth
+discovery. The public `tools/list` response contains ten sandbox-backed tools;
+`without_sandbox` is intentionally available only in local stdio mode. Each
+public tool must include a name, display title, description, input schema, and
+annotations. Start a new ChatGPT conversation and add the MCP connection from
+the tools menu so ChatGPT requests the refreshed tool list. See the [OpenAI
+connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt)
+and [MCP troubleshooting guide](https://developers.openai.com/plugins/deploy/troubleshooting)
+for the client-side checks.
+
+## Limits and safety boundaries
+
+- Public requests require a valid Cloudflare Access assertion.
+- All public tools require an explicit active session_id, except session_list.
+- File paths, symlink targets, and command cwd must remain under the session's
+  permitted roots.
+- Sandboxed commands have no network access.
+- A session has at most four active sandbox jobs.
+- Combined stdout/stderr per command is capped at 1 MiB and marked as
+  truncated.
+- A background sandbox job is cancelled after two hours or when its session
+  stops.
+- Runtime audit output records identity, tool, session, and status metadata;
+  command arguments and output are not persisted as audit logs.
+- There is intentionally no secret-file denylist. Do not add broad roots such
+  as /home; explicitly permit only the directories needed for the task.
+
+## Local stdio mode
+
+For a local MCP client that starts the process itself:
+
+    local-mcp mcp
+
+This mode is separate from the Cloudflare Access HTTP endpoint. It includes
+the local approval UI and the explicitly approved without_sandbox command.

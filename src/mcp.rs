@@ -14,6 +14,10 @@ use uuid::Uuid;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ACTIVE_JOBS_PER_SESSION: usize = 4;
+const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 struct Job {
     session_id: String,
@@ -21,9 +25,19 @@ struct Job {
     handle: JoinHandle<Result<String>>,
 }
 
-fn jobs() -> &'static Mutex<HashMap<Uuid, Job>> {
-    static JOBS: OnceLock<Mutex<HashMap<Uuid, Job>>> = OnceLock::new();
-    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+struct JobState {
+    jobs: HashMap<Uuid, Job>,
+    active_by_session: HashMap<String, usize>,
+}
+
+fn jobs() -> &'static Mutex<JobState> {
+    static JOBS: OnceLock<Mutex<JobState>> = OnceLock::new();
+    JOBS.get_or_init(|| {
+        Mutex::new(JobState {
+            jobs: HashMap::new(),
+            active_by_session: HashMap::new(),
+        })
+    })
 }
 
 pub async fn serve() -> Result<()> {
@@ -65,49 +79,80 @@ async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Resul
 }
 
 pub(crate) async fn dispatch(request: &Value) -> Result<Value> {
+    dispatch_with_mode(request, false).await
+}
+
+pub(crate) async fn dispatch_public(request: &Value) -> Result<Value> {
+    dispatch_with_mode(request, true).await
+}
+
+async fn dispatch_with_mode(request: &Value, public: bool) -> Result<Value> {
     match request
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
         "initialize" => Ok(json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": negotiate_protocol_version(request),
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "local-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user. Call session_info with that ID to inspect its working directory and sandbox roots."
+            "serverInfo": {"name": "local-mcp", "title": "Local MCP", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory and sandbox roots."
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools()})),
-        "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null)).await,
+        "tools/list" => Ok(json!({"tools": tools(public)})),
+        "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null), public).await,
         method => anyhow::bail!("method not found: {method}"),
     }
 }
 
-fn tools() -> Value {
+fn negotiate_protocol_version(request: &Value) -> &'static str {
+    let requested = request
+        .pointer("/params/protocolVersion")
+        .and_then(Value::as_str);
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|version| Some(*version) == requested)
+        .unwrap_or(LATEST_PROTOCOL_VERSION)
+}
+
+fn tools(public: bool) -> Value {
     let mut tools = json!([
-        {"name":"session_info","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"read_file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
-        {"name":"get_image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
-        {"name":"list_directory","description":"List entries in a local directory. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"}},"required":["session_id","path"]}},
-        {"name":"write_file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"]}},
-        {"name":"execute","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"start_command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}},
-        {"name":"poll_job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"stop_job","description":"Stop a background command returned by execute or start_command.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"job_id":{"type":"string","format":"uuid"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"without_sandbox","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","format":"uuid"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"]}}
+        {"name":"session_list","title":"List local MCP sessions","description":"List currently active local-mcp sessions. Returns only session IDs, working directories, start times, and status.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"session_info","title":"Inspect a local MCP session","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"get_image","title":"Read a local image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"list_directory","title":"List a local directory","description":"List entries in a local directory. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
+        {"name":"execute","title":"Run a sandboxed command","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"start_command","title":"Start a sandboxed command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"without_sandbox","title":"Run a host command","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}}
     ]);
-    for tool in tools.as_array_mut().unwrap() {
-        if let Some(session_id) = tool
-            .pointer_mut("/inputSchema/properties/session_id")
-            .and_then(Value::as_object_mut)
-        {
-            session_id.remove("format");
-        }
+    if public {
+        tools
+            .as_array_mut()
+            .unwrap()
+            .retain(|tool| tool["name"] != "without_sandbox");
     }
+    tools
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter(|tool| tool["name"] != "session_list")
+        .for_each(|tool| {
+            if let Some(session_id) = tool
+                .pointer_mut("/inputSchema/properties/session_id")
+                .and_then(Value::as_object_mut)
+            {
+                session_id.remove("format");
+            }
+        });
     tools
 }
 
-async fn call_tool(params: &Value) -> Result<Value> {
+async fn call_tool(params: &Value, public: bool) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -116,6 +161,18 @@ async fn call_tool(params: &Value) -> Result<Value> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    reap_inactive_jobs().await;
+    if name == "session_list" {
+        anyhow::ensure!(
+            args.as_object().is_some_and(|object| object.is_empty()),
+            "session_list takes no arguments"
+        );
+        return session_list().await;
+    }
+    anyhow::ensure!(
+        !public || name != "without_sandbox",
+        "without_sandbox is unavailable on the public MCP endpoint"
+    );
     let session_id = required_session_id(&args)?;
     let session = config::load_session(&session_id).await?;
     match name {
@@ -124,7 +181,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
             text_result(serde_json::to_string_pretty(&session)?)
         }
         "get_image" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = get_image(&path).await;
             report_result(
                 &session.id,
@@ -135,7 +192,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
             result
         }
         "read_file" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = tokio::fs::read_to_string(&path)
                 .await
                 .context("failed to read file");
@@ -148,7 +205,7 @@ async fn call_tool(params: &Value) -> Result<Value> {
             text_result(result?)
         }
         "list_directory" => {
-            let path = resolve_path(&session.cwd, required_path(&args, "path")?);
+            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = list_directory(&path).await;
             report_result(
                 &session.id,
@@ -166,6 +223,51 @@ async fn call_tool(params: &Value) -> Result<Value> {
         "without_sandbox" => without_sandbox(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
     }
+}
+
+async fn session_list() -> Result<Value> {
+    let directory = config::sessions_dir()?;
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return text_result("[]".to_owned());
+        }
+        Err(error) => return Err(error).context("failed to read session metadata"),
+    };
+    let mut sessions = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let session: config::Session = match serde_json::from_slice(&bytes) {
+            Ok(session) => session,
+            Err(_) => continue,
+        };
+        if !config::session_is_active(&session.id)
+            .await
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        sessions.push(json!({
+            "session_id": session.id,
+            "cwd": session.cwd,
+            "started_at": session.started_at,
+            "status": "active",
+        }));
+    }
+    sessions.sort_by_key(|session| {
+        session["session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    });
+    text_result(serde_json::to_string_pretty(&sessions)?)
 }
 
 async fn report_result<T>(session_id: &str, title: String, result: &Result<T>) {
@@ -249,22 +351,9 @@ fn required_session_id(args: &Value) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn resolve_path(session_cwd: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        session_cwd.join(path)
-    }
-}
-
-fn cwd(args: &Value, session_cwd: &Path) -> Result<PathBuf> {
-    let path = args
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .map(|path| resolve_path(session_cwd, path))
-        .unwrap_or_else(|| session_cwd.to_owned());
-    std::fs::canonicalize(&path).with_context(|| format!("cannot resolve cwd {}", path.display()))
+fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
+    let path = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+    config::resolve_cwd(session, path.as_deref())
 }
 
 async fn list_directory(path: &Path) -> Result<String> {
@@ -283,7 +372,7 @@ async fn list_directory(path: &Path) -> Result<String> {
 }
 
 async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
-    let absolute = resolve_path(&session.cwd, required_path(args, "path")?);
+    let absolute = config::resolve_write_path(session, &required_path(args, "path")?)?;
     let parent = absolute.parent().context("file has no parent directory")?;
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("parent does not exist: {}", parent.display()))?;
@@ -304,7 +393,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     let output = sandbox::run(
         &command,
         &parent,
-        &[parent.clone()],
+        std::slice::from_ref(&parent),
         Some(content.as_bytes()),
     )
     .await?;
@@ -326,7 +415,10 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     let (rendered_command, mut handle) = spawn_sandboxed_command(args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
-        Ok(joined) => text_result(joined.context("command task failed")??),
+        Ok(joined) => {
+            release_job_slot(&session.id);
+            text_result(joined.context("command task failed")??)
+        }
         Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
     }
 }
@@ -341,19 +433,25 @@ async fn spawn_sandboxed_command(
     session: &config::Session,
 ) -> Result<(String, JoinHandle<Result<String>>)> {
     let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
-    let mut roots = session.permitted_directories.clone();
-    if !roots.iter().any(|root| cwd.starts_with(root)) {
-        roots.push(cwd.clone());
-    }
+    let cwd = cwd(args, session)?;
+    let roots = session.permitted_directories.clone();
+    reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let session_id = session.id.clone();
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
-        let result = sandbox::run(&command, &cwd, &roots, None)
-            .await
-            .and_then(render_output);
+        let result = tokio::select! {
+            result = sandbox::run(&command, &cwd, &roots, None) => {
+                result.and_then(render_output)
+            }
+            _ = wait_for_session_stop(session_id.clone()) => {
+                anyhow::bail!("session stopped; sandbox job cancelled")
+            }
+            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
+                anyhow::bail!("sandbox job exceeded the two-hour lifetime limit")
+            }
+        };
         report_command_finished(session_id, &task_command, &result).await;
         result
     });
@@ -367,7 +465,7 @@ async fn store_job(
     activity: &str,
 ) -> Result<Value> {
     let job_id = Uuid::new_v4();
-    jobs().lock().unwrap().insert(
+    jobs().lock().unwrap().jobs.insert(
         job_id,
         Job {
             session_id: session.id.clone(),
@@ -384,11 +482,93 @@ async fn store_job(
     text_result(json!({"status":"running","job_id":job_id}).to_string())
 }
 
+fn reserve_job_slot(session_id: &str) -> Result<()> {
+    let mut state = jobs().lock().unwrap();
+    let active = state
+        .active_by_session
+        .entry(session_id.to_owned())
+        .or_default();
+    anyhow::ensure!(
+        *active < MAX_ACTIVE_JOBS_PER_SESSION,
+        "session {session_id} already has {MAX_ACTIVE_JOBS_PER_SESSION} active sandbox jobs"
+    );
+    *active += 1;
+    Ok(())
+}
+
+fn release_job_slot(session_id: &str) {
+    let mut state = jobs().lock().unwrap();
+    if let Some(active) = state.active_by_session.get_mut(session_id) {
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            state.active_by_session.remove(session_id);
+        }
+    }
+}
+
+fn remove_job(job_id: Uuid) -> Option<Job> {
+    let mut state = jobs().lock().unwrap();
+    let job = state.jobs.remove(&job_id)?;
+    if let Some(active) = state.active_by_session.get_mut(&job.session_id) {
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            state.active_by_session.remove(&job.session_id);
+        }
+    }
+    Some(job)
+}
+
+async fn reap_inactive_jobs() {
+    let session_ids = {
+        let state = jobs().lock().unwrap();
+        state
+            .jobs
+            .values()
+            .map(|job| job.session_id.clone())
+            .collect::<Vec<_>>()
+    };
+    for session_id in session_ids {
+        if config::session_is_active(&session_id)
+            .await
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let job_ids = {
+            let state = jobs().lock().unwrap();
+            state
+                .jobs
+                .iter()
+                .filter(|(_, job)| job.session_id == session_id)
+                .map(|(job_id, _)| *job_id)
+                .collect::<Vec<_>>()
+        };
+        for job_id in job_ids {
+            if let Some(job) = remove_job(job_id) {
+                job.handle.abort();
+                let _ = job.handle.await;
+            }
+        }
+    }
+}
+
+async fn wait_for_session_stop(session_id: String) {
+    loop {
+        if !config::session_is_active(&session_id)
+            .await
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let finished = {
         let jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
+        let job = jobs.jobs.get(&job_id).context("unknown job_id")?;
         anyhow::ensure!(
             job.session_id == session.id,
             "job does not belong to this session"
@@ -399,7 +579,7 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
         return text_result(json!({"status":"running","job_id":job_id}).to_string());
     }
 
-    let job = jobs().lock().unwrap().remove(&job_id).unwrap();
+    let job = remove_job(job_id).context("unknown job_id")?;
     let result = job.handle.await.context("background command task failed")?;
     text_result(result?)
 }
@@ -407,13 +587,14 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let job = {
-        let mut jobs = jobs().lock().unwrap();
-        let job = jobs.get(&job_id).context("unknown job_id")?;
+        let jobs = jobs().lock().unwrap();
+        let job = jobs.jobs.get(&job_id).context("unknown job_id")?;
         anyhow::ensure!(
             job.session_id == session.id,
             "job does not belong to this session"
         );
-        jobs.remove(&job_id).unwrap()
+        drop(jobs);
+        remove_job(job_id).context("unknown job_id")?
     };
     job.handle.abort();
     let _ = job.handle.await;
@@ -449,7 +630,7 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
     let command = required_command(args)?;
-    let cwd = cwd(args, &session.cwd)?;
+    let cwd = cwd(args, session)?;
     if !approvals::request(
         &session.id,
         "without_sandbox",
@@ -551,8 +732,13 @@ fn render_diff(old: &str, new: &str) -> (usize, usize, String) {
 }
 
 fn render_output(output: sandbox::Output) -> Result<String> {
-    let text = json!({"exit_code":output.status,"stdout":output.stdout,"stderr":output.stderr})
-        .to_string();
+    let text = json!({
+        "exit_code": output.status,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "truncated": output.truncated
+    })
+    .to_string();
     if output.status == 0 {
         Ok(text)
     } else {
@@ -590,6 +776,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiates_supported_protocol_versions() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"}
+        });
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["protocolVersion"], "2025-03-26");
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "future-version"}
+        });
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["protocolVersion"], LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn public_tools_have_chatgpt_display_metadata() {
+        let tools = tools(true).as_array().unwrap().to_owned();
+        assert_eq!(tools.len(), 10);
+        assert!(tools.iter().all(|tool| {
+            tool["name"].is_string()
+                && tool["title"].is_string()
+                && tool["description"].is_string()
+                && tool["inputSchema"].is_object()
+                && tool["annotations"].is_object()
+        }));
+    }
+
+    #[tokio::test]
     async fn get_image_returns_mcp_image_content() {
         let path = std::env::temp_dir().join(format!("local-mcp-{}.png", uuid::Uuid::new_v4()));
         let bytes = b"\x89PNG\r\n\x1a\nexample";
@@ -610,9 +830,7 @@ mod tests {
         let path = directory.join("image.gif");
         tokio::fs::write(&path, b"GIF89a").await.unwrap();
 
-        let result = get_image(&resolve_path(&directory, PathBuf::from("image.gif")))
-            .await
-            .unwrap();
+        let result = get_image(&directory.join("image.gif")).await.unwrap();
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");

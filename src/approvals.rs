@@ -22,6 +22,7 @@ pub struct Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Message {
+    Probe,
     Approval {
         request: Request,
     },
@@ -85,16 +86,22 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
 }
 
 pub async fn start(session_id: Option<&str>) -> Result<()> {
-    let mut session = config::create_session(&std::env::current_dir()?, session_id).await?;
+    let id = config::session_id(session_id)?;
+    config::remove_inactive_socket(&id).await?;
+    let mut session = config::new_session(&std::env::current_dir()?, Some(&id))?;
     let path = config::socket_path(&session.id)?;
     let state_dir = path.parent().context("session socket has no parent")?;
     tokio::fs::create_dir_all(state_dir).await?;
     tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).await?;
-    remove_stale_socket(&path).await?;
 
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    session.process_id = std::process::id();
+    if let Err(error) = config::save_session(&session).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
     eprintln!(
         "local-mcp session: {}\ncwd: {}\n\
          Give this session ID to the agent so it can include it in local-mcp tool calls.\n\
@@ -107,6 +114,24 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<(Request, UnixStream)>::new();
     let mut yolo = false;
+    let result = run_session(&listener, &mut input, &mut session, &mut pending, &mut yolo).await;
+    session.process_id = 0;
+    if let Err(error) = config::save_session(&session).await {
+        eprintln!("failed to mark session stopped: {error:#}");
+    }
+    let _ = tokio::fs::remove_file(&path).await;
+    result
+}
+
+async fn run_session(
+    listener: &UnixListener,
+    input: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    session: &mut Session,
+    pending: &mut VecDeque<(Request, UnixStream)>,
+    yolo: &mut bool,
+) -> Result<()> {
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             connection = listener.accept() => {
@@ -115,8 +140,11 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
                 BufReader::new(&mut stream).read_line(&mut line).await?;
                 let message: Message = serde_json::from_str(&line).context("invalid session message")?;
                 match message {
+                    Message::Probe => {
+                        stream.write_all(b"active\n").await?;
+                    }
                     Message::Activity { title, detail } => show_activity(&title, detail.as_deref()),
-                    Message::Approval { request } if yolo => {
+                    Message::Approval { request } if *yolo => {
                         eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
                         stream.write_all(b"allow\n").await?;
                     }
@@ -128,7 +156,12 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
-                handle_input(line.trim(), &mut session, &mut yolo, &mut pending).await?;
+                handle_input(line.trim(), session, yolo, pending).await?;
+            }
+            signal = &mut ctrl_c => {
+                signal.context("failed to receive Ctrl-C")?;
+                eprintln!("Stopping local-mcp session {}", session.id);
+                return Ok(());
             }
         }
     }
@@ -140,14 +173,6 @@ fn show_activity(title: &str, detail: Option<&str>) {
         for line in detail.lines() {
             eprintln!("  {line}");
         }
-    }
-}
-
-async fn remove_stale_socket(path: &PathBuf) -> Result<()> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("failed to remove stale session socket"),
     }
 }
 
