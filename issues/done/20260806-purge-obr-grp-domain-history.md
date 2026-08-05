@@ -1,6 +1,6 @@
 # リポジトリ履歴から旧公開ドメイン（example.com）と実名メールアドレスを除去する
 
-Status: open
+Status: done
 Model: claude-sonnet-5
 Created: 2026-08-06
 Updated: 2026-08-06
@@ -74,3 +74,4 @@ Branch: chore/20260806-purge-obr-grp-domain-history
 
 - origin は private リポジトリ（`f4ah6o/local-mcp`）であり、外部公開の形跡はない。upstream（`nakasyou/local-mcp`）は無関係の別プロジェクトで、そちらへの PR も存在しない。
 - 本イシューの実行はコマンド実行のみで完結し、Cloudflare ダッシュボード側の操作は不要。
+- 2026-08-06: バックアップ clone 作成、`feat/oauth-http-server` 削除（ローカル・origin）、`git filter-repo --replace-text` 実行、`origin/main` へ force push、GitHubからのクリーンcloneで受け入れ条件を全て確認済み。`cargo test` の4件の失敗はfilter-repo前のバックアップでも再現する既存の環境依存問題（macOSの `/tmp` symlink、Seatbelt）であり、本作業とは無関係と確認した。

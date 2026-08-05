@@ -14,7 +14,7 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `loc
 
 `local-mcp` の公開 HTTP エンドポイントは Cloudflare Access が Managed OAuth を終端し、Rust 側（[src/http.rs](../../src/http.rs)）は `Cf-Access-Jwt-Assertion` を検証するだけの設計（[README.md](../../README.md) の「Public HTTP endpoint」節）。現在、`local-mcp serve` と対応する `cloudflared tunnel run` はどちらも停止しており、`~/.config/local-mcp/public.env` は空（0バイト）で `LOCAL_MCP_PUBLIC_URL` 等が未設定。運用ドメインを旧ドメインから `f12o.com` に切り替えるため、Cloudflare 側の Access application と Tunnel を作り直す。
 
-このイシューは [20260806-purge-obr-grp-domain-history.md](20260806-purge-obr-grp-domain-history.md) の完了を前提とする。README/`.env.example` が新ドメインに更新されてから着手する。
+このイシューは [20260806-purge-obr-grp-domain-history.md](../done/20260806-purge-obr-grp-domain-history.md) の完了を前提とする。README/`.env.example` が新ドメインに更新されてから着手する。
 
 ## 問題
 
@@ -32,7 +32,7 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `loc
 
 ## 対象外
 
-- git 履歴・working tree からの旧ドメイン除去（[20260806-purge-obr-grp-domain-history.md](20260806-purge-obr-grp-domain-history.md) で扱う）。
+- git 履歴・working tree からの旧ドメイン除去（[20260806-purge-obr-grp-domain-history.md](../done/20260806-purge-obr-grp-domain-history.md) で扱う）。
 - Cloudflare API/Bindings/Builds/Observability の MCP ツールは未認証のため、これらを用いた自動化は行わない。Cloudflare ダッシュボード（Zero Trust）での作業はユーザーが直接実施する。
 - `opz`（1Password CLI ラッパー）経由の secret 注入。今回は README 記載の手動編集で `public.env` を設定する。
 
@@ -79,4 +79,4 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `loc
 
 ## 注記
 
-- [20260806-purge-obr-grp-domain-history.md](20260806-purge-obr-grp-domain-history.md) の完了後に着手する。
+- [20260806-purge-obr-grp-domain-history.md](../done/20260806-purge-obr-grp-domain-history.md) の完了後に着手する。
