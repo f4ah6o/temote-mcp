@@ -1,6 +1,7 @@
 mod access;
 mod approvals;
 mod config;
+mod doctor;
 mod http;
 mod mcp;
 mod sandbox;
@@ -19,6 +20,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Diagnose local-mcp and the host sandbox prerequisites.
+    Doctor,
     /// Start a session in the current directory and show its permission UI.
     Start {
         /// Session ID to use instead of generating a UUID.
@@ -43,6 +46,7 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Start { session_id: None }) {
+        Command::Doctor => doctor::run().await,
         Command::Start { session_id } => approvals::start(session_id.as_deref()).await,
         Command::Mcp => mcp::serve().await,
         Command::Serve { public_url, addr } => serve_http(public_url, addr).await,

@@ -45,8 +45,8 @@ pub async fn run(
     let permissions = PermissionProfile::workspace_write_with(
         &roots,
         NetworkSandboxPolicy::Restricted,
-        true,
-        true,
+        false, // keep the configured temporary directory available
+        false, // keep /tmp available for ordinary shell commands
     )
     .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
 
@@ -234,7 +234,7 @@ fn reserve_bytes(remaining: &AtomicUsize, maximum: usize) -> usize {
 }
 
 fn safe_environment() -> HashMap<String, String> {
-    ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR"]
+    ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "HOME"]
         .into_iter()
         .filter_map(|name| {
             std::env::var(name)
@@ -261,6 +261,16 @@ mod generic_tests {
 
         assert_eq!(output, b"01234567");
         assert!(truncated);
+    }
+
+    #[test]
+    fn preserves_home_for_login_shells() {
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                safe_environment().get("HOME").map(String::as_str),
+                Some(home.as_str())
+            );
+        }
     }
 }
 

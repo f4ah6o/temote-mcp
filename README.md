@@ -27,6 +27,22 @@ Keep `--locked` when installing. The Codex sandbox dependency is pinned to a
 Git revision, and resolving its transitive pre-release dependencies without
 the committed lockfile can select incompatible `rama` or `starlark` versions.
 
+Before starting a session or connecting ChatGPT, run the host diagnostics:
+
+    local-mcp doctor
+
+On Linux, `doctor` checks the installed `codex-linux-sandbox` helper,
+`bubblewrap`, user-namespace settings, the isolated network namespace, a real
+local-mcp sandbox command, and the runtime environment used by shell commands.
+A failed `network namespace` check means the host cannot create the bwrap
+network namespace; fix the displayed host policy hint before starting the HTTP
+server. The command exits non-zero when a required check fails.
+
+If ChatGPT reports that `/.bash_profile` or `/tmp` cannot be found or written,
+update the installed binary with `just install`, run `local-mcp doctor`, and
+restart the origin process. Shell commands receive a minimal environment with
+`HOME` and the standard temporary directories available.
+
 ## Local sessions
 
 Start each session from the project directory whose files it may access:
@@ -88,6 +104,7 @@ The repository also includes a `justfile` for these commands. After installing
 `just`, the equivalent workflow is:
 
     just install
+    just doctor
     just env-check
 
     # Origin + on-demand Tunnel in one terminal (Ctrl-C stops both)
@@ -204,6 +221,9 @@ for the client-side checks.
 - File paths, symlink targets, and command cwd must remain under the session's
   permitted roots.
 - Sandboxed commands have no network access.
+- Sandboxed commands retain only a minimal environment, including `HOME`, and
+  may write temporary files under `/tmp` or `TMPDIR`; do not store secrets
+  there.
 - A session has at most four active sandbox jobs.
 - Combined stdout/stderr per command is capped at 1 MiB and marked as
   truncated.
