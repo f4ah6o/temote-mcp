@@ -37,6 +37,10 @@ env-check:
     done; \
     echo "public environment is configured: $public_env_file"
 
+# Diagnose local-mcp and the host sandbox prerequisites.
+doctor:
+    local-mcp doctor
+
 # Run the local HTTP origin. Keep this terminal running while ChatGPT is connected.
 serve: env-check
     public_env_file="${LOCAL_MCP_ENV_FILE:-${HOME}/.config/local-mcp/public.env}"; \
