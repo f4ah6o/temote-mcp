@@ -71,6 +71,12 @@ jobs are cancelled. The public endpoint never exposes without_sandbox. The
 local stdio server retains that explicitly approved tool for local-only
 workflows.
 
+For ChatGPT, use the dedicated `git_add` and `git_commit` tools to stage files
+and create local commits. Ordinary `execute` commands keep `.git` metadata
+read-only. The Git tools do not create branches or push, disable hooks and
+signing, and keep network access disabled; create branches and push from a
+local terminal.
+
 ## Public HTTP endpoint
 
 Copy .env.example to a file outside the repository, such as
@@ -205,11 +211,12 @@ If OAuth succeeds but ChatGPT shows no tools, refresh the MCP connection after
 restarting `local-mcp serve` (especially after changing the self-hosted
 application AUD). The direct connection URL is still exactly
 `https://temotemcp.example.com/mcp`; the host root is only used for OAuth
-discovery. The public `tools/list` response contains ten sandbox-backed tools;
-`without_sandbox` is intentionally available only in local stdio mode. Each
-public tool must include a name, display title, description, input schema, and
-annotations. Start a new ChatGPT conversation and add the MCP connection from
-the tools menu so ChatGPT requests the refreshed tool list. See the [OpenAI
+discovery. The public `tools/list` response contains twelve tools, including
+the restricted `git_add` and `git_commit` operations; `without_sandbox` is
+intentionally available only in local stdio mode. Each public tool must
+include a name, display title, description, input schema, and annotations.
+Start a new ChatGPT conversation and add the MCP connection from the tools
+menu so ChatGPT requests the refreshed tool list. See the [OpenAI
 connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt)
 and [MCP troubleshooting guide](https://developers.openai.com/plugins/deploy/troubleshooting)
 for the client-side checks.
@@ -224,6 +231,9 @@ for the client-side checks.
 - Sandboxed commands retain only a minimal environment, including `HOME`, and
   may write temporary files under `/tmp` or `TMPDIR`; do not store secrets
   there.
+- Ordinary sandboxed commands cannot write `.git`; use `git_add` and
+  `git_commit` for the two explicitly supported local Git metadata operations.
+  They never push.
 - A session has at most four active sandbox jobs.
 - Combined stdout/stderr per command is capped at 1 MiB and marked as
   truncated.
@@ -241,4 +251,5 @@ For a local MCP client that starts the process itself:
     local-mcp mcp
 
 This mode is separate from the Cloudflare Access HTTP endpoint. It includes
-the local approval UI and the explicitly approved without_sandbox command.
+the local approval UI, the explicitly approved without_sandbox command, and
+the restricted git_add/git_commit operations.

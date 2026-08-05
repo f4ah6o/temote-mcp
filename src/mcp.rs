@@ -16,6 +16,8 @@ use crate::{approvals, config, sandbox};
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_JOBS_PER_SESSION: usize = 4;
 const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_GIT_ADD_PATHS: usize = 256;
+const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -96,7 +98,7 @@ async fn dispatch_with_mode(request: &Value, public: bool) -> Result<Value> {
             "protocolVersion": negotiate_protocol_version(request),
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "title": "Local MCP", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory and sandbox roots."
+            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory and sandbox roots. Use git_add and git_commit for local Git metadata changes; ordinary execute commands keep .git read-only and public access cannot push."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools(public)})),
@@ -124,6 +126,8 @@ fn tools(public: bool) -> Value {
         {"name":"get_image","title":"Read a local image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List entries in a local directory. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
+        {"name":"git_add","title":"Stage files with Git","description":"Stage existing files or directories in the session repository with git add. Only the specified paths are staged; Git hooks and network access are unavailable. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"cwd":{"type":"string"}},"required":["session_id","paths"],"additionalProperties":false}},
+        {"name":"git_commit","title":"Create a local Git commit","description":"Create a local commit from the current Git index. This does not push, hooks and signing are disabled, and network access is unavailable. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":16384},"cwd":{"type":"string"}},"required":["session_id","message"],"additionalProperties":false}},
         {"name":"execute","title":"Run a sandboxed command","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"start_command","title":"Start a sandboxed command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -216,6 +220,8 @@ async fn call_tool(params: &Value, public: bool) -> Result<Value> {
             text_result(result?)
         }
         "write_file" => write_file(&args, &session).await,
+        "git_add" => git_add(&args, &session).await,
+        "git_commit" => git_commit(&args, &session).await,
         "execute" => execute(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
@@ -408,6 +414,158 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         Err(error) => Some(format!("└ Error: {error:#}")),
     };
     approvals::activity(&session.id, title, detail).await;
+    text_result(result?)
+}
+
+async fn git_add(args: &Value, session: &config::Session) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let paths = required_string_array(args, "paths")?;
+    anyhow::ensure!(!paths.is_empty(), "paths must not be empty");
+    anyhow::ensure!(
+        paths.len() <= MAX_GIT_ADD_PATHS,
+        "paths must contain at most {MAX_GIT_ADD_PATHS} entries"
+    );
+
+    let mut command = vec!["git".to_owned(), "add".to_owned(), "--".to_owned()];
+    for path in paths {
+        command.push(resolve_git_add_path(session, &path)?);
+    }
+    run_git_and_report(session, cwd, command, "Stage files").await
+}
+
+async fn git_commit(args: &Value, session: &config::Session) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .context("missing message")?;
+    anyhow::ensure!(!message.trim().is_empty(), "message must not be empty");
+    anyhow::ensure!(
+        message.len() <= MAX_GIT_COMMIT_MESSAGE_BYTES,
+        "message must be at most {MAX_GIT_COMMIT_MESSAGE_BYTES} bytes"
+    );
+    ensure_staged_paths_are_permitted(session, &cwd).await?;
+
+    let command = vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "commit.gpgSign=false".to_owned(),
+        "commit".to_owned(),
+        "--no-verify".to_owned(),
+        "--no-gpg-sign".to_owned(),
+        "-m".to_owned(),
+        message.to_owned(),
+    ];
+    run_git_and_report(session, cwd, command, "Create Git commit").await
+}
+
+fn required_string_array(args: &Value, name: &str) -> Result<Vec<String>> {
+    args.get(name)
+        .and_then(Value::as_array)
+        .context(format!("missing {name}"))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .context(format!("{name} entries must be strings"))
+        })
+        .collect()
+}
+
+fn resolve_git_add_path(session: &config::Session, path: &str) -> Result<String> {
+    Ok(validate_git_path(session, path)?.display().to_string())
+}
+
+fn validate_git_path(session: &config::Session, path: &str) -> Result<PathBuf> {
+    anyhow::ensure!(!path.is_empty(), "Git path must not be empty");
+    anyhow::ensure!(
+        !path.starts_with('-'),
+        "Git path must not start with '-': {path:?}"
+    );
+    anyhow::ensure!(
+        !path.starts_with(':') && !path.chars().any(|character| "*?[]".contains(character)),
+        "Git pathspecs and glob patterns are not supported: {path:?}"
+    );
+
+    let path = PathBuf::from(path);
+    match config::resolve_existing_path(session, &path) {
+        Ok(_) => {}
+        Err(_) => {
+            config::resolve_write_path(session, &path)?;
+        }
+    };
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        session.cwd.join(path)
+    };
+    Ok(candidate)
+}
+
+async fn ensure_staged_paths_are_permitted(session: &config::Session, cwd: &Path) -> Result<()> {
+    let output = sandbox::run(
+        &[
+            "git".to_owned(),
+            "diff".to_owned(),
+            "--cached".to_owned(),
+            "--name-only".to_owned(),
+            "-z".to_owned(),
+            "--no-renames".to_owned(),
+        ],
+        cwd,
+        &session.permitted_directories,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "cannot inspect the Git index: {}",
+        output.stderr.trim()
+    );
+    anyhow::ensure!(
+        !output.truncated,
+        "cannot inspect the Git index because its path list exceeded the output limit"
+    );
+    let repository_root = sandbox::git_worktree_root(cwd)?;
+    for path in output.stdout.split('\0').filter(|path| !path.is_empty()) {
+        let path = Path::new(path);
+        anyhow::ensure!(
+            !path.is_absolute(),
+            "Git returned an absolute staged path: {}",
+            path.display()
+        );
+        let path = repository_root.join(path);
+        validate_git_path(session, &path.to_string_lossy()).with_context(|| {
+            format!(
+                "staged Git path is outside the session roots: {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn run_git_and_report(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    title: &str,
+) -> Result<Value> {
+    let rendered_command = render_command(&command);
+    approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
+    let git_roots = sandbox::git_metadata_roots(&cwd)?;
+    let output = sandbox::run_git(
+        &command,
+        &cwd,
+        &session.permitted_directories,
+        &git_roots,
+        None,
+    )
+    .await;
+    let result = output.and_then(render_output);
+    report_command_finished(session.id.clone(), &rendered_command, &result).await;
     text_result(result?)
 }
 
@@ -799,7 +957,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -807,6 +965,8 @@ mod tests {
                 && tool["inputSchema"].is_object()
                 && tool["annotations"].is_object()
         }));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_add"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_commit"));
     }
 
     #[tokio::test]
