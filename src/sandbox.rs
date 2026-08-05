@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::permissions::{
+    FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+    NetworkSandboxPolicy,
+};
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -35,6 +38,29 @@ pub async fn run(
     writable_roots: &[PathBuf],
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
+    run_with_metadata_roots(command, cwd, writable_roots, &[], stdin).await
+}
+
+/// Runs a narrowly validated Git operation with write access to the repository
+/// metadata needed by `git add` and `git commit`. Ordinary sandboxed commands
+/// continue to keep `.git` read-only.
+pub async fn run_git(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    git_metadata_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_with_metadata_roots(command, cwd, writable_roots, git_metadata_roots, stdin).await
+}
+
+async fn run_with_metadata_roots(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    git_metadata_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -49,6 +75,18 @@ pub async fn run(
         false, // keep /tmp available for ordinary shell commands
     )
     .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
+    let permissions = if git_metadata_roots.is_empty() {
+        permissions
+    } else {
+        let git_roots = git_metadata_roots
+            .iter()
+            .map(|path| absolute(path))
+            .collect::<Result<Vec<_>>>()?;
+        let mut file_system = permissions.file_system_sandbox_policy();
+        file_system = file_system.with_additional_writable_roots(&cwd, &git_roots);
+        add_git_metadata_read_only_entries(&mut file_system, &git_roots);
+        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted)
+    };
 
     #[cfg(target_os = "linux")]
     let mut process = {
@@ -121,6 +159,174 @@ pub async fn run(
         child_stdin.write_all(bytes).await?;
     }
     wait_with_limited_output(child).await
+}
+
+/// Resolves the worktree's private Git directory and its common repository
+/// directory. The latter is needed for linked worktrees, whose `.git` file
+/// points below the common repository metadata directory.
+pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    let worktree_root = git_worktree_root(&cwd)?;
+    let dot_git_path = worktree_root.join(".git");
+    let dot_git = std::fs::canonicalize(&dot_git_path).with_context(|| {
+        format!(
+            "cannot resolve Git metadata pointer {}",
+            dot_git_path.display()
+        )
+    })?;
+    let git_dir = if dot_git.is_dir() {
+        dot_git.clone()
+    } else {
+        resolve_git_pointer(&dot_git_path)?
+    };
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(value) => {
+            let relative = value.trim();
+            anyhow::ensure!(!relative.is_empty(), "Git commondir is empty");
+            let path = git_dir.join(relative);
+            std::fs::canonicalize(&path).with_context(|| {
+                format!("cannot resolve Git common directory {}", path.display())
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Err(error) => return Err(error).context("cannot read Git commondir"),
+    };
+    let common_parent = common_dir
+        .parent()
+        .context("Git common directory has no parent")?;
+    if dot_git_path.is_file() {
+        // A linked worktree may live outside the common repository directory.
+        // Only accept Git's standard private worktree metadata in that case,
+        // and verify its back-pointer so an arbitrary `.git` pointer cannot
+        // grant write access to an unrelated directory.
+        anyhow::ensure!(
+            git_dir != common_dir && git_dir.starts_with(common_dir.join("worktrees")),
+            "Git metadata is outside the working directory ancestry: {}",
+            common_dir.display()
+        );
+        let linked_worktree = resolve_plain_git_pointer(&git_dir.join("gitdir"))?;
+        anyhow::ensure!(
+            linked_worktree == dot_git,
+            "Git linked-worktree metadata does not point back to {}",
+            dot_git.display()
+        );
+    } else {
+        anyhow::ensure!(
+            cwd.starts_with(common_parent),
+            "Git metadata is outside the working directory ancestry: {}",
+            common_dir.display()
+        );
+    }
+
+    let mut roots = vec![git_dir, common_dir];
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+pub fn git_worktree_root(cwd: &Path) -> Result<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    cwd.ancestors()
+        .find(|ancestor| {
+            let dot_git = ancestor.join(".git");
+            dot_git.is_dir() || dot_git.is_file()
+        })
+        .map(Path::to_owned)
+        .context("no Git repository found from the working directory")
+}
+
+fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
+    let contents = std::fs::read_to_string(dot_git)
+        .with_context(|| format!("cannot read Git pointer {}", dot_git.display()))?;
+    let value = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("Git pointer does not contain a gitdir path")?;
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        dot_git
+            .parent()
+            .context("Git pointer has no parent")?
+            .join(path)
+    };
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("cannot resolve Git directory {}", path.display()))
+}
+
+fn resolve_plain_git_pointer(pointer: &Path) -> Result<PathBuf> {
+    let contents = std::fs::read_to_string(pointer)
+        .with_context(|| format!("cannot read Git pointer {}", pointer.display()))?;
+    let value = contents
+        .trim()
+        .lines()
+        .next()
+        .filter(|value| !value.is_empty())
+        .context("Git pointer is empty")?;
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        pointer
+            .parent()
+            .context("Git pointer has no parent")?
+            .join(path)
+    };
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("cannot resolve Git pointer target {}", path.display()))
+}
+
+fn add_git_metadata_read_only_entries(
+    policy: &mut FileSystemSandboxPolicy,
+    git_roots: &[AbsolutePathBuf],
+) {
+    // `git add` and `git commit` need the index, objects, refs, and reflogs.
+    // Keep configuration, hooks, and unrelated ref/object stores protected.
+    const READ_ONLY_PATHS: &[&str] = &[
+        "config",
+        "hooks",
+        "info",
+        "attributes",
+        "description",
+        "packed-refs",
+        "shallow",
+        "worktrees",
+        "refs/tags",
+        "refs/remotes",
+        "objects/info",
+        "objects/pack",
+    ];
+    for root in git_roots {
+        // A linked worktree's private directory contains per-worktree state
+        // that Git may lazily initialize (including config and hooks
+        // directories). It is not shared with other worktrees, so leave that
+        // private root writable while protecting the common repository root
+        // below.
+        if root.join("gitdir").is_file() {
+            for suffix in ["gitdir", "commondir"] {
+                policy.entries.push(FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: root.join(suffix),
+                    },
+                    access: FileSystemAccessMode::Read,
+                });
+            }
+            continue;
+        }
+        for suffix in READ_ONLY_PATHS {
+            policy.entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.join(suffix),
+                },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+    }
 }
 
 pub async fn run_unrestricted(
@@ -271,6 +477,81 @@ mod generic_tests {
                 Some(home.as_str())
             );
         }
+    }
+
+    #[test]
+    fn resolves_normal_git_metadata_roots() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+
+        let roots = git_metadata_roots(repository.path()).unwrap();
+
+        assert_eq!(roots, vec![repository.path().join(".git")]);
+    }
+
+    #[test]
+    fn resolves_linked_worktree_git_metadata_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let common = repository.join(".git");
+        let private = common.join("worktrees").join("feature");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+
+        let roots = git_metadata_roots(&worktree).unwrap();
+
+        assert_eq!(roots, vec![common, private]);
+    }
+
+    #[test]
+    fn rejects_an_unrelated_git_pointer() {
+        let worktree = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", unrelated.path().display()),
+        )
+        .unwrap();
+
+        let error = git_metadata_roots(worktree.path()).unwrap_err();
+
+        assert!(error.to_string().contains("outside the working directory"));
+    }
+
+    #[test]
+    fn git_metadata_policy_keeps_hooks_and_config_read_only() {
+        let repository = tempfile::tempdir().unwrap();
+        let git = repository.path().join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        let root = absolute(repository.path()).unwrap();
+        let mut file_system = PermissionProfile::workspace_write_with(
+            std::slice::from_ref(&root),
+            NetworkSandboxPolicy::Restricted,
+            false,
+            false,
+        )
+        .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&root))
+        .file_system_sandbox_policy();
+        let git = absolute(&git).unwrap();
+        file_system = file_system
+            .with_additional_writable_roots(repository.path(), std::slice::from_ref(&git));
+        add_git_metadata_read_only_entries(&mut file_system, std::slice::from_ref(&git));
+
+        assert!(file_system.can_write_path_with_cwd(&git.join("objects"), repository.path()));
+        assert!(!file_system.can_write_path_with_cwd(&git.join("config"), repository.path()));
+        assert!(!file_system.can_write_path_with_cwd(&git.join("hooks"), repository.path()));
     }
 }
 
