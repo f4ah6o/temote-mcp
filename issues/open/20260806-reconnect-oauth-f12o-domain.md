@@ -6,6 +6,14 @@ Created: 2026-08-06
 Updated: 2026-08-06
 Branch: chore/20260806-reconnect-oauth-f12o-domain
 
+## 進捗（2026-08-06）
+
+- 新Tunnel `local-mcp-f12o` を作成後、`localmcp.f12o.com` の既存CNAME（`local-mcp` Tunnel、ID `b5a1469a-85d3-47e1-b0f2-dc3845578fcc`、8/2作成の作業痕跡）が見つかったため、新Tunnelは削除し、既存 `local-mcp` Tunnelへ Published application route（`localmcp.f12o.com` → `http://127.0.0.1:8791`）を設定した。
+- 新規 self-hosted application `localmcp`（destination `localmcp.f12o.com`、Allow policy: `fujita.hirohito@protonmail.com`、Managed OAuth: token lifetime 15分、grant session 2週間、redirect URI 2件、localhost/loopback有効）を作成し、AUD `98e26d3569d59d06ff3a0d1c526c1e467b509eae3d268fa85f901b628976b74b` を取得。
+- Team domain: `f4ah6o.cloudflareaccess.com`。
+- `~/.config/local-mcp/public.env` を手動設定（モード0600に修正）、`just env-check` 成功、`just up` で `local-mcp serve` と `cloudflared tunnel run --token` を起動、3つのcurlプローブが全て期待通りの結果。
+- 残りはChatGPT側での接続確認のみ。
+
 ## 概要
 
 Cloudflare Access の self-hosted application と Tunnel を新ドメイン `localmcp.f12o.com` で新規作成し、`local-mcp serve` を新しい Managed OAuth 接続で起動し直す。
@@ -53,10 +61,10 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `loc
 
 ## 受け入れ条件
 
-- [ ] `curl -i -X POST https://localmcp.f12o.com/mcp ...`（未認証）が `401` と `WWW-Authenticate` ヘッダーを返す。
-- [ ] `curl -i https://localmcp.f12o.com/.well-known/oauth-authorization-server` が `200` を返す。
-- [ ] `curl -i https://localmcp.f12o.com/.well-known/oauth-protected-resource` が `200` を返す。
-- [ ] `just env-check` が成功する。
+- [x] `curl -i -X POST https://localmcp.f12o.com/mcp ...`（未認証）が `401` と `WWW-Authenticate` ヘッダーを返す。
+- [x] `curl -i https://localmcp.f12o.com/.well-known/oauth-authorization-server` が `200` を返す。
+- [x] `curl -i https://localmcp.f12o.com/.well-known/oauth-protected-resource` が `200` を返す。
+- [x] `just env-check` が成功する。
 - [ ] `local-mcp serve` のログにエラーがなく、認証成功後の `tools/list` が期待する12ツールを返す。
 - [ ] ChatGPT から `localmcp.f12o.com/mcp` への接続でツール一覧が表示される。
 
