@@ -440,14 +440,16 @@ fn reserve_bytes(remaining: &AtomicUsize, maximum: usize) -> usize {
 }
 
 fn safe_environment() -> HashMap<String, String> {
-    ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "HOME"]
+    let mut environment = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "HOME"]
         .into_iter()
         .filter_map(|name| {
             std::env::var(name)
                 .ok()
                 .map(|value| (name.to_owned(), value))
         })
-        .collect()
+        .collect::<HashMap<_, _>>();
+    environment.insert("LOCAL_MCP_SANDBOX".to_owned(), "1".to_owned());
+    environment
 }
 
 #[cfg(test)]
@@ -477,6 +479,12 @@ mod generic_tests {
                 Some(home.as_str())
             );
         }
+        assert_eq!(
+            safe_environment()
+                .get("LOCAL_MCP_SANDBOX")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
@@ -567,7 +575,9 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_allows_workspace_writes_and_denies_other_writes() -> Result<()> {
         // Nix's macOS build sandbox does not allow a nested Seatbelt profile.
-        if std::env::var_os("NIX_BUILD_TOP").is_some() {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
             return Ok(());
         }
         let root = test_directory();
@@ -606,7 +616,9 @@ mod tests {
 
     #[tokio::test]
     async fn seatbelt_denies_network_access() -> Result<()> {
-        if std::env::var_os("NIX_BUILD_TOP").is_some() {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
             return Ok(());
         }
         let workspace = test_directory();

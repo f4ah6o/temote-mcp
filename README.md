@@ -72,10 +72,12 @@ local stdio server retains that explicitly approved tool for local-only
 workflows.
 
 For ChatGPT, use the dedicated `git_add` and `git_commit` tools to stage files
-and create local commits. Ordinary `execute` commands keep `.git` metadata
-read-only. The Git tools do not create branches or push, disable hooks and
-signing, and keep network access disabled; create branches and push from a
-local terminal.
+and create local commits. Use `git_fetch`, `git_pull`, and `git_push` for remote
+synchronization. The remote tools execute on the host only after approval
+(unless the session is in yolo mode), accept configured remote names rather
+than arbitrary URLs or refspecs, disable hooks, reject force-push options, and
+make `git_pull` fast-forward-only. Ordinary `execute` commands keep `.git`
+metadata read-only and network access disabled.
 
 ## Public HTTP endpoint
 
@@ -106,10 +108,12 @@ Use separate terminals when the service is needed:
     cd ~/src/local-mcp
     local-mcp start local-mcp
 
-The repository also includes a `justfile` for these commands. After installing
-`just`, the equivalent workflow is:
+The repository also includes a `justfile` for these commands. Its development
+recipes build and run `target/release/local-mcp` from the current checkout, so
+an older globally installed binary cannot silently hide newly added tools.
+After installing `just`, the workflow is:
 
-    just install
+    just build
     just doctor
     just env-check
 
@@ -128,9 +132,11 @@ The repository also includes a `justfile` for these commands. After installing
     just start shuttle-rs ~/src/shuttle-rs
 
 The `start` recipe takes the session ID as its first argument and an optional
-working directory as its second argument. Run one `just start` command per
-project/session in its own terminal; the origin and Tunnel recipes are also
-foreground processes.
+working directory as its second argument. `doctor`, `serve`, `up`, `start`, and
+`mcp` depend on the release build and execute that repository-local binary.
+Run one `just start` command per project/session in its own terminal; the origin
+and Tunnel recipes are also foreground processes. Use `just install` only when
+a globally available `local-mcp` command is required.
 
 The public route is:
 
@@ -211,9 +217,10 @@ If OAuth succeeds but ChatGPT shows no tools, refresh the MCP connection after
 restarting `local-mcp serve` (especially after changing the self-hosted
 application AUD). The direct connection URL is still exactly
 `https://temotemcp.example.com/mcp`; the host root is only used for OAuth
-discovery. The public `tools/list` response contains twelve tools, including
-the restricted `git_add` and `git_commit` operations; `without_sandbox` is
-intentionally available only in local stdio mode. Each public tool must
+discovery. The public `tools/list` response contains fifteen tools, including the
+restricted `git_add`, `git_commit`, `git_fetch`, `git_pull`, and `git_push`
+operations; `without_sandbox` is intentionally available only in local stdio
+mode. Each public tool must
 include a name, display title, description, input schema, and annotations.
 Start a new ChatGPT conversation and add the MCP connection from the tools
 menu so ChatGPT requests the refreshed tool list. See the [OpenAI
@@ -232,8 +239,9 @@ for the client-side checks.
   may write temporary files under `/tmp` or `TMPDIR`; do not store secrets
   there.
 - Ordinary sandboxed commands cannot write `.git`; use `git_add` and
-  `git_commit` for the two explicitly supported local Git metadata operations.
-  They never push.
+  `git_commit` for local Git metadata operations.
+- Remote Git operations use dedicated approval-gated host tools. `git_pull` is
+  fast-forward-only, and `git_push` exposes no force option or arbitrary URL.
 - A session has at most four active sandbox jobs.
 - Combined stdout/stderr per command is capped at 1 MiB and marked as
   truncated.
@@ -252,4 +260,4 @@ For a local MCP client that starts the process itself:
 
 This mode is separate from the Cloudflare Access HTTP endpoint. It includes
 the local approval UI, the explicitly approved without_sandbox command, and
-the restricted git_add/git_commit operations.
+the restricted Git operations described above.

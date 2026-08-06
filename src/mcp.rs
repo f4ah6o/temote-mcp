@@ -98,7 +98,7 @@ async fn dispatch_with_mode(request: &Value, public: bool) -> Result<Value> {
             "protocolVersion": negotiate_protocol_version(request),
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "title": "Local MCP", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory and sandbox roots. Use git_add and git_commit for local Git metadata changes; ordinary execute commands keep .git read-only and public access cannot push."
+            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory and sandbox roots. Use git_add and git_commit for local Git metadata changes. Use the approval-gated git_fetch, git_pull, and git_push tools for network operations; ordinary execute commands keep .git read-only and network-disabled."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools(public)})),
@@ -128,6 +128,9 @@ fn tools(public: bool) -> Value {
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
         {"name":"git_add","title":"Stage files with Git","description":"Stage existing files or directories in the session repository with git add. Only the specified paths are staged; Git hooks and network access are unavailable. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"cwd":{"type":"string"}},"required":["session_id","paths"],"additionalProperties":false}},
         {"name":"git_commit","title":"Create a local Git commit","description":"Create a local commit from the current Git index. This does not push, hooks and signing are disabled, and network access is unavailable. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":16384},"cwd":{"type":"string"}},"required":["session_id","message"],"additionalProperties":false}},
+        {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name, arbitrary URLs and refspecs are not accepted, and every call requires local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled and every call requires local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled and every call requires local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
         {"name":"execute","title":"Run a sandboxed command","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"start_command","title":"Start a sandboxed command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -222,6 +225,9 @@ async fn call_tool(params: &Value, public: bool) -> Result<Value> {
         "write_file" => write_file(&args, &session).await,
         "git_add" => git_add(&args, &session).await,
         "git_commit" => git_commit(&args, &session).await,
+        "git_fetch" => git_fetch(&args, &session).await,
+        "git_pull" => git_pull(&args, &session).await,
+        "git_push" => git_push(&args, &session).await,
         "execute" => execute(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
@@ -459,6 +465,148 @@ async fn git_commit(args: &Value, session: &config::Session) -> Result<Value> {
         message.to_owned(),
     ];
     run_git_and_report(session, cwd, command, "Create Git commit").await
+}
+
+async fn git_fetch(args: &Value, session: &config::Session) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    ensure_configured_git_remote(session, &cwd, &remote).await?;
+    let command = vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "fetch.recurseSubmodules=false".to_owned(),
+        "fetch".to_owned(),
+        "--prune".to_owned(),
+        remote,
+    ];
+    run_approved_git_command(session, cwd, command, "git_fetch").await
+}
+
+async fn git_pull(args: &Value, session: &config::Session) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let command = vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "fetch.recurseSubmodules=false".to_owned(),
+        "pull".to_owned(),
+        "--ff-only".to_owned(),
+        "--recurse-submodules=no".to_owned(),
+    ];
+    run_approved_git_command(session, cwd, command, "git_pull").await
+}
+
+async fn git_push(args: &Value, session: &config::Session) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let remote = optional_git_remote(args)?;
+    let set_upstream = args
+        .get("set_upstream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let selected_remote = if set_upstream {
+        Some(remote.clone().unwrap_or_else(|| "origin".to_owned()))
+    } else {
+        remote.clone()
+    };
+    if let Some(remote) = &selected_remote {
+        ensure_configured_git_remote(session, &cwd, remote).await?;
+    }
+    let mut command = vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "push.recurseSubmodules=off".to_owned(),
+        "push".to_owned(),
+    ];
+    if set_upstream {
+        command.push("--set-upstream".to_owned());
+        command.push(selected_remote.expect("set_upstream selects a remote"));
+        command.push("HEAD".to_owned());
+    } else if let Some(remote) = remote {
+        command.push(remote);
+        command.push("HEAD".to_owned());
+    }
+    run_approved_git_command(session, cwd, command, "git_push").await
+}
+
+fn optional_git_remote(args: &Value) -> Result<Option<String>> {
+    let Some(value) = args.get("remote") else {
+        return Ok(None);
+    };
+    let remote = value.as_str().context("remote must be a string")?;
+    validate_git_remote(remote)?;
+    Ok(Some(remote.to_owned()))
+}
+
+async fn ensure_configured_git_remote(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+) -> Result<()> {
+    let output = sandbox::run(
+        &[
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            remote.to_owned(),
+        ],
+        cwd,
+        &session.permitted_directories,
+        None,
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "Git remote {remote:?} is not configured: {}",
+        output.stderr.trim()
+    );
+    Ok(())
+}
+
+fn validate_git_remote(remote: &str) -> Result<()> {
+    anyhow::ensure!(!remote.is_empty(), "Git remote must not be empty");
+    anyhow::ensure!(remote.len() <= 255, "Git remote is too long");
+    anyhow::ensure!(
+        !remote.starts_with('-')
+            && !remote.starts_with('/')
+            && !remote.ends_with('/')
+            && !remote.contains("..")
+            && !remote.contains("//"),
+        "unsafe Git remote name: {remote:?}"
+    );
+    anyhow::ensure!(
+        remote
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_./".contains(character)),
+        "Git remote must be a configured name, not a URL or refspec: {remote:?}"
+    );
+    Ok(())
+}
+
+async fn run_approved_git_command(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    operation: &str,
+) -> Result<Value> {
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    if !approvals::request(
+        &session.id,
+        operation,
+        format!("argv: {command:?}"),
+        repository_root.clone(),
+    )
+    .await?
+    {
+        anyhow::bail!("user denied {operation}")
+    }
+    run_and_report(session.id.clone(), command, repository_root, true, &[]).await
 }
 
 fn required_string_array(args: &Value, name: &str) -> Result<Vec<String>> {
@@ -957,7 +1105,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 15);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -967,6 +1115,25 @@ mod tests {
         }));
         assert!(tools.iter().any(|tool| tool["name"] == "git_add"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_commit"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_fetch"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_pull"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
+    }
+
+    #[test]
+    fn accepts_configured_git_remote_names_only() {
+        for remote in ["origin", "upstream", "team/review", "release-1.0"] {
+            validate_git_remote(remote).unwrap();
+        }
+        for remote in [
+            "",
+            "-origin",
+            "../origin",
+            "https://example.com/repo",
+            "git@example.com:repo",
+        ] {
+            assert!(validate_git_remote(remote).is_err(), "accepted {remote:?}");
+        }
     }
 
     #[tokio::test]

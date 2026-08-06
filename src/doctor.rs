@@ -9,6 +9,7 @@ use tokio::process::Command;
 
 use crate::sandbox;
 
+#[cfg(target_os = "linux")]
 const BWRAP_INSTALL_HINT: &str =
     "Install bubblewrap (for example: sudo apt install bubblewrap) and make sure it is in PATH.";
 const APPARMOR_PROFILE_HINT: &str = "Ubuntu may be blocking unprivileged user namespaces. Try:\n\
@@ -20,6 +21,7 @@ sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict";
 #[derive(Clone, Copy)]
 enum Level {
     Pass,
+    #[cfg(target_os = "linux")]
     Warn,
     Fail,
 }
@@ -41,6 +43,7 @@ impl Check {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn warn(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             level: Level::Warn,
@@ -66,6 +69,7 @@ impl Check {
     fn print(&self) {
         let label = match self.level {
             Level::Pass => "PASS",
+            #[cfg(target_os = "linux")]
             Level::Warn => "WARN",
             Level::Fail => "FAIL",
         };
@@ -101,11 +105,14 @@ impl Report {
             .iter()
             .filter(|check| check.is_failure())
             .count();
+        #[cfg(target_os = "linux")]
         let warnings = self
             .checks
             .iter()
             .filter(|check| matches!(check.level, Level::Warn))
             .count();
+        #[cfg(not(target_os = "linux"))]
+        let warnings = 0;
         println!();
         println!(
             "doctor summary: {} failure(s), {} warning(s)",

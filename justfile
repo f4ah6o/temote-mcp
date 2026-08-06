@@ -4,6 +4,10 @@ set dotenv-load := false
 default:
     @just --list
 
+# Build the repository version used by the development recipes below.
+build:
+    cargo build --release --locked
+
 # Install local-mcp and the Linux sandbox helper from the locked dependency set.
 install:
     cargo install --path . --locked
@@ -38,14 +42,14 @@ env-check:
     echo "public environment is configured: $public_env_file"
 
 # Diagnose local-mcp and the host sandbox prerequisites.
-doctor:
-    local-mcp doctor
+doctor: build
+    "{{ justfile_directory() }}/target/release/local-mcp" doctor
 
 # Run the local HTTP origin. Keep this terminal running while ChatGPT is connected.
-serve: env-check
+serve: build env-check
     public_env_file="${LOCAL_MCP_ENV_FILE:-${HOME}/.config/local-mcp/public.env}"; \
     set -a; source "$public_env_file"; set +a; \
-    exec local-mcp serve
+    exec "{{ justfile_directory() }}/target/release/local-mcp" serve
 
 # Run the on-demand remotely managed Cloudflare Tunnel.
 tunnel: env-check
@@ -54,7 +58,7 @@ tunnel: env-check
     exec cloudflared tunnel run --token "$LOCAL_MCP_TUNNEL_TOKEN"
 
 # Run the origin and Tunnel together. Ctrl-C stops both child processes.
-up: env-check
+up: build env-check
     set +e; \
     public_env_file="${LOCAL_MCP_ENV_FILE:-${HOME}/.config/local-mcp/public.env}"; \
     set -a; source "$public_env_file"; set +a; \
@@ -69,7 +73,7 @@ up: env-check
         fi; \
         rm -f "$pid_file"; \
     fi; \
-    local-mcp serve & serve_pid=$!; \
+    "{{ justfile_directory() }}/target/release/local-mcp" serve & serve_pid=$!; \
     cloudflared tunnel run --token "$LOCAL_MCP_TUNNEL_TOKEN" & tunnel_pid=$!; \
     printf '%s %s\n' "$serve_pid" "$tunnel_pid" > "$pid_file"; \
     cleanup() { kill "$serve_pid" "$tunnel_pid" 2>/dev/null || true; wait "$serve_pid" "$tunnel_pid" 2>/dev/null || true; rm -f "$pid_file"; }; \
@@ -115,9 +119,9 @@ down:
     rm -f "$pid_file"
 
 # Start one permission-scoped local session. The optional directory controls its working directory.
-start session_id working_directory=".":
-    cd {{ quote(working_directory) }} && local-mcp start {{ quote(session_id) }}
+start session_id working_directory=".": build
+    cd {{ quote(working_directory) }} && "{{ justfile_directory() }}/target/release/local-mcp" start {{ quote(session_id) }}
 
 # Run the local stdio MCP server for clients that launch it directly.
-mcp:
-    local-mcp mcp
+mcp: build
+    "{{ justfile_directory() }}/target/release/local-mcp" mcp
