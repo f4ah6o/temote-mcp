@@ -261,3 +261,27 @@ For a local MCP client that starts the process itself:
 This mode is separate from the Cloudflare Access HTTP endpoint. It includes
 the local approval UI, the explicitly approved without_sandbox command, and
 the restricted Git operations described above.
+
+## Serverless multi-host gateway
+
+The optional [`gateway/`](gateway/) deployment exposes one Cloudflare Workers
+MCP endpoint and routes calls through Durable Objects by `session_id`. Mac and
+Windows/WSL2 endpoints run `local-mcp gateway-agent`, make outbound-only HTTPS
+long polls, and retain the local terminal approval and sandbox boundary. A new
+host connection increments its generation so responses from a disconnected or
+replaced process cannot complete current requests.
+
+Typical endpoint commands are:
+
+    # Mac
+    local-mcp start mac-main
+    local-mcp gateway-agent --session-id mac-main
+
+    # Windows interim path, inside WSL2
+    local-mcp start windows-wsl2-main
+    local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
+
+Set `LOCAL_MCP_GATEWAY_URL`, `LOCAL_MCP_GATEWAY_HOST_TOKEN`, and, when the host
+route is protected by Cloudflare Access, the service-token client ID and secret.
+Deployment, Managed OAuth, Durable Object migration, reconnect behavior, and
+secret handling are documented in [`gateway/README.md`](gateway/README.md).

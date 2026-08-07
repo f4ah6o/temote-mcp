@@ -276,7 +276,7 @@ fn show_request(request: &Request) -> Result<()> {
         request.cwd.display(),
         request.detail
     );
-    eprint!("Allow without sandbox? [y/N] ");
+    eprint!("Allow operation? [y/N] ");
     std::io::stderr().flush()?;
     Ok(())
 }

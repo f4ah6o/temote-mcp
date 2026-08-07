@@ -2,3 +2,6 @@
 .env
 .env.*
 !.env.example
+gateway/.dev.vars
+gateway/node_modules/
+.wrangler/

@@ -240,19 +240,21 @@ mod tests {
     fn path_resolution_stays_inside_permitted_roots() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        let root = canonical_directory(root.path()).unwrap();
+        let outside = canonical_directory(outside.path()).unwrap();
         let session = Session {
             id: "test".to_owned(),
-            cwd: root.path().to_owned(),
-            permitted_directories: vec![root.path().to_owned()],
+            cwd: root.clone(),
+            permitted_directories: vec![root.clone()],
             started_at: 0,
             process_id: 0,
         };
-        std::fs::write(root.path().join("inside.txt"), "ok").unwrap();
+        std::fs::write(root.join("inside.txt"), "ok").unwrap();
 
         assert!(resolve_existing_path(&session, Path::new("inside.txt")).is_ok());
-        assert!(resolve_existing_path(&session, outside.path()).is_err());
+        assert!(resolve_existing_path(&session, &outside).is_err());
         assert!(resolve_write_path(&session, Path::new("new.txt")).is_ok());
-        assert!(resolve_write_path(&session, &outside.path().join("new.txt")).is_err());
+        assert!(resolve_write_path(&session, &outside.join("new.txt")).is_err());
     }
 
     #[cfg(unix)]
@@ -264,10 +266,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
         symlink(outside.path(), root.path().join("outside")).unwrap();
+        let canonical_root = canonical_directory(root.path()).unwrap();
         let session = Session {
             id: "test".to_owned(),
-            cwd: root.path().to_owned(),
-            permitted_directories: vec![root.path().to_owned()],
+            cwd: canonical_root.clone(),
+            permitted_directories: vec![canonical_root],
             started_at: 0,
             process_id: 0,
         };

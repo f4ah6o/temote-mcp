@@ -1,0 +1,26 @@
+name = "local-mcp-gateway"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+workers_dev = false
+
+[vars]
+GATEWAY_VERSION = "2026.8.0"
+ACCESS_TEAM_DOMAIN = "replace-me.cloudflareaccess.com"
+ACCESS_AUDIENCE = "replace-with-access-application-aud"
+ACCESS_ALLOWED_EMAILS = "replace@example.com"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_SESSIONS"
+class_name = "GatewaySession"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_REGISTRY"
+class_name = "GatewayRegistry"
+
+[exports.GatewaySession]
+type = "durable-object"
+storage = "sqlite"
+
+[exports.GatewayRegistry]
+type = "durable-object"
+storage = "sqlite"
