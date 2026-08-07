@@ -1,0 +1,15 @@
+{
+  "name": "local-mcp-gateway",
+  "private": true,
+  "version": "2026.8.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "deploy:dry-run": "npx wrangler deploy --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

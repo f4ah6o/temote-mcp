@@ -494,7 +494,10 @@ mod generic_tests {
 
         let roots = git_metadata_roots(repository.path()).unwrap();
 
-        assert_eq!(roots, vec![repository.path().join(".git")]);
+        assert_eq!(
+            roots,
+            vec![std::fs::canonicalize(repository.path().join(".git")).unwrap()]
+        );
     }
 
     #[test]
@@ -520,7 +523,13 @@ mod generic_tests {
 
         let roots = git_metadata_roots(&worktree).unwrap();
 
-        assert_eq!(roots, vec![common, private]);
+        assert_eq!(
+            roots,
+            vec![
+                std::fs::canonicalize(common).unwrap(),
+                std::fs::canonicalize(private).unwrap(),
+            ]
+        );
     }
 
     #[test]

@@ -2,11 +2,13 @@ mod access;
 mod approvals;
 mod config;
 mod doctor;
+mod gateway;
 mod http;
 mod mcp;
 mod sandbox;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -40,6 +42,34 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8791")]
         addr: SocketAddr,
     },
+    /// Connect an active local session to a Cloudflare gateway using outbound long polling.
+    GatewayAgent {
+        /// Cloudflare Worker origin, without a path.
+        #[arg(long, env = "LOCAL_MCP_GATEWAY_URL")]
+        gateway_url: String,
+        /// Active local-mcp session to publish through the gateway.
+        #[arg(long)]
+        session_id: String,
+        /// Shared host credential stored as the Worker's HOST_TOKEN secret.
+        #[arg(long, env = "LOCAL_MCP_GATEWAY_HOST_TOKEN", hide_env_values = true)]
+        host_token: String,
+        /// Optional Cloudflare Access service-token client ID.
+        #[arg(long, env = "LOCAL_MCP_GATEWAY_ACCESS_CLIENT_ID")]
+        access_client_id: Option<String>,
+        /// Optional Cloudflare Access service-token client secret.
+        #[arg(
+            long,
+            env = "LOCAL_MCP_GATEWAY_ACCESS_CLIENT_SECRET",
+            hide_env_values = true
+        )]
+        access_client_secret: Option<String>,
+        /// Host platform reported to the gateway. Auto detects macOS, Linux, or WSL2.
+        #[arg(long, value_enum, default_value = "auto")]
+        platform: gateway::Platform,
+        /// Delay before reconnecting after a disconnect or generation replacement.
+        #[arg(long, default_value_t = 2)]
+        reconnect_delay_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -50,6 +80,26 @@ async fn main() -> Result<()> {
         Command::Start { session_id } => approvals::start(session_id.as_deref()).await,
         Command::Mcp => mcp::serve().await,
         Command::Serve { public_url, addr } => serve_http(public_url, addr).await,
+        Command::GatewayAgent {
+            gateway_url,
+            session_id,
+            host_token,
+            access_client_id,
+            access_client_secret,
+            platform,
+            reconnect_delay_seconds,
+        } => {
+            gateway::run_agent(gateway::AgentOptions {
+                gateway_url,
+                session_id,
+                host_token,
+                access_client_id,
+                access_client_secret,
+                platform,
+                reconnect_delay: Duration::from_secs(reconnect_delay_seconds),
+            })
+            .await
+        }
     }
 }
 
