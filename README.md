@@ -53,6 +53,17 @@ Start each session from the project directory whose files it may access:
     cd ~/src/shuttle-rs
     local-mcp start shuttle-rs
 
+For an explicitly unrestricted session, add `--yolo`:
+
+    local-mcp start local-mcp --yolo
+
+YOLO mode is intentionally dangerous: local approvals are skipped, path roots are
+not enforced, and command tools run directly on the host with the full filesystem,
+environment, process, and network permissions of the user running `local-mcp`. The
+mode is stored in the active session metadata so local stdio, HTTP, and gateway
+requests all observe the same setting. `/permission ask` restores the normal
+restricted mode and `/permission yolo` enables it again while the session runs.
+
 The session ID is explicit in every tool call. session_list discovers active
 sessions; session_info shows a session's working directory and sandbox roots.
 Session IDs contain only ASCII letters, numbers, -, _, and .. A duplicate
@@ -67,9 +78,10 @@ directory from that session's local terminal:
     /permission status
 
 When the start process exits, its Unix socket is removed and active sandbox
-jobs are cancelled. The public endpoint never exposes without_sandbox. The
-local stdio server retains that explicitly approved tool for local-only
-workflows.
+jobs are cancelled. The public endpoint never exposes the separate `without_sandbox` tool. A public or
+gateway request targeting a session explicitly started with `--yolo` can nevertheless
+use `execute`/`start_command` with unrestricted host permissions; Cloudflare Access
+(or the gateway's authentication) remains the outer authentication boundary.
 
 For ChatGPT, use the dedicated `git_add` and `git_commit` tools to stage files
 and create local commits. Use `git_fetch`, `git_pull`, and `git_push` for remote
@@ -232,9 +244,12 @@ for the client-side checks.
 
 - Public requests require a valid Cloudflare Access assertion.
 - All public tools require an explicit active session_id, except session_list.
-- File paths, symlink targets, and command cwd must remain under the session's
-  permitted roots.
-- Sandboxed commands have no network access.
+- In normal mode, file paths, symlink targets, and command cwd must remain under the
+  session's permitted roots.
+- In normal mode, sandboxed commands have no network access.
+- In `--yolo` mode those two boundaries are disabled: tools may use any host path and
+  `execute`/`start_command` run unsandboxed with the local user's inherited environment
+  and network access, without local approval prompts.
 - Sandboxed commands retain only a minimal environment, including `HOME`, and
   may write temporary files under `/tmp` or `TMPDIR`; do not store secrets
   there.
