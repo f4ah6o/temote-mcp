@@ -85,10 +85,10 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
     let _ = stream.shutdown().await;
 }
 
-pub async fn start(session_id: Option<&str>) -> Result<()> {
+pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
     let id = config::session_id(session_id)?;
     config::remove_inactive_socket(&id).await?;
-    let mut session = config::new_session(&std::env::current_dir()?, Some(&id))?;
+    let mut session = config::new_session(&std::env::current_dir()?, Some(&id), yolo)?;
     let path = config::socket_path(&session.id)?;
     let state_dir = path.parent().context("session socket has no parent")?;
     tokio::fs::create_dir_all(state_dir).await?;
@@ -103,18 +103,23 @@ pub async fn start(session_id: Option<&str>) -> Result<()> {
         return Err(error);
     }
     eprintln!(
-        "local-mcp session: {}\ncwd: {}\n\
+        "local-mcp session: {}\ncwd: {}\nmode: {}\n\
          Give this session ID to the agent so it can include it in local-mcp tool calls.\n\
          Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
          Press Ctrl-C to stop.",
         session.id,
-        session.cwd.display()
+        session.cwd.display(),
+        if session.yolo { "yolo" } else { "ask" }
     );
+    if session.yolo {
+        eprintln!(
+            "WARNING: YOLO mode grants MCP tools this user's full filesystem, process, environment, and network permissions without local approval."
+        );
+    }
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<(Request, UnixStream)>::new();
-    let mut yolo = false;
-    let result = run_session(&listener, &mut input, &mut session, &mut pending, &mut yolo).await;
+    let result = run_session(&listener, &mut input, &mut session, &mut pending).await;
     session.process_id = 0;
     if let Err(error) = config::save_session(&session).await {
         eprintln!("failed to mark session stopped: {error:#}");
@@ -128,7 +133,6 @@ async fn run_session(
     input: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
     session: &mut Session,
     pending: &mut VecDeque<(Request, UnixStream)>,
-    yolo: &mut bool,
 ) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -144,7 +148,7 @@ async fn run_session(
                         stream.write_all(b"active\n").await?;
                     }
                     Message::Activity { title, detail } => show_activity(&title, detail.as_deref()),
-                    Message::Approval { request } if *yolo => {
+                    Message::Approval { request } if session.yolo => {
                         eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
                         stream.write_all(b"allow\n").await?;
                     }
@@ -156,7 +160,7 @@ async fn run_session(
             }
             line = input.next_line() => {
                 let Some(line) = line? else { anyhow::bail!("session input closed") };
-                handle_input(line.trim(), session, yolo, pending).await?;
+                handle_input(line.trim(), session, pending).await?;
             }
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
@@ -179,20 +183,21 @@ fn show_activity(title: &str, detail: Option<&str>) {
 async fn handle_input(
     input: &str,
     session: &mut Session,
-    yolo: &mut bool,
     pending: &mut VecDeque<(Request, UnixStream)>,
 ) -> Result<()> {
     match input {
         "/permissions yolo" | "/permission yolo" => {
-            *yolo = true;
-            eprintln!("Permissions: yolo (all unsandboxed calls are allowed for this session)");
+            session.yolo = true;
+            config::save_session(session).await?;
+            eprintln!("Permissions: yolo (full host permissions; no local approvals)");
             while let Some((request, mut stream)) = pending.pop_front() {
                 eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
                 stream.write_all(b"allow\n").await?;
             }
         }
         "/permissions ask" | "/permission ask" => {
-            *yolo = false;
+            session.yolo = false;
+            config::save_session(session).await?;
             eprintln!("Permissions: ask");
         }
         "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
@@ -207,7 +212,7 @@ async fn handle_input(
         }
         "/permission list" | "/permissions list" => show_permissions(session),
         "/permission status" | "/permissions status" => {
-            eprintln!("Permissions: {}", if *yolo { "yolo" } else { "ask" });
+            eprintln!("Permissions: {}", if session.yolo { "yolo" } else { "ask" });
             show_permissions(session);
         }
         command if permission_arg(command, "allow").is_some() => {

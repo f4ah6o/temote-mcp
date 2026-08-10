@@ -11,7 +11,7 @@ Branch: main
 - Worker / Durable Objects / endpoint agent / documentation / tests の実装は完了。
 - `cargo test` 32件、`cargo clippy --all-targets -- -D warnings`、Worker test 8件、Node syntax check が成功。
 - Wrangler はローカル未導入で、現在の sandbox はネットワーク無効のため deploy dry-run は未実施。
-- 現在接続中の Local MCP は Git metadata 書込み用 tool を公開しておらず、sandboxed `git switch` / `git add` は `.git` への書込みを拒否するため、commit / merge / push は未完了。
+- 実装は commit `74d1de4` (`feat: add Cloudflare Durable Object gateway`) として main / origin/main に反映済み。
 
 ## 概要
 
@@ -101,7 +101,7 @@ Cloudflare Worker (/mcp)
 - [x] Mac と WSL2 で同じ agent command を利用できる。
 - [ ] 実 Cloudflare account に Durable Object exports configuration と secrets を適用する。
 - [ ] ChatGPT Managed OAuth 接続から Mac / WSL2 の2 session を同時に live 検証する。
-- [ ] 実装差分を commit して main へ反映する。
+- [x] 実装差分を commit して main へ反映する。
 
 ## テスト計画
 

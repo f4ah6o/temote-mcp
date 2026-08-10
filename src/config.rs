@@ -14,6 +14,8 @@ pub struct Session {
     pub started_at: u64,
     #[serde(default)]
     pub process_id: u32,
+    #[serde(default)]
+    pub yolo: bool,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -57,7 +59,7 @@ pub fn session_id(id: Option<&str>) -> Result<String> {
     Ok(id)
 }
 
-pub fn new_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
+pub fn new_session(cwd: &Path, id: Option<&str>, yolo: bool) -> Result<Session> {
     let cwd = canonical_directory(cwd)?;
     let id = session_id(id)?;
     let session = Session {
@@ -66,6 +68,7 @@ pub fn new_session(cwd: &Path, id: Option<&str>) -> Result<Session> {
         permitted_directories: vec![cwd],
         started_at: unix_time(),
         process_id: 0,
+        yolo,
     };
     Ok(session)
 }
@@ -191,6 +194,9 @@ pub fn resolve_cwd(session: &Session, path: Option<&Path>) -> Result<PathBuf> {
 }
 
 pub fn ensure_permitted(session: &Session, path: &Path) -> Result<()> {
+    if session.yolo {
+        return Ok(());
+    }
     anyhow::ensure!(
         session
             .permitted_directories
@@ -248,6 +254,7 @@ mod tests {
             permitted_directories: vec![root.clone()],
             started_at: 0,
             process_id: 0,
+            yolo: false,
         };
         std::fs::write(root.join("inside.txt"), "ok").unwrap();
 
@@ -255,6 +262,27 @@ mod tests {
         assert!(resolve_existing_path(&session, &outside).is_err());
         assert!(resolve_write_path(&session, Path::new("new.txt")).is_ok());
         assert!(resolve_write_path(&session, &outside.join("new.txt")).is_err());
+    }
+
+    #[test]
+    fn yolo_session_allows_paths_outside_configured_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_directory(root.path()).unwrap();
+        let outside = canonical_directory(outside.path()).unwrap();
+        let session = Session {
+            id: "test-yolo".to_owned(),
+            cwd: root.clone(),
+            permitted_directories: vec![root],
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        std::fs::write(outside.join("outside.txt"), "ok").unwrap();
+
+        assert!(resolve_existing_path(&session, &outside.join("outside.txt")).is_ok());
+        assert!(resolve_write_path(&session, &outside.join("new.txt")).is_ok());
+        assert_eq!(resolve_cwd(&session, Some(&outside)).unwrap(), outside);
     }
 
     #[cfg(unix)]
@@ -273,6 +301,7 @@ mod tests {
             permitted_directories: vec![canonical_root],
             started_at: 0,
             process_id: 0,
+            yolo: false,
         };
 
         assert!(resolve_existing_path(&session, Path::new("outside/secret.txt")).is_err());

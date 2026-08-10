@@ -98,7 +98,7 @@ async fn dispatch_with_mode(request: &Value, public: bool) -> Result<Value> {
             "protocolVersion": negotiate_protocol_version(request),
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "local-mcp", "title": "Local MCP", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory and sandbox roots. Use git_add and git_commit for local Git metadata changes. Use the approval-gated git_fetch, git_pull, and git_push tools for network operations; ordinary execute commands keep .git read-only and network-disabled."
+            "instructions": "Every tool call requires the local-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory, mode, and sandbox roots. Normal sessions keep file paths scoped, execute commands sandboxed, and remote host operations approval-gated. A session started with `local-mcp start <session-id> --yolo` grants tools the full host permissions of the local-mcp user, including unrestricted filesystem and network access, and skips local approvals."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools(public)})),
@@ -120,21 +120,21 @@ fn negotiate_protocol_version(request: &Value) -> &'static str {
 
 fn tools(public: bool) -> Value {
     let mut tools = json!([
-        {"name":"session_list","title":"List local MCP sessions","description":"List currently active local-mcp sessions. Returns only session IDs, working directories, start times, and status.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"session_info","title":"Inspect a local MCP session","description":"Show a local-mcp session's ID, working directory, and allowed sandbox roots.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"session_list","title":"List local MCP sessions","description":"List currently active local-mcp sessions. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"session_info","title":"Inspect a local MCP session","description":"Show a local-mcp session's ID, working directory, allowed sandbox roots, and yolo mode state.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 file from the local machine. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"get_image","title":"Read a local image","description":"Read a local image and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List entries in a local directory. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
-        {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 file in the Codex sandbox. Relative paths use the session working directory. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
+        {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 file. Normal sessions are restricted to permitted roots and use the Codex sandbox; yolo sessions may write anywhere the local user can. ChatGPT should confirm before calling this tool unless session_info reports yolo=true.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
         {"name":"git_add","title":"Stage files with Git","description":"Stage existing files or directories in the session repository with git add. Only the specified paths are staged; Git hooks and network access are unavailable. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"cwd":{"type":"string"}},"required":["session_id","paths"],"additionalProperties":false}},
         {"name":"git_commit","title":"Create a local Git commit","description":"Create a local commit from the current Git index. This does not push, hooks and signing are disabled, and network access is unavailable. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":16384},"cwd":{"type":"string"}},"required":["session_id","message"],"additionalProperties":false}},
         {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name, arbitrary URLs and refspecs are not accepted, and every call requires local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled and every call requires local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled and every call requires local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"execute","title":"Run a sandboxed command","description":"Execute argv without a shell in the Codex sandbox. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id for use with poll_job or stop_job. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
-        {"name":"start_command","title":"Start a sandboxed command","description":"Start argv immediately as a background job in the Codex sandbox and return a job_id without waiting for completion. Network is disabled and approval is not required. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"execute","title":"Run a command","description":"Execute argv without a shell. Normal sessions run in the Codex sandbox with network disabled; yolo sessions run directly on the host with the local user's full filesystem, environment, process, and network permissions. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id. ChatGPT should confirm before calling this tool unless session_info reports yolo=true.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job. Normal sessions use the Codex sandbox with network disabled; yolo sessions run directly on the host with the local user's full permissions. ChatGPT should confirm before calling this tool unless session_info reports yolo=true.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
-        {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command. ChatGPT should confirm before calling this tool.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command. ChatGPT should confirm before calling this tool unless session_info reports yolo=true.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"without_sandbox","title":"Run a host command","description":"Execute argv directly on the host with full user permissions and network access. Every call requires approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}}
     ]);
     if public {
@@ -271,6 +271,7 @@ async fn session_list() -> Result<Value> {
             "cwd": session.cwd,
             "started_at": session.started_at,
             "status": "active",
+            "yolo": session.yolo,
         }));
     }
     sessions.sort_by_key(|session| {
@@ -402,14 +403,21 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         "local-mcp-write".to_owned(),
         absolute.display().to_string(),
     ];
-    let output = sandbox::run(
-        &command,
-        &parent,
-        std::slice::from_ref(&parent),
-        Some(content.as_bytes()),
-    )
-    .await?;
-    let result = render_output(output);
+    let result = if session.yolo {
+        tokio::fs::write(&absolute, content)
+            .await
+            .with_context(|| format!("failed to write {}", absolute.display()))
+            .map(|_| json!({"exit_code":0,"stdout":"","stderr":"","truncated":false}).to_string())
+    } else {
+        sandbox::run(
+            &command,
+            &parent,
+            std::slice::from_ref(&parent),
+            Some(content.as_bytes()),
+        )
+        .await
+        .and_then(render_output)
+    };
     let (added, removed, diff) = render_diff(&previous, content);
     let title = format!(
         "Edited {} (+{added} -{removed})",
@@ -703,15 +711,19 @@ async fn run_git_and_report(
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
-    let git_roots = sandbox::git_metadata_roots(&cwd)?;
-    let output = sandbox::run_git(
-        &command,
-        &cwd,
-        &session.permitted_directories,
-        &git_roots,
-        None,
-    )
-    .await;
+    let output = if session.yolo {
+        sandbox::run_unrestricted(&command, &cwd, None).await
+    } else {
+        let git_roots = sandbox::git_metadata_roots(&cwd)?;
+        sandbox::run_git(
+            &command,
+            &cwd,
+            &session.permitted_directories,
+            &git_roots,
+            None,
+        )
+        .await
+    };
     let result = output.and_then(render_output);
     report_command_finished(session.id.clone(), &rendered_command, &result).await;
     text_result(result?)
@@ -741,6 +753,7 @@ async fn spawn_sandboxed_command(
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
+    let yolo = session.yolo;
     reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
@@ -748,7 +761,7 @@ async fn spawn_sandboxed_command(
     let task_command = rendered_command.clone();
     let handle = tokio::spawn(async move {
         let result = tokio::select! {
-            result = sandbox::run(&command, &cwd, &roots, None) => {
+            result = run_session_command(&command, &cwd, &roots, yolo) => {
                 result.and_then(render_output)
             }
             _ = wait_for_session_stop(session_id.clone()) => {
@@ -762,6 +775,19 @@ async fn spawn_sandboxed_command(
         result
     });
     Ok((rendered_command, handle))
+}
+
+async fn run_session_command(
+    command: &[String],
+    cwd: &Path,
+    roots: &[PathBuf],
+    yolo: bool,
+) -> Result<sandbox::Output> {
+    if yolo {
+        sandbox::run_unrestricted(command, cwd, None).await
+    } else {
+        sandbox::run(command, cwd, roots, None).await
+    }
 }
 
 async fn store_job(
@@ -1134,6 +1160,27 @@ mod tests {
         ] {
             assert!(validate_git_remote(remote).is_err(), "accepted {remote:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yolo_command_bypasses_sandbox_file_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("yolo-marker");
+        let command = vec!["/usr/bin/touch".to_owned(), marker.display().to_string()];
+
+        let output = run_session_command(
+            &command,
+            workspace.path(),
+            &[workspace.path().to_path_buf()],
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert!(marker.is_file());
     }
 
     #[tokio::test]
