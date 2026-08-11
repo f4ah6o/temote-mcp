@@ -57,12 +57,14 @@ For an explicitly unrestricted session, add `--yolo`:
 
     local-mcp start local-mcp --yolo
 
-YOLO mode is intentionally dangerous: local approvals are skipped, path roots are
-not enforced, and command tools run directly on the host with the full filesystem,
-environment, process, and network permissions of the user running `local-mcp`. The
-mode is stored in the active session metadata so local stdio, HTTP, and gateway
-requests all observe the same setting. `/permission ask` restores the normal
-restricted mode and `/permission yolo` enables it again while the session runs.
+YOLO mode is intentionally dangerous: local-mcp approval prompts are skipped, path
+roots are not enforced, and command tools run directly on the host with the
+filesystem, environment, process, and network permissions of the user running
+`local-mcp`. The mode is stored in the active session metadata so local stdio, HTTP,
+and gateway requests all observe the same setting. This setting only controls
+local-mcp boundaries; any confirmation or authorization enforced by an MCP client is
+independent. `/permission ask` restores the normal restricted mode and
+`/permission yolo` enables it again while the session runs.
 
 The session ID is explicit in every tool call. session_list discovers active
 sessions; session_info shows a session's working directory and sandbox roots.
