@@ -262,7 +262,7 @@ for the client-side checks.
   truncated.
 - A background sandbox job is cancelled after two hours or when its session
   stops.
-- Runtime audit output records identity, tool, session, and status metadata;
+- Runtime audit output records tool, session, status, and timing metadata; authenticated email and subject identifiers are intentionally not logged.
   command arguments and output are not persisted as audit logs.
 - There is intentionally no secret-file denylist. Do not add broad roots such
   as /home; explicitly permit only the directories needed for the task.
