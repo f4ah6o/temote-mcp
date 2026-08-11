@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::access::{AccessAuthenticator, AccessIdentity};
+use crate::access::AccessAuthenticator;
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -101,10 +101,9 @@ async fn mcp_options() -> Response {
 }
 
 async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Bytes) -> Response {
-    let identity = match runtime.authenticator.authenticate(&headers).await {
-        Ok(identity) => identity,
-        Err(error) => return unauthorized(error),
-    };
+    if let Err(error) = runtime.authenticator.authenticate(&headers).await {
+        return unauthorized(error);
+    }
     let request: Value = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -116,7 +115,7 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
         }
     };
     let started = Instant::now();
-    let audit = AuditContext::from_request(&identity, &request);
+    let audit = AuditContext::from_request(&request);
 
     // Notifications and responses carry no id and expect no reply.
     let Some(id) = request.get("id").cloned() else {
@@ -138,18 +137,14 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
 }
 
 struct AuditContext {
-    email: String,
-    subject: String,
     method: String,
     tool: String,
     session_id: String,
 }
 
 impl AuditContext {
-    fn from_request(identity: &AccessIdentity, request: &Value) -> Self {
+    fn from_request(request: &Value) -> Self {
         Self {
-            email: identity.email.clone(),
-            subject: identity.subject.clone(),
             method: request
                 .get("method")
                 .and_then(Value::as_str)
@@ -170,9 +165,7 @@ impl AuditContext {
 
     fn finish(&self, status: StatusCode, started: Instant) {
         eprintln!(
-            "[audit] email={} subject={} method={} tool={} session_id={} status={} duration_ms={}",
-            self.email,
-            self.subject,
+            "[audit] method={} tool={} session_id={} status={} duration_ms={}",
             self.method,
             self.tool,
             self.session_id,
@@ -222,6 +215,7 @@ fn with_cors(response: impl IntoResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::AccessIdentity;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
