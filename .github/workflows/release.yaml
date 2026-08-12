@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - latest
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calver-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify release source belongs to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release source ${GITHUB_SHA} is not in origin/main history."
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Allocate CalVer
+        id: calver
+        uses: f4ah6o/calver-action@ed77f35391c8a334e420974bb7983b0a13fc5deb
+        with:
+          format: YYYY.MM.PATCH
+          timezone: Asia/Tokyo
+          legacy_prefixes: v
+          create_tag: false
+
+      - name: Set package version
+        shell: bash
+        env:
+          VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path("Cargo.toml")
+          version = sys.argv[1]
+          text = path.read_text()
+          updated, count = re.subn(
+              r'(?m)^(version\s*=\s*")[^"]+("\s*)$',
+              rf'\g<1>{version}\2',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("could not update package version in Cargo.toml")
+          path.write_text(updated)
+          PY
+          cargo check
+
+      - name: Validate release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          cargo build --release --locked
+          cargo build --release --locked --no-default-features
+
+      - name: Create release-only commit
+        shell: bash
+        env:
+          VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit --allow-empty -m "chore: release local-mcp ${VERSION}"
+
+      - name: Push immutable CalVer tag
+        shell: bash
+        env:
+          TAG: ${{ steps.calver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG" HEAD
+          git push origin "refs/tags/${TAG}"
+
+      - name: Summary
+        shell: bash
+        env:
+          VERSION: ${{ steps.calver.outputs.version }}
+          TAG: ${{ steps.calver.outputs.tag }}
+        run: |
+          {
+            echo "## local-mcp release"
+            echo
+            echo "- version: \`${VERSION}\`"
+            echo "- tag: \`${TAG}\`"
+            echo "- source: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

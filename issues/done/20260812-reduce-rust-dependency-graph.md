@@ -1,10 +1,10 @@
 # Rust依存グラフを縮小する
 
-Status: open
+Status: done
 Model: GPT-5.6 Sol
 Created: 2026-08-12
 Updated: 2026-08-12
-Branch: docs/20260812-dependency-reduction
+Branch: main
 Priority: P1
 
 ## 概要
@@ -82,20 +82,57 @@ before/afterで最低限次を記録する。
 - clean release build時間
 - release binary size
 
+## 実装結果
+
+Baseline: `0b7eff3`。計測hostはApple Silicon macOS。package数は `cargo metadata --locked --filter-platform` のresolved node数。clean buildはbefore/afterで別の空target directoryを使用した。
+
+- `codex-linux-sandbox` をLinux target dependencyへ移動。macOS graphから除外された。`codex-protocol` / `codex-sandboxing` / `codex-utils-absolute-path` はmacOS Seatbeltでも必要なため共通dependencyを維持。
+- 直接依存していた vendored `openssl` を削除。`openssl-src` もresolved graphから消えた。Cloudflare Access / JWT / JWKS / gatewayを含むall-features check/testは成功。
+- `network` featureを追加し、defaultでは有効のまま既存CLI互換を維持。`--no-default-features` では `serve` / `gateway-agent` とlocal-mcp自身の `axum` / `dotenvy` / `jsonwebtoken` / `reqwest` / `url` 直接依存を除外する。Codex共通層由来のnetwork dependencyは推移依存として残る。
+- `tokio` featureは全て現行コードで利用されているため削除しなかった。
+- macOS Seatbelt test fixtureが書き込み許可対象の`$TMPDIR`内にdenied pathを置いていたため、sandbox policyは変更せずfixtureだけ`$HOME`配下へ移して境界テストを有効化した。
+- CalVer release workflowを追加。`f4ah6o/calver-action`をcommit SHA pinし、`YYYY.MM.PATCH`（`MM`は非zero-padなので出力例は`2026.8.0`）、`Asia/Tokyo`、prefixless tag、legacy `v` prefix考慮で割り当てる。`latest`をrelease sourceとし、release-only commitで`Cargo.toml` / `Cargo.lock`を更新してからimmutable CalVer tagをpushする。
+
+### 計測
+
+| 項目 | before | after | 差分 |
+| --- | ---: | ---: | ---: |
+| macOS default package数 | 449 | 441 | -8 |
+| Linux default package数 | 451 | 450 | -1 |
+| `cargo tree -d` duplicate name数 | 24 | 24 | 0 |
+| `cargo tree -d --depth 0` entry数 | 52 | 52 | 0 |
+| clean release build時間 | 102.126 s | 85.376 s | -16.750 s (-16.4%) |
+| default release binary | 9,748,432 B | 9,748,224 B | -208 B |
+
+追加のlocal-only結果:
+
+- macOS package数: 425
+- Linux package数: 433
+- macOS local-only release binary: 3,884,688 B
+- local-only CLI: `doctor` / `start` / `mcp` のみ
+
+検証:
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features` (34 passed)
+- `cargo clippy --no-default-features -- -D warnings`
+- `cargo test --no-default-features --locked` (24 passed)
+
 ## 受け入れ条件
 
-- [ ] macOS dependency graphにLinux sandbox helper専用crateが含まれない。
-- [ ] Linux sandbox実行が既存のpermission profileとLandlock経路を維持する。
-- [ ] macOS Seatbelt実行が維持される。
-- [ ] vendored OpenSSLが不要な場合は削除され、必要な場合は残す理由がIssueまたはPRに記録される。
-- [ ] network-only dependencyをlocal-only経路から外す方法が実装されるか、互換性上見送る場合は測定結果と理由が記録される。
-- [ ] Cloudflare Access JWT検証とJWKS refreshが維持される。
-- [ ] gateway connect / reconnect / generation分離が維持される。
-- [ ] approval UI、sandbox roots、Git metadata write gateを緩めない。
-- [ ] `cargo fmt --check` が成功する。
-- [ ] `cargo test` が成功する。
-- [ ] `cargo clippy --all-targets -- -D warnings` が成功する。
-- [ ] 変更前後のpackage数、compile time、binary sizeが記録される。
+- [x] macOS dependency graphにLinux sandbox helper専用crateが含まれない。
+- [x] Linux sandbox実行が既存のpermission profileとLandlock経路を維持する。
+- [x] macOS Seatbelt実行が維持される。
+- [x] vendored OpenSSLが不要な場合は削除され、必要な場合は残す理由がIssueまたはPRに記録される。
+- [x] network-only dependencyをlocal-only経路から外す方法が実装されるか、互換性上見送る場合は測定結果と理由が記録される。
+- [x] Cloudflare Access JWT検証とJWKS refreshが維持される。
+- [x] gateway connect / reconnect / generation分離が維持される。
+- [x] approval UI、sandbox roots、Git metadata write gateを緩めない。
+- [x] `cargo fmt --check` が成功する。
+- [x] `cargo test` が成功する。
+- [x] `cargo clippy --all-targets -- -D warnings` が成功する。
+- [x] 変更前後のpackage数、compile time、binary sizeが記録される。
 
 ## 対象外
 

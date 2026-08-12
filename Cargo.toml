@@ -6,26 +6,37 @@ license = "Apache-2.0"
 description = "A sandboxed local-machine MCP server with out-of-band approvals"
 default-run = "local-mcp"
 
+[features]
+default = ["network"]
+network = [
+    "dep:axum",
+    "dep:dotenvy",
+    "dep:jsonwebtoken",
+    "dep:reqwest",
+    "dep:url",
+]
+
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-codex-linux-sandbox = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 codex-protocol = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 codex-sandboxing = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 codex-utils-absolute-path = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 dirs = "6"
-dotenvy = "0.15"
-jsonwebtoken = "9"
-openssl = { version = "0.10", features = ["vendored"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dotenvy = { version = "0.15", optional = true }
+jsonwebtoken = { version = "9", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-url = "2"
+url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+codex-linux-sandbox = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

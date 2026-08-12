@@ -1,16 +1,23 @@
+#[cfg(feature = "network")]
 mod access;
 mod approvals;
 mod config;
 mod doctor;
+#[cfg(feature = "network")]
 mod gateway;
+#[cfg(feature = "network")]
 mod http;
 mod mcp;
 mod sandbox;
 
+#[cfg(feature = "network")]
 use std::net::SocketAddr;
+#[cfg(feature = "network")]
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(feature = "network")]
+use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -34,6 +41,7 @@ enum Command {
     },
     /// Run the session-independent MCP server over stdin/stdout.
     Mcp,
+    #[cfg(feature = "network")]
     /// Run the MCP server over HTTP behind Cloudflare Access.
     Serve {
         /// Public HTTPS base URL clients reach this server through. When
@@ -45,6 +53,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8791")]
         addr: SocketAddr,
     },
+    #[cfg(feature = "network")]
     /// Connect an active local session to a Cloudflare gateway using outbound long polling.
     GatewayAgent {
         /// Cloudflare Worker origin, without a path.
@@ -85,7 +94,9 @@ async fn main() -> Result<()> {
         Command::Doctor => doctor::run().await,
         Command::Start { session_id, yolo } => approvals::start(session_id.as_deref(), yolo).await,
         Command::Mcp => mcp::serve().await,
+        #[cfg(feature = "network")]
         Command::Serve { public_url, addr } => serve_http(public_url, addr).await,
+        #[cfg(feature = "network")]
         Command::GatewayAgent {
             gateway_url,
             session_id,
@@ -109,6 +120,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[cfg(feature = "network")]
 async fn serve_http(public_url: Option<String>, addr: SocketAddr) -> Result<()> {
     load_public_env()?;
     let public_url = public_url
@@ -121,6 +133,7 @@ async fn serve_http(public_url: Option<String>, addr: SocketAddr) -> Result<()> 
     http::serve(addr, public_url, authenticator).await
 }
 
+#[cfg(feature = "network")]
 fn load_public_env() -> Result<()> {
     let Some(config_dir) = dirs::config_dir() else {
         return Ok(());

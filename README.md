@@ -19,6 +19,12 @@ The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
     cargo build --release
     cargo install --path . --locked
 
+The default build includes the public HTTP and gateway-agent commands. For a
+local-only binary containing `doctor`, `start`, and `mcp` without local-mcp's
+direct HTTP/JWT client dependencies, disable the default `network` feature:
+
+    cargo build --release --no-default-features --locked
+
 On Linux, install both local-mcp and the sibling codex-linux-sandbox binary
 in the same directory, and make sure bwrap is available in PATH. macOS uses
 the system Seatbelt sandbox. Windows is not supported.
@@ -42,6 +48,22 @@ If ChatGPT reports that `/.bash_profile` or `/tmp` cannot be found or written,
 update the installed binary with `just install`, run `local-mcp doctor`, and
 restart the origin process. Shell commands receive a minimal environment with
 `HOME` and the standard temporary directories available.
+
+## Release versioning
+
+Releases use CalVer `YYYY.MM.PATCH` in the `Asia/Tokyo` timezone through
+[`f4ah6o/calver-action`](https://github.com/f4ah6o/calver-action). Move the
+`latest` tag to a commit in `main` history to request a release:
+
+    git tag -f latest <commit-to-release>
+    git push -f origin latest
+
+`.github/workflows/release.yaml` allocates the next prefixless CalVer tag,
+updates `Cargo.toml` and `Cargo.lock` in a release-only commit, validates both
+the normal and local-only builds, and pushes the immutable CalVer tag. The
+release-only commit is not merged back into `main`. Existing `vYYYY.MM.PATCH`
+tags are considered during allocation so migration to prefixless tags does not
+reset the monthly patch counter.
 
 ## Local sessions
 

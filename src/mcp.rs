@@ -84,6 +84,7 @@ pub(crate) async fn dispatch(request: &Value) -> Result<Value> {
     dispatch_with_mode(request, false).await
 }
 
+#[cfg(feature = "network")]
 pub(crate) async fn dispatch_public(request: &Value) -> Result<Value> {
     dispatch_with_mode(request, true).await
 }

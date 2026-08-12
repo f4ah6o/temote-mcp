@@ -578,7 +578,9 @@ mod tests {
     use uuid::Uuid;
 
     fn test_directory() -> PathBuf {
-        std::env::temp_dir().join(format!("local-mcp-sandbox-test-{}", Uuid::new_v4()))
+        dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(".local-mcp-sandbox-test-{}", Uuid::new_v4()))
     }
 
     #[tokio::test]
