@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{approvals, config, sandbox};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_ACTIVE_JOBS_PER_SESSION: usize = 4;
+const MAX_ACTIVE_JOBS_PER_SESSION: usize = 8;
 const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
