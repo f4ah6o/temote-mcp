@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -16,15 +16,39 @@ use crate::{approvals, config, sandbox};
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_JOBS_PER_SESSION: usize = 8;
 const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
+#[derive(Clone)]
+enum CachedJobResult {
+    Success(String),
+    Error(String),
+}
+
+#[derive(Default)]
+struct JobCompletion {
+    result: Option<CachedJobResult>,
+    completed_at: Option<Instant>,
+}
+
 struct Job {
     session_id: String,
     command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: JoinHandle<()>,
+    completion: Arc<Mutex<JobCompletion>>,
+}
+
+struct JobSlot {
+    session_id: String,
+}
+
+impl Drop for JobSlot {
+    fn drop(&mut self) {
+        release_job_slot(&self.session_id);
+    }
 }
 
 struct JobState {
@@ -169,7 +193,7 @@ async fn call_tool(params: &Value, public: bool) -> Result<Value> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    reap_inactive_jobs().await;
+    reap_jobs();
     if name == "session_list" {
         anyhow::ensure!(
             args.as_object().is_some_and(|object| object.is_empty()),
@@ -731,51 +755,74 @@ async fn run_git_and_report(
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, mut handle) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, mut handle, completion) = spawn_sandboxed_command(args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
-            release_job_slot(&session.id);
-            text_result(joined.context("command task failed")??)
+            joined.context("command task failed")?;
+            let result = completion
+                .lock()
+                .unwrap()
+                .result
+                .clone()
+                .context("command task completed without a cached result")?;
+            cached_job_result(result)
         }
-        Err(_) => store_job(session, rendered_command, handle, "Backgrounded").await,
+        Err(_) => {
+            store_job(
+                session,
+                rendered_command,
+                handle,
+                completion,
+                "Backgrounded",
+            )
+            .await
+        }
     }
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
-    let (rendered_command, handle) = spawn_sandboxed_command(args, session).await?;
-    store_job(session, rendered_command, handle, "Started").await
+    let (rendered_command, handle, completion) = spawn_sandboxed_command(args, session).await?;
+    store_job(session, rendered_command, handle, completion, "Started").await
 }
 
 async fn spawn_sandboxed_command(
     args: &Value,
     session: &config::Session,
-) -> Result<(String, JoinHandle<Result<String>>)> {
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
     let yolo = session.yolo;
-    reserve_job_slot(&session.id)?;
+    let slot = reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let session_id = session.id.clone();
     let task_command = rendered_command.clone();
+    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
         let result = tokio::select! {
             result = run_session_command(&command, &cwd, &roots, yolo) => {
                 result.and_then(render_output)
             }
             _ = wait_for_session_stop(session_id.clone()) => {
-                anyhow::bail!("session stopped; sandbox job cancelled")
+                Err(anyhow::anyhow!("session stopped; sandbox job cancelled"))
             }
             _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                anyhow::bail!("sandbox job exceeded the two-hour lifetime limit")
+                Err(anyhow::anyhow!("sandbox job exceeded the two-hour lifetime limit"))
             }
         };
+        let cached = cache_job_result(&result);
+        {
+            let mut completion = task_completion.lock().unwrap();
+            completion.result = Some(cached);
+            completion.completed_at = Some(Instant::now());
+        }
+        drop(slot);
         report_command_finished(session_id, &task_command, &result).await;
-        result
     });
-    Ok((rendered_command, handle))
+    Ok((rendered_command, handle, completion))
 }
 
 async fn run_session_command(
@@ -794,7 +841,8 @@ async fn run_session_command(
 async fn store_job(
     session: &config::Session,
     rendered_command: String,
-    handle: JoinHandle<Result<String>>,
+    handle: JoinHandle<()>,
+    completion: Arc<Mutex<JobCompletion>>,
     activity: &str,
 ) -> Result<Value> {
     let job_id = Uuid::new_v4();
@@ -804,6 +852,7 @@ async fn store_job(
             session_id: session.id.clone(),
             command: rendered_command.clone(),
             handle,
+            completion,
         },
     );
     approvals::activity(
@@ -815,7 +864,21 @@ async fn store_job(
     text_result(json!({"status":"running","job_id":job_id}).to_string())
 }
 
-fn reserve_job_slot(session_id: &str) -> Result<()> {
+fn cache_job_result(result: &Result<String>) -> CachedJobResult {
+    match result {
+        Ok(text) => CachedJobResult::Success(text.clone()),
+        Err(error) => CachedJobResult::Error(format!("{error:#}")),
+    }
+}
+
+fn cached_job_result(result: CachedJobResult) -> Result<Value> {
+    match result {
+        CachedJobResult::Success(text) => text_result(text),
+        CachedJobResult::Error(error) => anyhow::bail!(error),
+    }
+}
+
+fn reserve_job_slot(session_id: &str) -> Result<JobSlot> {
     let mut state = jobs().lock().unwrap();
     let active = state
         .active_by_session
@@ -826,7 +889,9 @@ fn reserve_job_slot(session_id: &str) -> Result<()> {
         "session {session_id} already has {MAX_ACTIVE_JOBS_PER_SESSION} active sandbox jobs"
     );
     *active += 1;
-    Ok(())
+    Ok(JobSlot {
+        session_id: session_id.to_owned(),
+    })
 }
 
 fn release_job_slot(session_id: &str) {
@@ -840,48 +905,29 @@ fn release_job_slot(session_id: &str) {
 }
 
 fn remove_job(job_id: Uuid) -> Option<Job> {
-    let mut state = jobs().lock().unwrap();
-    let job = state.jobs.remove(&job_id)?;
-    if let Some(active) = state.active_by_session.get_mut(&job.session_id) {
-        *active = active.saturating_sub(1);
-        if *active == 0 {
-            state.active_by_session.remove(&job.session_id);
-        }
-    }
-    Some(job)
+    jobs().lock().unwrap().jobs.remove(&job_id)
 }
 
-async fn reap_inactive_jobs() {
-    let session_ids = {
+fn reap_jobs() {
+    let now = Instant::now();
+    let expired = {
         let state = jobs().lock().unwrap();
         state
             .jobs
-            .values()
-            .map(|job| job.session_id.clone())
+            .iter()
+            .filter_map(|(job_id, job)| {
+                let completed_at = job.completion.lock().unwrap().completed_at?;
+                (now.saturating_duration_since(completed_at) >= COMPLETED_JOB_TTL)
+                    .then_some(*job_id)
+            })
             .collect::<Vec<_>>()
     };
-    for session_id in session_ids {
-        if config::session_is_active(&session_id)
-            .await
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let job_ids = {
-            let state = jobs().lock().unwrap();
-            state
-                .jobs
-                .iter()
-                .filter(|(_, job)| job.session_id == session_id)
-                .map(|(job_id, _)| *job_id)
-                .collect::<Vec<_>>()
-        };
-        for job_id in job_ids {
-            if let Some(job) = remove_job(job_id) {
-                job.handle.abort();
-                let _ = job.handle.await;
-            }
-        }
+    if expired.is_empty() {
+        return;
+    }
+    let mut state = jobs().lock().unwrap();
+    for job_id in expired {
+        state.jobs.remove(&job_id);
     }
 }
 
@@ -899,34 +945,40 @@ async fn wait_for_session_stop(session_id: String) {
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
-    let finished = {
-        let jobs = jobs().lock().unwrap();
-        let job = jobs.jobs.get(&job_id).context("unknown job_id")?;
+    let result = {
+        let state = jobs().lock().unwrap();
+        let job = state.jobs.get(&job_id).context("unknown job_id")?;
         anyhow::ensure!(
             job.session_id == session.id,
             "job does not belong to this session"
         );
-        job.handle.is_finished()
+        job.completion.lock().unwrap().result.clone()
     };
-    if !finished {
-        return text_result(json!({"status":"running","job_id":job_id}).to_string());
+    if let Some(result) = result {
+        return cached_job_result(result);
     }
 
-    let job = remove_job(job_id).context("unknown job_id")?;
-    let result = job.handle.await.context("background command task failed")?;
-    text_result(result?)
+    let task_finished_without_result = {
+        let state = jobs().lock().unwrap();
+        let job = state.jobs.get(&job_id).context("unknown job_id")?;
+        job.handle.is_finished()
+    };
+    if task_finished_without_result {
+        anyhow::bail!("background command task finished without a cached result")
+    }
+    text_result(json!({"status":"running","job_id":job_id}).to_string())
 }
 
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let job = {
-        let jobs = jobs().lock().unwrap();
-        let job = jobs.jobs.get(&job_id).context("unknown job_id")?;
+        let state = jobs().lock().unwrap();
+        let job = state.jobs.get(&job_id).context("unknown job_id")?;
         anyhow::ensure!(
             job.session_id == session.id,
             "job does not belong to this session"
         );
-        drop(jobs);
+        drop(state);
         remove_job(job_id).context("unknown job_id")?
     };
     job.handle.abort();
@@ -1214,5 +1266,90 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
 
         assert_eq!(result["content"][0]["mimeType"], "image/gif");
+    }
+
+    #[tokio::test]
+    async fn completed_job_result_can_be_polled_repeatedly() {
+        let session_id = format!("test-job-cache-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: session_id.clone(),
+            cwd: std::env::current_dir().unwrap(),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        let job_id = Uuid::new_v4();
+        let completion = Arc::new(Mutex::new(JobCompletion {
+            result: Some(CachedJobResult::Success("cached-result".to_owned())),
+            completed_at: Some(Instant::now()),
+        }));
+        let handle = tokio::spawn(async {});
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id,
+                command: "test".to_owned(),
+                handle,
+                completion,
+            },
+        );
+        let args = json!({"job_id": job_id.to_string()});
+
+        let first = poll_job(&args, &session).await.unwrap();
+        let second = poll_job(&args, &session).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first["content"][0]["text"], "cached-result");
+        remove_job(job_id);
+    }
+
+    #[test]
+    fn completed_jobs_release_their_active_slot_independently_of_cache_retention() {
+        let session_id = format!("test-job-slot-{}", Uuid::new_v4());
+        let slot = reserve_job_slot(&session_id).unwrap();
+        assert_eq!(
+            jobs()
+                .lock()
+                .unwrap()
+                .active_by_session
+                .get(&session_id)
+                .copied(),
+            Some(1)
+        );
+
+        drop(slot);
+
+        assert!(
+            !jobs()
+                .lock()
+                .unwrap()
+                .active_by_session
+                .contains_key(&session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_job_cache_is_reaped_only_after_ttl() {
+        let session_id = format!("test-job-ttl-{}", Uuid::new_v4());
+        let job_id = Uuid::new_v4();
+        let completion = Arc::new(Mutex::new(JobCompletion {
+            result: Some(CachedJobResult::Success("expired".to_owned())),
+            completed_at: Some(Instant::now() - COMPLETED_JOB_TTL - Duration::from_secs(1)),
+        }));
+        let handle = tokio::spawn(async {});
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id,
+                command: "test".to_owned(),
+                handle,
+                completion,
+            },
+        );
+
+        reap_jobs();
+
+        assert!(!jobs().lock().unwrap().jobs.contains_key(&job_id));
     }
 }
