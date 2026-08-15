@@ -2,7 +2,7 @@
 name = "local-mcp"
 version = "2026.8.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT AND Apache-2.0"
 description = "A sandboxed local-machine MCP server with out-of-band approvals"
 default-run = "local-mcp"
 
@@ -21,9 +21,6 @@ anyhow = "1"
 axum = { version = "0.8", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-codex-protocol = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
-codex-sandboxing = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
-codex-utils-absolute-path = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 dirs = "6"
 dotenvy = { version = "0.15", optional = true }
 jsonwebtoken = { version = "9", optional = true }
@@ -33,9 +30,12 @@ serde_json = "1"
 similar = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 url = { version = "2", optional = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+codex-protocol = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
+codex-sandboxing = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
+codex-utils-absolute-path = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 codex-linux-sandbox = { git = "https://github.com/openai/codex", rev = "20fedafff83f5c681fc62f73b0ca3227e42e3f8b" }
 
 [target.'cfg(unix)'.dependencies]

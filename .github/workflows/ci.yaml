@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Verify Linux dependency boundary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          raw = subprocess.check_output([
+              "cargo", "metadata", "--locked", "--format-version", "1",
+              "--filter-platform", "x86_64-unknown-linux-gnu",
+          ])
+          metadata = json.loads(raw)
+          nodes = metadata["resolve"]["nodes"]
+          packages = {package["id"]: package for package in metadata["packages"]}
+          names = {packages[node["id"]]["name"] for node in nodes}
+          required = {
+              "codex-linux-sandbox",
+              "codex-protocol",
+              "codex-sandboxing",
+              "codex-utils-absolute-path",
+          }
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"Linux Codex sandbox packages missing: {missing}")
+          if len(nodes) > 450:
+              raise SystemExit(
+                  f"Linux resolved package count {len(nodes)} exceeds 450"
+              )
+          print(f"x86_64-unknown-linux-gnu: {len(nodes)} packages")
+          PY
+
+      - name: Verify macOS dependency boundary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          expected = {
+              "aarch64-apple-darwin": 193,
+              "x86_64-apple-darwin": 194,
+          }
+          for target, maximum in expected.items():
+              raw = subprocess.check_output([
+                  "cargo", "metadata", "--locked", "--format-version", "1",
+                  "--filter-platform", target,
+              ])
+              metadata = json.loads(raw)
+              nodes = metadata["resolve"]["nodes"]
+              packages = {package["id"]: package for package in metadata["packages"]}
+              codex = sorted({
+                  packages[node["id"]]["name"]
+                  for node in nodes
+                  if packages[node["id"]]["name"].startswith("codex-")
+              })
+              if codex:
+                  raise SystemExit(f"{target}: Codex packages remain: {codex}")
+              if len(nodes) > maximum:
+                  raise SystemExit(
+                      f"{target}: resolved package count {len(nodes)} exceeds {maximum}"
+                  )
+              print(f"{target}: {len(nodes)} packages, codex=0")
+          PY

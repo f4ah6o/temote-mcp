@@ -2,7 +2,8 @@
 
 local-mcp exposes local files and sandboxed commands as MCP tools. It does
 not provide web search or a general network-request tool. Sandboxed commands
-run with Codex Landlock/Seatbelt isolation and network access disabled.
+run with network access disabled. Linux uses the pinned Codex sandbox stack;
+macOS uses local-mcp's native Seatbelt backend.
 
 The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
 
@@ -29,9 +30,10 @@ On Linux, install both local-mcp and the sibling codex-linux-sandbox binary
 in the same directory, and make sure bwrap is available in PATH. macOS uses
 the system Seatbelt sandbox. Windows is not supported.
 
-Keep `--locked` when installing. The Codex sandbox dependency is pinned to a
-Git revision, and resolving its transitive pre-release dependencies without
-the committed lockfile can select incompatible `rama` or `starlark` versions.
+Keep `--locked` when installing. The Linux Codex sandbox dependencies are
+pinned to a Git revision, and resolving their transitive pre-release
+dependencies without the committed lockfile can select incompatible `rama` or
+`starlark` versions. macOS does not resolve the Codex sandbox crates.
 
 Before starting a session or connecting ChatGPT, run the host diagnostics:
 
