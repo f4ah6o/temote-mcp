@@ -1,6 +1,6 @@
 # macOS sandbox を Codex 依存から分離して native Seatbelt backend 化する
 
-Status: open
+Status: done
 Model: GPT-5.6 Sol
 Created: 2026-08-14
 Updated: 2026-08-15
@@ -123,11 +123,15 @@ security behavior change と dependency graph change は分離した。
 1. `eca51e1` `refactor: use native Seatbelt sandbox on macOS`
 2. `d79bbfc` `build: scope Codex sandbox dependencies to Linux`
 
-## 残り
+## 完了確認
 
-- [ ] 上記commitを `main` へpushする。
-- [ ] GitHub Actions `CI` の Ubuntu / macOS jobs が green になることを確認する。
-- [ ] green確認後、このIssueを `issues/done` へ移動する。
+- [x] implementation/docs commits を `main` へpushした。
+- [x] GitHub Actions `CI` run `31854818176` が success。
+- [x] `rust (macos-15)` success（1m25s）。
+- [x] `rust (ubuntu-latest)` success（6m57s）。
+- [x] macOS dependency boundary success。
+- [x] Linux dependency boundary success。
+- [x] Issueを `issues/done` へ移動した。
 
 ## 変更履歴
 
