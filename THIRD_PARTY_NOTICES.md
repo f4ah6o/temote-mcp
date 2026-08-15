@@ -25,10 +25,19 @@ listed below originates there or was added in this repository.
 
 ## Sandboxing
 
-Command isolation uses `codex-sandboxing`, `codex-linux-sandbox`,
+Linux command isolation uses `codex-sandboxing`, `codex-linux-sandbox`,
 `codex-protocol`, and `codex-utils-absolute-path` from
 [`openai/codex`](https://github.com/openai/codex), licensed under the Apache
 License 2.0 and pinned by git revision in [`Cargo.toml`](Cargo.toml).
+
+The macOS Seatbelt base policy in
+[`src/sandbox/macos_base_policy.sbpl`](src/sandbox/macos_base_policy.sbpl) is
+derived from the same OpenAI Codex revision. The surrounding local-mcp
+Seatbelt policy builder is intentionally limited to local-mcp's fixed
+filesystem and network contract rather than porting the general Codex
+permission model. The Apache License 2.0 text is included in
+[`LICENSE-APACHE`](LICENSE-APACHE). Required upstream attribution is retained:
+OpenAI Codex, Copyright 2025 OpenAI.
 
 ## Rust dependencies
 

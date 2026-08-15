@@ -5,14 +5,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use codex_protocol::models::PermissionProfile;
+#[cfg(target_os = "linux")]
 use codex_protocol::permissions::{
     FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
     NetworkSandboxPolicy,
 };
+#[cfg(target_os = "linux")]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+mod policy;
 
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
@@ -23,6 +31,7 @@ pub struct Output {
     pub truncated: bool,
 }
 
+#[cfg(target_os = "linux")]
 fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
     let path = if path.is_absolute() {
         path.to_owned()
@@ -64,28 +73,41 @@ async fn run_with_metadata_roots(
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
-    let roots = writable_roots
-        .iter()
-        .map(|path| absolute(path))
-        .collect::<Result<Vec<_>>>()?;
-    let permissions = PermissionProfile::workspace_write_with(
-        &roots,
-        NetworkSandboxPolicy::Restricted,
-        false, // keep the configured temporary directory available
-        false, // keep /tmp available for ordinary shell commands
-    )
-    .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
-    let permissions = if git_metadata_roots.is_empty() {
-        permissions
-    } else {
-        let git_roots = git_metadata_roots
+    #[cfg(target_os = "linux")]
+    let permissions = {
+        let roots = writable_roots
             .iter()
             .map(|path| absolute(path))
             .collect::<Result<Vec<_>>>()?;
-        let mut file_system = permissions.file_system_sandbox_policy();
-        file_system = file_system.with_additional_writable_roots(&cwd, &git_roots);
-        add_git_metadata_read_only_entries(&mut file_system, &git_roots);
-        PermissionProfile::from_runtime_permissions(&file_system, NetworkSandboxPolicy::Restricted)
+        let permissions = PermissionProfile::workspace_write_with(
+            &roots,
+            NetworkSandboxPolicy::Restricted,
+            false, // keep the configured temporary directory available
+            false, // keep /tmp available for ordinary shell commands
+        )
+        .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
+        if git_metadata_roots.is_empty() {
+            permissions
+        } else {
+            let git_roots = git_metadata_roots
+                .iter()
+                .map(|path| absolute(path))
+                .collect::<Result<Vec<_>>>()?;
+            let mut file_system = permissions.file_system_sandbox_policy();
+            file_system = file_system.with_additional_writable_roots(&cwd, &git_roots);
+            add_git_metadata_read_only_entries(&mut file_system, &git_roots);
+            PermissionProfile::from_runtime_permissions(
+                &file_system,
+                NetworkSandboxPolicy::Restricted,
+            )
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    let spec = if git_metadata_roots.is_empty() {
+        policy::SandboxSpec::command(&cwd, writable_roots)?
+    } else {
+        policy::SandboxSpec::git(&cwd, writable_roots, git_metadata_roots)?
     };
 
     #[cfg(target_os = "linux")]
@@ -114,25 +136,7 @@ async fn run_with_metadata_roots(
     };
 
     #[cfg(target_os = "macos")]
-    let mut process = {
-        use codex_sandboxing::seatbelt::CreateSeatbeltCommandArgsParams;
-        use codex_sandboxing::seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE;
-        use codex_sandboxing::seatbelt::create_seatbelt_command_args;
-
-        let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
-        let args = create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
-            command: command.to_vec(),
-            file_system_sandbox_policy: &file_system_policy,
-            network_sandbox_policy: network_policy,
-            sandbox_policy_cwd: &cwd,
-            enforce_managed_network: false,
-            network: None,
-            extra_allow_unix_sockets: &[],
-        });
-        let mut process = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE);
-        process.args(args);
-        process
-    };
+    let mut process = macos::command(&spec, command)?;
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut process =
@@ -281,6 +285,7 @@ fn resolve_plain_git_pointer(pointer: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve Git pointer target {}", path.display()))
 }
 
+#[cfg(target_os = "linux")]
 fn add_git_metadata_read_only_entries(
     policy: &mut FileSystemSandboxPolicy,
     git_roots: &[AbsolutePathBuf],
@@ -547,8 +552,9 @@ mod generic_tests {
         assert!(error.to_string().contains("outside the working directory"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn git_metadata_policy_keeps_hooks_and_config_read_only() {
+    fn linux_git_metadata_policy_keeps_hooks_and_config_read_only() {
         let repository = tempfile::tempdir().unwrap();
         let git = repository.path().join(".git");
         std::fs::create_dir_all(git.join("hooks")).unwrap();
@@ -620,6 +626,473 @@ mod tests {
         .await?;
         assert_ne!(denied.status, 0);
         assert!(!denied_path.exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_denies_update_and_delete_outside_workspace() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+        let protected = outside.join("protected");
+        std::fs::write(&protected, b"original\n")?;
+
+        let update = run(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'changed\\n' > \"$1\"".into(),
+                "local-mcp-test".into(),
+                protected.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(update.status, 0);
+        assert_eq!(std::fs::read(&protected)?, b"original\n");
+
+        let delete = run(
+            &["/bin/rm".into(), protected.to_string_lossy().into_owned()],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(delete.status, 0);
+        assert_eq!(std::fs::read(&protected)?, b"original\n");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_allows_an_explicit_extra_writable_root() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&extra)?;
+
+        let marker = extra.join("allowed");
+        let output = run(
+            &[
+                "/usr/bin/touch".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            std::slice::from_ref(&extra),
+            None,
+        )
+        .await?;
+
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert!(marker.is_file());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_denies_symlink_escape_from_workspace() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+        std::os::unix::fs::symlink(&outside, workspace.join("escape"))?;
+
+        let marker = workspace.join("escape").join("denied");
+        let output = run(
+            &[
+                "/usr/bin/touch".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+
+        assert_ne!(output.status, 0);
+        assert!(!outside.join("denied").exists());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_denies_rename_and_hardlink_escape_from_workspace() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&outside)?;
+
+        let rename_source = workspace.join("rename-source");
+        std::fs::write(&rename_source, b"rename")?;
+        let rename_target = outside.join("rename-target");
+        let rename = run(
+            &[
+                "/bin/mv".into(),
+                rename_source.to_string_lossy().into_owned(),
+                rename_target.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(rename.status, 0);
+        assert!(rename_source.is_file());
+        assert!(!rename_target.exists());
+
+        let link_source = workspace.join("link-source");
+        std::fs::write(&link_source, b"link")?;
+        let link_target = outside.join("link-target");
+        let link = run(
+            &[
+                "/bin/ln".into(),
+                link_source.to_string_lossy().into_owned(),
+                link_target.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(link.status, 0);
+        assert!(!link_target.exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_keeps_git_metadata_read_only_for_normal_commands() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let git = workspace.join(".git");
+        std::fs::create_dir_all(&git)?;
+
+        let index = git.join("index");
+        let output = run(
+            &[
+                "/usr/bin/touch".into(),
+                index.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+
+        assert_ne!(output.status, 0);
+        assert!(!index.exists());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broader_writable_root_does_not_bypass_workspace_git_protection() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let git = workspace.join(".git");
+        std::fs::create_dir_all(&git)?;
+
+        let index = git.join("index");
+        let output = run(
+            &[
+                "/usr/bin/touch".into(),
+                index.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            std::slice::from_ref(&root),
+            None,
+        )
+        .await?;
+
+        assert_ne!(output.status, 0);
+        assert!(!index.exists());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_git_mode_allows_index_but_protects_config() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        let git = workspace.join(".git");
+        std::fs::create_dir_all(&git)?;
+        let config = git.join("config");
+        std::fs::write(&config, b"protected\n")?;
+        let git_roots = git_metadata_roots(&workspace)?;
+
+        let index = git.join("index");
+        let allowed = run_git(
+            &[
+                "/usr/bin/touch".into(),
+                index.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(allowed.status, 0, "{}", allowed.stderr);
+        assert!(index.is_file());
+
+        let denied = run_git(
+            &[
+                "/usr/bin/touch".into(),
+                config.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_ne!(denied.status, 0);
+        assert_eq!(std::fs::read(&config)?, b"protected\n");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_git_mode_runs_real_add_and_commit_and_protects_sensitive_metadata()
+    -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let init = std::process::Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status()?;
+        assert!(init.success());
+        std::fs::write(workspace.join("tracked.txt"), b"tracked\n")?;
+        let git_roots = git_metadata_roots(&workspace)?;
+
+        let add = run_git(
+            &[
+                "/usr/bin/git".into(),
+                "add".into(),
+                "--".into(),
+                "tracked.txt".into(),
+            ],
+            &workspace,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(add.status, 0, "{}", add.stderr);
+
+        let commit = run_git(
+            &[
+                "/usr/bin/git".into(),
+                "-c".into(),
+                "user.name=local-mcp test".into(),
+                "-c".into(),
+                "user.email=local-mcp@example.invalid".into(),
+                "-c".into(),
+                "core.hooksPath=/dev/null".into(),
+                "-c".into(),
+                "commit.gpgSign=false".into(),
+                "commit".into(),
+                "--no-verify".into(),
+                "--no-gpg-sign".into(),
+                "-m".into(),
+                "sandbox acceptance".into(),
+            ],
+            &workspace,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(commit.status, 0, "{}", commit.stderr);
+
+        let git = workspace.join(".git");
+        for protected in [
+            "config",
+            "hooks/blocked",
+            "refs/tags/blocked",
+            "refs/remotes/blocked",
+            "objects/pack/blocked",
+        ] {
+            let path = git.join(protected);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let denied = run_git(
+                &["/usr/bin/touch".into(), path.to_string_lossy().into_owned()],
+                &workspace,
+                std::slice::from_ref(&root),
+                &git_roots,
+                None,
+            )
+            .await?;
+            assert_ne!(denied.status, 0, "unexpectedly wrote {}", path.display());
+            assert!(!path.exists() || protected == "config");
+        }
+
+        let head = std::process::Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&workspace)
+            .output()?;
+        assert!(
+            head.status.success(),
+            "{}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_git_mode_commits_in_a_linked_worktree() -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let repository = root.join("repository");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repository)?;
+
+        let init = std::process::Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .status()?;
+        assert!(init.success());
+        std::fs::write(repository.join("base.txt"), b"base\n")?;
+        for args in [
+            vec!["add", "--", "base.txt"],
+            vec![
+                "-c",
+                "user.name=local-mcp test",
+                "-c",
+                "user.email=local-mcp@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        ] {
+            let status = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(&repository)
+                .status()?;
+            assert!(status.success());
+        }
+        let status = std::process::Command::new("/usr/bin/git")
+            .args(["worktree", "add", "-q", "-b", "feature"])
+            .arg(&worktree)
+            .current_dir(&repository)
+            .status()?;
+        assert!(status.success());
+
+        std::fs::write(worktree.join("feature.txt"), b"feature\n")?;
+        let git_roots = git_metadata_roots(&worktree)?;
+        assert_eq!(git_roots.len(), 2);
+
+        let add = run_git(
+            &[
+                "/usr/bin/git".into(),
+                "add".into(),
+                "--".into(),
+                "feature.txt".into(),
+            ],
+            &worktree,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(add.status, 0, "{}", add.stderr);
+
+        let commit = run_git(
+            &[
+                "/usr/bin/git".into(),
+                "-c".into(),
+                "user.name=local-mcp test".into(),
+                "-c".into(),
+                "user.email=local-mcp@example.invalid".into(),
+                "-c".into(),
+                "core.hooksPath=/dev/null".into(),
+                "-c".into(),
+                "commit.gpgSign=false".into(),
+                "commit".into(),
+                "--no-verify".into(),
+                "--no-gpg-sign".into(),
+                "-m".into(),
+                "linked worktree acceptance".into(),
+            ],
+            &worktree,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(commit.status, 0, "{}", commit.stderr);
+
+        let head = std::process::Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&worktree)
+            .output()?;
+        assert!(
+            head.status.success(),
+            "{}",
+            String::from_utf8_lossy(&head.stderr)
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

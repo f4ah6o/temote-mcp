@@ -132,6 +132,10 @@ pub async fn run() -> Result<()> {
 
     let mut report = Report::new();
     check_platform(&mut report);
+    #[cfg(target_os = "macos")]
+    report.add(Check::pass("sandbox backend", "native macOS Seatbelt"));
+    #[cfg(target_os = "linux")]
+    report.add(Check::pass("sandbox backend", "Codex Linux sandbox"));
 
     #[cfg(target_os = "linux")]
     {
@@ -341,7 +345,11 @@ async fn check_sandbox_execution(report: &mut Report) {
     };
 
     let roots = vec![cwd.clone()];
-    match sandbox::run(&["/bin/true".to_owned()], &cwd, &roots, None).await {
+    #[cfg(target_os = "macos")]
+    let true_executable = "/usr/bin/true";
+    #[cfg(not(target_os = "macos"))]
+    let true_executable = "/bin/true";
+    match sandbox::run(&[true_executable.to_owned()], &cwd, &roots, None).await {
         Ok(output) if output.status == 0 => report.add(Check::pass(
             "sandbox execution",
             "a local-mcp sandboxed command completed successfully",
