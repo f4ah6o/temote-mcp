@@ -12,9 +12,9 @@ Branch: chore/20260806-purge-example-domain-history
 
 ## 背景
 
-`local-mcp` の公開 HTTP エンドポイントは Cloudflare Access Managed OAuth で保護されており、README には運用ドメインとして旧ドメイン `localmcp.example.com` が記載されていた（[README.md](../../README.md)）。`origin`（`f4ah6o/local-mcp`）は private リポジトリで、`upstream`（`nakasyou/local-mcp`）は無関係の別プロジェクトであり、外部への公開実績はない。運用ドメインを `temotemcp.example.com` に切り替えるにあたり、旧ドメインと、[src/http.rs](../../src/http.rs) のテストコードに含まれる実名メールアドレス（プレースホルダー: `test@example.com` に置換）を履歴からも除去する。
+`local-mcp` の公開 HTTP エンドポイントは Cloudflare Access Managed OAuth で保護されており、README には運用ドメインとして旧ドメイン `localmcp.example.com` が記載されていた（[README.md](../../README.md)）。`origin`（`f4ah6o/local-mcp`）は当時 private リポジトリだった。なお、当時この issue では `upstream`（`nakasyou/local-mcp`）を「無関係の別プロジェクト」と認識していたが、公開準備時の再確認で、本リポジトリが同 upstream から派生したことを明示する方針へ訂正した。運用ドメインを `temotemcp.example.com` に切り替えるにあたり、旧ドメインと、[src/http.rs](../../src/http.rs) のテストコードに含まれる実名メールアドレス（プレースホルダー: `test@example.com` に置換）を履歴からも除去する。
 
-このイシューは [20260806-reconnect-oauth-example-domain.md](20260806-reconnect-oauth-example-domain.md) の前提作業であり、Cloudflare 側の再設定より先に完了させる。
+このイシューは [20260806-reconnect-oauth-example-domain.md](../open/20260806-reconnect-oauth-example-domain.md) の前提作業であり、Cloudflare 側の再設定より先に完了させる。
 
 ## 問題
 
@@ -31,7 +31,7 @@ Branch: chore/20260806-purge-example-domain-history
 
 ## 対象外
 
-- Cloudflare Access / Tunnel 側の再設定（[20260806-reconnect-oauth-example-domain.md](20260806-reconnect-oauth-example-domain.md) で扱う）。
+- Cloudflare Access / Tunnel 側の再設定（[20260806-reconnect-oauth-example-domain.md](../open/20260806-reconnect-oauth-example-domain.md) で扱う）。
 - `~/.config/local-mcp/public.env` の値の設定（同上）。
 - `opz`（1Password CLI ラッパー）のトラブルシューティング。生の `op item list --format json`（vault 指定なし）が `authorization timeout` になる一方、`--vault Personal` 指定時や単発の直接呼び出しは数秒で成功する。`opz` はad-hoc署名の自己ビルドバイナリで、再ビルドのたびに1Password側の承認がリセットされている可能性がある。原因調査はスコープ外とする。
 
@@ -72,6 +72,6 @@ Branch: chore/20260806-purge-example-domain-history
 
 ## 注記
 
-- origin は private リポジトリ（`f4ah6o/local-mcp`）であり、外部公開の形跡はない。upstream（`nakasyou/local-mcp`）は無関係の別プロジェクトで、そちらへの PR も存在しない。
+- 2026-08-18 公開準備時に lineage を再確認し、本リポジトリは `nakasyou/local-mcp` から派生したものとして README と third-party notice で明示する方針に訂正した。GitHub の fork metadata は持たない。
 - 本イシューの実行はコマンド実行のみで完結し、Cloudflare ダッシュボード側の操作は不要。
 - 2026-08-06: バックアップ clone 作成、`feat/oauth-http-server` 削除（ローカル・origin）、`git filter-repo --replace-text` 実行、`origin/main` へ force push、GitHubからのクリーンcloneで受け入れ条件を全て確認済み。`cargo test` の4件の失敗はfilter-repo前のバックアップでも再現する既存の環境依存問題（macOSの `/tmp` symlink、Seatbelt）であり、本作業とは無関係と確認した。

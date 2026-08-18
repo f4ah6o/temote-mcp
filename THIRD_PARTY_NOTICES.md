@@ -1,5 +1,7 @@
 # Third-Party Notices
 
+[日本語](THIRD_PARTY_NOTICES.ja.md)
+
 This project incorporates third-party open-source software distributed under
 the terms of their respective licenses.
 
@@ -13,15 +15,13 @@ listed below originates there or was added in this repository.
 
 ## Ported sources
 
-- [`src/oauth.rs`](src/oauth.rs) and [`src/http.rs`](src/http.rs) are derived
-  from [`f4ah6o/shuttle-rs`](https://github.com/f4ah6o/shuttle-rs)
-  (`src/oauth.rs` and `src/app.rs`), dual-licensed under MIT OR Apache-2.0.
-
-  Modifications: the SQLite-backed OAuth store was replaced by the JSON state
-  file this crate already uses for sessions, refresh tokens with rotation were
-  added, dynamic client registration was restricted to an allow list of
-  redirect URIs, and MCP requests are dispatched through this crate's own
-  stdio handler.
+- [`src/http.rs`](src/http.rs) originated from
+  [`f4ah6o/shuttle-rs`](https://github.com/f4ah6o/shuttle-rs) (`src/app.rs`),
+  dual-licensed under MIT OR Apache-2.0. Earlier revisions also ported its
+  OAuth implementation; that code was later removed when Cloudflare Access
+  became the Managed OAuth boundary. The current HTTP layer dispatches MCP
+  requests through local-mcp's own handler and validates Cloudflare Access at
+  the origin.
 
 ## Sandboxing
 

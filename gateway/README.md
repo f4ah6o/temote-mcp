@@ -1,5 +1,7 @@
 # local-mcp Cloudflare gateway
 
+[日本語](README.ja.md)
+
 This Worker exposes one MCP endpoint to ChatGPT and routes each tool call to a
 Mac, Linux, or Windows/WSL2 host selected by `session_id`. Hosts make outbound
 HTTPS long-poll requests; no inbound port or per-host Tunnel is required.

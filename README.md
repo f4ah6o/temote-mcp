@@ -1,5 +1,11 @@
 # local-mcp
 
+[日本語](README.ja.md)
+
+**Lineage:** Derived from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp); focused on secure remote access, gateway operation, and MCP bridging.
+
+**テモート / Temote:** This project also credits [@mr_konn's proposal of 「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), a Japanese coinage for the opposite of “remote”. No Latin spelling is attributed here to the original proposal; this repository uses **Temote** as its own romanization, including the example hostname `temotemcp.example.com`. This naming influence is acknowledged alongside the upstream project because both are foundational to this project's identity.
+
 local-mcp exposes local files and sandboxed commands as MCP tools. It does
 not provide web search or a general network-request tool. Sandboxed commands
 run with network access disabled. Linux uses the pinned Codex sandbox stack;
