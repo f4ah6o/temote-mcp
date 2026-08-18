@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
-use crate::sandbox;
+use crate::{kintone_mcp, sandbox};
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -35,6 +36,9 @@ enum Message {
     OnePasswordServiceAccount {
         request: ServiceAccountRequest,
     },
+    KintoneMcp {
+        request: KintoneMcpRequest,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -51,6 +55,20 @@ enum ServiceAccountRequest {
 
 #[derive(Serialize, Deserialize)]
 struct ServiceAccountResponse {
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum KintoneMcpRequest {
+    Status,
+    Discover,
+    Call { tool_name: String, arguments: Value },
+}
+
+#[derive(Serialize, Deserialize)]
+struct KintoneMcpResponse {
     result: Option<Value>,
     error: Option<String>,
 }
@@ -109,6 +127,52 @@ pub async fn onepassword_service_account_run(
     .await
 }
 
+pub async fn kintone_mcp_status(session_id: &str) -> Result<Value> {
+    kintone_mcp_request(session_id, KintoneMcpRequest::Status).await
+}
+
+pub async fn kintone_mcp_discover(session_id: &str) -> Result<Value> {
+    kintone_mcp_request(session_id, KintoneMcpRequest::Discover).await
+}
+
+pub async fn kintone_mcp_call(
+    session_id: &str,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<Value> {
+    kintone_mcp_request(
+        session_id,
+        KintoneMcpRequest::Call {
+            tool_name: tool_name.to_owned(),
+            arguments,
+        },
+    )
+    .await
+}
+
+async fn kintone_mcp_request(session_id: &str, request: KintoneMcpRequest) -> Result<Value> {
+    let path = config::socket_path(session_id)?;
+    let mut stream = UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
+    stream
+        .write_all(&serde_json::to_vec(&Message::KintoneMcp { request })?)
+        .await?;
+    stream.write_all(b"\n").await?;
+    stream.shutdown().await?;
+
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).await?;
+    let response: KintoneMcpResponse =
+        serde_json::from_str(response.trim()).context("invalid kintone MCP response")?;
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
+    response
+        .result
+        .context("kintone MCP response is missing result")
+}
+
 async fn service_account_request(
     session_id: &str,
     request: ServiceAccountRequest,
@@ -163,6 +227,7 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
     let service_account_token = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let kintone_bridge = Arc::new(tokio::sync::Mutex::new(kintone_mcp::Bridge::capture()));
     let id = config::session_id(session_id)?;
     config::remove_inactive_socket(&id).await?;
     let mut session = config::new_session(&std::env::current_dir()?, Some(&id), yolo)?;
@@ -201,6 +266,14 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
             "not configured"
         }
     );
+    eprintln!(
+        "kintone MCP: {}",
+        if kintone_bridge.lock().await.configured() {
+            "configured (credentials kept only by this session process)"
+        } else {
+            "not configured"
+        }
+    );
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<(Request, UnixStream)>::new();
@@ -210,6 +283,7 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
         &mut session,
         &mut pending,
         service_account_token.as_deref(),
+        Arc::clone(&kintone_bridge),
     )
     .await;
     session.process_id = 0;
@@ -226,6 +300,7 @@ async fn run_session(
     session: &mut Session,
     pending: &mut VecDeque<(Request, UnixStream)>,
     service_account_token: Option<&str>,
+    kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
 ) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -257,6 +332,22 @@ async fn run_session(
                             }
                         });
                     }
+                    Message::KintoneMcp { request } => {
+                        let session = session.clone();
+                        let bridge = Arc::clone(&kintone_bridge);
+                        tokio::spawn(async move {
+                            let response = handle_kintone_mcp_request(&session, bridge, request).await;
+                            let response = match response {
+                                Ok(result) => KintoneMcpResponse { result: Some(result), error: None },
+                                Err(error) => KintoneMcpResponse { result: None, error: Some(format!("{error:#}")) },
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&response) {
+                                let _ = stream.write_all(&bytes).await;
+                                let _ = stream.write_all(b"\n").await;
+                                let _ = stream.shutdown().await;
+                            }
+                        });
+                    }
                     Message::Approval { request } if session.yolo => {
                         eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
                         stream.write_all(b"allow\n").await?;
@@ -277,6 +368,22 @@ async fn run_session(
                 return Ok(());
             }
         }
+    }
+}
+
+async fn handle_kintone_mcp_request(
+    session: &Session,
+    bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
+    request: KintoneMcpRequest,
+) -> Result<Value> {
+    let mut bridge = bridge.lock().await;
+    match request {
+        KintoneMcpRequest::Status => Ok(bridge.status(session)),
+        KintoneMcpRequest::Discover => bridge.discover(session).await,
+        KintoneMcpRequest::Call {
+            tool_name,
+            arguments,
+        } => bridge.call_tool(session, &tool_name, arguments).await,
     }
 }
 

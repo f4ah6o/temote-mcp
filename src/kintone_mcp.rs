@@ -1,0 +1,484 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+use crate::config;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const PROTOCOL_VERSION: &str = "2025-06-18";
+const KINTONE_ENV_NAMES: &[&str] = &[
+    "KINTONE_BASE_URL",
+    "KINTONE_USERNAME",
+    "KINTONE_PASSWORD",
+    "KINTONE_API_TOKEN",
+    "KINTONE_BASIC_AUTH_USERNAME",
+    "KINTONE_BASIC_AUTH_PASSWORD",
+    "KINTONE_PFX_FILE_PATH",
+    "KINTONE_PFX_FILE_PASSWORD",
+    "KINTONE_ATTACHMENTS_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+];
+const CHILD_RUNTIME_ENV_NAMES: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+
+pub struct Bridge {
+    executable_override: Option<PathBuf>,
+    environment: BTreeMap<String, String>,
+    client: Option<Client>,
+}
+
+impl Bridge {
+    pub fn capture() -> Self {
+        let executable_override = std::env::var_os("LOCAL_MCP_KINTONE_MCP").map(PathBuf::from);
+        let environment = KINTONE_ENV_NAMES
+            .iter()
+            .chain(CHILD_RUNTIME_ENV_NAMES.iter())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ((*name).to_owned(), value))
+            })
+            .collect();
+        Self {
+            executable_override,
+            environment,
+            client: None,
+        }
+    }
+
+    pub fn configured(&self) -> bool {
+        self.environment
+            .get("KINTONE_BASE_URL")
+            .is_some_and(|value| !value.trim().is_empty())
+            && self.auth_mode().is_some()
+    }
+
+    pub fn status(&self, session: &config::Session) -> Value {
+        let executable_found = self.executable_path().is_ok();
+        let configuration_valid = self.validated_environment(session).is_ok();
+        json!({
+            "configured": self.configured(),
+            "configuration_valid": configuration_valid,
+            "executable_found": executable_found,
+            "auth_mode": self.auth_mode(),
+            "basic_auth_configured": self.environment.contains_key("KINTONE_BASIC_AUTH_USERNAME")
+                || self.environment.contains_key("KINTONE_BASIC_AUTH_PASSWORD"),
+            "client_certificate_configured": self.environment.contains_key("KINTONE_PFX_FILE_PATH"),
+            "attachments_dir_configured": self.environment.contains_key("KINTONE_ATTACHMENTS_DIR"),
+            "proxy_configured": self.environment.contains_key("HTTPS_PROXY")
+                || self.environment.contains_key("https_proxy"),
+        })
+    }
+
+    pub async fn discover(&mut self, session: &config::Session) -> Result<Value> {
+        self.ensure_client(session).await?;
+        let result = self
+            .client
+            .as_mut()
+            .context("kintone MCP client disappeared")?
+            .request("tools/list", json!({}))
+            .await;
+        match result {
+            Ok(value) => Ok(json!({"tools": value["tools"]})),
+            Err(error) => {
+                self.client = None;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn call_tool(
+        &mut self,
+        session: &config::Session,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value> {
+        anyhow::ensure!(!tool_name.is_empty(), "kintone tool name must not be empty");
+        anyhow::ensure!(
+            arguments.is_object(),
+            "kintone tool arguments must be an object"
+        );
+        self.ensure_client(session).await?;
+
+        let listed = self
+            .client
+            .as_mut()
+            .context("kintone MCP client disappeared")?
+            .request("tools/list", json!({}))
+            .await;
+        let listed = match listed {
+            Ok(value) => value,
+            Err(error) => {
+                self.client = None;
+                return Err(error);
+            }
+        };
+        let known = listed["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["name"].as_str() == Some(tool_name))
+        });
+        anyhow::ensure!(known, "unknown kintone MCP tool: {tool_name}");
+
+        let result = self
+            .client
+            .as_mut()
+            .context("kintone MCP client disappeared")?
+            .request(
+                "tools/call",
+                json!({"name": tool_name, "arguments": arguments}),
+            )
+            .await;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.client = None;
+                Err(error)
+            }
+        }
+    }
+
+    async fn ensure_client(&mut self, session: &config::Session) -> Result<()> {
+        let environment = self.validated_environment(session)?;
+        if self.client.is_none() {
+            let executable = self.executable_path()?;
+            self.client = Some(Client::spawn(&executable, &session.cwd, &environment).await?);
+        }
+        Ok(())
+    }
+
+    fn auth_mode(&self) -> Option<&'static str> {
+        let username = self
+            .environment
+            .get("KINTONE_USERNAME")
+            .is_some_and(|value| !value.trim().is_empty());
+        let password = self
+            .environment
+            .get("KINTONE_PASSWORD")
+            .is_some_and(|value| !value.trim().is_empty());
+        if username && password {
+            return Some("password");
+        }
+        self.environment
+            .get("KINTONE_API_TOKEN")
+            .is_some_and(|value| !value.trim().is_empty())
+            .then_some("api_token")
+    }
+
+    fn validated_environment(&self, session: &config::Session) -> Result<BTreeMap<String, String>> {
+        let base_url = self
+            .environment
+            .get("KINTONE_BASE_URL")
+            .filter(|value| !value.trim().is_empty())
+            .context(
+                "kintone MCP is not configured; start the session with KINTONE_BASE_URL set",
+            )?;
+        anyhow::ensure!(
+            base_url.starts_with("https://") || base_url.starts_with("http://"),
+            "KINTONE_BASE_URL must be an http:// or https:// URL"
+        );
+        anyhow::ensure!(
+            self.auth_mode().is_some(),
+            "kintone MCP authentication is not configured; set KINTONE_USERNAME and KINTONE_PASSWORD, or KINTONE_API_TOKEN, when starting the session"
+        );
+        anyhow::ensure!(
+            self.environment.contains_key("KINTONE_USERNAME")
+                == self.environment.contains_key("KINTONE_PASSWORD"),
+            "KINTONE_USERNAME and KINTONE_PASSWORD must be set together"
+        );
+        anyhow::ensure!(
+            self.environment.contains_key("KINTONE_BASIC_AUTH_USERNAME")
+                == self.environment.contains_key("KINTONE_BASIC_AUTH_PASSWORD"),
+            "KINTONE_BASIC_AUTH_USERNAME and KINTONE_BASIC_AUTH_PASSWORD must be set together"
+        );
+        anyhow::ensure!(
+            self.environment.contains_key("KINTONE_PFX_FILE_PATH")
+                == self.environment.contains_key("KINTONE_PFX_FILE_PASSWORD"),
+            "KINTONE_PFX_FILE_PATH and KINTONE_PFX_FILE_PASSWORD must be set together"
+        );
+
+        let mut environment = self.environment.clone();
+        if let Some(path) = self.environment.get("KINTONE_PFX_FILE_PATH") {
+            let resolved = config::resolve_existing_path(session, Path::new(path))?;
+            anyhow::ensure!(
+                resolved.is_file(),
+                "KINTONE_PFX_FILE_PATH must point to a file"
+            );
+            environment.insert(
+                "KINTONE_PFX_FILE_PATH".to_owned(),
+                resolved.display().to_string(),
+            );
+        }
+        if let Some(path) = self.environment.get("KINTONE_ATTACHMENTS_DIR") {
+            let path = Path::new(path);
+            let resolved = if path.exists() {
+                config::resolve_existing_path(session, path)?
+            } else {
+                config::resolve_write_path(session, path)?
+            };
+            if resolved.exists() {
+                anyhow::ensure!(
+                    resolved.is_dir(),
+                    "KINTONE_ATTACHMENTS_DIR must point to a directory"
+                );
+            }
+            environment.insert(
+                "KINTONE_ATTACHMENTS_DIR".to_owned(),
+                resolved.display().to_string(),
+            );
+        }
+        Ok(environment)
+    }
+
+    fn executable_path(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.executable_override {
+            anyhow::ensure!(
+                path.is_absolute(),
+                "LOCAL_MCP_KINTONE_MCP must be an absolute path"
+            );
+            anyhow::ensure!(
+                path.is_file(),
+                "kintone MCP executable not found: {}",
+                path.display()
+            );
+            return Ok(path.clone());
+        }
+        let path = self
+            .environment
+            .get("PATH")
+            .and_then(|path| find_on_path("kintone-mcp-server", path));
+        path.context(
+            "kintone-mcp-server was not found in PATH; install @kintone/mcp-server globally or set LOCAL_MCP_KINTONE_MCP to its absolute executable path",
+        )
+    }
+}
+
+struct Client {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    next_id: u64,
+}
+
+impl Client {
+    async fn spawn(
+        executable: &Path,
+        cwd: &Path,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let mut command = Command::new(executable);
+        command
+            .current_dir(cwd)
+            .env_clear()
+            .envs(environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start kintone MCP server at {}",
+                executable.display()
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("kintone MCP stdin is unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("kintone MCP stdout is unavailable")?;
+        let mut client = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            next_id: 1,
+        };
+        client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "local-mcp",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await
+            .context("failed to initialize kintone MCP server")?;
+        client
+            .notify("notifications/initialized", json!({}))
+            .await
+            .context("failed to finish kintone MCP initialization")?;
+        Ok(client)
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .await
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await?;
+
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                let Some(line) = self.stdout.next_line().await? else {
+                    let status = self.child.try_wait().ok().flatten();
+                    anyhow::bail!("kintone MCP server closed stdout (status: {status:?})")
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let message: Value = serde_json::from_str(&line)
+                    .context("kintone MCP server returned invalid JSON")?;
+                if message.get("id") == Some(&json!(id)) {
+                    if let Some(error) = message.get("error") {
+                        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+                        let message = error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown kintone MCP error");
+                        anyhow::bail!("kintone MCP error {code}: {message}")
+                    }
+                    return message
+                        .get("result")
+                        .cloned()
+                        .context("kintone MCP response is missing result");
+                }
+                if message.get("id").is_some() && message.get("method").is_some() {
+                    let request_id = message.get("id").cloned().unwrap_or(Value::Null);
+                    self.write_json(&json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32601,
+                            "message": "local-mcp does not expose client-side MCP capabilities to kintone"
+                        }
+                    }))
+                    .await?;
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for kintone MCP server")?
+    }
+
+    async fn write_json(&mut self, value: &Value) -> Result<()> {
+        self.stdin
+            .write_all(serde_json::to_string(value)?.as_bytes())
+            .await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+}
+
+fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|directory| directory.join(executable))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bridge(environment: &[(&str, &str)]) -> Bridge {
+        Bridge {
+            executable_override: None,
+            environment: environment
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            client: None,
+        }
+    }
+
+    fn session(root: &Path) -> config::Session {
+        let root = config::canonical_directory(root).unwrap();
+        config::Session {
+            id: "kintone-test".to_owned(),
+            cwd: root.clone(),
+            permitted_directories: vec![root],
+            started_at: 0,
+            process_id: 0,
+            yolo: false,
+        }
+    }
+
+    #[test]
+    fn accepts_password_or_api_token_authentication_without_exposing_values() {
+        let password = bridge(&[
+            ("KINTONE_BASE_URL", "https://example.cybozu.com"),
+            ("KINTONE_USERNAME", "user"),
+            ("KINTONE_PASSWORD", "secret"),
+        ]);
+        assert!(password.configured());
+        assert_eq!(password.auth_mode(), Some("password"));
+
+        let token = bridge(&[
+            ("KINTONE_BASE_URL", "https://example.cybozu.com"),
+            ("KINTONE_API_TOKEN", "secret-token"),
+        ]);
+        assert!(token.configured());
+        assert_eq!(token.auth_mode(), Some("api_token"));
+        let status = token.status(&session(tempfile::tempdir().unwrap().path()));
+        let rendered = status.to_string();
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("example.cybozu.com"));
+    }
+
+    #[test]
+    fn normal_sessions_reject_kintone_file_paths_outside_permitted_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let pfx = outside.path().join("client.pfx");
+        std::fs::write(&pfx, b"fake").unwrap();
+        let bridge = bridge(&[
+            ("KINTONE_BASE_URL", "https://example.cybozu.com"),
+            ("KINTONE_API_TOKEN", "secret-token"),
+            ("KINTONE_PFX_FILE_PATH", pfx.to_str().unwrap()),
+        ]);
+        let session = session(root.path());
+        assert!(bridge.validated_environment(&session).is_err());
+    }
+
+    #[test]
+    fn attachments_directory_must_stay_inside_permitted_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let bridge = bridge(&[
+            ("KINTONE_BASE_URL", "https://example.cybozu.com"),
+            ("KINTONE_API_TOKEN", "secret-token"),
+            (
+                "KINTONE_ATTACHMENTS_DIR",
+                outside.path().join("downloads").to_str().unwrap(),
+            ),
+        ]);
+        let session = session(root.path());
+        assert!(bridge.validated_environment(&session).is_err());
+    }
+}

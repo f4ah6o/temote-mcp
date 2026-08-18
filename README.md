@@ -255,10 +255,10 @@ If OAuth succeeds but ChatGPT shows no tools, refresh the MCP connection after
 restarting `local-mcp serve` (especially after changing the self-hosted
 application AUD). The direct connection URL is still exactly
 `https://temotemcp.example.com/mcp`; the host root is only used for OAuth
-discovery. The public `tools/list` response contains fifteen tools, including the
-restricted `git_add`, `git_commit`, `git_fetch`, `git_pull`, and `git_push`
-operations; `without_sandbox` is intentionally available only in local stdio
-mode. Each public tool must
+discovery. The public `tools/list` response includes the restricted `git_add`, `git_commit`,
+`git_fetch`, `git_pull`, and `git_push` operations plus the configured child-MCP
+bridges; `without_sandbox` is intentionally available only in local stdio mode.
+Each public tool must
 include a name, display title, description, input schema, and annotations.
 Start a new ChatGPT conversation and add the MCP connection from the tools
 menu so ChatGPT requests the refreshed tool list. See the [OpenAI
@@ -360,6 +360,55 @@ for fully unattended operation use:
 `env_files` and `cwd` remain restricted to the session's permitted filesystem
 roots in normal mode. The service-account token should be scoped to only the
 vaults required by the automation.
+
+## kintone MCP Server
+
+local-mcp can also bridge the official [`@kintone/mcp-server`](https://github.com/kintone/mcp-server).
+Install its CLI on the host first; the upstream package currently requires Node.js 22 or newer:
+
+    npm install -g @kintone/mcp-server
+
+Start the local-mcp session with the kintone settings on the **`local-mcp start`
+process**, not on `local-mcp serve` or `gateway-agent`. The session process keeps
+the credential values in memory and does not write them to session metadata or
+return them through MCP:
+
+    KINTONE_BASE_URL='https://example.cybozu.com' \
+    KINTONE_API_TOKEN='<api-token>' \
+    local-mcp start my-project
+
+Username/password authentication is also supported:
+
+    KINTONE_BASE_URL='https://example.cybozu.com' \
+    KINTONE_USERNAME='<username>' \
+    KINTONE_PASSWORD='<password>' \
+    local-mcp start my-project
+
+The bridge passes the official configuration variables supported by the upstream
+server: `KINTONE_BASE_URL`, username/password or `KINTONE_API_TOKEN`, optional
+Basic-auth credentials, PFX client-certificate settings, `HTTPS_PROXY`/`https_proxy`, and
+`KINTONE_ATTACHMENTS_DIR`. `KINTONE_PFX_FILE_PATH` and
+`KINTONE_ATTACHMENTS_DIR` must remain inside the selected session's permitted
+filesystem roots in normal mode. Set `LOCAL_MCP_KINTONE_MCP` to an absolute
+path when `kintone-mcp-server` is not on `PATH`.
+
+Three public/local tools are exposed:
+
+- `kintone_mcp_status` reports whether the executable and required configuration
+  are present without returning credential values or the tenant URL.
+- `kintone_mcp_discover` starts the child server on demand and lists its current
+  tool schemas.
+- `kintone_mcp_call` forwards one named child tool call over the session-local
+  stdio connection. Because the current upstream server does not annotate tools
+  as read-only versus mutating, every forwarded call is approval-gated in normal
+  mode. A session started with `--yolo` skips that local approval.
+
+The child process receives only the small runtime environment needed to launch
+Node plus the allow-listed kintone variables. Other credentials present in the
+`local-mcp start` environment are not inherited by the kintone child. To source
+kintone credentials from 1Password, run `local-mcp start` itself through
+`op run`; the resolved values are then captured by the session process without
+being placed in local-mcp's session JSON.
 
 ## Serverless multi-host gateway
 

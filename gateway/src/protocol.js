@@ -247,6 +247,34 @@ export const PUBLIC_TOOLS = [
       ["session_id", "command"],
     ),
   ),
+  tool(
+    "kintone_mcp_status",
+    "Check kintone MCP",
+    "Check whether the selected local-mcp session has the official kintone MCP executable and required authentication configuration. Credential values are never returned.",
+    readOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "kintone_mcp_discover",
+    "Discover kintone MCP",
+    "List tool schemas exposed by the official kintone MCP server using credentials retained only by the selected local-mcp start process.",
+    { ...readOnly, openWorldHint: true },
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "kintone_mcp_call",
+    "Call a kintone MCP tool",
+    "Call a tool exposed by the official kintone MCP server. All child tool calls are host-approval-gated in normal local-mcp sessions.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        tool_name: { type: "string" },
+        arguments: { type: "object", additionalProperties: true },
+      },
+      ["session_id", "tool_name", "arguments"],
+    ),
+  ),
 ];
 
 export function validateSessionId(value) {

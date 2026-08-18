@@ -51,8 +51,8 @@ async function body(response) {
   return response.json();
 }
 
-test("public gateway exposes the same twenty public tools", () => {
-  assert.equal(PUBLIC_TOOLS.length, 20);
+test("public gateway exposes the same twenty-three public tools", () => {
+  assert.equal(PUBLIC_TOOLS.length, 23);
   assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "without_sandbox"), false);
   assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "session_list"), true);
   assert.equal(PUBLIC_TOOLS.every((tool) => tool.inputSchema.additionalProperties === false), true);
@@ -167,7 +167,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 20);
+  assert.equal(rpc.result.tools.length, 23);
   assert.equal(rpc.result.tools.some((tool) => tool.name === "without_sandbox"), false);
 });
 
