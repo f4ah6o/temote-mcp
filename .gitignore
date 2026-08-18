@@ -5,3 +5,4 @@
 gateway/.dev.vars
 gateway/node_modules/
 .wrangler/
+.DS_Store
