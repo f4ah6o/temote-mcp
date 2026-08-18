@@ -2,13 +2,13 @@
 
 [English](README.md)
 
-**系譜:** 本リポジトリは [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) を起点として派生し、安全なリモートアクセス、gateway 運用、MCP bridge に重点を置いています。GitHub 上では fork metadata を持たないため、この関係を明示します。
+`local-mcp` は [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生したプロジェクトです。安全なリモートアクセス、ゲートウェイ運用、MCP ブリッジを中心に拡張しています。GitHub 上では fork として紐づいていないため、ここで出自を明記しています。
 
-**テモート / Temote:** 本プロジェクトは、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46) からも重要な着想を得ています。提唱者による英字表記とは扱わず、本リポジトリでは便宜上 **Temote** と表記します。例示用ホスト名 `temotemcp.example.com` もこの表記に基づきます。この命名上の着想は fork 元と並んで、本プロジェクトの成り立ちに重要なものとして明記します。
+名前の着想には、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46) もあります。元の投稿では英字表記が示されていないため、このリポジトリでは **Temote** と表記します。例示用ホスト名 `temotemcp.example.com` もこの表記に合わせています。upstream と同じく、この命名の出典もプロジェクトの由来として記録します。
 
-local-mcp は、ローカルファイル操作と sandbox 化されたコマンド実行を MCP tool として公開します。Web 検索や汎用ネットワークリクエスト機能は提供しません。通常モードの sandbox command はネットワークアクセスを無効化します。Linux では固定された Codex sandbox stack、macOS では local-mcp 独自の Seatbelt backend を使用します。
+local-mcp は、手元のファイル操作とサンドボックス内のコマンド実行を MCP ツールとして公開します。Web 検索や任意のネットワークリクエスト機能はありません。通常モードのコマンドはネットワークから隔離されます。Linux では固定した Codex sandbox stack、macOS では local-mcp 独自の Seatbelt バックエンドを使います。
 
-公開 HTTP endpoint は、オンデマンドの Cloudflare Tunnel を前提とします。
+公開 HTTP エンドポイントは、必要なときだけ Cloudflare Tunnel を起動する構成を想定しています。
 
     ChatGPT Plus
         | Managed OAuth
@@ -18,37 +18,37 @@ local-mcp は、ローカルファイル操作と sandbox 化されたコマン�
                                                    v
                                             local-mcp serve
 
-## Build
+## ビルド
 
     cargo build --release
     cargo install --path . --locked
 
-既定 build には public HTTP と gateway-agent command が含まれます。`doctor`、`start`、`mcp` のみを含む local-only binary を作る場合は、既定の `network` feature を無効化します。
+通常のビルドには公開 HTTP と `gateway-agent` が含まれます。`doctor`、`start`、`mcp` だけを含むローカル専用バイナリが必要なら、既定の `network` feature を無効にします。
 
     cargo build --release --no-default-features --locked
 
-Linux では local-mcp と sibling の `codex-linux-sandbox` binary を同じ directory に配置し、`bwrap` を PATH から利用できるようにしてください。macOS は system Seatbelt sandbox を使用します。Windows native は未対応です。
+Linux では local-mcp と `codex-linux-sandbox` を同じディレクトリに置き、`bwrap` を PATH から実行できるようにしてください。macOS はシステムの Seatbelt を使います。Windows ネイティブには対応していません。
 
-install 時は `--locked` を維持してください。Linux 向け Codex sandbox dependency は Git revision に固定されており、commit 済み lockfile を使わずに解決すると互換性のない prerelease dependency が選択される可能性があります。macOS では Codex sandbox crate を解決しません。
+インストール時は `--locked` を付けてください。Linux 用の Codex sandbox 依存関係は Git revision に固定されています。commit 済みの lockfile を使わないと、互換性のない prerelease 版の `rama` や `starlark` が選ばれることがあります。macOS では Codex sandbox crate 自体を解決しません。
 
-session 開始前や ChatGPT 接続前に host diagnostics を実行します。
+セッションを開始する前、または ChatGPT から接続する前に診断を実行します。
 
     local-mcp doctor
 
-Linux の `doctor` は `codex-linux-sandbox`、`bubblewrap`、user namespace、隔離 network namespace、実 sandbox command、shell command の runtime environment を確認します。必須 check が失敗すると non-zero で終了します。
+Linux の `doctor` は `codex-linux-sandbox`、`bubblewrap`、user namespace、隔離した network namespace、実際のサンドボックス実行、shell 用の実行環境を確認します。必須項目に失敗すると終了コードは non-zero です。
 
-## Release versioning
+## リリース番号
 
-release は `Asia/Tokyo` timezone の CalVer `YYYY.MM.PATCH` を [`f4ah6o/calver-action`](https://github.com/f4ah6o/calver-action) で割り当てます。`main` history 内の commit に `latest` tag を移動すると release を要求できます。
+リリース番号は [`f4ah6o/calver-action`](https://github.com/f4ah6o/calver-action) で割り当てる CalVer `YYYY.MM.PATCH` です。日付の基準は `Asia/Tokyo`。`main` 上のリリース対象 commit に `latest` tag を移すとリリースが始まります。
 
     git tag -f latest <commit-to-release>
     git push -f origin latest
 
-`.github/workflows/release.yaml` は次の prefixless CalVer tag を割り当て、release 専用 commit で `Cargo.toml` と `Cargo.lock` を更新し、normal/local-only build を検証して immutable tag を push します。この release-only commit は `main` に merge しません。
+`.github/workflows/release.yaml` は次の prefixless CalVer tag を採番し、リリース専用 commit で `Cargo.toml` と `Cargo.lock` を更新します。その後、通常ビルドと local-only ビルドを検証し、immutable tag を push します。この commit は `main` には戻しません。
 
-## Local sessions
+## ローカルセッション
 
-各 session は、その session に許可する project directory から開始します。
+セッションは、そのセッションから触らせたいプロジェクトのディレクトリで開始します。
 
     cd ~/src/local-mcp
     local-mcp start local-mcp
@@ -56,33 +56,33 @@ release は `Asia/Tokyo` timezone の CalVer `YYYY.MM.PATCH` を [`f4ah6o/calver
     cd ~/src/shuttle-rs
     local-mcp start shuttle-rs
 
-明示的に制限を解除する場合は `--yolo` を付けます。
+制限を外して実行する場合は `--yolo` を付けます。
 
     local-mcp start local-mcp --yolo
 
-YOLO mode では local-mcp の approval prompt と path root 制約が無効になり、command tool は local-mcp を実行している user の filesystem・environment・process・network 権限で host 上に直接実行されます。これは意図的に危険な mode です。`/permission ask` で通常 mode、`/permission yolo` で YOLO mode に切り替えます。
+YOLO mode では local-mcp の承認プロンプトとパス制限がなくなり、コマンドは local-mcp を実行しているユーザー権限でホスト上に直接実行されます。ファイル、環境変数、プロセス、ネットワークもその権限を引き継ぎます。危険なモードなので、用途を限定してください。実行中は `/permission ask` で通常モード、`/permission yolo` で YOLO mode に切り替えられます。
 
-すべての tool call は `session_id` を明示します。ただし `session_list` は active session 発見用のため例外です。`session_info` は working directory と sandbox root を表示します。
+`session_list` を除くすべてのツール呼び出しには `session_id` が必要です。`session_list` で起動中のセッションを探し、`session_info` で作業ディレクトリと許可済みのルートを確認できます。
 
-追加 directory を許可する場合は session の local terminal で操作します。
+別のディレクトリも許可する場合は、そのセッションを起動したローカル端末で設定します。
 
     /permission allow ../another-project
     /permission revoke ../another-project
     /permission list
     /permission status
 
-ChatGPT から Git を操作する場合、local commit には `git_add` と `git_commit`、remote synchronization には `git_fetch`、`git_pull`、`git_push` を使用します。remote Git tool は通常 approval-gated で、force push や arbitrary URL/refspec は受け付けません。`git_pull` は fast-forward-only です。
+ChatGPT から Git を操作するときは、ローカル commit に `git_add` と `git_commit`、リモート同期に `git_fetch`、`git_pull`、`git_push` を使います。リモート操作は通常、ホスト側の承認が必要です。任意 URL/refspec や force push は受け付けず、`git_pull` は fast-forward-only です。
 
-## Public HTTP endpoint
+## 公開 HTTP エンドポイント
 
-`.env.example` を repository 外へコピーし、Cloudflare Access の値を設定します。Tunnel token は credential なので file mode は 0600 を維持してください。
+`.env.example` をリポジトリの外へコピーし、Cloudflare Access の設定値を入れます。Tunnel token は認証情報なので、ファイルの mode は 0600 にしてください。
 
     install -d -m 700 ~/.config/local-mcp
     cp .env.example ~/.config/local-mcp/public.env
     chmod 600 ~/.config/local-mcp/public.env
     vi ~/.config/local-mcp/public.env
 
-service が必要なときだけ別 terminal で起動します。
+サービスが必要な間だけ、別々の端末で origin と Tunnel を起動します。
 
     # Terminal 1: local origin
     set -a
@@ -100,7 +100,7 @@ service が必要なときだけ別 terminal で起動します。
     cd ~/src/local-mcp
     local-mcp start local-mcp
 
-`justfile` を使う場合は次の通りです。
+`justfile` から同じ操作を行えます。
 
     just build
     just doctor
@@ -112,25 +112,25 @@ service が必要なときだけ別 terminal で起動します。
     just start local-mcp
     just start shuttle-rs ~/src/shuttle-rs
 
-公開 route の例は次です。
+公開 URL の例は次のとおりです。
 
     https://temotemcp.example.com/mcp
 
-Cloudflare 側では次を構成します。
+Cloudflare 側では次の4点を設定します。
 
-1. remotely managed Tunnel を作成し、`temotemcp.example.com` を `http://127.0.0.1:8791` へ route します。
-2. public hostname 全体を保護する **self-hosted Cloudflare Access application** を作成します。`/mcp` のみに制限しないでください。Managed OAuth discovery は host root の `/.well-known/` を使用します。
-3. intended email account のみを許可する Allow policy を設定します。公開 endpoint に Bypass や Service Auth policy を追加しません。
-4. self-hosted application の Advanced settings で Managed OAuth を有効にします。dynamic client registration、短い access-token lifetime、適切な grant session duration を設定します。ChatGPT redirect URI は次です。
+1. remotely managed Tunnel を作り、`temotemcp.example.com` を `http://127.0.0.1:8791` へ向けます。
+2. ホスト全体を保護する **self-hosted Cloudflare Access application** を作ります。`/mcp` だけに制限しないでください。Managed OAuth の discovery はホスト直下の `/.well-known/` を使います。
+3. 接続を許すメールアカウントだけを Allow policy に入れます。この公開エンドポイントには Bypass や Service Auth policy を追加しません。
+4. self-hosted application の Advanced settings で Managed OAuth を有効にし、dynamic client registration、access token の寿命、grant session の期間を設定します。ChatGPT の redirect URI は次の2つです。
 
        https://chatgpt.com/connector/oauth/*
        https://chatgpt.com/connector_platform_oauth_redirect
 
-`AI controls > MCP servers` の portal registration は direct Tunnel route を保護する self-hosted application とは別物です。
+`AI controls > MCP servers` に作る portal registration は別用途です。ChatGPT が `temotemcp.example.com` に直接接続する構成を保護するのは、上記の self-hosted application です。
 
-Managed OAuth は Cloudflare Access が終端します。Rust origin は `Cf-Access-Jwt-Assertion` の signature、issuer、audience、expiry、subject、許可 email を検証します。`LOCAL_MCP_ACCESS_AUDIENCE` には `temotemcp.example.com` を保護する self-hosted application の AUD を設定してください。
+Managed OAuth の処理は Cloudflare Access が担当します。Rust 側では `Cf-Access-Jwt-Assertion` の署名、issuer、audience、有効期限、subject、許可メールアドレスを検証します。`LOCAL_MCP_ACCESS_AUDIENCE` には `temotemcp.example.com` を保護している self-hosted application の AUD を設定します。
 
-接続前 probe の例です。
+接続前は、次の probe で Access が origin より手前で応答していることを確認できます。
 
     curl -i -X POST https://temotemcp.example.com/mcp \
       -H 'Content-Type: application/json' \
@@ -138,82 +138,79 @@ Managed OAuth は Cloudflare Access が終端します。Rust origin は `Cf-Acc
     curl -i https://temotemcp.example.com/.well-known/oauth-authorization-server
     curl -i https://temotemcp.example.com/.well-known/oauth-protected-resource
 
-未認証 MCP request は Cloudflare の `WWW-Authenticate` header 付き `401`、discovery endpoint は JSON metadata 付き `200` になる想定です。`530` は on-demand Tunnel または local origin が停止していることを示します。
+未認証の MCP request は Cloudflare の `WWW-Authenticate` header 付き `401`、2つの discovery endpoint は JSON metadata 付き `200` が正常です。`530` なら on-demand Tunnel か local origin が止まっています。
 
-## Limits and safety boundaries
+## 制約と安全境界
 
-- public request には valid Cloudflare Access assertion が必要です。
-- `session_list` を除き、public tool は active `session_id` を必須とします。
-- normal mode では file path、symlink target、command cwd は permitted root 内に制限されます。
-- normal mode の sandbox command は network access を持ちません。
-- `--yolo` では path と sandbox boundary が無効になり、host user 権限で command が実行されます。
-- ordinary sandbox command は `.git` を書き換えません。local Git metadata の変更には専用 Git tool を使います。
-- remote Git operation は dedicated tool を使い、`git_pull` は fast-forward-only、`git_push` は force option を公開しません。
-- session あたり active sandbox job は最大4件です。
-- stdout/stderr 合計は command あたり 1 MiB 上限です。
-- background sandbox job は最長2時間、または session 終了時に cancel されます。
-- runtime audit は tool、session、status、timing metadata を記録しますが、認証 email/subject、command argument/output は永続 audit log に保存しません。
-- secret-file denylist は意図的に持ちません。`/home` 等の広い root を許可せず、必要な directory だけを明示してください。
+- 公開リクエストには有効な Cloudflare Access assertion が必要です。
+- `session_list` 以外の公開ツールでは、起動中の `session_id` を指定します。
+- 通常モードでは、ファイルパス、symlink の参照先、コマンドの cwd を許可済みルート内に制限します。
+- 通常モードのサンドボックスコマンドはネットワークへ接続できません。
+- `--yolo` ではパス制限とサンドボックスを外し、ホストユーザーの権限でコマンドを実行します。
+- 通常のサンドボックスコマンドから `.git` は書き換えられません。Git metadata の変更には専用の Git ツールを使います。
+- リモート Git 操作も専用ツール経由です。`git_pull` は fast-forward-only、`git_push` には force option がありません。
+- 1セッションで同時に実行できるサンドボックス job は4件までです。
+- stdout と stderr の合計は1コマンドあたり 1 MiB までです。
+- background job は2時間で停止します。セッションが終了した場合も停止します。
+- runtime audit にはツール名、セッション、status、実行時間を記録します。認証メール/subject やコマンド引数、出力内容は永続ログに残しません。
+- secret-file denylist はありません。`/home` のような広いディレクトリを許可せず、必要な場所だけを追加してください。
 
-## Local stdio mode
+## ローカル stdio
 
-local MCP client が process を直接起動する場合は次を使用します。
+MCP client が local-mcp の process を直接起動する場合は、HTTP ではなく stdio mode を使えます。
 
     local-mcp mcp
 
-この mode は Cloudflare Access HTTP endpoint とは独立しています。
+Cloudflare Access を使う公開 HTTP エンドポイントとは独立したモードです。
 
 ## 1Password Environments MCP
 
-local-mcp は official local 1Password Environments MCP server を bridge できます。macOS では通常 `/Applications/1Password.app/Contents/MacOS/1password-mcp`、Linux では `/opt/1Password/1password-mcp` を使用します。非標準 installation のみ `LOCAL_MCP_ONEPASSWORD_MCP` を指定してください。
+local-mcp は公式の 1Password Environments MCP server をブリッジできます。通常は macOS なら `/Applications/1Password.app/Contents/MacOS/1password-mcp`、Linux なら `/opt/1Password/1password-mcp` を使います。別の場所にインストールした場合だけ `LOCAL_MCP_ONEPASSWORD_MCP` を指定します。
 
-公開/local endpoint は次の bridge tool を提供します。
+公開エンドポイントとローカルエンドポイントには、次の3つのブリッジツールがあります。
 
-- `onepassword_mcp_discover`: child server の resource と tool schema を列挙します。
-- `onepassword_mcp_read_resource`: child server が公開した resource のみを読みます。
-- `onepassword_mcp_call`: persistent stdio connection 経由で child tool を呼び出します。
+- `onepassword_mcp_discover` は child server が公開している resource と tool schema を列挙します。
+- `onepassword_mcp_read_resource` は child server が公開した resource だけを読み取ります。
+- `onepassword_mcp_call` は persistent stdio connection 経由で child tool を呼び出します。
 
-normal session では mutating child tool は local-mcp の approval 対象です。secret handling は official 1Password MCP server が担当し、local-mcp は secret-reading API を追加しません。
+通常セッションでは、書き込みを伴う child tool も local-mcp の承認対象です。secret の扱いは公式 1Password MCP server に任せており、local-mcp 独自の secret-reading API は追加していません。
 
 ### Service-account mode
 
-unattended secret injection では `local-mcp start` に service-account token を渡します。
+無人実行で secret を注入する場合は、`local-mcp start` に service-account token を渡します。
 
     OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' local-mcp start my-project
 
 service-account token は session process が保持し、session JSON metadata には書き込みません。
 
-追加 tool:
-
-- `onepassword_service_account_status`: token の存在と `op whoami` 成功可否を token 非表示で確認します。
-- `onepassword_service_account_run`: `op run` 経由で command を実行します。secret reference は `op://...` を使用し、plaintext value は拒否します。
+このモードでは `onepassword_service_account_status` で token の有無と `op whoami` の成否を値を返さずに確認でき、`onepassword_service_account_run` で `op run` 経由のコマンドを実行できます。secret reference には `op://...` を使い、平文値は拒否します。
 
 ## kintone MCP Server
 
-local-mcp は official [`@kintone/mcp-server`](https://github.com/kintone/mcp-server) も bridge できます。host 側に CLI を install してください。
+local-mcp は公式の [`@kintone/mcp-server`](https://github.com/kintone/mcp-server) もブリッジできます。先にホストへ CLI をインストールしてください。
 
     npm install -g @kintone/mcp-server
 
-credential は `local-mcp serve` や `gateway-agent` ではなく **`local-mcp start` process** に渡します。
+credential は `local-mcp serve` や `gateway-agent` ではなく、**`local-mcp start` process** に渡します。
 
     KINTONE_BASE_URL='https://example.cybozu.com' \
     KINTONE_API_TOKEN='<api-token>' \
     local-mcp start my-project
 
-username/password authentication も利用できます。
+username/password 認証も使えます。
 
     KINTONE_BASE_URL='https://example.cybozu.com' \
     KINTONE_USERNAME='<username>' \
     KINTONE_PASSWORD='<password>' \
     local-mcp start my-project
 
-公開/local endpoint は `kintone_mcp_status`、`kintone_mcp_discover`、`kintone_mcp_call` を提供します。credential value や tenant URL を status から返しません。
+公開/ローカルの各エンドポイントは `kintone_mcp_status`、`kintone_mcp_discover`、`kintone_mcp_call` を提供します。status から credential の値や tenant URL は返しません。
 
 ## Serverless multi-host gateway
 
-optional [`gateway/`](gateway/) deployment は1つの Cloudflare Workers MCP endpoint を公開し、`session_id` ごとに Durable Object 経由で host へ route します。Mac、Linux、Windows/WSL2 endpoint の `local-mcp gateway-agent` は outbound-only HTTPS long poll を行うため、host ごとの inbound port や Tunnel は不要です。
+[`gateway/`](gateway/) は任意で使える Cloudflare Workers ベースのゲートウェイです。1つの MCP エンドポイントを公開し、`session_id` ごとに Durable Object を介して接続先ホストを選びます。Mac、Linux、Windows/WSL2 側の `local-mcp gateway-agent` は outbound-only の HTTPS long poll だけを行うため、ホストごとの inbound port や Tunnel は不要です。
 
-典型的な endpoint command:
+代表的な起動例です。
 
     # Mac
     local-mcp start mac-main
@@ -223,4 +220,4 @@ optional [`gateway/`](gateway/) deployment は1つの Cloudflare Workers MCP end
     local-mcp start windows-wsl2-main
     local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
 
-`LOCAL_MCP_GATEWAY_URL`、`LOCAL_MCP_GATEWAY_HOST_TOKEN`、必要に応じて Cloudflare Access service-token client ID/secret を設定します。deploy、Managed OAuth、Durable Object migration、reconnect、secret handling の詳細は [`gateway/README.ja.md`](gateway/README.ja.md) を参照してください。
+`LOCAL_MCP_GATEWAY_URL`、`LOCAL_MCP_GATEWAY_HOST_TOKEN` と、必要なら Cloudflare Access の service-token client ID/secret を設定します。デプロイ、Managed OAuth、Durable Object migration、再接続、secret の扱いは [`gateway/README.ja.md`](gateway/README.ja.md) にまとめています。

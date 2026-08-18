@@ -2,9 +2,9 @@
 
 [日本語](README.ja.md)
 
-**Lineage:** Derived from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp); focused on secure remote access, gateway operation, and MCP bridging.
+This repository is derived from [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp), with a focus on secure remote access, gateway operation, and MCP bridging. GitHub does not record this repository as a fork, so the relationship is stated here.
 
-**テモート / Temote:** This project also credits [@mr_konn's proposal of 「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), a Japanese coinage for the opposite of “remote”. No Latin spelling is attributed here to the original proposal; this repository uses **Temote** as its own romanization, including the example hostname `temotemcp.example.com`. This naming influence is acknowledged alongside the upstream project because both are foundational to this project's identity.
+The name also draws on [@mr_konn's proposal of 「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), coined in Japanese as the opposite of “remote.” The original post does not give a Latin spelling; this repository uses **Temote**, including the example hostname `temotemcp.example.com`. We credit both the upstream codebase and this naming idea as part of the project's origin.
 
 local-mcp exposes local files and sandboxed commands as MCP tools. It does
 not provide web search or a general network-request tool. Sandboxed commands
@@ -34,7 +34,7 @@ direct HTTP/JWT client dependencies, disable the default `network` feature:
 
 On Linux, install both local-mcp and the sibling codex-linux-sandbox binary
 in the same directory, and make sure bwrap is available in PATH. macOS uses
-the system Seatbelt sandbox. Windows is not supported.
+the system Seatbelt sandbox. Native Windows is not supported.
 
 Keep `--locked` when installing. The Linux Codex sandbox dependencies are
 pinned to a Git revision, and resolving their transitive pre-release
@@ -96,10 +96,10 @@ local-mcp boundaries; any confirmation or authorization enforced by an MCP clien
 independent. `/permission ask` restores the normal restricted mode and
 `/permission yolo` enables it again while the session runs.
 
-The session ID is explicit in every tool call. session_list discovers active
-sessions; session_info shows a session's working directory and sandbox roots.
-Session IDs contain only ASCII letters, numbers, -, _, and .. A duplicate
-active ID is rejected.
+Every tool call except `session_list` requires a `session_id`. `session_list`
+discovers active sessions, and `session_info` shows a session's working
+directory and sandbox roots. Session IDs may contain ASCII letters, digits,
+`-`, `_`, and `.` only. A duplicate active ID is rejected.
 
 The initial sandbox root is the startup directory. Add another existing
 directory from that session's local terminal:
@@ -264,8 +264,8 @@ application AUD). The direct connection URL is still exactly
 discovery. The public `tools/list` response includes the restricted `git_add`, `git_commit`,
 `git_fetch`, `git_pull`, and `git_push` operations plus the configured child-MCP
 bridges; `without_sandbox` is intentionally available only in local stdio mode.
-Each public tool must
-include a name, display title, description, input schema, and annotations.
+Each public tool includes a name, display title, description, input schema, and
+annotations.
 Start a new ChatGPT conversation and add the MCP connection from the tools
 menu so ChatGPT requests the refreshed tool list. See the [OpenAI
 connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt)
@@ -294,8 +294,9 @@ for the client-side checks.
   truncated.
 - A background sandbox job is cancelled after two hours or when its session
   stops.
-- Runtime audit output records tool, session, status, and timing metadata; authenticated email and subject identifiers are intentionally not logged.
-  command arguments and output are not persisted as audit logs.
+- Runtime audit output records tool, session, status, and timing metadata.
+  Authenticated email and subject identifiers, command arguments, and command
+  output are not persisted in audit logs.
 - There is intentionally no secret-file denylist. Do not add broad roots such
   as /home; explicitly permit only the directories needed for the task.
 

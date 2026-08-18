@@ -2,53 +2,56 @@
 
 [English](README.md)
 
-この Worker は ChatGPT に1つの MCP endpoint を公開し、各 tool call を `session_id` で選択した Mac、Linux、Windows/WSL2 host へ route します。host 側は outbound HTTPS long poll を行うため、inbound port や host ごとの Tunnel は不要です。
+この Worker は ChatGPT 向けに1つの MCP エンドポイントを公開し、`session_id` に応じて Mac、Linux、Windows/WSL2 の各ホストへツール呼び出しを振り分けます。ホスト側から HTTPS long poll で接続するため、外向きにポートを開けたり、ホストごとに Tunnel を用意したりする必要はありません。
 
-## Components
+## 構成
 
-- `GatewaySession`: `session_id` ごとに1つの Durable Object。現在の host generation、request queue、pending response、host lease を保持します。
-- `GatewayRegistry`: active session lease を保持し、`session_list` に使用する Durable Object です。
-- Worker `/mcp`: Cloudflare Access assertion を検証し、MCP `initialize` / `tools/list` を提供し、`tools/call` を route します。
-- Worker `/v1/hosts/*`: `local-mcp gateway-agent` が使用する bearer-token-protected API です。
+`GatewaySession` は `session_id` ごとに1つ作られる Durable Object です。現在のホスト generation、request queue、処理待ちの response、host lease を持ちます。
 
-reconnect 時は Durable Object generation を増やします。古い generation または古い process `instance_id` からの request/response は HTTP 409 で拒否します。tool は non-idempotent の可能性があるため、timeout した tool call を gateway が自動 retry することはありません。
+`GatewayRegistry` は有効な session lease を集約し、`session_list` に使います。
 
-## Configure and deploy
+Worker の `/mcp` は Cloudflare Access assertion を検証し、MCP の `initialize` と `tools/list` に応答します。`tools/call` は対象の `GatewaySession` へ転送します。
 
-1. `wrangler.toml` に non-secret Access value を設定します。
+`/v1/hosts/*` は `local-mcp gateway-agent` 用の API で、bearer token で保護します。
+
+ホストが再接続すると Durable Object の generation が増えます。古い generation や古い process `instance_id` から届いた request/response は HTTP 409 で拒否します。ツール呼び出しには非 idempotent な操作もあるため、timeout 後の自動 retry は行いません。
+
+## 設定とデプロイ
+
+1. `wrangler.toml` に、secret ではない Access の設定値を入れます。
 
    - `ACCESS_TEAM_DOMAIN`
    - `ACCESS_AUDIENCE`
    - `ACCESS_ALLOWED_EMAILS`
 
-2. high-entropy host token を作成し、Worker secret として保存します。
+2. 十分に長いランダムな host token を作り、Worker secret として保存します。
 
        cd gateway
        npx wrangler secret put HOST_TOKEN
 
-   `CLIENT_TOKEN` は local development 用の optional fallback です。production の ChatGPT traffic では verified `Cf-Access-Jwt-Assertion` を使用してください。
+   `CLIENT_TOKEN` はローカル開発用の fallback です。本番の ChatGPT traffic では、検証済みの `Cf-Access-Jwt-Assertion` を使います。
 
-3. Worker と Durable Object exports configuration を deploy します。
+3. テストと dry-run を通してからデプロイします。
 
        npm test
        npx wrangler deploy --dry-run
        npx wrangler deploy
 
-4. custom domain を割り当て、Cloudflare Access self-hosted application で保護します。ChatGPT MCP connection 用に Managed OAuth を有効化します。Access 保護された custom hostname を public route とするため `workers_dev = false` を維持します。
+4. custom domain を割り当て、Cloudflare Access の self-hosted application で保護します。ChatGPT の MCP 接続用に Managed OAuth を有効にしてください。公開経路を Access 配下の custom hostname に限定するため、`workers_dev = false` のまま使います。
 
-5. host agent は Access service-token policy で通過させます。service-token client ID/secret は各 endpoint のみに保存してください。Worker はさらに `HOST_TOKEN` を要求するため、Access service token 自体は host protocol credential ではありません。
+5. host agent は Access の service-token policy で通します。service-token の client ID/secret は各 endpoint にだけ保存してください。Worker は別に `HOST_TOKEN` も確認するため、Access service token と host protocol の認証情報は別物です。
 
-public MCP URL の例:
+公開 MCP URL は次の形になります。
 
     https://<gateway-host>/mcp
 
-## Start endpoint agents
+## endpoint agent の起動
 
-各 project directory から local approval/session UI を開始します。
+まず、対象プロジェクトのディレクトリでローカルセッションを起動します。
 
     local-mcp start mac-main
 
-その terminal で `gateway_connect` を承認後、outbound agent を開始します。
+その端末で `gateway_connect` を承認してから、outbound agent を起動します。
 
     export LOCAL_MCP_GATEWAY_URL=https://<gateway-host>
     export LOCAL_MCP_GATEWAY_HOST_TOKEN='<worker HOST_TOKEN>'
@@ -56,20 +59,21 @@ public MCP URL の例:
     export LOCAL_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
     local-mcp gateway-agent --session-id mac-main
 
-Windows endpoint では別の session ID を使用してください。native Windows transport/sandbox が実装されるまでは WSL2 内で両 command を実行します。
+Windows 側は別の session ID にしてください。native Windows transport/sandbox が入るまでは、セッションと agent の両方を WSL2 内で起動します。
 
     local-mcp start windows-wsl2-main
     local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
 
-`--platform auto` は macOS、通常 Linux、WSL2 を検出します。session ID は routing key であって credential ではありません。endpoint approval、Access policy、host token は引き続き必須です。
+`--platform auto` は macOS、通常の Linux、WSL2 を判別します。session ID は接続先を選ぶための routing key で、認証情報ではありません。endpoint 側の承認、Access policy、host token は別に必要です。
 
-## Operational behavior
+## 動作
 
-- Agent connect: generation を増やし、同じ `session_id` の以前の host を置き換えます。
-- Agent poll: 90秒 lease を更新し、work を最大20秒待ちます。
-- Tool dispatch: endpoint response を最大35秒待ちます。
-- Disconnect / lease expiry: pending call は失敗し、replay しません。
-- active call 中の Worker upgrade: caller には retryable gateway error を返しますが、gateway は endpoint operation を再実行しません。
-- `session_list`: Registry lease を返します。最終的な online validation は per-session Durable Object 側でも実施します。
+ホストが接続すると generation が増え、同じ `session_id` にいた古いホストを置き換えます。
 
-local Worker development では `.dev.vars.example` を `.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、endpoint environment file は commit しないでください。
+agent は poll のたびに90秒の lease を更新し、最大20秒 request を待ちます。ツール呼び出しを受けた gateway は endpoint の response を最大35秒待ちます。
+
+接続が切れた場合や lease が切れた場合、処理待ちの call は失敗します。自動 replay はしません。実行中に Worker が更新された場合も、caller には retryable な gateway error を返しますが、endpoint の操作自体はやり直しません。
+
+`session_list` は Registry にある lease を返します。実際にそのホストがオンラインかどうかは、各 session の Durable Object 側でも確認します。
+
+ローカルで Worker を動かす場合は `.dev.vars.example` を `.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、endpoint の環境ファイルは commit しないでください。
