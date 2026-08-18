@@ -329,6 +329,38 @@ keys only and never persist argument values. Secret handling remains owned by th
 official 1Password MCP server; local-mcp does not add a secret-reading API or
 translate 1Password data into environment variables itself.
 
+### Service-account mode
+
+For unattended secret injection, start the local-mcp session with a 1Password
+service-account token:
+
+    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' local-mcp start my-project
+
+The token is captured by the `local-mcp start` process and forwarded only to
+transient `op` subprocesses. It is not written to session JSON metadata, returned
+by any MCP tool, or required by the gateway agent. Keep `local-mcp start` running for the lifetime of the session.
+
+Two additional tools are available:
+
+- `onepassword_service_account_status` checks whether the session has a token and
+  whether `op whoami` accepts it, without returning the token.
+- `onepassword_service_account_run` executes a command through `op run`. Provide
+  secret references either as `environment` entries such as
+  `DATABASE_URL=op://vault/item/field` or through checked-in `.env` files using
+  `env_files`. Plaintext values in `environment` are rejected. 1Password CLI's
+  output masking remains enabled and `OP_SERVICE_ACCOUNT_TOKEN` is removed from
+  the target command's direct environment.
+
+Normal local-mcp sessions still require host approval before a service-account
+command runs. A session started with `--yolo` skips that local-mcp approval, so
+for fully unattended operation use:
+
+    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' local-mcp start my-project --yolo
+
+`env_files` and `cwd` remain restricted to the session's permitted filesystem
+roots in normal mode. The service-account token should be scoped to only the
+vaults required by the automation.
+
 ## Serverless multi-host gateway
 
 The optional [`gateway/`](gateway/) deployment exposes one Cloudflare Workers

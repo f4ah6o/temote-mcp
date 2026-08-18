@@ -163,6 +163,8 @@ fn tools(public: bool) -> Value {
         {"name":"onepassword_mcp_discover","title":"Discover 1Password MCP","description":"List resources and tool schemas exposed by the official local 1Password Environments MCP server. Start with this tool before using 1Password MCP tools.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"onepassword_mcp_read_resource","title":"Read a 1Password MCP resource","description":"Read a documentation resource exposed by the official local 1Password Environments MCP server.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"uri":{"type":"string"}},"required":["session_id","uri"],"additionalProperties":false}},
         {"name":"onepassword_mcp_call","title":"Call a 1Password MCP tool","description":"Call a tool exposed by the official local 1Password Environments MCP server. Non-read-only child tools require local-mcp approval unless the session is in yolo mode. Raw secrets remain governed by 1Password's MCP server contract.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}},"required":["session_id","tool_name","arguments"],"additionalProperties":false}},
+        {"name":"onepassword_service_account_status","title":"Check 1Password service account","description":"Check whether this local-mcp session was started with a 1Password service-account token and whether 1Password CLI accepts it. The token is never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"onepassword_service_account_run","title":"Run with 1Password service-account secrets","description":"Run a host command through `op run` using the service-account token held only by the local-mcp start process. 1Password CLI output masking remains enabled and OP_SERVICE_ACCOUNT_TOKEN is removed from the target command environment. Normal sessions require local approval; yolo sessions do not.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"env_files":{"type":"array","items":{"type":"string"}},"environment":{"type":"object","additionalProperties":{"type":"string"},"description":"Environment variable names mapped to op:// secret references. Plaintext values are rejected."}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"without_sandbox","title":"Run a host command","description":"Execute argv directly on the host with the local user's permissions and network access. local-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}}
     ]);
     if public {
@@ -279,6 +281,83 @@ async fn call_tool(params: &Value, public: bool) -> Result<Value> {
                 .context("missing tool_name")?;
             let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
             onepassword_mcp::call_tool(&session, tool_name, arguments).await
+        }
+        "onepassword_service_account_status" => {
+            let result = approvals::onepassword_service_account_status(&session.id).await?;
+            text_result(serde_json::to_string_pretty(&result)?)
+        }
+        "onepassword_service_account_run" => {
+            let command = required_command(&args)?;
+            let cwd = cwd(&args, &session)?;
+            let env_files = args
+                .get("env_files")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            item.as_str()
+                                .map(PathBuf::from)
+                                .context("env_files entries must be strings")
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let environment = args
+                .get("environment")
+                .map(|value| {
+                    value
+                        .as_object()
+                        .context("environment must be an object")?
+                        .iter()
+                        .map(|(name, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (name.clone(), value.to_owned()))
+                                .context("environment values must be strings")
+                        })
+                        .collect::<Result<std::collections::BTreeMap<_, _>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let detail = format!(
+                "argv: {}\nenv files: {}\nsecret env names: {}",
+                render_command(&command),
+                if env_files.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    env_files
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                if environment.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    environment.keys().cloned().collect::<Vec<_>>().join(", ")
+                }
+            );
+            if !approvals::request(
+                &session.id,
+                "onepassword_service_account_run",
+                detail,
+                cwd.clone(),
+            )
+            .await?
+            {
+                anyhow::bail!("user denied 1Password service-account command")
+            }
+            let result = approvals::onepassword_service_account_run(
+                &session.id,
+                cwd,
+                command,
+                env_files,
+                environment,
+            )
+            .await?;
+            text_result(serde_json::to_string_pretty(&result)?)
         }
         "without_sandbox" => without_sandbox(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
@@ -1207,7 +1286,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 20);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()

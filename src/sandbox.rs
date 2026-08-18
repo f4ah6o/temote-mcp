@@ -339,6 +339,16 @@ pub async fn run_unrestricted(
     cwd: &Path,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
+    run_unrestricted_with_env(command, cwd, stdin, &HashMap::new(), &[]).await
+}
+
+pub async fn run_unrestricted_with_env(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -346,7 +356,12 @@ pub async fn run_unrestricted(
     process
         .kill_on_drop(true)
         .args(&command[1..])
-        .current_dir(cwd)
+        .current_dir(cwd);
+    for name in remove_environment {
+        process.env_remove(name);
+    }
+    process
+        .envs(environment)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {

@@ -224,6 +224,29 @@ export const PUBLIC_TOOLS = [
       ["session_id", "tool_name", "arguments"],
     ),
   ),
+  tool(
+    "onepassword_service_account_status",
+    "Check 1Password service account",
+    "Check whether the selected host session has a service-account token and whether 1Password CLI accepts it. The token is never returned.",
+    { ...readOnly, openWorldHint: true },
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "onepassword_service_account_run",
+    "Run with 1Password service-account secrets",
+    "Run a host command through op run using the service-account token held by the selected local-mcp start process. 1Password CLI output masking remains enabled; normal sessions require host approval.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        command: { type: "array", items: { type: "string" }, minItems: 1 },
+        cwd: { type: "string" },
+        env_files: { type: "array", items: { type: "string" } },
+        environment: { type: "object", additionalProperties: { type: "string" } },
+      },
+      ["session_id", "command"],
+    ),
+  ),
 ];
 
 export function validateSessionId(value) {
