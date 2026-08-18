@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-この Worker は ChatGPT 向けに1つの MCP エンドポイントを公開し、`session_id` に応じて Mac、Linux、Windows/WSL2 の各ホストへツール呼び出しを振り分けます。ホスト側から HTTPS long poll で接続するため、外向きにポートを開けたり、ホストごとに Tunnel を用意したりする必要はありません。
+この Worker は1つの MCP エンドポイントを公開し、`session_id` に応じて Mac、Linux、Windows/WSL2 の各ホストへツール呼び出しを振り分けます。ホスト側から HTTPS long poll で接続するため、外向きにポートを開けたり、ホストごとに Tunnel を用意したりする必要はありません。
 
 ## 構成
 
@@ -29,7 +29,7 @@ Worker の `/mcp` は Cloudflare Access assertion を検証し、MCP の `initia
        cd gateway
        npx wrangler secret put HOST_TOKEN
 
-   `CLIENT_TOKEN` はローカル開発用の fallback です。本番の ChatGPT traffic では、検証済みの `Cf-Access-Jwt-Assertion` を使います。
+   `CLIENT_TOKEN` はローカル開発用の fallback です。本番の MCP traffic では、検証済みの `Cf-Access-Jwt-Assertion` を使います。
 
 3. テストと dry-run を通してからデプロイします。
 
@@ -37,7 +37,7 @@ Worker の `/mcp` は Cloudflare Access assertion を検証し、MCP の `initia
        npx wrangler deploy --dry-run
        npx wrangler deploy
 
-4. custom domain を割り当て、Cloudflare Access の self-hosted application で保護します。ChatGPT の MCP 接続用に Managed OAuth を有効にしてください。公開経路を Access 配下の custom hostname に限定するため、`workers_dev = false` のまま使います。
+4. custom domain を割り当て、Cloudflare Access の self-hosted application で保護します。利用する MCP client 向けに Managed OAuth を有効にしてください。公開経路を Access 配下の custom hostname に限定するため、`workers_dev = false` のまま使います。
 
 5. host agent は Access の service-token policy で通します。service-token の client ID/secret は各 endpoint にだけ保存してください。Worker は別に `HOST_TOKEN` も確認するため、Access service token と host protocol の認証情報は別物です。
 

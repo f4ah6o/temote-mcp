@@ -10,8 +10,8 @@ temote-mcp は、手元のファイル操作とサンドボックス内のコマ
 
 公開 HTTP エンドポイントは、必要なときだけ Cloudflare Tunnel を起動する構成を想定しています。
 
-    ChatGPT Plus
-        | Managed OAuth
+    MCP client
+        | OAuth
         v
     Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                    |
@@ -31,7 +31,7 @@ Linux では temote-mcp と `codex-linux-sandbox` を同じディレクトリに
 
 インストール時は `--locked` を付けてください。Linux 用の Codex sandbox 依存関係は Git revision に固定されています。commit 済みの lockfile を使わないと、互換性のない prerelease 版の `rama` や `starlark` が選ばれることがあります。macOS では Codex sandbox crate 自体を解決しません。
 
-セッションを開始する前、または ChatGPT から接続する前に診断を実行します。
+セッションを開始する前、または公開 HTTP エンドポイントを起動する前に診断を実行します。
 
     temote-mcp doctor
 
@@ -71,7 +71,7 @@ YOLO mode では temote-mcp の承認プロンプトとパス制限がなくな�
     /permission list
     /permission status
 
-ChatGPT から Git を操作するときは、ローカル commit に `git_add` と `git_commit`、リモート同期に `git_fetch`、`git_pull`、`git_push` を使います。リモート操作は通常、ホスト側の承認が必要です。任意 URL/refspec や force push は受け付けず、`git_pull` は fast-forward-only です。
+Git 操作には、ローカル commit 用の `git_add` と `git_commit`、リモート同期用の `git_fetch`、`git_pull`、`git_push` を使います。リモート操作は通常、ホスト側の承認が必要です。任意 URL/refspec や force push は受け付けず、`git_pull` は fast-forward-only です。
 
 ## 公開 HTTP エンドポイント
 
@@ -121,12 +121,9 @@ Cloudflare 側では次の4点を設定します。
 1. remotely managed Tunnel を作り、`temotemcp.example.com` を `http://127.0.0.1:8791` へ向けます。
 2. ホスト全体を保護する **self-hosted Cloudflare Access application** を作ります。`/mcp` だけに制限しないでください。Managed OAuth の discovery はホスト直下の `/.well-known/` を使います。
 3. 接続を許すメールアカウントだけを Allow policy に入れます。この公開エンドポイントには Bypass や Service Auth policy を追加しません。
-4. self-hosted application の Advanced settings で Managed OAuth を有効にし、dynamic client registration、access token の寿命、grant session の期間を設定します。ChatGPT の redirect URI は次の2つです。
+4. self-hosted application の Advanced settings で Managed OAuth を有効にし、dynamic client registration、access token の寿命、grant session の期間を設定します。redirect URI や localhost/loopback client の許可は、利用する OAuth client に必要な場合だけ設定します。
 
-       https://chatgpt.com/connector/oauth/*
-       https://chatgpt.com/connector_platform_oauth_redirect
-
-`AI controls > MCP servers` に作る portal registration は別用途です。ChatGPT が `temotemcp.example.com` に直接接続する構成を保護するのは、上記の self-hosted application です。
+`AI controls > MCP servers` に作る portal registration は別用途です。`temotemcp.example.com` 自体を保護するのは、上記の self-hosted application です。
 
 Managed OAuth の処理は Cloudflare Access が担当します。Rust 側では `Cf-Access-Jwt-Assertion` の署名、issuer、audience、有効期限、subject、許可メールアドレスを検証します。`TEMOTE_MCP_ACCESS_AUDIENCE` には `temotemcp.example.com` を保護している self-hosted application の AUD を設定します。
 

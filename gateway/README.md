@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md)
 
-This Worker exposes a single MCP endpoint to ChatGPT and routes each tool call to a Mac, Linux, or Windows/WSL2 host by `session_id`. Hosts connect with outbound HTTPS long polling, so they do not need an inbound port or a per-host Tunnel.
+This Worker exposes a single MCP endpoint and routes each tool call to a Mac, Linux, or Windows/WSL2 host by `session_id`. Hosts connect with outbound HTTPS long polling, so they do not need an inbound port or a per-host Tunnel.
 
 ## Components
 
@@ -29,7 +29,7 @@ When a host reconnects, the Durable Object generation increases. Requests and re
        cd gateway
        npx wrangler secret put HOST_TOKEN
 
-   `CLIENT_TOKEN` is only a local-development fallback. Production ChatGPT traffic should use a verified `Cf-Access-Jwt-Assertion`.
+   `CLIENT_TOKEN` is only a local-development fallback. Production MCP traffic should use a verified `Cf-Access-Jwt-Assertion`.
 
 3. Test and dry-run the deployment before publishing it:
 
@@ -37,7 +37,7 @@ When a host reconnects, the Durable Object generation increases. Requests and re
        npx wrangler deploy --dry-run
        npx wrangler deploy
 
-4. Attach a custom domain and protect it with a Cloudflare Access self-hosted application. Enable Managed OAuth for the ChatGPT MCP connection. Keep `workers_dev = false` so the Access-protected custom hostname remains the public route.
+4. Attach a custom domain and protect it with a Cloudflare Access self-hosted application. Enable Managed OAuth for the intended MCP clients. Keep `workers_dev = false` so the Access-protected custom hostname remains the public route.
 
 5. Allow host agents through Access with a service-token policy. Store the service-token client ID and secret only on each endpoint. The Worker also requires `HOST_TOKEN`, so the Access service token is separate from the host-protocol credential.
 

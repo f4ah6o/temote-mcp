@@ -13,8 +13,8 @@ macOS uses temote-mcp's native Seatbelt backend.
 
 The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
 
-    ChatGPT Plus
-        | Managed OAuth
+    MCP client
+        | OAuth
         v
     Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                    |
@@ -41,7 +41,7 @@ pinned to a Git revision, and resolving their transitive pre-release
 dependencies without the committed lockfile can select incompatible `rama` or
 `starlark` versions. macOS does not resolve the Codex sandbox crates.
 
-Before starting a session or connecting ChatGPT, run the host diagnostics:
+Before starting a session or exposing the HTTP endpoint, run the host diagnostics:
 
     temote-mcp doctor
 
@@ -52,7 +52,7 @@ A failed `network namespace` check means the host cannot create the bwrap
 network namespace; fix the displayed host policy hint before starting the HTTP
 server. The command exits non-zero when a required check fails.
 
-If ChatGPT reports that `/.bash_profile` or `/tmp` cannot be found or written,
+If an MCP client reports that `/.bash_profile` or `/tmp` cannot be found or written,
 update the installed binary with `just install`, run `temote-mcp doctor`, and
 restart the origin process. Shell commands receive a minimal environment with
 `HOME` and the standard temporary directories available.
@@ -115,8 +115,8 @@ gateway request targeting a session explicitly started with `--yolo` can neverth
 use `execute`/`start_command` with unrestricted host permissions; Cloudflare Access
 (or the gateway's authentication) remains the outer authentication boundary.
 
-For ChatGPT, use the dedicated `git_add` and `git_commit` tools to stage files
-and create local commits. Use `git_fetch`, `git_pull`, and `git_push` for remote
+Use the dedicated `git_add` and `git_commit` tools to stage files and create
+local commits. Use `git_fetch`, `git_pull`, and `git_push` for remote
 synchronization. The remote tools execute on the host only after approval
 (unless the session is in yolo mode), accept configured remote names rather
 than arbitrary URLs or refspecs, disable hooks, reject force-push options, and
@@ -199,23 +199,16 @@ Cloudflare configuration must provide:
    paths, while the MCP request URL remains `/mcp`.
 3. An Allow policy on that application for only the intended email account.
    Do not add a Bypass or Service Auth policy for this public endpoint.
-4. Managed OAuth enabled in the self-hosted application's Advanced settings:
-   dynamic client registration enabled, a 15-minute access token lifetime, and
-   a 14-day grant session duration. The ChatGPT redirect URIs are:
-   https://chatgpt.com/connector/oauth/*
-   and
-   https://chatgpt.com/connector_platform_oauth_redirect.
-   The working setup also enabled the localhost and loopback client options
-   for local OAuth clients; ChatGPT itself is covered by the explicit HTTPS
-   redirect URIs, so disable those options when no local OAuth client needs
-   them.
+4. Managed OAuth enabled in the self-hosted application's Advanced settings.
+   Enable dynamic client registration and choose access-token and grant-session
+   lifetimes appropriate for the deployment. Configure redirect URIs and local
+   or loopback client options only when required by the intended OAuth client.
 
 The `AI controls > MCP servers` page serves a different purpose. An entry
 created there is a portal registration (often shown as an Access application
 with `type: mcp` and a `via_mcp_server_portal` destination); it does not protect
-`temotemcp.example.com` when ChatGPT connects directly to that hostname. Such an
-entry can remain if the portal is used separately, but it is not part of this
-direct Tunnel path.
+`temotemcp.example.com` itself. Such an entry can remain if the portal is used
+separately, but it is not part of this direct Tunnel path.
 
 See the [Cloudflare Managed OAuth documentation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
 and [Cloudflare MCP security guidance](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/secure-mcp-servers/)
@@ -229,11 +222,6 @@ reuse the AUD of the portal-only `type: mcp` entry. If the self-hosted
 application is recreated, update `~/.config/temote-mcp/public.env` and restart
 `temote-mcp serve`. The old built-in local OAuth server is not part of the
 public path.
-
-In ChatGPT, add a custom MCP app in Developer mode and use the public /mcp
-URL. The account's available Plus features are verified at connection time;
-the server advertises write and command tools with MCP action annotations so
-the client can request confirmation.
 
 Before connecting, check that Access intercepts the request before it reaches
 the Rust origin:
@@ -257,20 +245,15 @@ entry) into `TEMOTE_MCP_ACCESS_AUDIENCE`, then restart `temote-mcp serve`. The
 Allow policy decides whether Access forwards the request; the Rust origin still
 validates the forwarded JWT audience.
 
-If OAuth succeeds but ChatGPT shows no tools, refresh the MCP connection after
+If OAuth succeeds but an MCP client shows no tools, refresh the connection after
 restarting `temote-mcp serve` (especially after changing the self-hosted
 application AUD). The direct connection URL is still exactly
 `https://temotemcp.example.com/mcp`; the host root is only used for OAuth
-discovery. The public `tools/list` response includes the restricted `git_add`, `git_commit`,
-`git_fetch`, `git_pull`, and `git_push` operations plus the configured child-MCP
-bridges; `without_sandbox` is intentionally available only in local stdio mode.
-Each public tool includes a name, display title, description, input schema, and
-annotations.
-Start a new ChatGPT conversation and add the MCP connection from the tools
-menu so ChatGPT requests the refreshed tool list. See the [OpenAI
-connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt)
-and [MCP troubleshooting guide](https://developers.openai.com/plugins/deploy/troubleshooting)
-for the client-side checks.
+discovery. The public `tools/list` response includes the restricted `git_add`,
+`git_commit`, `git_fetch`, `git_pull`, and `git_push` operations plus the
+configured child-MCP bridges; `without_sandbox` is intentionally available only
+in local stdio mode. Each public tool includes a name, display title,
+description, input schema, and annotations.
 
 ## Limits and safety boundaries
 
