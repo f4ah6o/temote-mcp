@@ -303,6 +303,32 @@ This mode is separate from the Cloudflare Access HTTP endpoint. It includes
 the local approval UI, the explicitly approved without_sandbox command, and
 the restricted Git operations described above.
 
+## 1Password Environments MCP
+
+local-mcp can bridge the official local 1Password Environments MCP server so a
+remote client can use the same 1Password Developer workflow without exposing a
+new inbound port on the host. Enable **MCP Server** in 1Password Labs/Developer
+settings first. local-mcp uses the bundled `1password-mcp` binary at
+`/Applications/1Password.app/Contents/MacOS/1password-mcp` on macOS or
+`/opt/1Password/1password-mcp` on Linux. Set `LOCAL_MCP_ONEPASSWORD_MCP` to an
+absolute path only for a non-standard installation.
+
+The public and local MCP endpoints expose three bridge tools:
+
+- `onepassword_mcp_discover` lists the official child server's current resources
+  and tool schemas. Use it before calling child tools.
+- `onepassword_mcp_read_resource` reads only resources advertised by that child
+  server, including its getting-started and Environments guides.
+- `onepassword_mcp_call` forwards a named child tool call over a persistent stdio
+  connection. Calls whose child tool is not marked read-only use local-mcp's
+  normal approval UI unless the selected session is in yolo mode.
+
+For normal sessions, `create_local_env_file.mountPath` is additionally constrained
+to the session's permitted filesystem roots. Approval summaries include argument
+keys only and never persist argument values. Secret handling remains owned by the
+official 1Password MCP server; local-mcp does not add a secret-reading API or
+translate 1Password data into environment variables itself.
+
 ## Serverless multi-host gateway
 
 The optional [`gateway/`](gateway/) deployment exposes one Cloudflare Workers

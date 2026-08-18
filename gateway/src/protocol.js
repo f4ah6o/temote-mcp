@@ -196,6 +196,34 @@ export const PUBLIC_TOOLS = [
     mutation,
     schema({ ...sessionProperty, job_id: { type: "string" } }, ["session_id", "job_id"]),
   ),
+  tool(
+    "onepassword_mcp_discover",
+    "Discover 1Password MCP",
+    "List resources and tool schemas exposed by the official local 1Password Environments MCP server.",
+    readOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "onepassword_mcp_read_resource",
+    "Read a 1Password MCP resource",
+    "Read a documentation resource exposed by the official local 1Password Environments MCP server.",
+    readOnly,
+    schema({ ...sessionProperty, uri: { type: "string" } }, ["session_id", "uri"]),
+  ),
+  tool(
+    "onepassword_mcp_call",
+    "Call a 1Password MCP tool",
+    "Call a tool exposed by the official local 1Password Environments MCP server. Non-read-only child tools remain approval-gated by the host local-mcp session.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        tool_name: { type: "string" },
+        arguments: { type: "object", additionalProperties: true },
+      },
+      ["session_id", "tool_name", "arguments"],
+    ),
+  ),
 ];
 
 export function validateSessionId(value) {

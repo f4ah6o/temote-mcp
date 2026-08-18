@@ -8,6 +8,7 @@ mod gateway;
 #[cfg(feature = "network")]
 mod http;
 mod mcp;
+mod onepassword_mcp;
 mod sandbox;
 
 #[cfg(feature = "network")]

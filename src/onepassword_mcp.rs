@@ -1,0 +1,460 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+
+use crate::{approvals, config};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const PROTOCOL_VERSION: &str = "2025-06-18";
+
+struct Client {
+    child: Arc<Mutex<Child>>,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    next_id: u64,
+    session_watcher: JoinHandle<()>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.session_watcher.abort();
+    }
+}
+
+fn clients() -> &'static Mutex<HashMap<String, Client>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl Client {
+    async fn spawn(session: &config::Session) -> Result<Self> {
+        let executable = executable_path()?;
+        let mut child = Command::new(&executable)
+            .current_dir(&session.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start 1Password MCP server at {}",
+                    executable.display()
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("1Password MCP stdin is unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("1Password MCP stdout is unavailable")?;
+        let child = Arc::new(Mutex::new(child));
+        let watched_child = Arc::clone(&child);
+        let watched_session_id = session.id.clone();
+        let session_watcher = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !config::session_is_active(&watched_session_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    let mut child = watched_child.lock().await;
+                    let _ = child.kill().await;
+                    return;
+                }
+            }
+        });
+        let mut client = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            next_id: 1,
+            session_watcher,
+        };
+        client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "local-mcp",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await
+            .context("failed to initialize 1Password MCP server")?;
+        client
+            .notify("notifications/initialized", json!({}))
+            .await
+            .context("failed to finish 1Password MCP initialization")?;
+        Ok(client)
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .await
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await?;
+
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                let Some(line) = self.stdout.next_line().await? else {
+                    let status = self.child.lock().await.try_wait().ok().flatten();
+                    anyhow::bail!("1Password MCP server closed stdout (status: {status:?})")
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let message: Value = serde_json::from_str(&line)
+                    .context("1Password MCP server returned invalid JSON")?;
+                if message.get("id") == Some(&json!(id)) {
+                    if let Some(error) = message.get("error") {
+                        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+                        let message = error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown 1Password MCP error");
+                        anyhow::bail!("1Password MCP error {code}: {message}")
+                    }
+                    return message
+                        .get("result")
+                        .cloned()
+                        .context("1Password MCP response is missing result");
+                }
+                if message.get("id").is_some() && message.get("method").is_some() {
+                    let request_id = message.get("id").cloned().unwrap_or(Value::Null);
+                    self.write_json(&json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32601,
+                            "message": "local-mcp does not expose client-side MCP capabilities to 1Password"
+                        }
+                    }))
+                    .await?;
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for 1Password MCP server")??;
+        Ok(response)
+    }
+
+    async fn write_json(&mut self, value: &Value) -> Result<()> {
+        self.stdin
+            .write_all(serde_json::to_string(value)?.as_bytes())
+            .await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+}
+
+pub async fn discover(session: &config::Session) -> Result<Value> {
+    let (resources, tools) = {
+        let mut clients = clients().lock().await;
+        ensure_client(&mut clients, session).await?;
+        let client = clients
+            .get_mut(&session.id)
+            .context("1Password MCP client disappeared")?;
+        let resources = match client.request("resources/list", json!({})).await {
+            Ok(value) => value,
+            Err(error) => {
+                clients.remove(&session.id);
+                return Err(error);
+            }
+        };
+        let tools = match client.request("tools/list", json!({})).await {
+            Ok(value) => value,
+            Err(error) => {
+                clients.remove(&session.id);
+                return Err(error);
+            }
+        };
+        (resources, tools)
+    };
+    approvals::activity(&session.id, "Discovered 1Password MCP capabilities", None).await;
+    Ok(json!({"resources": resources["resources"], "tools": tools["tools"]}))
+}
+
+pub async fn read_resource(session: &config::Session, uri: &str) -> Result<Value> {
+    anyhow::ensure!(
+        uri.starts_with("1password://"),
+        "unsupported 1Password resource URI"
+    );
+    let result = {
+        let mut clients = clients().lock().await;
+        ensure_client(&mut clients, session).await?;
+        let client = clients
+            .get_mut(&session.id)
+            .context("1Password MCP client disappeared")?;
+        let listed = client.request("resources/list", json!({})).await;
+        let listed = match listed {
+            Ok(value) => value,
+            Err(error) => {
+                clients.remove(&session.id);
+                return Err(error);
+            }
+        };
+        let allowed = listed["resources"].as_array().is_some_and(|resources| {
+            resources
+                .iter()
+                .any(|resource| resource["uri"].as_str() == Some(uri))
+        });
+        anyhow::ensure!(allowed, "unknown 1Password MCP resource: {uri}");
+        match client.request("resources/read", json!({"uri": uri})).await {
+            Ok(value) => value,
+            Err(error) => {
+                clients.remove(&session.id);
+                return Err(error);
+            }
+        }
+    };
+    approvals::activity(
+        &session.id,
+        "Read 1Password MCP resource",
+        Some(format!("└ {uri}")),
+    )
+    .await;
+    Ok(result)
+}
+
+pub async fn call_tool(
+    session: &config::Session,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<Value> {
+    anyhow::ensure!(
+        !tool_name.is_empty(),
+        "1Password tool name must not be empty"
+    );
+    anyhow::ensure!(
+        arguments.is_object(),
+        "1Password tool arguments must be an object"
+    );
+    enforce_path_boundary(session, tool_name, &arguments)?;
+
+    let descriptor = {
+        let mut clients = clients().lock().await;
+        ensure_client(&mut clients, session).await?;
+        let client = clients
+            .get_mut(&session.id)
+            .context("1Password MCP client disappeared")?;
+        let listed = match client.request("tools/list", json!({})).await {
+            Ok(value) => value,
+            Err(error) => {
+                clients.remove(&session.id);
+                return Err(error);
+            }
+        };
+        listed["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"].as_str() == Some(tool_name))
+                    .cloned()
+            })
+            .with_context(|| format!("unknown 1Password MCP tool: {tool_name}"))?
+    };
+
+    let read_only = descriptor
+        .pointer("/annotations/readOnlyHint")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !read_only
+        && !approvals::request(
+            &session.id,
+            "onepassword_mcp_call",
+            safe_call_summary(tool_name, &arguments),
+            session.cwd.clone(),
+        )
+        .await?
+    {
+        anyhow::bail!("user denied 1Password MCP tool call")
+    }
+
+    let result = {
+        let mut clients = clients().lock().await;
+        ensure_client(&mut clients, session).await?;
+        let client = clients
+            .get_mut(&session.id)
+            .context("1Password MCP client disappeared")?;
+        match client
+            .request(
+                "tools/call",
+                json!({"name": tool_name, "arguments": arguments}),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                clients.remove(&session.id);
+                return Err(error);
+            }
+        }
+    };
+    approvals::activity(
+        &session.id,
+        format!("Called 1Password MCP tool {tool_name}"),
+        None,
+    )
+    .await;
+    Ok(result)
+}
+
+async fn ensure_client(
+    clients: &mut HashMap<String, Client>,
+    session: &config::Session,
+) -> Result<()> {
+    if !clients.contains_key(&session.id) {
+        clients.insert(session.id.clone(), Client::spawn(session).await?);
+    }
+    Ok(())
+}
+
+fn enforce_path_boundary(
+    session: &config::Session,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<()> {
+    if tool_name != "create_local_env_file" {
+        return Ok(());
+    }
+    let mount_path = arguments
+        .get("mountPath")
+        .and_then(Value::as_str)
+        .context("create_local_env_file requires mountPath")?;
+    config::resolve_write_path(session, Path::new(mount_path))?;
+    Ok(())
+}
+
+fn safe_call_summary(tool_name: &str, arguments: &Value) -> String {
+    let mut keys = arguments
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    keys.sort();
+    format!(
+        "tool: {tool_name}\nargument keys: {}",
+        if keys.is_empty() {
+            "(none)".to_owned()
+        } else {
+            keys.join(", ")
+        }
+    )
+}
+
+fn executable_path() -> Result<PathBuf> {
+    if let Ok(value) = std::env::var("LOCAL_MCP_ONEPASSWORD_MCP") {
+        let path = PathBuf::from(value);
+        anyhow::ensure!(
+            path.is_absolute(),
+            "LOCAL_MCP_ONEPASSWORD_MCP must be an absolute path"
+        );
+        anyhow::ensure!(
+            path.is_file(),
+            "1Password MCP executable not found: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    let path = PathBuf::from("/Applications/1Password.app/Contents/MacOS/1password-mcp");
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from("/opt/1Password/1password-mcp");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    anyhow::bail!("1Password MCP support is currently available on macOS and Linux hosts");
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        anyhow::ensure!(
+            path.is_file(),
+            "1Password MCP executable not found at {}; enable the local MCP server in 1Password Developer settings",
+            path.display()
+        );
+        Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_summary_never_contains_argument_values() {
+        let summary = safe_call_summary(
+            "append_variables",
+            &json!({
+                "accountId": "account-secret-ish",
+                "environmentId": "environment-secret-ish",
+                "variables": [{"name": "TOKEN", "value": "super-secret", "concealed": true}]
+            }),
+        );
+        assert!(summary.contains("accountId"));
+        assert!(summary.contains("environmentId"));
+        assert!(summary.contains("variables"));
+        assert!(!summary.contains("super-secret"));
+        assert!(!summary.contains("TOKEN"));
+        assert!(!summary.contains("account-secret-ish"));
+    }
+
+    #[test]
+    fn local_env_file_mounts_stay_inside_normal_session_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = config::canonical_directory(root.path()).unwrap();
+        let session = config::Session {
+            id: "onepassword-test".to_owned(),
+            cwd: root.clone(),
+            permitted_directories: vec![root],
+            started_at: 0,
+            process_id: 0,
+            yolo: false,
+        };
+        assert!(
+            enforce_path_boundary(
+                &session,
+                "create_local_env_file",
+                &json!({"mountPath": "inside.env"}),
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_path_boundary(
+                &session,
+                "create_local_env_file",
+                &json!({"mountPath": outside.path().join("outside.env")}),
+            )
+            .is_err()
+        );
+    }
+}
