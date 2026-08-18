@@ -1,4 +1,4 @@
-# local-mcp
+# temote-mcp
 
 [日本語](README.ja.md)
 
@@ -6,10 +6,10 @@ This repository is derived from [nakasyou/local-mcp](https://github.com/nakasyou
 
 The name also draws on [@mr_konn's proposal of 「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), coined in Japanese as the opposite of “remote.” The original post does not give a Latin spelling; this repository uses **Temote**, including the example hostname `temotemcp.example.com`. We credit both the upstream codebase and this naming idea as part of the project's origin.
 
-local-mcp exposes local files and sandboxed commands as MCP tools. It does
+temote-mcp exposes local files and sandboxed commands as MCP tools. It does
 not provide web search or a general network-request tool. Sandboxed commands
 run with network access disabled. Linux uses the pinned Codex sandbox stack;
-macOS uses local-mcp's native Seatbelt backend.
+macOS uses temote-mcp's native Seatbelt backend.
 
 The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
 
@@ -19,7 +19,7 @@ The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
     Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                    |
                                                    v
-                                            local-mcp serve
+                                            temote-mcp serve
 
 ## Build
 
@@ -27,12 +27,12 @@ The public HTTP endpoint is designed for an on-demand Cloudflare Tunnel:
     cargo install --path . --locked
 
 The default build includes the public HTTP and gateway-agent commands. For a
-local-only binary containing `doctor`, `start`, and `mcp` without local-mcp's
+local-only binary containing `doctor`, `start`, and `mcp` without temote-mcp's
 direct HTTP/JWT client dependencies, disable the default `network` feature:
 
     cargo build --release --no-default-features --locked
 
-On Linux, install both local-mcp and the sibling codex-linux-sandbox binary
+On Linux, install both temote-mcp and the sibling codex-linux-sandbox binary
 in the same directory, and make sure bwrap is available in PATH. macOS uses
 the system Seatbelt sandbox. Native Windows is not supported.
 
@@ -43,17 +43,17 @@ dependencies without the committed lockfile can select incompatible `rama` or
 
 Before starting a session or connecting ChatGPT, run the host diagnostics:
 
-    local-mcp doctor
+    temote-mcp doctor
 
 On Linux, `doctor` checks the installed `codex-linux-sandbox` helper,
 `bubblewrap`, user-namespace settings, the isolated network namespace, a real
-local-mcp sandbox command, and the runtime environment used by shell commands.
+temote-mcp sandbox command, and the runtime environment used by shell commands.
 A failed `network namespace` check means the host cannot create the bwrap
 network namespace; fix the displayed host policy hint before starting the HTTP
 server. The command exits non-zero when a required check fails.
 
 If ChatGPT reports that `/.bash_profile` or `/tmp` cannot be found or written,
-update the installed binary with `just install`, run `local-mcp doctor`, and
+update the installed binary with `just install`, run `temote-mcp doctor`, and
 restart the origin process. Shell commands receive a minimal environment with
 `HOME` and the standard temporary directories available.
 
@@ -77,22 +77,22 @@ reset the monthly patch counter.
 
 Start each session from the project directory whose files it may access:
 
-    cd ~/src/local-mcp
-    local-mcp start local-mcp
+    cd ~/src/temote-mcp
+    temote-mcp start temote-mcp
 
     cd ~/src/shuttle-rs
-    local-mcp start shuttle-rs
+    temote-mcp start shuttle-rs
 
 For an explicitly unrestricted session, add `--yolo`:
 
-    local-mcp start local-mcp --yolo
+    temote-mcp start temote-mcp --yolo
 
-YOLO mode is intentionally dangerous: local-mcp approval prompts are skipped, path
+YOLO mode is intentionally dangerous: temote-mcp approval prompts are skipped, path
 roots are not enforced, and command tools run directly on the host with the
 filesystem, environment, process, and network permissions of the user running
-`local-mcp`. The mode is stored in the active session metadata so local stdio, HTTP,
+`temote-mcp`. The mode is stored in the active session metadata so local stdio, HTTP,
 and gateway requests all observe the same setting. This setting only controls
-local-mcp boundaries; any confirmation or authorization enforced by an MCP client is
+temote-mcp boundaries; any confirmation or authorization enforced by an MCP client is
 independent. `/permission ask` restores the normal restricted mode and
 `/permission yolo` enables it again while the session runs.
 
@@ -126,34 +126,34 @@ metadata read-only and network access disabled.
 ## Public HTTP endpoint
 
 Copy .env.example to a file outside the repository, such as
-~/.config/local-mcp/public.env, and set the Cloudflare Access values. Keep
+~/.config/temote-mcp/public.env, and set the Cloudflare Access values. Keep
 the file mode 0600; the Tunnel token is a credential.
 
-    install -d -m 700 ~/.config/local-mcp
-    cp .env.example ~/.config/local-mcp/public.env
-    chmod 600 ~/.config/local-mcp/public.env
-    vi ~/.config/local-mcp/public.env
+    install -d -m 700 ~/.config/temote-mcp
+    cp .env.example ~/.config/temote-mcp/public.env
+    chmod 600 ~/.config/temote-mcp/public.env
+    vi ~/.config/temote-mcp/public.env
 
 Use separate terminals when the service is needed:
 
     # Terminal 1: the local origin
     set -a
-    . ~/.config/local-mcp/public.env
+    . ~/.config/temote-mcp/public.env
     set +a
-    local-mcp serve
+    temote-mcp serve
 
     # Terminal 2: the on-demand remotely managed Tunnel
     set -a
-    . ~/.config/local-mcp/public.env
+    . ~/.config/temote-mcp/public.env
     set +a
-    cloudflared tunnel run --token "$LOCAL_MCP_TUNNEL_TOKEN"
+    cloudflared tunnel run --token "$TEMOTE_MCP_TUNNEL_TOKEN"
 
     # Terminal 3+: one local session per project
-    cd ~/src/local-mcp
-    local-mcp start local-mcp
+    cd ~/src/temote-mcp
+    temote-mcp start temote-mcp
 
 The repository also includes a `justfile` for these commands. Its development
-recipes build and run `target/release/local-mcp` from the current checkout, so
+recipes build and run `target/release/temote-mcp` from the current checkout, so
 an older globally installed binary cannot silently hide newly added tools.
 After installing `just`, the workflow is:
 
@@ -172,7 +172,7 @@ After installing `just`, the workflow is:
     just tunnel
 
     # Terminal 3+: one session per project
-    just start local-mcp
+    just start temote-mcp
     just start shuttle-rs ~/src/shuttle-rs
 
 The `start` recipe takes the session ID as its first argument and an optional
@@ -180,7 +180,7 @@ working directory as its second argument. `doctor`, `serve`, `up`, `start`, and
 `mcp` depend on the release build and execute that repository-local binary.
 Run one `just start` command per project/session in its own terminal; the origin
 and Tunnel recipes are also foreground processes. Use `just install` only when
-a globally available `local-mcp` command is required.
+a globally available `temote-mcp` command is required.
 
 The public route is:
 
@@ -188,7 +188,7 @@ The public route is:
 
 Cloudflare configuration must provide:
 
-1. A remotely managed Tunnel named local-mcp with
+1. A remotely managed Tunnel named temote-mcp with
    temotemcp.example.com routed to http://127.0.0.1:8791.
 2. A **self-hosted Cloudflare Access application** that directly protects the
    public hostname. Create it under Zero Trust > Access controls >
@@ -223,11 +223,11 @@ for the current Access terminology and API fields.
 
 Managed OAuth is handled by Cloudflare Access. The Rust origin validates the
 Cf-Access-Jwt-Assertion signature, issuer, audience, expiry, subject, and
-configured email allow list. `LOCAL_MCP_ACCESS_AUDIENCE` must contain the AUD
+configured email allow list. `TEMOTE_MCP_ACCESS_AUDIENCE` must contain the AUD
 of the self-hosted application that protects `temotemcp.example.com`; do not
 reuse the AUD of the portal-only `type: mcp` entry. If the self-hosted
-application is recreated, update `~/.config/local-mcp/public.env` and restart
-`local-mcp serve`. The old built-in local OAuth server is not part of the
+application is recreated, update `~/.config/temote-mcp/public.env` and restart
+`temote-mcp serve`. The old built-in local OAuth server is not part of the
 public path.
 
 In ChatGPT, add a custom MCP app in Developer mode and use the public /mcp
@@ -253,12 +253,12 @@ path, or is not the application on which Managed OAuth was enabled.
 
 If the origin log says `Cloudflare Access JWT audience is invalid`, copy the
 `AUD` value from the self-hosted application (not the portal-only `type: mcp`
-entry) into `LOCAL_MCP_ACCESS_AUDIENCE`, then restart `local-mcp serve`. The
+entry) into `TEMOTE_MCP_ACCESS_AUDIENCE`, then restart `temote-mcp serve`. The
 Allow policy decides whether Access forwards the request; the Rust origin still
 validates the forwarded JWT audience.
 
 If OAuth succeeds but ChatGPT shows no tools, refresh the MCP connection after
-restarting `local-mcp serve` (especially after changing the self-hosted
+restarting `temote-mcp serve` (especially after changing the self-hosted
 application AUD). The direct connection URL is still exactly
 `https://temotemcp.example.com/mcp`; the host root is only used for OAuth
 discovery. The public `tools/list` response includes the restricted `git_add`, `git_commit`,
@@ -302,9 +302,9 @@ for the client-side checks.
 
 ## Local stdio mode
 
-For a local MCP client that starts the process itself:
+For a Temote MCP client that starts the process itself:
 
-    local-mcp mcp
+    temote-mcp mcp
 
 This mode is separate from the Cloudflare Access HTTP endpoint. It includes
 the local approval UI, the explicitly approved without_sandbox command, and
@@ -312,40 +312,40 @@ the restricted Git operations described above.
 
 ## 1Password Environments MCP
 
-local-mcp can bridge the official local 1Password Environments MCP server so a
+temote-mcp can bridge the official local 1Password Environments MCP server so a
 remote client can use the same 1Password Developer workflow without exposing a
 new inbound port on the host. Enable **MCP Server** in 1Password Labs/Developer
-settings first. local-mcp uses the bundled `1password-mcp` binary at
+settings first. temote-mcp uses the bundled `1password-mcp` binary at
 `/Applications/1Password.app/Contents/MacOS/1password-mcp` on macOS or
-`/opt/1Password/1password-mcp` on Linux. Set `LOCAL_MCP_ONEPASSWORD_MCP` to an
+`/opt/1Password/1password-mcp` on Linux. Set `TEMOTE_MCP_ONEPASSWORD_MCP` to an
 absolute path only for a non-standard installation.
 
-The public and local MCP endpoints expose three bridge tools:
+The public and Temote MCP endpoints expose three bridge tools:
 
 - `onepassword_mcp_discover` lists the official child server's current resources
   and tool schemas. Use it before calling child tools.
 - `onepassword_mcp_read_resource` reads only resources advertised by that child
   server, including its getting-started and Environments guides.
 - `onepassword_mcp_call` forwards a named child tool call over a persistent stdio
-  connection. Calls whose child tool is not marked read-only use local-mcp's
+  connection. Calls whose child tool is not marked read-only use temote-mcp's
   normal approval UI unless the selected session is in yolo mode.
 
 For normal sessions, `create_local_env_file.mountPath` is additionally constrained
 to the session's permitted filesystem roots. Approval summaries include argument
 keys only and never persist argument values. Secret handling remains owned by the
-official 1Password MCP server; local-mcp does not add a secret-reading API or
+official 1Password MCP server; temote-mcp does not add a secret-reading API or
 translate 1Password data into environment variables itself.
 
 ### Service-account mode
 
-For unattended secret injection, start the local-mcp session with a 1Password
+For unattended secret injection, start the temote-mcp session with a 1Password
 service-account token:
 
-    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' local-mcp start my-project
+    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' temote-mcp start my-project
 
-The token is captured by the `local-mcp start` process and forwarded only to
+The token is captured by the `temote-mcp start` process and forwarded only to
 transient `op` subprocesses. It is not written to session JSON metadata, returned
-by any MCP tool, or required by the gateway agent. Keep `local-mcp start` running for the lifetime of the session.
+by any MCP tool, or required by the gateway agent. Keep `temote-mcp start` running for the lifetime of the session.
 
 Two additional tools are available:
 
@@ -358,11 +358,11 @@ Two additional tools are available:
   output masking remains enabled and `OP_SERVICE_ACCOUNT_TOKEN` is removed from
   the target command's direct environment.
 
-Normal local-mcp sessions still require host approval before a service-account
-command runs. A session started with `--yolo` skips that local-mcp approval, so
+Normal temote-mcp sessions still require host approval before a service-account
+command runs. A session started with `--yolo` skips that temote-mcp approval, so
 for fully unattended operation use:
 
-    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' local-mcp start my-project --yolo
+    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' temote-mcp start my-project --yolo
 
 `env_files` and `cwd` remain restricted to the session's permitted filesystem
 roots in normal mode. The service-account token should be scoped to only the
@@ -370,33 +370,33 @@ vaults required by the automation.
 
 ## kintone MCP Server
 
-local-mcp can also bridge the official [`@kintone/mcp-server`](https://github.com/kintone/mcp-server).
+temote-mcp can also bridge the official [`@kintone/mcp-server`](https://github.com/kintone/mcp-server).
 Install its CLI on the host first; the upstream package currently requires Node.js 22 or newer:
 
     npm install -g @kintone/mcp-server
 
-Start the local-mcp session with the kintone settings on the **`local-mcp start`
-process**, not on `local-mcp serve` or `gateway-agent`. The session process keeps
+Start the temote-mcp session with the kintone settings on the **`temote-mcp start`
+process**, not on `temote-mcp serve` or `gateway-agent`. The session process keeps
 the credential values in memory and does not write them to session metadata or
 return them through MCP:
 
     KINTONE_BASE_URL='https://example.cybozu.com' \
     KINTONE_API_TOKEN='<api-token>' \
-    local-mcp start my-project
+    temote-mcp start my-project
 
 Username/password authentication is also supported:
 
     KINTONE_BASE_URL='https://example.cybozu.com' \
     KINTONE_USERNAME='<username>' \
     KINTONE_PASSWORD='<password>' \
-    local-mcp start my-project
+    temote-mcp start my-project
 
 The bridge passes the official configuration variables supported by the upstream
 server: `KINTONE_BASE_URL`, username/password or `KINTONE_API_TOKEN`, optional
 Basic-auth credentials, PFX client-certificate settings, `HTTPS_PROXY`/`https_proxy`, and
 `KINTONE_ATTACHMENTS_DIR`. `KINTONE_PFX_FILE_PATH` and
 `KINTONE_ATTACHMENTS_DIR` must remain inside the selected session's permitted
-filesystem roots in normal mode. Set `LOCAL_MCP_KINTONE_MCP` to an absolute
+filesystem roots in normal mode. Set `TEMOTE_MCP_KINTONE_MCP` to an absolute
 path when `kintone-mcp-server` is not on `PATH`.
 
 Three public/local tools are exposed:
@@ -412,16 +412,16 @@ Three public/local tools are exposed:
 
 The child process receives only the small runtime environment needed to launch
 Node plus the allow-listed kintone variables. Other credentials present in the
-`local-mcp start` environment are not inherited by the kintone child. To source
-kintone credentials from 1Password, run `local-mcp start` itself through
+`temote-mcp start` environment are not inherited by the kintone child. To source
+kintone credentials from 1Password, run `temote-mcp start` itself through
 `op run`; the resolved values are then captured by the session process without
-being placed in local-mcp's session JSON.
+being placed in temote-mcp's session JSON.
 
 ## Serverless multi-host gateway
 
 The optional [`gateway/`](gateway/) deployment exposes one Cloudflare Workers
 MCP endpoint and routes calls through Durable Objects by `session_id`. Mac and
-Windows/WSL2 endpoints run `local-mcp gateway-agent`, make outbound-only HTTPS
+Windows/WSL2 endpoints run `temote-mcp gateway-agent`, make outbound-only HTTPS
 long polls, and retain the local terminal approval and sandbox boundary. A new
 host connection increments its generation so responses from a disconnected or
 replaced process cannot complete current requests.
@@ -429,14 +429,14 @@ replaced process cannot complete current requests.
 Typical endpoint commands are:
 
     # Mac
-    local-mcp start mac-main
-    local-mcp gateway-agent --session-id mac-main
+    temote-mcp start mac-main
+    temote-mcp gateway-agent --session-id mac-main
 
     # Windows interim path, inside WSL2
-    local-mcp start windows-wsl2-main
-    local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
+    temote-mcp start windows-wsl2-main
+    temote-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
 
-Set `LOCAL_MCP_GATEWAY_URL`, `LOCAL_MCP_GATEWAY_HOST_TOKEN`, and, when the host
+Set `TEMOTE_MCP_GATEWAY_URL`, `TEMOTE_MCP_GATEWAY_HOST_TOKEN`, and, when the host
 route is protected by Cloudflare Access, the service-token client ID and secret.
 Deployment, Managed OAuth, Durable Object migration, reconnect behavior, and
 secret handling are documented in [`gateway/README.md`](gateway/README.md).

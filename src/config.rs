@@ -21,7 +21,7 @@ pub struct Session {
 pub fn state_dir() -> Result<PathBuf> {
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
-        .map(|path| path.join("local-mcp"))
+        .map(|path| path.join("temote-mcp"))
         .context("could not determine a local state directory")
 }
 
@@ -48,7 +48,7 @@ fn socket_dir() -> PathBuf {
     // `TMPDIR` on macOS can itself be long, so use the conventional short
     // system temporary directory rather than `std::env::temp_dir()`.
     let uid = unsafe { libc::geteuid() };
-    PathBuf::from("/tmp").join(format!("local-mcp-{uid}"))
+    PathBuf::from("/tmp").join(format!("temote-mcp-{uid}"))
 }
 
 pub fn session_id(id: Option<&str>) -> Result<String> {
@@ -77,12 +77,12 @@ pub async fn load_session(id: &str) -> Result<Session> {
     let path = session_path(id)?;
     anyhow::ensure!(
         session_is_active(id).await?,
-        "session {id} is not running; run local-mcp start {id} first"
+        "session {id} is not running; run temote-mcp start {id} first"
     );
     let bytes = tokio::fs::read(&path)
         .await
-        .with_context(|| format!("session {id} was not found; run `local-mcp start` first"))?;
-    serde_json::from_slice(&bytes).context("invalid local-mcp session")
+        .with_context(|| format!("session {id} was not found; run `temote-mcp start` first"))?;
+    serde_json::from_slice(&bytes).context("invalid temote-mcp session")
 }
 
 pub async fn session_is_active(id: &str) -> Result<bool> {

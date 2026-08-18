@@ -8,11 +8,11 @@ Branch: chore/20260806-purge-example-domain-history
 
 ## 概要
 
-`local-mcp` の working tree と全 git 履歴から、旧公開ドメイン `localmcp.example.com` および実名を含むテストメールアドレスを除去し、新ドメイン `example.com` に置き換える。
+`temote-mcp` の working tree と全 git 履歴から、旧公開ドメイン `localmcp.example.com` および実名を含むテストメールアドレスを除去し、新ドメイン `example.com` に置き換える。
 
 ## 背景
 
-`local-mcp` の公開 HTTP エンドポイントは Cloudflare Access Managed OAuth で保護されており、README には運用ドメインとして旧ドメイン `localmcp.example.com` が記載されていた（[README.md](../../README.md)）。`origin`（`f4ah6o/local-mcp`）は当時 private リポジトリだった。なお、当時この issue では `upstream`（`nakasyou/local-mcp`）を「無関係の別プロジェクト」と認識していたが、公開準備時の再確認で、本リポジトリが同 upstream から派生したことを明示する方針へ訂正した。運用ドメインを `temotemcp.example.com` に切り替えるにあたり、旧ドメインと、[src/http.rs](../../src/http.rs) のテストコードに含まれる実名メールアドレス（プレースホルダー: `test@example.com` に置換）を履歴からも除去する。
+`temote-mcp` の公開 HTTP エンドポイントは Cloudflare Access Managed OAuth で保護されており、README には運用ドメインとして旧ドメイン `localmcp.example.com` が記載されていた（[README.md](../../README.md)）。`origin`（`f4ah6o/temote-mcp`）は当時 private リポジトリだった。なお、当時この issue では `upstream`（`nakasyou/local-mcp`）を「無関係の別プロジェクト」と認識していたが、公開準備時の再確認で、本リポジトリが同 upstream から派生したことを明示する方針へ訂正した。運用ドメインを `temotemcp.example.com` に切り替えるにあたり、旧ドメインと、[src/http.rs](../../src/http.rs) のテストコードに含まれる実名メールアドレス（プレースホルダー: `test@example.com` に置換）を履歴からも除去する。
 
 このイシューは [20260806-reconnect-oauth-example-domain.md](../open/20260806-reconnect-oauth-example-domain.md) の前提作業であり、Cloudflare 側の再設定より先に完了させる。
 
@@ -32,7 +32,7 @@ Branch: chore/20260806-purge-example-domain-history
 ## 対象外
 
 - Cloudflare Access / Tunnel 側の再設定（[20260806-reconnect-oauth-example-domain.md](../open/20260806-reconnect-oauth-example-domain.md) で扱う）。
-- `~/.config/local-mcp/public.env` の値の設定（同上）。
+- `~/.config/temote-mcp/public.env` の値の設定（同上）。
 - `opz`（1Password CLI ラッパー）のトラブルシューティング。生の `op item list --format json`（vault 指定なし）が `authorization timeout` になる一方、`--vault Personal` 指定時や単発の直接呼び出しは数秒で成功する。`opz` はad-hoc署名の自己ビルドバイナリで、再ビルドのたびに1Password側の承認がリセットされている可能性がある。原因調査はスコープ外とする。
 
 ## 提案する方針

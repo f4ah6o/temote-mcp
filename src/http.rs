@@ -33,7 +33,7 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
-    eprintln!("local-mcp HTTP server listening on http://{addr}");
+    eprintln!("temote-mcp HTTP server listening on http://{addr}");
     eprintln!("MCP endpoint for remote clients: {public_url}/mcp");
     eprintln!("Authentication: Cloudflare Access Managed OAuth");
     axum::serve(listener, router(runtime)).await?;
@@ -55,7 +55,7 @@ pub fn router(runtime: Runtime) -> Router {
 }
 
 pub fn normalize_public_url(value: &str) -> Result<String> {
-    let parsed = Url::parse(value.trim()).context("LOCAL_MCP_PUBLIC_URL is invalid")?;
+    let parsed = Url::parse(value.trim()).context("TEMOTE_MCP_PUBLIC_URL is invalid")?;
     anyhow::ensure!(
         parsed.scheme() == "https"
             && parsed.username().is_empty()
@@ -63,11 +63,11 @@ pub fn normalize_public_url(value: &str) -> Result<String> {
             && parsed.query().is_none()
             && parsed.fragment().is_none()
             && parsed.path().trim_matches('/').is_empty(),
-        "LOCAL_MCP_PUBLIC_URL must be an HTTPS origin without a path"
+        "TEMOTE_MCP_PUBLIC_URL must be an HTTPS origin without a path"
     );
     anyhow::ensure!(
         parsed.host_str().is_some(),
-        "LOCAL_MCP_PUBLIC_URL has no host"
+        "TEMOTE_MCP_PUBLIC_URL has no host"
     );
     Ok(parsed
         .origin()
@@ -77,7 +77,7 @@ pub fn normalize_public_url(value: &str) -> Result<String> {
 }
 
 async fn healthz() -> Response {
-    Json(json!({"status": "ok", "service": "local-mcp"})).into_response()
+    Json(json!({"status": "ok", "service": "temote-mcp"})).into_response()
 }
 
 /// Streamable HTTP uses POST for this stateless endpoint. SSE is deliberately

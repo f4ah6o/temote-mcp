@@ -1,4 +1,4 @@
-# local-mcp Cloudflare gateway
+# temote-mcp Cloudflare gateway
 
 [English](README.md)
 
@@ -12,7 +12,7 @@
 
 Worker の `/mcp` は Cloudflare Access assertion を検証し、MCP の `initialize` と `tools/list` に応答します。`tools/call` は対象の `GatewaySession` へ転送します。
 
-`/v1/hosts/*` は `local-mcp gateway-agent` 用の API で、bearer token で保護します。
+`/v1/hosts/*` は `temote-mcp gateway-agent` 用の API で、bearer token で保護します。
 
 ホストが再接続すると Durable Object の generation が増えます。古い generation や古い process `instance_id` から届いた request/response は HTTP 409 で拒否します。ツール呼び出しには非 idempotent な操作もあるため、timeout 後の自動 retry は行いません。
 
@@ -49,20 +49,20 @@ Worker の `/mcp` は Cloudflare Access assertion を検証し、MCP の `initia
 
 まず、対象プロジェクトのディレクトリでローカルセッションを起動します。
 
-    local-mcp start mac-main
+    temote-mcp start mac-main
 
 その端末で `gateway_connect` を承認してから、outbound agent を起動します。
 
-    export LOCAL_MCP_GATEWAY_URL=https://<gateway-host>
-    export LOCAL_MCP_GATEWAY_HOST_TOKEN='<worker HOST_TOKEN>'
-    export LOCAL_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
-    export LOCAL_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
-    local-mcp gateway-agent --session-id mac-main
+    export TEMOTE_MCP_GATEWAY_URL=https://<gateway-host>
+    export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<worker HOST_TOKEN>'
+    export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
+    export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
+    temote-mcp gateway-agent --session-id mac-main
 
 Windows 側は別の session ID にしてください。native Windows transport/sandbox が入るまでは、セッションと agent の両方を WSL2 内で起動します。
 
-    local-mcp start windows-wsl2-main
-    local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
+    temote-mcp start windows-wsl2-main
+    temote-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
 
 `--platform auto` は macOS、通常の Linux、WSL2 を判別します。session ID は接続先を選ぶための routing key で、認証情報ではありません。endpoint 側の承認、Access policy、host token は別に必要です。
 

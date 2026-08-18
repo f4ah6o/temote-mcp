@@ -1,4 +1,4 @@
-# local-mcp Cloudflare gateway
+# temote-mcp Cloudflare gateway
 
 [日本語](README.ja.md)
 
@@ -12,7 +12,7 @@ This Worker exposes a single MCP endpoint to ChatGPT and routes each tool call t
 
 The Worker `/mcp` endpoint validates Cloudflare Access assertions, serves MCP `initialize` and `tools/list`, and forwards `tools/call` to the selected `GatewaySession`.
 
-`/v1/hosts/*` is the bearer-token-protected API used by `local-mcp gateway-agent`.
+`/v1/hosts/*` is the bearer-token-protected API used by `temote-mcp gateway-agent`.
 
 When a host reconnects, the Durable Object generation increases. Requests and responses from an older generation or process `instance_id` are rejected with HTTP 409. The gateway does not automatically retry timed-out tool calls because some tools are non-idempotent.
 
@@ -49,20 +49,20 @@ The public MCP URL has this form:
 
 Start a local session from the project directory first:
 
-    local-mcp start mac-main
+    temote-mcp start mac-main
 
 Approve `gateway_connect` in that terminal, then start the outbound agent:
 
-    export LOCAL_MCP_GATEWAY_URL=https://<gateway-host>
-    export LOCAL_MCP_GATEWAY_HOST_TOKEN='<worker HOST_TOKEN>'
-    export LOCAL_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
-    export LOCAL_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
-    local-mcp gateway-agent --session-id mac-main
+    export TEMOTE_MCP_GATEWAY_URL=https://<gateway-host>
+    export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<worker HOST_TOKEN>'
+    export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
+    export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
+    temote-mcp gateway-agent --session-id mac-main
 
 Use a different session ID for the Windows endpoint. Until native Windows transport and sandbox support are implemented, run both the session and the agent inside WSL2:
 
-    local-mcp start windows-wsl2-main
-    local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
+    temote-mcp start windows-wsl2-main
+    temote-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
 
 `--platform auto` detects macOS, ordinary Linux, and WSL2. A session ID is a routing key, not a credential. Endpoint approval, the Access policy, and the host token are still required.
 

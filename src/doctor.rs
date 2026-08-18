@@ -121,13 +121,13 @@ impl Report {
         if failures == 0 {
             Ok(())
         } else {
-            anyhow::bail!("local-mcp doctor found {failures} failing check(s)")
+            anyhow::bail!("temote-mcp doctor found {failures} failing check(s)")
         }
     }
 }
 
 pub async fn run() -> Result<()> {
-    println!("local-mcp doctor");
+    println!("temote-mcp doctor");
     println!("platform: {}", std::env::consts::OS);
 
     let mut report = Report::new();
@@ -164,17 +164,18 @@ fn check_platform(report: &mut Report) {
         report.add(Check::fail(
             "platform",
             "unsupported operating system",
-            "local-mcp sandbox execution currently supports Linux and macOS only.",
+            "temote-mcp sandbox execution currently supports Linux and macOS only.",
         ));
     }
 }
 
 #[cfg(target_os = "linux")]
 fn check_linux_helper(report: &mut Report) -> Result<bool> {
-    let executable = std::env::current_exe().context("could not determine local-mcp executable")?;
+    let executable =
+        std::env::current_exe().context("could not determine temote-mcp executable")?;
     let directory = executable
         .parent()
-        .context("local-mcp executable has no parent directory")?;
+        .context("temote-mcp executable has no parent directory")?;
     let helper = directory.join("codex-linux-sandbox");
     if helper.is_file() {
         report.add(Check::pass(
@@ -186,7 +187,7 @@ fn check_linux_helper(report: &mut Report) -> Result<bool> {
         report.add(Check::fail(
             "sandbox helper",
             format!("missing {}", helper.display()),
-            "Install local-mcp with `cargo install --path . --locked` so the helper is installed beside it.",
+            "Install temote-mcp with `cargo install --path . --locked` so the helper is installed beside it.",
         ));
         Ok(false)
     }
@@ -272,7 +273,7 @@ fn check_user_namespace_settings(report: &mut Report, network_namespace_ok: bool
         report,
         "/proc/sys/user/max_user_namespaces",
         "user namespaces",
-        "Enable unprivileged user namespaces or run local-mcp on a host that permits them.",
+        "Enable unprivileged user namespaces or run temote-mcp on a host that permits them.",
     );
     check_positive_sysctl(
         report,
@@ -352,7 +353,7 @@ async fn check_sandbox_execution(report: &mut Report) {
     match sandbox::run(&[true_executable.to_owned()], &cwd, &roots, None).await {
         Ok(output) if output.status == 0 => report.add(Check::pass(
             "sandbox execution",
-            "a local-mcp sandboxed command completed successfully",
+            "a temote-mcp sandboxed command completed successfully",
         )),
         Ok(output) => {
             let detail = if output.stderr.trim().is_empty() {
@@ -363,7 +364,7 @@ async fn check_sandbox_execution(report: &mut Report) {
             let hint = if contains_loopback_permission_error_text(&detail) {
                 APPARMOR_PROFILE_HINT
             } else {
-                "Fix the lower-level sandbox check above, then restart local-mcp."
+                "Fix the lower-level sandbox check above, then restart temote-mcp."
             };
             report.add(Check::fail("sandbox execution", detail, hint));
         }
@@ -372,7 +373,7 @@ async fn check_sandbox_execution(report: &mut Report) {
             let hint = if contains_loopback_permission_error_text(&detail) {
                 APPARMOR_PROFILE_HINT
             } else {
-                "Fix the lower-level sandbox check above, then restart local-mcp."
+                "Fix the lower-level sandbox check above, then restart temote-mcp."
             };
             report.add(Check::fail("sandbox execution", detail, hint));
         }
@@ -395,7 +396,7 @@ async fn check_sandbox_runtime_environment(report: &mut Report) {
     let command = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
-        "test -n \"$HOME\" || { echo 'HOME is unset' >&2; exit 10; }; test -d \"$HOME\" || { echo 'HOME is not a directory' >&2; exit 11; }; temp=$(mktemp /tmp/local-mcp-doctor.XXXXXX) || { echo '/tmp is not writable' >&2; exit 12; }; rm -f \"$temp\" || { echo 'cannot remove temporary file from /tmp' >&2; exit 13; }".to_owned(),
+        "test -n \"$HOME\" || { echo 'HOME is unset' >&2; exit 10; }; test -d \"$HOME\" || { echo 'HOME is not a directory' >&2; exit 11; }; temp=$(mktemp /tmp/temote-mcp-doctor.XXXXXX) || { echo '/tmp is not writable' >&2; exit 12; }; rm -f \"$temp\" || { echo 'cannot remove temporary file from /tmp' >&2; exit 13; }".to_owned(),
     ];
     match sandbox::run(&command, &cwd, std::slice::from_ref(&cwd), None).await {
         Ok(output) if output.status == 0 => report.add(Check::pass(
@@ -407,13 +408,13 @@ async fn check_sandbox_runtime_environment(report: &mut Report) {
             report.add(Check::fail(
                 "sandbox runtime environment",
                 detail,
-                "Run `just install` to update local-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
+                "Run `just install` to update temote-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
             ));
         }
         Err(error) => report.add(Check::fail(
             "sandbox runtime environment",
             format!("{error:#}"),
-            "Run `just install` to update local-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
+            "Run `just install` to update temote-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
         )),
     }
 }

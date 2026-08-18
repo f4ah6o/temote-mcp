@@ -9,7 +9,7 @@ Priority: P1
 
 ## 概要
 
-`local-mcp` のRust依存をplatform境界と機能境界に沿って整理し、ローカルMCP利用、HTTP公開、Cloudflare gateway、sandbox実行で必要なcrateだけを対応buildへ含める。
+`temote-mcp` のRust依存をplatform境界と機能境界に沿って整理し、ローカルMCP利用、HTTP公開、Cloudflare gateway、sandbox実行で必要なcrateだけを対応buildへ含める。
 
 最初にLinux専用Codex sandbox依存をtarget dependencyへ移し、その後にHTTP / Cloudflare Access / gateway機能とローカル実行機能の依存境界を整理する。
 
@@ -20,7 +20,7 @@ Priority: P1
 sandbox実装はplatform別で、Linuxでは `codex-linux-sandbox` を起動し、macOSではSeatbelt経路を利用する。
 一方 `codex-linux-sandbox` は全platform共通dependencyとして宣言されている。
 
-また `local-mcp start` / `mcp` のローカル経路と、`serve` / `gateway-agent` のネットワーク経路が同じbinaryに入り、Cloudflare Access JWT検証用のHTTP/JWT依存も常時解決される。
+また `temote-mcp start` / `mcp` のローカル経路と、`serve` / `gateway-agent` のネットワーク経路が同じbinaryに入り、Cloudflare Access JWT検証用のHTTP/JWT依存も常時解決される。
 
 ## 目標
 
@@ -88,7 +88,7 @@ Baseline: `0b7eff3`。計測hostはApple Silicon macOS。package数は `cargo me
 
 - `codex-linux-sandbox` をLinux target dependencyへ移動。macOS graphから除外された。`codex-protocol` / `codex-sandboxing` / `codex-utils-absolute-path` はmacOS Seatbeltでも必要なため共通dependencyを維持。
 - 直接依存していた vendored `openssl` を削除。`openssl-src` もresolved graphから消えた。Cloudflare Access / JWT / JWKS / gatewayを含むall-features check/testは成功。
-- `network` featureを追加し、defaultでは有効のまま既存CLI互換を維持。`--no-default-features` では `serve` / `gateway-agent` とlocal-mcp自身の `axum` / `dotenvy` / `jsonwebtoken` / `reqwest` / `url` 直接依存を除外する。Codex共通層由来のnetwork dependencyは推移依存として残る。
+- `network` featureを追加し、defaultでは有効のまま既存CLI互換を維持。`--no-default-features` では `serve` / `gateway-agent` とtemote-mcp自身の `axum` / `dotenvy` / `jsonwebtoken` / `reqwest` / `url` 直接依存を除外する。Codex共通層由来のnetwork dependencyは推移依存として残る。
 - `tokio` featureは全て現行コードで利用されているため削除しなかった。
 - macOS Seatbelt test fixtureが書き込み許可対象の`$TMPDIR`内にdenied pathを置いていたため、sandbox policyは変更せずfixtureだけ`$HOME`配下へ移して境界テストを有効化した。
 - CalVer release workflowを追加。`f4ah6o/calver-action`をcommit SHA pinし、`YYYY.MM.PATCH`（`MM`は非zero-padなので出力例は`2026.8.0`）、`Asia/Tokyo`、prefixless tag、legacy `v` prefix考慮で割り当てる。`latest`をrelease sourceとし、release-only commitで`Cargo.toml` / `Cargo.lock`を更新してからimmutable CalVer tagをpushする。

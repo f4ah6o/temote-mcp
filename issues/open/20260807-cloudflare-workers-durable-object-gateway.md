@@ -19,7 +19,7 @@ ChatGPT には単一の MCP endpoint だけを公開し、Cloudflare Workers と
 
 ## 背景
 
-現行構成は `local-mcp serve` と端末ごとの Cloudflare Tunnel を直接結び、公開 endpoint と host が一対一になっている。複数端末・複数 session を扱うには ChatGPT 側の MCP connection が増え、端末の切断・再接続や stale response の扱いも origin ごとに分散する。
+現行構成は `temote-mcp serve` と端末ごとの Cloudflare Tunnel を直接結び、公開 endpoint と host が一対一になっている。複数端末・複数 session を扱うには ChatGPT 側の MCP connection が増え、端末の切断・再接続や stale response の扱いも origin ごとに分散する。
 
 ## 目標
 
@@ -49,7 +49,7 @@ Cloudflare Worker (/mcp)
             ^
             | outbound connect + long poll
             |
-       local-mcp gateway-agent
+       temote-mcp gateway-agent
             |
             +--> local session socket
                   approval UI / sandbox roots / command execution
@@ -82,7 +82,7 @@ Cloudflare Worker (/mcp)
 - [x] active session lease を Registry Durable Object で管理する。
 - [x] connect / poll / respond / disconnect host protocol を追加する。
 - [x] generation 分離と stale response 拒否を追加する。
-- [x] `local-mcp gateway-agent` を追加する。
+- [x] `temote-mcp gateway-agent` を追加する。
 - [x] gateway 接続前の terminal approval を追加する。
 - [x] Mac / Linux / WSL2 platform reporting を追加する。
 - [x] Cloudflare Access service token header を agent option として追加する。
@@ -114,7 +114,7 @@ Cloudflare Worker (/mcp)
 
 ## Windows 方針
 
-現行 local session transport と sandbox は Unix API を使用するため、Windows native は対象外とする。Windows端末では WSL2 内で `local-mcp start <windows-session-id>` と `local-mcp gateway-agent` を動かす。native Windows transport と sandbox backend が実装された時点で platform を `windows` に切り替えるが、gateway protocol と generation model は変更しない。
+現行 local session transport と sandbox は Unix API を使用するため、Windows native は対象外とする。Windows端末では WSL2 内で `temote-mcp start <windows-session-id>` と `temote-mcp gateway-agent` を動かす。native Windows transport と sandbox backend が実装された時点で platform を `windows` に切り替えるが、gateway protocol と generation model は変更しない。
 
 ## リスク
 

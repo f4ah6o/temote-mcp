@@ -136,7 +136,7 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
     };
 
     eprintln!(
-        "local-mcp gateway agent approved\nsession_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
+        "temote-mcp gateway agent approved\nsession_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
         session.id, platform, instance_id, gateway.base_url
     );
 

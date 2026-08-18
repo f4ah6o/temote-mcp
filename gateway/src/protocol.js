@@ -62,7 +62,7 @@ export const PUBLIC_TOOLS = [
   ),
   tool(
     "session_info",
-    "Inspect a local MCP session",
+    "Inspect a Temote MCP session",
     "Show a session's ID, working directory, and allowed sandbox roots.",
     readOnly,
     schema(sessionProperty, ["session_id"]),
@@ -213,7 +213,7 @@ export const PUBLIC_TOOLS = [
   tool(
     "onepassword_mcp_call",
     "Call a 1Password MCP tool",
-    "Call a tool exposed by the official local 1Password Environments MCP server. Non-read-only child tools remain approval-gated by the host local-mcp session.",
+    "Call a tool exposed by the official local 1Password Environments MCP server. Non-read-only child tools remain approval-gated by the host temote-mcp session.",
     networkMutation,
     schema(
       {
@@ -234,7 +234,7 @@ export const PUBLIC_TOOLS = [
   tool(
     "onepassword_service_account_run",
     "Run with 1Password service-account secrets",
-    "Run a host command through op run using the service-account token held by the selected local-mcp start process. 1Password CLI output masking remains enabled; normal sessions require host approval.",
+    "Run a host command through op run using the service-account token held by the selected temote-mcp start process. 1Password CLI output masking remains enabled; normal sessions require host approval.",
     networkMutation,
     schema(
       {
@@ -250,21 +250,21 @@ export const PUBLIC_TOOLS = [
   tool(
     "kintone_mcp_status",
     "Check kintone MCP",
-    "Check whether the selected local-mcp session has the official kintone MCP executable and required authentication configuration. Credential values are never returned.",
+    "Check whether the selected temote-mcp session has the official kintone MCP executable and required authentication configuration. Credential values are never returned.",
     readOnly,
     schema(sessionProperty, ["session_id"]),
   ),
   tool(
     "kintone_mcp_discover",
     "Discover kintone MCP",
-    "List tool schemas exposed by the official kintone MCP server using credentials retained only by the selected local-mcp start process.",
+    "List tool schemas exposed by the official kintone MCP server using credentials retained only by the selected temote-mcp start process.",
     { ...readOnly, openWorldHint: true },
     schema(sessionProperty, ["session_id"]),
   ),
   tool(
     "kintone_mcp_call",
     "Call a kintone MCP tool",
-    "Call a tool exposed by the official kintone MCP server. All child tool calls are host-approval-gated in normal local-mcp sessions.",
+    "Call a tool exposed by the official kintone MCP server. All child tool calls are host-approval-gated in normal temote-mcp sessions.",
     networkMutation,
     schema(
       {

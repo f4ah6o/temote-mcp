@@ -1,12 +1,12 @@
-# local-mcp
+# temote-mcp
 
 [English](README.md)
 
-`local-mcp` は [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生したプロジェクトです。安全なリモートアクセス、ゲートウェイ運用、MCP ブリッジを中心に拡張しています。GitHub 上では fork として紐づいていないため、ここで出自を明記しています。
+`temote-mcp` は [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生したプロジェクトです。安全なリモートアクセス、ゲートウェイ運用、MCP ブリッジを中心に拡張しています。GitHub 上では fork として紐づいていないため、ここで出自を明記しています。
 
 名前の着想には、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46) もあります。元の投稿では英字表記が示されていないため、このリポジトリでは **Temote** と表記します。例示用ホスト名 `temotemcp.example.com` もこの表記に合わせています。upstream と同じく、この命名の出典もプロジェクトの由来として記録します。
 
-local-mcp は、手元のファイル操作とサンドボックス内のコマンド実行を MCP ツールとして公開します。Web 検索や任意のネットワークリクエスト機能はありません。通常モードのコマンドはネットワークから隔離されます。Linux では固定した Codex sandbox stack、macOS では local-mcp 独自の Seatbelt バックエンドを使います。
+temote-mcp は、手元のファイル操作とサンドボックス内のコマンド実行を MCP ツールとして公開します。Web 検索や任意のネットワークリクエスト機能はありません。通常モードのコマンドはネットワークから隔離されます。Linux では固定した Codex sandbox stack、macOS では temote-mcp 独自の Seatbelt バックエンドを使います。
 
 公開 HTTP エンドポイントは、必要なときだけ Cloudflare Tunnel を起動する構成を想定しています。
 
@@ -16,7 +16,7 @@ local-mcp は、手元のファイル操作とサンドボックス内のコマ�
     Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                    |
                                                    v
-                                            local-mcp serve
+                                            temote-mcp serve
 
 ## ビルド
 
@@ -27,13 +27,13 @@ local-mcp は、手元のファイル操作とサンドボックス内のコマ�
 
     cargo build --release --no-default-features --locked
 
-Linux では local-mcp と `codex-linux-sandbox` を同じディレクトリに置き、`bwrap` を PATH から実行できるようにしてください。macOS はシステムの Seatbelt を使います。Windows ネイティブには対応していません。
+Linux では temote-mcp と `codex-linux-sandbox` を同じディレクトリに置き、`bwrap` を PATH から実行できるようにしてください。macOS はシステムの Seatbelt を使います。Windows ネイティブには対応していません。
 
 インストール時は `--locked` を付けてください。Linux 用の Codex sandbox 依存関係は Git revision に固定されています。commit 済みの lockfile を使わないと、互換性のない prerelease 版の `rama` や `starlark` が選ばれることがあります。macOS では Codex sandbox crate 自体を解決しません。
 
 セッションを開始する前、または ChatGPT から接続する前に診断を実行します。
 
-    local-mcp doctor
+    temote-mcp doctor
 
 Linux の `doctor` は `codex-linux-sandbox`、`bubblewrap`、user namespace、隔離した network namespace、実際のサンドボックス実行、shell 用の実行環境を確認します。必須項目に失敗すると終了コードは non-zero です。
 
@@ -50,17 +50,17 @@ Linux の `doctor` は `codex-linux-sandbox`、`bubblewrap`、user namespace、�
 
 セッションは、そのセッションから触らせたいプロジェクトのディレクトリで開始します。
 
-    cd ~/src/local-mcp
-    local-mcp start local-mcp
+    cd ~/src/temote-mcp
+    temote-mcp start temote-mcp
 
     cd ~/src/shuttle-rs
-    local-mcp start shuttle-rs
+    temote-mcp start shuttle-rs
 
 制限を外して実行する場合は `--yolo` を付けます。
 
-    local-mcp start local-mcp --yolo
+    temote-mcp start temote-mcp --yolo
 
-YOLO mode では local-mcp の承認プロンプトとパス制限がなくなり、コマンドは local-mcp を実行しているユーザー権限でホスト上に直接実行されます。ファイル、環境変数、プロセス、ネットワークもその権限を引き継ぎます。危険なモードなので、用途を限定してください。実行中は `/permission ask` で通常モード、`/permission yolo` で YOLO mode に切り替えられます。
+YOLO mode では temote-mcp の承認プロンプトとパス制限がなくなり、コマンドは temote-mcp を実行しているユーザー権限でホスト上に直接実行されます。ファイル、環境変数、プロセス、ネットワークもその権限を引き継ぎます。危険なモードなので、用途を限定してください。実行中は `/permission ask` で通常モード、`/permission yolo` で YOLO mode に切り替えられます。
 
 `session_list` を除くすべてのツール呼び出しには `session_id` が必要です。`session_list` で起動中のセッションを探し、`session_info` で作業ディレクトリと許可済みのルートを確認できます。
 
@@ -77,28 +77,28 @@ ChatGPT から Git を操作するときは、ローカル commit に `git_add` 
 
 `.env.example` をリポジトリの外へコピーし、Cloudflare Access の設定値を入れます。Tunnel token は認証情報なので、ファイルの mode は 0600 にしてください。
 
-    install -d -m 700 ~/.config/local-mcp
-    cp .env.example ~/.config/local-mcp/public.env
-    chmod 600 ~/.config/local-mcp/public.env
-    vi ~/.config/local-mcp/public.env
+    install -d -m 700 ~/.config/temote-mcp
+    cp .env.example ~/.config/temote-mcp/public.env
+    chmod 600 ~/.config/temote-mcp/public.env
+    vi ~/.config/temote-mcp/public.env
 
 サービスが必要な間だけ、別々の端末で origin と Tunnel を起動します。
 
     # Terminal 1: local origin
     set -a
-    . ~/.config/local-mcp/public.env
+    . ~/.config/temote-mcp/public.env
     set +a
-    local-mcp serve
+    temote-mcp serve
 
     # Terminal 2: on-demand remotely managed Tunnel
     set -a
-    . ~/.config/local-mcp/public.env
+    . ~/.config/temote-mcp/public.env
     set +a
-    cloudflared tunnel run --token "$LOCAL_MCP_TUNNEL_TOKEN"
+    cloudflared tunnel run --token "$TEMOTE_MCP_TUNNEL_TOKEN"
 
     # Terminal 3+: project/session ごとに1つ
-    cd ~/src/local-mcp
-    local-mcp start local-mcp
+    cd ~/src/temote-mcp
+    temote-mcp start temote-mcp
 
 `justfile` から同じ操作を行えます。
 
@@ -109,7 +109,7 @@ ChatGPT から Git を操作するときは、ローカル commit に `git_add` 
     just down
     just serve
     just tunnel
-    just start local-mcp
+    just start temote-mcp
     just start shuttle-rs ~/src/shuttle-rs
 
 公開 URL の例は次のとおりです。
@@ -128,7 +128,7 @@ Cloudflare 側では次の4点を設定します。
 
 `AI controls > MCP servers` に作る portal registration は別用途です。ChatGPT が `temotemcp.example.com` に直接接続する構成を保護するのは、上記の self-hosted application です。
 
-Managed OAuth の処理は Cloudflare Access が担当します。Rust 側では `Cf-Access-Jwt-Assertion` の署名、issuer、audience、有効期限、subject、許可メールアドレスを検証します。`LOCAL_MCP_ACCESS_AUDIENCE` には `temotemcp.example.com` を保護している self-hosted application の AUD を設定します。
+Managed OAuth の処理は Cloudflare Access が担当します。Rust 側では `Cf-Access-Jwt-Assertion` の署名、issuer、audience、有効期限、subject、許可メールアドレスを検証します。`TEMOTE_MCP_ACCESS_AUDIENCE` には `temotemcp.example.com` を保護している self-hosted application の AUD を設定します。
 
 接続前は、次の probe で Access が origin より手前で応答していることを確認できます。
 
@@ -157,15 +157,15 @@ Managed OAuth の処理は Cloudflare Access が担当します。Rust 側では
 
 ## ローカル stdio
 
-MCP client が local-mcp の process を直接起動する場合は、HTTP ではなく stdio mode を使えます。
+MCP client が temote-mcp の process を直接起動する場合は、HTTP ではなく stdio mode を使えます。
 
-    local-mcp mcp
+    temote-mcp mcp
 
 Cloudflare Access を使う公開 HTTP エンドポイントとは独立したモードです。
 
 ## 1Password Environments MCP
 
-local-mcp は公式の 1Password Environments MCP server をブリッジできます。通常は macOS なら `/Applications/1Password.app/Contents/MacOS/1password-mcp`、Linux なら `/opt/1Password/1password-mcp` を使います。別の場所にインストールした場合だけ `LOCAL_MCP_ONEPASSWORD_MCP` を指定します。
+temote-mcp は公式の 1Password Environments MCP server をブリッジできます。通常は macOS なら `/Applications/1Password.app/Contents/MacOS/1password-mcp`、Linux なら `/opt/1Password/1password-mcp` を使います。別の場所にインストールした場合だけ `TEMOTE_MCP_ONEPASSWORD_MCP` を指定します。
 
 公開エンドポイントとローカルエンドポイントには、次の3つのブリッジツールがあります。
 
@@ -173,13 +173,13 @@ local-mcp は公式の 1Password Environments MCP server をブリッジでき�
 - `onepassword_mcp_read_resource` は child server が公開した resource だけを読み取ります。
 - `onepassword_mcp_call` は persistent stdio connection 経由で child tool を呼び出します。
 
-通常セッションでは、書き込みを伴う child tool も local-mcp の承認対象です。secret の扱いは公式 1Password MCP server に任せており、local-mcp 独自の secret-reading API は追加していません。
+通常セッションでは、書き込みを伴う child tool も temote-mcp の承認対象です。secret の扱いは公式 1Password MCP server に任せており、temote-mcp 独自の secret-reading API は追加していません。
 
 ### Service-account mode
 
-無人実行で secret を注入する場合は、`local-mcp start` に service-account token を渡します。
+無人実行で secret を注入する場合は、`temote-mcp start` に service-account token を渡します。
 
-    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' local-mcp start my-project
+    OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' temote-mcp start my-project
 
 service-account token は session process が保持し、session JSON metadata には書き込みません。
 
@@ -187,37 +187,37 @@ service-account token は session process が保持し、session JSON metadata �
 
 ## kintone MCP Server
 
-local-mcp は公式の [`@kintone/mcp-server`](https://github.com/kintone/mcp-server) もブリッジできます。先にホストへ CLI をインストールしてください。
+temote-mcp は公式の [`@kintone/mcp-server`](https://github.com/kintone/mcp-server) もブリッジできます。先にホストへ CLI をインストールしてください。
 
     npm install -g @kintone/mcp-server
 
-credential は `local-mcp serve` や `gateway-agent` ではなく、**`local-mcp start` process** に渡します。
+credential は `temote-mcp serve` や `gateway-agent` ではなく、**`temote-mcp start` process** に渡します。
 
     KINTONE_BASE_URL='https://example.cybozu.com' \
     KINTONE_API_TOKEN='<api-token>' \
-    local-mcp start my-project
+    temote-mcp start my-project
 
 username/password 認証も使えます。
 
     KINTONE_BASE_URL='https://example.cybozu.com' \
     KINTONE_USERNAME='<username>' \
     KINTONE_PASSWORD='<password>' \
-    local-mcp start my-project
+    temote-mcp start my-project
 
 公開/ローカルの各エンドポイントは `kintone_mcp_status`、`kintone_mcp_discover`、`kintone_mcp_call` を提供します。status から credential の値や tenant URL は返しません。
 
 ## Serverless multi-host gateway
 
-[`gateway/`](gateway/) は任意で使える Cloudflare Workers ベースのゲートウェイです。1つの MCP エンドポイントを公開し、`session_id` ごとに Durable Object を介して接続先ホストを選びます。Mac、Linux、Windows/WSL2 側の `local-mcp gateway-agent` は outbound-only の HTTPS long poll だけを行うため、ホストごとの inbound port や Tunnel は不要です。
+[`gateway/`](gateway/) は任意で使える Cloudflare Workers ベースのゲートウェイです。1つの MCP エンドポイントを公開し、`session_id` ごとに Durable Object を介して接続先ホストを選びます。Mac、Linux、Windows/WSL2 側の `temote-mcp gateway-agent` は outbound-only の HTTPS long poll だけを行うため、ホストごとの inbound port や Tunnel は不要です。
 
 代表的な起動例です。
 
     # Mac
-    local-mcp start mac-main
-    local-mcp gateway-agent --session-id mac-main
+    temote-mcp start mac-main
+    temote-mcp gateway-agent --session-id mac-main
 
     # Windows interim path, inside WSL2
-    local-mcp start windows-wsl2-main
-    local-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
+    temote-mcp start windows-wsl2-main
+    temote-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
 
-`LOCAL_MCP_GATEWAY_URL`、`LOCAL_MCP_GATEWAY_HOST_TOKEN` と、必要なら Cloudflare Access の service-token client ID/secret を設定します。デプロイ、Managed OAuth、Durable Object migration、再接続、secret の扱いは [`gateway/README.ja.md`](gateway/README.ja.md) にまとめています。
+`TEMOTE_MCP_GATEWAY_URL`、`TEMOTE_MCP_GATEWAY_HOST_TOKEN` と、必要なら Cloudflare Access の service-token client ID/secret を設定します。デプロイ、Managed OAuth、Durable Object migration、再接続、secret の扱いは [`gateway/README.ja.md`](gateway/README.ja.md) にまとめています。

@@ -22,7 +22,7 @@
         in
         {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "local-mcp";
+            pname = "temote-mcp";
             version = "0.1.0";
             src = self;
 
@@ -38,7 +38,7 @@
             ];
 
             postInstall = ''
-              wrapProgram $out/bin/local-mcp \
+              wrapProgram $out/bin/temote-mcp \
                 --prefix PATH : ${
                   pkgs.lib.makeBinPath (
                     [
@@ -54,7 +54,7 @@
               description = "Sandboxed local-machine MCP server with out-of-band approvals";
               homepage = "https://github.com/openai/codex";
               license = pkgs.lib.licenses.asl20;
-              mainProgram = "local-mcp";
+              mainProgram = "temote-mcp";
               platforms = supportedSystems;
             };
           };
@@ -64,8 +64,8 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/local-mcp";
-          meta.description = "Run the local-mcp stdio server";
+          program = "${self.packages.${system}.default}/bin/temote-mcp";
+          meta.description = "Run the temote-mcp stdio server";
         };
       });
 

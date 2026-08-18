@@ -123,7 +123,7 @@ async fn run_with_metadata_roots(
             );
         let executable = std::env::current_exe()?
             .parent()
-            .context("local-mcp executable has no parent directory")?
+            .context("temote-mcp executable has no parent directory")?
             .join("codex-linux-sandbox");
         anyhow::ensure!(
             executable.is_file(),
@@ -468,7 +468,7 @@ fn safe_environment() -> HashMap<String, String> {
                 .map(|value| (name.to_owned(), value))
         })
         .collect::<HashMap<_, _>>();
-    environment.insert("LOCAL_MCP_SANDBOX".to_owned(), "1".to_owned());
+    environment.insert("TEMOTE_MCP_SANDBOX".to_owned(), "1".to_owned());
     environment
 }
 
@@ -501,7 +501,7 @@ mod generic_tests {
         }
         assert_eq!(
             safe_environment()
-                .get("LOCAL_MCP_SANDBOX")
+                .get("TEMOTE_MCP_SANDBOX")
                 .map(String::as_str),
             Some("1")
         );
@@ -601,14 +601,14 @@ mod tests {
     fn test_directory() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join(format!(".local-mcp-sandbox-test-{}", Uuid::new_v4()))
+            .join(format!(".temote-mcp-sandbox-test-{}", Uuid::new_v4()))
     }
 
     #[tokio::test]
     async fn seatbelt_allows_workspace_writes_and_denies_other_writes() -> Result<()> {
         // Nix's macOS build sandbox does not allow a nested Seatbelt profile.
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -649,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_denies_update_and_delete_outside_workspace() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -666,7 +666,7 @@ mod tests {
                 "/bin/sh".into(),
                 "-c".into(),
                 "printf 'changed\\n' > \"$1\"".into(),
-                "local-mcp-test".into(),
+                "temote-mcp-test".into(),
                 protected.to_string_lossy().into_owned(),
             ],
             &workspace,
@@ -694,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_allows_an_explicit_extra_writable_root() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -725,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_denies_symlink_escape_from_workspace() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -757,7 +757,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_denies_rename_and_hardlink_escape_from_workspace() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -809,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_keeps_git_metadata_read_only_for_normal_commands() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -839,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn broader_writable_root_does_not_bypass_workspace_git_protection() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -869,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_git_mode_allows_index_but_protects_config() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -918,7 +918,7 @@ mod tests {
     async fn seatbelt_git_mode_runs_real_add_and_commit_and_protects_sensitive_metadata()
     -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -952,9 +952,9 @@ mod tests {
             &[
                 "/usr/bin/git".into(),
                 "-c".into(),
-                "user.name=local-mcp test".into(),
+                "user.name=temote-mcp test".into(),
                 "-c".into(),
-                "user.email=local-mcp@example.invalid".into(),
+                "user.email=temote-mcp@example.invalid".into(),
                 "-c".into(),
                 "core.hooksPath=/dev/null".into(),
                 "-c".into(),
@@ -1014,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_git_mode_commits_in_a_linked_worktree() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }
@@ -1033,9 +1033,9 @@ mod tests {
             vec!["add", "--", "base.txt"],
             vec![
                 "-c",
-                "user.name=local-mcp test",
+                "user.name=temote-mcp test",
                 "-c",
-                "user.email=local-mcp@example.invalid",
+                "user.email=temote-mcp@example.invalid",
                 "commit",
                 "-q",
                 "-m",
@@ -1078,9 +1078,9 @@ mod tests {
             &[
                 "/usr/bin/git".into(),
                 "-c".into(),
-                "user.name=local-mcp test".into(),
+                "user.name=temote-mcp test".into(),
                 "-c".into(),
-                "user.email=local-mcp@example.invalid".into(),
+                "user.email=temote-mcp@example.invalid".into(),
                 "-c".into(),
                 "core.hooksPath=/dev/null".into(),
                 "-c".into(),
@@ -1116,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn seatbelt_denies_network_access() -> Result<()> {
         if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("LOCAL_MCP_SANDBOX").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
         {
             return Ok(());
         }

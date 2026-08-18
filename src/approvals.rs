@@ -88,7 +88,7 @@ pub async fn request(
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
-        .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
+        .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
     stream
         .write_all(&serde_json::to_vec(&Message::Approval { request })?)
         .await?;
@@ -154,7 +154,7 @@ async fn kintone_mcp_request(session_id: &str, request: KintoneMcpRequest) -> Re
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
-        .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
+        .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
     stream
         .write_all(&serde_json::to_vec(&Message::KintoneMcp { request })?)
         .await?;
@@ -180,7 +180,7 @@ async fn service_account_request(
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
-        .with_context(|| format!("session {session_id} is not running; run `local-mcp start`"))?;
+        .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
     stream
         .write_all(&serde_json::to_vec(&Message::OnePasswordServiceAccount {
             request,
@@ -245,8 +245,8 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
         return Err(error);
     }
     eprintln!(
-        "local-mcp session: {}\ncwd: {}\nmode: {}\n\
-         Give this session ID to the agent so it can include it in local-mcp tool calls.\n\
+        "temote-mcp session: {}\ncwd: {}\nmode: {}\n\
+         Give this session ID to the agent so it can include it in temote-mcp tool calls.\n\
          Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
          Press Ctrl-C to stop.",
         session.id,
@@ -364,7 +364,7 @@ async fn run_session(
             }
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
-                eprintln!("Stopping local-mcp session {}", session.id);
+                eprintln!("Stopping temote-mcp session {}", session.id);
                 return Ok(());
             }
         }

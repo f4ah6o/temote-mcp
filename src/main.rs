@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Diagnose local-mcp and the host sandbox prerequisites.
+    /// Diagnose temote-mcp and the host sandbox prerequisites.
     Doctor,
     /// Start a session in the current directory and show its permission UI.
     Start {
@@ -47,9 +47,9 @@ enum Command {
     /// Run the MCP server over HTTP behind Cloudflare Access.
     Serve {
         /// Public HTTPS base URL clients reach this server through. When
-        /// omitted, LOCAL_MCP_PUBLIC_URL or ~/.config/local-mcp/public.env is
+        /// omitted, TEMOTE_MCP_PUBLIC_URL or ~/.config/temote-mcp/public.env is
         /// used.
-        #[arg(long, env = "LOCAL_MCP_PUBLIC_URL")]
+        #[arg(long, env = "TEMOTE_MCP_PUBLIC_URL")]
         public_url: Option<String>,
         /// Local address to listen on.
         #[arg(long, default_value = "127.0.0.1:8791")]
@@ -59,21 +59,21 @@ enum Command {
     /// Connect an active local session to a Cloudflare gateway using outbound long polling.
     GatewayAgent {
         /// Cloudflare Worker origin, without a path.
-        #[arg(long, env = "LOCAL_MCP_GATEWAY_URL")]
+        #[arg(long, env = "TEMOTE_MCP_GATEWAY_URL")]
         gateway_url: String,
-        /// Active local-mcp session to publish through the gateway.
+        /// Active temote-mcp session to publish through the gateway.
         #[arg(long)]
         session_id: String,
         /// Shared host credential stored as the Worker's HOST_TOKEN secret.
-        #[arg(long, env = "LOCAL_MCP_GATEWAY_HOST_TOKEN", hide_env_values = true)]
+        #[arg(long, env = "TEMOTE_MCP_GATEWAY_HOST_TOKEN", hide_env_values = true)]
         host_token: String,
         /// Optional Cloudflare Access service-token client ID.
-        #[arg(long, env = "LOCAL_MCP_GATEWAY_ACCESS_CLIENT_ID")]
+        #[arg(long, env = "TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID")]
         access_client_id: Option<String>,
         /// Optional Cloudflare Access service-token client secret.
         #[arg(
             long,
-            env = "LOCAL_MCP_GATEWAY_ACCESS_CLIENT_SECRET",
+            env = "TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET",
             hide_env_values = true
         )]
         access_client_secret: Option<String>,
@@ -126,9 +126,9 @@ async fn main() -> Result<()> {
 async fn serve_http(public_url: Option<String>, addr: SocketAddr) -> Result<()> {
     load_public_env()?;
     let public_url = public_url
-        .or_else(|| std::env::var("LOCAL_MCP_PUBLIC_URL").ok())
+        .or_else(|| std::env::var("TEMOTE_MCP_PUBLIC_URL").ok())
         .context(
-            "LOCAL_MCP_PUBLIC_URL is required; pass --public-url or create ~/.config/local-mcp/public.env",
+            "TEMOTE_MCP_PUBLIC_URL is required; pass --public-url or create ~/.config/temote-mcp/public.env",
         )?;
     let public_url = http::normalize_public_url(&public_url)?;
     let authenticator = access::AccessAuthenticator::from_env().await?;
@@ -140,7 +140,7 @@ fn load_public_env() -> Result<()> {
     let Some(config_dir) = dirs::config_dir() else {
         return Ok(());
     };
-    let path = config_dir.join("local-mcp").join("public.env");
+    let path = config_dir.join("temote-mcp").join("public.env");
     if path.is_file() {
         dotenvy::from_path(&path).with_context(|| format!("failed to load {}", path.display()))?;
     }

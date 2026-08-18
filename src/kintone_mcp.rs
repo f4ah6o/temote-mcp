@@ -35,7 +35,7 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn capture() -> Self {
-        let executable_override = std::env::var_os("LOCAL_MCP_KINTONE_MCP").map(PathBuf::from);
+        let executable_override = std::env::var_os("TEMOTE_MCP_KINTONE_MCP").map(PathBuf::from);
         let environment = KINTONE_ENV_NAMES
             .iter()
             .chain(CHILD_RUNTIME_ENV_NAMES.iter())
@@ -241,7 +241,7 @@ impl Bridge {
         if let Some(path) = &self.executable_override {
             anyhow::ensure!(
                 path.is_absolute(),
-                "LOCAL_MCP_KINTONE_MCP must be an absolute path"
+                "TEMOTE_MCP_KINTONE_MCP must be an absolute path"
             );
             anyhow::ensure!(
                 path.is_file(),
@@ -255,7 +255,7 @@ impl Bridge {
             .get("PATH")
             .and_then(|path| find_on_path("kintone-mcp-server", path));
         path.context(
-            "kintone-mcp-server was not found in PATH; install @kintone/mcp-server globally or set LOCAL_MCP_KINTONE_MCP to its absolute executable path",
+            "kintone-mcp-server was not found in PATH; install @kintone/mcp-server globally or set TEMOTE_MCP_KINTONE_MCP to its absolute executable path",
         )
     }
 }
@@ -309,7 +309,7 @@ impl Client {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "local-mcp",
+                        "name": "temote-mcp",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }),
@@ -375,7 +375,7 @@ impl Client {
                         "id": request_id,
                         "error": {
                             "code": -32601,
-                            "message": "local-mcp does not expose client-side MCP capabilities to kintone"
+                            "message": "temote-mcp does not expose client-side MCP capabilities to kintone"
                         }
                     }))
                     .await?;

@@ -1,4 +1,4 @@
-# local-mcp の公開 OAuth 接続を temotemcp.example.com で再構築する
+# temote-mcp の公開 OAuth 接続を temotemcp.example.com で再構築する
 
 Status: open
 Model: claude-sonnet-5
@@ -8,34 +8,34 @@ Branch: chore/20260806-reconnect-oauth-example-domain
 
 ## 進捗（2026-08-06）
 
-- 新Tunnel `temotemcp-example` を作成後、`temotemcp.example.com` の既存CNAME（`local-mcp` Tunnel、ID `00000000-0000-0000-0000-000000000000`、8/2作成の作業痕跡）が見つかったため、新Tunnelは削除し、既存 `local-mcp` Tunnelへ Published application route（`temotemcp.example.com` → `http://127.0.0.1:8791`）を設定した。
+- 新Tunnel `temotemcp-example` を作成後、`temotemcp.example.com` の既存CNAME（`temote-mcp` Tunnel、ID `00000000-0000-0000-0000-000000000000`、8/2作成の作業痕跡）が見つかったため、新Tunnelは削除し、既存 `temote-mcp` Tunnelへ Published application route（`temotemcp.example.com` → `http://127.0.0.1:8791`）を設定した。
 - 新規 self-hosted application `localmcp`（destination `temotemcp.example.com`、Allow policy: `operator@example.com`、Managed OAuth: token lifetime 15分、grant session 2週間、redirect URI 2件、localhost/loopback有効）を作成し、AUD `replace-with-cloudflare-access-audience` を取得。
 - Team domain: `example.cloudflareaccess.com`。
-- `~/.config/local-mcp/public.env` を手動設定（モード0600に修正）、`just env-check` 成功、`just up` で `local-mcp serve` と `cloudflared tunnel run --token` を起動、3つのcurlプローブが全て期待通りの結果。
+- `~/.config/temote-mcp/public.env` を手動設定（モード0600に修正）、`just env-check` 成功、`just up` で `temote-mcp serve` と `cloudflared tunnel run --token` を起動、3つのcurlプローブが全て期待通りの結果。
 - 残りはChatGPT側での接続確認のみ。
 
 ## 概要
 
-Cloudflare Access の self-hosted application と Tunnel を新ドメイン `temotemcp.example.com` で新規作成し、`local-mcp serve` を新しい Managed OAuth 接続で起動し直す。
+Cloudflare Access の self-hosted application と Tunnel を新ドメイン `temotemcp.example.com` で新規作成し、`temote-mcp serve` を新しい Managed OAuth 接続で起動し直す。
 
 ## 背景
 
-`local-mcp` の公開 HTTP エンドポイントは Cloudflare Access が Managed OAuth を終端し、Rust 側（[src/http.rs](../../src/http.rs)）は `Cf-Access-Jwt-Assertion` を検証するだけの設計（[README.md](../../README.md) の「Public HTTP endpoint」節）。現在、`local-mcp serve` と対応する `cloudflared tunnel run` はどちらも停止しており、`~/.config/local-mcp/public.env` は空（0バイト）で `LOCAL_MCP_PUBLIC_URL` 等が未設定。運用ドメインを旧ドメインから `example.com` に切り替えるため、Cloudflare 側の Access application と Tunnel を作り直す。
+`temote-mcp` の公開 HTTP エンドポイントは Cloudflare Access が Managed OAuth を終端し、Rust 側（[src/http.rs](../../src/http.rs)）は `Cf-Access-Jwt-Assertion` を検証するだけの設計（[README.md](../../README.md) の「Public HTTP endpoint」節）。現在、`temote-mcp serve` と対応する `cloudflared tunnel run` はどちらも停止しており、`~/.config/temote-mcp/public.env` は空（0バイト）で `TEMOTE_MCP_PUBLIC_URL` 等が未設定。運用ドメインを旧ドメインから `example.com` に切り替えるため、Cloudflare 側の Access application と Tunnel を作り直す。
 
 このイシューは [20260806-purge-example-domain-history.md](../done/20260806-purge-example-domain-history.md) の完了を前提とする。README/`.env.example` が新ドメインに更新されてから着手する。
 
 ## 問題
 
-- `local-mcp serve`（8791番）、local-mcp 用 `cloudflared tunnel run` のいずれも起動していない。
-- `~/.config/local-mcp/public.env` が空で、`LOCAL_MCP_PUBLIC_URL` / `LOCAL_MCP_ACCESS_TEAM_DOMAIN` / `LOCAL_MCP_ACCESS_AUDIENCE` / `LOCAL_MCP_ACCESS_ALLOWED_EMAILS` / `LOCAL_MCP_TUNNEL_TOKEN` が未設定。
-- 旧 self-hosted Access application（旧ホスト）と旧 Tunnel（名前 `local-mcp`）はドメイン移行に伴い作り直す対象であり、現行の AUD / トークンは新ドメインでは無効になる。
+- `temote-mcp serve`（8791番）、temote-mcp 用 `cloudflared tunnel run` のいずれも起動していない。
+- `~/.config/temote-mcp/public.env` が空で、`TEMOTE_MCP_PUBLIC_URL` / `TEMOTE_MCP_ACCESS_TEAM_DOMAIN` / `TEMOTE_MCP_ACCESS_AUDIENCE` / `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS` / `TEMOTE_MCP_TUNNEL_TOKEN` が未設定。
+- 旧 self-hosted Access application（旧ホスト）と旧 Tunnel（名前 `temote-mcp`）はドメイン移行に伴い作り直す対象であり、現行の AUD / トークンは新ドメインでは無効になる。
 
 ## 目標
 
 - `temotemcp.example.com` を保護する新しい self-hosted Access application が Managed OAuth 有効の状態で存在する。
 - `temotemcp.example.com` にルーティングする新しい Cloudflare Tunnel が動作している。
-- `~/.config/local-mcp/public.env` に新しい値が設定され、`just env-check` が通る。
-- `local-mcp serve` と対応する Tunnel が起動し、README記載の疎通確認（401 + `WWW-Authenticate`、OAuth discovery 200）が通る。
+- `~/.config/temote-mcp/public.env` に新しい値が設定され、`just env-check` が通る。
+- `temote-mcp serve` と対応する Tunnel が起動し、README記載の疎通確認（401 + `WWW-Authenticate`、OAuth discovery 200）が通る。
 - ChatGPT 側で `temotemcp.example.com/mcp` への新しい MCP コネクタ接続が確立している。
 
 ## 対象外
@@ -53,7 +53,7 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `tem
    - Advanced 設定で Managed OAuth を有効化: dynamic client registration 有効、アクセストークン寿命15分、grant session 期間14日。
    - Redirect URI: `https://chatgpt.com/connector/oauth/*` と `https://chatgpt.com/connector_platform_oauth_redirect`。localhost/loopback client オプションも有効化する（README 記載の既知動作構成を踏襲）。
    - 新しい AUD を控える。
-3. **ローカル設定（ユーザーが値を入力、値の適用はコマンド実行で確認）**: `~/.config/local-mcp/public.env` を `vi` 等で編集し、`LOCAL_MCP_PUBLIC_URL=https://temotemcp.example.com`、`LOCAL_MCP_ACCESS_TEAM_DOMAIN`、新しい `LOCAL_MCP_ACCESS_AUDIENCE`、`LOCAL_MCP_ACCESS_ALLOWED_EMAILS=operator@example.com`、新しい `LOCAL_MCP_TUNNEL_TOKEN` を設定する。
+3. **ローカル設定（ユーザーが値を入力、値の適用はコマンド実行で確認）**: `~/.config/temote-mcp/public.env` を `vi` 等で編集し、`TEMOTE_MCP_PUBLIC_URL=https://temotemcp.example.com`、`TEMOTE_MCP_ACCESS_TEAM_DOMAIN`、新しい `TEMOTE_MCP_ACCESS_AUDIENCE`、`TEMOTE_MCP_ACCESS_ALLOWED_EMAILS=operator@example.com`、新しい `TEMOTE_MCP_TUNNEL_TOKEN` を設定する。
 4. `just env-check` で必須変数が揃っていることを確認する。
 5. `just up`（または `just serve` / `just tunnel` を別ターミナルで）で起動する。
 6. README記載の curl プローブで疎通を確認する。
@@ -65,7 +65,7 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `tem
 - [x] `curl -i https://temotemcp.example.com/.well-known/oauth-authorization-server` が `200` を返す。
 - [x] `curl -i https://temotemcp.example.com/.well-known/oauth-protected-resource` が `200` を返す。
 - [x] `just env-check` が成功する。
-- [ ] `local-mcp serve` のログにエラーがなく、認証成功後の `tools/list` が期待する12ツールを返す。
+- [ ] `temote-mcp serve` のログにエラーがなく、認証成功後の `tools/list` が期待する12ツールを返す。
 - [ ] ChatGPT から `temotemcp.example.com/mcp` への接続でツール一覧が表示される。
 
 ## テスト計画

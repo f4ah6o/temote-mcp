@@ -9,13 +9,13 @@ Priority: P1
 
 ## 概要
 
-macOS の sandbox 実行から `codex-protocol` / `codex-sandboxing` / `codex-utils-absolute-path` を除去し、local-mcp が実際に必要とする固定権限モデルと Seatbelt profile 生成だけを local-mcp 側で所有する。Linux は既存 Codex sandbox stack を維持する。
+macOS の sandbox 実行から `codex-protocol` / `codex-sandboxing` / `codex-utils-absolute-path` を除去し、temote-mcp が実際に必要とする固定権限モデルと Seatbelt profile 生成だけを temote-mcp 側で所有する。Linux は既存 Codex sandbox stack を維持する。
 
 Apple Silicon macOS の resolved graph は 441 -> 193 packages、248 packages / 56.2% 削減。x86_64 macOS は 442 -> 194 packages。macOS graph の `codex-*` は 0 になった。
 
 ## 実装結果
 
-- `SandboxSpec` を導入し、macOS の filesystem / network / Git 例外権限を local-mcp 固有の小さい policy model に集約した。
+- `SandboxSpec` を導入し、macOS の filesystem / network / Git 例外権限を temote-mcp 固有の小さい policy model に集約した。
 - macOS production path を `/usr/bin/sandbox-exec` を直接使う native Seatbelt backend に切り替えた。
 - Seatbelt dynamic path は `-D` parameter 経由に限定し、非UTF-8 path は fail-closed とした。
 - network allow rule を持たない default-deny policy を維持した。
@@ -25,7 +25,7 @@ Apple Silicon macOS の resolved graph は 441 -> 193 packages、248 packages / 
 - broad permitted root が nested workspace の `.git` 保護を迂回しないよう、親 writable rule から nested protected metadata を除外する。
 - `codex-protocol` / `codex-sandboxing` / `codex-utils-absolute-path` を Linux-only dependency へ移動した。
 - Codex dependency の feature unification に偶然依存していた `uuid/serde` を直接宣言した。
-- MCP tool description を platform-neutral な `local-mcp sandbox` 表現へ更新した。
+- MCP tool description を platform-neutral な `temote-mcp sandbox` 表現へ更新した。
 - `doctor` に `native macOS Seatbelt` backend 表示を追加し、macOS 26 で実在する `/usr/bin/true` を sandbox probe に使用するよう修正した。
 - package license metadata を `MIT AND Apache-2.0` に整理し、`LICENSE-APACHE` と OpenAI Codex attribution を同梱した。
 - Linux/macOS matrix CI を追加し、macOS graph の Codex=0 / package上限と Linux Codex stack / package上限を固定した。
@@ -113,7 +113,7 @@ Apple Silicon macOS。同一hostで before/after を別の空 `CARGO_TARGET_DIR`
 - [x] `cargo build --release --locked`
 - [x] `cargo build --release --locked --no-default-features`
 - [x] aarch64/x86_64 macOS + x86_64 Linux metadata boundary check
-- [x] `local-mcp doctor` — native macOS Seatbelt / 0 failure / 0 warning
+- [x] `temote-mcp doctor` — native macOS Seatbelt / 0 failure / 0 warning
 - [x] `git diff --check`
 
 ## Commit separation

@@ -29,7 +29,7 @@ async function handleRequest(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }));
   if (url.pathname === "/healthz") {
-    return withCors(jsonResponse({ status: "ok", service: "local-mcp-gateway" }));
+    return withCors(jsonResponse({ status: "ok", service: "temote-mcp-gateway" }));
   }
   if (url.pathname === "/mcp") {
     const identity = await authorizeClient(request, env);
@@ -71,8 +71,8 @@ async function handleMcp(request, env, identity) {
         protocolVersion: negotiateProtocolVersion(rpc),
         capabilities: { tools: { listChanged: false } },
         serverInfo: {
-          name: "local-mcp-gateway",
-          title: "Local MCP Gateway",
+          name: "temote-mcp-gateway",
+          title: "Temote MCP Gateway",
           version: env.GATEWAY_VERSION || "2026.8.0",
         },
         instructions:

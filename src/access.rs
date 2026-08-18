@@ -30,13 +30,15 @@ pub struct AccessConfig {
 
 impl AccessConfig {
     pub fn from_env() -> Result<Self> {
-        let team_domain = required_env("LOCAL_MCP_ACCESS_TEAM_DOMAIN")?;
-        let audience = required_env("LOCAL_MCP_ACCESS_AUDIENCE")?.trim().to_owned();
+        let team_domain = required_env("TEMOTE_MCP_ACCESS_TEAM_DOMAIN")?;
+        let audience = required_env("TEMOTE_MCP_ACCESS_AUDIENCE")?
+            .trim()
+            .to_owned();
         anyhow::ensure!(
             !audience.is_empty(),
-            "LOCAL_MCP_ACCESS_AUDIENCE must not be empty"
+            "TEMOTE_MCP_ACCESS_AUDIENCE must not be empty"
         );
-        let allowed_emails = required_env("LOCAL_MCP_ACCESS_ALLOWED_EMAILS")?
+        let allowed_emails = required_env("TEMOTE_MCP_ACCESS_ALLOWED_EMAILS")?
             .split(',')
             .map(|email| email.trim().to_ascii_lowercase())
             .filter(|email| !email.is_empty())
@@ -44,7 +46,7 @@ impl AccessConfig {
 
         anyhow::ensure!(
             !allowed_emails.is_empty(),
-            "LOCAL_MCP_ACCESS_ALLOWED_EMAILS must contain at least one email"
+            "TEMOTE_MCP_ACCESS_ALLOWED_EMAILS must contain at least one email"
         );
 
         let team_domain = normalize_team_domain(&team_domain)?;
@@ -106,7 +108,7 @@ impl AccessAuthenticator {
         let config = Arc::new(AccessConfig::from_env()?);
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(format!("local-mcp/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("temote-mcp/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to create the Cloudflare Access HTTP client")?;
         let authenticator = Self {
@@ -286,7 +288,7 @@ fn normalize_team_domain(value: &str) -> Result<String> {
     } else {
         format!("https://{value}")
     };
-    let parsed = Url::parse(&candidate).context("LOCAL_MCP_ACCESS_TEAM_DOMAIN is invalid")?;
+    let parsed = Url::parse(&candidate).context("TEMOTE_MCP_ACCESS_TEAM_DOMAIN is invalid")?;
     anyhow::ensure!(
         parsed.scheme() == "https"
             && parsed.username().is_empty()
@@ -294,7 +296,7 @@ fn normalize_team_domain(value: &str) -> Result<String> {
             && parsed.query().is_none()
             && parsed.fragment().is_none()
             && parsed.path().trim_matches('/').is_empty(),
-        "LOCAL_MCP_ACCESS_TEAM_DOMAIN must be an HTTPS host without a path"
+        "TEMOTE_MCP_ACCESS_TEAM_DOMAIN must be an HTTPS host without a path"
     );
     anyhow::ensure!(
         parsed.host_str().is_some(),

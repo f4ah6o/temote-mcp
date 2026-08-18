@@ -89,7 +89,7 @@ impl Client {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "local-mcp",
+                        "name": "temote-mcp",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }),
@@ -155,7 +155,7 @@ impl Client {
                         "id": request_id,
                         "error": {
                             "code": -32601,
-                            "message": "local-mcp does not expose client-side MCP capabilities to 1Password"
+                            "message": "temote-mcp does not expose client-side MCP capabilities to 1Password"
                         }
                     }))
                     .await?;
@@ -373,11 +373,11 @@ fn safe_call_summary(tool_name: &str, arguments: &Value) -> String {
 }
 
 fn executable_path() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("LOCAL_MCP_ONEPASSWORD_MCP") {
+    if let Ok(value) = std::env::var("TEMOTE_MCP_ONEPASSWORD_MCP") {
         let path = PathBuf::from(value);
         anyhow::ensure!(
             path.is_absolute(),
-            "LOCAL_MCP_ONEPASSWORD_MCP must be an absolute path"
+            "TEMOTE_MCP_ONEPASSWORD_MCP must be an absolute path"
         );
         anyhow::ensure!(
             path.is_file(),
@@ -398,7 +398,7 @@ fn executable_path() -> Result<PathBuf> {
     {
         anyhow::ensure!(
             path.is_file(),
-            "1Password MCP executable not found at {}; enable the local MCP server in 1Password Developer settings",
+            "1Password MCP executable not found at {}; enable the Temote MCP server in 1Password Developer settings",
             path.display()
         );
         Ok(path)
