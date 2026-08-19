@@ -51,4 +51,8 @@ git tag -f latest <commit-to-release>
 git push -f origin latest
 ```
 
-`.github/workflows/release.yaml` allocates the next prefixless CalVer tag, updates `Cargo.toml` and `Cargo.lock` in a release-only commit, validates normal and local-only builds, and pushes the immutable CalVer tag. The release-only version commit is not merged back into `main`.
+`.github/workflows/release.yaml` allocates the next prefixless CalVer tag, updates `Cargo.toml` and `Cargo.lock` in a release-only commit, validates normal and local-only builds, and pushes the immutable CalVer tag. It then dispatches the generated cargo-dist workflow at that immutable tag. The release-only version commit is not merged back into `main`.
+
+`dist-workspace.toml` is the source of truth for binary distribution. `dist generate` refreshes `.github/workflows/release.yml`; do not hand-edit the generated workflow. Releases currently build `.tar.xz` archives for Apple Silicon macOS plus ARM64 and x64 GNU/Linux, then publish them to GitHub Releases. Intel macOS is not supported.
+
+`cargo-binstall` reads the repository manifest through `--git` and downloads the versionless target archive from the latest GitHub Release. The repository is not currently published to crates.io because its Linux sandbox dependencies are pinned Git dependencies, so the registry-only `cargo binstall temote-mcp` form is intentionally not advertised.

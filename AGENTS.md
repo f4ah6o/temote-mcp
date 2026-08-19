@@ -69,4 +69,4 @@ When behavior changes, update the narrowest relevant document and the skill only
 
 ## Release
 
-Releases use CalVer `YYYY.MM.PATCH` in `Asia/Tokyo` through `f4ah6o/calver-action`. The `latest` tag selects the release candidate; the workflow creates a release-only version commit and immutable CalVer tag rather than merging that version bump back into `main`.
+Releases use CalVer `YYYY.MM.PATCH` in `Asia/Tokyo` through `f4ah6o/calver-action`. The `latest` tag selects the release candidate; the allocator workflow creates a release-only version commit and immutable CalVer tag rather than merging that version bump back into `main`, then dispatches cargo-dist on that tag. Keep binary distribution settings in `dist-workspace.toml` and regenerate `.github/workflows/release.yml` with `dist generate` instead of hand-editing the generated workflow.

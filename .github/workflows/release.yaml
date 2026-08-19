@@ -1,4 +1,4 @@
-name: Release
+name: Allocate Release
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - latest
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -89,7 +90,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit --allow-empty -m "chore: release local-mcp ${VERSION}"
+          git commit --allow-empty -m "chore: release temote-mcp ${VERSION}"
 
       - name: Push immutable CalVer tag
         shell: bash
@@ -100,6 +101,15 @@ jobs:
           git tag "$TAG" HEAD
           git push origin "refs/tags/${TAG}"
 
+      - name: Dispatch dist release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.calver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref "$TAG" -f "tag=$TAG"
+
       - name: Summary
         shell: bash
         env:
@@ -107,7 +117,7 @@ jobs:
           TAG: ${{ steps.calver.outputs.tag }}
         run: |
           {
-            echo "## local-mcp release"
+            echo "## Temote MCP release"
             echo
             echo "- version: \`${VERSION}\`"
             echo "- tag: \`${TAG}\`"

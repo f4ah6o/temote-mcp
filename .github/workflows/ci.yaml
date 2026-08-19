@@ -79,7 +79,6 @@ jobs:
 
           expected = {
               "aarch64-apple-darwin": 193,
-              "x86_64-apple-darwin": 194,
           }
           for target, maximum in expected.items():
               raw = subprocess.check_output([
