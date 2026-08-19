@@ -6,12 +6,20 @@ Temote MCP は、手元のファイル・コマンド・一部のホスト連携
 
 ## インストール
 
+ビルド済みバイナリは `cargo-binstall` で導入できます。
+
 ```sh
-cargo install --git https://github.com/f4ah6o/temote-mcp --locked
+cargo binstall --git https://github.com/f4ah6o/temote-mcp temote-mcp
 temote-mcp doctor
 ```
 
-macOS と Linux に対応しています。Windows ネイティブは未対応で、gateway endpoint では WSL2 を利用できます。
+ソースからビルドする場合は次を使います。
+
+```sh
+cargo install --git https://github.com/f4ah6o/temote-mcp --locked
+```
+
+Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネイティブは未対応で、gateway endpoint では WSL2 を利用できます。
 
 ## セッションを開始する
 

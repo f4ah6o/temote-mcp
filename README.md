@@ -6,12 +6,20 @@ Temote MCP exposes local files, commands, and selected host integrations as MCP 
 
 ## Install
 
+Prebuilt binaries are available through `cargo-binstall`:
+
 ```sh
-cargo install --git https://github.com/f4ah6o/temote-mcp --locked
+cargo binstall --git https://github.com/f4ah6o/temote-mcp temote-mcp
 temote-mcp doctor
 ```
 
-macOS and Linux are supported. Native Windows is not supported; WSL2 can be used for the gateway endpoint path.
+To build from source instead:
+
+```sh
+cargo install --git https://github.com/f4ah6o/temote-mcp --locked
+```
+
+Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are not supported; WSL2 can be used for the gateway endpoint path.
 
 ## Start a session
 
