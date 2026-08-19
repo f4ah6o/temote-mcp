@@ -30,7 +30,7 @@ chmod 600 ~/.config/temote-mcp/public.env
 - `TEMOTE_MCP_ACCESS_TEAM_DOMAIN`
 - `TEMOTE_MCP_ACCESS_AUDIENCE`
 - `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS`
-- `TEMOTE_MCP_TUNNEL_TOKEN`
+- `~/.config/temote-mcp/tunnel-token`（mode `0600`。変更する場合は `TUNNEL_TOKEN_FILE`）
 
 `just env-check` は secret value を表示せず設定有無を確認します。
 
@@ -49,7 +49,7 @@ temote-mcp serve
 set -a
 . ~/.config/temote-mcp/public.env
 set +a
-cloudflared tunnel run --token "$TEMOTE_MCP_TUNNEL_TOKEN"
+cloudflared tunnel run --token-file "${TUNNEL_TOKEN_FILE:-$HOME/.config/temote-mcp/tunnel-token}"
 ```
 
 project ごとの local session は別 process として起動しておく必要があります。

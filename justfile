@@ -36,10 +36,13 @@ env-check:
     public_env_file="${TEMOTE_MCP_ENV_FILE:-${HOME}/.config/temote-mcp/public.env}"; \
     test -r "$public_env_file" || { echo "missing readable environment file: $public_env_file" >&2; exit 1; }; \
     set -a; source "$public_env_file"; set +a; \
-    for variable_name in TEMOTE_MCP_PUBLIC_URL TEMOTE_MCP_ACCESS_TEAM_DOMAIN TEMOTE_MCP_ACCESS_AUDIENCE TEMOTE_MCP_ACCESS_ALLOWED_EMAILS TEMOTE_MCP_TUNNEL_TOKEN; do \
+    for variable_name in TEMOTE_MCP_PUBLIC_URL TEMOTE_MCP_ACCESS_TEAM_DOMAIN TEMOTE_MCP_ACCESS_AUDIENCE TEMOTE_MCP_ACCESS_ALLOWED_EMAILS; do \
         test -n "${!variable_name:-}" || { echo "missing $variable_name in $public_env_file" >&2; exit 1; }; \
     done; \
-    echo "public environment is configured: $public_env_file"
+    tunnel_token_file="${TUNNEL_TOKEN_FILE:-${HOME}/.config/temote-mcp/tunnel-token}"; \
+    test -s "$tunnel_token_file" || { echo "missing or empty tunnel token file: $tunnel_token_file" >&2; exit 1; }; \
+    echo "public environment is configured: $public_env_file"; \
+    echo "tunnel token file is configured: $tunnel_token_file"
 
 # Diagnose temote-mcp and the host sandbox prerequisites.
 doctor: build
@@ -55,7 +58,8 @@ serve: build env-check
 tunnel: env-check
     public_env_file="${TEMOTE_MCP_ENV_FILE:-${HOME}/.config/temote-mcp/public.env}"; \
     set -a; source "$public_env_file"; set +a; \
-    exec cloudflared tunnel run --token "$TEMOTE_MCP_TUNNEL_TOKEN"
+    tunnel_token_file="${TUNNEL_TOKEN_FILE:-${HOME}/.config/temote-mcp/tunnel-token}"; \
+    exec cloudflared tunnel run --token-file "$tunnel_token_file"
 
 # Run the origin and Tunnel together. Ctrl-C stops both child processes.
 up: build env-check
@@ -74,7 +78,8 @@ up: build env-check
         rm -f "$pid_file"; \
     fi; \
     "{{ justfile_directory() }}/target/release/temote-mcp" serve & serve_pid=$!; \
-    cloudflared tunnel run --token "$TEMOTE_MCP_TUNNEL_TOKEN" & tunnel_pid=$!; \
+    tunnel_token_file="${TUNNEL_TOKEN_FILE:-${HOME}/.config/temote-mcp/tunnel-token}"; \
+    cloudflared tunnel run --token-file "$tunnel_token_file" & tunnel_pid=$!; \
     printf '%s %s\n' "$serve_pid" "$tunnel_pid" > "$pid_file"; \
     cleanup() { kill "$serve_pid" "$tunnel_pid" 2>/dev/null || true; wait "$serve_pid" "$tunnel_pid" 2>/dev/null || true; rm -f "$pid_file"; }; \
     trap cleanup EXIT; \

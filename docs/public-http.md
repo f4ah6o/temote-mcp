@@ -30,7 +30,7 @@ Required values are:
 - `TEMOTE_MCP_ACCESS_TEAM_DOMAIN`
 - `TEMOTE_MCP_ACCESS_AUDIENCE`
 - `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS`
-- `TEMOTE_MCP_TUNNEL_TOKEN`
+- `~/.config/temote-mcp/tunnel-token` (mode `0600`; override with `TUNNEL_TOKEN_FILE`)
 
 `just env-check` validates presence without printing secret values.
 
@@ -49,7 +49,7 @@ temote-mcp serve
 set -a
 . ~/.config/temote-mcp/public.env
 set +a
-cloudflared tunnel run --token "$TEMOTE_MCP_TUNNEL_TOKEN"
+cloudflared tunnel run --token-file "${TUNNEL_TOKEN_FILE:-$HOME/.config/temote-mcp/tunnel-token}"
 ```
 
 Local project sessions are separate processes and must also be running.
