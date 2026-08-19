@@ -262,6 +262,8 @@ fn tools(public: bool) -> Value {
         {"name":"kintone_mcp_status","title":"Check kintone MCP","description":"Check whether the selected temote-mcp session has the official kintone MCP server executable and required authentication configuration. Credential values are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"kintone_mcp_discover","title":"Discover kintone MCP","description":"List tool schemas exposed by the official kintone MCP server using credentials retained only by the selected temote-mcp start process.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"kintone_mcp_call","title":"Call a kintone MCP tool","description":"Call a tool exposed by the official kintone MCP server. All child tool calls are host-approval-gated in normal temote-mcp sessions because the upstream server does not currently annotate read-only versus mutating tools.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}},"required":["session_id","tool_name","arguments"],"additionalProperties":false}},
+        {"name":"kintone_cli_status","title":"Check cli-kintone","description":"Check whether the selected temote-mcp session has cli-kintone plus kintone authentication configuration, and list the supported API-backed command pairs. Credential values and tenant URL are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"kintone_cli_run","title":"Run cli-kintone","description":"Run an allow-listed API-backed cli-kintone command using credentials held only by the temote-mcp start process. Supports record export/import/delete, customize export/apply, and plugin upload. Secret-bearing connection/auth options are rejected; file arguments and optional stdout_path must stay within permitted roots in normal sessions. All runs require local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"arguments":{"type":"array","items":{"type":"string"},"minItems":2,"description":"cli-kintone arguments excluding the executable, beginning with a supported command pair such as [\"record\",\"export\",...]."},"cwd":{"type":"string"},"stdout_path":{"type":"string","description":"Optional file path for record export stdout. Written atomically on success; rejected for other command pairs."}},"required":["session_id","arguments"],"additionalProperties":false}},
         {"name":"without_sandbox","title":"Run a host command","description":"Execute argv directly on the host with the local user's permissions and network access. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}}
     ]);
     if public {
@@ -501,6 +503,58 @@ async fn call_tool(params: &Value, public: bool) -> Result<Value> {
             )
             .await;
             Ok(result)
+        }
+        "kintone_cli_status" => {
+            let result = approvals::kintone_cli_status(&session.id).await?;
+            text_result(serde_json::to_string_pretty(&result)?)
+        }
+        "kintone_cli_run" => {
+            let arguments = args
+                .get("arguments")
+                .and_then(Value::as_array)
+                .context("missing arguments")?
+                .iter()
+                .map(|argument| {
+                    argument
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("arguments entries must be strings")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                arguments.len() >= 2,
+                "kintone_cli_run requires a cli-kintone command pair"
+            );
+            let cwd = cwd(&args, &session)?;
+            let stdout_path = args
+                .get("stdout_path")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(PathBuf::from)
+                        .context("stdout_path must be a string")
+                })
+                .transpose()?;
+            if !approvals::request(
+                &session.id,
+                "kintone_cli_run",
+                safe_kintone_cli_summary(&arguments, stdout_path.as_deref()),
+                cwd.clone(),
+            )
+            .await?
+            {
+                anyhow::bail!("user denied cli-kintone command")
+            }
+            let result =
+                approvals::kintone_cli_run(&session.id, cwd, arguments.clone(), stdout_path)
+                    .await?;
+            approvals::activity(
+                &session.id,
+                format!("Ran cli-kintone {} {}", arguments[0], arguments[1]),
+                None,
+            )
+            .await;
+            text_result(serde_json::to_string_pretty(&result)?)
         }
         "without_sandbox" => without_sandbox(&args, &session).await,
         _ => anyhow::bail!("unknown tool: {name}"),
@@ -1309,6 +1363,51 @@ fn safe_child_call_summary(tool_name: &str, arguments: &Value) -> String {
     )
 }
 
+fn safe_kintone_cli_summary(arguments: &[String], stdout_path: Option<&Path>) -> String {
+    let command = match arguments.get(0..2) {
+        Some([group, action])
+            if matches!(
+                (group.as_str(), action.as_str()),
+                ("record", "export")
+                    | ("record", "import")
+                    | ("record", "delete")
+                    | ("customize", "export")
+                    | ("customize", "apply")
+                    | ("plugin", "upload")
+            ) =>
+        {
+            format!("{group} {action}")
+        }
+        _ => "(unvalidated)".to_owned(),
+    };
+    let mut option_names = arguments
+        .iter()
+        .skip(2)
+        .filter(|argument| argument.starts_with('-'))
+        .map(|argument| {
+            argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(name, _)| name)
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    option_names.sort();
+    option_names.dedup();
+    format!(
+        "command: {command}\noption names: {}\nstdout file: {}",
+        if option_names.is_empty() {
+            "(none)".to_owned()
+        } else {
+            option_names.join(", ")
+        },
+        if stdout_path.is_some() {
+            "configured"
+        } else {
+            "capture"
+        }
+    )
+}
+
 fn render_command(command: &[String]) -> String {
     command
         .iter()
@@ -1437,6 +1536,26 @@ mod tests {
         assert!(!summary.contains("sensitive-value"));
     }
 
+    #[test]
+    fn cli_kintone_approval_summary_hides_argument_values_and_paths() {
+        let summary = safe_kintone_cli_summary(
+            &[
+                "record".to_owned(),
+                "export".to_owned(),
+                "--app=42".to_owned(),
+                "--attachments-dir".to_owned(),
+                "/private/work/attachments".to_owned(),
+            ],
+            Some(Path::new("/private/work/export.csv")),
+        );
+        assert!(summary.contains("record export"));
+        assert!(summary.contains("--app"));
+        assert!(summary.contains("--attachments-dir"));
+        assert!(!summary.contains("42"));
+        assert!(!summary.contains("/private/work"));
+        assert!(!summary.contains("export.csv"));
+    }
+
     #[tokio::test]
     async fn negotiates_supported_protocol_versions() {
         let request = json!({
@@ -1514,7 +1633,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 25);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()

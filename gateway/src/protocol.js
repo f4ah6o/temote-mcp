@@ -276,6 +276,36 @@ export const PUBLIC_TOOLS = [
       ["session_id", "tool_name", "arguments"],
     ),
   ),
+  tool(
+    "kintone_cli_status",
+    "Check cli-kintone",
+    "Check whether the selected temote-mcp session has cli-kintone plus kintone authentication configuration, and list the supported API-backed command pairs. Credential values and tenant URL are never returned.",
+    readOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "kintone_cli_run",
+    "Run cli-kintone",
+    "Run an allow-listed API-backed cli-kintone command using credentials held only by the temote-mcp start process. Supports record export/import/delete, customize export/apply, and plugin upload. Secret-bearing connection/auth options are rejected; file arguments and optional stdout_path must stay within permitted roots in normal sessions. All runs require local approval unless the session is in yolo mode.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        arguments: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 2,
+          description: "cli-kintone arguments excluding the executable, beginning with a supported command pair such as [\"record\",\"export\",...].",
+        },
+        cwd: { type: "string" },
+        stdout_path: {
+          type: "string",
+          description: "Optional file path for record export stdout. Written atomically on success; rejected for other command pairs.",
+        },
+      },
+      ["session_id", "arguments"],
+    ),
+  ),
 ];
 
 export function validateSessionId(value) {

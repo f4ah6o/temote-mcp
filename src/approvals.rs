@@ -12,7 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
 use crate::config::{self, Session};
-use crate::{kintone_mcp, sandbox};
+use crate::{kintone_cli, kintone_mcp, sandbox};
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -38,6 +38,9 @@ enum Message {
     },
     KintoneMcp {
         request: KintoneMcpRequest,
+    },
+    KintoneCli {
+        request: KintoneCliRequest,
     },
 }
 
@@ -69,6 +72,23 @@ enum KintoneMcpRequest {
 
 #[derive(Serialize, Deserialize)]
 struct KintoneMcpResponse {
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum KintoneCliRequest {
+    Status,
+    Run {
+        cwd: PathBuf,
+        arguments: Vec<String>,
+        stdout_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct KintoneCliResponse {
     result: Option<Value>,
     error: Option<String>,
 }
@@ -150,6 +170,50 @@ pub async fn kintone_mcp_call(
     .await
 }
 
+pub async fn kintone_cli_status(session_id: &str) -> Result<Value> {
+    kintone_cli_request(session_id, KintoneCliRequest::Status).await
+}
+
+pub async fn kintone_cli_run(
+    session_id: &str,
+    cwd: PathBuf,
+    arguments: Vec<String>,
+    stdout_path: Option<PathBuf>,
+) -> Result<Value> {
+    kintone_cli_request(
+        session_id,
+        KintoneCliRequest::Run {
+            cwd,
+            arguments,
+            stdout_path,
+        },
+    )
+    .await
+}
+
+async fn kintone_cli_request(session_id: &str, request: KintoneCliRequest) -> Result<Value> {
+    let path = config::socket_path(session_id)?;
+    let mut stream = UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
+    stream
+        .write_all(&serde_json::to_vec(&Message::KintoneCli { request })?)
+        .await?;
+    stream.write_all(b"\n").await?;
+    stream.shutdown().await?;
+
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).await?;
+    let response: KintoneCliResponse =
+        serde_json::from_str(response.trim()).context("invalid cli-kintone response")?;
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
+    response
+        .result
+        .context("cli-kintone response is missing result")
+}
+
 async fn kintone_mcp_request(session_id: &str, request: KintoneMcpRequest) -> Result<Value> {
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
@@ -228,6 +292,7 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     let kintone_bridge = Arc::new(tokio::sync::Mutex::new(kintone_mcp::Bridge::capture()));
+    let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture());
     let id = config::session_id(session_id)?;
     config::remove_inactive_socket(&id).await?;
     let mut session = config::new_session(&std::env::current_dir()?, Some(&id), yolo)?;
@@ -274,6 +339,14 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
             "not configured"
         }
     );
+    eprintln!(
+        "cli-kintone: {}",
+        if kintone_cli_bridge.configured() {
+            "configured (credentials kept only by this session process)"
+        } else {
+            "not configured"
+        }
+    );
 
     let mut input = BufReader::new(tokio::io::stdin()).lines();
     let mut pending = VecDeque::<(Request, UnixStream)>::new();
@@ -284,6 +357,7 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
         &mut pending,
         service_account_token.as_deref(),
         Arc::clone(&kintone_bridge),
+        Arc::clone(&kintone_cli_bridge),
     )
     .await;
     session.process_id = 0;
@@ -301,6 +375,7 @@ async fn run_session(
     pending: &mut VecDeque<(Request, UnixStream)>,
     service_account_token: Option<&str>,
     kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
+    kintone_cli_bridge: Arc<kintone_cli::Bridge>,
 ) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -348,6 +423,22 @@ async fn run_session(
                             }
                         });
                     }
+                    Message::KintoneCli { request } => {
+                        let session = session.clone();
+                        let bridge = Arc::clone(&kintone_cli_bridge);
+                        tokio::spawn(async move {
+                            let response = handle_kintone_cli_request(&session, bridge, request).await;
+                            let response = match response {
+                                Ok(result) => KintoneCliResponse { result: Some(result), error: None },
+                                Err(error) => KintoneCliResponse { result: None, error: Some(format!("{error:#}")) },
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&response) {
+                                let _ = stream.write_all(&bytes).await;
+                                let _ = stream.write_all(b"\n").await;
+                                let _ = stream.shutdown().await;
+                            }
+                        });
+                    }
                     Message::Approval { request } if session.yolo => {
                         eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
                         stream.write_all(b"allow\n").await?;
@@ -368,6 +459,21 @@ async fn run_session(
                 return Ok(());
             }
         }
+    }
+}
+
+async fn handle_kintone_cli_request(
+    session: &Session,
+    bridge: Arc<kintone_cli::Bridge>,
+    request: KintoneCliRequest,
+) -> Result<Value> {
+    match request {
+        KintoneCliRequest::Status => Ok(bridge.status()),
+        KintoneCliRequest::Run {
+            cwd,
+            arguments,
+            stdout_path,
+        } => bridge.run(session, &cwd, arguments, stdout_path).await,
     }
 }
 

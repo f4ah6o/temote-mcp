@@ -7,6 +7,7 @@ mod doctor;
 mod gateway;
 #[cfg(feature = "network")]
 mod http;
+mod kintone_cli;
 mod kintone_mcp;
 mod mcp;
 mod onepassword_mcp;

@@ -92,13 +92,15 @@ For service-account workflows, use `onepassword_service_account_status` before a
 
 ## kintone bridge
 
-Use this sequence:
+Prefer the official MCP server for structured kintone operations:
 
 1. `kintone_mcp_status`
 2. `kintone_mcp_discover`
 3. `kintone_mcp_call` with a discovered tool name/schema
 
-Do not guess tenant credentials or expose them. In normal sessions, forwarded kintone calls are approval-gated because the child server may not distinguish read-only and mutating tools.
+Use `kintone_cli_status` and then `kintone_cli_run` when cli-kintone covers a gap better: attachment-aware bulk record export/import, guest-space record work, customization export/apply, or plugin upload. Pass CLI arguments without connection/authentication flags; those values belong to the `temote-mcp start` environment. Use `stdout_path` for large record exports instead of relying on captured stdout.
+
+Do not guess tenant credentials or expose them. In normal sessions, forwarded kintone MCP calls and all cli-kintone runs are approval-gated.
 
 ## Failure handling
 

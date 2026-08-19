@@ -37,6 +37,7 @@ Do not weaken these without an explicit issue describing the security model chan
 - Background jobs are session-owned and cancelled when the session stops or reaches its lifetime limit.
 - 1Password child MCP usage is discover-first: `onepassword_mcp_discover`, then resource/tool calls.
 - kintone child MCP usage is status/discover-first and mutating ambiguity remains approval-gated in normal mode.
+- cli-kintone usage is status-first; keep credentials/session target out of agent-supplied argv, validate file paths against permitted roots, and approval-gate all runs in normal mode.
 
 ## Development workflow
 

@@ -67,3 +67,26 @@ temote-mcp start my-project
 upstream server が全 tool を read-only/mutating と annotate していないため、通常 Temote MCP session では forwarded kintone call を approval-gate します。
 
 child process に渡す environment は最小 runtime environment と allow-list 済み kintone setting に限定されます。`temote-mcp start` が持つその他の credential は自動継承しません。
+
+## cli-kintone による補完
+
+MCP server でまだ扱いにくい API-backed operation、特に attachment 付き bulk record、guest space の record、JavaScript/CSS customization の export/apply、plugin upload を使う場合は公式 CLI を install します。
+
+```sh
+npm install -g @kintone/cli
+```
+
+`temote-mcp start` は同じ `KINTONE_BASE_URL`、`KINTONE_USERNAME` / `KINTONE_PASSWORD`、`KINTONE_API_TOKEN`、Basic auth、proxy、`KINTONE_GUEST_SPACE_ID` を capture します。`cli-kintone` が標準外の場所にある場合だけ `TEMOTE_MCP_KINTONE_CLI` に absolute path を指定します。
+
+最初に `kintone_cli_status` を使います。`kintone_cli_run` は API を使う次の command pair だけを受け付けます。
+
+- `record export`
+- `record import`
+- `record delete`
+- `customize export`
+- `customize apply`
+- `plugin upload`
+
+agent が渡す argument では `--base-url`、`--username`、`--password`、`--api-token`、proxy、PFX、`--guest-space-id` などの connection/auth/target option を拒否し、credential と tenant/guest-space target を session process に固定します。現行 cli-kintone は PFX password を command-line option でしか受け取らないため、CLI bridge では PFX を転送しません。PFX 認証が必要な場合は kintone MCP bridge を使います。
+
+`--attachments-dir`、`--file-path`、`--input`、`--output` など path を取る option は指定 cwd 基準で解決し、通常 session では permitted root 内に限定します。customize manifest 内の local JS/CSS reference も事前検証し、attachment import では parent traversal と attachment tree 内の symlink を拒否します。大きな `record export` の CSV は `stdout_path` で atomically file 保存できます。`kintone_cli_run` は通常 mode ではすべて local approval が必要です。CLI child process には `temote-mcp start` の全 environment ではなく、allow-list 済み runtime/kintone environment だけを渡します。

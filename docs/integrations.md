@@ -67,3 +67,26 @@ Use the bridge in this order:
 Because the upstream server does not currently annotate every tool as read-only versus mutating, forwarded kintone calls are approval-gated in normal Temote MCP sessions.
 
 The child process receives only a small runtime environment plus allow-listed kintone settings. Other credentials inherited by `temote-mcp start` are not passed through automatically.
+
+## cli-kintone complement
+
+Install the official CLI when you need API-backed operations that the MCP server does not currently cover well, especially bulk record workflows with attachments, guest-space record access, JavaScript/CSS customization export/apply, or plugin upload:
+
+```sh
+npm install -g @kintone/cli
+```
+
+The same `KINTONE_BASE_URL`, `KINTONE_USERNAME` / `KINTONE_PASSWORD`, `KINTONE_API_TOKEN`, Basic-auth, proxy, and `KINTONE_GUEST_SPACE_ID` settings are captured by `temote-mcp start`. Set `TEMOTE_MCP_KINTONE_CLI` only when `cli-kintone` is installed at a non-standard absolute path.
+
+Use `kintone_cli_status` first. `kintone_cli_run` then accepts only these API-backed command pairs:
+
+- `record export`
+- `record import`
+- `record delete`
+- `customize export`
+- `customize apply`
+- `plugin upload`
+
+Connection/authentication and target options such as `--base-url`, `--username`, `--password`, `--api-token`, proxy, PFX, and `--guest-space-id` are rejected in agent-supplied arguments so credentials and the tenant/guest-space target stay pinned to the session process. PFX is intentionally not forwarded through the CLI bridge because current cli-kintone exposes its certificate password only as a command-line option; use the kintone MCP bridge when PFX authentication is required.
+
+Path-bearing CLI options such as `--attachments-dir`, `--file-path`, `--input`, and `--output` are resolved against the requested working directory and must remain inside permitted roots in normal sessions. Customize manifests are preflighted so local JS/CSS references cannot escape those roots; attachment imports reject parent traversal and symlinks in the attachment tree. `stdout_path` can atomically save stdout, which is useful for large `record export` CSV output. All `kintone_cli_run` calls require local approval in normal mode. The CLI child receives only allow-listed runtime/kintone environment variables rather than the full `temote-mcp start` environment.
