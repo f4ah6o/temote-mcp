@@ -68,6 +68,10 @@ A Cloudflare `AI controls > MCP servers` portal registration is separate from th
 
 The Rust origin validates the forwarded `Cf-Access-Jwt-Assertion` signature, issuer, audience, expiry, subject, and configured email allow list.
 
+## MCP protocol compatibility
+
+The public endpoint supports both MCP `2026-07-28` and the existing 2025-era handshake. Modern requests use `server/discover`, per-request `_meta`, and the `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` HTTP headers. Legacy clients continue to use `initialize`; no `Mcp-Session-Id` is created for modern requests.
+
 ## Probe
 
 Before attaching an MCP client, verify that Access intercepts the origin:

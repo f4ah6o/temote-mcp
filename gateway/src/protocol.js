@@ -1,5 +1,6 @@
-export const PROTOCOL_VERSION = "2025-06-18";
-export const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+export const LEGACY_PROTOCOL_VERSION = "2025-06-18";
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
+export const SUPPORTED_LEGACY_PROTOCOL_VERSIONS = new Set([
   "2025-06-18",
   "2025-03-26",
   "2024-11-05",
@@ -288,7 +289,75 @@ export function sessionIdFromRpc(request) {
 
 export function negotiateProtocolVersion(request) {
   const requested = request?.params?.protocolVersion;
-  return SUPPORTED_PROTOCOL_VERSIONS.has(requested) ? requested : PROTOCOL_VERSION;
+  return SUPPORTED_LEGACY_PROTOCOL_VERSIONS.has(requested) ? requested : LEGACY_PROTOCOL_VERSION;
+}
+
+export function modernProtocolVersion(request) {
+  const value = request?.params?._meta?.["io.modelcontextprotocol/protocolVersion"];
+  return typeof value === "string" ? value : null;
+}
+
+export function isModernRequest(request) {
+  if (request?.method === "server/discover") return true;
+  const meta = request?.params?._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return false;
+  return [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/logLevel",
+  ].some((key) => Object.hasOwn(meta, key));
+}
+
+export function validateModernRequestBody(request) {
+  const meta = request?.params?._meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return { code: -32602, message: "modern MCP requests require params._meta" };
+  }
+  const version = meta["io.modelcontextprotocol/protocolVersion"];
+  if (typeof version !== "string") {
+    return { code: -32602, message: "missing io.modelcontextprotocol/protocolVersion" };
+  }
+  const capabilities = meta["io.modelcontextprotocol/clientCapabilities"];
+  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+    return { code: -32602, message: "missing or invalid io.modelcontextprotocol/clientCapabilities" };
+  }
+  return null;
+}
+
+export function serverInfo(version = "2026.8.0") {
+  return { name: "temote-mcp-gateway", title: "Temote MCP Gateway", version };
+}
+
+export function discoverResult(version = "2026.8.0") {
+  return {
+    resultType: "complete",
+    supportedVersions: [MODERN_PROTOCOL_VERSION],
+    capabilities: { tools: { listChanged: false } },
+    instructions:
+      "This is one MCP gateway for multiple endpoint sessions. Use session_list, then pass the selected session_id to every other tool.",
+    ttlMs: 0,
+    cacheScope: "private",
+    _meta: { "io.modelcontextprotocol/serverInfo": serverInfo(version) },
+  };
+}
+
+export function modernizeResult(method, result, version = "2026.8.0") {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  if (method === "server/discover") return result;
+  const modern = {
+    ...result,
+    resultType: "complete",
+    _meta: {
+      ...(result._meta && typeof result._meta === "object" ? result._meta : {}),
+      "io.modelcontextprotocol/serverInfo": serverInfo(version),
+    },
+  };
+  if (method === "tools/list") {
+    modern.ttlMs = 0;
+    modern.cacheScope = "private";
+  }
+  return modern;
 }
 
 export function textResult(text) {

@@ -13,6 +13,10 @@
 
 host reconnect 時は generation を増やし、古い generation や process `instance_id` からの request/response を拒否します。非 idempotent operation があるため timeout 後の tool call は自動 replay しません。
 
+## MCP protocol compatibility
+
+gateway は MCP `2026-07-28` と既存の 2025 系 handshake の両方に対応します。modern request は dispatch 前に request ごとの `_meta` と標準 HTTP routing header を検証します。modern の `server/discover`、`tools/list`、tool result には 2026 仕様で必要な result metadata を付け、legacy の `initialize` は従来どおり維持します。
+
 ## deploy
 
 1. `gateway/wrangler.toml` に non-secret の `ACCESS_TEAM_DOMAIN`、`ACCESS_AUDIENCE`、`ACCESS_ALLOWED_EMAILS` を設定します。

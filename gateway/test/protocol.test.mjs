@@ -3,6 +3,7 @@ import test from "node:test";
 
 import worker, { GatewaySession } from "../src/index.js";
 import {
+  MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
   negotiateProtocolVersion,
   sessionIdFromRpc,
@@ -209,4 +210,131 @@ test("the MCP endpoint selects a Session Durable Object only by session_id", asy
 
   assert.deepEqual(selected, ["mac-main"]);
   assert.equal((await response.json()).result.content[0].text, "routed");
+});
+
+
+test("modern server/discover advertises the 2026 protocol", async () => {
+  const request = new Request("https://gateway.example.test/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-token",
+      "content-type": "application/json",
+      "mcp-protocol-version": MODERN_PROTOCOL_VERSION,
+      "mcp-method": "server/discover",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "discover-1",
+      method: "server/discover",
+      params: {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+  const response = await worker.fetch(request, {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_VERSION: "test",
+  });
+
+  assert.equal(response.status, 200);
+  const result = (await response.json()).result;
+  assert.deepEqual(result.supportedVersions, [MODERN_PROTOCOL_VERSION]);
+  assert.equal(result.resultType, "complete");
+  assert.equal(result.ttlMs, 0);
+  assert.equal(result.cacheScope, "private");
+});
+
+test("modern tools/list requires Mcp-Method and returns cacheable result fields", async () => {
+  const rpc = {
+    jsonrpc: "2.0",
+    id: 11,
+    method: "tools/list",
+    params: {
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+      },
+    },
+  };
+  const missingHeader = await worker.fetch(new Request("https://gateway.example.test/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-token",
+      "content-type": "application/json",
+      "mcp-protocol-version": MODERN_PROTOCOL_VERSION,
+    },
+    body: JSON.stringify(rpc),
+  }), { CLIENT_TOKEN: "client-token" });
+  assert.equal(missingHeader.status, 400);
+  assert.equal((await missingHeader.json()).error.code, -32020);
+
+  const response = await worker.fetch(new Request("https://gateway.example.test/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-token",
+      "content-type": "application/json",
+      "mcp-protocol-version": MODERN_PROTOCOL_VERSION,
+      "mcp-method": "tools/list",
+    },
+    body: JSON.stringify(rpc),
+  }), { CLIENT_TOKEN: "client-token", GATEWAY_VERSION: "test" });
+  assert.equal(response.status, 200);
+  const result = (await response.json()).result;
+  assert.equal(result.resultType, "complete");
+  assert.equal(result.ttlMs, 0);
+  assert.equal(result.cacheScope, "private");
+  assert.equal(Array.isArray(result.tools), true);
+});
+
+test("modern routed tool responses are normalized to the 2026 result shape", async () => {
+  const sessionStub = {
+    fetch: async (_url, init) => {
+      const request = JSON.parse(init.body).request;
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "routed" }] },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  };
+  const request = new Request("https://gateway.example.test/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-token",
+      "content-type": "application/json",
+      "mcp-protocol-version": MODERN_PROTOCOL_VERSION,
+      "mcp-method": "tools/call",
+      "mcp-name": "session_info",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: {
+        name: "session_info",
+        arguments: { session_id: "mac-main" },
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+  const response = await worker.fetch(request, {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_VERSION: "test",
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: () => sessionStub,
+    },
+  });
+
+  assert.equal(response.status, 200);
+  const result = (await response.json()).result;
+  assert.equal(result.resultType, "complete");
+  assert.equal(result.content[0].text, "routed");
+  assert.equal(result._meta["io.modelcontextprotocol/serverInfo"].name, "temote-mcp-gateway");
 });

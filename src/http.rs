@@ -116,6 +116,10 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
     };
     let started = Instant::now();
     let audit = AuditContext::from_request(&request);
+    if let Some(response) = validate_modern_http_request(&headers, &request) {
+        audit.finish(response.status(), started);
+        return response;
+    }
 
     // Notifications and responses carry no id and expect no reply.
     let Some(id) = request.get("id").cloned() else {
@@ -134,6 +138,137 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
     let response = with_cors(Json(response_value));
     audit.finish(response.status(), started);
     response
+}
+
+fn validate_modern_http_request(headers: &HeaderMap, request: &Value) -> Option<Response> {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let header_version = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok());
+    let modern_meta = request
+        .pointer("/params/_meta")
+        .and_then(Value::as_object)
+        .is_some_and(|meta| {
+            [
+                "io.modelcontextprotocol/protocolVersion",
+                "io.modelcontextprotocol/clientCapabilities",
+                "io.modelcontextprotocol/clientInfo",
+                "io.modelcontextprotocol/logLevel",
+            ]
+            .iter()
+            .any(|key| meta.contains_key(*key))
+        });
+    let modern = method == "server/discover"
+        || modern_meta
+        || header_version == Some(crate::mcp::MODERN_PROTOCOL_VERSION);
+    if !modern {
+        return None;
+    }
+
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let meta = request.pointer("/params/_meta").and_then(Value::as_object);
+    let Some(meta) = meta else {
+        return Some(modern_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32602,
+            "modern MCP requests require params._meta",
+            None,
+        ));
+    };
+    let Some(version) = meta
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(Value::as_str)
+    else {
+        return Some(modern_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32602,
+            "missing io.modelcontextprotocol/protocolVersion",
+            None,
+        ));
+    };
+    if !meta
+        .get("io.modelcontextprotocol/clientCapabilities")
+        .is_some_and(Value::is_object)
+    {
+        return Some(modern_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32602,
+            "missing or invalid io.modelcontextprotocol/clientCapabilities",
+            None,
+        ));
+    }
+    if header_version != Some(version) {
+        return Some(modern_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32020,
+            "MCP-Protocol-Version header must match request _meta",
+            None,
+        ));
+    }
+    if version != crate::mcp::MODERN_PROTOCOL_VERSION {
+        return Some(modern_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32022,
+            "unsupported MCP protocol version",
+            Some(json!({
+                "supported": [crate::mcp::MODERN_PROTOCOL_VERSION],
+                "requested": version
+            })),
+        ));
+    }
+    let header_method = headers
+        .get("mcp-method")
+        .and_then(|value| value.to_str().ok());
+    if header_method != Some(method) {
+        return Some(modern_error(
+            StatusCode::BAD_REQUEST,
+            id,
+            -32020,
+            "Mcp-Method header must match the JSON-RPC method",
+            None,
+        ));
+    }
+    if method == "tools/call" {
+        let name = request.pointer("/params/name").and_then(Value::as_str);
+        let header_name = headers
+            .get("mcp-name")
+            .and_then(|value| value.to_str().ok());
+        if name.is_none() || header_name != name {
+            return Some(modern_error(
+                StatusCode::BAD_REQUEST,
+                id,
+                -32020,
+                "Mcp-Name header must match params.name",
+                None,
+            ));
+        }
+    }
+    None
+}
+
+fn modern_error(
+    status: StatusCode,
+    id: Value,
+    code: i64,
+    message: &str,
+    data: Option<Value>,
+) -> Response {
+    let mut error = json!({"code": code, "message": message});
+    if let Some(data) = data {
+        error["data"] = data;
+    }
+    with_cors((
+        status,
+        Json(json!({"jsonrpc": "2.0", "id": id, "error": error})),
+    ))
 }
 
 struct AuditContext {
@@ -202,7 +337,7 @@ fn with_cors(response: impl IntoResponse) -> Response {
     parts.headers.insert(
         "access-control-allow-headers",
         HeaderValue::from_static(
-            "accept,authorization,content-type,mcp-protocol-version,mcp-session-id",
+            "accept,authorization,content-type,mcp-protocol-version,mcp-method,mcp-name,mcp-session-id",
         ),
     );
     parts.headers.insert(
@@ -306,6 +441,87 @@ mod tests {
                 .unwrap()["annotations"]["readOnlyHint"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_requires_and_accepts_standard_headers() {
+        let response = router(runtime())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("cf-access-jwt-assertion", "test-token")
+                    .header("mcp-protocol-version", crate::mcp::MODERN_PROTOCOL_VERSION)
+                    .header("mcp-method", "server/discover")
+                    .body(Body::from(format!(
+                        r#"{{"jsonrpc":"2.0","id":"discover-1","method":"server/discover","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#,
+                        crate::mcp::MODERN_PROTOCOL_VERSION
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body_json(response).await["result"].clone();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["supportedVersions"],
+            json!([crate::mcp::MODERN_PROTOCOL_VERSION])
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_tool_list_rejects_missing_method_header() {
+        let response = router(runtime())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("cf-access-jwt-assertion", "test-token")
+                    .header("mcp-protocol-version", crate::mcp::MODERN_PROTOCOL_VERSION)
+                    .body(Body::from(format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#,
+                        crate::mcp::MODERN_PROTOCOL_VERSION
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await["error"].clone();
+        assert_eq!(error["code"], -32020);
+    }
+
+    #[tokio::test]
+    async fn modern_tool_list_returns_cacheable_result_shape() {
+        let response = router(runtime())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("cf-access-jwt-assertion", "test-token")
+                    .header("mcp-protocol-version", crate::mcp::MODERN_PROTOCOL_VERSION)
+                    .header("mcp-method", "tools/list")
+                    .body(Body::from(format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#,
+                        crate::mcp::MODERN_PROTOCOL_VERSION
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body_json(response).await["result"].clone();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+        assert!(result["tools"].is_array());
     }
 
     #[tokio::test]

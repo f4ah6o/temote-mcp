@@ -68,6 +68,10 @@ Cloudflare の `AI controls > MCP servers` に作る portal registration は、h
 
 Rust origin は転送された `Cf-Access-Jwt-Assertion` の signature、issuer、audience、expiry、subject、email allow list を検証します。
 
+## MCP protocol compatibility
+
+公開 endpoint は MCP `2026-07-28` と既存の 2025 系 handshake の両方に対応します。modern request は `server/discover`、request ごとの `_meta`、`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` HTTP header を使います。legacy client は従来どおり `initialize` を使い、modern request では `Mcp-Session-Id` を作りません。
+
 ## probe
 
 MCP client を接続する前に Access が origin より手前で応答することを確認できます。

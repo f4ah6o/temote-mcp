@@ -19,8 +19,10 @@ const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
-const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
+pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+const SERVER_INSTRUCTIONS: &str = "Every tool call requires the temote-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session before using other tools.";
 
 #[derive(Clone)]
 enum CachedJobResult {
@@ -114,7 +116,12 @@ pub(crate) async fn dispatch_public(request: &Value) -> Result<Value> {
 }
 
 async fn dispatch_with_mode(request: &Value, public: bool) -> Result<Value> {
-    match request
+    let modern = modern_request(request);
+    if modern || request.get("method").and_then(Value::as_str) == Some("server/discover") {
+        validate_modern_request(request)?;
+    }
+
+    let result = match request
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -125,10 +132,23 @@ async fn dispatch_with_mode(request: &Value, public: bool) -> Result<Value> {
             "serverInfo": {"name": "temote-mcp", "title": "Temote MCP", "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Every tool call requires the temote-mcp session_id supplied by the user, except session_list. Call session_list to discover active sessions, then session_info to inspect a session's working directory, mode, and sandbox roots. Normal sessions keep file paths scoped, execute commands sandboxed, and remote host operations approval-gated. A session started with `temote-mcp start <session-id> --yolo` runs with the host permissions of the temote-mcp user and skips temote-mcp approval prompts. The session mode does not control confirmation or authorization enforced by the MCP client."
         })),
+        "server/discover" => Ok(discover_result()),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools(public)})),
         "tools/call" => call_tool(request.get("params").unwrap_or(&Value::Null), public).await,
         method => anyhow::bail!("method not found: {method}"),
+    }?;
+
+    if modern {
+        Ok(modernize_result(
+            request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            result,
+        ))
+    } else {
+        Ok(result)
     }
 }
 
@@ -136,11 +156,85 @@ fn negotiate_protocol_version(request: &Value) -> &'static str {
     let requested = request
         .pointer("/params/protocolVersion")
         .and_then(Value::as_str);
-    SUPPORTED_PROTOCOL_VERSIONS
+    SUPPORTED_LEGACY_PROTOCOL_VERSIONS
         .iter()
         .copied()
         .find(|version| Some(*version) == requested)
-        .unwrap_or(LATEST_PROTOCOL_VERSION)
+        .unwrap_or(LATEST_LEGACY_PROTOCOL_VERSION)
+}
+
+fn modern_request(request: &Value) -> bool {
+    let Some(meta) = request.pointer("/params/_meta").and_then(Value::as_object) else {
+        return false;
+    };
+    [
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientCapabilities",
+        "io.modelcontextprotocol/clientInfo",
+        "io.modelcontextprotocol/logLevel",
+    ]
+    .iter()
+    .any(|key| meta.contains_key(*key))
+}
+
+fn validate_modern_request(request: &Value) -> Result<()> {
+    let meta = request
+        .pointer("/params/_meta")
+        .and_then(Value::as_object)
+        .context("modern MCP requests require params._meta")?;
+    let version = meta
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(Value::as_str)
+        .context("modern MCP requests require io.modelcontextprotocol/protocolVersion")?;
+    anyhow::ensure!(
+        version == MODERN_PROTOCOL_VERSION,
+        "unsupported MCP protocol version: {version}"
+    );
+    anyhow::ensure!(
+        meta.get("io.modelcontextprotocol/clientCapabilities")
+            .is_some_and(Value::is_object),
+        "modern MCP requests require io.modelcontextprotocol/clientCapabilities as an object"
+    );
+    Ok(())
+}
+
+fn server_info() -> Value {
+    json!({
+        "name": "temote-mcp",
+        "title": "Temote MCP",
+        "version": env!("CARGO_PKG_VERSION")
+    })
+}
+
+fn discover_result() -> Value {
+    json!({
+        "resultType": "complete",
+        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+        "capabilities": {"tools": {"listChanged": false}},
+        "instructions": SERVER_INSTRUCTIONS,
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "_meta": {"io.modelcontextprotocol/serverInfo": server_info()}
+    })
+}
+
+fn modernize_result(method: &str, mut result: Value) -> Value {
+    if method == "server/discover" {
+        return result;
+    }
+    let Some(object) = result.as_object_mut() else {
+        return result;
+    };
+    object.insert("resultType".to_owned(), json!("complete"));
+    object.insert(
+        "_meta".to_owned(),
+        json!({"io.modelcontextprotocol/serverInfo": server_info()}),
+    );
+    if method == "tools/list" {
+        object.insert("ttlMs".to_owned(), json!(0));
+        object.insert("cacheScope".to_owned(), json!("private"));
+    }
+    result
 }
 
 fn tools(public: bool) -> Value {
@@ -1361,7 +1455,60 @@ mod tests {
             "params": {"protocolVersion": "future-version"}
         });
         let result = dispatch(&request).await.unwrap();
-        assert_eq!(result["protocolVersion"], LATEST_PROTOCOL_VERSION);
+        assert_eq!(result["protocolVersion"], LATEST_LEGACY_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn modern_discovery_advertises_only_the_modern_protocol() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "discover-1",
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["supportedVersions"],
+            json!([MODERN_PROTOCOL_VERSION])
+        );
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "temote-mcp"
+        );
+    }
+
+    #[tokio::test]
+    async fn modern_tool_list_uses_the_2026_result_shape() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+        assert!(result["tools"].is_array());
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "temote-mcp"
+        );
     }
 
     #[test]

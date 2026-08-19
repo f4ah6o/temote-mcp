@@ -1,10 +1,16 @@
 import {
+  MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
+  discoverResult,
+  isModernRequest,
+  modernProtocolVersion,
+  modernizeResult,
   negotiateProtocolVersion,
   rpcError,
   rpcResult,
   sessionIdFromRpc,
   textResult,
+  validateModernRequestBody,
   validateSessionId,
 } from "./protocol.js";
 
@@ -54,6 +60,8 @@ async function handleMcp(request, env, identity) {
   if (!body.ok) return withCors(jsonResponse(rpcError(null, -32700, body.error), 400));
   const rpc = body.value;
   const id = rpc?.id ?? null;
+  const protocolError = validateModernHttpRequest(request, rpc);
+  if (protocolError) return protocolError;
   if (rpc?.id === undefined) return withCors(new Response(null, { status: 202 }));
 
   console.log(JSON.stringify({
@@ -78,15 +86,73 @@ async function handleMcp(request, env, identity) {
         instructions:
           "This is one MCP gateway for multiple endpoint sessions. Use session_list, then pass the selected session_id to every other tool. Mac and Windows/WSL2 sessions use different IDs.",
       }));
-    case "ping":
-      return mcpJson(rpcResult(id, {}));
-    case "tools/list":
-      return mcpJson(rpcResult(id, { tools: PUBLIC_TOOLS }));
+    case "server/discover":
+      return mcpJson(rpcResult(id, discoverResult(env.GATEWAY_VERSION || "2026.8.0")));
+    case "ping": {
+      const result = isModernRequest(rpc)
+        ? modernizeResult("ping", {}, env.GATEWAY_VERSION || "2026.8.0")
+        : {};
+      return mcpJson(rpcResult(id, result));
+    }
+    case "tools/list": {
+      const result = { tools: PUBLIC_TOOLS };
+      return mcpJson(rpcResult(
+        id,
+        isModernRequest(rpc)
+          ? modernizeResult("tools/list", result, env.GATEWAY_VERSION || "2026.8.0")
+          : result,
+      ));
+    }
     case "tools/call":
       return handleToolCall(rpc, env);
     default:
       return mcpJson(rpcError(id, -32601, `method not found: ${rpc?.method ?? ""}`));
   }
+}
+
+function validateModernHttpRequest(request, rpc) {
+  const bodyVersion = modernProtocolVersion(rpc);
+  const headerVersion = request.headers.get("mcp-protocol-version");
+  const modern = isModernRequest(rpc) || headerVersion === MODERN_PROTOCOL_VERSION;
+  if (!modern) return null;
+
+  const id = rpc?.id ?? null;
+  const bodyError = validateModernRequestBody(rpc);
+  if (bodyError) {
+    return withCors(jsonResponse(rpcError(id, bodyError.code, bodyError.message, bodyError.data), 400));
+  }
+  if (headerVersion !== bodyVersion) {
+    return withCors(jsonResponse(
+      rpcError(id, -32020, "MCP-Protocol-Version header must match request _meta"),
+      400,
+    ));
+  }
+  if (bodyVersion !== MODERN_PROTOCOL_VERSION) {
+    return withCors(jsonResponse(
+      rpcError(id, -32022, "unsupported MCP protocol version", {
+        supported: [MODERN_PROTOCOL_VERSION],
+        requested: bodyVersion,
+      }),
+      400,
+    ));
+  }
+  const method = typeof rpc?.method === "string" ? rpc.method : "";
+  if (request.headers.get("mcp-method") !== method) {
+    return withCors(jsonResponse(
+      rpcError(id, -32020, "Mcp-Method header must match the JSON-RPC method"),
+      400,
+    ));
+  }
+  if (method === "tools/call") {
+    const name = rpc?.params?.name;
+    if (typeof name !== "string" || request.headers.get("mcp-name") !== name) {
+      return withCors(jsonResponse(
+        rpcError(id, -32020, "Mcp-Name header must match params.name"),
+        400,
+      ));
+    }
+  }
+  return null;
 }
 
 async function handleToolCall(rpc, env) {
@@ -103,7 +169,13 @@ async function handleToolCall(rpc, env) {
     const response = await registry.fetch("https://registry.internal/list");
     if (!response.ok) return mcpJson(rpcError(id, -32001, "session registry unavailable"));
     const sessions = await response.json();
-    return mcpJson(rpcResult(id, textResult(JSON.stringify(sessions, null, 2))));
+    const result = textResult(JSON.stringify(sessions, null, 2));
+    return mcpJson(rpcResult(
+      id,
+      isModernRequest(rpc)
+        ? modernizeResult("tools/call", result, env.GATEWAY_VERSION || "2026.8.0")
+        : result,
+    ));
   }
 
   if (!PUBLIC_TOOLS.some((tool) => tool.name === name)) {
@@ -120,7 +192,18 @@ async function handleToolCall(rpc, env) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ request: rpc }),
   });
-  if (response.ok) return withCors(new Response(response.body, { status: 200, headers: mcpHeaders() }));
+  if (response.ok) {
+    const payload = await safeJson(response);
+    if (!payload) return mcpJson(rpcError(id, -32001, "host returned invalid JSON"));
+    if (isModernRequest(rpc) && payload.result) {
+      payload.result = modernizeResult(
+        rpc.method,
+        payload.result,
+        env.GATEWAY_VERSION || "2026.8.0",
+      );
+    }
+    return mcpJson(payload);
+  }
 
   const failure = await safeJson(response);
   const message = failure?.error || "host request failed";
@@ -584,7 +667,7 @@ function withCors(response) {
   headers.set("access-control-allow-methods", "GET,POST,DELETE,OPTIONS");
   headers.set(
     "access-control-allow-headers",
-    "accept,authorization,content-type,mcp-protocol-version,mcp-session-id,cf-access-client-id,cf-access-client-secret",
+    "accept,authorization,content-type,mcp-protocol-version,mcp-method,mcp-name,mcp-session-id,cf-access-client-id,cf-access-client-secret",
   );
   headers.set("access-control-expose-headers", "mcp-session-id");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });

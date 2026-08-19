@@ -13,6 +13,10 @@ The optional `gateway/` Worker exposes one MCP endpoint and routes calls to Mac,
 
 A reconnect increments the host generation. Requests/responses from an older generation or process `instance_id` are rejected. Timed-out tool calls are not automatically replayed because some operations are non-idempotent.
 
+## MCP protocol compatibility
+
+The gateway serves both MCP `2026-07-28` and the existing 2025-era handshake. Modern requests are validated for per-request `_meta` and the standard HTTP routing headers before dispatch. Modern `server/discover`, `tools/list`, and tool results include the required 2026 result metadata while legacy `initialize` behavior remains unchanged.
+
 ## Deploy
 
 1. Set non-secret Access values in `gateway/wrangler.toml`: `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, and `ACCESS_ALLOWED_EMAILS`.
