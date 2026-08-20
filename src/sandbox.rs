@@ -32,6 +32,29 @@ pub struct Output {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_sandbox_executable() -> Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let directory = executable
+        .parent()
+        .context("temote-mcp executable has no parent directory")?;
+    let sibling = directory.join("codex-linux-sandbox");
+    if sibling.is_file() {
+        return Ok(sibling);
+    }
+
+    if directory.file_name().is_some_and(|name| name == "deps")
+        && let Some(profile_directory) = directory.parent()
+    {
+        let test_sibling = profile_directory.join("codex-linux-sandbox");
+        if test_sibling.is_file() {
+            return Ok(test_sibling);
+        }
+    }
+
+    anyhow::bail!("sandbox helper is missing next to {}", executable.display())
+}
+
+#[cfg(target_os = "linux")]
 fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
     let path = if path.is_absolute() {
         path.to_owned()
@@ -121,15 +144,7 @@ async fn run_with_metadata_roots(
                 false,
                 false,
             );
-        let executable = std::env::current_exe()?
-            .parent()
-            .context("temote-mcp executable has no parent directory")?
-            .join("codex-linux-sandbox");
-        anyhow::ensure!(
-            executable.is_file(),
-            "sandbox helper is missing: {}",
-            executable.display()
-        );
+        let executable = linux_sandbox_executable()?;
         let mut process = Command::new(executable);
         process.args(args);
         process

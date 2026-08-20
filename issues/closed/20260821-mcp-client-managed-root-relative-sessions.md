@@ -430,3 +430,19 @@ git diff --check                                 PASS
 ```
 
 `just --list` also parsed the updated process-layout recipes successfully.
+
+### CI follow-up
+
+The first post-merge CI run (`32426742525`) exposed a Linux-only test-layout issue in the existing sandbox-helper lookup. During `cargo test --all-targets`, the test executable lives under `target/debug/deps/`, while the `codex-linux-sandbox` helper is built at `target/debug/`. The new managed-session HTTP `execute` acceptance was the first Linux CI path to exercise that lookup from a test binary.
+
+The helper lookup now preserves the production sibling lookup and additionally recognizes Cargo's `deps/` test-binary layout, resolving only the adjacent profile directory's `codex-linux-sandbox`. No sandbox, approval, path-containment, or public-endpoint semantics were relaxed.
+
+Post-fix local validation:
+
+```text
+cargo fmt --all -- --check                              PASS
+cargo test --all-targets --all-features --locked       PASS (83 passed, 0 failed on macOS)
+cargo clippy --all-targets --all-features --locked -- -D warnings  PASS
+git diff --check                                        PASS
+```
+
