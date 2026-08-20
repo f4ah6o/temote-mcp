@@ -446,3 +446,5 @@ cargo clippy --all-targets --all-features --locked -- -D warnings  PASS
 git diff --check                                        PASS
 ```
 
+The second CI fix run (`32427976303`) proved the helper binary was present, but the real Linux sandbox still could not start. The repository already documents `bwrap` as a Linux runtime prerequisite and `temote-mcp doctor` probes the same user/network namespace operation. The CI Ubuntu job had never installed that system dependency because older tests did not execute a real sandbox command. CI now installs `bubblewrap` and runs the same namespace probe before building the helper and executing the managed-session acceptance.
+

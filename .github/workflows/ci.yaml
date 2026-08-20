@@ -32,6 +32,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Set up Linux sandbox runtime
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+          bwrap \
+            --unshare-user \
+            --unshare-net \
+            --ro-bind / / \
+            --proc /proc \
+            --dev /dev \
+            -- /bin/true
+
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
         run: cargo build --bin codex-linux-sandbox --locked
