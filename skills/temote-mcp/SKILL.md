@@ -2,7 +2,7 @@
 name: temote-mcp
 description: Operate local files, commands, Git, background jobs, 1Password, and kintone through Temote MCP. Use when the user mentions Temote MCP or temote-mcp, asks an agent to work on a local repository/session through Temote, supplies a Temote session ID, or when tools such as session_list, session_info, execute, git_commit, or git_push are available.
 license: MIT AND Apache-2.0
-compatibility: Requires an MCP connection to a running Temote MCP server and at least one local session for tools that use session_id.
+compatibility: Requires an MCP connection to Temote MCP. A serve endpoint may create normal sessions from host-configured named roots; otherwise tools using session_id require an existing local session.
 metadata:
   author: f4ah6o
 ---
@@ -11,15 +11,18 @@ metadata:
 
 Temote MCP exposes a user's local machine through explicit sessions. Treat the selected session as the source of truth for its working directory, permission mode, filesystem roots, and host process state.
 
-## Select the session first
+## Select or create the session first
 
 1. If the user explicitly names a session ID, use that exact ID.
-2. Otherwise call `session_list` before asking the user for an ID.
-3. Match the user's target project to the returned `cwd`. If one session clearly matches, use it.
-4. Call `session_info` before operations where the working directory, permitted roots, or yolo mode materially affects the action.
-5. Do not silently switch to a different session midway through a task.
+2. Otherwise call `session_list` first.
+3. Match the target project to an existing session `cwd`. If one clearly matches, use it.
+4. If no session matches and `session_start` is available, start one with the host's logical named-root path such as `src/project`. Do not invent an absolute host path, do not pass a yolo option, and do not retry an unknown root by weakening path constraints.
+5. Call `session_info` after selecting or creating the session, before ordinary tools.
+6. Do not silently switch to a different session midway through a task.
 
-Do not ask the user to repeat a session ID or path that Temote MCP can discover itself.
+The normal remote workflow is `session_list` → `session_start` when needed → `session_info` → ordinary tools. `session_stop` may stop only sessions owned by the current `serve` supervisor; never use it to try to terminate a separately started CLI session.
+
+Do not ask the user to repeat a session ID or logical path that Temote MCP can discover or that the current task already supplies.
 
 ## Inspect before modifying
 

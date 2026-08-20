@@ -23,34 +23,33 @@ Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネ
 
 ## セッションを開始する
 
-AI に触らせたいプロジェクトのディレクトリで起動します。
+常駐 host では named root を設定して HTTP supervisor を起動します。
+
+```sh
+# host の例:
+# ~/src -> /Volumes/devstorage/Developer
+export TEMOTE_MCP_ROOTS='src=~/src'
+just up
+```
+
+認証済み MCP client からは次の順で利用します。
+
+```text
+session_list
+session_start(path="src/my-project", session_id="my-project")
+session_info(session_id="my-project")
+```
+
+managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。host/network 操作の承認は `just up` を実行しているローカル端末で行います。
+
+従来どおり、ローカル session を直接起動することもできます。
 
 ```sh
 cd ~/src/my-project
 temote-mcp start my-project
 ```
 
-MCP client からローカル stdio server を起動するコマンドは次です。
-
-```sh
-temote-mcp mcp
-```
-
-`session_list` 以外のツール呼び出しでは session ID を指定します。セッションを起動した端末で、承認と許可ディレクトリを管理できます。
-
-```text
-/permission allow ../another-project
-/permission revoke ../another-project
-/permission list
-```
-
-意図的に制限を外す場合だけ `--yolo` を使います。
-
-```sh
-temote-mcp start my-project --yolo
-```
-
-`--yolo` では Temote MCP のパス制限、サンドボックス、ローカル承認が無効になります。
+local stdio client は `temote-mcp mcp` を起動します。制限を意図的に外す CLI session は `temote-mcp start my-project --yolo` で利用できます。
 
 ## Agent Skill
 
@@ -65,6 +64,7 @@ gh skill install f4ah6o/temote-mcp temote-mcp --scope user
 ## 詳細ドキュメント
 
 - [session と tool の使い方](docs/usage.ja.md)
+- [managed session と named root](docs/managed-sessions.ja.md)
 - [公開 HTTP endpoint と Cloudflare Access](docs/public-http.ja.md)
 - [1Password / kintone 連携](docs/integrations.ja.md)
 - [multi-host Cloudflare gateway](docs/gateway.ja.md)

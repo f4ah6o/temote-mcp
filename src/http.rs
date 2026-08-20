@@ -5,6 +5,7 @@
 //! valid Cloudflare Access JWT assertion.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -18,25 +19,33 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::access::AccessAuthenticator;
+use crate::supervisor::SessionSupervisor;
 
 #[derive(Clone)]
 pub struct Runtime {
     pub authenticator: AccessAuthenticator,
+    pub supervisor: Arc<SessionSupervisor>,
 }
 
 pub async fn serve(
     addr: SocketAddr,
     public_url: String,
     authenticator: AccessAuthenticator,
+    supervisor: Arc<SessionSupervisor>,
 ) -> Result<()> {
-    let runtime = Runtime { authenticator };
+    let runtime = Runtime {
+        authenticator,
+        supervisor,
+    };
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
     eprintln!("temote-mcp HTTP server listening on http://{addr}");
     eprintln!("MCP endpoint for remote clients: {public_url}/mcp");
     eprintln!("Authentication: Cloudflare Access Managed OAuth");
-    axum::serve(listener, router(runtime)).await?;
+    axum::serve(listener, router(runtime))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -74,6 +83,31 @@ pub fn normalize_public_url(value: &str) -> Result<String> {
         .ascii_serialization()
         .trim_end_matches('/')
         .to_owned())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            let _ = signal.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 async fn healthz() -> Response {
@@ -127,14 +161,15 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
         audit.finish(response.status(), started);
         return response;
     };
-    let response_value = match crate::mcp::dispatch_public(&request).await {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(error) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32000, "message": format!("{error:#}")}
-        }),
-    };
+    let response_value =
+        match crate::mcp::dispatch_public(&request, Some(&runtime.supervisor)).await {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(error) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32000, "message": format!("{error:#}")}
+            }),
+        };
     let response = with_cors(Json(response_value));
     audit.finish(response.status(), started);
     response
@@ -357,6 +392,8 @@ mod tests {
     use tower::ServiceExt;
 
     fn runtime() -> Runtime {
+        let (supervisor, _approvals) =
+            SessionSupervisor::new(crate::named_roots::NamedRoots::default());
         Runtime {
             authenticator: AccessAuthenticator::test(
                 "test-token",
@@ -365,6 +402,7 @@ mod tests {
                     subject: "test-subject".to_owned(),
                 },
             ),
+            supervisor,
         }
     }
 
@@ -542,5 +580,267 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+    fn runtime_with_root(
+        root: std::path::PathBuf,
+    ) -> (
+        Runtime,
+        Arc<SessionSupervisor>,
+        crate::approvals::ApprovalReceiver,
+    ) {
+        let roots =
+            crate::named_roots::NamedRoots::from_canonical_roots(std::collections::BTreeMap::from(
+                [("src".to_owned(), std::fs::canonicalize(root).unwrap())],
+            ))
+            .unwrap();
+        let (supervisor, approvals) = SessionSupervisor::new(roots);
+        let runtime = Runtime {
+            authenticator: AccessAuthenticator::test(
+                "test-token",
+                AccessIdentity {
+                    email: "test@example.com".to_owned(),
+                    subject: "test-subject".to_owned(),
+                },
+            ),
+            supervisor: Arc::clone(&supervisor),
+        };
+        (runtime, supervisor, approvals)
+    }
+
+    async fn call_public_tool(runtime: &Runtime, name: &str, arguments: Value) -> Value {
+        let response = router(runtime.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("cf-access-jwt-assertion", "test-token")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": name, "arguments": arguments}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await
+    }
+
+    fn tool_text(response: &Value) -> &str {
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text")
+    }
+
+    #[tokio::test]
+    async fn public_managed_session_lifecycle_uses_named_root_and_existing_tools() {
+        let fixture = tempfile::tempdir().unwrap();
+        let volume = fixture.path().join("volume");
+        std::fs::create_dir_all(volume.join("repo-a")).unwrap();
+        std::fs::create_dir_all(volume.join("repo-b")).unwrap();
+        std::fs::write(volume.join("repo-a/note.txt"), "hello managed session\n").unwrap();
+        let (runtime, supervisor, _approvals) = runtime_with_root(volume.clone());
+        let first_id = format!("http-a-{}", uuid::Uuid::new_v4());
+        let second_id = format!("http-b-{}", uuid::Uuid::new_v4());
+
+        let first = call_public_tool(
+            &runtime,
+            "session_start",
+            json!({"path": "src/repo-a", "session_id": first_id}),
+        )
+        .await;
+        let first_info: Value = serde_json::from_str(tool_text(&first)).unwrap();
+        assert_eq!(first_info["status"], "active");
+        assert_eq!(first_info["yolo"], false);
+        assert_eq!(
+            first_info["cwd"],
+            std::fs::canonicalize(volume.join("repo-a"))
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        let second = call_public_tool(
+            &runtime,
+            "session_start",
+            json!({"path": "src/repo-b", "session_id": second_id}),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(tool_text(&second)).unwrap()["status"],
+            "active"
+        );
+
+        let listed = call_public_tool(&runtime, "session_list", json!({})).await;
+        let sessions: Vec<Value> = serde_json::from_str(tool_text(&listed)).unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session["session_id"] == first_id)
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session["session_id"] == second_id)
+        );
+
+        let info =
+            call_public_tool(&runtime, "session_info", json!({"session_id": first_id})).await;
+        let info: Value = serde_json::from_str(tool_text(&info)).unwrap();
+        assert_eq!(info["yolo"], false);
+
+        let read = call_public_tool(
+            &runtime,
+            "read_file",
+            json!({"session_id": first_id, "path": "note.txt"}),
+        )
+        .await;
+        assert_eq!(tool_text(&read), "hello managed session\n");
+
+        let executed = call_public_tool(
+            &runtime,
+            "execute",
+            json!({"session_id": first_id, "command": ["/bin/pwd"]}),
+        )
+        .await;
+        let executed: Value = serde_json::from_str(tool_text(&executed)).unwrap();
+        assert_eq!(executed["exit_code"], 0);
+        assert_eq!(
+            executed["stdout"].as_str().unwrap().trim(),
+            std::fs::canonicalize(volume.join("repo-a"))
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        let root_id = format!("http-root-{}", uuid::Uuid::new_v4());
+        let root_session = call_public_tool(
+            &runtime,
+            "session_start",
+            json!({"path": "src", "session_id": root_id}),
+        )
+        .await;
+        let root_info: Value = serde_json::from_str(tool_text(&root_session)).unwrap();
+        assert_eq!(
+            root_info["cwd"],
+            std::fs::canonicalize(&volume)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        let _ = call_public_tool(&runtime, "session_stop", json!({"session_id": root_id})).await;
+
+        let duplicate = call_public_tool(
+            &runtime,
+            "session_start",
+            json!({"path": "src/repo-a", "session_id": first_id}),
+        )
+        .await;
+        assert!(
+            duplicate["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("already")
+        );
+
+        let stopped =
+            call_public_tool(&runtime, "session_stop", json!({"session_id": first_id})).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(tool_text(&stopped)).unwrap()["status"],
+            "stopped"
+        );
+        supervisor.shutdown().await.unwrap();
+        assert!(!crate::config::session_is_active(&second_id).await.unwrap());
+        assert!(!crate::config::socket_path(&second_id).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_session_start_rejects_path_escape_yolo_and_missing_roots() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let volume = fixture.path().join("volume");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(volume.join("repo-a")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, volume.join("outside-link")).unwrap();
+        let (configured_runtime, supervisor, _approvals) = runtime_with_root(volume);
+
+        for (path, needle) in [
+            (outside.to_string_lossy().to_string(), "absolute"),
+            ("unknown/repo-a".to_owned(), "unknown named root"),
+            ("src/../outside".to_owned(), "escapes named root"),
+            ("src/outside-link".to_owned(), "escapes named root"),
+            ("src/missing".to_owned(), "cannot resolve session path"),
+        ] {
+            let response = call_public_tool(
+                &configured_runtime,
+                "session_start",
+                json!({"path": path, "session_id": format!("reject-{}", uuid::Uuid::new_v4())}),
+            )
+            .await;
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(needle),
+                "{response}"
+            );
+        }
+
+        let yolo = call_public_tool(
+            &configured_runtime,
+            "session_start",
+            json!({"path": "src/repo-a", "session_id": "reject-yolo", "yolo": true}),
+        )
+        .await;
+        assert!(
+            yolo["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("only path and session_id")
+        );
+        supervisor.shutdown().await.unwrap();
+
+        let no_roots = runtime();
+        let response = call_public_tool(
+            &no_roots,
+            "session_start",
+            json!({"path": "src/repo-a", "session_id": "reject-no-roots"}),
+        )
+        .await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_session_stop_cannot_stop_unmanaged_cli_runtime() {
+        let runtime = runtime();
+        let cwd = tempfile::tempdir().unwrap();
+        let id = format!("cli-owned-{}", uuid::Uuid::new_v4());
+        let (sender, _approvals) = crate::approvals::approval_channel();
+        let handle = crate::approvals::spawn_runtime(cwd.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+
+        let response = call_public_tool(&runtime, "session_stop", json!({"session_id": id})).await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not managed")
+        );
+        assert!(crate::config::session_is_active(&id).await.unwrap());
+        handle.shutdown().await.unwrap();
     }
 }

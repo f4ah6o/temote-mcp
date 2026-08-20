@@ -11,9 +11,27 @@ cd ~/src/my-project
 temote-mcp start my-project
 ```
 
-`session_list` discovers active sessions. Every other public tool requires `session_id`; use `session_info` to inspect the working directory, permitted roots, and whether the session is in yolo mode.
+`session_list` discovers active sessions. Session-bound tools require `session_id`; `session_start` is the exception because it creates one. Use `session_info` to inspect the working directory, permitted roots, and whether the session is in yolo mode.
 
 Relative paths resolve from the session working directory.
+
+### Managed sessions from `temote-mcp serve`
+
+Set `TEMOTE_MCP_ROOTS` on the host and keep `just up` running in a terminal. A single root uses `name=path`:
+
+```sh
+TEMOTE_MCP_ROOTS='src=~/src' just up
+```
+
+For multiple roots, use a JSON object instead of a separator-based list:
+
+```sh
+TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' just up
+```
+
+The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. Missing roots fail closed with no HOME, `/`, cwd, or repository fallback.
+
+`session_stop` can stop only sessions created by the current `serve` supervisor. It cannot stop an independently started `temote-mcp start` session. Managed sessions are always non-yolo and retain the same local approval gates as CLI sessions.
 
 ## Permission roots
 

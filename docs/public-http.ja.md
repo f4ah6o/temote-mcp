@@ -52,7 +52,7 @@ set +a
 cloudflared tunnel run --token-file "${TUNNEL_TOKEN_FILE:-$HOME/.config/temote-mcp/tunnel-token}"
 ```
 
-project ごとの local session は別 process として起動しておく必要があります。
+`TEMOTE_MCP_ROOTS` を設定すると、direct HTTP client から `session_start` で managed project session を作成できます。別 process で起動する従来の CLI session も引き続き利用できます。
 
 ## Cloudflare Access
 
@@ -92,3 +92,9 @@ origin が Access audience 不一致を報告した場合は、hostname を保�
 ## 公開 tool の境界
 
 公開 HTTP も local stdio と同じ session model を使いますが、`without_sandbox` は公開しません。ただし明示的に `--yolo` で起動した session の通常 command tool は unrestricted host permission で動きます。Cloudflare Access は authentication boundary であり、session mode の代替ではありません。
+
+## managed session lifecycle
+
+`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み direct HTTP endpoint は `session_start` / `session_stop` を公開します。`session_start` は logical named-root-relative path のみを受け付け、yolo option はありません。absolute path、unknown root、traversal / symlink escape、roots 未設定時の fallback は拒否します。`session_stop` は現在の `serve` process が所有する session に限定されます。公開 endpoint で `without_sandbox` が使えない既存境界も維持します。
+
+`just up` は `temote-mcp serve` を foreground に置き、`cloudflared` を child process として管理します。これにより local approval console が stdin を所有し、shutdown 時に managed session と Tunnel をまとめて cleanup します。

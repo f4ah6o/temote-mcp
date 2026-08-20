@@ -52,7 +52,7 @@ set +a
 cloudflared tunnel run --token-file "${TUNNEL_TOKEN_FILE:-$HOME/.config/temote-mcp/tunnel-token}"
 ```
 
-Local project sessions are separate processes and must also be running.
+With `TEMOTE_MCP_ROOTS` configured, the direct HTTP client can create managed project sessions with `session_start`. Separately started CLI sessions remain supported.
 
 ## Cloudflare Access
 
@@ -92,3 +92,9 @@ If the origin reports an invalid Access audience, copy the `AUD` from the hostna
 ## Public tool boundary
 
 Public HTTP uses the same session model as local stdio. It does not expose `without_sandbox`. A session explicitly started with `--yolo` still gives its ordinary public command tools unrestricted host permissions, so Cloudflare Access is an authentication boundary, not a replacement for session-mode decisions.
+
+## Managed session lifecycle
+
+When `TEMOTE_MCP_ROOTS` is configured, the authenticated direct HTTP endpoint exposes `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal/symlink escapes, and roots-unset fallback are rejected. `session_stop` is limited to sessions owned by the current `serve` process. `without_sandbox` remains unavailable on the public endpoint.
+
+`just up` keeps `temote-mcp serve` in the foreground and runs `cloudflared` as its child. The local approval console therefore owns stdin, and shutdown cleans up managed sessions and the Tunnel together.

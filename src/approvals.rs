@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{self, Session};
@@ -287,15 +289,136 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
     let _ = stream.shutdown().await;
 }
 
-pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
+pub struct ApprovalPrompt {
+    pub session_id: String,
+    pub request: Request,
+    response: oneshot::Sender<bool>,
+}
+
+impl ApprovalPrompt {
+    pub fn respond(self, allowed: bool) {
+        let _ = self.response.send(allowed);
+    }
+}
+
+pub type ApprovalReceiver = mpsc::UnboundedReceiver<ApprovalPrompt>;
+pub type ApprovalSender = mpsc::UnboundedSender<ApprovalPrompt>;
+
+pub fn approval_channel() -> (ApprovalSender, ApprovalReceiver) {
+    mpsc::unbounded_channel()
+}
+
+enum RuntimeCommand {
+    SetYolo {
+        value: bool,
+        response: oneshot::Sender<Result<()>>,
+    },
+    AllowDirectory {
+        path: PathBuf,
+        response: oneshot::Sender<Result<()>>,
+    },
+    RevokeDirectory {
+        path: PathBuf,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Snapshot {
+        response: oneshot::Sender<Session>,
+    },
+    Shutdown,
+}
+
+pub struct RuntimeHandle {
+    id: String,
+    cwd: PathBuf,
+    service_account_configured: bool,
+    kintone_mcp_configured: bool,
+    kintone_cli_configured: bool,
+    commands: mpsc::UnboundedSender<RuntimeCommand>,
+    join: JoinHandle<Result<()>>,
+}
+
+impl RuntimeHandle {
+    pub fn session_id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+
+    async fn set_yolo(&self, value: bool) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::SetYolo { value, response })
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before updating permission mode")??;
+        Ok(())
+    }
+
+    async fn allow_directory(&self, path: PathBuf) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::AllowDirectory { path, response })
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before adding sandbox root")??;
+        Ok(())
+    }
+
+    async fn revoke_directory(&self, path: PathBuf) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::RevokeDirectory { path, response })
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before revoking sandbox root")??;
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> Result<Session> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::Snapshot { response })
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before snapshot")
+    }
+
+    pub async fn shutdown(self) -> Result<()> {
+        let _ = self.commands.send(RuntimeCommand::Shutdown);
+        self.join
+            .await
+            .context("session runtime task failed to join")??;
+        Ok(())
+    }
+}
+
+pub async fn spawn_runtime(
+    cwd: &Path,
+    session_id: Option<&str>,
+    yolo: bool,
+    approval_sender: ApprovalSender,
+) -> Result<RuntimeHandle> {
     let service_account_token = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let kintone_bridge = Arc::new(tokio::sync::Mutex::new(kintone_mcp::Bridge::capture()));
     let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture());
+    let service_account_configured = service_account_token.is_some();
+    let kintone_mcp_configured = kintone_bridge.lock().await.configured();
+    let kintone_cli_configured = kintone_cli_bridge.configured();
     let id = config::session_id(session_id)?;
     config::remove_inactive_socket(&id).await?;
-    let mut session = config::new_session(&std::env::current_dir()?, Some(&id), yolo)?;
+    let mut session = config::new_session(cwd, Some(&id), yolo)?;
     let path = config::socket_path(&session.id)?;
     let state_dir = path.parent().context("session socket has no parent")?;
     tokio::fs::create_dir_all(state_dir).await?;
@@ -309,23 +432,61 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error);
     }
+
+    let id_for_handle = session.id.clone();
+    let cwd_for_handle = session.cwd.clone();
+    let (commands, command_receiver) = mpsc::unbounded_channel();
+    let join = tokio::spawn(async move {
+        let result = run_runtime(
+            listener,
+            &mut session,
+            command_receiver,
+            approval_sender,
+            service_account_token.as_deref(),
+            kintone_bridge,
+            kintone_cli_bridge,
+        )
+        .await;
+        session.process_id = 0;
+        if let Err(error) = config::save_session(&session).await {
+            eprintln!("failed to mark session {} stopped: {error:#}", session.id);
+        }
+        let _ = tokio::fs::remove_file(&path).await;
+        result
+    });
+
+    Ok(RuntimeHandle {
+        id: id_for_handle,
+        cwd: cwd_for_handle,
+        service_account_configured,
+        kintone_mcp_configured,
+        kintone_cli_configured,
+        commands,
+        join,
+    })
+}
+
+pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
+    let (approval_sender, approval_receiver) = approval_channel();
+    let handle =
+        spawn_runtime(&std::env::current_dir()?, session_id, yolo, approval_sender).await?;
     eprintln!(
         "temote-mcp session: {}\ncwd: {}\nmode: {}\n\
          Give this session ID to the agent so it can include it in temote-mcp tool calls.\n\
          Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
          Press Ctrl-C to stop.",
-        session.id,
-        session.cwd.display(),
-        if session.yolo { "yolo" } else { "ask" }
+        handle.session_id(),
+        handle.cwd().display(),
+        if yolo { "yolo" } else { "ask" }
     );
-    if session.yolo {
+    if yolo {
         eprintln!(
             "WARNING: YOLO mode grants MCP tools this user's full filesystem, process, environment, and network permissions without local approval."
         );
     }
     eprintln!(
         "1Password service account: {}",
-        if service_account_token.is_some() {
+        if handle.service_account_configured {
             "configured (token kept only by this session process)"
         } else {
             "not configured"
@@ -333,7 +494,7 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
     );
     eprintln!(
         "kintone MCP: {}",
-        if kintone_bridge.lock().await.configured() {
+        if handle.kintone_mcp_configured {
             "configured (credentials kept only by this session process)"
         } else {
             "not configured"
@@ -341,44 +502,81 @@ pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
     );
     eprintln!(
         "cli-kintone: {}",
-        if kintone_cli_bridge.configured() {
+        if handle.kintone_cli_configured {
             "configured (credentials kept only by this session process)"
         } else {
             "not configured"
         }
     );
-
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut pending = VecDeque::<(Request, UnixStream)>::new();
-    let result = run_session(
-        &listener,
-        &mut input,
-        &mut session,
-        &mut pending,
-        service_account_token.as_deref(),
-        Arc::clone(&kintone_bridge),
-        Arc::clone(&kintone_cli_bridge),
-    )
-    .await;
-    session.process_id = 0;
-    if let Err(error) = config::save_session(&session).await {
-        eprintln!("failed to mark session stopped: {error:#}");
-    }
-    let _ = tokio::fs::remove_file(&path).await;
-    result
+    run_cli_console(&handle, approval_receiver).await?;
+    handle.shutdown().await
 }
 
-async fn run_session(
-    listener: &UnixListener,
-    input: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+pub async fn run_supervisor_console(mut approvals: ApprovalReceiver) -> Result<()> {
+    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut pending = VecDeque::<ApprovalPrompt>::new();
+    loop {
+        tokio::select! {
+            prompt = approvals.recv() => {
+                let Some(prompt) = prompt else { return Ok(()) };
+                let show_now = pending.is_empty();
+                pending.push_back(prompt);
+                if show_now {
+                    show_supervisor_prompt(pending.front().unwrap())?;
+                }
+            }
+            line = input.next_line() => {
+                let Some(line) = line? else {
+                    deny_all(&mut pending);
+                    return Ok(());
+                };
+                handle_supervisor_input(line.trim(), &mut pending)?;
+            }
+        }
+    }
+}
+
+async fn run_cli_console(handle: &RuntimeHandle, mut approvals: ApprovalReceiver) -> Result<()> {
+    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut pending = VecDeque::<ApprovalPrompt>::new();
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            prompt = approvals.recv() => {
+                let Some(prompt) = prompt else { return Ok(()) };
+                let show_now = pending.is_empty();
+                pending.push_back(prompt);
+                if show_now {
+                    show_supervisor_prompt(pending.front().unwrap())?;
+                }
+            }
+            line = input.next_line() => {
+                let Some(line) = line? else {
+                    deny_all(&mut pending);
+                    return Ok(());
+                };
+                handle_cli_input(line.trim(), handle, &mut pending).await?;
+            }
+            signal = &mut ctrl_c => {
+                signal.context("failed to receive Ctrl-C")?;
+                eprintln!("Stopping temote-mcp session {}", handle.session_id());
+                deny_all(&mut pending);
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_runtime(
+    listener: UnixListener,
     session: &mut Session,
-    pending: &mut VecDeque<(Request, UnixStream)>,
+    mut commands: mpsc::UnboundedReceiver<RuntimeCommand>,
+    approval_sender: ApprovalSender,
     service_account_token: Option<&str>,
     kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
     kintone_cli_bridge: Arc<kintone_cli::Bridge>,
 ) -> Result<()> {
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             connection = listener.accept() => {
@@ -390,7 +588,9 @@ async fn run_session(
                     Message::Probe => {
                         stream.write_all(b"active\n").await?;
                     }
-                    Message::Activity { title, detail } => show_activity(&title, detail.as_deref()),
+                    Message::Activity { title, detail } => {
+                        show_activity_for_session(&session.id, &title, detail.as_deref());
+                    }
                     Message::OnePasswordServiceAccount { request } => {
                         let session = session.clone();
                         let token = service_account_token.map(str::to_owned);
@@ -440,26 +640,189 @@ async fn run_session(
                         });
                     }
                     Message::Approval { request } if session.yolo => {
-                        eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
+                        eprintln!("[session {}] [yolo] allowing {}: {}", session.id, request.operation, request.detail);
                         stream.write_all(b"allow\n").await?;
                     }
                     Message::Approval { request } => {
-                        show_request(&request)?;
-                        pending.push_back((request, stream));
+                        let (response, receiver) = oneshot::channel();
+                        let prompt = ApprovalPrompt {
+                            session_id: session.id.clone(),
+                            request,
+                            response,
+                        };
+                        if let Err(error) = approval_sender.send(prompt) {
+                            error.0.respond(false);
+                            continue;
+                        }
+                        tokio::spawn(async move {
+                            let allowed = receiver.await.unwrap_or(false);
+                            let _ = stream
+                                .write_all(if allowed { b"allow\n" } else { b"deny\n" })
+                                .await;
+                            let _ = stream.shutdown().await;
+                        });
                     }
                 }
             }
-            line = input.next_line() => {
-                let Some(line) = line? else { anyhow::bail!("session input closed") };
-                handle_input(line.trim(), session, pending).await?;
-            }
-            signal = &mut ctrl_c => {
-                signal.context("failed to receive Ctrl-C")?;
-                eprintln!("Stopping temote-mcp session {}", session.id);
-                return Ok(());
+            command = commands.recv() => {
+                let Some(command) = command else { return Ok(()) };
+                match command {
+                    RuntimeCommand::SetYolo { value, response } => {
+                        session.yolo = value;
+                        let result = config::save_session(session).await;
+                        let _ = response.send(result);
+                    }
+                    RuntimeCommand::AllowDirectory { path, response } => {
+                        let result = (|| -> Result<()> {
+                            let directory = config::canonical_directory(&path)?;
+                            if !session.permitted_directories.contains(&directory) {
+                                session.permitted_directories.push(directory);
+                                session.permitted_directories.sort();
+                            }
+                            Ok(())
+                        })();
+                        let result = match result {
+                            Ok(()) => config::save_session(session).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = response.send(result);
+                    }
+                    RuntimeCommand::RevokeDirectory { path, response } => {
+                        let result = (|| -> Result<()> {
+                            let directory = config::canonical_directory(&path)?;
+                            anyhow::ensure!(directory != session.cwd, "cannot revoke the session cwd");
+                            session.permitted_directories.retain(|item| item != &directory);
+                            Ok(())
+                        })();
+                        let result = match result {
+                            Ok(()) => config::save_session(session).await,
+                            Err(error) => Err(error),
+                        };
+                        let _ = response.send(result);
+                    }
+                    RuntimeCommand::Snapshot { response } => {
+                        let _ = response.send(session.clone());
+                    }
+                    RuntimeCommand::Shutdown => return Ok(()),
+                }
             }
         }
     }
+}
+
+async fn handle_cli_input(
+    input: &str,
+    handle: &RuntimeHandle,
+    pending: &mut VecDeque<ApprovalPrompt>,
+) -> Result<()> {
+    match input {
+        "/permissions yolo" | "/permission yolo" => {
+            handle.set_yolo(true).await?;
+            eprintln!("Permissions: yolo (full host permissions; no local approvals)");
+            while let Some(prompt) = pending.pop_front() {
+                eprintln!(
+                    "[session {}] [yolo] allowing {}: {}",
+                    prompt.session_id, prompt.request.operation, prompt.request.detail
+                );
+                prompt.respond(true);
+            }
+        }
+        "/permissions ask" | "/permission ask" => {
+            handle.set_yolo(false).await?;
+            eprintln!("Permissions: ask");
+        }
+        "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
+            pending.pop_front().unwrap().respond(true);
+            show_next_prompt(pending)?;
+        }
+        "n" | "N" | "no" | "NO" if !pending.is_empty() => {
+            pending.pop_front().unwrap().respond(false);
+            show_next_prompt(pending)?;
+        }
+        "/permission list" | "/permissions list" => {
+            show_permissions(&handle.snapshot().await?);
+        }
+        "/permission status" | "/permissions status" => {
+            let session = handle.snapshot().await?;
+            eprintln!("Permissions: {}", if session.yolo { "yolo" } else { "ask" });
+            show_permissions(&session);
+        }
+        command if permission_arg(command, "allow").is_some() => {
+            let directory = PathBuf::from(permission_arg(command, "allow").unwrap());
+            handle.allow_directory(directory.clone()).await?;
+            eprintln!(
+                "Allowed sandbox root: {}",
+                config::canonical_directory(&directory)?.display()
+            );
+        }
+        command if permission_arg(command, "revoke").is_some() => {
+            let directory = PathBuf::from(permission_arg(command, "revoke").unwrap());
+            let canonical = config::canonical_directory(&directory)?;
+            handle.revoke_directory(directory).await?;
+            eprintln!("Revoked sandbox root: {}", canonical.display());
+        }
+        "/permission" | "/permissions" | "/permission help" | "/permissions help" => {
+            eprintln!("/permission ask|yolo|allow <directory>|revoke <directory>|list|status");
+        }
+        "" => {}
+        command if !pending.is_empty() => {
+            pending.pop_front().unwrap().respond(false);
+            eprintln!("Denied request (unrecognized response: {command})");
+            show_next_prompt(pending)?;
+        }
+        command => eprintln!("Unknown command: {command}"),
+    }
+    Ok(())
+}
+
+fn handle_supervisor_input(input: &str, pending: &mut VecDeque<ApprovalPrompt>) -> Result<()> {
+    match input {
+        "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
+            pending.pop_front().unwrap().respond(true);
+            show_next_prompt(pending)?;
+        }
+        "n" | "N" | "no" | "NO" if !pending.is_empty() => {
+            pending.pop_front().unwrap().respond(false);
+            show_next_prompt(pending)?;
+        }
+        "" => {}
+        command if !pending.is_empty() => {
+            pending.pop_front().unwrap().respond(false);
+            eprintln!("Denied request (unrecognized response: {command})");
+            show_next_prompt(pending)?;
+        }
+        command => eprintln!(
+            "Unknown supervisor command: {command}. Managed-session approvals use y/yes or n/no."
+        ),
+    }
+    Ok(())
+}
+
+fn deny_all(pending: &mut VecDeque<ApprovalPrompt>) {
+    while let Some(prompt) = pending.pop_front() {
+        prompt.respond(false);
+    }
+}
+
+fn show_supervisor_prompt(prompt: &ApprovalPrompt) -> Result<()> {
+    eprintln!(
+        "\n[session {}] approval {}\ncwd: {}\noperation: {}\n{}",
+        prompt.session_id,
+        prompt.request.id,
+        prompt.request.cwd.display(),
+        prompt.request.operation,
+        prompt.request.detail
+    );
+    eprint!("Allow operation? [y/N] ");
+    std::io::stderr().flush()?;
+    Ok(())
+}
+
+fn show_next_prompt(pending: &VecDeque<ApprovalPrompt>) -> Result<()> {
+    if let Some(prompt) = pending.front() {
+        show_supervisor_prompt(prompt)?;
+    }
+    Ok(())
 }
 
 async fn handle_kintone_cli_request(
@@ -641,88 +1004,13 @@ fn redact_token(text: &str, token: &str) -> String {
     }
 }
 
-fn show_activity(title: &str, detail: Option<&str>) {
-    eprintln!("\n• {title}");
+fn show_activity_for_session(session_id: &str, title: &str, detail: Option<&str>) {
+    eprintln!("\n[session {session_id}] • {title}");
     if let Some(detail) = detail.filter(|value| !value.is_empty()) {
         for line in detail.lines() {
             eprintln!("  {line}");
         }
     }
-}
-
-async fn handle_input(
-    input: &str,
-    session: &mut Session,
-    pending: &mut VecDeque<(Request, UnixStream)>,
-) -> Result<()> {
-    match input {
-        "/permissions yolo" | "/permission yolo" => {
-            session.yolo = true;
-            config::save_session(session).await?;
-            eprintln!("Permissions: yolo (full host permissions; no local approvals)");
-            while let Some((request, mut stream)) = pending.pop_front() {
-                eprintln!("[yolo] allowing {}: {}", request.operation, request.detail);
-                stream.write_all(b"allow\n").await?;
-            }
-        }
-        "/permissions ask" | "/permission ask" => {
-            session.yolo = false;
-            config::save_session(session).await?;
-            eprintln!("Permissions: ask");
-        }
-        "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
-            let (_, mut stream) = pending.pop_front().unwrap();
-            stream.write_all(b"allow\n").await?;
-            show_next(pending)?;
-        }
-        "n" | "N" | "no" | "NO" if !pending.is_empty() => {
-            let (_, mut stream) = pending.pop_front().unwrap();
-            stream.write_all(b"deny\n").await?;
-            show_next(pending)?;
-        }
-        "/permission list" | "/permissions list" => show_permissions(session),
-        "/permission status" | "/permissions status" => {
-            eprintln!("Permissions: {}", if session.yolo { "yolo" } else { "ask" });
-            show_permissions(session);
-        }
-        command if permission_arg(command, "allow").is_some() => {
-            let directory = config::canonical_directory(
-                PathBuf::from(permission_arg(command, "allow").unwrap()).as_path(),
-            )?;
-            if !session.permitted_directories.contains(&directory) {
-                session.permitted_directories.push(directory.clone());
-                session.permitted_directories.sort();
-                config::save_session(session).await?;
-            }
-            eprintln!("Allowed sandbox root: {}", directory.display());
-        }
-        command if permission_arg(command, "revoke").is_some() => {
-            let directory = config::canonical_directory(
-                PathBuf::from(permission_arg(command, "revoke").unwrap()).as_path(),
-            )?;
-            if directory == session.cwd {
-                eprintln!("Cannot revoke the session cwd");
-            } else {
-                session
-                    .permitted_directories
-                    .retain(|item| item != &directory);
-                config::save_session(session).await?;
-                eprintln!("Revoked sandbox root: {}", directory.display());
-            }
-        }
-        "/permission" | "/permissions" | "/permission help" | "/permissions help" => {
-            eprintln!("/permission ask|yolo|allow <directory>|revoke <directory>|list|status");
-        }
-        "" => {}
-        command if !pending.is_empty() => {
-            let (_, mut stream) = pending.pop_front().unwrap();
-            stream.write_all(b"deny\n").await?;
-            eprintln!("Denied request (unrecognized response: {command})");
-            show_next(pending)?;
-        }
-        command => eprintln!("Unknown command: {command}"),
-    }
-    Ok(())
 }
 
 fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
@@ -741,26 +1029,6 @@ fn show_permissions(session: &Session) {
     for path in &session.permitted_directories {
         eprintln!("  {}", path.display());
     }
-}
-
-fn show_request(request: &Request) -> Result<()> {
-    eprintln!(
-        "\n[{}] {}\ncwd: {}\n{}",
-        request.id,
-        request.operation,
-        request.cwd.display(),
-        request.detail
-    );
-    eprint!("Allow operation? [y/N] ");
-    std::io::stderr().flush()?;
-    Ok(())
-}
-
-fn show_next(pending: &VecDeque<(Request, UnixStream)>) -> Result<()> {
-    if let Some((request, _)) = pending.front() {
-        show_request(request)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -310,7 +310,7 @@ async fn run_generation(
 
 async fn dispatch_response(request: &Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
-    match mcp::dispatch_public(request).await {
+    match mcp::dispatch_public(request, None).await {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(error) => json!({
             "jsonrpc": "2.0",

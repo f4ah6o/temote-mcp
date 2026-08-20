@@ -21,36 +21,35 @@ cargo install --git https://github.com/f4ah6o/temote-mcp --locked
 
 Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are not supported; WSL2 can be used for the gateway endpoint path.
 
-## Start a session
+## Start sessions
 
-Run Temote MCP from the directory the agent should work in:
+For an always-on host, configure a named root and run the HTTP supervisor:
+
+```sh
+# Example host layout:
+# ~/src -> /Volumes/devstorage/Developer
+export TEMOTE_MCP_ROOTS='src=~/src'
+just up
+```
+
+An authenticated MCP client can then use:
+
+```text
+session_list
+session_start(path="src/my-project", session_id="my-project")
+session_info(session_id="my-project")
+```
+
+Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode; host/network-sensitive operations still require approval in the local `just up` terminal.
+
+For a traditional local session, run:
 
 ```sh
 cd ~/src/my-project
 temote-mcp start my-project
 ```
 
-Then configure an MCP client to start the local stdio server with:
-
-```sh
-temote-mcp mcp
-```
-
-Every tool call except `session_list` uses a session ID. The session terminal shows approvals and lets you change permitted directories:
-
-```text
-/permission allow ../another-project
-/permission revoke ../another-project
-/permission list
-```
-
-For an intentionally unrestricted session:
-
-```sh
-temote-mcp start my-project --yolo
-```
-
-`--yolo` removes Temote MCP's path, sandbox, and local-approval boundaries. Use it only when unrestricted host access is intended.
+Local stdio clients can launch `temote-mcp mcp`. A deliberately unrestricted CLI session remains available with `temote-mcp start my-project --yolo`.
 
 ## Agent skill
 
@@ -65,6 +64,7 @@ Specify `--agent codex`, `--agent claude-code`, or another supported agent when 
 ## More documentation
 
 - [Using sessions and tools](docs/usage.md)
+- [Managed sessions and named roots](docs/managed-sessions.md)
 - [Public HTTP endpoint and Cloudflare Access](docs/public-http.md)
 - [1Password and kintone integrations](docs/integrations.md)
 - [Multi-host Cloudflare gateway](docs/gateway.md)

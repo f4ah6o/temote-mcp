@@ -10,11 +10,20 @@ mod http;
 mod kintone_cli;
 mod kintone_mcp;
 mod mcp;
+mod named_roots;
 mod onepassword_mcp;
 mod sandbox;
+#[cfg(feature = "network")]
+mod supervisor;
 
 #[cfg(feature = "network")]
 use std::net::SocketAddr;
+#[cfg(feature = "network")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "network")]
+use std::process::Stdio;
+#[cfg(feature = "network")]
+use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::time::Duration;
 
@@ -55,6 +64,9 @@ enum Command {
         /// Local address to listen on.
         #[arg(long, default_value = "127.0.0.1:8791")]
         addr: SocketAddr,
+        /// Run cloudflared as a child of this supervisor using this token file.
+        #[arg(long)]
+        tunnel_token_file: Option<PathBuf>,
     },
     #[cfg(feature = "network")]
     /// Connect an active local session to a Cloudflare gateway using outbound long polling.
@@ -98,7 +110,11 @@ async fn main() -> Result<()> {
         Command::Start { session_id, yolo } => approvals::start(session_id.as_deref(), yolo).await,
         Command::Mcp => mcp::serve().await,
         #[cfg(feature = "network")]
-        Command::Serve { public_url, addr } => serve_http(public_url, addr).await,
+        Command::Serve {
+            public_url,
+            addr,
+            tunnel_token_file,
+        } => serve_http(public_url, addr, tunnel_token_file.as_deref()).await,
         #[cfg(feature = "network")]
         Command::GatewayAgent {
             gateway_url,
@@ -124,7 +140,11 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(feature = "network")]
-async fn serve_http(public_url: Option<String>, addr: SocketAddr) -> Result<()> {
+async fn serve_http(
+    public_url: Option<String>,
+    addr: SocketAddr,
+    tunnel_token_file: Option<&Path>,
+) -> Result<()> {
     load_public_env()?;
     let public_url = public_url
         .or_else(|| std::env::var("TEMOTE_MCP_PUBLIC_URL").ok())
@@ -133,7 +153,74 @@ async fn serve_http(public_url: Option<String>, addr: SocketAddr) -> Result<()> 
         )?;
     let public_url = http::normalize_public_url(&public_url)?;
     let authenticator = access::AccessAuthenticator::from_env().await?;
-    http::serve(addr, public_url, authenticator).await
+    let roots = named_roots::NamedRoots::from_env()?;
+    let (supervisor, approvals) = supervisor::SessionSupervisor::new(roots);
+    eprintln!(
+        "Managed session roots: {}",
+        if supervisor.roots_configured() {
+            "configured"
+        } else {
+            "not configured (session_start fails closed)"
+        }
+    );
+    let console = tokio::spawn(approvals::run_supervisor_console(approvals));
+    let mut tunnel = if let Some(token_file) = tunnel_token_file {
+        let child = tokio::process::Command::new("cloudflared")
+            .args(["tunnel", "run", "--token-file"])
+            .arg(token_file)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!("failed to start cloudflared with {}", token_file.display())
+            })?;
+        Some(child)
+    } else {
+        None
+    };
+
+    let serve = http::serve(addr, public_url, authenticator, Arc::clone(&supervisor));
+    tokio::pin!(serve);
+    let serve_result = if let Some(child) = tunnel.as_mut() {
+        tokio::select! {
+            result = &mut serve => result,
+            status = child.wait() => {
+                let status = status.context("failed while waiting for cloudflared")?;
+                Err(anyhow::anyhow!("cloudflared exited while temote-mcp serve was active: {status}"))
+            }
+        }
+    } else {
+        serve.await
+    };
+
+    if let Some(child) = tunnel.as_mut() {
+        stop_child(child).await;
+    }
+    let shutdown_result = supervisor.shutdown().await;
+    console.abort();
+    if let Ok(pid_file) = std::env::var("TEMOTE_MCP_UP_PID_FILE") {
+        let _ = tokio::fs::remove_file(pid_file).await;
+    }
+    serve_result?;
+    shutdown_result
+}
+
+#[cfg(feature = "network")]
+async fn stop_child(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
 }
 
 #[cfg(feature = "network")]

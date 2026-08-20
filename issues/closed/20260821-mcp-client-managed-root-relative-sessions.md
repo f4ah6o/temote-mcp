@@ -1,6 +1,6 @@
 # MCP client から named root-relative path で session lifecycle を管理できるようにする
 
-Status: open
+Status: closed
 Model: gpt-5.6-sol
 Created: 2026-08-21
 Updated: 2026-08-21
@@ -277,22 +277,22 @@ session に supervisor ownership を持たせ、少なくとも次を区別で�
 
 ## 実装タスク
 
-- [ ] `TEMOTE_MCP_ROOTS` の config 読み込みと validation を追加する。
-- [ ] named root の structured parser / representation を追加する。
-- [ ] logical `<root>/<path>` resolver を追加する。
-- [ ] configured root 自体の symlink canonicalization を正式にサポートする。
-- [ ] traversal / descendant symlink escape tests を追加する。
-- [ ] `approvals::start()` の session runtime と terminal UI を reusable component に分離する。
-- [ ] `SessionSupervisor` を追加する。
-- [ ] `temote-mcp serve` が managed session を保持できるようにする。
-- [ ] `just up` で approval console の stdin が失われない process layout に変更する。
-- [ ] MCP tool `session_start` を追加する。
-- [ ] MCP tool `session_stop` を追加する。
-- [ ] managed / unmanaged session ownership を表現する。
-- [ ] `session_list` / `session_info` が managed session を正しく返すことを確認する。
-- [ ] serve shutdown 時の managed session cleanup を実装する。
-- [ ] direct HTTP/public dispatch で session lifecycle tools を検証する。
-- [ ] README / README.ja.md / docs/usage* / Agent Skill を新しい workflow に更新する。
+- [x] `TEMOTE_MCP_ROOTS` の config 読み込みと validation を追加する。
+- [x] named root の structured parser / representation を追加する。
+- [x] logical `<root>/<path>` resolver を追加する。
+- [x] configured root 自体の symlink canonicalization を正式にサポートする。
+- [x] traversal / descendant symlink escape tests を追加する。
+- [x] `approvals::start()` の session runtime と terminal UI を reusable component に分離する。
+- [x] `SessionSupervisor` を追加する。
+- [x] `temote-mcp serve` が managed session を保持できるようにする。
+- [x] `just up` で approval console の stdin が失われない process layout に変更する。
+- [x] MCP tool `session_start` を追加する。
+- [x] MCP tool `session_stop` を追加する。
+- [x] managed / unmanaged session ownership を表現する。
+- [x] `session_list` / `session_info` が managed session を正しく返すことを確認する。
+- [x] serve shutdown 時の managed session cleanup を実装する。
+- [x] direct HTTP/public dispatch で session lifecycle tools を検証する。
+- [x] README / README.ja.md / docs/usage* / Agent Skill を新しい workflow に更新する。
 
 ## 受け入れ条件
 
@@ -315,28 +315,28 @@ TEMOTE_MCP_ROOTS=src=$HOME/src
 
 最低限、次を満たす。
 
-- [ ] MCP client から `session_start(path="src/repo-a")` が成功する。
-- [ ] root alias 自体が symlink でも `src/repo-a` が canonical physical target に解決される。
-- [ ] `session_start(path="src")` で named root 自身を session root にできる。
-- [ ] 返された session ID を使って `session_info`, `read_file`, `execute` 等の既存 tool を呼べる。
-- [ ] `session_list` に managed session が active として現れる。
-- [ ] `session_stop` 後は session が active list から消える。
-- [ ] absolute path は拒否される。
-- [ ] unknown root alias は拒否される。
-- [ ] `src/../outside` 等で physical root 外へ出る path は拒否される。
-- [ ] `src/outside-link` のような descendant symlink escape は拒否される。
-- [ ] roots 未設定時の `session_start` は fail closed する。
-- [ ] MCP client から yolo session を生成できない。
-- [ ] remote-created normal session の approval-gated operation は local console approval なしに実行されない。
-- [ ] 複数 managed session の approval 表示に session ID が含まれ、取り違えない。
-- [ ] active session ID collision は existing session を置換せず conflict になる。
-- [ ] `temote-mcp serve` 終了時に managed session socket が stale active として残らない。
-- [ ] 従来の `temote-mcp start <id>` workflow が regression なく動く。
-- [ ] public endpoint の `without_sandbox` 非公開など既存 security boundary を弱めない。
-- [ ] `cargo fmt --all -- --check` が成功する。
-- [ ] `cargo test` が成功する。
-- [ ] `cargo clippy --all-targets -- -D warnings` が成功する。
-- [ ] `git diff --check` が成功する。
+- [x] MCP client から `session_start(path="src/repo-a")` が成功する。
+- [x] root alias 自体が symlink でも `src/repo-a` が canonical physical target に解決される。
+- [x] `session_start(path="src")` で named root 自身を session root にできる。
+- [x] 返された session ID を使って `session_info`, `read_file`, `execute` 等の既存 tool を呼べる。
+- [x] `session_list` に managed session が active として現れる。
+- [x] `session_stop` 後は session が active list から消える。
+- [x] absolute path は拒否される。
+- [x] unknown root alias は拒否される。
+- [x] `src/../outside` 等で physical root 外へ出る path は拒否される。
+- [x] `src/outside-link` のような descendant symlink escape は拒否される。
+- [x] roots 未設定時の `session_start` は fail closed する。
+- [x] MCP client から yolo session を生成できない。
+- [x] remote-created normal session の approval-gated operation は local console approval なしに実行されない。
+- [x] 複数 managed session の approval 表示に session ID が含まれ、取り違えない。
+- [x] active session ID collision は existing session を置換せず conflict になる。
+- [x] `temote-mcp serve` 終了時に managed session socket が stale active として残らない。
+- [x] 従来の `temote-mcp start <id>` workflow が regression なく動く。
+- [x] public endpoint の `without_sandbox` 非公開など既存 security boundary を弱めない。
+- [x] `cargo fmt --all -- --check` が成功する。
+- [x] `cargo test` が成功する。
+- [x] `cargo clippy --all-targets -- -D warnings` が成功する。
+- [x] `git diff --check` が成功する。
 
 ## live acceptance
 
@@ -378,3 +378,55 @@ just up
 ## 変更履歴
 
 `CHANGES.md` impact: no
+
+## Completion evidence
+
+Completed: 2026-08-21
+
+### Implementation
+
+- Added `TEMOTE_MCP_ROOTS` named-root configuration. A single root keeps the convenient `name=path` form; multiple roots use a JSON object so path separators are not overloaded.
+- Configured root paths are expanded and canonicalized before use. The configured root itself may therefore be a symlink, while every requested target is canonicalized again and must remain the canonical root itself or a descendant.
+- Added reusable session runtime plumbing shared by `temote-mcp start` and `temote-mcp serve`, plus a `SessionSupervisor` for serve-owned sessions.
+- Added direct HTTP MCP `session_start(path, session_id?)` / `session_stop(session_id)`. Managed sessions are always `yolo=false`; extra fields such as `yolo` are rejected.
+- `session_stop` tracks in-process supervisor ownership and refuses to stop an independently started active CLI session.
+- Managed approval requests are routed to the local serve console and display `session_id`, cwd, and operation before a local allow/deny response is accepted.
+- `just up` now keeps `temote-mcp serve` in the foreground and makes `cloudflared` its child, so serve owns terminal stdin and shuts down its managed sessions and Tunnel together.
+- Cloudflare Workers/Durable Objects gateway dispatch does not advertise managed-session lifecycle tools; host selection remains out of scope. The public direct HTTP endpoint still excludes `without_sandbox`.
+- Updated README / README.ja.md, detailed managed-session docs, public HTTP/usage docs, `.env.example`, and the Agent Skill workflow.
+
+### Automated acceptance
+
+`cargo test` passed with 83 tests. Relevant evidence includes:
+
+- named-root parsing and strict root-name validation;
+- configured root-alias symlink canonicalization;
+- `src`, `src/repo-a`, and `src/repo-b` canonical target success;
+- absolute path, unknown root, traversal, descendant symlink escape, nonexistent directory, and roots-unset rejection;
+- authenticated direct HTTP `session_start` for two sessions, `session_list`, `session_info`, `read_file`, sandboxed `execute`, duplicate-ID rejection, and `session_stop`;
+- rejection of a `yolo` field at the public session-start boundary;
+- unmanaged active CLI runtime cannot be stopped by `session_stop`;
+- supervisor shutdown removes sockets and writes inactive session metadata;
+- approval-gated request remains pending until the local approval receiver responds, and the prompt identifies the correct session ID, cwd, and operation;
+- existing Cloudflare Access unauthenticated rejection and public `without_sandbox` exclusion tests remain green.
+
+### CLI regression / host observation
+
+A freshly built `target/debug/temote-mcp start <id>` was run with stdin closed as a lifecycle regression check. It exited successfully (`exit 0`) and left no session socket behind. The traditional CLI startup output also retained the existing permission-mode and integration-status information.
+
+The current host was inspected without modifying it. On this machine `~/src` is presently a real directory, while `~/src/local-mcp` is a descendant symlink to `/Volumes/devstorage/Developer/local-mcp`. Under the required semantics, configuring `src=~/src` must reject that descendant escape rather than treating it as a trusted root alias. Therefore no live validation weakened containment to make the current host layout pass. The requested root-alias case (`~/src` itself being the configured symlink) is covered by the canonicalization fixture and direct HTTP acceptance tests.
+
+A live request through the production Cloudflare Access endpoint was not performed because doing so would require reconfiguring/restarting the currently connected host service or bypassing its authentication boundary. Direct HTTP routing is exercised with the authenticated test runtime instead; production Access authentication tests remain intact.
+
+### Validation
+
+All required final commands passed on the completed worktree:
+
+```text
+cargo fmt --all -- --check                       PASS
+cargo test                                       PASS (83 passed, 0 failed)
+cargo clippy --all-targets -- -D warnings        PASS
+git diff --check                                 PASS
+```
+
+`just --list` also parsed the updated process-layout recipes successfully.
