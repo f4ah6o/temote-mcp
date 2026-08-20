@@ -435,7 +435,7 @@ git diff --check                                 PASS
 
 The first post-merge CI run (`32426742525`) exposed a Linux-only test-layout issue in the existing sandbox-helper lookup. During `cargo test --all-targets`, the test executable lives under `target/debug/deps/`, while the `codex-linux-sandbox` helper is built at `target/debug/`. The new managed-session HTTP `execute` acceptance was the first Linux CI path to exercise that lookup from a test binary.
 
-The helper lookup now preserves the production sibling lookup and additionally recognizes Cargo's `deps/` test-binary layout, resolving only the adjacent profile directory's `codex-linux-sandbox`. No sandbox, approval, path-containment, or public-endpoint semantics were relaxed.
+The helper lookup now preserves the production sibling lookup and additionally recognizes Cargo's `deps/` test-binary layout, resolving only the adjacent profile directory's `codex-linux-sandbox`. The first fix run (`32427474144`) confirmed that `cargo test --all-targets` does not itself emit the normal helper executable; it only emits the helper's test harness under `deps/`. CI therefore builds the real `codex-linux-sandbox` binary before the Linux test step, matching the installed/runtime process layout while keeping the HTTP `execute` acceptance real rather than skipping it. No sandbox, approval, path-containment, or public-endpoint semantics were relaxed.
 
 Post-fix local validation:
 

@@ -32,6 +32,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Build Linux sandbox helper
+        if: runner.os == 'Linux'
+        run: cargo build --bin codex-linux-sandbox --locked
+
       - name: Test
         run: cargo test --all-targets --all-features --locked
 
