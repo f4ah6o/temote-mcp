@@ -1,4 +1,4 @@
-# MCP client から root-relative path で session lifecycle を管理できるようにする
+# MCP client から named root-relative path で session lifecycle を管理できるようにする
 
 Status: open
 Model: gpt-5.6-sol
@@ -8,14 +8,20 @@ Branch: main
 
 ## 概要
 
-`just up` で Temote MCP の HTTP origin と Cloudflare Tunnel が常駐している場合、MCP client 側から `session_start` を呼び、host 側で事前設定した root directory からの相対パスを指定して session を開始できるようにする。
+`just up` で Temote MCP の HTTP origin と Cloudflare Tunnel が常駐している場合、MCP client 側から `session_start` を呼び、host 側で事前設定した **named root** からの相対パスを指定して session を開始できるようにする。
 
 現在は `session_list` / `session_info` が MCP tool として存在する一方、session 作成は対象ディレクトリへ `cd` した上で `temote-mcp start` または `just start` を人間が別 terminal から実行する必要がある。この非対称性を解消し、`just up` を常駐 host supervisor として利用できるようにする。
 
-例:
+主用途として、host 側で次のように `~/src` が別 volume への symlink になっていても、client からは論理 namespace の `src/foo` と指定できることを重視する。
 
 ```text
-TEMOTE_MCP_ROOT_DIR=/Volumes/devstorage/Developer
+~/src -> /Volumes/devstorage/Developer
+```
+
+host configuration:
+
+```text
+TEMOTE_MCP_ROOTS=src=~/src
 just up
 ```
 
@@ -23,8 +29,8 @@ MCP client:
 
 ```json
 {
-  "path": "twin",
-  "session_id": "twin"
+  "path": "src/foo",
+  "session_id": "foo"
 }
 ```
 
@@ -32,8 +38,8 @@ MCP client:
 
 ```json
 {
-  "session_id": "twin",
-  "cwd": "/Volumes/devstorage/Developer/twin",
+  "session_id": "foo",
+  "cwd": "/Volumes/devstorage/Developer/foo",
   "status": "active",
   "yolo": false
 }
@@ -45,10 +51,15 @@ MCP client:
 
 そのため HTTP handler から単純に `temote-mcp start` を background spawn すると、session process が読むべき stdin / approval UI が失われる。remote-created session でも既存の sandbox / approval semantics を弱めないため、session runtime と terminal UI を分離し、`just up` 側で複数 session を管理できる supervisor を持たせる。
 
+また、単一の physical root に containment をかけるだけでは、`~/src -> /Volumes/...` のような日常的な symlink mount を logical path `src/foo` として扱えない。そこで「logical root name」と「host 上の physical root」を分離する。
+
 ## 目標
 
 - `just up` 済みなら MCP client から session を開始できる。
-- client が指定する path は host 設定の root directory からの相対パスだけにする。
+- client が指定する path は configured named roots から始まる logical relative path のみにする。
+- `src/foo` のような stable logical path を使える。
+- named root 自体が symlink でも、その symlink target を root boundary として安全に利用できる。
+- named root 配下からさらに root 外へ出る traversal / symlink escape は拒否する。
 - session ID は省略可能で、既存と同様に UUID を生成できる。
 - 作成した session は既存 `session_list` / `session_info` / tool calls から通常 session と同様に扱える。
 - MCP client から session を明示停止できる。
@@ -58,8 +69,8 @@ MCP client:
 ## 非目標
 
 - MCP client から `--yolo` を有効化する機能は追加しない。
-- 任意の absolute path を remote client に公開しない。
-- root directory 外への symlink escape を許可しない。
+- arbitrary absolute path を remote client に公開しない。
+- configured named root 配下から root 外への symlink escape を許可しない。
 - session start を permission escalation の代替にしない。
 - この issue では Cloudflare Workers + Durable Objects gateway 経由の remote session creation は扱わない。multi-host では host selection / routing contract が別途必要になる。
 - Windows native 対応は追加しない。
@@ -74,14 +85,15 @@ Input:
 
 ```json
 {
-  "path": "twin",
-  "session_id": "twin"
+  "path": "src/foo",
+  "session_id": "foo"
 }
 ```
 
 - `path` は required。
-- `path` は `TEMOTE_MCP_ROOT_DIR` からの relative path。
+- `path` は `<root-name>` または `<root-name>/<relative-path>` の logical path。
 - absolute path は拒否する。
+- unknown root name は拒否する。
 - `session_id` は optional。
 - `yolo` 引数は持たせない。
 
@@ -89,12 +101,14 @@ Output は少なくとも次を含む。
 
 ```json
 {
-  "session_id": "twin",
-  "cwd": "/Volumes/devstorage/Developer/twin",
+  "session_id": "foo",
+  "cwd": "/Volumes/devstorage/Developer/foo",
   "status": "active",
   "yolo": false
 }
 ```
+
+可能なら `session_info` / `session_list` には debugging / observability 用に logical root/path も追加してよい。ただし既存 consumer を壊さない additive field にする。
 
 ### `session_stop`
 
@@ -102,7 +116,7 @@ Input:
 
 ```json
 {
-  "session_id": "twin"
+  "session_id": "foo"
 }
 ```
 
@@ -117,28 +131,70 @@ Input:
 
 は managed session も既存 session と同じ形式で返す。
 
-## root directory contract
+## named root contract
 
-新しい host-side configuration として `TEMOTE_MCP_ROOT_DIR` を追加する。
+新しい host-side configuration として `TEMOTE_MCP_ROOTS` を追加する。
+
+最低限、単一 root は次のように設定できるようにする。
+
+```text
+TEMOTE_MCP_ROOTS=src=~/src
+```
+
+複数 root も設定できる contract を定義する。具体的な separator / parser は安全かつ document しやすい形式を選ぶこと。パスに separator が含まれる曖昧な ad-hoc parser は避ける。必要なら config file / structured representation を採用してよい。
+
+root name は MCP path namespace の first component として使うため、少なくとも ASCII alphanumeric、`-`、`_` 程度に制限し、`.`, `..`, slash、空文字は拒否する。
+
+### root symlink semantics
+
+named root の configured path 自体は symlink でよい。
 
 例:
 
 ```text
-TEMOTE_MCP_ROOT_DIR=/Volumes/devstorage/Developer
+~/src -> /Volumes/devstorage/Developer
 ```
+
+起動時または初回使用時に configured root path を canonicalize し、その結果を **physical containment root** とする。
+
+```text
+logical root:  src
+configured:    ~/src
+canonical:     /Volumes/devstorage/Developer
+```
+
+この場合、client の `src/foo` は次として扱う。
+
+```text
+/Volumes/devstorage/Developer/foo
+```
+
+つまり root alias 自体の symlink traversal は host configuration として明示的に trusted とする。
+
+一方、named root の descendant にある symlink が canonical root の外へ出る場合は拒否する。
+
+```text
+~/src/outside-link -> /private/tmp/outside
+```
+
+`src/outside-link` やその descendant は session root にできない。
+
+### path resolution
 
 `session_start(path)` は次の手順で target cwd を解決する。
 
-1. configured root を canonicalize する。
-2. `path` が absolute なら拒否する。
-3. `root.join(path)` を canonicalize する。
-4. target が directory であることを確認する。
-5. canonical target が canonical root 自身、またはその descendant であることを確認する。
-6. root 外を指す `..` traversal / symlink escape を拒否する。
+1. path が absolute なら拒否する。
+2. first component を root name として取得する。
+3. configured named root を取得する。unknown root は拒否する。
+4. configured root 自体を canonicalize して physical root を得る。
+5. remaining components を physical root に join して target を canonicalize する。
+6. target が directory であることを確認する。
+7. canonical target が canonical physical root 自身、またはその descendant であることを確認する。
+8. root 外を指す `..` traversal / descendant symlink escape を拒否する。
 
 文字列レベルの `..` 禁止だけを security boundary にしない。
 
-`TEMOTE_MCP_ROOT_DIR` が未設定なら public/direct HTTP endpoint の `session_start` は利用不可とし、任意の cwd や process cwd へ fallback しない。
+named roots が未設定なら public/direct HTTP endpoint の `session_start` は利用不可とし、HOME、process cwd、filesystem root などへ fallback しない。
 
 ## session supervisor
 
@@ -213,15 +269,19 @@ session に supervisor ownership を持たせ、少なくとも次を区別で�
 公開 endpoint から以下はできないことをテストする。
 
 - absolute path で任意 directory を session root にする。
-- `../` や symlink で configured root 外へ出る。
+- unknown root alias を使う。
+- `../` や descendant symlink で configured physical root 外へ出る。
 - `yolo` session を作成する。
 - unmanaged CLI session を停止する。
-- root 未設定時に process cwd 等へ fallback する。
+- roots 未設定時に HOME / process cwd 等へ fallback する。
 
 ## 実装タスク
 
-- [ ] `TEMOTE_MCP_ROOT_DIR` の config 読み込みと validation を追加する。
-- [ ] root-relative target resolver を追加し、traversal / symlink escape test を追加する。
+- [ ] `TEMOTE_MCP_ROOTS` の config 読み込みと validation を追加する。
+- [ ] named root の structured parser / representation を追加する。
+- [ ] logical `<root>/<path>` resolver を追加する。
+- [ ] configured root 自体の symlink canonicalization を正式にサポートする。
+- [ ] traversal / descendant symlink escape tests を追加する。
 - [ ] `approvals::start()` の session runtime と terminal UI を reusable component に分離する。
 - [ ] `SessionSupervisor` を追加する。
 - [ ] `temote-mcp serve` が managed session を保持できるようにする。
@@ -236,15 +296,36 @@ session に supervisor ownership を持たせ、少なくとも次を区別で�
 
 ## 受け入れ条件
 
-- [ ] `TEMOTE_MCP_ROOT_DIR=/tmp/projects just up` の状態で MCP client から `session_start(path="repo-a")` が成功する。
+host fixture:
+
+```text
+$HOME/src -> /tmp/temote-volume
+/tmp/temote-volume/
+  repo-a/
+  repo-b/
+  outside-link -> /tmp/outside
+/tmp/outside/
+```
+
+configuration:
+
+```text
+TEMOTE_MCP_ROOTS=src=$HOME/src
+```
+
+最低限、次を満たす。
+
+- [ ] MCP client から `session_start(path="src/repo-a")` が成功する。
+- [ ] root alias 自体が symlink でも `src/repo-a` が canonical physical target に解決される。
+- [ ] `session_start(path="src")` で named root 自身を session root にできる。
 - [ ] 返された session ID を使って `session_info`, `read_file`, `execute` 等の既存 tool を呼べる。
 - [ ] `session_list` に managed session が active として現れる。
 - [ ] `session_stop` 後は session が active list から消える。
 - [ ] absolute path は拒否される。
-- [ ] `../outside` は拒否される。
-- [ ] configured root 内 symlink から root 外へ出る path は拒否される。
-- [ ] root 自身または root 内の実 directory は受理される。
-- [ ] root 未設定時の `session_start` は fail closed する。
+- [ ] unknown root alias は拒否される。
+- [ ] `src/../outside` 等で physical root 外へ出る path は拒否される。
+- [ ] `src/outside-link` のような descendant symlink escape は拒否される。
+- [ ] roots 未設定時の `session_start` は fail closed する。
 - [ ] MCP client から yolo session を生成できない。
 - [ ] remote-created normal session の approval-gated operation は local console approval なしに実行されない。
 - [ ] 複数 managed session の approval 表示に session ID が含まれ、取り違えない。
@@ -259,27 +340,22 @@ session に supervisor ownership を持たせ、少なくとも次を区別で�
 
 ## live acceptance
 
-可能なら temporary root を使って direct HTTP endpoint で end-to-end を残す。
-
-```text
-root/
-  repo-a/
-  repo-b/
-outside/
-```
+可能なら temporary roots と symlink fixture を使って direct HTTP endpoint で end-to-end evidence を残す。
 
 最低限:
 
-1. `session_start(repo-a)` success
-2. `session_start(repo-b)` success
+1. `session_start(src/repo-a)` success
+2. `session_start(src/repo-b)` success
 3. `session_list` で2件確認
 4. repo-a に対する safe read / execute
-5. `../outside` rejection
-6. root 内 symlink -> outside rejection
-7. approval-gated operation が local approval 待ちになることを確認
-8. `session_stop(repo-a)`
-9. serve shutdown
-10. stale socket / active metadata が残らないことを確認
+5. unknown root rejection
+6. absolute path rejection
+7. traversal rejection
+8. descendant symlink escape rejection
+9. approval-gated operation が local approval 待ちになることを確認
+10. `session_stop`
+11. serve shutdown
+12. stale socket / active metadata が残らないことを確認
 
 live acceptance のためだけに security semantics を緩めない。
 
@@ -287,16 +363,17 @@ live acceptance のためだけに security semantics を緩めない。
 
 README は利用者向けに短く保つ。
 
-利用例は次を中心にする。
+主例は次とする。
 
 ```text
-TEMOTE_MCP_ROOT_DIR=~/Developer
+~/src -> /Volumes/devstorage/Developer
+TEMOTE_MCP_ROOTS=src=~/src
 just up
 ```
 
-その後 MCP client が `session_list` を確認し、必要な project session がなければ `session_start` する workflow を Agent Skill に記載する。
+その後 MCP client が `session_list` を確認し、必要な project session がなければ、たとえば `session_start(path="src/foo")` する workflow を Agent Skill に記載する。
 
-内部 supervisor / approval routing の詳細は `docs/` とこの issue に残す。
+内部 supervisor / approval routing / canonical containment の詳細は `docs/` とこの issue に残す。
 
 ## 変更履歴
 
