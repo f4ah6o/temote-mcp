@@ -29,7 +29,7 @@ Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネ
 # host の例:
 # ~/src -> /Volumes/devstorage/Developer
 export TEMOTE_MCP_ROOTS='src=~/src'
-just up
+temote-mcp up
 ```
 
 認証済み MCP client からは次の順で利用します。
@@ -40,7 +40,7 @@ session_start(path="src/my-project", session_id="my-project")
 session_info(session_id="my-project")
 ```
 
-managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。host/network 操作の承認は `just up` を実行しているローカル端末で行います。
+managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。host/network 操作の承認は `temote-mcp up` を実行しているローカル端末で行います。停止は `temote-mcp down` です。
 
 従来どおり、ローカル session を直接起動することもできます。
 
@@ -69,6 +69,8 @@ gh skill install f4ah6o/temote-mcp temote-mcp --scope user
 - [1Password / kintone 連携](docs/integrations.ja.md)
 - [multi-host Cloudflare gateway](docs/gateway.ja.md)
 - [build / test / release](docs/development.md)
+
+repository checkout では `just up` / `just down` が checkout の binary を build・選択して CLI へ委譲する開発用 wrapper です。インストール済み binary の運用に `just` は必要ありません。
 
 このリポジトリを編集する coding agent 向けの指示は [AGENTS.md](AGENTS.md) にあります。
 
