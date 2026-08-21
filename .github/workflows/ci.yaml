@@ -59,6 +59,10 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features --locked
 
+      - name: CLI session E2E
+        timeout-minutes: 5
+        run: cargo test --test cli_session_e2e --all-features --locked -- --ignored --nocapture
+
       - name: Verify Linux dependency boundary
         if: runner.os == 'Linux'
         shell: bash
