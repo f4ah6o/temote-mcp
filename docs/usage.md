@@ -15,23 +15,23 @@ temote-mcp start my-project
 
 Relative paths resolve from the session working directory.
 
-### Managed sessions from `temote-mcp serve`
+### Managed sessions from `temote-mcp up`
 
-Set `TEMOTE_MCP_ROOTS` on the host and keep `just up` running in a terminal. A single root uses `name=path`:
+Set `TEMOTE_MCP_ROOTS` on the host and keep `temote-mcp up` running in a terminal. A single root uses `name=path`:
 
 ```sh
-TEMOTE_MCP_ROOTS='src=~/src' just up
+TEMOTE_MCP_ROOTS='src=~/src' temote-mcp up
 ```
 
 For multiple roots, use a JSON object instead of a separator-based list:
 
 ```sh
-TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' just up
+TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' temote-mcp up
 ```
 
 The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. Missing roots fail closed with no HOME, `/`, cwd, or repository fallback.
 
-`session_stop` can stop only sessions created by the current `serve` supervisor. It cannot stop an independently started `temote-mcp start` session. Managed sessions are always non-yolo and retain the same local approval gates as CLI sessions.
+`session_stop` can stop only sessions created by the current `serve` supervisor. It cannot stop an independently started `temote-mcp start` session. Managed sessions are always non-yolo and retain the same local approval gates as CLI sessions. Stop the HTTP supervisor and its Tunnel with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
 
 ## Permission roots
 

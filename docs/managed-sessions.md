@@ -40,7 +40,7 @@ The supervisor tracks only runtimes it created. `session_stop` removes and grace
 
 Active session-ID collisions fail instead of replacing the existing socket/runtime. When `serve` terminates, it drains all managed runtime handles, marks their metadata inactive (`process_id = 0`), and removes their Unix sockets.
 
-`just up` keeps `temote-mcp serve` as the foreground process and lets it own `cloudflared` as a child. This gives the approval console the terminal stdin and ties Tunnel cleanup to the same shutdown path.
+`temote-mcp up` keeps `temote-mcp serve` as the foreground process and lets it own `cloudflared` as a child. This gives the approval console the terminal stdin and ties Tunnel cleanup to the same shutdown path. `temote-mcp down` requests the same graceful shutdown and removes stale lifecycle state.
 
 ## Endpoint scope
 

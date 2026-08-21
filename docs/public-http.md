@@ -11,7 +11,7 @@ MCP client
 Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                |
                                                v
-                                        temote-mcp serve
+                                        temote-mcp up
 ```
 
 ## Environment
@@ -32,11 +32,13 @@ Required values are:
 - `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS`
 - `~/.config/temote-mcp/tunnel-token` (mode `0600`; override with `TUNNEL_TOKEN_FILE`)
 
-`just env-check` validates presence without printing secret values.
+`temote-mcp up` loads this file and validates the runtime configuration without requiring `just`. In a repository checkout, `just env-check` remains a development-only preflight that does not print secret values.
+
+For local Tunnel diagnostics, `temote-mcp doctor` checks `cloudflared` and the token file. Add `--cloudflare` to query the configured Tunnel status through the Cloudflare API; this requires the account ID, Tunnel ID, and API token environment variables documented in [development diagnostics](development.md).
 
 ## Run
 
-Use `just up` to build and run the origin plus Tunnel together, or run them separately:
+Use `temote-mcp up` to run the origin and Tunnel together. Stop it with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers. To run them separately:
 
 ```sh
 set -a
@@ -97,4 +99,4 @@ Public HTTP uses the same session model as local stdio. It does not expose `with
 
 When `TEMOTE_MCP_ROOTS` is configured, the authenticated direct HTTP endpoint exposes `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal/symlink escapes, and roots-unset fallback are rejected. `session_stop` is limited to sessions owned by the current `serve` process. `without_sandbox` remains unavailable on the public endpoint.
 
-`just up` keeps `temote-mcp serve` in the foreground and runs `cloudflared` as its child. The local approval console therefore owns stdin, and shutdown cleans up managed sessions and the Tunnel together.
+`temote-mcp up` keeps `temote-mcp serve` in the foreground and runs `cloudflared` as its child. The local approval console therefore owns stdin, and shutdown cleans up managed sessions and the Tunnel together. Stop it with `temote-mcp down`.

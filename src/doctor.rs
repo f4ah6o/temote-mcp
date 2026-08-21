@@ -1,27 +1,38 @@
-#[cfg(target_os = "linux")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(target_os = "linux")]
+#[cfg(feature = "network")]
+use serde::Deserialize;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tokio::process::Command;
 
 use crate::sandbox;
 
+#[cfg(feature = "network")]
+use std::time::Duration;
+
 #[cfg(target_os = "linux")]
 const BWRAP_INSTALL_HINT: &str =
     "Install bubblewrap (for example: sudo apt install bubblewrap) and make sure it is in PATH.";
-const APPARMOR_PROFILE_HINT: &str = "Ubuntu may be blocking unprivileged user namespaces. Try:\n\
-sudo apt update\n\
-sudo apt install apparmor-profiles apparmor-utils\n\
-sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict\n\
+const APPARMOR_PROFILE_HINT: &str = "Ubuntu may be blocking unprivileged user namespaces. Try:\
+sudo apt update\
+sudo apt install apparmor-profiles apparmor-utils\
+sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict\
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict";
 
-#[derive(Clone, Copy)]
+#[derive(Default)]
+pub struct Options {
+    pub cloudflare: bool,
+    pub tunnel_token_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
     Pass,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", feature = "network"))]
     Warn,
     Fail,
 }
@@ -43,7 +54,7 @@ impl Check {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", feature = "network"))]
     fn warn(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             level: Level::Warn,
@@ -69,7 +80,7 @@ impl Check {
     fn print(&self) {
         let label = match self.level {
             Level::Pass => "PASS",
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", feature = "network"))]
             Level::Warn => "WARN",
             Level::Fail => "FAIL",
         };
@@ -105,13 +116,13 @@ impl Report {
             .iter()
             .filter(|check| check.is_failure())
             .count();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", feature = "network"))]
         let warnings = self
             .checks
             .iter()
             .filter(|check| matches!(check.level, Level::Warn))
             .count();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", feature = "network")))]
         let warnings = 0;
         println!();
         println!(
@@ -126,7 +137,7 @@ impl Report {
     }
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(options: Options) -> Result<()> {
     println!("temote-mcp doctor");
     println!("platform: {}", std::env::consts::OS);
 
@@ -154,6 +165,27 @@ pub async fn run() -> Result<()> {
         check_sandbox_runtime_environment(&mut report).await;
     }
 
+    check_cloudflare_local(
+        &mut report,
+        options.tunnel_token_file.as_deref(),
+        options.cloudflare,
+    )
+    .await;
+
+    #[cfg(feature = "network")]
+    if options.cloudflare {
+        check_cloudflare_api(&mut report).await;
+    }
+
+    #[cfg(not(feature = "network"))]
+    if options.cloudflare {
+        report.add(Check::fail(
+            "cloudflare API",
+            "this binary was built without the network feature",
+            "Use the default temote-mcp build to enable the authenticated Cloudflare check.",
+        ));
+    }
+
     report.finish()
 }
 
@@ -166,6 +198,358 @@ fn check_platform(report: &mut Report) {
             "unsupported operating system",
             "temote-mcp sandbox execution currently supports Linux and macOS only.",
         ));
+    }
+}
+
+async fn check_cloudflare_local(report: &mut Report, override_path: Option<&Path>, force: bool) {
+    let (path, explicit) = resolve_tunnel_token_file(override_path);
+    let should_check = force || explicit || path.as_deref().is_some_and(Path::is_file);
+    if !should_check {
+        report.add(Check::pass(
+            "cloudflare tunnel",
+            "not configured; local Tunnel checks skipped",
+        ));
+        return;
+    }
+
+    check_cloudflared(report).await;
+    match path {
+        Some(path) => check_tunnel_token_file(report, &path),
+        None => report.add(Check::fail(
+            "cloudflare tunnel token",
+            "cannot determine the default token file because HOME is unavailable",
+            "Set TUNNEL_TOKEN_FILE to an absolute readable token file path.",
+        )),
+    }
+}
+
+fn resolve_tunnel_token_file(override_path: Option<&Path>) -> (Option<PathBuf>, bool) {
+    if let Some(path) = override_path {
+        return (Some(path.to_owned()), true);
+    }
+    if let Some(path) = std::env::var_os("TUNNEL_TOKEN_FILE") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return (Some(path), true);
+        }
+    }
+    (
+        dirs::home_dir().map(|home| home.join(".config/temote-mcp/tunnel-token")),
+        false,
+    )
+}
+
+async fn check_cloudflared(report: &mut Report) {
+    match Command::new("cloudflared").arg("--version").output().await {
+        Ok(output) if output.status.success() => report.add(Check::pass(
+            "cloudflared",
+            display_output(&output).unwrap_or_else(|| "available".to_owned()),
+        )),
+        Ok(output) => report.add(Check::fail(
+            "cloudflared",
+            format!("--version exited with {}", output.status),
+            "Install cloudflared and make sure it is available on PATH.",
+        )),
+        Err(error) => report.add(Check::fail(
+            "cloudflared",
+            format!("cannot execute cloudflared: {error}"),
+            "Install cloudflared and make sure it is available on PATH.",
+        )),
+    }
+}
+
+fn check_tunnel_token_file(report: &mut Report, path: &Path) {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare tunnel token",
+                format!("cannot read {}: {error}", path.display()),
+                format!(
+                    "Create a readable remotely managed Tunnel token file at {}.",
+                    path.display()
+                ),
+            ));
+            return;
+        }
+    };
+    if !metadata.is_file() {
+        report.add(Check::fail(
+            "cloudflare tunnel token",
+            format!("{} is not a regular file", path.display()),
+            format!(
+                "Set TUNNEL_TOKEN_FILE to a regular token file, not a directory: {}.",
+                path.display()
+            ),
+        ));
+        return;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(value) if value.trim().is_empty() => {
+            report.add(Check::fail(
+                "cloudflare tunnel token",
+                format!("{} is empty", path.display()),
+                format!(
+                    "Store the remotely managed Tunnel token in {}.",
+                    path.display()
+                ),
+            ));
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare tunnel token",
+                format!("cannot read {}: {error}", path.display()),
+                "Make the Tunnel token file readable by the user running temote-mcp.",
+            ));
+            return;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            report.add(Check::fail(
+                "cloudflare tunnel token",
+                format!(
+                    "{} is readable by group or other users (mode {mode:04o})",
+                    path.display()
+                ),
+                format!(
+                    "Protect the bearer token with: chmod 600 {}.",
+                    path.display()
+                ),
+            ));
+            return;
+        }
+        report.add(Check::pass(
+            "cloudflare tunnel token",
+            format!(
+                "{} is readable and protected (mode {mode:04o})",
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(not(unix))]
+    report.add(Check::pass(
+        "cloudflare tunnel token",
+        format!("{} is readable", path.display()),
+    ));
+}
+
+#[cfg(feature = "network")]
+#[derive(Deserialize)]
+struct CloudflareApiResponse<T> {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    errors: Vec<CloudflareApiError>,
+    result: Option<T>,
+}
+
+#[cfg(feature = "network")]
+#[derive(Deserialize)]
+struct CloudflareApiError {
+    message: Option<String>,
+}
+
+#[cfg(feature = "network")]
+#[derive(Deserialize)]
+struct CloudflareTunnel {
+    id: Option<String>,
+    name: Option<String>,
+    status: Option<String>,
+}
+
+#[cfg(feature = "network")]
+async fn check_cloudflare_api(report: &mut Report) {
+    let account_id =
+        first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"]);
+    let tunnel_id =
+        first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID", "CLOUDFLARE_TUNNEL_ID"]);
+    let api_token =
+        first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"]);
+
+    let mut missing = Vec::new();
+    if account_id.is_none() {
+        missing.push("TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID");
+    }
+    if tunnel_id.is_none() {
+        missing.push("TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID or CLOUDFLARE_TUNNEL_ID");
+    }
+    if api_token.is_none() {
+        missing.push("TEMOTE_MCP_CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_TOKEN");
+    }
+    if !missing.is_empty() {
+        report.add(Check::fail(
+            "cloudflare API",
+            format!("missing {}", missing.join(", ")),
+            "Provide the account ID, Tunnel ID, and API token before using doctor --cloudflare. Values are never printed.",
+        ));
+        return;
+    }
+
+    let account_id = account_id.expect("account ID checked above");
+    let tunnel_id = tunnel_id.expect("Tunnel ID checked above");
+    let api_token = api_token.expect("API token checked above");
+
+    if !is_cloudflare_account_id(&account_id) {
+        report.add(Check::fail(
+            "cloudflare API",
+            "Cloudflare account ID must be a 32-character hexadecimal value",
+            "Set TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID to the account ID from Cloudflare.",
+        ));
+        return;
+    }
+    if uuid::Uuid::parse_str(&tunnel_id).is_err() {
+        report.add(Check::fail(
+            "cloudflare API",
+            "Cloudflare Tunnel ID must be a UUID",
+            "Set TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID to the Tunnel UUID from Cloudflare.",
+        ));
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare API",
+                format!("cannot create the HTTPS client: {error}"),
+                "Check the temote-mcp network build and TLS runtime.",
+            ));
+            return;
+        }
+    };
+
+    let endpoint = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
+    );
+    let response = match client.get(endpoint).bearer_auth(api_token).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare API",
+                format!("Tunnel status request failed: {error}"),
+                "Check outbound HTTPS access and the Cloudflare API token permissions.",
+            ));
+            return;
+        }
+    };
+
+    let http_status = response.status();
+    let body = match response
+        .json::<CloudflareApiResponse<CloudflareTunnel>>()
+        .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare API",
+                format!("Cloudflare returned an unreadable response ({http_status}): {error}"),
+                "Check the Cloudflare API endpoint and token permissions.",
+            ));
+            return;
+        }
+    };
+
+    if !http_status.is_success() || !body.success {
+        report.add(Check::fail(
+            "cloudflare API",
+            format!(
+                "Tunnel status request returned {http_status}: {}",
+                cloudflare_error_detail(&body.errors)
+            ),
+            "Check the account ID, Tunnel ID, and API token permissions.",
+        ));
+        return;
+    }
+
+    let Some(tunnel) = body.result else {
+        report.add(Check::fail(
+            "cloudflare API",
+            "Cloudflare returned no Tunnel result",
+            "Check the account ID and Tunnel ID.",
+        ));
+        return;
+    };
+
+    let status = tunnel.status.as_deref().unwrap_or("unknown");
+    let name = tunnel.name.as_deref().unwrap_or("unnamed");
+    let detail = format!("{name} ({tunnel_id}): status={status}");
+    match cloudflare_status_level(Some(status)) {
+        Level::Pass => report.add(Check::pass("cloudflare tunnel", detail)),
+        Level::Warn => report.add(Check::warn(
+            "cloudflare tunnel",
+            detail,
+            "Inspect the Tunnel connector and Cloudflare dashboard before relying on the public endpoint.",
+        )),
+        Level::Fail => report.add(Check::fail(
+            "cloudflare tunnel",
+            detail,
+            "Start cloudflared for this Tunnel and verify its connector and public hostname configuration.",
+        )),
+    }
+
+    if let Some(id) = tunnel.id
+        && id != tunnel_id
+    {
+        report.add(Check::fail(
+            "cloudflare API",
+            "Cloudflare returned a different Tunnel ID than requested",
+            "Check the configured Tunnel ID and account ID.",
+        ));
+    }
+}
+
+#[cfg(feature = "network")]
+fn first_nonempty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_owned())
+    })
+}
+
+#[cfg(feature = "network")]
+fn is_cloudflare_account_id(value: &str) -> bool {
+    value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+#[cfg(feature = "network")]
+fn cloudflare_status_level(status: Option<&str>) -> Level {
+    match status {
+        Some(value) if value.eq_ignore_ascii_case("healthy") => Level::Pass,
+        Some(value) if value.eq_ignore_ascii_case("degraded") => Level::Warn,
+        Some(value)
+            if value.eq_ignore_ascii_case("inactive") || value.eq_ignore_ascii_case("down") =>
+        {
+            Level::Fail
+        }
+        _ => Level::Fail,
+    }
+}
+
+#[cfg(feature = "network")]
+fn cloudflare_error_detail(errors: &[CloudflareApiError]) -> String {
+    let messages = errors
+        .iter()
+        .filter_map(|error| error.message.as_deref())
+        .filter(|message| !message.trim().is_empty())
+        .take(2)
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        "Cloudflare reported an unsuccessful API response".to_owned()
+    } else {
+        messages.join("; ")
     }
 }
 
@@ -187,7 +571,7 @@ fn check_linux_helper(report: &mut Report) -> Result<bool> {
         report.add(Check::fail(
             "sandbox helper",
             format!("missing {}", helper.display()),
-            "Install temote-mcp with `cargo install --path . --locked` so the helper is installed beside it.",
+            "Install temote-mcp with cargo install --path . --locked so the helper is installed beside it.",
         ));
         Ok(false)
     }
@@ -408,13 +792,13 @@ async fn check_sandbox_runtime_environment(report: &mut Report) {
             report.add(Check::fail(
                 "sandbox runtime environment",
                 detail,
-                "Run `just install` to update temote-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
+                "Run just install to update temote-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
             ));
         }
         Err(error) => report.add(Check::fail(
             "sandbox runtime environment",
             format!("{error:#}"),
-            "Run `just install` to update temote-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
+            "Run just install to update temote-mcp, then restart it; shell commands need HOME and a writable temporary directory.",
         )),
     }
 }
@@ -430,7 +814,6 @@ fn command_output_detail(output: &sandbox::Output) -> String {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn display_output(output: &std::process::Output) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -474,5 +857,24 @@ mod tests {
         assert!(!contains_loopback_permission_error_text(
             "bwrap: Can't find source path /missing\n"
         ));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn classifies_cloudflare_tunnel_statuses() {
+        assert_eq!(cloudflare_status_level(Some("healthy")), Level::Pass);
+        assert_eq!(cloudflare_status_level(Some("degraded")), Level::Warn);
+        assert_eq!(cloudflare_status_level(Some("down")), Level::Fail);
+        assert_eq!(cloudflare_status_level(Some("inactive")), Level::Fail);
+        assert_eq!(cloudflare_status_level(Some("future-status")), Level::Fail);
+        assert_eq!(cloudflare_status_level(None), Level::Fail);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn validates_cloudflare_account_ids() {
+        assert!(is_cloudflare_account_id("0123456789abcdef0123456789abcdef"));
+        assert!(!is_cloudflare_account_id("not-an-account-id"));
+        assert!(!is_cloudflare_account_id("0123456789abcdef0123456789abcde"));
     }
 }

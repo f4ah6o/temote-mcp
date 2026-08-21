@@ -17,7 +17,7 @@ cargo build --release --no-default-features --locked
 
 On Linux, install the sibling `codex-linux-sandbox` binary and make sure `bwrap` is on `PATH`. macOS uses the system Seatbelt sandbox. Native Windows is not supported.
 
-Keep `--locked`: Linux sandbox dependencies are pinned to a Codex Git revision and the committed lockfile prevents incompatible prerelease transitive versions from being selected.
+Keep `--locked`: Linux sandbox dependencies use the namespaced `unofficial-codex-*` crates.io packages and the committed lockfile prevents incompatible transitive versions from being selected. The mirror source and upstream-sync workflow live in [`unofficial-codex-rs`](https://github.com/f4ah6o/unofficial-codex-rs).
 
 ## Diagnostics
 
@@ -25,7 +25,15 @@ Keep `--locked`: Linux sandbox dependencies are pinned to a Codex Git revision a
 temote-mcp doctor
 ```
 
-On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status.
+On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status. When a Tunnel token file is configured or present at the default path, it also checks `cloudflared`, token-file readability, and Unix token-file permissions without printing the token.
+
+To query the Cloudflare control plane, run:
+
+```sh
+temote-mcp doctor --cloudflare
+```
+
+This uses the official Cloudflare Cloudflared Tunnel API. Set `TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID`, `TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID`, and `TEMOTE_MCP_CLOUDFLARE_API_TOKEN`; the corresponding `CLOUDFLARE_*` names are also accepted. The API token is read from the environment and never printed. The check reports Cloudflare's `inactive`, `degraded`, `healthy`, or `down` Tunnel state.
 
 ## Checks
 
@@ -38,7 +46,7 @@ cargo check --no-default-features --all-targets
 git diff --check
 ```
 
-The `justfile` provides `just build`, `just install`, `just doctor`, `just check`, and deployment-oriented recipes.
+The installed-binary lifecycle commands are `temote-mcp up` and `temote-mcp down`. The `justfile` provides development-oriented `just build`, `just install`, `just doctor`, `just check`, and wrappers that delegate `just up/down` to the checkout binary.
 
 ## Release versioning
 
@@ -55,4 +63,4 @@ git push -f origin latest
 
 `dist-workspace.toml` is the source of truth for binary distribution. `dist generate` refreshes `.github/workflows/release.yml`; do not hand-edit the generated workflow. Releases currently build `.tar.xz` archives for Apple Silicon macOS plus ARM64 and x64 GNU/Linux, then publish them to GitHub Releases. Intel macOS is not supported.
 
-`cargo-binstall` reads the repository manifest through `--git` and downloads the versionless target archive from the latest GitHub Release. The repository is not currently published to crates.io because its Linux sandbox dependencies are pinned Git dependencies, so the registry-only `cargo binstall temote-mcp` form is intentionally not advertised.
+`cargo-binstall` reads the repository manifest through `--git` and downloads the versionless target archive from the latest GitHub Release. The Linux sandbox dependencies are now registry dependencies from the unofficial mirror; after the first mirror release is available, the normal registry-only `cargo binstall temote-mcp` path can be used as well.
