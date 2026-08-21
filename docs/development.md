@@ -25,7 +25,15 @@ Keep `--locked`: Linux sandbox dependencies are pinned to a Codex Git revision a
 temote-mcp doctor
 ```
 
-On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status.
+On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status. When a Tunnel token file is configured or present at the default path, it also checks `cloudflared`, token-file readability, and Unix token-file permissions without printing the token.
+
+To query the Cloudflare control plane, run:
+
+```sh
+temote-mcp doctor --cloudflare
+```
+
+This uses the official Cloudflare Cloudflared Tunnel API. Set `TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID`, `TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID`, and `TEMOTE_MCP_CLOUDFLARE_API_TOKEN`; the corresponding `CLOUDFLARE_*` names are also accepted. The API token is read from the environment and never printed. The check reports Cloudflare's `inactive`, `degraded`, `healthy`, or `down` Tunnel state.
 
 ## Checks
 
@@ -38,7 +46,7 @@ cargo check --no-default-features --all-targets
 git diff --check
 ```
 
-The `justfile` provides `just build`, `just install`, `just doctor`, `just check`, and deployment-oriented recipes.
+The installed-binary lifecycle commands are `temote-mcp up` and `temote-mcp down`. The `justfile` provides development-oriented `just build`, `just install`, `just doctor`, `just check`, and wrappers that delegate `just up/down` to the checkout binary.
 
 ## Release versioning
 

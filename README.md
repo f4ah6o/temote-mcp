@@ -29,7 +29,7 @@ For an always-on host, configure a named root and run the HTTP supervisor:
 # Example host layout:
 # ~/src -> /Volumes/devstorage/Developer
 export TEMOTE_MCP_ROOTS='src=~/src'
-just up
+temote-mcp up
 ```
 
 An authenticated MCP client can then use:
@@ -40,7 +40,7 @@ session_start(path="src/my-project", session_id="my-project")
 session_info(session_id="my-project")
 ```
 
-Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode; host/network-sensitive operations still require approval in the local `just up` terminal.
+Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode; host/network-sensitive operations still require approval in the local `temote-mcp up` terminal. Stop this supervisor with `temote-mcp down`.
 
 For a traditional local session, run:
 
@@ -69,6 +69,8 @@ Specify `--agent codex`, `--agent claude-code`, or another supported agent when 
 - [1Password and kintone integrations](docs/integrations.md)
 - [Multi-host Cloudflare gateway](docs/gateway.md)
 - [Building, testing, and releasing](docs/development.md)
+
+In a repository checkout, `just up` and `just down` are development wrappers that build or select the checkout binary and delegate to these commands. Installed users do not need `just`.
 
 Repository-specific instructions for coding agents are in [AGENTS.md](AGENTS.md).
 

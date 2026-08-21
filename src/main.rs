@@ -9,17 +9,19 @@ mod gateway;
 mod http;
 mod kintone_cli;
 mod kintone_mcp;
+#[cfg(all(feature = "network", unix))]
+mod lifecycle;
 mod mcp;
 mod named_roots;
 mod onepassword_mcp;
 mod sandbox;
-#[cfg(feature = "network")]
 mod supervisor;
 
 #[cfg(feature = "network")]
 use std::net::SocketAddr;
 #[cfg(feature = "network")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(feature = "network")]
 use std::process::Stdio;
 #[cfg(feature = "network")]
@@ -41,8 +43,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Diagnose temote-mcp and the host sandbox prerequisites.
-    Doctor,
+    /// Diagnose temote-mcp, local Tunnel prerequisites, and the host sandbox.
+    Doctor {
+        /// Also query the Cloudflare API for the configured Tunnel status.
+        #[arg(long)]
+        cloudflare: bool,
+        /// Cloudflare Tunnel token file. Defaults to TUNNEL_TOKEN_FILE or
+        /// ~/.config/temote-mcp/tunnel-token.
+        #[arg(long, env = "TUNNEL_TOKEN_FILE")]
+        tunnel_token_file: Option<PathBuf>,
+    },
     /// Start a session in the current directory and show its permission UI.
     Start {
         /// Session ID to use instead of generating a UUID.
@@ -68,6 +78,25 @@ enum Command {
         #[arg(long)]
         tunnel_token_file: Option<PathBuf>,
     },
+    #[cfg(all(feature = "network", unix))]
+    /// Start the HTTP server and Cloudflare Tunnel as one foreground supervisor.
+    Up {
+        /// Public HTTPS base URL clients reach this server through. When
+        /// omitted, TEMOTE_MCP_PUBLIC_URL or ~/.config/temote-mcp/public.env is
+        /// used.
+        #[arg(long, env = "TEMOTE_MCP_PUBLIC_URL")]
+        public_url: Option<String>,
+        /// Local address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8791")]
+        addr: SocketAddr,
+        /// Cloudflare Tunnel token file. Defaults to TUNNEL_TOKEN_FILE or
+        /// ~/.config/temote-mcp/tunnel-token.
+        #[arg(long, env = "TUNNEL_TOKEN_FILE")]
+        tunnel_token_file: Option<PathBuf>,
+    },
+    #[cfg(all(feature = "network", unix))]
+    /// Stop the foreground supervisor started by temote-mcp up.
+    Down,
     #[cfg(feature = "network")]
     /// Connect an active local session to a Cloudflare gateway using outbound long polling.
     GatewayAgent {
@@ -106,7 +135,18 @@ async fn main() -> Result<()> {
         session_id: None,
         yolo: false,
     }) {
-        Command::Doctor => doctor::run().await,
+        Command::Doctor {
+            cloudflare,
+            tunnel_token_file,
+        } => {
+            #[cfg(feature = "network")]
+            load_public_env()?;
+            doctor::run(doctor::Options {
+                cloudflare,
+                tunnel_token_file,
+            })
+            .await
+        }
         Command::Start { session_id, yolo } => approvals::start(session_id.as_deref(), yolo).await,
         Command::Mcp => mcp::serve().await,
         #[cfg(feature = "network")]
@@ -114,7 +154,18 @@ async fn main() -> Result<()> {
             public_url,
             addr,
             tunnel_token_file,
-        } => serve_http(public_url, addr, tunnel_token_file.as_deref()).await,
+        } => {
+            load_public_env()?;
+            serve_http(public_url, addr, tunnel_token_file.as_deref()).await
+        }
+        #[cfg(all(feature = "network", unix))]
+        Command::Up {
+            public_url,
+            addr,
+            tunnel_token_file,
+        } => lifecycle::up(public_url, addr, tunnel_token_file).await,
+        #[cfg(all(feature = "network", unix))]
+        Command::Down => lifecycle::down().await,
         #[cfg(feature = "network")]
         Command::GatewayAgent {
             gateway_url,
@@ -145,7 +196,6 @@ async fn serve_http(
     addr: SocketAddr,
     tunnel_token_file: Option<&Path>,
 ) -> Result<()> {
-    load_public_env()?;
     let public_url = public_url
         .or_else(|| std::env::var("TEMOTE_MCP_PUBLIC_URL").ok())
         .context(
@@ -198,9 +248,6 @@ async fn serve_http(
     }
     let shutdown_result = supervisor.shutdown().await;
     console.abort();
-    if let Ok(pid_file) = std::env::var("TEMOTE_MCP_UP_PID_FILE") {
-        let _ = tokio::fs::remove_file(pid_file).await;
-    }
     serve_result?;
     shutdown_result
 }
@@ -224,12 +271,11 @@ async fn stop_child(child: &mut tokio::process::Child) {
 }
 
 #[cfg(feature = "network")]
-fn load_public_env() -> Result<()> {
-    let Some(config_dir) = dirs::config_dir() else {
-        return Ok(());
-    };
-    let path = config_dir.join("temote-mcp").join("public.env");
-    if path.is_file() {
+pub(crate) fn load_public_env() -> Result<()> {
+    let path = std::env::var_os("TEMOTE_MCP_ENV_FILE")
+        .map(PathBuf::from)
+        .or_else(|| dirs::config_dir().map(|config| config.join("temote-mcp").join("public.env")));
+    if let Some(path) = path.filter(|path| path.is_file()) {
         dotenvy::from_path(&path).with_context(|| format!("failed to load {}", path.display()))?;
     }
     Ok(())

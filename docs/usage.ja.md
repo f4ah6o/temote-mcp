@@ -15,23 +15,23 @@ temote-mcp start my-project
 
 相対パスは session の working directory を基準に解決されます。
 
-### `temote-mcp serve` から作る managed session
+### `temote-mcp up` から作る managed session
 
-host で `TEMOTE_MCP_ROOTS` を設定し、`just up` を端末で常駐させます。単一 root は `name=path` 形式です。
+host で `TEMOTE_MCP_ROOTS` を設定し、`temote-mcp up` を端末で常駐させます。単一 root は `name=path` 形式です。
 
 ```sh
-TEMOTE_MCP_ROOTS='src=~/src' just up
+TEMOTE_MCP_ROOTS='src=~/src' temote-mcp up
 ```
 
 複数 root は区切り文字の ad-hoc list ではなく JSON object を使います。
 
 ```sh
-TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' just up
+TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' temote-mcp up
 ```
 
 client は `session_list` を確認し、必要なら `session_start(path="src/project")`、続いて `session_info` を呼びます。configured root 自体は canonicalize されるため、`~/src -> /Volumes/devstorage/Developer` のような host alias は利用できます。一方、その配下の symlink や `..` が canonical physical root の外へ解決される場合は拒否されます。roots 未設定時は HOME、`/`、cwd、repository cwd へ fallback しません。
 
-`session_stop` で停止できるのは現在の `serve` supervisor が作成した session だけです。別 terminal の `temote-mcp start` session は停止できません。managed session は常に non-yolo で、CLI session と同じ local approval gate を維持します。
+`session_stop` で停止できるのは現在の `serve` supervisor が作成した session だけです。別 terminal の `temote-mcp start` session は停止できません。managed session は常に non-yolo で、CLI session と同じ local approval gate を維持します。HTTP supervisor と Tunnel の停止は `temote-mcp down` で行います。repository checkout の `just up/down` は、この CLI command に委譲する開発用 wrapper です。
 
 ## 許可 root
 

@@ -11,7 +11,7 @@ MCP client
 Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                |
                                                v
-                                        temote-mcp serve
+                                        temote-mcp up
 ```
 
 ## environment
@@ -32,11 +32,13 @@ chmod 600 ~/.config/temote-mcp/public.env
 - `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS`
 - `~/.config/temote-mcp/tunnel-token`（mode `0600`。変更する場合は `TUNNEL_TOKEN_FILE`）
 
-`just env-check` は secret value を表示せず設定有無を確認します。
+`temote-mcp up` は `just` なしでこの設定を読み込み、runtime configuration を検証します。repository checkout の `just env-check` は secret value を表示しない開発用 preflight として残っています。
+
+ローカルの Tunnel 診断では `temote-mcp doctor` が `cloudflared` と token file を検査します。Cloudflare API に設定済み Tunnel の状態を問い合わせる場合は `--cloudflare` を付けます。必要な account ID、Tunnel ID、API token は [development diagnostics](development.md) に記載しています。
 
 ## 起動
 
-`just up` で build、origin、Tunnel をまとめて起動できます。個別に起動する場合:
+`temote-mcp up` で origin と Tunnel をまとめて起動し、`temote-mcp down` で停止します。repository checkout の `just up/down` は開発用 wrapper です。個別に起動する場合:
 
 ```sh
 set -a
@@ -97,4 +99,4 @@ origin が Access audience 不一致を報告した場合は、hostname を保�
 
 `TEMOTE_MCP_ROOTS` が設定されている場合、認証済み direct HTTP endpoint は `session_start` / `session_stop` を公開します。`session_start` は logical named-root-relative path のみを受け付け、yolo option はありません。absolute path、unknown root、traversal / symlink escape、roots 未設定時の fallback は拒否します。`session_stop` は現在の `serve` process が所有する session に限定されます。公開 endpoint で `without_sandbox` が使えない既存境界も維持します。
 
-`just up` は `temote-mcp serve` を foreground に置き、`cloudflared` を child process として管理します。これにより local approval console が stdin を所有し、shutdown 時に managed session と Tunnel をまとめて cleanup します。
+`temote-mcp up` は `temote-mcp serve` を foreground に置き、`cloudflared` を child process として管理します。これにより local approval console が stdin を所有し、shutdown 時に managed session と Tunnel をまとめて cleanup します。停止は `temote-mcp down` で行います。
