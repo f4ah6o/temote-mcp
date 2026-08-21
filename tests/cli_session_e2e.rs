@@ -27,7 +27,10 @@ impl ChildGuard {
             if let Some(status) = self.child.try_wait().expect("failed to poll child process") {
                 return status;
             }
-            assert!(Instant::now() < deadline, "child process did not exit in time");
+            assert!(
+                Instant::now() < deadline,
+                "child process did not exit in time"
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -183,7 +186,8 @@ fn cli_session_runs_real_cli_through_real_mcp_process() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
     let project = TempDir::new().expect("failed to create E2E project directory");
     initialize_git_repository(project.path());
-    let canonical_project = fs::canonicalize(project.path()).expect("failed to canonicalize project");
+    let canonical_project =
+        fs::canonicalize(project.path()).expect("failed to canonicalize project");
     let session_id = format!("cli-e2e-{}", std::process::id());
 
     let mut start_command = Command::new(&binary);
@@ -211,10 +215,7 @@ fn cli_session_runs_real_cli_through_real_mcp_process() {
         canonical_project
     );
 
-    let info = tool_json(&client.tool_call(
-        "session_info",
-        json!({"session_id": session_id}),
-    ));
+    let info = tool_json(&client.tool_call("session_info", json!({"session_id": session_id})));
     assert_eq!(info["session_id"], session_id);
     assert_eq!(info["yolo"], false);
 
@@ -226,7 +227,10 @@ fn cli_session_runs_real_cli_through_real_mcp_process() {
         }),
     ));
     assert_eq!(pwd["exit_code"], 0);
-    assert_eq!(pwd["stdout"].as_str().unwrap().trim(), canonical_project.to_string_lossy());
+    assert_eq!(
+        pwd["stdout"].as_str().unwrap().trim(),
+        canonical_project.to_string_lossy()
+    );
 
     let git_status = tool_json(&client.tool_call(
         "execute",
