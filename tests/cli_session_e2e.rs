@@ -216,8 +216,12 @@ fn cli_session_runs_real_cli_through_real_mcp_process() {
     );
 
     let info = tool_json(&client.tool_call("session_info", json!({"session_id": session_id})));
-    assert_eq!(info["session_id"], session_id);
+    assert_eq!(info["id"], session_id);
     assert_eq!(info["yolo"], false);
+    assert_eq!(
+        PathBuf::from(info["cwd"].as_str().expect("session_info cwd missing")),
+        canonical_project
+    );
 
     let pwd = tool_json(&client.tool_call(
         "execute",
