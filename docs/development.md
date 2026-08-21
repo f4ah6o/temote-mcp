@@ -17,7 +17,7 @@ cargo build --release --no-default-features --locked
 
 On Linux, install the sibling `codex-linux-sandbox` binary and make sure `bwrap` is on `PATH`. macOS uses the system Seatbelt sandbox. Native Windows is not supported.
 
-Keep `--locked`: Linux sandbox dependencies are pinned to a Codex Git revision and the committed lockfile prevents incompatible prerelease transitive versions from being selected.
+Keep `--locked`: Linux sandbox dependencies use the namespaced `unofficial-codex-*` crates.io packages and the committed lockfile prevents incompatible transitive versions from being selected. The mirror source and upstream-sync workflow live in [`unofficial-codex-rs`](https://github.com/f4ah6o/unofficial-codex-rs).
 
 ## Diagnostics
 
@@ -55,4 +55,4 @@ git push -f origin latest
 
 `dist-workspace.toml` is the source of truth for binary distribution. `dist generate` refreshes `.github/workflows/release.yml`; do not hand-edit the generated workflow. Releases currently build `.tar.xz` archives for Apple Silicon macOS plus ARM64 and x64 GNU/Linux, then publish them to GitHub Releases. Intel macOS is not supported.
 
-`cargo-binstall` reads the repository manifest through `--git` and downloads the versionless target archive from the latest GitHub Release. The repository is not currently published to crates.io because its Linux sandbox dependencies are pinned Git dependencies, so the registry-only `cargo binstall temote-mcp` form is intentionally not advertised.
+`cargo-binstall` reads the repository manifest through `--git` and downloads the versionless target archive from the latest GitHub Release. The Linux sandbox dependencies are now registry dependencies from the unofficial mirror; after the first mirror release is available, the normal registry-only `cargo binstall temote-mcp` path can be used as well.
