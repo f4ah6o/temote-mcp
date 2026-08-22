@@ -405,6 +405,7 @@ fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     fn bridge(environment: &[(&str, &str)]) -> Bridge {
         Bridge {
@@ -480,5 +481,143 @@ mod tests {
         ]);
         let session = session(root.path());
         assert!(bridge.validated_environment(&session).is_err());
+    }
+
+    #[test]
+    fn generated_authentication_matrix_matches_bridge_policy() -> noprop::TestResult {
+        test_support::run(0x4b4d_4350_4155_5448, test_support::DEFAULT_CASES, |ctx| {
+            let username = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => None,
+                1 => Some(String::new()),
+                _ => Some(test_support::safe_component(ctx)),
+            };
+            let password = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => None,
+                1 => Some("   ".to_owned()),
+                _ => Some(test_support::safe_component(ctx)),
+            };
+            let token = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => None,
+                1 => Some(String::new()),
+                _ => Some(test_support::safe_component(ctx)),
+            };
+            let mut environment =
+                vec![("KINTONE_BASE_URL", "https://example.cybozu.com".to_owned())];
+            if let Some(value) = &username {
+                environment.push(("KINTONE_USERNAME", value.clone()));
+            }
+            if let Some(value) = &password {
+                environment.push(("KINTONE_PASSWORD", value.clone()));
+            }
+            if let Some(value) = &token {
+                environment.push(("KINTONE_API_TOKEN", value.clone()));
+            }
+            let bridge = Bridge {
+                executable_override: None,
+                environment: environment
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value))
+                    .collect(),
+                client: None,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let session = session(root.path());
+
+            let password_auth = username.as_deref().is_some_and(|v| !v.trim().is_empty())
+                && password.as_deref().is_some_and(|v| !v.trim().is_empty());
+            let token_auth = token.as_deref().is_some_and(|v| !v.trim().is_empty());
+            let pair_shape = username.is_some() == password.is_some();
+            let expected = (password_auth || token_auth) && pair_shape;
+            assert_eq!(
+                bridge.validated_environment(&session).is_ok(),
+                expected,
+                "username={username:?} password_present={} token_present={}",
+                password.is_some(),
+                token.is_some()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_status_never_exposes_kintone_credentials() -> noprop::TestResult {
+        test_support::run(0x4b4d_4350_5354_4154, 512, |ctx| {
+            let host_secret = format!("{}.secret.example", test_support::safe_component(ctx));
+            let token_secret = format!(
+                "token-{}-{}",
+                test_support::safe_component(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let user_secret = format!("user-{}", test_support::safe_component(ctx));
+            let password_secret = format!(
+                "password-{}-{}",
+                test_support::safe_component(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let bridge = Bridge {
+                executable_override: None,
+                environment: [
+                    (
+                        "KINTONE_BASE_URL".to_owned(),
+                        format!("https://{host_secret}"),
+                    ),
+                    ("KINTONE_USERNAME".to_owned(), user_secret.clone()),
+                    ("KINTONE_PASSWORD".to_owned(), password_secret.clone()),
+                    ("KINTONE_API_TOKEN".to_owned(), token_secret.clone()),
+                ]
+                .into_iter()
+                .collect(),
+                client: None,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let rendered = bridge.status(&session(root.path())).to_string();
+            for secret in [&host_secret, &token_secret, &user_secret, &password_secret] {
+                assert!(
+                    !rendered.contains(secret),
+                    "secret leaked in status: {secret:?}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_kintone_paths_reject_symlink_escape() -> noprop::TestResult {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let session = session(&root);
+
+        test_support::run(0x4b4d_4350_5041_5448, 512, |ctx| {
+            let leaf = test_support::safe_component(ctx);
+            let bridge = Bridge {
+                executable_override: None,
+                environment: [
+                    (
+                        "KINTONE_BASE_URL".to_owned(),
+                        "https://example.cybozu.com".to_owned(),
+                    ),
+                    ("KINTONE_API_TOKEN".to_owned(), "token".to_owned()),
+                    (
+                        "KINTONE_ATTACHMENTS_DIR".to_owned(),
+                        format!("escape/{leaf}"),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                client: None,
+            };
+            assert!(
+                bridge.validated_environment(&session).is_err(),
+                "symlink escape accepted: {leaf:?}"
+            );
+            Ok(())
+        })
     }
 }

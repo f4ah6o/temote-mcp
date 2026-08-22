@@ -242,6 +242,7 @@ fn send_signal(pid: i32, signal: libc::c_int) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn parses_only_positive_pids() {
@@ -255,5 +256,42 @@ mod tests {
     fn extracts_the_executable_name() {
         assert_eq!(executable_name("temote-mcp"), "temote-mcp");
         assert_eq!(executable_name("/usr/local/bin/temote-mcp"), "temote-mcp");
+    }
+
+    #[test]
+    fn generated_pid_strings_match_positive_i32_model() -> noprop::TestResult {
+        test_support::run(0x5049_4446_494c_4501, test_support::DEFAULT_CASES, |ctx| {
+            let raw = match noprop::sample_usize_in(ctx, 0..=5) {
+                0 => noprop::sample_u32(ctx).to_string(),
+                1 => format!("-{}", noprop::sample_u32(ctx)),
+                2 => "0".to_owned(),
+                3 => format!(" {} \n", 1 + noprop::sample_u16(ctx)),
+                4 => test_support::safe_component(ctx),
+                _ => format!(
+                    "{}{}",
+                    u64::from(i32::MAX as u32) + 1,
+                    noprop::sample_u16(ctx)
+                ),
+            };
+            let expected = raw.trim().parse::<i32>().ok().filter(|pid| *pid > 0);
+            assert_eq!(parse_pid(&raw).ok(), expected, "raw={raw:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_executable_paths_return_last_component() -> noprop::TestResult {
+        test_support::run(0x5052_4f43_4e41_4d45, 512, |ctx| {
+            let executable = test_support::safe_component(ctx);
+            let path = format!(
+                "/{}/{}/{}",
+                test_support::safe_component(ctx),
+                test_support::safe_component(ctx),
+                executable
+            );
+            assert_eq!(executable_name(&path), executable);
+            assert_eq!(executable_name(&executable), executable);
+            Ok(())
+        })
     }
 }

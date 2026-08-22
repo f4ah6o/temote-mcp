@@ -408,6 +408,7 @@ fn executable_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn approval_summary_never_contains_argument_values() {
@@ -456,5 +457,95 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn generated_approval_summaries_expose_keys_but_never_values() -> noprop::TestResult {
+        test_support::run(0x4f50_5355_4d4d_4152, test_support::DEFAULT_CASES, |ctx| {
+            let key_a = format!("key_{}", test_support::safe_component(ctx));
+            let key_b = format!("key_{}", test_support::safe_component(ctx));
+            let value_a = format!(
+                "value-{}-{}",
+                test_support::safe_component(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let value_b = format!(
+                "value-{}-{}",
+                test_support::safe_component(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let arguments = json!({
+                key_a.clone(): value_a.clone(),
+                key_b.clone(): {"nested": value_b.clone()}
+            });
+            let summary = safe_call_summary("generated_tool", &arguments);
+            assert!(summary.contains(&key_a));
+            assert!(summary.contains(&key_b));
+            assert!(
+                !summary.contains(&value_a),
+                "leaked {value_a:?} in {summary:?}"
+            );
+            assert!(
+                !summary.contains(&value_b),
+                "leaked {value_b:?} in {summary:?}"
+            );
+
+            let mut expected_keys = [key_a, key_b];
+            expected_keys.sort();
+            assert!(
+                summary.ends_with(&expected_keys.join(", ")),
+                "summary={summary:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_local_env_mounts_fail_closed_on_outside_and_symlink_paths() -> noprop::TestResult {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let root = config::canonical_directory(&root).unwrap();
+        let session = config::Session {
+            id: "onepassword-pbt".to_owned(),
+            cwd: root.clone(),
+            permitted_directories: vec![root],
+            started_at: 0,
+            process_id: 0,
+            yolo: false,
+        };
+
+        test_support::run(0x4f50_4d4f_554e_5401, 512, |ctx| {
+            let leaf = format!("{}.env", test_support::safe_component(ctx));
+            assert!(
+                enforce_path_boundary(
+                    &session,
+                    "create_local_env_file",
+                    &json!({"mountPath": leaf}),
+                )
+                .is_ok()
+            );
+
+            let escaped = if noprop::sample_bool(ctx) {
+                outside.join(format!("{}.env", test_support::safe_component(ctx)))
+            } else {
+                PathBuf::from(format!("escape/{}.env", test_support::safe_component(ctx)))
+            };
+            assert!(
+                enforce_path_boundary(
+                    &session,
+                    "create_local_env_file",
+                    &json!({"mountPath": escaped}),
+                )
+                .is_err()
+            );
+            Ok(())
+        })
     }
 }
