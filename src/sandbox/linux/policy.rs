@@ -317,7 +317,9 @@ mod tests {
         assert!(serde_json::from_value::<LinuxSandboxPolicy>(value).is_err());
 
         let mut policy = LinuxSandboxPolicy::for_command(root.path(), &[], &[]).unwrap();
-        policy.cwd = root.path().join(".");
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        policy.cwd = child.join("..");
         assert!(policy.validate().is_err());
     }
 
