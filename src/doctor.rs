@@ -22,6 +22,7 @@ sudo apt update\
 sudo apt install apparmor-profiles apparmor-utils\
 sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict\
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict";
+const MAX_TUNNEL_TOKEN_BYTES: u64 = 16 * 1024;
 
 #[derive(Default)]
 pub struct Options {
@@ -262,7 +263,7 @@ async fn check_cloudflared(report: &mut Report) {
 }
 
 fn check_tunnel_token_file(report: &mut Report, path: &Path) {
-    let metadata = match std::fs::metadata(path) {
+    let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
             report.add(Check::fail(
@@ -284,6 +285,18 @@ fn check_tunnel_token_file(report: &mut Report, path: &Path) {
                 "Set TUNNEL_TOKEN_FILE to a regular token file, not a directory: {}.",
                 path.display()
             ),
+        ));
+        return;
+    }
+
+    if metadata.len() > MAX_TUNNEL_TOKEN_BYTES {
+        report.add(Check::fail(
+            "cloudflare tunnel token",
+            format!(
+                "{} exceeds the {MAX_TUNNEL_TOKEN_BYTES}-byte token-file limit",
+                path.display()
+            ),
+            "Replace the file with the remotely managed Tunnel bearer token only.",
         ));
         return;
     }
@@ -860,6 +873,7 @@ fn contains_loopback_permission_error_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn recognizes_the_bwrap_loopback_failure() {
@@ -877,6 +891,53 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
+    fn generated_cloudflare_account_ids_match_hex_grammar() -> noprop::TestResult {
+        test_support::run(0x4346_4143_4354_0001, test_support::DEFAULT_CASES, |ctx| {
+            let value = test_support::ascii_string(ctx, 40);
+            let expected =
+                value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit());
+            assert_eq!(
+                is_cloudflare_account_id(&value),
+                expected,
+                "account id={value:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn generated_cloudflare_statuses_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x4346_5354_4154_0001, 512, |ctx| {
+            let known = ["healthy", "degraded", "inactive", "down"];
+            let status = if noprop::sample_bool(ctx) {
+                let value = known[noprop::sample_usize_in(ctx, 0..known.len())];
+                if noprop::sample_bool(ctx) {
+                    value.to_ascii_uppercase()
+                } else {
+                    value.to_owned()
+                }
+            } else {
+                test_support::safe_component(ctx)
+            };
+            let expected = if status.eq_ignore_ascii_case("healthy") {
+                Level::Pass
+            } else if status.eq_ignore_ascii_case("degraded") {
+                Level::Warn
+            } else {
+                Level::Fail
+            };
+            assert_eq!(
+                cloudflare_status_level(Some(&status)),
+                expected,
+                "status={status:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
     fn classifies_cloudflare_tunnel_statuses() {
         assert_eq!(cloudflare_status_level(Some("healthy")), Level::Pass);
         assert_eq!(cloudflare_status_level(Some("degraded")), Level::Warn);
@@ -884,6 +945,53 @@ mod tests {
         assert_eq!(cloudflare_status_level(Some("inactive")), Level::Fail);
         assert_eq!(cloudflare_status_level(Some("future-status")), Level::Fail);
         assert_eq!(cloudflare_status_level(None), Level::Fail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_tunnel_token_permissions_match_private_file_policy() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("token");
+        std::fs::write(&path, "opaque-token").unwrap();
+
+        test_support::run(0x4346_544f_4b45_4e01, 512, |ctx| {
+            let exposure = noprop::sample_u8(ctx) & 0o77;
+            let mode = 0o600 | u32::from(exposure);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let mut report = Report::new();
+            check_tunnel_token_file(&mut report, &path);
+            let level = report.checks.last().unwrap().level;
+            let expected = if exposure == 0 {
+                Level::Pass
+            } else {
+                Level::Fail
+            };
+            assert_eq!(level, expected, "mode={mode:04o}");
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tunnel_token_rejects_symlinks_and_oversized_files() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let link = fixture.path().join("link");
+        std::fs::write(&target, "opaque-token").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+        let mut report = Report::new();
+        check_tunnel_token_file(&mut report, &link);
+        assert_eq!(report.checks.last().unwrap().level, Level::Fail);
+
+        let oversized = fixture.path().join("oversized");
+        std::fs::write(&oversized, vec![b'x'; MAX_TUNNEL_TOKEN_BYTES as usize + 1]).unwrap();
+        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut report = Report::new();
+        check_tunnel_token_file(&mut report, &oversized);
+        assert_eq!(report.checks.last().unwrap().level, Level::Fail);
     }
 
     #[cfg(feature = "network")]
