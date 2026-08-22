@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -86,7 +87,9 @@ pub async fn load_session(id: &str) -> Result<Session> {
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("session {id} was not found; run `temote-mcp start` first"))?;
-    serde_json::from_slice(&bytes).context("invalid temote-mcp session")
+    let session: Session = serde_json::from_slice(&bytes).context("invalid temote-mcp session")?;
+    validate_loaded_session(id, &session)?;
+    Ok(session)
 }
 
 pub async fn session_is_active(id: &str) -> Result<bool> {
@@ -140,11 +143,79 @@ pub async fn remove_inactive_socket(id: &str) -> Result<()> {
 }
 
 pub async fn save_session(session: &Session) -> Result<()> {
+    validate_session_id(&session.id)?;
     let path = session_path(&session.id)?;
     tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    tokio::fs::write(&temporary, serde_json::to_vec_pretty(session)?).await?;
-    tokio::fs::rename(temporary, path).await?;
+    let temporary = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec_pretty(session)?;
+    let result = async {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot create session temporary file {}",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, &path).await?;
+        Result::<()>::Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
+}
+
+fn validate_loaded_session(requested_id: &str, session: &Session) -> Result<()> {
+    validate_session_id(requested_id)?;
+    anyhow::ensure!(
+        session.id == requested_id,
+        "session metadata ID mismatch: requested {requested_id}, found {}",
+        session.id
+    );
+    validate_session_id(&session.id)?;
+
+    let canonical_cwd = canonical_directory(&session.cwd)?;
+    anyhow::ensure!(
+        canonical_cwd == session.cwd,
+        "session cwd is not canonical: {}",
+        session.cwd.display()
+    );
+    anyhow::ensure!(
+        !session.permitted_directories.is_empty(),
+        "session metadata has no permitted directories"
+    );
+
+    let mut seen = BTreeSet::new();
+    for root in &session.permitted_directories {
+        let canonical = canonical_directory(root)?;
+        anyhow::ensure!(
+            canonical == *root,
+            "session permitted root is not canonical: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            seen.insert(root.clone()),
+            "duplicate session permitted root: {}",
+            root.display()
+        );
+    }
+    anyhow::ensure!(
+        seen.contains(&session.cwd),
+        "session cwd is missing from permitted directories"
+    );
     Ok(())
 }
 
@@ -404,6 +475,89 @@ mod tests {
 
         assert!(resolve_existing_path(&session, Path::new("outside/secret.txt")).is_err());
         assert!(resolve_write_path(&session, Path::new("outside/new.txt")).is_err());
+    }
+
+    #[test]
+    fn generated_loaded_session_structure_matches_reference_invariants() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("cwd");
+        let extra_a = fixture.path().join("extra-a");
+        let extra_b = fixture.path().join("extra-b");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&extra_a).unwrap();
+        std::fs::create_dir(&extra_b).unwrap();
+        let cwd = canonical_directory(&cwd).unwrap();
+        let extra_a = canonical_directory(&extra_a).unwrap();
+        let extra_b = canonical_directory(&extra_b).unwrap();
+
+        test_support::run(0x5345_5353_4d45_5441, 512, |ctx| {
+            let requested = format!("meta-{:x}", noprop::sample_u64(ctx));
+            let mut session = Session {
+                id: requested.clone(),
+                cwd: cwd.clone(),
+                permitted_directories: vec![cwd.clone(), extra_a.clone(), extra_b.clone()],
+                started_at: noprop::sample_u64(ctx),
+                process_id: noprop::sample_u32(ctx),
+                yolo: noprop::sample_bool(ctx),
+            };
+            let mutation = noprop::sample_usize_in(ctx, 0..=5);
+            let expected = mutation == 0;
+            match mutation {
+                0 => {}
+                1 => session.id = format!("other-{:x}", noprop::sample_u64(ctx)),
+                2 => session.permitted_directories.clear(),
+                3 => session.permitted_directories.retain(|root| root != &cwd),
+                4 => session.permitted_directories.push(extra_a.clone()),
+                _ => session.cwd = cwd.join(".."),
+            }
+            assert_eq!(
+                validate_loaded_session(&requested, &session).is_ok(),
+                expected,
+                "mutation={mutation} session={:?}",
+                session.id
+            );
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_saves_remain_atomic_and_leave_no_temporary_files() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = canonical_directory(root.path()).unwrap();
+        let id = format!("concurrent-save-{}", Uuid::new_v4());
+        let mut tasks = Vec::new();
+        for revision in 0..16_u64 {
+            let session = Session {
+                id: id.clone(),
+                cwd: cwd.clone(),
+                permitted_directories: vec![cwd.clone()],
+                started_at: revision,
+                process_id: revision as u32,
+                yolo: revision % 2 == 0,
+            };
+            tasks.push(tokio::spawn(async move { save_session(&session).await }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let path = session_path(&id).unwrap();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let saved: Session = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved.id, id);
+        validate_loaded_session(&id, &saved).unwrap();
+
+        let prefix = format!("{id}.json.");
+        let mut entries = tokio::fs::read_dir(sessions_dir().unwrap()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(&prefix) || !name.ends_with(".tmp"),
+                "orphan session temporary file: {name}"
+            );
+        }
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[test]
