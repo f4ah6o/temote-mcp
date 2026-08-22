@@ -16,6 +16,7 @@ mod macos;
 mod policy;
 
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
 
 pub struct Output {
     pub status: i32,
@@ -160,8 +161,8 @@ pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
     } else {
         resolve_git_pointer(&dot_git_path)?
     };
-    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(value) => {
+    let common_dir = match read_git_control_file(&git_dir.join("commondir"), "Git commondir")? {
+        Some(value) => {
             let mut lines = value.lines().filter(|line| !line.trim().is_empty());
             let relative = lines.next().map(str::trim).unwrap_or_default();
             anyhow::ensure!(!relative.is_empty(), "Git commondir is empty");
@@ -174,8 +175,7 @@ pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
                 format!("cannot resolve Git common directory {}", path.display())
             })?
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
-        Err(error) => return Err(error).context("cannot read Git commondir"),
+        None => git_dir.clone(),
     };
     if dot_git_is_directory {
         anyhow::ensure!(
@@ -232,16 +232,38 @@ pub fn git_worktree_root(cwd: &Path) -> Result<PathBuf> {
         .context("no Git repository found from the working directory")
 }
 
-fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
-    let metadata = std::fs::symlink_metadata(dot_git)
-        .with_context(|| format!("cannot inspect Git pointer {}", dot_git.display()))?;
+fn read_git_control_file(path: &Path, label: &str) -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect {label} {}", path.display()));
+        }
+    };
     anyhow::ensure!(
         metadata.file_type().is_file(),
-        "Git pointer is not a regular file: {}",
-        dot_git.display()
+        "{label} is not a regular file: {}",
+        path.display()
     );
-    let contents = std::fs::read_to_string(dot_git)
-        .with_context(|| format!("cannot read Git pointer {}", dot_git.display()))?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_GIT_POINTER_BYTES,
+        "{label} exceeds {MAX_GIT_POINTER_BYTES} bytes: {}",
+        path.display()
+    );
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read {label} {}", path.display()))?;
+    anyhow::ensure!(
+        contents.len() as u64 <= MAX_GIT_POINTER_BYTES,
+        "{label} exceeds {MAX_GIT_POINTER_BYTES} bytes: {}",
+        path.display()
+    );
+    Ok(Some(contents))
+}
+
+fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
+    let contents = read_git_control_file(dot_git, "Git pointer")?
+        .with_context(|| format!("Git pointer does not exist: {}", dot_git.display()))?;
     let mut lines = contents.lines();
     let value = lines
         .next()
@@ -267,15 +289,8 @@ fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_plain_git_pointer(pointer: &Path) -> Result<PathBuf> {
-    let metadata = std::fs::symlink_metadata(pointer)
-        .with_context(|| format!("cannot inspect Git pointer {}", pointer.display()))?;
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "Git pointer is not a regular file: {}",
-        pointer.display()
-    );
-    let contents = std::fs::read_to_string(pointer)
-        .with_context(|| format!("cannot read Git pointer {}", pointer.display()))?;
+    let contents = read_git_control_file(pointer, "Git pointer")?
+        .with_context(|| format!("Git pointer does not exist: {}", pointer.display()))?;
     let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
     let value = lines.next().map(str::trim);
     anyhow::ensure!(
@@ -506,6 +521,78 @@ mod generic_tests {
     }
 
     #[test]
+    fn generated_shared_output_budget_never_overcaptures() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x4f55_5450_5554_0001, 256, |ctx| {
+            let budget = noprop::sample_usize_in(ctx, 0..=2048);
+            let stdout_len = noprop::sample_usize_in(ctx, 0..=3072);
+            let stderr_len = noprop::sample_usize_in(ctx, 0..=3072);
+
+            runtime.block_on(async {
+                let (mut stdout_writer, stdout_reader) = tokio::io::duplex(4096);
+                let (mut stderr_writer, stderr_reader) = tokio::io::duplex(4096);
+                stdout_writer
+                    .write_all(&vec![b'o'; stdout_len])
+                    .await
+                    .unwrap();
+                stdout_writer.shutdown().await.unwrap();
+                stderr_writer
+                    .write_all(&vec![b'e'; stderr_len])
+                    .await
+                    .unwrap();
+                stderr_writer.shutdown().await.unwrap();
+
+                let remaining = Arc::new(AtomicUsize::new(budget));
+                let (stdout, stderr) = tokio::join!(
+                    read_limited(stdout_reader, remaining.clone()),
+                    read_limited(stderr_reader, remaining.clone())
+                );
+                let (stdout, stdout_truncated) = stdout.unwrap();
+                let (stderr, stderr_truncated) = stderr.unwrap();
+                let captured = stdout.len() + stderr.len();
+                let total = stdout_len + stderr_len;
+
+                assert!(captured <= budget, "captured={captured} budget={budget}");
+                assert_eq!(remaining.load(Ordering::SeqCst), budget - captured);
+                if total <= budget {
+                    assert_eq!(captured, total);
+                    assert!(!stdout_truncated && !stderr_truncated);
+                } else {
+                    assert_eq!(captured, budget);
+                    assert!(stdout_truncated || stderr_truncated);
+                }
+            });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_reservations_never_exceed_atomic_budget() -> noprop::TestResult {
+        test_support::run(0x5245_5345_5256_4501, test_support::DEFAULT_CASES, |ctx| {
+            let initial = noprop::sample_usize_in(ctx, 0..=8192);
+            let requests = (0..32)
+                .map(|_| noprop::sample_usize_in(ctx, 0..=2048))
+                .collect::<Vec<_>>();
+            let remaining = AtomicUsize::new(initial);
+            let mut reserved_total = 0usize;
+
+            for request in requests {
+                let before = remaining.load(Ordering::SeqCst);
+                let reserved = reserve_bytes(&remaining, request);
+                assert_eq!(reserved, before.min(request));
+                reserved_total += reserved;
+                assert_eq!(remaining.load(Ordering::SeqCst), initial - reserved_total);
+            }
+            assert!(reserved_total <= initial);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn preserves_home_for_login_shells() {
         if let Ok(home) = std::env::var("HOME") {
             assert_eq!(
@@ -574,6 +661,104 @@ mod generic_tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn generated_git_pointer_grammar_is_fail_closed() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let pointer = fixture.path().join(".git");
+        let target = fixture.path().join("metadata");
+        std::fs::create_dir(&target).unwrap();
+        let target = std::fs::canonicalize(target).unwrap();
+
+        test_support::run(0x4749_5450_5452_0001, 512, |ctx| {
+            let relative = noprop::sample_bool(ctx);
+            let rendered_target = if relative {
+                "metadata".to_owned()
+            } else {
+                target.display().to_string()
+            };
+            let valid = noprop::sample_bool(ctx);
+            let contents = if valid {
+                let trailing_blanks = noprop::sample_usize_in(ctx, 0..=3);
+                format!(
+                    "gitdir: {rendered_target}\n{}",
+                    "\n".repeat(trailing_blanks)
+                )
+            } else {
+                match noprop::sample_usize_in(ctx, 0..=3) {
+                    0 => format!("{rendered_target}\n"),
+                    1 => "gitdir:   \n".to_owned(),
+                    2 => format!("gitdir: {rendered_target}\nunexpected\n"),
+                    _ => format!(" gitdir: {rendered_target}\n"),
+                }
+            };
+            std::fs::write(&pointer, contents).unwrap();
+            let result = resolve_git_pointer(&pointer);
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "Git pointer classification mismatch: {result:?}"
+            );
+            if let Ok(resolved) = result {
+                assert_eq!(resolved, target);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_plain_git_pointer_requires_one_nonempty_path() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let pointer = fixture.path().join("gitdir");
+        let target = fixture.path().join("worktree-dot-git");
+        std::fs::write(&target, b"gitdir marker").unwrap();
+        let target = std::fs::canonicalize(target).unwrap();
+
+        test_support::run(0x4749_5450_4c41_494e, 512, |ctx| {
+            let valid = noprop::sample_bool(ctx);
+            let contents = if valid {
+                let leading_blanks = noprop::sample_usize_in(ctx, 0..=2);
+                let trailing_blanks = noprop::sample_usize_in(ctx, 0..=2);
+                format!(
+                    "{}worktree-dot-git\n{}",
+                    "\n".repeat(leading_blanks),
+                    "\n".repeat(trailing_blanks)
+                )
+            } else {
+                match noprop::sample_usize_in(ctx, 0..=2) {
+                    0 => "\n   \n".to_owned(),
+                    1 => "worktree-dot-git\nsecond\n".to_owned(),
+                    _ => "missing-target\n".to_owned(),
+                }
+            };
+            std::fs::write(&pointer, contents).unwrap();
+            let result = resolve_plain_git_pointer(&pointer);
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "plain Git pointer classification mismatch: {result:?}"
+            );
+            if let Ok(resolved) = result {
+                assert_eq!(resolved, target);
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_control_files_reject_symlinks_and_oversized_contents() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("target");
+        let link = fixture.path().join("link");
+        std::fs::write(&target, b"metadata").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_git_control_file(&link, "test pointer").is_err());
+
+        let oversized = fixture.path().join("oversized");
+        std::fs::write(&oversized, vec![b'x'; MAX_GIT_POINTER_BYTES as usize + 1]).unwrap();
+        assert!(read_git_control_file(&oversized, "test pointer").is_err());
     }
 
     #[test]

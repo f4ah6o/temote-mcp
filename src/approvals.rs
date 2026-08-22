@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -15,6 +15,8 @@ use uuid::Uuid;
 
 use crate::config::{self, Session};
 use crate::{kintone_cli, kintone_mcp, sandbox};
+
+const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -568,6 +570,23 @@ async fn run_cli_console(handle: &RuntimeHandle, mut approvals: ApprovalReceiver
     }
 }
 
+async fn read_session_message(stream: &mut UnixStream) -> Result<Option<String>> {
+    let mut line = String::new();
+    let read = BufReader::new(stream)
+        .take((MAX_SESSION_MESSAGE_BYTES + 1) as u64)
+        .read_line(&mut line)
+        .await
+        .context("failed to read session message")?;
+    if read == 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        read <= MAX_SESSION_MESSAGE_BYTES,
+        "session message exceeds {MAX_SESSION_MESSAGE_BYTES} bytes"
+    );
+    Ok(Some(line))
+}
+
 async fn run_runtime(
     listener: UnixListener,
     session: &mut Session,
@@ -582,9 +601,21 @@ async fn run_runtime(
         tokio::select! {
             connection = listener.accept() => {
                 let (mut stream, _) = connection?;
-                let mut line = String::new();
-                BufReader::new(&mut stream).read_line(&mut line).await?;
-                let message: Message = serde_json::from_str(&line).context("invalid session message")?;
+                let line = match read_session_message(&mut stream).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        eprintln!("[session {}] rejected session message: {error:#}", session.id);
+                        continue;
+                    }
+                };
+                let message: Message = match serde_json::from_str(&line) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        eprintln!("[session {}] ignoring invalid session message: {error}", session.id);
+                        continue;
+                    }
+                };
                 match message {
                     Message::Probe => {
                         stream.write_all(b"active\n").await?;
@@ -1116,6 +1147,133 @@ mod tests {
             redact_token("before secret-token after", "secret-token"),
             "before [REDACTED_SERVICE_ACCOUNT_TOKEN] after"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_ipc_message_does_not_stop_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("malformed-ipc-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let path = config::socket_path(&id).unwrap();
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(b"{not-json}\n").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = String::new();
+        let read = BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        assert_eq!(
+            read, 0,
+            "invalid messages should be closed without a response"
+        );
+
+        let snapshot = handle.snapshot().await.unwrap();
+        assert_eq!(snapshot.id, id);
+        assert!(!snapshot.yolo);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_ipc_message_does_not_stop_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("oversized-ipc-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let path = config::socket_path(&id).unwrap();
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        let oversized = vec![b'x'; MAX_SESSION_MESSAGE_BYTES + 1];
+        let _ = stream.write_all(&oversized).await;
+        let _ = stream.shutdown().await;
+        let mut response = String::new();
+        let _ = BufReader::new(stream).read_line(&mut response).await;
+
+        let snapshot = handle.snapshot().await.unwrap();
+        assert_eq!(snapshot.id, id);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn generated_runtime_permission_sequences_match_reference_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x5045_524d_5354_4154, 64, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let steps = (0..16)
+                .map(|_| {
+                    (
+                        noprop::sample_usize_in(ctx, 0..=4),
+                        noprop::sample_usize_in(ctx, 0..3),
+                        noprop::sample_bool(ctx),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            runtime.block_on(async {
+                let fixture = tempfile::tempdir().unwrap();
+                let cwd = fixture.path().join("cwd");
+                let extras = [
+                    fixture.path().join("extra-a"),
+                    fixture.path().join("extra-b"),
+                    fixture.path().join("extra-c"),
+                ];
+                std::fs::create_dir(&cwd).unwrap();
+                for extra in &extras {
+                    std::fs::create_dir(extra).unwrap();
+                }
+                let cwd = config::canonical_directory(&cwd).unwrap();
+                let extras = extras
+                    .iter()
+                    .map(|path| config::canonical_directory(path).unwrap())
+                    .collect::<Vec<_>>();
+                let id = format!("permission-pbt-{nonce:x}");
+                let (sender, _receiver) = approval_channel();
+                let handle = spawn_runtime(&cwd, Some(&id), false, sender).await.unwrap();
+                let mut expected_yolo = false;
+                let mut expected_roots = vec![cwd.clone()];
+
+                for (operation, index, value) in steps {
+                    match operation {
+                        0 => {
+                            handle.set_yolo(value).await.unwrap();
+                            expected_yolo = value;
+                        }
+                        1 | 2 => {
+                            let path = extras[index].clone();
+                            handle.allow_directory(path.clone()).await.unwrap();
+                            if !expected_roots.contains(&path) {
+                                expected_roots.push(path);
+                                expected_roots.sort();
+                            }
+                        }
+                        3 => {
+                            let path = extras[index].clone();
+                            handle.revoke_directory(path.clone()).await.unwrap();
+                            expected_roots.retain(|root| root != &path);
+                        }
+                        _ => {
+                            assert!(handle.revoke_directory(cwd.clone()).await.is_err());
+                        }
+                    }
+
+                    let snapshot = handle.snapshot().await.unwrap();
+                    assert_eq!(snapshot.yolo, expected_yolo);
+                    assert_eq!(snapshot.permitted_directories, expected_roots);
+                }
+
+                handle.shutdown().await.unwrap();
+                assert!(!config::session_is_active(&id).await.unwrap());
+            });
+            Ok(())
+        })
     }
 
     #[test]
