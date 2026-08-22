@@ -1930,6 +1930,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generated_job_slot_sequences_respect_per_session_capacity() -> noprop::TestResult {
+        test_support::run(0x4a4f_4253_4c4f_5401, 256, |ctx| {
+            let session_id = format!("pbt-job-slot-{}", noprop::sample_u64(ctx));
+            let attempts = noprop::sample_usize_in(ctx, 0..=MAX_ACTIVE_JOBS_PER_SESSION + 4);
+            let mut slots = Vec::new();
+
+            for attempt in 0..attempts {
+                match reserve_job_slot(&session_id) {
+                    Ok(slot) => {
+                        assert!(
+                            attempt < MAX_ACTIVE_JOBS_PER_SESSION,
+                            "slot above capacity was accepted: attempt={attempt}"
+                        );
+                        slots.push(slot);
+                    }
+                    Err(_) => {
+                        assert!(
+                            attempt >= MAX_ACTIVE_JOBS_PER_SESSION,
+                            "slot below capacity was rejected: attempt={attempt}"
+                        );
+                    }
+                }
+            }
+
+            let expected_active = attempts.min(MAX_ACTIVE_JOBS_PER_SESSION);
+            let actual_active = jobs()
+                .lock()
+                .unwrap()
+                .active_by_session
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(actual_active, expected_active);
+
+            let releases = noprop::sample_usize_in(ctx, 0..=slots.len());
+            for _ in 0..releases {
+                slots.pop();
+            }
+            let remaining = expected_active - releases;
+            let actual_remaining = jobs()
+                .lock()
+                .unwrap()
+                .active_by_session
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default();
+            assert_eq!(actual_remaining, remaining);
+
+            drop(slots);
+            assert!(
+                !jobs()
+                    .lock()
+                    .unwrap()
+                    .active_by_session
+                    .contains_key(&session_id),
+                "dropping all slots did not clear the session counter"
+            );
+            Ok(())
+        })
+    }
+
     #[tokio::test]
     async fn completed_job_cache_is_reaped_only_after_ttl() {
         let session_id = format!("test-job-ttl-{}", Uuid::new_v4());

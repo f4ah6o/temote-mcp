@@ -581,6 +581,7 @@ fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     fn bridge(environment: &[(&str, &str)]) -> Bridge {
         Bridge {
@@ -682,6 +683,169 @@ mod tests {
         );
         assert!(validate_command(&["plugin".into(), "pack".into()]).is_err());
         assert!(validate_command(&["plugin".into(), "upload".into(), "--watch".into(),]).is_err());
+    }
+
+    #[test]
+    fn command_validation_matches_allowlist_and_secret_option_model() -> noprop::TestResult {
+        const PAIRS: [(&str, &str, bool); 10] = [
+            ("record", "export", true),
+            ("record", "import", true),
+            ("record", "delete", true),
+            ("customize", "export", true),
+            ("customize", "apply", true),
+            ("plugin", "upload", true),
+            ("plugin", "pack", false),
+            ("record", "watch", false),
+            ("customize", "delete", false),
+            ("unknown", "export", false),
+        ];
+
+        test_support::run(0x4b49_4e54_434d_4401, test_support::DEFAULT_CASES, |ctx| {
+            let (group, command, pair_allowed) =
+                PAIRS[noprop::sample_usize_in(ctx, 0..PAIRS.len())];
+            let option_mode = noprop::sample_usize_in(ctx, 0..4);
+            let mut arguments = vec![group.to_owned(), command.to_owned()];
+            let option_allowed = match option_mode {
+                0 => true,
+                1 => {
+                    let option =
+                        FORBIDDEN_OPTIONS[noprop::sample_usize_in(ctx, 0..FORBIDDEN_OPTIONS.len())];
+                    arguments.push(format!("{option}=pbt-secret-{}", noprop::sample_u64(ctx)));
+                    false
+                }
+                2 => {
+                    arguments.push("--watch".to_owned());
+                    false
+                }
+                _ => {
+                    arguments.push(format!("--app={}", noprop::sample_u16(ctx)));
+                    true
+                }
+            };
+            assert_eq!(
+                validate_command(&arguments).is_ok(),
+                pair_allowed && option_allowed,
+                "cli-kintone command validation mismatch for {arguments:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn authentication_matrix_matches_command_policy() -> noprop::TestResult {
+        test_support::run(0x4b49_4e54_4155_5448, test_support::DEFAULT_CASES, |ctx| {
+            let base_mode = noprop::sample_usize_in(ctx, 0..4);
+            let username = noprop::sample_bool(ctx);
+            let password = noprop::sample_bool(ctx);
+            let token = noprop::sample_bool(ctx);
+            let basic_username = noprop::sample_bool(ctx);
+            let basic_password = noprop::sample_bool(ctx);
+            let mut environment = Vec::new();
+            match base_mode {
+                0 => environment.push(("KINTONE_BASE_URL", "https://pbt.example.invalid")),
+                1 => environment.push(("KINTONE_BASE_URL", "http://pbt.example.invalid")),
+                2 => environment.push(("KINTONE_BASE_URL", "ftp://pbt.example.invalid")),
+                _ => {}
+            }
+            if username {
+                environment.push(("KINTONE_USERNAME", "pbt-user"));
+            }
+            if password {
+                environment.push(("KINTONE_PASSWORD", "pbt-password"));
+            }
+            if token {
+                environment.push(("KINTONE_API_TOKEN", "pbt-token"));
+            }
+            if basic_username {
+                environment.push(("KINTONE_BASIC_AUTH_USERNAME", "pbt-basic-user"));
+            }
+            if basic_password {
+                environment.push(("KINTONE_BASIC_AUTH_PASSWORD", "pbt-basic-password"));
+            }
+            let bridge = bridge(&environment);
+            let kind_index = noprop::sample_usize_in(ctx, 0..6);
+            let kind = match kind_index {
+                0 => CommandKind::RecordExport,
+                1 => CommandKind::RecordImport,
+                2 => CommandKind::RecordDelete,
+                3 => CommandKind::CustomizeExport,
+                4 => CommandKind::CustomizeApply,
+                _ => CommandKind::PluginUpload,
+            };
+
+            let common = matches!(base_mode, 0 | 1)
+                && username == password
+                && basic_username == basic_password;
+            let password_auth = username && password;
+            let expected = common
+                && match kind_index {
+                    0 | 1 => password_auth || token,
+                    2 => token,
+                    _ => password_auth,
+                };
+            let actual = bridge.validated_environment(kind);
+            assert_eq!(
+                actual.is_ok(),
+                expected,
+                "authentication policy mismatch: kind={kind_index}, base={base_mode}, username={username}, password={password}, token={token}, basic_username={basic_username}, basic_password={basic_password}"
+            );
+
+            if let Ok(environment) = actual {
+                match kind_index {
+                    2 => {
+                        assert!(environment.contains_key("KINTONE_API_TOKEN"));
+                        assert!(!environment.contains_key("KINTONE_USERNAME"));
+                        assert!(!environment.contains_key("KINTONE_PASSWORD"));
+                    }
+                    3..=5 => {
+                        assert!(environment.contains_key("KINTONE_USERNAME"));
+                        assert!(environment.contains_key("KINTONE_PASSWORD"));
+                        assert!(!environment.contains_key("KINTONE_API_TOKEN"));
+                    }
+                    _ if password_auth => {
+                        assert!(!environment.contains_key("KINTONE_API_TOKEN"));
+                    }
+                    _ => {
+                        assert!(environment.contains_key("KINTONE_API_TOKEN"));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn status_never_exposes_generated_kintone_values() -> noprop::TestResult {
+        test_support::run(0x4b49_4e54_5345_4352, 512, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let host = format!("pbt-secret-host-{nonce}.example.invalid");
+            let token = format!("pbt-secret-token-{nonce}");
+            let username = format!("pbt-secret-user-{nonce}");
+            let password = format!("pbt-secret-password-{nonce}");
+            let guest = format!("pbt-secret-guest-{nonce}");
+            let environment = [
+                ("KINTONE_BASE_URL", format!("https://{host}")),
+                ("KINTONE_USERNAME", username.clone()),
+                ("KINTONE_PASSWORD", password.clone()),
+                ("KINTONE_API_TOKEN", token.clone()),
+                ("KINTONE_GUEST_SPACE_ID", guest.clone()),
+            ];
+            let bridge = Bridge {
+                executable_override: None,
+                environment: environment
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value))
+                    .collect(),
+            };
+            let rendered = bridge.status().to_string();
+            for secret in [&host, &token, &username, &password, &guest] {
+                assert!(
+                    !rendered.contains(secret),
+                    "status leaked configured value {secret:?}: {rendered}"
+                );
+            }
+            Ok(())
+        })
     }
 
     #[test]
