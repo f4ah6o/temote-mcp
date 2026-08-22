@@ -262,7 +262,7 @@ fn normalize_paths(paths: &mut Vec<PathBuf>) {
     paths.dedup();
 }
 
-fn is_linked_worktree_metadata_root(path: &Path) -> bool {
+pub(super) fn is_linked_worktree_metadata_root(path: &Path) -> bool {
     path.parent()
         .and_then(Path::file_name)
         .is_some_and(|name| name == "worktrees")

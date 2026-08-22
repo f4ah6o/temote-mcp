@@ -18,7 +18,9 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
-use super::policy::{LinuxSandboxPolicy, missing_path_is_directory};
+use super::policy::{
+    LinuxSandboxPolicy, is_linked_worktree_metadata_root, missing_path_is_directory,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "temote-linux-sandbox")]
@@ -136,12 +138,41 @@ fn build_bwrap_args(
         {
             continue;
         }
-        if mask.exists() {
-            append_pair(&mut args, "--ro-bind", &mask, &mask)?;
-        } else {
-            append_missing_mask(&mut args, &mask)?;
-        }
+        append_read_only_mask(&mut args, &mask)?;
         masked_paths.push(mask);
+    }
+
+    // The common Git metadata root protects its entire `worktrees` directory.
+    // A validated linked worktree has one private metadata directory nested
+    // below that read-only mount. Re-overlay only that validated private root
+    // as writable, then restore every narrower read-only mask below it. This
+    // keeps sibling worktree metadata protected while allowing Git to create
+    // index.lock and other per-worktree state.
+    let mut linked_worktree_roots = policy
+        .writable_roots
+        .iter()
+        .filter(|root| is_linked_worktree_metadata_root(root))
+        .cloned()
+        .collect::<Vec<_>>();
+    linked_worktree_roots.sort_by_key(|path| path_depth(path));
+    for root in linked_worktree_roots {
+        append_pair(&mut args, "--bind", &root, &root)?;
+        let mut remasked = Vec::<PathBuf>::new();
+        let mut descendants = policy
+            .read_only_paths
+            .iter()
+            .filter(|path| path.starts_with(&root) && *path != &root)
+            .cloned()
+            .collect::<Vec<_>>();
+        descendants.sort_by_key(|path| path_depth(path));
+        for path in descendants {
+            let mask = first_missing_component(&path).unwrap_or(path);
+            if remasked.iter().any(|ancestor| mask.starts_with(ancestor)) {
+                continue;
+            }
+            append_read_only_mask(&mut args, &mask)?;
+            remasked.push(mask);
+        }
     }
 
     args.push("--chdir".to_owned());
@@ -156,6 +187,14 @@ fn append_pair(args: &mut Vec<String>, flag: &str, source: &Path, target: &Path)
     args.push(path_to_string(source)?);
     args.push(path_to_string(target)?);
     Ok(())
+}
+
+fn append_read_only_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
+    if path.exists() {
+        append_pair(args, "--ro-bind", path, path)
+    } else {
+        append_missing_mask(args, path)
+    }
 }
 
 fn append_missing_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
@@ -317,7 +356,7 @@ fn create_sealed_seccomp_memfd(program: &BpfProgram) -> Result<OwnedFd> {
     // Do not use MFD_CLOEXEC: bubblewrap must inherit this fd and consumes it
     // through --seccomp FD. MFD_ALLOW_SEALING lets us make the bytecode
     // immutable before exec.
-    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING as u32) };
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
     anyhow::ensure!(
         raw_fd >= 0,
         "memfd_create failed: {}",
