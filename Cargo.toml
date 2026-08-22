@@ -49,6 +49,7 @@ seccompiler = "0.5"
 libc = "0.2"
 
 [dev-dependencies]
+noprop = "=0.2.0"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

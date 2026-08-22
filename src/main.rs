@@ -15,6 +15,8 @@ mod mcp;
 mod named_roots;
 mod onepassword_mcp;
 mod supervisor;
+#[cfg(test)]
+mod test_support;
 
 use temote_mcp::sandbox;
 

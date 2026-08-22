@@ -48,6 +48,16 @@ git diff --check
 
 The installed-binary lifecycle commands are `temote-mcp up` and `temote-mcp down`. The `justfile` provides development-oriented `just build`, `just install`, `just doctor`, `just check`, and wrappers that delegate `just up/down` to the checkout binary.
 
+### Property-based tests
+
+Security and path-containment invariants use [`noprop`](https://github.com/sile/noprop). The suite uses a deterministic default seed so failures reproduce under a normal `cargo test`. To replay or explore with another seed, set `TEMOTE_PBT_SEED` to a decimal or hexadecimal `u64`:
+
+```sh
+TEMOTE_PBT_SEED=0x1234 cargo test --all-features
+```
+
+Keep example tests for named regressions; use property tests for grammars, containment/fail-closed rules, redaction, and state-machine invariants where the input space is larger than a useful example table.
+
 ## Release versioning
 
 Releases use CalVer `YYYY.MM.PATCH` in the `Asia/Tokyo` timezone through [`f4ah6o/calver-action`](https://github.com/f4ah6o/calver-action).

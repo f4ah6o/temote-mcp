@@ -225,6 +225,7 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn validates_custom_session_ids() {
@@ -306,5 +307,64 @@ mod tests {
 
         assert!(resolve_existing_path(&session, Path::new("outside/secret.txt")).is_err());
         assert!(resolve_write_path(&session, Path::new("outside/new.txt")).is_err());
+    }
+
+    #[test]
+    fn session_id_validation_matches_reference_grammar() -> noprop::TestResult {
+        test_support::run(0x5345_5353_494f_4e01, test_support::DEFAULT_CASES, |ctx| {
+            let id = test_support::ascii_string(ctx, 80);
+            let expected = !id.is_empty()
+                && id.len() <= 64
+                && id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_.".contains(character)
+                })
+                && id != "."
+                && id != "..";
+            assert_eq!(
+                validate_session_id(&id).is_ok(),
+                expected,
+                "session ID mismatch for {id:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_read_and_write_paths_never_follow_symlinks_outside_sandbox() -> noprop::TestResult
+    {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let canonical_root = canonical_directory(&root).unwrap();
+        let session = Session {
+            id: "pbt".to_owned(),
+            cwd: canonical_root.clone(),
+            permitted_directories: vec![canonical_root],
+            started_at: 0,
+            process_id: 0,
+            yolo: false,
+        };
+
+        test_support::run(0x5041_5448_4553_4301, 512, |ctx| {
+            let leaf = test_support::safe_component(ctx);
+            std::fs::write(outside.join(&leaf), b"secret").unwrap();
+            let escaped = PathBuf::from(format!("escape/{leaf}"));
+            assert!(
+                resolve_existing_path(&session, &escaped).is_err(),
+                "read escape unexpectedly allowed: {escaped:?}"
+            );
+            let write = PathBuf::from(format!("escape/{leaf}.new"));
+            assert!(
+                resolve_write_path(&session, &write).is_err(),
+                "write escape unexpectedly allowed: {write:?}"
+            );
+            Ok(())
+        })
     }
 }

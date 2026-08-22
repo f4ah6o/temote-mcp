@@ -1036,6 +1036,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::test_support;
 
     fn test_session(root: &Path) -> Session {
         let root = config::canonical_directory(root).unwrap();
@@ -1107,5 +1108,48 @@ mod tests {
             redact_token("before secret-token after", "secret-token"),
             "before [REDACTED_SERVICE_ACCOUNT_TOKEN] after"
         );
+    }
+
+    #[test]
+    fn environment_name_validation_matches_shell_identifier_grammar() -> noprop::TestResult {
+        test_support::run(0x454e_564e_414d_4501, test_support::DEFAULT_CASES, |ctx| {
+            let name = test_support::ascii_string(ctx, 96);
+            let mut chars = name.chars();
+            let expected = matches!(
+                chars.next(),
+                Some(first) if first == '_' || first.is_ascii_alphabetic()
+            ) && chars
+                .all(|character| character == '_' || character.is_ascii_alphanumeric());
+            assert_eq!(
+                valid_environment_name(&name),
+                expected,
+                "environment name mismatch for {name:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_service_account_tokens_are_fully_redacted() -> noprop::TestResult {
+        test_support::run(0x5245_4441_4354_0001, test_support::DEFAULT_CASES, |ctx| {
+            let token = format!(
+                "tok-{}-{}",
+                test_support::safe_component(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let prefix = test_support::safe_component(ctx);
+            let suffix = test_support::safe_component(ctx);
+            let input = format!("{prefix}{token}{suffix}{token}");
+            let redacted = redact_token(&input, &token);
+            assert!(
+                !redacted.contains(&token),
+                "token survived redaction: token={token:?}, output={redacted:?}"
+            );
+            assert_eq!(
+                redacted.matches("[REDACTED_SERVICE_ACCOUNT_TOKEN]").count(),
+                2
+            );
+            Ok(())
+        })
     }
 }

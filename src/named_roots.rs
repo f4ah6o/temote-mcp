@@ -168,6 +168,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn validates_root_names() {
@@ -240,5 +241,90 @@ mod tests {
     fn empty_configuration_fails_closed_on_resolution() {
         let roots = NamedRoots::default();
         assert!(roots.resolve("src").is_err());
+    }
+
+    #[test]
+    fn root_name_validation_matches_reference_grammar() -> noprop::TestResult {
+        test_support::run(0x524f_4f54_4e41_4d45, test_support::DEFAULT_CASES, |ctx| {
+            let name = test_support::ascii_string(ctx, 80);
+            let expected = !name.is_empty()
+                && name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                });
+            assert_eq!(
+                validate_root_name(&name).is_ok(),
+                expected,
+                "root name mismatch for {name:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_descendants_resolve_to_canonical_paths_inside_root() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical_root = fixture.path().join("volume");
+        std::fs::create_dir(&physical_root).unwrap();
+        let physical_root = std::fs::canonicalize(physical_root).unwrap();
+        let roots = NamedRoots::from_canonical_roots(BTreeMap::from([(
+            "src".to_owned(),
+            physical_root.clone(),
+        )]))
+        .unwrap();
+
+        test_support::run(0x4445_5343_454e_4401, 512, |ctx| {
+            let depth = noprop::sample_usize_in(ctx, 0..=4);
+            let components = (0..depth)
+                .map(|_| test_support::safe_component(ctx))
+                .collect::<Vec<_>>();
+            let mut target = physical_root.clone();
+            for component in &components {
+                target.push(component);
+            }
+            std::fs::create_dir_all(&target).unwrap();
+
+            let logical = if components.is_empty() {
+                "src".to_owned()
+            } else {
+                format!("src/{}", components.join("/"))
+            };
+            let resolved = roots.resolve(&logical).unwrap();
+            let canonical = std::fs::canonicalize(&target).unwrap();
+            assert_eq!(resolved, canonical, "logical={logical:?}");
+            assert!(
+                resolved == physical_root || resolved.starts_with(&physical_root),
+                "resolved path escaped root: logical={logical:?}, resolved={resolved:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_parent_and_symlink_escapes_fail_closed() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let physical_root = fixture.path().join("volume");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&physical_root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, physical_root.join("escape-link")).unwrap();
+        let physical_root = std::fs::canonicalize(physical_root).unwrap();
+        let roots =
+            NamedRoots::from_canonical_roots(BTreeMap::from([("src".to_owned(), physical_root)]))
+                .unwrap();
+
+        test_support::run(0x4553_4341_5045_0001, 512, |ctx| {
+            let leaf = test_support::safe_component(ctx);
+            std::fs::create_dir_all(outside.join(&leaf)).unwrap();
+            let logical = if noprop::sample_bool(ctx) {
+                format!("src/../outside/{leaf}")
+            } else {
+                format!("src/escape-link/{leaf}")
+            };
+            assert!(
+                roots.resolve(&logical).is_err(),
+                "escape unexpectedly resolved: {logical:?}"
+            );
+            Ok(())
+        })
     }
 }

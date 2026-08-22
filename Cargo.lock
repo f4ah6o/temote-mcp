@@ -696,6 +696,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "noprop"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73026775e276cb339c67cdf71b2a8c067991fbe1cfbf25e17c7420afe6f829f7"
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1223,6 +1229,7 @@ dependencies = [
  "http-body-util",
  "jsonwebtoken",
  "libc",
+ "noprop",
  "reqwest",
  "seccompiler",
  "serde",
