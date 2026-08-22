@@ -14,9 +14,9 @@ This repository is derived from [`nakasyou/local-mcp`](https://github.com/nakasy
 
 ## Sandboxing
 
-Linux command isolation uses `codex-sandboxing`, `codex-linux-sandbox`, `codex-protocol`, and `codex-utils-absolute-path` from [`openai/codex`](https://github.com/openai/codex). They are licensed under the Apache License 2.0 and pinned to a Git revision in [`Cargo.toml`](Cargo.toml).
+The Linux sandbox implementation in [`src/sandbox/linux/`](src/sandbox/linux/) was developed from an audit of [`openai/codex`](https://github.com/openai/codex) at revision `20fedafff83f5c681fc62f73b0ca3227e42e3f8b`, licensed under the Apache License 2.0. The imported scope is limited to Linux sandboxing concepts and behavior from Codex's sandboxing and linux-sandbox components: filesystem isolation, bubblewrap namespace setup, restricted networking/seccomp hardening, and helper execution. Temote replaces the Codex permission/protocol topology with its own minimal policy and packages `temote-linux-sandbox` in the `temote-mcp` Cargo package. See [`docs/linux-sandbox.md`](docs/linux-sandbox.md) for the exact upstream areas, intentionally omitted components, and local modifications.
 
-The macOS Seatbelt base policy in [`src/sandbox/macos_base_policy.sbpl`](src/sandbox/macos_base_policy.sbpl) is derived from the same OpenAI Codex revision. temote-mcp's Seatbelt policy builder does not port the general Codex permission model; it implements the filesystem and network boundaries needed by temote-mcp. The Apache License 2.0 text is included in [`LICENSE-APACHE`](LICENSE-APACHE). Required upstream attribution is retained: OpenAI Codex, Copyright 2025 OpenAI.
+The macOS Seatbelt base policy in [`src/sandbox/macos_base_policy.sbpl`](src/sandbox/macos_base_policy.sbpl) is derived from the same OpenAI Codex revision. temote-mcp's Seatbelt policy builder does not port the general Codex permission model; it implements the filesystem and network boundaries needed by temote-mcp. The Apache License 2.0 text is included in [`LICENSE-APACHE`](LICENSE-APACHE). Required upstream attribution is retained for both sandbox implementations: OpenAI Codex, Copyright 2025 OpenAI.
 
 ## Rust dependencies
 

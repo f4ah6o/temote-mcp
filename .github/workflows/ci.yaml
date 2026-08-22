@@ -27,7 +27,13 @@ jobs:
           components: rustfmt, clippy
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+
+      - name: Check no-default-features
+        run: cargo check --no-default-features --all-targets --locked
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -54,7 +60,11 @@ jobs:
 
       - name: Build Linux sandbox helper
         if: runner.os == 'Linux'
-        run: cargo build --bin codex-linux-sandbox --locked
+        run: cargo build --bin temote-linux-sandbox --locked
+
+      - name: Linux live sandbox acceptance
+        if: runner.os == 'Linux'
+        run: cargo test --lib --all-features --locked linux_tests -- --nocapture
 
       - name: Test
         run: cargo test --all-targets --all-features --locked
@@ -79,22 +89,114 @@ jobs:
           metadata = json.loads(raw)
           nodes = metadata["resolve"]["nodes"]
           packages = {package["id"]: package for package in metadata["packages"]}
-          names = {packages[node["id"]]["name"] for node in nodes}
-          required = {
-              "codex-linux-sandbox",
-              "codex-protocol",
-              "codex-sandboxing",
-              "codex-utils-absolute-path",
-          }
-          missing = sorted(required - names)
-          if missing:
-              raise SystemExit(f"Linux Codex sandbox packages missing: {missing}")
-          if len(nodes) > 450:
-              raise SystemExit(
-                  f"Linux resolved package count {len(nodes)} exceeds 450"
-              )
+          root = metadata["resolve"]["root"]
+          forbidden = sorted({
+              packages[node["id"]]["name"]
+              for node in nodes
+              if packages[node["id"]]["name"] == "codex"
+              or packages[node["id"]]["name"].startswith("codex-")
+              or packages[node["id"]]["name"].startswith("unofficial-codex-")
+          })
+          if forbidden:
+              raise SystemExit(f"forbidden runtime packages remain: {forbidden}")
+          non_registry = sorted({
+              packages[node["id"]]["name"]
+              for node in nodes
+              if node["id"] != root
+              and not (packages[node["id"]].get("source") or "").startswith("registry+")
+          })
+          if non_registry:
+              raise SystemExit(f"non-registry runtime packages remain: {non_registry}")
           print(f"x86_64-unknown-linux-gnu: {len(nodes)} packages")
           PY
+
+      - name: Verify packaged crate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          python3 - <<'PY'
+          import glob
+          import io
+          import pathlib
+          import tarfile
+          import tomllib
+
+          crates = sorted(glob.glob("target/package/temote-mcp-*.crate"))
+          if not crates:
+              raise SystemExit("cargo package did not produce a temote-mcp crate")
+          crate = pathlib.Path(crates[-1])
+          with tarfile.open(crate) as archive:
+              manifest_names = [
+                  name for name in archive.getnames()
+                  if name.count("/") == 1 and name.endswith("/Cargo.toml")
+              ]
+              if len(manifest_names) != 1:
+                  raise SystemExit(f"unexpected packaged manifests: {manifest_names}")
+              package_root = manifest_names[0].split("/", 1)[0]
+              manifest = tomllib.loads(
+                  archive.extractfile(manifest_names[0]).read().decode()
+              )
+              members = set(archive.getnames())
+          if f"{package_root}/src/bin/temote-linux-sandbox.rs" not in members:
+              raise SystemExit("temote-linux-sandbox source is missing from the crate")
+          if f"{package_root}/docs/linux-sandbox.md" not in members:
+              raise SystemExit("Linux sandbox provenance documentation is missing from the crate")
+          if f"{package_root}/THIRD_PARTY_NOTICES.md" not in members:
+              raise SystemExit("third-party notice is missing from the crate")
+          forbidden = []
+
+          def visit(value, path=()):
+              if isinstance(value, dict):
+                  if "git" in value:
+                      forbidden.append((path, "git dependency"))
+                  for key, child in value.items():
+                      visit(child, path + (key,))
+              elif isinstance(value, list):
+                  for child in value:
+                      visit(child, path)
+
+          visit(manifest.get("dependencies", {}), ("dependencies",))
+          visit(manifest.get("dev-dependencies", {}), ("dev-dependencies",))
+          visit(manifest.get("build-dependencies", {}), ("build-dependencies",))
+          for target, target_table in manifest.get("target", {}).items():
+              visit(target_table, ("target", target))
+          def check_dependency_names(table, path):
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  for name, spec in table.get(section, {}).items():
+                      package_name = spec.get("package", name) if isinstance(spec, dict) else name
+                      if (
+                          package_name == "codex"
+                          or package_name.startswith("codex-")
+                          or package_name.startswith("unofficial-codex-")
+                      ):
+                          forbidden.append((path + (section, name), package_name))
+
+          check_dependency_names(manifest, ())
+          for target, target_table in manifest.get("target", {}).items():
+              check_dependency_names(target_table, ("target", target))
+          if forbidden:
+              raise SystemExit(f"forbidden packaged dependencies: {forbidden}")
+          print(f"checked {crate}")
+          PY
+
+
+      - name: Install from packaged crate source
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate="$(ls -1t target/package/temote-mcp-*.crate | head -n1)"
+          extract_root="$(mktemp -d)"
+          install_root="$(mktemp -d)"
+          trap 'rm -rf "$extract_root" "$install_root"' EXIT
+          tar -xzf "$crate" -C "$extract_root"
+          package_root="$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d -name 'temote-mcp-*' -print -quit)"
+          test -n "$package_root"
+          cargo install --path "$package_root" --root "$install_root" --locked --force
+          test -x "$install_root/bin/temote-mcp"
+          test -x "$install_root/bin/temote-linux-sandbox"
+          "$install_root/bin/temote-mcp" --version
 
       - name: Verify macOS dependency boundary
         if: runner.os == 'macOS'
@@ -116,16 +218,27 @@ jobs:
               metadata = json.loads(raw)
               nodes = metadata["resolve"]["nodes"]
               packages = {package["id"]: package for package in metadata["packages"]}
-              codex = sorted({
+              forbidden = sorted({
                   packages[node["id"]]["name"]
                   for node in nodes
-                  if packages[node["id"]]["name"].startswith("codex-")
+                  if packages[node["id"]]["name"] == "codex"
+                  or packages[node["id"]]["name"].startswith("codex-")
+                  or packages[node["id"]]["name"].startswith("unofficial-codex-")
               })
-              if codex:
-                  raise SystemExit(f"{target}: Codex packages remain: {codex}")
+              if forbidden:
+                  raise SystemExit(f"{target}: forbidden packages remain: {forbidden}")
+              root = metadata["resolve"]["root"]
+              non_registry = sorted({
+                  packages[node["id"]]["name"]
+                  for node in nodes
+                  if node["id"] != root
+                  and not (packages[node["id"]].get("source") or "").startswith("registry+")
+              })
+              if non_registry:
+                  raise SystemExit(f"{target}: non-registry packages remain: {non_registry}")
               if len(nodes) > maximum:
                   raise SystemExit(
                       f"{target}: resolved package count {len(nodes)} exceeds {maximum}"
                   )
-              print(f"{target}: {len(nodes)} packages, codex=0")
+              print(f"{target}: {len(nodes)} packages, forbidden=0, registry-only")
           PY

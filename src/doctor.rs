@@ -146,7 +146,10 @@ pub async fn run(options: Options) -> Result<()> {
     #[cfg(target_os = "macos")]
     report.add(Check::pass("sandbox backend", "native macOS Seatbelt"));
     #[cfg(target_os = "linux")]
-    report.add(Check::pass("sandbox backend", "Codex Linux sandbox"));
+    report.add(Check::pass(
+        "sandbox backend",
+        "Temote Linux bubblewrap sandbox",
+    ));
 
     #[cfg(target_os = "linux")]
     {
@@ -560,14 +563,27 @@ fn check_linux_helper(report: &mut Report) -> Result<bool> {
     let directory = executable
         .parent()
         .context("temote-mcp executable has no parent directory")?;
-    let helper = directory.join("codex-linux-sandbox");
-    if helper.is_file() {
+    let candidates = if directory.file_name().is_some_and(|name| name == "deps") {
+        directory
+            .parent()
+            .map(|profile| {
+                vec![
+                    directory.join("temote-linux-sandbox"),
+                    profile.join("temote-linux-sandbox"),
+                ]
+            })
+            .unwrap_or_else(|| vec![directory.join("temote-linux-sandbox")])
+    } else {
+        vec![directory.join("temote-linux-sandbox")]
+    };
+    if let Some(helper) = candidates.into_iter().find(|candidate| candidate.is_file()) {
         report.add(Check::pass(
             "sandbox helper",
             format!("{}", helper.display()),
         ));
         Ok(true)
     } else {
+        let helper = directory.join("temote-linux-sandbox");
         report.add(Check::fail(
             "sandbox helper",
             format!("missing {}", helper.display()),

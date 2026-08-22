@@ -9,14 +9,14 @@ Temote MCP exposes local files, commands, and selected host integrations as MCP 
 Prebuilt binaries are available through `cargo-binstall`:
 
 ```sh
-cargo binstall --git https://github.com/f4ah6o/temote-mcp temote-mcp
+cargo binstall temote-mcp
 temote-mcp doctor
 ```
 
 To build from source instead:
 
 ```sh
-cargo install --git https://github.com/f4ah6o/temote-mcp --locked
+cargo install temote-mcp --locked
 ```
 
 Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are not supported; WSL2 can be used for the gateway endpoint path.
@@ -68,6 +68,7 @@ Specify `--agent codex`, `--agent claude-code`, or another supported agent when 
 - [Public HTTP endpoint and Cloudflare Access](docs/public-http.md)
 - [1Password and kintone integrations](docs/integrations.md)
 - [Multi-host Cloudflare gateway](docs/gateway.md)
+- [Linux sandbox and crates.io packaging](docs/linux-sandbox.md)
 - [Building, testing, and releasing](docs/development.md)
 
 In a repository checkout, `just up` and `just down` are development wrappers that build or select the checkout binary and delegate to these commands. Installed users do not need `just`.

@@ -9,14 +9,14 @@ Temote MCP は、手元のファイル・コマンド・一部のホスト連携
 ビルド済みバイナリは `cargo-binstall` で導入できます。
 
 ```sh
-cargo binstall --git https://github.com/f4ah6o/temote-mcp temote-mcp
+cargo binstall temote-mcp
 temote-mcp doctor
 ```
 
 ソースからビルドする場合は次を使います。
 
 ```sh
-cargo install --git https://github.com/f4ah6o/temote-mcp --locked
+cargo install temote-mcp --locked
 ```
 
 Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネイティブは未対応で、gateway endpoint では WSL2 を利用できます。
@@ -68,6 +68,7 @@ gh skill install f4ah6o/temote-mcp temote-mcp --scope user
 - [公開 HTTP endpoint と Cloudflare Access](docs/public-http.ja.md)
 - [1Password / kintone 連携](docs/integrations.ja.md)
 - [multi-host Cloudflare gateway](docs/gateway.ja.md)
+- [Linux sandbox と crates.io packaging](docs/linux-sandbox.ja.md)
 - [build / test / release](docs/development.md)
 
 repository checkout では `just up` / `just down` が checkout の binary を build・選択して CLI へ委譲する開発用 wrapper です。インストール済み binary の運用に `just` は必要ありません。

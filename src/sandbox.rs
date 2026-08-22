@@ -5,18 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "linux")]
-use codex_protocol::models::PermissionProfile;
-#[cfg(target_os = "linux")]
-use codex_protocol::permissions::{
-    FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
-    NetworkSandboxPolicy,
-};
-#[cfg(target_os = "linux")]
-use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -29,39 +22,6 @@ pub struct Output {
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
-}
-
-#[cfg(target_os = "linux")]
-fn linux_sandbox_executable() -> Result<PathBuf> {
-    let executable = std::env::current_exe()?;
-    let directory = executable
-        .parent()
-        .context("temote-mcp executable has no parent directory")?;
-    let sibling = directory.join("codex-linux-sandbox");
-    if sibling.is_file() {
-        return Ok(sibling);
-    }
-
-    if directory.file_name().is_some_and(|name| name == "deps")
-        && let Some(profile_directory) = directory.parent()
-    {
-        let test_sibling = profile_directory.join("codex-linux-sandbox");
-        if test_sibling.is_file() {
-            return Ok(test_sibling);
-        }
-    }
-
-    anyhow::bail!("sandbox helper is missing next to {}", executable.display())
-}
-
-#[cfg(target_os = "linux")]
-fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    AbsolutePathBuf::from_absolute_path(path).map_err(|error| anyhow::anyhow!(error))
 }
 
 pub async fn run(
@@ -80,10 +40,37 @@ pub async fn run_git(
     command: &[String],
     cwd: &Path,
     writable_roots: &[PathBuf],
-    git_metadata_roots: &[PathBuf],
+    provided_git_metadata_roots: &[PathBuf],
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
-    run_with_metadata_roots(command, cwd, writable_roots, git_metadata_roots, stdin).await
+    let validated_roots = git_metadata_roots(cwd)?;
+    anyhow::ensure!(
+        provided_git_metadata_roots == validated_roots,
+        "Git metadata roots do not match the validated repository at {}",
+        cwd.display()
+    );
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    let mut permitted_roots = vec![cwd.clone()];
+    permitted_roots.extend(
+        writable_roots
+            .iter()
+            .map(|path| {
+                std::fs::canonicalize(path)
+                    .with_context(|| format!("cannot resolve writable root {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    for git_root in &validated_roots {
+        anyhow::ensure!(
+            permitted_roots
+                .iter()
+                .any(|permitted| git_root.starts_with(permitted)),
+            "Git metadata root is outside the permitted session roots: {}",
+            git_root.display()
+        );
+    }
+    run_with_metadata_roots(command, &cwd, writable_roots, &validated_roots, stdin).await
 }
 
 async fn run_with_metadata_roots(
@@ -96,36 +83,7 @@ async fn run_with_metadata_roots(
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
-    #[cfg(target_os = "linux")]
-    let permissions = {
-        let roots = writable_roots
-            .iter()
-            .map(|path| absolute(path))
-            .collect::<Result<Vec<_>>>()?;
-        let permissions = PermissionProfile::workspace_write_with(
-            &roots,
-            NetworkSandboxPolicy::Restricted,
-            false, // keep the configured temporary directory available
-            false, // keep /tmp available for ordinary shell commands
-        )
-        .materialize_project_roots_with_workspace_roots(&[absolute(&cwd)?]);
-        if git_metadata_roots.is_empty() {
-            permissions
-        } else {
-            let git_roots = git_metadata_roots
-                .iter()
-                .map(|path| absolute(path))
-                .collect::<Result<Vec<_>>>()?;
-            let mut file_system = permissions.file_system_sandbox_policy();
-            file_system = file_system.with_additional_writable_roots(&cwd, &git_roots);
-            add_git_metadata_read_only_entries(&mut file_system, &git_roots);
-            PermissionProfile::from_runtime_permissions(
-                &file_system,
-                NetworkSandboxPolicy::Restricted,
-            )
-        }
-    };
-
+    validate_writable_scope(&cwd, writable_roots)?;
     #[cfg(target_os = "macos")]
     let spec = if git_metadata_roots.is_empty() {
         policy::SandboxSpec::command(&cwd, writable_roots)?
@@ -134,21 +92,7 @@ async fn run_with_metadata_roots(
     };
 
     #[cfg(target_os = "linux")]
-    let mut process = {
-        let args =
-            codex_sandboxing::landlock::create_linux_sandbox_command_args_for_permission_profile(
-                command.to_vec(),
-                &cwd,
-                &permissions,
-                &cwd,
-                false,
-                false,
-            );
-        let executable = linux_sandbox_executable()?;
-        let mut process = Command::new(executable);
-        process.args(args);
-        process
-    };
+    let mut process = linux::command(command, &cwd, writable_roots, git_metadata_roots)?;
 
     #[cfg(target_os = "macos")]
     let mut process = macos::command(&spec, command)?;
@@ -188,21 +132,43 @@ pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
     let worktree_root = git_worktree_root(&cwd)?;
     let dot_git_path = worktree_root.join(".git");
+    let dot_git_metadata = std::fs::symlink_metadata(&dot_git_path).with_context(|| {
+        format!(
+            "cannot inspect Git metadata pointer {}",
+            dot_git_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !dot_git_metadata.file_type().is_symlink(),
+        "symbolic-link .git metadata pointers are not supported: {}",
+        dot_git_path.display()
+    );
+    let dot_git_is_directory = dot_git_metadata.file_type().is_dir();
     let dot_git = std::fs::canonicalize(&dot_git_path).with_context(|| {
         format!(
             "cannot resolve Git metadata pointer {}",
             dot_git_path.display()
         )
     })?;
-    let git_dir = if dot_git.is_dir() {
+    anyhow::ensure!(
+        dot_git_is_directory || dot_git_metadata.file_type().is_file(),
+        "Git metadata pointer is neither a directory nor a file: {}",
+        dot_git_path.display()
+    );
+    let git_dir = if dot_git_is_directory {
         dot_git.clone()
     } else {
         resolve_git_pointer(&dot_git_path)?
     };
     let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
         Ok(value) => {
-            let relative = value.trim();
+            let mut lines = value.lines().filter(|line| !line.trim().is_empty());
+            let relative = lines.next().map(str::trim).unwrap_or_default();
             anyhow::ensure!(!relative.is_empty(), "Git commondir is empty");
+            anyhow::ensure!(
+                lines.next().is_none(),
+                "Git commondir contains unexpected extra content"
+            );
             let path = git_dir.join(relative);
             std::fs::canonicalize(&path).with_context(|| {
                 format!("cannot resolve Git common directory {}", path.display())
@@ -211,16 +177,26 @@ pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
         Err(error) => return Err(error).context("cannot read Git commondir"),
     };
+    if dot_git_is_directory {
+        anyhow::ensure!(
+            common_dir == git_dir,
+            "unexpected Git commondir in a regular repository: {}",
+            dot_git_path.display()
+        );
+    }
     let common_parent = common_dir
         .parent()
         .context("Git common directory has no parent")?;
-    if dot_git_path.is_file() {
+    if !dot_git_is_directory {
         // A linked worktree may live outside the common repository directory.
         // Only accept Git's standard private worktree metadata in that case,
         // and verify its back-pointer so an arbitrary `.git` pointer cannot
         // grant write access to an unrelated directory.
+        let worktrees = common_dir.join("worktrees");
         anyhow::ensure!(
-            git_dir != common_dir && git_dir.starts_with(common_dir.join("worktrees")),
+            git_dir != common_dir
+                && git_dir.parent() == Some(worktrees.as_path())
+                && worktrees.is_dir(),
             "Git metadata is outside the working directory ancestry: {}",
             common_dir.display()
         );
@@ -257,14 +233,26 @@ pub fn git_worktree_root(cwd: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(dot_git)
+        .with_context(|| format!("cannot inspect Git pointer {}", dot_git.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "Git pointer is not a regular file: {}",
+        dot_git.display()
+    );
     let contents = std::fs::read_to_string(dot_git)
         .with_context(|| format!("cannot read Git pointer {}", dot_git.display()))?;
-    let value = contents
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:"))
+    let mut lines = contents.lines();
+    let value = lines
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .context("Git pointer does not contain a gitdir path")?;
+    anyhow::ensure!(
+        lines.all(|line| line.trim().is_empty()),
+        "Git pointer contains unexpected extra content"
+    );
     let path = PathBuf::from(value);
     let path = if path.is_absolute() {
         path
@@ -279,14 +267,22 @@ fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_plain_git_pointer(pointer: &Path) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(pointer)
+        .with_context(|| format!("cannot inspect Git pointer {}", pointer.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "Git pointer is not a regular file: {}",
+        pointer.display()
+    );
     let contents = std::fs::read_to_string(pointer)
         .with_context(|| format!("cannot read Git pointer {}", pointer.display()))?;
-    let value = contents
-        .trim()
-        .lines()
-        .next()
-        .filter(|value| !value.is_empty())
-        .context("Git pointer is empty")?;
+    let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
+    let value = lines.next().map(str::trim);
+    anyhow::ensure!(
+        value.is_some() && lines.next().is_none(),
+        "Git pointer must contain exactly one non-empty path"
+    );
+    let value = value.expect("validated Git pointer path");
     let path = PathBuf::from(value);
     let path = if path.is_absolute() {
         path
@@ -300,53 +296,31 @@ fn resolve_plain_git_pointer(pointer: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve Git pointer target {}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
-fn add_git_metadata_read_only_entries(
-    policy: &mut FileSystemSandboxPolicy,
-    git_roots: &[AbsolutePathBuf],
-) {
-    // `git add` and `git commit` need the index, objects, refs, and reflogs.
-    // Keep configuration, hooks, and unrelated ref/object stores protected.
-    const READ_ONLY_PATHS: &[&str] = &[
-        "config",
-        "hooks",
-        "info",
-        "attributes",
-        "description",
-        "packed-refs",
-        "shallow",
-        "worktrees",
-        "refs/tags",
-        "refs/remotes",
-        "objects/info",
-        "objects/pack",
-    ];
-    for root in git_roots {
-        // A linked worktree's private directory contains per-worktree state
-        // that Git may lazily initialize (including config and hooks
-        // directories). It is not shared with other worktrees, so leave that
-        // private root writable while protecting the common repository root
-        // below.
-        if root.join("gitdir").is_file() {
-            for suffix in ["gitdir", "commondir"] {
-                policy.entries.push(FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: root.join(suffix),
-                    },
-                    access: FileSystemAccessMode::Read,
-                });
-            }
-            continue;
-        }
-        for suffix in READ_ONLY_PATHS {
-            policy.entries.push(FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: root.join(suffix),
-                },
-                access: FileSystemAccessMode::Read,
-            });
-        }
+fn validate_writable_scope(cwd: &Path, writable_roots: &[PathBuf]) -> Result<()> {
+    anyhow::ensure!(
+        !is_protected_metadata_location(cwd),
+        "sandbox cwd must not be inside protected metadata: {}",
+        cwd.display()
+    );
+    for root in writable_roots {
+        let canonical = std::fs::canonicalize(root)
+            .with_context(|| format!("cannot resolve writable root {}", root.display()))?;
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "writable root must not be inside protected metadata: {}",
+            canonical.display()
+        );
     }
+    Ok(())
+}
+
+fn is_protected_metadata_location(path: &Path) -> bool {
+    path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        matches!(name.to_str(), Some(".git" | ".agents" | ".codex"))
+    })
 }
 
 pub async fn run_unrestricted(
@@ -606,29 +580,308 @@ mod generic_tests {
         assert!(error.to_string().contains("outside the working directory"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
-    fn linux_git_metadata_policy_keeps_hooks_and_config_read_only() {
-        let repository = tempfile::tempdir().unwrap();
-        let git = repository.path().join(".git");
-        std::fs::create_dir_all(git.join("hooks")).unwrap();
-        let root = absolute(repository.path()).unwrap();
-        let mut file_system = PermissionProfile::workspace_write_with(
-            std::slice::from_ref(&root),
-            NetworkSandboxPolicy::Restricted,
-            false,
-            false,
-        )
-        .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&root))
-        .file_system_sandbox_policy();
-        let git = absolute(&git).unwrap();
-        file_system = file_system
-            .with_additional_writable_roots(repository.path(), std::slice::from_ref(&git));
-        add_git_metadata_read_only_entries(&mut file_system, std::slice::from_ref(&git));
+    fn rejects_a_symbolic_link_git_pointer() {
+        let worktree = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(unrelated.path(), worktree.path().join(".git")).unwrap();
 
-        assert!(file_system.can_write_path_with_cwd(&git.join("objects"), repository.path()));
-        assert!(!file_system.can_write_path_with_cwd(&git.join("config"), repository.path()));
-        assert!(!file_system.can_write_path_with_cwd(&git.join("hooks"), repository.path()));
+        let error = git_metadata_roots(worktree.path()).unwrap_err();
+
+        assert!(error.to_string().contains("symbolic-link .git"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_root() -> tempfile::TempDir {
+        tempfile::tempdir_in("/var/tmp").expect("/var/tmp is required for Linux sandbox tests")
+    }
+
+    fn command(program: &str, args: &[&str]) -> Vec<String> {
+        std::iter::once(program.to_owned())
+            .chain(args.iter().map(|arg| (*arg).to_owned()))
+            .collect()
+    }
+
+    fn host_git(cwd: &Path, args: &[&str]) -> Result<()> {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(cwd)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "host git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_filesystem_policy_allows_only_workspace_explicit_and_tmp_writes() -> Result<()> {
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        let explicit = root.path().join("explicit");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&explicit)?;
+        std::fs::write(workspace.join("input"), b"readable\n")?;
+
+        let read = run(
+            &command("/bin/sh", &["-c", "test \"$(cat input)\" = readable"]),
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(read.status, 0, "{}", read.stderr);
+
+        let cwd_write = run(
+            &command("/usr/bin/touch", &["cwd-write"]),
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(cwd_write.status, 0, "{}", cwd_write.stderr);
+        assert!(workspace.join("cwd-write").is_file());
+
+        let explicit_marker = explicit.join("explicit-write");
+        let explicit_write = run(
+            &command("/usr/bin/touch", &[explicit_marker.to_str().unwrap()]),
+            &workspace,
+            std::slice::from_ref(&explicit),
+            None,
+        )
+        .await?;
+        assert_eq!(explicit_write.status, 0, "{}", explicit_write.stderr);
+        assert!(explicit_marker.is_file());
+
+        let tmp_marker = PathBuf::from("/tmp").join(format!("temote-mcp-{}", Uuid::new_v4()));
+        let tmp_write = run(
+            &command("/usr/bin/touch", &[tmp_marker.to_str().unwrap()]),
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(tmp_write.status, 0, "{}", tmp_write.stderr);
+        assert!(tmp_marker.is_file());
+
+        let outside_marker =
+            PathBuf::from("/var/tmp").join(format!("temote-mcp-{}", Uuid::new_v4()));
+        let outside_write = run(
+            &command("/usr/bin/touch", &[outside_marker.to_str().unwrap()]),
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(outside_write.status, 0);
+        assert!(!outside_marker.exists());
+
+        let _ = std::fs::remove_file(tmp_marker);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_normal_git_metadata_is_read_only_but_run_git_can_commit() -> Result<()> {
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        host_git(&workspace, &["init", "-q"])?;
+        std::fs::write(workspace.join("tracked.txt"), b"tracked\n")?;
+        let writable_root = root.path().to_path_buf();
+        let git = workspace.join(".git");
+        let config = git.join("config");
+        let git_roots = git_metadata_roots(&workspace)?;
+
+        let ordinary = run(
+            &command("/usr/bin/touch", &[git.join("index").to_str().unwrap()]),
+            &workspace,
+            std::slice::from_ref(&writable_root),
+            None,
+        )
+        .await?;
+        assert_ne!(ordinary.status, 0);
+        assert!(!git.join("index").exists());
+
+        let add = run_git(
+            &command("/usr/bin/git", &["add", "--", "tracked.txt"]),
+            &workspace,
+            std::slice::from_ref(&writable_root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(add.status, 0, "{}", add.stderr);
+
+        let commit = run_git(
+            &command(
+                "/usr/bin/git",
+                &[
+                    "-c",
+                    "user.name=temote-mcp test",
+                    "-c",
+                    "user.email=temote-mcp@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "--no-verify",
+                    "--no-gpg-sign",
+                    "-m",
+                    "linux sandbox acceptance",
+                ],
+            ),
+            &workspace,
+            std::slice::from_ref(&writable_root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(commit.status, 0, "{}", commit.stderr);
+
+        let protected = run_git(
+            &command("/usr/bin/touch", &[config.to_str().unwrap()]),
+            &workspace,
+            std::slice::from_ref(&writable_root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_ne!(protected.status, 0);
+
+        let head = std::process::Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&workspace)
+            .output()?;
+        assert!(
+            head.status.success(),
+            "{}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_linked_worktree_git_operation_is_supported() -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&repository)?;
+        host_git(&repository, &["init", "-q"])?;
+        std::fs::write(repository.join("base.txt"), b"base\n")?;
+        host_git(&repository, &["add", "--", "base.txt"])?;
+        host_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=temote-mcp test",
+                "-c",
+                "user.email=temote-mcp@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )?;
+        host_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        )?;
+        std::fs::write(worktree.join("feature.txt"), b"feature\n")?;
+        let writable_root = root.path().to_path_buf();
+        let git_roots = git_metadata_roots(&worktree)?;
+        assert_eq!(git_roots.len(), 2);
+
+        let add = run_git(
+            &command("/usr/bin/git", &["add", "--", "feature.txt"]),
+            &worktree,
+            std::slice::from_ref(&writable_root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(add.status, 0, "{}", add.stderr);
+
+        let commit = run_git(
+            &command(
+                "/usr/bin/git",
+                &[
+                    "-c",
+                    "user.name=temote-mcp test",
+                    "-c",
+                    "user.email=temote-mcp@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "--no-verify",
+                    "--no-gpg-sign",
+                    "-m",
+                    "linked worktree acceptance",
+                ],
+            ),
+            &worktree,
+            std::slice::from_ref(&writable_root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(commit.status, 0, "{}", commit.stderr);
+
+        let head = std::process::Command::new("/usr/bin/git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&worktree)
+            .output()?;
+        assert!(
+            head.status.success(),
+            "{}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_network_and_child_hardening_are_restricted() -> Result<()> {
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let no_new_privs = run(
+            &command(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status",
+                ],
+            ),
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(no_new_privs.status, 0, "{}", no_new_privs.stderr);
+
+        let network = run(
+            &command("/bin/bash", &["-c", "echo >/dev/tcp/198.51.100.1/80"]),
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
+        assert_ne!(network.status, 0);
+        Ok(())
     }
 }
 

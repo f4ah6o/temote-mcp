@@ -14,8 +14,9 @@ mod lifecycle;
 mod mcp;
 mod named_roots;
 mod onepassword_mcp;
-mod sandbox;
 mod supervisor;
+
+use temote_mcp::sandbox;
 
 #[cfg(feature = "network")]
 use std::net::SocketAddr;

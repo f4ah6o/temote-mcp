@@ -16,9 +16,9 @@
 
 ## Sandboxing
 
-Linux のコマンド隔離には [`openai/codex`](https://github.com/openai/codex) の `codex-sandboxing`、`codex-linux-sandbox`、`codex-protocol`、`codex-utils-absolute-path` を使っています。いずれも Apache License 2.0 で、[`Cargo.toml`](Cargo.toml) では特定の Git revision に固定しています。
+Linux sandbox 実装 [`src/sandbox/linux/`](src/sandbox/linux/) は、Apache License 2.0 で提供される [`openai/codex`](https://github.com/openai/codex) revision `20fedafff83f5c681fc62f73b0ca3227e42e3f8b` を調査して開発しています。取り込んだ範囲は Codex の sandboxing / linux-sandbox component にある Linux sandbox の概念と挙動に限定し、filesystem isolation、bubblewrap namespace、restricted network/seccomp hardening、helper execution を Temote 用に縮約しています。Codex の permission/protocol topology は持ち込まず、Temote 固有の最小 policy と、同一 `temote-mcp` Cargo package に含まれる `temote-linux-sandbox` helper に置き換えています。参照した upstream 箇所、意図的に除外した component、local modification は [`docs/linux-sandbox.md`](docs/linux-sandbox.md) に記録しています。
 
-macOS 用の Seatbelt base policy [`src/sandbox/macos_base_policy.sbpl`](src/sandbox/macos_base_policy.sbpl) も、同じ OpenAI Codex revision から派生しています。temote-mcp 側の Seatbelt policy builder は Codex の汎用 permission model 全体を移植せず、temote-mcp が必要とする filesystem/network の制約だけを実装しています。Apache License 2.0 の全文は [`LICENSE-APACHE`](LICENSE-APACHE) に収録しています。必要な attribution として OpenAI Codex, Copyright 2025 OpenAI を保持します。
+macOS 用の Seatbelt base policy [`src/sandbox/macos_base_policy.sbpl`](src/sandbox/macos_base_policy.sbpl) も、同じ OpenAI Codex revision から派生しています。temote-mcp 側の Seatbelt policy builder は Codex の汎用 permission model 全体を移植せず、temote-mcp が必要とする filesystem/network の制約だけを実装しています。Apache License 2.0 の全文は [`LICENSE-APACHE`](LICENSE-APACHE) に収録しています。両 sandbox 実装に必要な attribution として OpenAI Codex, Copyright 2025 OpenAI を保持します。
 
 ## Rust dependencies
 
