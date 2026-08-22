@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::Deserializer;
+use serde::de::{self, MapAccess, Visitor};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default)]
@@ -117,24 +119,50 @@ impl NamedRoots {
 }
 
 fn parse_json_roots(value: &str) -> Result<BTreeMap<String, String>> {
-    let parsed: Value = serde_json::from_str(value).context("invalid TEMOTE_MCP_ROOTS JSON")?;
-    let object = parsed
-        .as_object()
-        .context("TEMOTE_MCP_ROOTS JSON must be an object")?;
-    anyhow::ensure!(
-        !object.is_empty(),
-        "TEMOTE_MCP_ROOTS JSON must not be empty"
-    );
-    object
-        .iter()
-        .map(|(name, value)| {
-            let path = value
-                .as_str()
-                .with_context(|| format!("named root {name} path must be a string"))?;
-            anyhow::ensure!(!path.is_empty(), "named root {name} path must not be empty");
-            Ok((name.clone(), path.to_owned()))
-        })
-        .collect()
+    struct UniqueRootMapVisitor;
+
+    impl<'de> Visitor<'de> for UniqueRootMapVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a non-empty JSON object of unique named-root string paths")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut roots = BTreeMap::new();
+            while let Some((name, value)) = map.next_entry::<String, Value>()? {
+                let path = value.as_str().ok_or_else(|| {
+                    de::Error::custom(format!("named root {name} path must be a string"))
+                })?;
+                if path.is_empty() {
+                    return Err(de::Error::custom(format!(
+                        "named root {name} path must not be empty"
+                    )));
+                }
+                if roots.insert(name.clone(), path.to_owned()).is_some() {
+                    return Err(de::Error::custom(format!(
+                        "duplicate named root in TEMOTE_MCP_ROOTS JSON: {name}"
+                    )));
+                }
+            }
+            if roots.is_empty() {
+                return Err(de::Error::custom("TEMOTE_MCP_ROOTS JSON must not be empty"));
+            }
+            Ok(roots)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(value);
+    let roots = deserializer
+        .deserialize_map(UniqueRootMapVisitor)
+        .context("invalid TEMOTE_MCP_ROOTS JSON")?;
+    deserializer
+        .end()
+        .context("invalid trailing TEMOTE_MCP_ROOTS JSON content")?;
+    Ok(roots)
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
@@ -202,6 +230,61 @@ mod tests {
                 .to_string()
                 .contains("cannot resolve configured named root")
         );
+    }
+
+    #[test]
+    fn duplicate_json_root_names_fail_closed() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let json = format!(
+            r#"{{"src":"{}","src":"{}"}}"#,
+            root_a.path().display(),
+            root_b.path().display()
+        );
+        assert!(NamedRoots::parse(&json).is_err());
+    }
+
+    #[test]
+    fn generated_json_root_maps_round_trip_to_canonical_model() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let roots = (0..6)
+            .map(|index| {
+                let path = fixture.path().join(format!("root-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                std::fs::canonicalize(path).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        test_support::run(0x4e52_4a53_4f4e_0001, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 1..=roots.len());
+            let mut configured = BTreeMap::new();
+            let mut expected = BTreeMap::new();
+            for (index, root) in roots.iter().take(count).enumerate() {
+                let name = format!("{}-{index}", test_support::safe_component(ctx));
+                configured.insert(name.clone(), root.display().to_string());
+                expected.insert(name, root.clone());
+            }
+            let json = serde_json::to_string(&configured).unwrap();
+            let parsed = NamedRoots::parse(&json).unwrap();
+            assert_eq!(parsed.roots, expected);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_invalid_json_root_values_fail_closed() -> noprop::TestResult {
+        test_support::run(0x4e52_4a53_4f4e_0002, 512, |ctx| {
+            let name = test_support::safe_component(ctx);
+            let invalid = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => serde_json::json!({}),
+                1 => serde_json::json!({name.clone(): ""}),
+                2 => serde_json::json!({name.clone(): 42}),
+                3 => serde_json::json!({name.clone(): null}),
+                _ => serde_json::json!({name: ["not", "a", "path"]}),
+            };
+            assert!(NamedRoots::parse(&invalid.to_string()).is_err());
+            Ok(())
+        })
     }
 
     #[test]
