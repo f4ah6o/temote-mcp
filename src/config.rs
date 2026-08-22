@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_SESSION_PROBE_RESPONSE_BYTES: usize = 64;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -87,7 +91,13 @@ pub async fn load_session(id: &str) -> Result<Session> {
 
 pub async fn session_is_active(id: &str) -> Result<bool> {
     let path = socket_path(id)?;
-    let mut stream = match tokio::net::UnixStream::connect(&path).await {
+    tokio::time::timeout(SESSION_PROBE_TIMEOUT, probe_session_socket(&path))
+        .await
+        .with_context(|| format!("timed out inspecting session socket for {id}"))?
+}
+
+async fn probe_session_socket(path: &Path) -> Result<bool> {
+    let mut stream = match tokio::net::UnixStream::connect(path).await {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -101,12 +111,19 @@ pub async fn session_is_active(id: &str) -> Result<bool> {
         }
         Err(error) => return Err(error).context("failed to inspect session socket"),
     };
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     stream.write_all(br#"{"type":"probe"}"#).await?;
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
     let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
+    let read = BufReader::new(stream)
+        .take((MAX_SESSION_PROBE_RESPONSE_BYTES + 1) as u64)
+        .read_line(&mut response)
+        .await?;
+    anyhow::ensure!(
+        read <= MAX_SESSION_PROBE_RESPONSE_BYTES,
+        "session probe response exceeds {MAX_SESSION_PROBE_RESPONSE_BYTES} bytes"
+    );
     Ok(response.trim() == "active")
 }
 
@@ -241,6 +258,86 @@ mod tests {
         let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
         assert_eq!(path.parent(), Some(socket_dir().as_path()));
         assert!(path.as_os_str().len() < 104);
+    }
+
+    #[test]
+    fn generated_session_paths_are_deterministic_distinct_and_short() -> noprop::TestResult {
+        test_support::run(0x534f_434b_4554_0001, 512, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let id_a = format!("{}-{nonce:x}-a", test_support::safe_component(ctx));
+            let id_b = format!("{}-{nonce:x}-b", test_support::safe_component(ctx));
+            let socket_a = socket_path(&id_a).unwrap();
+            let socket_b = socket_path(&id_b).unwrap();
+            let state_a = session_path(&id_a).unwrap();
+            let state_b = session_path(&id_b).unwrap();
+
+            assert_eq!(socket_path(&id_a).unwrap(), socket_a);
+            assert_eq!(session_path(&id_a).unwrap(), state_a);
+            assert_ne!(socket_a, socket_b);
+            assert_ne!(state_a, state_b);
+            assert_eq!(socket_a.parent(), Some(socket_dir().as_path()));
+            assert!(
+                socket_a.as_os_str().len() < 104,
+                "socket path too long: {socket_a:?}"
+            );
+            assert!(
+                socket_b.as_os_str().len() < 104,
+                "socket path too long: {socket_b:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn stalled_session_probe_times_out_without_becoming_inactive() {
+        let id = format!("stalled-probe-{}", Uuid::new_v4());
+        let path = socket_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let error = session_is_active(&id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out inspecting session socket")
+        );
+
+        server.abort();
+        let _ = server.await;
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_session_probe_response_fails_closed() {
+        let id = format!("oversized-probe-{}", Uuid::new_v4());
+        let path = socket_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(&[b'x'; MAX_SESSION_PROBE_RESPONSE_BYTES + 1])
+                .await
+                .unwrap();
+            let _ = stream.shutdown().await;
+        });
+
+        let error = session_is_active(&id).await.unwrap_err();
+        assert!(error.to_string().contains("probe response exceeds"));
+
+        server.await.unwrap();
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[test]
