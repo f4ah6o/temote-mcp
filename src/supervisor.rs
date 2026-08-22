@@ -121,9 +121,10 @@ impl SessionSupervisor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
 
     use super::*;
+    use crate::test_support;
 
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
@@ -218,6 +219,136 @@ mod tests {
         prompt.respond(false);
         assert!(!request.await.unwrap().unwrap());
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_session_denies_pending_approval() {
+        let (_temp, roots) = fixture();
+        let (supervisor, mut approval_receiver) = SessionSupervisor::new(roots);
+        let id = format!("approval-stop-{}", uuid::Uuid::new_v4());
+        let info = supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        let request_id = id.clone();
+        let request_cwd = info.cwd.clone();
+        let request = tokio::spawn(async move {
+            approvals::request(
+                &request_id,
+                "git_pull",
+                "git pull --ff-only".to_owned(),
+                request_cwd,
+            )
+            .await
+        });
+
+        let prompt =
+            tokio::time::timeout(std::time::Duration::from_secs(2), approval_receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!request.is_finished());
+
+        supervisor.stop(&id).await.unwrap();
+        let allowed = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .expect("pending approval must resolve when its session stops")
+            .unwrap()
+            .unwrap();
+        assert!(!allowed);
+        prompt.respond(true);
+    }
+
+    #[test]
+    fn generated_start_stop_sequences_match_active_session_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x5355_5056_5354_4154, 64, |ctx| {
+            let (_temp, roots) = fixture();
+            let nonce = noprop::sample_u64(ctx);
+            let ids = [
+                format!("pbt-{nonce:x}-a"),
+                format!("pbt-{nonce:x}-b"),
+                format!("pbt-{nonce:x}-c"),
+            ];
+            let steps = (0..12)
+                .map(|_| {
+                    (
+                        noprop::sample_usize_in(ctx, 0..=3),
+                        noprop::sample_usize_in(ctx, 0..ids.len()),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            runtime.block_on(async {
+                let (supervisor, _approvals) = SessionSupervisor::new(roots);
+                let mut active = HashSet::new();
+                let mut failure = None::<String>;
+
+                for (operation, index) in steps {
+                    let id = &ids[index];
+                    match operation {
+                        0 | 1 => {
+                            let logical = if operation == 0 { "src/repo-a" } else { "src/repo-b" };
+                            let expected = !active.contains(id);
+                            let result = supervisor.start(logical, Some(id)).await;
+                            if result.is_ok() != expected {
+                                failure = Some(format!(
+                                    "start mismatch: id={id:?} logical={logical:?} expected={expected} result={result:?}"
+                                ));
+                                break;
+                            }
+                            if result.is_ok() {
+                                active.insert(id.clone());
+                            }
+                        }
+                        2 => {
+                            let expected = active.contains(id);
+                            let result = supervisor.stop(id).await;
+                            if result.is_ok() != expected {
+                                failure = Some(format!(
+                                    "stop mismatch: id={id:?} expected={expected} result={result:?}"
+                                ));
+                                break;
+                            }
+                            if result.is_ok() {
+                                active.remove(id);
+                            }
+                        }
+                        _ => {
+                            let result = supervisor.start("src/missing", Some(id)).await;
+                            if result.is_ok() {
+                                failure = Some(format!("missing root path unexpectedly started: id={id:?}"));
+                                break;
+                            }
+                        }
+                    }
+
+                    for candidate in &ids {
+                        let actual = config::session_is_active(candidate).await.unwrap();
+                        let expected = active.contains(candidate);
+                        if actual != expected {
+                            failure = Some(format!(
+                                "active-state mismatch: id={candidate:?} actual={actual} expected={expected}"
+                            ));
+                            break;
+                        }
+                    }
+                    if failure.is_some() {
+                        break;
+                    }
+                }
+
+                supervisor.shutdown().await.unwrap();
+                for id in &ids {
+                    assert!(!config::session_is_active(id).await.unwrap());
+                }
+                if let Some(failure) = failure {
+                    panic!("{failure}");
+                }
+            });
+            Ok(())
+        })
     }
 
     #[tokio::test]

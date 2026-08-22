@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -577,6 +577,7 @@ async fn run_runtime(
     kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
     kintone_cli_bridge: Arc<kintone_cli::Bridge>,
 ) -> Result<()> {
+    let (approval_lifetime, _) = watch::channel(false);
     loop {
         tokio::select! {
             connection = listener.accept() => {
@@ -654,8 +655,12 @@ async fn run_runtime(
                             error.0.respond(false);
                             continue;
                         }
+                        let mut runtime_alive = approval_lifetime.subscribe();
                         tokio::spawn(async move {
-                            let allowed = receiver.await.unwrap_or(false);
+                            let allowed = tokio::select! {
+                                response = receiver => response.unwrap_or(false),
+                                _ = runtime_alive.changed() => false,
+                            };
                             let _ = stream
                                 .write_all(if allowed { b"allow\n" } else { b"deny\n" })
                                 .await;
@@ -703,7 +708,10 @@ async fn run_runtime(
                     RuntimeCommand::Snapshot { response } => {
                         let _ = response.send(session.clone());
                     }
-                    RuntimeCommand::Shutdown => return Ok(()),
+                    RuntimeCommand::Shutdown => {
+                        let _ = approval_lifetime.send(true);
+                        return Ok(());
+                    }
                 }
             }
         }
