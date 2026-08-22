@@ -389,11 +389,17 @@ fn validate_access_service_token(
     client_id: Option<&str>,
     client_secret: Option<&str>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        client_id.is_some() == client_secret.is_some(),
-        "Cloudflare Access client ID and secret must be provided together"
-    );
-    Ok(())
+    match (client_id, client_secret) {
+        (None, None) => Ok(()),
+        (Some(client_id), Some(client_secret)) => {
+            anyhow::ensure!(
+                !client_id.trim().is_empty() && !client_secret.trim().is_empty(),
+                "Cloudflare Access client ID and secret must not be empty"
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("Cloudflare Access client ID and secret must be provided together"),
+    }
 }
 
 fn detected_platform() -> &'static str {
@@ -413,6 +419,7 @@ fn detected_platform() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn gateway_url_requires_a_secure_origin() {
@@ -435,6 +442,62 @@ mod tests {
         assert!(validate_access_service_token(Some("id"), Some("secret")).is_ok());
         assert!(validate_access_service_token(Some("id"), None).is_err());
         assert!(validate_access_service_token(None, Some("secret")).is_err());
+    }
+
+    #[test]
+    fn generated_access_service_tokens_match_presence_and_nonempty_model() -> noprop::TestResult {
+        test_support::run(0x4741_5445_544f_4b45, test_support::DEFAULT_CASES, |ctx| {
+            let id = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => None,
+                1 => Some(String::new()),
+                _ => Some(test_support::safe_component(ctx)),
+            };
+            let secret = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => None,
+                1 => Some("   ".to_owned()),
+                _ => Some(test_support::safe_component(ctx)),
+            };
+            let expected = match (id.as_deref(), secret.as_deref()) {
+                (None, None) => true,
+                (Some(id), Some(secret)) => !id.trim().is_empty() && !secret.trim().is_empty(),
+                _ => false,
+            };
+            assert_eq!(
+                validate_access_service_token(id.as_deref(), secret.as_deref()).is_ok(),
+                expected,
+                "id={id:?} secret_present={}",
+                secret.is_some()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_gateway_urls_match_secure_origin_policy() -> noprop::TestResult {
+        test_support::run(0x4741_5445_5741_5955, 512, |ctx| {
+            let host = format!("{}.example.test", test_support::safe_component(ctx));
+            let safe = format!("https://{host}/");
+            assert_eq!(
+                normalize_gateway_url(&safe).unwrap(),
+                format!("https://{host}")
+            );
+            let local_port = 1 + noprop::sample_u16(ctx) % 65534;
+            let local = format!("http://127.0.0.1:{local_port}");
+            assert_eq!(normalize_gateway_url(&local).unwrap(), local);
+
+            let unsafe_value = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => format!("http://{host}"),
+                1 => format!("https://{host}/mcp"),
+                2 => format!("https://{host}?q=1"),
+                3 => format!("https://{host}#fragment"),
+                _ => format!("https://user@{host}"),
+            };
+            assert!(
+                normalize_gateway_url(&unsafe_value).is_err(),
+                "accepted {unsafe_value:?}"
+            );
+            Ok(())
+        })
     }
 
     #[tokio::test]

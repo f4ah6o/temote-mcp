@@ -1655,6 +1655,87 @@ mod tests {
         assert_eq!(result["protocolVersion"], LATEST_LEGACY_PROTOCOL_VERSION);
     }
 
+    #[test]
+    fn generated_legacy_protocol_negotiation_matches_supported_set() -> noprop::TestResult {
+        test_support::run(0x4d43_504c_4547_4143, 512, |ctx| {
+            let requested = if noprop::sample_bool(ctx) {
+                SUPPORTED_LEGACY_PROTOCOL_VERSIONS
+                    [noprop::sample_usize_in(ctx, 0..SUPPORTED_LEGACY_PROTOCOL_VERSIONS.len())]
+                .to_owned()
+            } else {
+                format!("future-{}", test_support::safe_component(ctx))
+            };
+            let request = json!({"params": {"protocolVersion": requested}});
+            let expected = SUPPORTED_LEGACY_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|version| *version == request["params"]["protocolVersion"].as_str().unwrap())
+                .unwrap_or(LATEST_LEGACY_PROTOCOL_VERSION);
+            assert_eq!(negotiate_protocol_version(&request), expected);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_modern_meta_matches_detection_and_validation_model() -> noprop::TestResult {
+        const MODERN_KEYS: [&str; 4] = [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/logLevel",
+        ];
+        test_support::run(0x4d43_504d_4f44_4552, test_support::DEFAULT_CASES, |ctx| {
+            let mut meta = serde_json::Map::new();
+            let include_marker = noprop::sample_bool(ctx);
+            if include_marker {
+                let key = MODERN_KEYS[noprop::sample_usize_in(ctx, 0..MODERN_KEYS.len())];
+                meta.insert(key.to_owned(), Value::Null);
+            } else if noprop::sample_bool(ctx) {
+                meta.insert("unrelated".to_owned(), Value::Bool(true));
+            }
+
+            let valid_version = noprop::sample_bool(ctx);
+            let valid_caps = noprop::sample_bool(ctx);
+            if noprop::sample_bool(ctx) {
+                meta.insert(
+                    "io.modelcontextprotocol/protocolVersion".to_owned(),
+                    if valid_version {
+                        Value::String(MODERN_PROTOCOL_VERSION.to_owned())
+                    } else {
+                        Value::String("unsupported".to_owned())
+                    },
+                );
+            }
+            if noprop::sample_bool(ctx) {
+                meta.insert(
+                    "io.modelcontextprotocol/clientCapabilities".to_owned(),
+                    if valid_caps {
+                        json!({})
+                    } else {
+                        Value::String("bad".to_owned())
+                    },
+                );
+            }
+            let request = json!({"params": {"_meta": Value::Object(meta.clone())}});
+            let expected_modern = MODERN_KEYS.iter().any(|key| meta.contains_key(*key));
+            assert_eq!(modern_request(&request), expected_modern);
+
+            let expected_valid = meta
+                .get("io.modelcontextprotocol/protocolVersion")
+                .and_then(Value::as_str)
+                == Some(MODERN_PROTOCOL_VERSION)
+                && meta
+                    .get("io.modelcontextprotocol/clientCapabilities")
+                    .is_some_and(Value::is_object);
+            assert_eq!(
+                validate_modern_request(&request).is_ok(),
+                expected_valid,
+                "meta={meta:?}"
+            );
+            Ok(())
+        })
+    }
+
     #[tokio::test]
     async fn modern_discovery_advertises_only_the_modern_protocol() {
         let request = json!({

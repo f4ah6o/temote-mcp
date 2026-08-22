@@ -312,6 +312,7 @@ fn normalize_team_domain(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn normalizes_access_team_domain() {
@@ -347,5 +348,62 @@ mod tests {
             validation.aud,
             Some(["self-hosted-audience".to_owned()].into_iter().collect())
         );
+    }
+
+    #[test]
+    fn generated_audiences_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x4143_4345_5353_4155, test_support::DEFAULT_CASES, |ctx| {
+            let expected = test_support::safe_component(ctx);
+            let value = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => None,
+                1 => Some(Value::String(expected.clone())),
+                2 => Some(Value::String(test_support::safe_component(ctx))),
+                3 => Some(serde_json::json!([
+                    test_support::safe_component(ctx),
+                    expected.clone(),
+                    noprop::sample_u64(ctx)
+                ])),
+                _ => Some(serde_json::json!({"aud": expected.clone()})),
+            };
+            let model = value.as_ref().is_some_and(|value| {
+                value.as_str() == Some(expected.as_str())
+                    || value.as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item.as_str() == Some(expected.as_str()))
+                    })
+            });
+            assert_eq!(audience_matches(value.as_ref(), &expected), model);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_team_domains_accept_only_https_origins() -> noprop::TestResult {
+        test_support::run(0x4143_4345_5353_5552, 512, |ctx| {
+            let host = format!("{}.example.test", test_support::safe_component(ctx));
+            let safe = match noprop::sample_usize_in(ctx, 0..=2) {
+                0 => host.clone(),
+                1 => format!("https://{host}"),
+                _ => format!("https://{host}/"),
+            };
+            assert_eq!(
+                normalize_team_domain(&safe).unwrap(),
+                format!("https://{host}")
+            );
+
+            let unsafe_value = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => format!("http://{host}"),
+                1 => format!("https://{host}/path"),
+                2 => format!("https://{host}?q=1"),
+                3 => format!("https://{host}#fragment"),
+                _ => format!("https://user@{host}"),
+            };
+            assert!(
+                normalize_team_domain(&unsafe_value).is_err(),
+                "accepted {unsafe_value:?}"
+            );
+            Ok(())
+        })
     }
 }

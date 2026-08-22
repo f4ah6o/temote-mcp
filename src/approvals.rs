@@ -1111,6 +1111,42 @@ mod tests {
     }
 
     #[test]
+    fn generated_permission_arguments_match_command_grammar() -> noprop::TestResult {
+        test_support::run(0x5045_524d_4152_4701, test_support::DEFAULT_CASES, |ctx| {
+            let action = if noprop::sample_bool(ctx) {
+                "allow"
+            } else {
+                "revoke"
+            };
+            let prefix = if noprop::sample_bool(ctx) {
+                "/permission"
+            } else {
+                "/permissions"
+            };
+            let value = format!(
+                "/{}/{}",
+                test_support::safe_component(ctx),
+                test_support::safe_component(ctx)
+            );
+            let command = format!("{prefix} {action}   {value}   ");
+            assert_eq!(permission_arg(&command, action), Some(value.as_str()));
+
+            let invalid = match noprop::sample_usize_in(ctx, 0..=3) {
+                0 => format!("{prefix} {action}"),
+                1 => format!("{prefix} other {value}"),
+                2 => format!("permission {action} {value}"),
+                _ => format!("{prefix}{action} {value}"),
+            };
+            assert_eq!(
+                permission_arg(&invalid, action),
+                None,
+                "accepted {invalid:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn environment_name_validation_matches_shell_identifier_grammar() -> noprop::TestResult {
         test_support::run(0x454e_564e_414d_4501, test_support::DEFAULT_CASES, |ctx| {
             let name = test_support::ascii_string(ctx, 96);

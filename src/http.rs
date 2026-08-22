@@ -386,6 +386,7 @@ fn with_cors(response: impl IntoResponse) -> Response {
 mod tests {
     use super::*;
     use crate::access::AccessIdentity;
+    use crate::test_support;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -419,6 +420,31 @@ mod tests {
         );
         assert!(normalize_public_url("http://localmcp.example.test").is_err());
         assert!(normalize_public_url("https://localmcp.example.test/mcp").is_err());
+    }
+
+    #[test]
+    fn generated_public_urls_accept_only_https_origins() -> noprop::TestResult {
+        test_support::run(0x4854_5450_4f52_4947, 512, |ctx| {
+            let host = format!("{}.example.test", test_support::safe_component(ctx));
+            let safe = format!("  https://{host}/  ");
+            assert_eq!(
+                normalize_public_url(&safe).unwrap(),
+                format!("https://{host}")
+            );
+
+            let unsafe_value = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => format!("http://{host}"),
+                1 => format!("https://{host}/mcp"),
+                2 => format!("https://{host}?q=1"),
+                3 => format!("https://{host}#fragment"),
+                _ => format!("https://user@{host}"),
+            };
+            assert!(
+                normalize_public_url(&unsafe_value).is_err(),
+                "accepted {unsafe_value:?}"
+            );
+            Ok(())
+        })
     }
 
     #[tokio::test]
