@@ -1309,10 +1309,7 @@ fn reap_jobs() {
 
 async fn wait_for_session_stop(session_id: String) {
     loop {
-        if !config::session_is_active(&session_id)
-            .await
-            .unwrap_or(false)
-        {
+        if let Ok(false) = config::session_is_active(&session_id).await {
             return;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

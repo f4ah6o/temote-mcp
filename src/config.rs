@@ -127,7 +127,17 @@ async fn probe_session_socket(path: &Path) -> Result<bool> {
         read <= MAX_SESSION_PROBE_RESPONSE_BYTES,
         "session probe response exceeds {MAX_SESSION_PROBE_RESPONSE_BYTES} bytes"
     );
-    Ok(response.trim() == "active")
+    validate_session_probe_response(&response)?;
+    Ok(true)
+}
+
+fn validate_session_probe_response(response: &str) -> Result<()> {
+    anyhow::ensure!(
+        response.trim() == "active",
+        "unexpected session probe response: {:?}",
+        response.trim()
+    );
+    Ok(())
 }
 
 pub async fn remove_inactive_socket(id: &str) -> Result<()> {
@@ -357,6 +367,53 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn generated_session_probe_responses_accept_only_active() -> noprop::TestResult {
+        test_support::run(0x5052_4f42_4552_4553, test_support::DEFAULT_CASES, |ctx| {
+            let response = if noprop::sample_bool(ctx) {
+                let left = " ".repeat(noprop::sample_usize_in(ctx, 0..=3));
+                let right = "\n".repeat(noprop::sample_usize_in(ctx, 0..=3));
+                format!("{left}active{right}")
+            } else {
+                test_support::ascii_string(ctx, 24)
+            };
+            let expected = response.trim() == "active";
+            assert_eq!(
+                validate_session_probe_response(&response).is_ok(),
+                expected,
+                "response={response:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn unexpected_session_probe_response_fails_closed() {
+        let id = format!("unexpected-probe-{}", Uuid::new_v4());
+        let path = socket_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"not-active\n").await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+
+        let error = session_is_active(&id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected session probe response")
+        );
+
+        server.await.unwrap();
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[tokio::test]
