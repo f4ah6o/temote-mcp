@@ -1571,6 +1571,7 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn detects_supported_image_types() {
@@ -1746,6 +1747,78 @@ mod tests {
         ] {
             assert!(validate_git_remote(remote).is_err(), "accepted {remote:?}");
         }
+    }
+
+    #[test]
+    fn git_remote_validation_matches_reference_grammar() -> noprop::TestResult {
+        test_support::run(0x4749_5452_454d_4f54, test_support::DEFAULT_CASES, |ctx| {
+            let remote = test_support::ascii_string(ctx, 280);
+            let expected = !remote.is_empty()
+                && remote.len() <= 255
+                && !remote.starts_with('-')
+                && !remote.starts_with('/')
+                && !remote.ends_with('/')
+                && !remote.contains("..")
+                && !remote.contains("//")
+                && remote.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_./".contains(character)
+                });
+            assert_eq!(
+                validate_git_remote(&remote).is_ok(),
+                expected,
+                "Git remote grammar mismatch for {remote:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_git_paths_reject_pathspecs_and_outside_roots() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let root = config::canonical_directory(&root).unwrap();
+        let outside = config::canonical_directory(&outside).unwrap();
+        let session = config::Session {
+            id: "git-pbt".to_owned(),
+            cwd: root.clone(),
+            permitted_directories: vec![root.clone()],
+            started_at: 0,
+            process_id: 0,
+            yolo: false,
+        };
+
+        test_support::run(0x4749_5450_4154_4801, 512, |ctx| {
+            let leaf = test_support::safe_component(ctx);
+            let inside = root.join(&leaf);
+            std::fs::write(&inside, b"ok").unwrap();
+            assert!(
+                validate_git_path(&session, &leaf).is_ok(),
+                "safe path rejected: {leaf:?}"
+            );
+
+            let dangerous = match noprop::sample_usize_in(ctx, 0..5) {
+                0 => format!("-{leaf}"),
+                1 => format!(":{leaf}"),
+                2 => format!("{leaf}*"),
+                3 => format!("{leaf}?"),
+                _ => format!("{leaf}[0]"),
+            };
+            assert!(
+                validate_git_path(&session, &dangerous).is_err(),
+                "pathspec unexpectedly accepted: {dangerous:?}"
+            );
+
+            let outside_path = outside.join(&leaf);
+            std::fs::write(&outside_path, b"secret").unwrap();
+            assert!(
+                validate_git_path(&session, &outside_path.to_string_lossy()).is_err(),
+                "outside path unexpectedly accepted: {outside_path:?}"
+            );
+            Ok(())
+        })
     }
 
     #[cfg(unix)]

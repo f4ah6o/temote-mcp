@@ -26,6 +26,7 @@ pub fn run(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn ascii_string(ctx: &mut TestCaseContext, max_len: usize) -> String {
     let len = noprop::sample_usize_in(ctx, 0..=max_len);
     (0..len)

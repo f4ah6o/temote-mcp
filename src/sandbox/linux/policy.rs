@@ -295,6 +295,7 @@ pub fn missing_path_is_directory(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn serializes_only_the_temote_policy_shape() {
@@ -333,5 +334,77 @@ mod tests {
 
         let error = LinuxSandboxPolicy::for_command(root.path(), &[], &[]).unwrap_err();
         assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn generated_policy_normalizes_roots_and_preserves_protection() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let git = cwd.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let cwd = std::fs::canonicalize(cwd).unwrap();
+        let git = std::fs::canonicalize(git).unwrap();
+
+        test_support::run(0x4c49_4e55_5850_4f4c, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=6);
+            let mut requested = Vec::new();
+            for _ in 0..count {
+                let root = fixture.path().join(test_support::safe_component(ctx));
+                std::fs::create_dir_all(&root).unwrap();
+                requested.push(root.clone());
+                if noprop::sample_bool(ctx) {
+                    requested.push(root);
+                }
+            }
+            let policy =
+                LinuxSandboxPolicy::for_command(&cwd, &requested, std::slice::from_ref(&git))
+                    .unwrap();
+
+            assert!(policy.validate().is_ok());
+            assert!(policy.writable_roots.contains(&cwd));
+            assert!(policy.writable_roots.contains(&git));
+            assert!(
+                policy
+                    .writable_roots
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            );
+            for suffix in GIT_READ_ONLY_PATHS {
+                assert!(
+                    policy.read_only_paths.contains(&git.join(suffix)),
+                    "missing Git protection for {suffix}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_invalid_policy_mutations_fail_closed() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let extra = fixture.path().join("extra");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        let cwd = std::fs::canonicalize(cwd).unwrap();
+        let extra = std::fs::canonicalize(extra).unwrap();
+
+        test_support::run(0x4c49_4e55_584d_5554, 512, |ctx| {
+            let mut policy =
+                LinuxSandboxPolicy::for_command(&cwd, std::slice::from_ref(&extra), &[]).unwrap();
+            match noprop::sample_usize_in(ctx, 0..4) {
+                0 => policy.version = policy.version.saturating_add(1),
+                1 => policy.writable_roots.retain(|root| root != &cwd),
+                2 => policy.writable_roots.push(extra.clone()),
+                _ => policy
+                    .read_only_paths
+                    .push(fixture.path().join("outside-mask")),
+            }
+            assert!(
+                policy.validate().is_err(),
+                "invalid policy mutation was accepted: {policy:?}"
+            );
+            Ok(())
+        })
     }
 }

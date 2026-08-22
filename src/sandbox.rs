@@ -488,6 +488,7 @@ fn safe_environment() -> HashMap<String, String> {
 #[cfg(test)]
 mod generic_tests {
     use super::*;
+    use crate::test_support;
 
     #[tokio::test]
     async fn limits_a_stream_and_drains_the_rest() {
@@ -518,6 +519,61 @@ mod generic_tests {
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn protected_metadata_detection_matches_component_reference_model() -> noprop::TestResult {
+        const PROTECTED: [&str; 3] = [".git", ".agents", ".codex"];
+
+        test_support::run(0x5341_4e44_424f_5801, test_support::DEFAULT_CASES, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 1..=6);
+            let mut components = (0..count)
+                .map(|_| test_support::safe_component(ctx))
+                .collect::<Vec<_>>();
+            if noprop::sample_bool(ctx) {
+                let index = noprop::sample_usize_in(ctx, 0..components.len());
+                components[index] =
+                    PROTECTED[noprop::sample_usize_in(ctx, 0..PROTECTED.len())].to_owned();
+            }
+            let path = components.iter().collect::<PathBuf>();
+            let expected = components
+                .iter()
+                .any(|component| PROTECTED.contains(&component.as_str()));
+            assert_eq!(
+                is_protected_metadata_location(&path),
+                expected,
+                "metadata classification mismatch for {path:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_writable_scope_fails_closed_for_protected_metadata() -> noprop::TestResult {
+        const PROTECTED: [&str; 3] = [".git", ".agents", ".codex"];
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = std::fs::canonicalize(cwd).unwrap();
+
+        test_support::run(0x5341_4e44_5343_4f50, 512, |ctx| {
+            let protected = noprop::sample_bool(ctx);
+            let mut path = cwd.clone();
+            if protected {
+                path.push(PROTECTED[noprop::sample_usize_in(ctx, 0..PROTECTED.len())]);
+            } else {
+                path.push(test_support::safe_component(ctx));
+            }
+            path.push(test_support::safe_component(ctx));
+            std::fs::create_dir_all(&path).unwrap();
+
+            assert_eq!(
+                validate_writable_scope(&cwd, std::slice::from_ref(&path)).is_ok(),
+                !protected,
+                "writable scope classification mismatch for {path:?}"
+            );
+            Ok(())
+        })
     }
 
     #[test]
