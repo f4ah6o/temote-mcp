@@ -1262,10 +1262,15 @@ fn redact_token(text: &str, token: &str) -> String {
     }
 }
 
-fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+fn bounded_console_text_with_layout(
+    value: &str,
+    max_bytes: usize,
+    preserve_layout: bool,
+) -> std::borrow::Cow<'_, str> {
+    let is_preserved_layout = |character| preserve_layout && matches!(character, '\n' | '\t');
     let console_safe = value
         .chars()
-        .all(|character| !character.is_control() || matches!(character, '\n' | '\t'));
+        .all(|character| !character.is_control() || is_preserved_layout(character));
     if console_safe && value.len() <= max_bytes {
         return std::borrow::Cow::Borrowed(value);
     }
@@ -1281,7 +1286,7 @@ fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, s
     let mut consumed = 0usize;
 
     for character in value.chars() {
-        let escaped = if character.is_control() && !matches!(character, '\n' | '\t') {
+        let escaped = if character.is_control() && !is_preserved_layout(character) {
             Some(if character.is_ascii() {
                 format!("\\x{:02x}", character as u32)
             } else {
@@ -1310,9 +1315,13 @@ fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, s
     std::borrow::Cow::Owned(bounded)
 }
 
+fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+    bounded_console_text_with_layout(value, max_bytes, true)
+}
+
 fn bounded_console_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
-    bounded_console_text(&rendered, MAX_CONSOLE_PATH_BYTES).into_owned()
+    bounded_console_text_with_layout(&rendered, MAX_CONSOLE_PATH_BYTES, false).into_owned()
 }
 
 fn show_activity_for_session(session_id: &str, title: &str, detail: Option<&str>) {
@@ -1406,6 +1415,23 @@ mod tests {
         assert!(!bounded.contains('\r'));
         assert!(bounded.contains('\n'));
         assert!(bounded.contains('\t'));
+    }
+
+    #[test]
+    fn generated_console_paths_are_single_line_and_control_free() -> noprop::TestResult {
+        test_support::run(0x434f_4e53_5041_5448, test_support::DEFAULT_CASES, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=512);
+            let value = (0..len)
+                .map(|_| char::from(noprop::sample_u8(ctx) & 0x7f))
+                .collect::<String>();
+            let rendered = bounded_console_path(Path::new(&value));
+            assert!(rendered.len() <= MAX_CONSOLE_PATH_BYTES);
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "console path retained terminal control characters: {rendered:?}"
+            );
+            Ok(())
+        })
     }
 
     #[test]

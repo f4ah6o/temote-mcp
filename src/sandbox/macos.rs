@@ -89,6 +89,136 @@ fn ensure_utf8(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
+
+    #[test]
+    fn generated_write_policy_parameterizes_every_writable_root_and_protection()
+    -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let outer = fixture.path().join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let candidates = [
+            std::fs::canonicalize(&outer).unwrap(),
+            std::fs::canonicalize(&nested).unwrap(),
+        ];
+
+        test_support::run(0x4d41_434f_5350_4254, 512, |ctx| {
+            let requested = candidates
+                .iter()
+                .filter(|_| noprop::sample_bool(ctx))
+                .cloned()
+                .collect::<Vec<_>>();
+            let spec = SandboxSpec::command(&workspace, &requested).unwrap();
+            let (policy, definitions) = build_write_policy(&spec).unwrap();
+
+            let defined_paths = definitions
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let defined_keys = definitions
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                defined_keys.len(),
+                definitions.len(),
+                "duplicate Seatbelt parameter key"
+            );
+
+            for root in spec.writable_roots() {
+                assert!(
+                    defined_paths.contains(root),
+                    "missing writable root parameter: {root:?}"
+                );
+                assert!(
+                    !policy.contains(root.to_string_lossy().as_ref()),
+                    "raw writable root leaked into Seatbelt policy: {root:?}"
+                );
+                for protected in spec.protected_metadata_paths(root) {
+                    assert!(
+                        defined_paths.contains(&protected),
+                        "missing protected metadata exclusion: {protected:?}"
+                    );
+                    assert!(
+                        !policy.contains(protected.to_string_lossy().as_ref()),
+                        "raw protected path leaked into Seatbelt policy: {protected:?}"
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_git_policy_parameterizes_every_read_only_override() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let git = workspace.join(".git");
+        let broader = fixture.path().to_path_buf();
+        std::fs::create_dir_all(&git).unwrap();
+
+        test_support::run(0x4d41_434f_5347_4954, 512, |ctx| {
+            let writable_roots = if noprop::sample_bool(ctx) {
+                vec![broader.clone()]
+            } else {
+                vec![workspace.clone()]
+            };
+            let spec =
+                SandboxSpec::git(&workspace, &writable_roots, std::slice::from_ref(&git)).unwrap();
+            let (policy, definitions) = build_write_policy(&spec).unwrap();
+            let defined_paths = definitions
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+
+            for path in spec.read_only_overrides() {
+                assert!(
+                    defined_paths.contains(path),
+                    "missing read-only Git metadata exclusion: {path:?}"
+                );
+                assert!(
+                    !policy.contains(path.to_string_lossy().as_ref()),
+                    "raw read-only path leaked into Seatbelt policy: {path:?}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_command_argv_is_preserved_after_seatbelt_separator() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let spec = SandboxSpec::command(&workspace, &[]).unwrap();
+
+        test_support::run(0x4d41_434f_5341_5247, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 1..=8);
+            let argv = (0..count)
+                .map(|_| {
+                    test_support::ascii_string(ctx, 32)
+                        .chars()
+                        .filter(|character| *character != '\0')
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let process = command(&spec, &argv).unwrap();
+            let args = process
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let separator = args
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("Seatbelt separator");
+            assert_eq!(&args[separator + 1..], argv.as_slice());
+            Ok(())
+        })
+    }
 
     #[test]
     fn profile_has_no_network_allowance_and_uses_parameterized_paths() {
