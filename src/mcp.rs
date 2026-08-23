@@ -25,6 +25,7 @@ const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_COMPLETED_JOBS_PER_SESSION: usize = 128;
 const MAX_COMPLETED_JOBS_TOTAL: usize = 1024;
 const MAX_GIT_ADD_PATHS: usize = 256;
+const MAX_PATH_ARGUMENT_BYTES: usize = 4096;
 const MAX_COMMAND_ARGUMENTS: usize = 256;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
@@ -422,6 +423,7 @@ async fn call_tool(
             .get("path")
             .and_then(Value::as_str)
             .context("missing path")?;
+        validate_path_argument(path, "path")?;
         let session_id = object
             .get("session_id")
             .map(|value| value.as_str().context("session_id must be a string"))
@@ -540,9 +542,9 @@ async fn call_tool(
                     items
                         .iter()
                         .map(|item| {
-                            item.as_str()
-                                .map(PathBuf::from)
-                                .context("env_files entries must be strings")
+                            let value =
+                                item.as_str().context("env_files entries must be strings")?;
+                            bounded_path(value, "env_files entry")
                         })
                         .collect::<Result<Vec<_>>>()
                 })
@@ -673,10 +675,8 @@ async fn call_tool(
             let stdout_path = args
                 .get("stdout_path")
                 .map(|value| {
-                    value
-                        .as_str()
-                        .map(PathBuf::from)
-                        .context("stdout_path must be a string")
+                    let value = value.as_str().context("stdout_path must be a string")?;
+                    bounded_path(value, "stdout_path")
                 })
                 .transpose()?;
             if !approvals::request(
@@ -941,11 +941,25 @@ fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn validate_path_argument(value: &str, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        value.len() <= MAX_PATH_ARGUMENT_BYTES,
+        "{name} exceeds {MAX_PATH_ARGUMENT_BYTES} bytes"
+    );
+    Ok(())
+}
+
+fn bounded_path(value: &str, name: &str) -> Result<PathBuf> {
+    validate_path_argument(value, name)?;
+    Ok(PathBuf::from(value))
+}
+
 fn required_path(args: &Value, name: &str) -> Result<PathBuf> {
-    args.get(name)
+    let value = args
+        .get(name)
         .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .context(format!("missing {name}"))
+        .context(format!("missing {name}"))?;
+    bounded_path(value, name)
 }
 
 fn required_session_id(args: &Value) -> Result<String> {
@@ -958,7 +972,13 @@ fn required_session_id(args: &Value) -> Result<String> {
 }
 
 fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
-    let path = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+    let path = args
+        .get("cwd")
+        .map(|value| {
+            let value = value.as_str().context("cwd must be a string")?;
+            bounded_path(value, "cwd")
+        })
+        .transpose()?;
     config::resolve_cwd(session, path.as_deref())
 }
 
@@ -1272,6 +1292,7 @@ fn resolve_git_add_path(session: &config::Session, path: &str) -> Result<String>
 }
 
 fn validate_git_path(session: &config::Session, path: &str) -> Result<PathBuf> {
+    validate_path_argument(path, "Git path")?;
     anyhow::ensure!(!path.is_empty(), "Git path must not be empty");
     anyhow::ensure!(
         !path.starts_with('-'),
@@ -2579,6 +2600,27 @@ mod tests {
                 validate_git_remote(&remote).is_ok(),
                 expected,
                 "Git remote grammar mismatch for {remote:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_path_arguments_match_byte_limit() -> noprop::TestResult {
+        test_support::run(0x5041_5448_424f_554e, 512, |ctx| {
+            let length = match noprop::sample_usize_in(ctx, 0..=5) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_PATH_ARGUMENT_BYTES - 1,
+                3 => MAX_PATH_ARGUMENT_BYTES,
+                4 => MAX_PATH_ARGUMENT_BYTES + 1,
+                _ => noprop::sample_usize_in(ctx, 0..=MAX_PATH_ARGUMENT_BYTES + 256),
+            };
+            let value = "x".repeat(length);
+            assert_eq!(
+                validate_path_argument(&value, "path").is_ok(),
+                length <= MAX_PATH_ARGUMENT_BYTES,
+                "length={length}"
             );
             Ok(())
         })
