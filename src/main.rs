@@ -599,22 +599,12 @@ fn read_private_public_env(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 #[cfg(feature = "network")]
-fn quote_dotenv_value(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for character in value.chars() {
-        match character {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            '$' => quoted.push_str("\\$"),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            other => quoted.push(other),
-        }
-    }
-    quoted.push('"');
-    quoted
+fn quote_dotenv_value(value: &str) -> Result<String> {
+    anyhow::ensure!(
+        !value.chars().any(|character| matches!(character, '\0' | '\n' | '\r' | '\'')),
+        "legacy Temote env value contains characters that cannot be migrated safely"
+    );
+    Ok(format!("'{value}'"))
 }
 
 #[cfg(feature = "network")]
@@ -662,7 +652,7 @@ fn parse_legacy_cloudflare_env(
         if let Some(value) = values.get(key) {
             public_env.push_str(key);
             public_env.push('=');
-            public_env.push_str(&quote_dotenv_value(value));
+            public_env.push_str(&quote_dotenv_value(value)?);
             public_env.push('\n');
         }
     }
@@ -978,13 +968,20 @@ TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team.cloudflareaccess.com
     }
 
     #[test]
-    fn quoted_dotenv_values_round_trip_special_characters() {
-        let original = "a b$c\\d\"e\nf\tg";
-        let line = format!("VALUE={}\n", quote_dotenv_value(original));
+    fn quoted_dotenv_values_are_literal_and_round_trip() {
+        let original = "a b$c\\d\"e#f";
+        let line = format!("VALUE={}\n", quote_dotenv_value(original).unwrap());
         let parsed = dotenvy::from_read_iter(std::io::Cursor::new(line))
             .next()
             .unwrap()
             .unwrap();
         assert_eq!(parsed, ("VALUE".to_owned(), original.to_owned()));
+    }
+
+    #[test]
+    fn quoted_dotenv_values_fail_closed_on_ambiguous_characters() {
+        for value in ["line\nbreak", "carriage\rreturn", "single'quote", "nul\0byte"] {
+            assert!(quote_dotenv_value(value).is_err(), "{value:?}");
+        }
     }
 }
