@@ -7,9 +7,10 @@ use anyhow::{Context, Result};
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::digest::{SHA256, digest};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
@@ -1095,13 +1096,14 @@ fn pkce_challenge(verifier: &str) -> std::result::Result<String, OAuthError> {
             "code_verifier is invalid",
         ));
     }
-    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())))
+    Ok(URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()).as_ref()))
 }
 
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow::anyhow!("secure random generation failed: {error}"))?;
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("secure random generation failed: {error:?}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -1359,6 +1361,17 @@ mod tests {
         assert_eq!(
             pkce_challenge(verifier).unwrap(),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn random_token_keeps_32_byte_base64url_shape() {
+        let token = random_token().unwrap();
+        assert_eq!(token.len(), 43);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         );
     }
 
