@@ -1266,6 +1266,55 @@ mod tests {
     }
 
     #[test]
+    fn generated_shutdown_denies_all_pending_approvals() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x4150_5052_5348_5554, 64, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 1..=8);
+            let nonce = noprop::sample_u64(ctx);
+            runtime.block_on(async {
+                let root = tempfile::tempdir().unwrap();
+                let id = format!("approval-shutdown-{nonce:x}");
+                let (sender, mut receiver) = approval_channel();
+                let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+                    .await
+                    .unwrap();
+                let mut requests = Vec::with_capacity(count);
+                for index in 0..count {
+                    let id = id.clone();
+                    let cwd = root.path().to_path_buf();
+                    requests.push(tokio::spawn(async move {
+                        request(&id, "generated", format!("request-{index}"), cwd).await
+                    }));
+                }
+
+                for _ in 0..count {
+                    tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                        .await
+                        .expect("pending approval was not delivered")
+                        .expect("approval channel closed unexpectedly");
+                }
+
+                handle.shutdown().await.unwrap();
+                for request in requests {
+                    let allowed = tokio::time::timeout(Duration::from_secs(1), request)
+                        .await
+                        .expect("pending approval did not resolve after shutdown")
+                        .unwrap()
+                        .unwrap();
+                    assert!(!allowed, "shutdown allowed a pending approval");
+                }
+                assert!(!config::session_is_active(&id).await.unwrap());
+            });
+            Ok(())
+        })
+    }
+
+    #[test]
     fn generated_runtime_permission_sequences_match_reference_model() -> noprop::TestResult {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
