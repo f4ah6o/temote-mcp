@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
 use crate::approvals::ApprovalSender;
@@ -21,6 +21,7 @@ const TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_CLIENTS: usize = 256;
 const MAX_CODES: usize = 256;
 const MAX_TOKENS: usize = 1024;
+const MAX_PENDING_AUTHORIZATIONS: usize = 64;
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_URI_BYTES: usize = 2048;
 
@@ -29,6 +30,7 @@ pub struct LocalOAuth {
     public_url: String,
     resource: String,
     approvals: ApprovalSender,
+    approval_slots: Arc<Semaphore>,
     state: Arc<Mutex<State>>,
 }
 
@@ -140,11 +142,20 @@ struct ClientMetadataDocument {
 
 impl LocalOAuth {
     pub fn new(public_url: String, approvals: ApprovalSender) -> Self {
+        Self::with_authorization_limit(public_url, approvals, MAX_PENDING_AUTHORIZATIONS)
+    }
+
+    fn with_authorization_limit(
+        public_url: String,
+        approvals: ApprovalSender,
+        max_pending_authorizations: usize,
+    ) -> Self {
         let resource = format!("{public_url}/mcp");
         Self {
             public_url,
             resource,
             approvals,
+            approval_slots: Arc::new(Semaphore::new(max_pending_authorizations)),
             state: Arc::new(Mutex::new(State::default())),
         }
     }
@@ -300,6 +311,16 @@ impl LocalOAuth {
             ));
         }
 
+        let _approval_permit = self
+            .approval_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                OAuthError::bad_request(
+                    "temporarily_unavailable",
+                    "too many OAuth authorization requests are waiting for local approval",
+                )
+            })?;
         let detail = format!(
             "Authorize OAuth client {:?}\nclient_id: {}\nredirect: {}\nresource: {}\nscope: mcp",
             client.name, request.client_id, request.redirect_uri, request.resource
@@ -1084,6 +1105,91 @@ mod tests {
             };
             let allowed = HashSet::from([registered.clone()]);
             assert_eq!(allowed.contains(&candidate), candidate == registered);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_authorization_approval_queue_stays_bounded() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        crate::test_support::run(0x4f41_5554_4841_5051, 32, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 1..=4);
+            runtime.block_on(async {
+                let (sender, mut approvals) = approvals::approval_channel();
+                let oauth = LocalOAuth::with_authorization_limit(
+                    "https://node.example.ts.net".to_owned(),
+                    sender,
+                    limit,
+                );
+                let client_id = registered(&oauth).await;
+                let make_request = |state: String| AuthorizeRequest {
+                    response_type: "code".to_owned(),
+                    client_id: client_id.clone(),
+                    redirect_uri: "http://127.0.0.1:9876/callback".to_owned(),
+                    code_challenge: "A".repeat(43),
+                    code_challenge_method: "S256".to_owned(),
+                    resource: "https://node.example.ts.net/mcp".to_owned(),
+                    state: Some(state),
+                    scope: Some("mcp".to_owned()),
+                };
+
+                let mut waiting = Vec::with_capacity(limit);
+                for index in 0..limit {
+                    let oauth = oauth.clone();
+                    let request = make_request(format!("waiting-{index}"));
+                    waiting.push(tokio::spawn(async move { oauth.authorize(request).await }));
+                }
+                let mut prompts = Vec::with_capacity(limit);
+                for _ in 0..limit {
+                    prompts.push(
+                        tokio::time::timeout(Duration::from_secs(1), approvals.recv())
+                            .await
+                            .expect("OAuth approval prompt was not delivered")
+                            .expect("approval channel closed unexpectedly"),
+                    );
+                }
+
+                let excess = oauth
+                    .authorize(make_request("excess".to_owned()))
+                    .await
+                    .unwrap_err();
+                assert_eq!(excess.code, "temporarily_unavailable");
+                assert!(
+                    approvals.try_recv().is_err(),
+                    "over-capacity OAuth request reached approval queue"
+                );
+
+                for prompt in prompts {
+                    prompt.respond(false);
+                }
+                for task in waiting {
+                    let redirect = task.await.unwrap().unwrap();
+                    assert!(redirect.contains("error=access_denied"));
+                }
+
+                let oauth_for_recovery = oauth.clone();
+                let recovery_request = make_request("recovery".to_owned());
+                let recovery =
+                    tokio::spawn(
+                        async move { oauth_for_recovery.authorize(recovery_request).await },
+                    );
+                let prompt = tokio::time::timeout(Duration::from_secs(1), approvals.recv())
+                    .await
+                    .expect("OAuth approval capacity did not recover")
+                    .expect("approval channel closed unexpectedly");
+                prompt.respond(false);
+                assert!(
+                    recovery
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .contains("error=access_denied")
+                );
+            });
             Ok(())
         })
     }
