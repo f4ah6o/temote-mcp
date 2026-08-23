@@ -684,22 +684,9 @@ async fn session_list() -> Result<Value> {
         if config::validate_session_id(id).is_err() {
             continue;
         }
-        let session = match config::read_session_metadata(id).await {
-            Ok(session) => session,
-            Err(_) => continue,
-        };
-        let status = match config::session_is_active(&session.id).await {
-            Ok(true) => "active",
-            Ok(false) => continue,
-            Err(_) => "unknown",
-        };
-        sessions.push(json!({
-            "session_id": session.id,
-            "cwd": session.cwd,
-            "started_at": session.started_at,
-            "status": status,
-            "yolo": session.yolo,
-        }));
+        if let Some(session) = session_list_entry(id).await {
+            sessions.push(session);
+        }
     }
     sessions.sort_by_key(|session| {
         session["session_id"]
@@ -708,6 +695,22 @@ async fn session_list() -> Result<Value> {
             .to_owned()
     });
     text_result(serde_json::to_string_pretty(&sessions)?)
+}
+
+async fn session_list_entry(id: &str) -> Option<Value> {
+    let session = config::read_session_metadata(id).await.ok()?;
+    let status = match config::session_is_active(&session.id).await {
+        Ok(true) => "active",
+        Ok(false) => return None,
+        Err(_) => "unknown",
+    };
+    Some(json!({
+        "session_id": session.id,
+        "cwd": session.cwd,
+        "started_at": session.started_at,
+        "status": status,
+        "yolo": session.yolo,
+    }))
 }
 
 async fn report_result<T>(session_id: &str, title: String, result: &Result<T>) {
@@ -2235,16 +2238,11 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
 
-        let result = session_list().await.unwrap();
-        server.await.unwrap();
-        let text = result["content"][0]["text"].as_str().unwrap();
-        let sessions: Value = serde_json::from_str(text).unwrap();
-        let listed = sessions
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|session| session["session_id"] == id)
+        let listed = session_list_entry(&id)
+            .await
             .expect("ambiguous session should be surfaced");
+        server.await.unwrap();
+        assert_eq!(listed["session_id"], id);
         assert_eq!(listed["status"], "unknown");
 
         tokio::fs::remove_file(config::session_path(&id).unwrap())
