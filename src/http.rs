@@ -231,6 +231,15 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
             })));
         }
     };
+    if let Err(error) = crate::mcp::validate_rpc_request_shape(&request) {
+        return modern_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            -32600,
+            &format!("{error:#}"),
+            None,
+        );
+    }
     let started = Instant::now();
     let audit = AuditContext::from_request(&request);
     if let Some(response) = validate_modern_http_request(&headers, &request) {
@@ -685,6 +694,35 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[tokio::test]
+    async fn invalid_json_rpc_envelope_is_rejected_without_reflecting_bad_id() {
+        let response = router(runtime())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("cf-access-jwt-assertion", "test-token")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": {"attacker": "value"},
+                            "method": "tools/list"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["id"], Value::Null);
+        assert_eq!(body["error"]["code"], -32600);
+        assert!(!body.to_string().contains("attacker"));
     }
 
     #[tokio::test]

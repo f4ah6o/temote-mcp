@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -147,7 +147,7 @@ test("gateway log fields are bounded and reject structured values", () => {
   assert.equal(boundedLogField(undefined, "unknown"), "unknown");
 });
 
-test("oversized RPC identifiers cannot amplify gateway request logs", async () => {
+test("oversized RPC identifiers are rejected before gateway request logs", async () => {
   const originalLog = console.log;
   const lines = [];
   console.log = (line) => lines.push(String(line));
@@ -158,14 +158,9 @@ test("oversized RPC identifiers cannot amplify gateway request logs", async () =
       legacyToolCallRequest(hugeTool, { session_id: hugeSession }),
       { CLIENT_TOKEN: "client-token" },
     );
-    assert.equal(response.status, 200);
-    assert.equal(lines.length, 1);
-    assert.equal(lines[0].length < 2048, true, `log bytes=${lines[0].length}`);
-    const logged = JSON.parse(lines[0]);
-    assert.equal(logged.tool.length, 257);
-    assert.equal(logged.session_id.length, 257);
-    assert.equal(logged.tool.includes("tail-marker"), false);
-    assert.equal(logged.session_id.includes("tail-marker"), false);
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, -32600);
+    assert.equal(lines.length, 0);
   } finally {
     console.log = originalLog;
   }
@@ -386,6 +381,26 @@ test("protocol negotiation accepts known versions and falls back", () => {
     "2025-03-26",
   );
   assert.equal(negotiateProtocolVersion({ params: { protocolVersion: "future" } }), "2025-06-18");
+});
+
+test("JSON-RPC request shape and tool names are bounded", () => {
+  for (const id of [null, 0, 1, -1, 1.5, "", "i".repeat(256)]) {
+    assert.equal(validRpcId(id), true, `valid id ${String(id).slice(0, 16)}`);
+  }
+  for (const id of ["i".repeat(257), "😀".repeat(65), undefined, true, {}, [], Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(validRpcId(id), false, `invalid id ${String(id).slice(0, 16)}`);
+  }
+  assert.equal(validRpcRequestShape({ jsonrpc: "2.0", method: "tools/list", id: 1 }), true);
+  assert.equal(validRpcRequestShape({ jsonrpc: "2.0", method: "notify" }), true);
+  assert.equal(validRpcRequestShape({ jsonrpc: "1.0", method: "tools/list", id: 1 }), false);
+  assert.equal(validRpcRequestShape({ jsonrpc: "2.0", method: "", id: 1 }), false);
+  assert.equal(validRpcRequestShape({ jsonrpc: "2.0", method: "m".repeat(257), id: 1 }), false);
+  assert.equal(validRpcRequestShape({ jsonrpc: "2.0", method: "😀".repeat(65), id: 1 }), false);
+  assert.equal(validRpcRequestShape({ jsonrpc: "2.0", method: "tools/list", id: {} }), false);
+  for (const length of [0, 1, 255, 256, 257]) {
+    assert.equal(validRpcToolName("t".repeat(length)), length > 0 && length <= 256);
+  }
+  assert.equal(validRpcToolName("😀".repeat(65)), false);
 });
 
 test("JSON-RPC response correlation matches only the pending request", () => {

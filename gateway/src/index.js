@@ -35,6 +35,9 @@ const MAX_ACCESS_JWT_CLAIMS_BYTES = 32 * 1024;
 const MAX_ACCESS_JWT_SIGNATURE_BYTES = 8 * 1024;
 const MAX_ACCESS_KID_CHARS = 256;
 const MAX_LOG_FIELD_CHARS = 256;
+const MAX_RPC_METHOD_BYTES = 256;
+const MAX_RPC_ID_BYTES = 256;
+const MAX_RPC_TOOL_NAME_BYTES = 256;
 const jwksCache = new Map();
 
 export default {
@@ -76,6 +79,9 @@ async function handleMcp(request, env, identity) {
   const body = await readJson(request);
   if (!body.ok) return withCors(jsonResponse(rpcError(null, -32700, body.error), 400));
   const rpc = body.value;
+  if (!validRpcRequestShape(rpc)) {
+    return withCors(jsonResponse(rpcError(null, -32600, "invalid JSON-RPC request"), 400));
+  }
   const id = rpc?.id ?? null;
   const protocolError = validateModernHttpRequest(request, rpc);
   if (protocolError) return protocolError;
@@ -175,7 +181,7 @@ function validateModernHttpRequest(request, rpc) {
 async function handleToolCall(rpc, env) {
   const id = rpc.id ?? null;
   const name = rpc?.params?.name;
-  if (typeof name !== "string") return mcpJson(rpcError(id, -32602, "missing tool name"));
+  if (!validRpcToolName(name)) return mcpJson(rpcError(id, -32602, "missing or invalid tool name"));
 
   if (name === "session_list") {
     const args = rpc?.params?.arguments ?? {};
@@ -581,8 +587,26 @@ export class GatewayRegistry {
   }
 }
 
+function utf8Within(value, maxBytes) {
+  if (typeof value !== "string" || value.length > maxBytes) return false;
+  return new TextEncoder().encode(value).byteLength <= maxBytes;
+}
+
 export function validRpcId(value) {
-  return value === null || typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
+  return value === null
+    || (typeof value === "string" && utf8Within(value, MAX_RPC_ID_BYTES))
+    || (typeof value === "number" && Number.isFinite(value));
+}
+
+export function validRpcToolName(value) {
+  return typeof value === "string" && value.length > 0 && utf8Within(value, MAX_RPC_TOOL_NAME_BYTES);
+}
+
+export function validRpcRequestShape(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) return false;
+  if (request.jsonrpc !== "2.0") return false;
+  if (typeof request.method !== "string" || request.method.length === 0 || !utf8Within(request.method, MAX_RPC_METHOD_BYTES)) return false;
+  return !Object.hasOwn(request, "id") || validRpcId(request.id);
 }
 
 export function validHostRpcResponse(response, expectedId) {

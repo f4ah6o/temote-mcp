@@ -26,6 +26,9 @@ const MAX_COMPLETED_JOBS_PER_SESSION: usize = 128;
 const MAX_COMPLETED_JOBS_TOTAL: usize = 1024;
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_PATH_ARGUMENT_BYTES: usize = 4096;
+const MAX_RPC_METHOD_BYTES: usize = 256;
+const MAX_RPC_ID_STRING_BYTES: usize = 256;
+const MAX_MCP_TOOL_NAME_BYTES: usize = 256;
 const MAX_COMMAND_ARGUMENTS: usize = 256;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
@@ -121,6 +124,14 @@ pub async fn serve() -> Result<()> {
                 continue;
             }
         };
+        if let Err(error) = validate_rpc_request_shape(&request) {
+            write_message(
+                &mut stdout,
+                &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":format!("{error:#}")}}),
+            )
+            .await?;
+            continue;
+        }
         if request.get("id").is_none() {
             continue;
         }
@@ -194,6 +205,7 @@ async fn dispatch_with_mode(
     public: bool,
     supervisor: Option<&Arc<SessionSupervisor>>,
 ) -> Result<Value> {
+    validate_rpc_request_shape(request)?;
     let modern = modern_request(request);
     if modern || request.get("method").and_then(Value::as_str) == Some("server/discover") {
         validate_modern_request(request)?;
@@ -235,6 +247,46 @@ async fn dispatch_with_mode(
     } else {
         Ok(result)
     }
+}
+
+fn valid_rpc_id(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Number(_) => true,
+        Value::String(value) => value.len() <= MAX_RPC_ID_STRING_BYTES,
+        Value::Bool(_) | Value::Array(_) | Value::Object(_) => false,
+    }
+}
+
+pub(crate) fn validate_rpc_request_shape(request: &Value) -> Result<()> {
+    let object = request
+        .as_object()
+        .context("JSON-RPC request must be an object")?;
+    anyhow::ensure!(
+        object.get("jsonrpc").and_then(Value::as_str) == Some("2.0"),
+        "JSON-RPC request must declare jsonrpc=2.0"
+    );
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .context("JSON-RPC method must be a string")?;
+    anyhow::ensure!(!method.is_empty(), "JSON-RPC method must not be empty");
+    anyhow::ensure!(
+        method.len() <= MAX_RPC_METHOD_BYTES,
+        "JSON-RPC method exceeds {MAX_RPC_METHOD_BYTES} bytes"
+    );
+    if let Some(id) = object.get("id") {
+        anyhow::ensure!(valid_rpc_id(id), "JSON-RPC id is invalid or too large");
+    }
+    Ok(())
+}
+
+fn validate_mcp_tool_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "tool name must not be empty");
+    anyhow::ensure!(
+        name.len() <= MAX_MCP_TOOL_NAME_BYTES,
+        "tool name exceeds {MAX_MCP_TOOL_NAME_BYTES} bytes"
+    );
+    Ok(())
 }
 
 fn negotiate_protocol_version(request: &Value) -> &'static str {
@@ -392,6 +444,7 @@ async fn call_tool(
         .get("name")
         .and_then(Value::as_str)
         .context("missing tool name")?;
+    validate_mcp_tool_name(name)?;
     let args = params
         .get("arguments")
         .cloned()
@@ -2342,6 +2395,82 @@ mod tests {
         assert!(!summary.contains("42"));
         assert!(!summary.contains("/private/work"));
         assert!(!summary.contains("export.csv"));
+    }
+
+    #[test]
+    fn generated_rpc_request_shapes_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x5250_4353_4841_5045, 512, |ctx| {
+            let valid_version = noprop::sample_bool(ctx);
+            let method_len = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_RPC_METHOD_BYTES,
+                3 => MAX_RPC_METHOD_BYTES + 1,
+                _ => noprop::sample_usize_in(ctx, 0..=MAX_RPC_METHOD_BYTES + 32),
+            };
+            let method_is_string = noprop::sample_bool(ctx);
+            let id_kind = noprop::sample_usize_in(ctx, 0..=5);
+            let id_len = match noprop::sample_usize_in(ctx, 0..=3) {
+                0 => 0,
+                1 => MAX_RPC_ID_STRING_BYTES,
+                2 => MAX_RPC_ID_STRING_BYTES + 1,
+                _ => noprop::sample_usize_in(ctx, 0..=MAX_RPC_ID_STRING_BYTES + 32),
+            };
+            let id = match id_kind {
+                0 => None,
+                1 => Some(Value::Null),
+                2 => Some(json!(noprop::sample_u64(ctx))),
+                3 => Some(Value::String("i".repeat(id_len))),
+                4 => Some(Value::Bool(noprop::sample_bool(ctx))),
+                _ => Some(json!({"bad": true})),
+            };
+            let method = if method_is_string {
+                Value::String("m".repeat(method_len))
+            } else {
+                Value::Bool(true)
+            };
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "jsonrpc".to_owned(),
+                Value::String(if valid_version { "2.0" } else { "1.0" }.to_owned()),
+            );
+            object.insert("method".to_owned(), method);
+            if let Some(id) = id.clone() {
+                object.insert("id".to_owned(), id);
+            }
+            let request = Value::Object(object);
+            let expected_id = match id {
+                None | Some(Value::Null) | Some(Value::Number(_)) => true,
+                Some(Value::String(value)) => value.len() <= MAX_RPC_ID_STRING_BYTES,
+                Some(Value::Bool(_) | Value::Array(_) | Value::Object(_)) => false,
+            };
+            let expected = valid_version
+                && method_is_string
+                && method_len > 0
+                && method_len <= MAX_RPC_METHOD_BYTES
+                && expected_id;
+            assert_eq!(validate_rpc_request_shape(&request).is_ok(), expected);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_mcp_tool_names_match_byte_limit() -> noprop::TestResult {
+        test_support::run(0x544f_4f4c_4e41_4d45, 512, |ctx| {
+            let length = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_MCP_TOOL_NAME_BYTES,
+                3 => MAX_MCP_TOOL_NAME_BYTES + 1,
+                _ => noprop::sample_usize_in(ctx, 0..=MAX_MCP_TOOL_NAME_BYTES + 32),
+            };
+            let name = "t".repeat(length);
+            assert_eq!(
+                validate_mcp_tool_name(&name).is_ok(),
+                length > 0 && length <= MAX_MCP_TOOL_NAME_BYTES
+            );
+            Ok(())
+        })
     }
 
     #[tokio::test]
