@@ -658,13 +658,45 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         return is_public_ipv4(ipv4);
     }
     let segments = ip.segments();
+
+    // RFC 6052 well-known NAT64 prefix. Preserve IPv4 SSRF policy for the
+    // embedded address rather than treating the translator prefix as public.
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2..6].iter().all(|segment| *segment == 0)
+    {
+        let ipv4 = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return is_public_ipv4(ipv4);
+    }
+
+    let local_nat64 = segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001;
+    let discard_only = segments[0] == 0x0100
+        && segments[1] == 0
+        && segments[2] == 0
+        && matches!(segments[3], 0 | 1);
+    let ietf_protocol_space = segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0;
+    let six_to_four = segments[0] == 0x2002;
+    let documentation_3fff = segments[0] == 0x3fff && (segments[1] & 0xf000) == 0;
+    let srv6_sid = segments[0] == 0x5f00;
+
     if ip.is_unspecified()
         || ip.is_loopback()
         || (segments[0] & 0xff00) == 0xff00
         || (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xffc0) == 0xfec0
+        || local_nat64
+        || discard_only
+        || ietf_protocol_space
+        || six_to_four
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || documentation_3fff
+        || srv6_sid
     {
         return false;
     }
@@ -1027,10 +1059,43 @@ mod tests {
             "::1",
             "fc00::1",
             "fe80::1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:2::1",
             "2001:db8::1",
+            "2002:0808:0808::1",
+            "3fff::1",
+            "5f00::1",
         ] {
             assert!(!is_public_ip(value.parse().unwrap()), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn generated_well_known_nat64_inherits_ipv4_publicness() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_484e_4154, 1024, |ctx| {
+            let raw = noprop::sample_u32(ctx);
+            let octets = raw.to_be_bytes();
+            let ipv4 = Ipv4Addr::from(octets);
+            let ipv6 = Ipv6Addr::new(
+                0x0064,
+                0xff9b,
+                0,
+                0,
+                0,
+                0,
+                u16::from_be_bytes([octets[0], octets[1]]),
+                u16::from_be_bytes([octets[2], octets[3]]),
+            );
+            assert_eq!(
+                is_public_ipv6(ipv6),
+                is_public_ipv4(ipv4),
+                "NAT64 classification diverged for {ipv4} via {ipv6}"
+            );
+            Ok(())
+        })
     }
 
     #[tokio::test]
