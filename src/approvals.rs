@@ -3,13 +3,14 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -17,6 +18,8 @@ use crate::config::{self, Session};
 use crate::{kintone_cli, kintone_mcp, sandbox};
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const SESSION_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_PENDING_SESSION_READS: usize = 64;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -587,6 +590,38 @@ async fn read_session_message(stream: &mut UnixStream) -> Result<Option<String>>
     Ok(Some(line))
 }
 
+async fn receive_session_message(
+    mut stream: UnixStream,
+    session_id: String,
+    sender: mpsc::UnboundedSender<(UnixStream, Message)>,
+) {
+    let line = match tokio::time::timeout(
+        SESSION_MESSAGE_READ_TIMEOUT,
+        read_session_message(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => {
+            eprintln!("[session {session_id}] rejected session message: {error:#}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("[session {session_id}] timed out waiting for a session message");
+            return;
+        }
+    };
+    let message: Message = match serde_json::from_str(&line) {
+        Ok(message) => message,
+        Err(error) => {
+            eprintln!("[session {session_id}] ignoring invalid session message: {error}");
+            return;
+        }
+    };
+    let _ = sender.send((stream, message));
+}
+
 async fn run_runtime(
     listener: UnixListener,
     session: &mut Session,
@@ -597,25 +632,28 @@ async fn run_runtime(
     kintone_cli_bridge: Arc<kintone_cli::Bridge>,
 ) -> Result<()> {
     let (approval_lifetime, _) = watch::channel(false);
+    let (incoming_sender, mut incoming_receiver) = mpsc::unbounded_channel();
+    let read_slots = Arc::new(Semaphore::new(MAX_PENDING_SESSION_READS));
     loop {
         tokio::select! {
             connection = listener.accept() => {
-                let (mut stream, _) = connection?;
-                let line = match read_session_message(&mut stream).await {
-                    Ok(Some(line)) => line,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        eprintln!("[session {}] rejected session message: {error:#}", session.id);
+                let (stream, _) = connection?;
+                let permit = match Arc::clone(&read_slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        eprintln!("[session {}] rejecting session connection: too many pending reads", session.id);
                         continue;
                     }
                 };
-                let message: Message = match serde_json::from_str(&line) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        eprintln!("[session {}] ignoring invalid session message: {error}", session.id);
-                        continue;
-                    }
-                };
+                let sender = incoming_sender.clone();
+                let session_id = session.id.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    receive_session_message(stream, session_id, sender).await;
+                });
+            }
+            incoming = incoming_receiver.recv() => {
+                let Some((mut stream, message)) = incoming else { continue };
                 match message {
                     Message::Probe => {
                         stream.write_all(b"active\n").await?;
@@ -1175,6 +1213,35 @@ mod tests {
         assert_eq!(snapshot.id, id);
         assert!(!snapshot.yolo);
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_ipc_connection_does_not_block_runtime_control_or_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("idle-ipc-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let path = config::socket_path(&id).unwrap();
+        let _idle = UnixStream::connect(&path).await.unwrap();
+
+        let snapshot = tokio::time::timeout(Duration::from_millis(500), handle.snapshot())
+            .await
+            .expect("idle IPC client blocked runtime snapshot")
+            .unwrap();
+        assert_eq!(snapshot.id, id);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), config::session_is_active(&id))
+                .await
+                .expect("idle IPC client blocked session probe")
+                .unwrap()
+        );
+        tokio::time::timeout(Duration::from_millis(500), handle.shutdown())
+            .await
+            .expect("idle IPC client blocked runtime shutdown")
+            .unwrap();
+        assert!(!config::socket_path(&id).unwrap().exists());
     }
 
     #[tokio::test]
