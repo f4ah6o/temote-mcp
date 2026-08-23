@@ -35,6 +35,7 @@ const MAX_ACTIVITY_TITLE_BYTES: usize = 512;
 const MAX_ACTIVITY_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
+const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
@@ -370,11 +371,15 @@ impl ApprovalPrompt {
     }
 }
 
-pub type ApprovalReceiver = mpsc::UnboundedReceiver<ApprovalPrompt>;
-pub type ApprovalSender = mpsc::UnboundedSender<ApprovalPrompt>;
+pub type ApprovalReceiver = mpsc::Receiver<ApprovalPrompt>;
+pub type ApprovalSender = mpsc::Sender<ApprovalPrompt>;
+
+fn approval_channel_with_capacity(capacity: usize) -> (ApprovalSender, ApprovalReceiver) {
+    mpsc::channel(capacity)
+}
 
 pub fn approval_channel() -> (ApprovalSender, ApprovalReceiver) {
-    mpsc::unbounded_channel()
+    approval_channel_with_capacity(MAX_PENDING_APPROVAL_PROMPTS)
 }
 
 pub async fn request_supervisor_approval(
@@ -394,9 +399,9 @@ pub async fn request_supervisor_approval(
         request,
         response,
     };
-    sender.send(prompt).map_err(|error| {
-        error.0.respond(false);
-        anyhow::anyhow!("local approval console is unavailable")
+    sender.try_send(prompt).map_err(|error| {
+        error.into_inner().respond(false);
+        anyhow::anyhow!("local approval console is unavailable or busy")
     })?;
     Ok(receiver.await.unwrap_or(false))
 }
@@ -828,8 +833,8 @@ async fn run_runtime(
                             request,
                             response,
                         };
-                        if let Err(error) = approval_sender.send(prompt) {
-                            error.0.respond(false);
+                        if let Err(error) = approval_sender.try_send(prompt) {
+                            error.into_inner().respond(false);
                             drop(permit);
                             let _ = stream.write_all(b"deny\n").await;
                             let _ = stream.shutdown().await;
@@ -1832,6 +1837,61 @@ mod tests {
                 .unwrap();
             assert!(!allowed);
         }
+    }
+
+    #[test]
+    fn generated_approval_channel_matches_bounded_queue_model() -> noprop::TestResult {
+        test_support::run(0x4150_5052_5142_4f55, 256, |ctx| {
+            let capacity = noprop::sample_usize_in(ctx, 1..=16);
+            let steps = noprop::sample_usize_in(ctx, 1..=128);
+            let (sender, mut receiver) = approval_channel_with_capacity(capacity);
+            let mut expected = VecDeque::<String>::new();
+
+            for index in 0..steps {
+                let should_send = expected.is_empty() || noprop::sample_bool(ctx);
+                if should_send {
+                    let operation = format!("generated-{index}");
+                    let (response, _receiver) = oneshot::channel();
+                    let prompt = ApprovalPrompt {
+                        session_id: "generated".to_owned(),
+                        request: Request {
+                            id: Uuid::new_v4(),
+                            operation: operation.clone(),
+                            detail: String::new(),
+                            cwd: PathBuf::from("."),
+                        },
+                        response,
+                    };
+                    let result = sender.try_send(prompt);
+                    let accepted = expected.len() < capacity;
+                    assert_eq!(result.is_ok(), accepted);
+                    if accepted {
+                        expected.push_back(operation);
+                    } else {
+                        result.unwrap_err().into_inner().respond(false);
+                    }
+                } else {
+                    let prompt = receiver.try_recv().expect("model expected queued approval");
+                    assert_eq!(
+                        prompt.request.operation,
+                        expected.pop_front().expect("model queue was empty")
+                    );
+                    prompt.respond(false);
+                }
+                assert!(expected.len() <= capacity);
+            }
+
+            while let Some(operation) = expected.pop_front() {
+                let prompt = receiver.try_recv().expect("queued approval disappeared");
+                assert_eq!(prompt.request.operation, operation);
+                prompt.respond(false);
+            }
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            Ok(())
+        })
     }
 
     #[test]
