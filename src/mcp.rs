@@ -28,6 +28,9 @@ const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_DIRECTORY_LIST_BYTES: usize = 1024 * 1024;
+const MAX_SESSION_METADATA_ENTRIES_SCANNED: usize = 4096;
+const MAX_SESSION_LIST_ENTRIES: usize = 256;
+const MAX_SESSION_LIST_BYTES: usize = 4 * 1024 * 1024;
 const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -675,7 +678,11 @@ async fn session_list() -> Result<Value> {
         Err(error) => return Err(error).context("failed to read session metadata"),
     };
     let mut sessions = Vec::new();
+    let mut scanned_entries = 0usize;
+    let mut session_bytes = 0usize;
     while let Some(entry) = entries.next_entry().await? {
+        scanned_entries =
+            next_session_scan_count(scanned_entries, MAX_SESSION_METADATA_ENTRIES_SCANNED)?;
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
@@ -687,7 +694,13 @@ async fn session_list() -> Result<Value> {
             continue;
         }
         if let Some(session) = session_list_entry(id).await {
-            sessions.push(session);
+            push_session_list_entry(
+                &mut sessions,
+                &mut session_bytes,
+                session,
+                MAX_SESSION_LIST_ENTRIES,
+                MAX_SESSION_LIST_BYTES,
+            )?;
         }
     }
     sessions.sort_by_key(|session| {
@@ -696,7 +709,47 @@ async fn session_list() -> Result<Value> {
             .unwrap_or_default()
             .to_owned()
     });
-    text_result(serde_json::to_string_pretty(&sessions)?)
+    let rendered = serde_json::to_string_pretty(&sessions)?;
+    anyhow::ensure!(
+        rendered.len() <= MAX_SESSION_LIST_BYTES,
+        "session list exceeds {MAX_SESSION_LIST_BYTES} bytes"
+    );
+    text_result(rendered)
+}
+
+fn next_session_scan_count(current: usize, max_entries: usize) -> Result<usize> {
+    let next = current
+        .checked_add(1)
+        .context("session metadata entry count overflow")?;
+    anyhow::ensure!(
+        next <= max_entries,
+        "session metadata directory exceeds {max_entries} entries"
+    );
+    Ok(next)
+}
+
+fn push_session_list_entry(
+    sessions: &mut Vec<Value>,
+    rendered_bytes: &mut usize,
+    session: Value,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        sessions.len() < max_entries,
+        "session list exceeds {max_entries} entries"
+    );
+    let entry_bytes = serde_json::to_string_pretty(&session)?.len();
+    let charged = entry_bytes
+        .checked_add(64)
+        .context("session list entry size overflow")?;
+    let next = rendered_bytes
+        .checked_add(charged)
+        .context("session list size overflow")?;
+    anyhow::ensure!(next <= max_bytes, "session list exceeds {max_bytes} bytes");
+    sessions.push(session);
+    *rendered_bytes = next;
+    Ok(())
 }
 
 async fn session_list_entry(id: &str) -> Option<Value> {
@@ -1882,6 +1935,71 @@ mod tests {
                 reference_bytes = next.unwrap();
                 assert_eq!(rendered_bytes, reference_bytes);
                 assert_eq!(names.join("\n").len(), reference_bytes);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_session_scan_count_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x5345_5353_5343_414e, 512, |ctx| {
+            let max_entries = noprop::sample_usize_in(ctx, 0..=16);
+            let current = noprop::sample_usize_in(ctx, 0..=max_entries.saturating_add(2));
+            let result = next_session_scan_count(current, max_entries);
+            let expected = current
+                .checked_add(1)
+                .is_some_and(|next| next <= max_entries);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "current={current} max_entries={max_entries}"
+            );
+            if expected {
+                assert_eq!(result.unwrap(), current + 1);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_session_list_budget_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x5345_5353_4c49_5354, 512, |ctx| {
+            let max_entries = noprop::sample_usize_in(ctx, 0..=8);
+            let max_bytes = noprop::sample_usize_in(ctx, 0..=1024);
+            let count = noprop::sample_usize_in(ctx, 0..=12);
+            let mut sessions = Vec::new();
+            let mut rendered_bytes = 0usize;
+            let mut reference_bytes = 0usize;
+
+            for index in 0..count {
+                let repeat = noprop::sample_usize_in(ctx, 0..=96);
+                let session = json!({
+                    "session_id": format!("generated-{index}"),
+                    "cwd": "x".repeat(repeat),
+                    "status": if noprop::sample_bool(ctx) { "active" } else { "unknown" },
+                });
+                let charged = serde_json::to_string_pretty(&session).unwrap().len() + 64;
+                let next = reference_bytes.checked_add(charged);
+                let expected =
+                    sessions.len() < max_entries && next.is_some_and(|value| value <= max_bytes);
+                let result = push_session_list_entry(
+                    &mut sessions,
+                    &mut rendered_bytes,
+                    session,
+                    max_entries,
+                    max_bytes,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "entries={} bytes={reference_bytes} max_entries={max_entries} max_bytes={max_bytes}",
+                    sessions.len()
+                );
+                if !expected {
+                    break;
+                }
+                reference_bytes = next.unwrap();
+                assert_eq!(rendered_bytes, reference_bytes);
             }
             Ok(())
         })
