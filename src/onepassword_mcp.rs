@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
 use crate::{approvals, config};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -19,7 +20,7 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 struct Client {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
     next_id: u64,
     session_watcher: JoinHandle<()>,
 }
@@ -28,6 +29,10 @@ impl Drop for Client {
     fn drop(&mut self) {
         self.session_watcher.abort();
     }
+}
+
+fn session_probe_means_stopped(probe: &Result<bool>) -> bool {
+    matches!(probe, Ok(false))
 }
 
 fn clients() -> &'static Mutex<HashMap<String, Client>> {
@@ -65,10 +70,8 @@ impl Client {
         let session_watcher = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if !config::session_is_active(&watched_session_id)
-                    .await
-                    .unwrap_or(false)
-                {
+                let probe = config::session_is_active(&watched_session_id).await;
+                if session_probe_means_stopped(&probe) {
                     let mut child = watched_child.lock().await;
                     let _ = child.kill().await;
                     return;
@@ -78,7 +81,7 @@ impl Client {
         let mut client = Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
             next_id: 1,
             session_watcher,
         };
@@ -125,9 +128,20 @@ impl Client {
 
         let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
-                let Some(line) = self.stdout.next_line().await? else {
-                    let status = self.child.lock().await.try_wait().ok().flatten();
-                    anyhow::bail!("1Password MCP server closed stdout (status: {status:?})")
+                let line = match next_bounded_line(&mut self.stdout, MAX_JSON_LINE_BYTES).await? {
+                    Some(BoundedLine::Line(line)) => line,
+                    Some(BoundedLine::TooLarge) => {
+                        anyhow::bail!(
+                            "1Password MCP server response exceeds {MAX_JSON_LINE_BYTES} bytes"
+                        )
+                    }
+                    Some(BoundedLine::InvalidUtf8) => {
+                        anyhow::bail!("1Password MCP server returned invalid UTF-8")
+                    }
+                    None => {
+                        let status = self.child.lock().await.try_wait().ok().flatten();
+                        anyhow::bail!("1Password MCP server closed stdout (status: {status:?})")
+                    }
                 };
                 if line.trim().is_empty() {
                     continue;
@@ -409,6 +423,20 @@ fn executable_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn generated_session_watcher_stops_only_on_explicit_inactive() -> noprop::TestResult {
+        test_support::run(0x3150_5741_5443_4845, 512, |ctx| {
+            let choice = noprop::sample_usize_in(ctx, 0..3);
+            let probe = match choice {
+                0 => Ok(true),
+                1 => Ok(false),
+                _ => Err(anyhow::anyhow!("probe failure")),
+            };
+            assert_eq!(session_probe_means_stopped(&probe), choice == 1);
+            Ok(())
+        })
+    }
 
     #[test]
     fn approval_summary_never_contains_argument_values() {

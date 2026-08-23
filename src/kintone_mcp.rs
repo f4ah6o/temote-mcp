@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::config;
+use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -263,7 +264,7 @@ impl Bridge {
 struct Client {
     child: Child,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
     next_id: u64,
 }
 
@@ -299,7 +300,7 @@ impl Client {
         let mut client = Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout).lines(),
+            stdout: BufReader::new(stdout),
             next_id: 1,
         };
         client
@@ -345,9 +346,20 @@ impl Client {
 
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
-                let Some(line) = self.stdout.next_line().await? else {
-                    let status = self.child.try_wait().ok().flatten();
-                    anyhow::bail!("kintone MCP server closed stdout (status: {status:?})")
+                let line = match next_bounded_line(&mut self.stdout, MAX_JSON_LINE_BYTES).await? {
+                    Some(BoundedLine::Line(line)) => line,
+                    Some(BoundedLine::TooLarge) => {
+                        anyhow::bail!(
+                            "kintone MCP server response exceeds {MAX_JSON_LINE_BYTES} bytes"
+                        )
+                    }
+                    Some(BoundedLine::InvalidUtf8) => {
+                        anyhow::bail!("kintone MCP server returned invalid UTF-8")
+                    }
+                    None => {
+                        let status = self.child.try_wait().ok().flatten();
+                        anyhow::bail!("kintone MCP server closed stdout (status: {status:?})")
+                    }
                 };
                 if line.trim().is_empty() {
                     continue;

@@ -11,6 +11,7 @@ mod kintone_cli;
 mod kintone_mcp;
 #[cfg(all(feature = "network", unix))]
 mod lifecycle;
+mod line_protocol;
 mod mcp;
 mod named_roots;
 mod onepassword_mcp;

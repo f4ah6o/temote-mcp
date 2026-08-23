@@ -90,8 +90,8 @@ fn canonical_existing_root(path: &Path) -> Result<PathBuf> {
     let canonical = std::fs::canonicalize(&path)
         .with_context(|| format!("cannot resolve sandbox root {}", path.display()))?;
     anyhow::ensure!(
-        canonical.is_absolute(),
-        "sandbox root is not absolute: {}",
+        canonical.is_absolute() && canonical.is_dir(),
+        "sandbox root is not an absolute directory: {}",
         canonical.display()
     );
     anyhow::ensure!(
@@ -115,6 +115,51 @@ fn normalize_paths(paths: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
+
+    #[test]
+    fn command_spec_rejects_regular_file_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(SandboxSpec::command(root.path(), &[file]).is_err());
+    }
+
+    #[test]
+    fn generated_command_spec_normalizes_duplicate_roots() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
+        let roots = (0..6)
+            .map(|index| {
+                let path = fixture.path().join(format!("root-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                std::fs::canonicalize(path).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        test_support::run(0x5341_4e44_5350_4543, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=12);
+            let requested = (0..count)
+                .map(|_| roots[noprop::sample_usize_in(ctx, 0..roots.len())].clone())
+                .collect::<Vec<_>>();
+            let spec = SandboxSpec::command(&cwd, &requested).unwrap();
+
+            assert!(spec.writable_roots().contains(&cwd));
+            assert!(
+                spec.writable_roots()
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]),
+                "writable roots are not sorted and unique: {:?}",
+                spec.writable_roots()
+            );
+            for root in &requested {
+                assert!(spec.writable_roots().contains(root));
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn git_spec_keeps_sensitive_metadata_read_only() {

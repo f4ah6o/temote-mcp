@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
 use crate::{approvals, config, onepassword_mcp, sandbox, supervisor::SessionSupervisor};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -19,7 +20,6 @@ const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
-const MAX_MCP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -74,12 +74,12 @@ pub async fn serve() -> Result<()> {
     let mut input = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     loop {
-        let line = match next_bounded_line(&mut input, MAX_MCP_REQUEST_BYTES).await? {
+        let line = match next_bounded_line(&mut input, MAX_JSON_LINE_BYTES).await? {
             Some(BoundedLine::Line(line)) => line,
             Some(BoundedLine::TooLarge) => {
                 write_message(
                     &mut stdout,
-                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":format!("MCP request exceeds {MAX_MCP_REQUEST_BYTES} bytes")}}),
+                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":format!("MCP request exceeds {MAX_JSON_LINE_BYTES} bytes")}}),
                 )
                 .await?;
                 continue;
@@ -117,57 +117,6 @@ pub async fn serve() -> Result<()> {
         write_message(&mut stdout, &response).await?;
     }
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum BoundedLine {
-    Line(String),
-    TooLarge,
-    InvalidUtf8,
-}
-
-async fn next_bounded_line<R>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> std::io::Result<Option<BoundedLine>>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut bytes = Vec::new();
-    let mut oversized = false;
-    let mut saw_any = false;
-
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            if !saw_any {
-                return Ok(None);
-            }
-            break;
-        }
-        saw_any = true;
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let consumed = newline.map_or(available.len(), |index| index + 1);
-        if !oversized {
-            if bytes.len().saturating_add(consumed) > max_bytes {
-                oversized = true;
-            } else {
-                bytes.extend_from_slice(&available[..consumed]);
-            }
-        }
-        reader.consume(consumed);
-        if newline.is_some() {
-            break;
-        }
-    }
-
-    if oversized {
-        return Ok(Some(BoundedLine::TooLarge));
-    }
-    match String::from_utf8(bytes) {
-        Ok(line) => Ok(Some(BoundedLine::Line(line))),
-        Err(_) => Ok(Some(BoundedLine::InvalidUtf8)),
-    }
 }
 
 async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
@@ -326,7 +275,7 @@ fn modernize_result(method: &str, mut result: Value) -> Value {
 
 fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
-        {"name":"session_list","title":"List Temote MCP sessions","description":"List currently active temote-mcp sessions. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created by this serve supervisor. Independently started CLI sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show a temote-mcp session's ID, working directory, allowed sandbox roots, and yolo mode state.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
@@ -726,25 +675,26 @@ async fn session_list() -> Result<Value> {
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
         };
-        let session: config::Session = match serde_json::from_slice(&bytes) {
+        if config::validate_session_id(id).is_err() {
+            continue;
+        }
+        let session = match config::read_session_metadata(id).await {
             Ok(session) => session,
             Err(_) => continue,
         };
-        if !config::session_is_active(&session.id)
-            .await
-            .unwrap_or(false)
-        {
-            continue;
-        }
+        let status = match config::session_is_active(&session.id).await {
+            Ok(true) => "active",
+            Ok(false) => continue,
+            Err(_) => "unknown",
+        };
         sessions.push(json!({
             "session_id": session.id,
             "cwd": session.cwd,
             "started_at": session.started_at,
-            "status": "active",
+            "status": status,
             "yolo": session.yolo,
         }));
     }
@@ -1989,6 +1939,53 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_fetch"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_pull"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
+    }
+
+    #[tokio::test]
+    async fn session_list_surfaces_ambiguous_probe_as_unknown() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = config::canonical_directory(root.path()).unwrap();
+        let id = format!("list-unknown-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: id.clone(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
+            started_at: 1,
+            process_id: 1,
+            yolo: false,
+        };
+        config::save_session(&session).await.unwrap();
+
+        let socket = config::socket_path(&id).unwrap();
+        tokio::fs::create_dir_all(socket.parent().unwrap())
+            .await
+            .unwrap();
+        let _ = tokio::fs::remove_file(&socket).await;
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"ambiguous\n").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let result = session_list().await.unwrap();
+        server.await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let sessions: Value = serde_json::from_str(text).unwrap();
+        let listed = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["session_id"] == id)
+            .expect("ambiguous session should be surfaced");
+        assert_eq!(listed["status"], "unknown");
+
+        tokio::fs::remove_file(config::session_path(&id).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::remove_file(socket).await.unwrap();
     }
 
     #[test]

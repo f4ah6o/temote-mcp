@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SESSION_PROBE_RESPONSE_BYTES: usize = 64;
+const MAX_SESSION_METADATA_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -79,14 +80,42 @@ pub fn new_session(cwd: &Path, id: Option<&str>, yolo: bool) -> Result<Session> 
 }
 
 pub async fn load_session(id: &str) -> Result<Session> {
-    let path = session_path(id)?;
     anyhow::ensure!(
         session_is_active(id).await?,
         "session {id} is not running; run temote-mcp start {id} first"
     );
-    let bytes = tokio::fs::read(&path)
+    read_session_metadata(id).await
+}
+
+pub async fn read_session_metadata(id: &str) -> Result<Session> {
+    let path = session_path(id)?;
+    let metadata = tokio::fs::symlink_metadata(&path)
         .await
         .with_context(|| format!("session {id} was not found; run `temote-mcp start` first"))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "session metadata is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_SESSION_METADATA_BYTES as u64,
+        "session metadata exceeds {MAX_SESSION_METADATA_BYTES} bytes: {}",
+        path.display()
+    );
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("cannot open session metadata {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_SESSION_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("cannot read session metadata {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_SESSION_METADATA_BYTES,
+        "session metadata exceeds {MAX_SESSION_METADATA_BYTES} bytes: {}",
+        path.display()
+    );
     let session: Session = serde_json::from_slice(&bytes).context("invalid temote-mcp session")?;
     validate_loaded_session(id, &session)?;
     Ok(session)
@@ -175,6 +204,12 @@ pub async fn save_session(session: &Session) -> Result<()> {
                     temporary.display()
                 )
             })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
         file.write_all(&bytes).await?;
         file.flush().await?;
         drop(file);
@@ -578,6 +613,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_metadata_reader_rejects_oversized_files() {
+        let id = format!("oversized-meta-{}", Uuid::new_v4());
+        let path = session_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_METADATA_BYTES as u64 + 1).unwrap();
+
+        let error = read_session_metadata(&id).await.err().unwrap();
+        assert!(error.to_string().contains("session metadata exceeds"));
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_metadata_reader_rejects_symlink_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.json");
+        std::fs::write(&target, b"{}").unwrap();
+        let id = format!("symlink-meta-{}", Uuid::new_v4());
+        let path = session_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = read_session_metadata(&id).await.err().unwrap();
+        assert!(error.to_string().contains("not a regular file"));
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_session_saves_remain_atomic_and_leave_no_temporary_files() {
         let root = tempfile::tempdir().unwrap();
         let cwd = canonical_directory(root.path()).unwrap();
@@ -603,6 +673,14 @@ mod tests {
         let saved: Session = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(saved.id, id);
         validate_loaded_session(&id, &saved).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         let prefix = format!("{id}.json.");
         let mut entries = tokio::fs::read_dir(sessions_dir().unwrap()).await.unwrap();
