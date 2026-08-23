@@ -25,6 +25,7 @@ use crate::supervisor::SessionSupervisor;
 
 const MAX_OAUTH_REGISTER_BODY_BYTES: usize = 128 * 1024;
 const MAX_OAUTH_TOKEN_BODY_BYTES: usize = 64 * 1024;
+const MAX_AUDIT_FIELD_BYTES: usize = 256;
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -394,24 +395,43 @@ struct AuditContext {
     session_id: String,
 }
 
+fn bounded_audit_field(value: &str) -> String {
+    if value.len() <= MAX_AUDIT_FIELD_BYTES {
+        return value.to_owned();
+    }
+    const SUFFIX: &str = "… [truncated]";
+    let budget = MAX_AUDIT_FIELD_BYTES - SUFFIX.len();
+    let mut end = budget.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX_AUDIT_FIELD_BYTES);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(SUFFIX);
+    bounded
+}
+
 impl AuditContext {
     fn from_request(request: &Value) -> Self {
         Self {
-            method: request
-                .get("method")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned(),
-            tool: request
-                .pointer("/params/name")
-                .and_then(Value::as_str)
-                .unwrap_or("-")
-                .to_owned(),
-            session_id: request
-                .pointer("/params/arguments/session_id")
-                .and_then(Value::as_str)
-                .unwrap_or("-")
-                .to_owned(),
+            method: bounded_audit_field(
+                request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            ),
+            tool: bounded_audit_field(
+                request
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+            ),
+            session_id: bounded_audit_field(
+                request
+                    .pointer("/params/arguments/session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+            ),
         }
     }
 
@@ -532,6 +552,55 @@ mod tests {
     async fn body_json(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn generated_audit_fields_are_bounded_and_utf8_safe() -> noprop::TestResult {
+        test_support::run(0x4155_4449_544c_4f47, 1024, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=1024);
+            let character = match noprop::sample_usize_in(ctx, 0..4) {
+                0 => "x",
+                1 => "é",
+                2 => "界",
+                _ => "😀",
+            };
+            let value = character.repeat(count);
+            let bounded = bounded_audit_field(&value);
+            assert!(
+                bounded.len() <= MAX_AUDIT_FIELD_BYTES,
+                "actual={} value_bytes={}",
+                bounded.len(),
+                value.len()
+            );
+            if value.len() <= MAX_AUDIT_FIELD_BYTES {
+                assert_eq!(bounded, value);
+            } else {
+                assert!(bounded.ends_with("… [truncated]"));
+                let prefix = bounded.strip_suffix("… [truncated]").unwrap();
+                assert!(value.starts_with(prefix));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn audit_context_never_retains_oversized_public_identifiers() {
+        let marker = "TAIL-MARKER";
+        let request = json!({
+            "method": format!("method-{}-{marker}", "m".repeat(4096)),
+            "params": {
+                "name": format!("tool-{}-{marker}", "t".repeat(4096)),
+                "arguments": {
+                    "session_id": format!("session-{}-{marker}", "s".repeat(4096))
+                }
+            }
+        });
+        let audit = AuditContext::from_request(&request);
+        for field in [&audit.method, &audit.tool, &audit.session_id] {
+            assert!(field.len() <= MAX_AUDIT_FIELD_BYTES);
+            assert!(!field.contains(marker));
+            assert!(field.ends_with("… [truncated]"));
+        }
     }
 
     #[tokio::test]
