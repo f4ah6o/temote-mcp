@@ -553,7 +553,7 @@ mod generic_tests {
                 .unwrap()
             });
             assert_eq!(output.status, 0);
-            assert_eq!(output.stdout.as_bytes().len(), output_len);
+            assert_eq!(output.stdout.len(), output_len);
             assert!(!output.truncated);
             Ok(())
         })
