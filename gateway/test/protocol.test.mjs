@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validateAccessJwtShape } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -98,6 +98,57 @@ test("Access email allowlist is fail-closed and case-insensitive", () => {
   }
   for (const email of ["", "other2@example.com", null, undefined]) {
     assert.equal(accessEmailAllowed("user@example.com", email), false, String(email));
+  }
+});
+
+test("Access JWT shape bounds match the segment model", () => {
+  const cases = [
+    [1, 1, 1, true],
+    [8 * 1024, 32 * 1024, 8 * 1024, true],
+    [8 * 1024 + 1, 1, 1, false],
+    [1, 32 * 1024 + 1, 1, false],
+    [1, 1, 8 * 1024 + 1, false],
+  ];
+  for (const [headerLength, claimsLength, signatureLength, expected] of cases) {
+    const token = `${"A".repeat(headerLength)}.${"B".repeat(claimsLength)}.${"C".repeat(signatureLength)}`;
+    let accepted = true;
+    try {
+      assert.equal(validateAccessJwtShape(token).length, 3);
+    } catch {
+      accepted = false;
+    }
+    assert.equal(accepted, expected, `${headerLength}/${claimsLength}/${signatureLength}`);
+  }
+  for (const token of ["", "a.b", "a.b.c.d", "a..c", "a.b.c=", "a.b.c+"]) {
+    assert.throws(() => validateAccessJwtShape(token));
+  }
+});
+
+test("oversized Access JWT is rejected before JWKS fetch", async () => {
+  const originalFetch = globalThis.fetch;
+  let jwksFetches = 0;
+  globalThis.fetch = async () => {
+    jwksFetches += 1;
+    throw new Error("JWKS fetch must not run");
+  };
+  try {
+    const request = new Request("https://gateway.example.test/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "cf-access-jwt-assertion": `${"A".repeat(8 * 1024 + 1)}.e30.signature`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    const response = await worker.fetch(request, {
+      ACCESS_TEAM_DOMAIN: "example.cloudflareaccess.com",
+      ACCESS_AUDIENCE: "audience",
+      ACCESS_ALLOWED_EMAILS: "user@example.com",
+    });
+    assert.equal(response.status, 401);
+    assert.equal(jwksFetches, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

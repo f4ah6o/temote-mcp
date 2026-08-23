@@ -29,6 +29,10 @@ const MAX_INTERNAL_RPC_RESPONSE_BYTES = MAX_HOST_RESPONSE_BODY_BYTES;
 const MAX_INTERNAL_ERROR_RESPONSE_BYTES = 64 * 1024;
 const MAX_REGISTRY_RESPONSE_BYTES = 1024 * 1024;
 const MAX_JWKS_BYTES = 1024 * 1024;
+const MAX_ACCESS_JWT_BYTES = 64 * 1024;
+const MAX_ACCESS_JWT_HEADER_BYTES = 8 * 1024;
+const MAX_ACCESS_JWT_CLAIMS_BYTES = 32 * 1024;
+const MAX_ACCESS_JWT_SIGNATURE_BYTES = 8 * 1024;
 const jwksCache = new Map();
 
 export default {
@@ -666,8 +670,7 @@ async function verifyAccessJwt(token, env) {
   if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUDIENCE) {
     throw new Error("Access JWT validation is not configured");
   }
-  const parts = token.split(".");
-  if (parts.length !== 3) throw new Error("invalid JWT");
+  const parts = validateAccessJwtShape(token);
   const header = decodeJwtPart(parts[0]);
   const claims = decodeJwtPart(parts[1]);
   if (header.alg !== "RS256" || typeof header.kid !== "string") throw new Error("unsupported JWT key");
@@ -705,6 +708,22 @@ async function verifyAccessJwt(token, env) {
   }
   if (typeof claims.sub !== "string" || !claims.sub) throw new Error("JWT subject missing");
   return { subject: claims.sub, email: claims.email || "-" };
+}
+
+export function validateAccessJwtShape(token) {
+  if (typeof token !== "string" || token.length === 0 || token.length > MAX_ACCESS_JWT_BYTES) {
+    throw new Error("invalid JWT size");
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("invalid JWT");
+  const limits = [MAX_ACCESS_JWT_HEADER_BYTES, MAX_ACCESS_JWT_CLAIMS_BYTES, MAX_ACCESS_JWT_SIGNATURE_BYTES];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (part.length === 0 || part.length > limits[index] || !/^[A-Za-z0-9_-]+$/.test(part)) {
+      throw new Error("invalid JWT segment");
+    }
+  }
+  return parts;
 }
 
 export function accessEmailAllowed(configured, email) {
