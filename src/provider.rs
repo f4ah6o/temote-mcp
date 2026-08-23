@@ -10,7 +10,16 @@ pub struct PublicEndpoint(String);
 
 impl PublicEndpoint {
     pub fn parse(value: &str) -> Result<Self> {
-        let parsed = Url::parse(value.trim())
+        let value = value.trim();
+        let Some((scheme, authority_and_path)) = value.split_once("://") else {
+            anyhow::bail!("public endpoint must be an HTTPS origin without a path");
+        };
+        anyhow::ensure!(
+            scheme.eq_ignore_ascii_case("https") && !authority_and_path.starts_with('/'),
+            "public endpoint must be an HTTPS origin without a path"
+        );
+
+        let parsed = Url::parse(value)
             .map_err(|error| anyhow::anyhow!("public endpoint is invalid: {error}"))?;
         anyhow::ensure!(
             parsed.scheme() == "https"
@@ -18,7 +27,7 @@ impl PublicEndpoint {
                 && parsed.password().is_none()
                 && parsed.query().is_none()
                 && parsed.fragment().is_none()
-                && parsed.path().trim_matches('/').is_empty(),
+                && parsed.path() == "/",
             "public endpoint must be an HTTPS origin without a path"
         );
         anyhow::ensure!(parsed.host_str().is_some(), "public endpoint has no host");
@@ -86,5 +95,48 @@ impl AuthProvider {
             Self::Cloudflare(_) | Self::OpenAiTunnel => None,
             Self::Local(local) => Some(local),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+
+    #[test]
+    fn generated_public_endpoints_match_https_origin_policy() -> noprop::TestResult {
+        test_support::run(0x5052_4f56_454e_4450, test_support::DEFAULT_CASES, |ctx| {
+            let host = format!("{}.example.invalid", test_support::safe_component(ctx));
+            let port = noprop::sample_usize_in(ctx, 1024..=65535);
+            let mode = noprop::sample_usize_in(ctx, 0..=10);
+            let (candidate, expected) = match mode {
+                0 => (format!("https://{host}"), true),
+                1 => (format!("  https://{host}/  "), true),
+                2 => (format!("https://{host}:{port}"), true),
+                3 => (format!("http://{host}"), false),
+                4 => (format!("https://{host}/mcp"), false),
+                5 => (format!("https://{host}//"), false),
+                6 => (format!("https://{host}?query=1"), false),
+                7 => (format!("https://{host}#fragment"), false),
+                8 => (format!("https://user@{host}"), false),
+                9 => (format!("https://user:password@{host}"), false),
+                _ => ("https:///missing-host".to_owned(), false),
+            };
+
+            let result = PublicEndpoint::parse(&candidate);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "candidate={candidate:?}, result={result:?}"
+            );
+            if let Ok(endpoint) = result {
+                let canonical = endpoint.into_string();
+                assert_eq!(
+                    PublicEndpoint::parse(&canonical).unwrap().into_string(),
+                    canonical
+                );
+            }
+            Ok(())
+        })
     }
 }

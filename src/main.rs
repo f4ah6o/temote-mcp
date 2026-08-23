@@ -606,7 +606,18 @@ fn quote_dotenv_value(value: &str) -> Result<String> {
             .any(|character| matches!(character, '\0' | '\n' | '\r' | '\'')),
         "legacy Temote env value contains characters that cannot be migrated safely"
     );
-    Ok(format!("'{value}'"))
+
+    // dotenvy's line reader treats a backslash before the closing single quote as
+    // escaping that quote, even though its value parser treats backslashes inside
+    // single quotes literally. Keep trailing backslashes outside the quoted segment
+    // and encode each as an escaped pair so both parser layers round-trip exactly.
+    let prefix = value.trim_end_matches('\\');
+    let trailing_backslashes = value.len() - prefix.len();
+    let mut encoded = format!("'{prefix}'");
+    for _ in 0..trailing_backslashes {
+        encoded.push_str("\\\\");
+    }
+    Ok(encoded)
 }
 
 #[cfg(feature = "network")]
@@ -990,5 +1001,123 @@ TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team.cloudflareaccess.com
         ] {
             assert!(quote_dotenv_value(value).is_err(), "{value:?}");
         }
+    }
+
+    #[test]
+    fn generated_safe_dotenv_values_round_trip_literal() -> noprop::TestResult {
+        test_support::run(0x444f_5445_4e56_5341, test_support::DEFAULT_CASES, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=256);
+            let value = (0..len)
+                .map(|_| match noprop::sample_u8(ctx) & 0x7f {
+                    b'\0' | b'\n' | b'\r' | b'\'' => 'x',
+                    byte => char::from(byte),
+                })
+                .collect::<String>();
+            let line = format!("VALUE={}\n", quote_dotenv_value(&value).unwrap());
+            let parsed = dotenvy::from_read_iter(std::io::Cursor::new(line))
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed, ("VALUE".to_owned(), value));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_ambiguous_dotenv_values_fail_closed() -> noprop::TestResult {
+        test_support::run(0x444f_5445_4e56_4241, test_support::DEFAULT_CASES, |ctx| {
+            let mut value = test_support::ascii_string(ctx, 128)
+                .chars()
+                .filter(|character| !matches!(character, '\0' | '\n' | '\r' | '\''))
+                .collect::<String>();
+            let forbidden = match noprop::sample_usize_in(ctx, 0..4) {
+                0 => '\0',
+                1 => '\n',
+                2 => '\r',
+                _ => '\'',
+            };
+            let index = noprop::sample_usize_in(ctx, 0..=value.len());
+            value.insert(index, forbidden);
+            assert!(quote_dotenv_value(&value).is_err(), "{value:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_legacy_required_key_sets_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x4c45_4741_4359_5245, test_support::DEFAULT_CASES, |ctx| {
+            let mask = noprop::sample_u8(ctx) & 0x0f;
+            let nonce = noprop::sample_u64(ctx);
+            let mut input = String::new();
+            for (index, key) in REQUIRED_CLOUDFLARE_ENV_KEYS.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    input.push_str(&format!("{key}=value-{index}-{nonce:x}\n"));
+                }
+            }
+
+            let result = parse_legacy_cloudflare_env(Path::new(".env"), input.as_bytes());
+            let public_url_present = mask & 0x01 != 0;
+            let all_required_present = mask == 0x0f;
+            match (public_url_present, all_required_present, result) {
+                (false, _, Ok(None)) => {}
+                (true, false, Err(_)) => {}
+                (true, true, Ok(Some(_))) => {}
+                (_, _, other) => {
+                    panic!("unexpected migration result for mask {mask:04b}: {other:?}")
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_legacy_migration_never_copies_secret_values() -> noprop::TestResult {
+        use std::collections::BTreeMap;
+
+        test_support::run(0x4c45_4741_4359_5345, test_support::DEFAULT_CASES, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let explicit_token_file = noprop::sample_bool(ctx);
+            let raw_token = format!("raw-secret-{nonce:016x}");
+            let gateway_secret = format!("gateway-secret-{nonce:016x}");
+            let unrelated_secret = format!("unrelated-secret-{nonce:016x}");
+            let mut input = format!(
+                "TEMOTE_MCP_PUBLIC_URL=https://public-{nonce:016x}.example.invalid\n\
+TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team-{nonce:016x}.example.invalid\n\
+TEMOTE_MCP_ACCESS_AUDIENCE=aud-{nonce:016x}\n\
+TEMOTE_MCP_ACCESS_ALLOWED_EMAILS=user-{nonce:016x}@example.invalid\n\
+{LEGACY_TUNNEL_TOKEN_KEY}={raw_token}\n\
+TEMOTE_MCP_GATEWAY_HOST_TOKEN={gateway_secret}\n\
+UNRELATED={unrelated_secret}\n"
+            );
+            if explicit_token_file {
+                input.push_str(&format!("TUNNEL_TOKEN_FILE=/tmp/token-{nonce:016x}\n"));
+            }
+
+            let migrated = parse_legacy_cloudflare_env(Path::new(".env"), input.as_bytes())
+                .unwrap()
+                .unwrap();
+            let public_env = String::from_utf8(migrated.public_env).unwrap();
+            for secret in [&raw_token, &gateway_secret, &unrelated_secret] {
+                assert!(
+                    !public_env.contains(secret),
+                    "secret leaked into public env"
+                );
+            }
+            assert!(!public_env.contains(LEGACY_TUNNEL_TOKEN_KEY));
+            assert!(!public_env.contains("TEMOTE_MCP_GATEWAY_HOST_TOKEN"));
+            assert!(!public_env.contains("UNRELATED"));
+
+            let parsed = dotenvy::from_read_iter(std::io::Cursor::new(public_env))
+                .map(|entry| entry.unwrap())
+                .collect::<BTreeMap<_, _>>();
+            let expected_len =
+                REQUIRED_CLOUDFLARE_ENV_KEYS.len() + usize::from(explicit_token_file);
+            assert_eq!(parsed.len(), expected_len);
+            assert_eq!(
+                migrated.tunnel_token.as_deref(),
+                (!explicit_token_file).then_some(raw_token.as_str())
+            );
+            Ok(())
+        })
     }
 }
