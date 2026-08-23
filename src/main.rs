@@ -525,9 +525,10 @@ fn default_public_env_file() -> Result<PathBuf> {
 
 #[cfg(feature = "network")]
 fn public_env_file() -> Result<PathBuf> {
-    Ok(std::env::var_os("TEMOTE_MCP_ENV_FILE")
-        .map(PathBuf::from)
-        .unwrap_or(default_public_env_file()?))
+    if let Some(path) = std::env::var_os("TEMOTE_MCP_ENV_FILE") {
+        return Ok(PathBuf::from(path));
+    }
+    default_public_env_file()
 }
 
 #[cfg(feature = "network")]
@@ -538,7 +539,11 @@ fn default_tunnel_token_file() -> Result<PathBuf> {
 }
 
 #[cfg(feature = "network")]
-fn read_bounded_env_file(path: &Path, require_private: bool, label: &str) -> Result<Option<Vec<u8>>> {
+fn read_bounded_env_file(
+    path: &Path,
+    require_private: bool,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
     use std::io::Read as _;
 
     let mut options = std::fs::OpenOptions::new();
@@ -613,13 +618,17 @@ fn quote_dotenv_value(value: &str) -> String {
 }
 
 #[cfg(feature = "network")]
+#[derive(Debug)]
 struct LegacyCloudflareConfig {
     public_env: Vec<u8>,
     tunnel_token: Option<String>,
 }
 
 #[cfg(feature = "network")]
-fn parse_legacy_cloudflare_env(path: &Path, bytes: &[u8]) -> Result<Option<LegacyCloudflareConfig>> {
+fn parse_legacy_cloudflare_env(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Option<LegacyCloudflareConfig>> {
     use std::collections::BTreeMap;
 
     let mut values = BTreeMap::<String, String>::new();
@@ -658,9 +667,16 @@ fn parse_legacy_cloudflare_env(path: &Path, bytes: &[u8]) -> Result<Option<Legac
         }
     }
 
-    let tunnel_token = values
-        .remove(LEGACY_TUNNEL_TOKEN_KEY)
-        .filter(|value| !value.is_empty());
+    let has_explicit_token_file = values
+        .get("TUNNEL_TOKEN_FILE")
+        .is_some_and(|value| !value.is_empty());
+    let tunnel_token = if has_explicit_token_file {
+        None
+    } else {
+        values
+            .remove(LEGACY_TUNNEL_TOKEN_KEY)
+            .filter(|value| !value.is_empty())
+    };
 
     Ok(Some(LegacyCloudflareConfig {
         public_env: public_env.into_bytes(),
@@ -787,7 +803,8 @@ fn migrate_legacy_cloudflare_config(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    if let (Some(token), Some(token_target)) = (config.tunnel_token.as_deref(), token_target.as_ref())
+    if let (Some(token), Some(token_target)) =
+        (config.tunnel_token.as_deref(), token_target.as_ref())
     {
         match read_bounded_env_file(token_target, true, "tunnel token")? {
             Some(existing) => {
@@ -887,9 +904,7 @@ TEMOTE_MCP_TUNNEL_TOKEN=legacy-secret
 TEMOTE_MCP_GATEWAY_HOST_TOKEN=must-not-copy
 UNRELATED=value
 "#;
-        let migrated = parse_legacy_cloudflare_env(path, bytes)
-            .unwrap()
-            .unwrap();
+        let migrated = parse_legacy_cloudflare_env(path, bytes).unwrap().unwrap();
         let public_env = String::from_utf8(migrated.public_env).unwrap();
         for expected in [
             "TEMOTE_MCP_PUBLIC_URL=",
@@ -904,6 +919,21 @@ UNRELATED=value
         assert!(!public_env.contains("TEMOTE_MCP_TUNNEL_TOKEN"));
         assert!(!public_env.contains("TEMOTE_MCP_GATEWAY_HOST_TOKEN"));
         assert!(!public_env.contains("UNRELATED"));
+        assert!(migrated.tunnel_token.is_none());
+    }
+
+    #[test]
+    fn legacy_cloudflare_env_extracts_raw_tunnel_token_without_token_file() {
+        let bytes = br#"
+TEMOTE_MCP_PUBLIC_URL=https://example.com
+TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team.cloudflareaccess.com
+TEMOTE_MCP_ACCESS_AUDIENCE=audience
+TEMOTE_MCP_ACCESS_ALLOWED_EMAILS=user@example.com
+TEMOTE_MCP_TUNNEL_TOKEN=legacy-secret
+"#;
+        let migrated = parse_legacy_cloudflare_env(Path::new(".env"), bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(migrated.tunnel_token.as_deref(), Some("legacy-secret"));
     }
 
@@ -917,7 +947,10 @@ TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team.cloudflareaccess.com
             .unwrap_err()
             .to_string();
         assert!(error.contains("TEMOTE_MCP_ACCESS_AUDIENCE"), "{error}");
-        assert!(error.contains("TEMOTE_MCP_ACCESS_ALLOWED_EMAILS"), "{error}");
+        assert!(
+            error.contains("TEMOTE_MCP_ACCESS_ALLOWED_EMAILS"),
+            "{error}"
+        );
     }
 
     #[test]
