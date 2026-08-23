@@ -608,7 +608,7 @@ fn reader_contains_parent_traversal(mut reader: impl Read) -> std::io::Result<bo
             return Ok(false);
         }
         for &byte in &buffer[..read] {
-            if seen >= 2 && previous == [b'.', b'.'] && matches!(byte, b'/' | b'\\') {
+            if seen >= 2 && previous == *b".." && matches!(byte, b'/' | b'\\') {
                 return Ok(true);
             }
             if seen == 0 {
