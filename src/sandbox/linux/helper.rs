@@ -448,18 +448,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let policy = LinuxSandboxPolicy::for_command(root.path(), &[], &[]).unwrap();
         let policy = serde_json::to_string(&policy).unwrap();
-        let parsed = parse_helper_args(
-            [
-                "temote-linux-sandbox".to_owned(),
-                "--policy".to_owned(),
-                policy,
-                "--".to_owned(),
-                "/bin/echo".to_owned(),
-                "--policy".to_owned(),
-                "child-value".to_owned(),
-            ]
-            .into_iter(),
-        )
+        let parsed = parse_helper_args([
+            "temote-linux-sandbox".to_owned(),
+            "--policy".to_owned(),
+            policy,
+            "--".to_owned(),
+            "/bin/echo".to_owned(),
+            "--policy".to_owned(),
+            "child-value".to_owned(),
+        ])
         .unwrap();
         assert_eq!(parsed.command, ["/bin/echo", "--policy", "child-value"]);
     }
