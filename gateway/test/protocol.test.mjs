@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validateAccessJwtShape } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -388,6 +388,20 @@ test("protocol negotiation accepts known versions and falls back", () => {
   assert.equal(negotiateProtocolVersion({ params: { protocolVersion: "future" } }), "2025-06-18");
 });
 
+test("JSON-RPC response correlation matches only the pending request", () => {
+  for (const id of [null, 0, 1, -1, 1.5, "", "request-1"]) {
+    assert.equal(validRpcId(id), true, `valid id ${String(id)}`);
+    assert.equal(validHostRpcResponse({ jsonrpc: "2.0", id, result: {} }, id), true);
+    assert.equal(validHostRpcResponse({ jsonrpc: "2.0", id, error: { code: -1 } }, id), true);
+    assert.equal(validHostRpcResponse({ jsonrpc: "2.0", id, result: {}, error: {} }, id), false);
+  }
+  for (const id of [undefined, true, false, {}, [], Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(validRpcId(id), false, `invalid id ${String(id)}`);
+  }
+  assert.equal(validHostRpcResponse({ jsonrpc: "2.0", id: "wrong", result: {} }, "expected"), false);
+  assert.equal(validHostRpcResponse({ jsonrpc: "1.0", id: "expected", result: {} }, "expected"), false);
+});
+
 test("reconnect increments generation and rejects the old host", async () => {
   const session = new GatewaySession(
     { storage: new MemoryStorage() },
@@ -714,6 +728,56 @@ test("dispatch, poll, and respond complete one routed RPC", async () => {
   });
 });
 
+
+test("mismatched host response preserves pending RPC for a correct retry", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const connected = await body(await session.fetch(post("connect", {
+    session_id: "correlated",
+    instance_id: "instance-c",
+    platform: "linux",
+  })));
+
+  const dispatched = session.fetch(post("dispatch", {
+    request: {
+      jsonrpc: "2.0",
+      id: "rpc-expected",
+      method: "tools/call",
+      params: { name: "session_info", arguments: { session_id: "correlated" } },
+    },
+  }));
+  const poll = await session.fetch(post("poll", {
+    session_id: "correlated",
+    instance_id: "instance-c",
+    generation: connected.generation,
+  }));
+  const envelope = await poll.json();
+  assert.equal(session.pending.size, 1);
+
+  const mismatch = await session.fetch(post("respond", {
+    session_id: "correlated",
+    instance_id: "instance-c",
+    generation: connected.generation,
+    request_id: envelope.request_id,
+    response: { jsonrpc: "2.0", id: "rpc-wrong", result: { content: [] } },
+  }));
+  assert.equal(mismatch.status, 400);
+  assert.equal((await mismatch.json()).error, "invalid_response");
+  assert.equal(session.pending.size, 1);
+
+  const correct = await session.fetch(post("respond", {
+    session_id: "correlated",
+    instance_id: "instance-c",
+    generation: connected.generation,
+    request_id: envelope.request_id,
+    response: { jsonrpc: "2.0", id: "rpc-expected", result: { content: [] } },
+  }));
+  assert.equal(correct.status, 204);
+  assert.equal(session.pending.size, 0);
+  assert.equal((await dispatched).status, 200);
+});
 
 test("host respond budget covers maximum get_image payload without widening other host APIs", async () => {
   const rawImageBytes = 32 * 1024 * 1024;

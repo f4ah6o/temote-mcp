@@ -358,6 +358,9 @@ export class GatewaySession {
 
     const pending = this.pending.get(body.request_id);
     if (!pending) return jsonResponse({ error: "stale_request" }, 409);
+    if (!validHostRpcResponse(body.response, pending.rpc_id)) {
+      return jsonResponse({ error: "invalid_response", detail: "JSON-RPC response does not match pending request" }, 400);
+    }
     clearTimeout(pending.timer);
     this.pending.delete(body.request_id);
     pending.resolve({ response: body.response });
@@ -382,7 +385,7 @@ export class GatewaySession {
 
   async dispatch(body) {
     const request = body?.request;
-    if (!request || typeof request !== "object" || request.id === undefined) {
+    if (!request || typeof request !== "object" || !validRpcId(request.id)) {
       return jsonResponse({ error: "invalid_rpc_request" }, 400);
     }
     const host = await this.currentHost();
@@ -406,7 +409,7 @@ export class GatewaySession {
         this.removeQueuedRequest(requestId);
         resolve({ status: 504, error: "host_request_timeout" });
       }, this.rpcTimeoutMs);
-      this.pending.set(requestId, { resolve, timer, generation: host.generation });
+      this.pending.set(requestId, { resolve, timer, generation: host.generation, rpc_id: request.id });
     });
     this.queue.push({ request_id: requestId, request, generation: host.generation });
     this.flushWaitingPoll();
@@ -576,6 +579,18 @@ export class GatewayRegistry {
     }
     return new Response(null, { status: 204 });
   }
+}
+
+export function validRpcId(value) {
+  return value === null || typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
+}
+
+export function validHostRpcResponse(response, expectedId) {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  if (response.jsonrpc !== "2.0" || !validRpcId(response.id) || response.id !== expectedId) return false;
+  const hasResult = Object.prototype.hasOwnProperty.call(response, "result");
+  const hasError = Object.prototype.hasOwnProperty.call(response, "error");
+  return hasResult !== hasError;
 }
 
 export function nextGatewayGeneration(previous) {
