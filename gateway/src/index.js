@@ -534,10 +534,14 @@ export class GatewayRegistry {
     }
     const sessions = (await this.state.storage.get("sessions")) || {};
     pruneExpiredRegistrySessions(sessions, this.now());
-    const existing = Object.hasOwn(sessions, host.session_id);
+    const existing = sessions[host.session_id];
     if (!existing && Object.keys(sessions).length >= this.maxSessions) {
       await this.state.storage.put("sessions", sessions);
       return jsonResponse({ error: "registry_full" }, 503);
+    }
+    if (existing && !shouldReplaceRegistrySession(existing, host)) {
+      await this.state.storage.put("sessions", sessions);
+      return new Response(null, { status: 204 });
     }
     sessions[host.session_id] = host;
     await this.state.storage.put("sessions", sessions);
@@ -555,6 +559,13 @@ export class GatewayRegistry {
     }
     return new Response(null, { status: 204 });
   }
+}
+
+export function shouldReplaceRegistrySession(existing, incoming) {
+  if (incoming.generation !== existing.generation) {
+    return incoming.generation > existing.generation;
+  }
+  return incoming.expires_at >= existing.expires_at;
 }
 
 export function pruneExpiredRegistrySessions(sessions, now) {

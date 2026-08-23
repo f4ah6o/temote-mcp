@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, hostApiBodyLimit, pruneExpiredRegistrySessions, readBoundedBytes } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, hostApiBodyLimit, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -102,6 +102,52 @@ test("registry expiry pruning matches the active-lease model", () => {
       assert.deepEqual(Object.keys(sessions), expected);
     }
   }
+});
+
+test("registry replacement is monotonic by generation then lease expiry", () => {
+  for (let existingGeneration = 1; existingGeneration <= 4; existingGeneration += 1) {
+    for (let incomingGeneration = 1; incomingGeneration <= 4; incomingGeneration += 1) {
+      for (const existingExpiry of [100, 200, 300]) {
+        for (const incomingExpiry of [100, 200, 300]) {
+          const actual = shouldReplaceRegistrySession(
+            { generation: existingGeneration, expires_at: existingExpiry },
+            { generation: incomingGeneration, expires_at: incomingExpiry },
+          );
+          const expected = incomingGeneration > existingGeneration
+            || (incomingGeneration === existingGeneration && incomingExpiry >= existingExpiry);
+          assert.equal(
+            actual,
+            expected,
+            `existing=${existingGeneration}/${existingExpiry} incoming=${incomingGeneration}/${incomingExpiry}`,
+          );
+        }
+      }
+    }
+  }
+});
+
+test("stale registry upserts cannot roll back generation or lease expiry", async () => {
+  const now = 10_000;
+  const storage = new MemoryStorage();
+  const registry = new GatewayRegistry({ storage }, {}, { now: () => now });
+  const upsert = (generation, expires_at) => registry.fetch(post("upsert", {
+    session_id: "monotonic",
+    generation,
+    expires_at,
+  }));
+
+  assert.equal((await upsert(2, now + 200)).status, 204);
+  assert.equal((await upsert(1, now + 1000)).status, 204);
+  assert.deepEqual(await storage.get("sessions"), {
+    monotonic: { session_id: "monotonic", generation: 2, expires_at: now + 200 },
+  });
+
+  assert.equal((await upsert(2, now + 100)).status, 204);
+  assert.equal((await storage.get("sessions")).monotonic.expires_at, now + 200);
+  assert.equal((await upsert(2, now + 300)).status, 204);
+  assert.equal((await storage.get("sessions")).monotonic.expires_at, now + 300);
+  assert.equal((await upsert(3, now + 50)).status, 204);
+  assert.equal((await storage.get("sessions")).monotonic.generation, 3);
 });
 
 test("registry capacity prunes expired leases and preserves existing refreshes", async () => {
