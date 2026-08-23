@@ -19,6 +19,7 @@ use url::Url;
 
 const ACCESS_ASSERTION_HEADER: &str = "cf-access-jwt-assertion";
 const JWKS_PATH: &str = "/cdn-cgi/access/certs";
+const MAX_JWKS_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AccessConfig {
@@ -218,14 +219,7 @@ impl AccessAuthenticator {
             .context("failed to fetch Cloudflare Access signing keys")?
             .error_for_status()
             .context("Cloudflare Access signing-key endpoint returned an error")?;
-        let bytes = response
-            .bytes()
-            .await
-            .context("failed to read Cloudflare Access signing-key response")?;
-        anyhow::ensure!(
-            bytes.len() <= 1024 * 1024,
-            "Cloudflare Access signing-key response is too large"
-        );
+        let bytes = read_bounded_jwks_response(response).await?;
         let set: JwkSet = serde_json::from_slice(&bytes)
             .context("invalid Cloudflare Access signing-key response")?;
         anyhow::ensure!(
@@ -252,6 +246,42 @@ impl AccessAuthenticator {
             test_identity: Some(identity),
         }
     }
+}
+
+async fn read_bounded_jwks_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(
+            length <= MAX_JWKS_BYTES as u64,
+            "Cloudflare Access signing-key response is too large"
+        );
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_JWKS_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read Cloudflare Access signing-key response")?
+    {
+        append_bounded_jwks_chunk(&mut bytes, &chunk)?;
+    }
+    Ok(bytes)
+}
+
+fn append_bounded_jwks_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+    let next = bytes
+        .len()
+        .checked_add(chunk.len())
+        .context("Cloudflare Access signing-key response size overflow")?;
+    anyhow::ensure!(
+        next <= MAX_JWKS_BYTES,
+        "Cloudflare Access signing-key response is too large"
+    );
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn rsa_key(key: &JsonWebKey) -> Result<DecodingKey> {
@@ -374,6 +404,31 @@ mod tests {
                     })
             });
             assert_eq!(audience_matches(value.as_ref(), &expected), model);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_jwks_chunk_budget_never_overreads() -> noprop::TestResult {
+        test_support::run(0x4143_4345_5353_4a57, 512, |ctx| {
+            let start = if noprop::sample_bool(ctx) {
+                noprop::sample_usize_in(ctx, 0..=2048)
+            } else {
+                MAX_JWKS_BYTES - noprop::sample_usize_in(ctx, 0..=2048)
+            };
+            let chunk_len = noprop::sample_usize_in(ctx, 0..=4096);
+            let mut bytes = vec![0_u8; start];
+            let chunk = vec![noprop::sample_u8(ctx); chunk_len];
+            let expected = start
+                .checked_add(chunk_len)
+                .is_some_and(|next| next <= MAX_JWKS_BYTES);
+            let result = append_bounded_jwks_chunk(&mut bytes, &chunk);
+            assert_eq!(result.is_ok(), expected);
+            assert_eq!(
+                bytes.len(),
+                if expected { start + chunk_len } else { start }
+            );
+            assert!(bytes.len() <= MAX_JWKS_BYTES);
             Ok(())
         })
     }
