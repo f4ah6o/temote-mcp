@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::approvals::ApprovalSender;
@@ -22,6 +22,9 @@ const MAX_CLIENTS: usize = 256;
 const MAX_CODES: usize = 256;
 const MAX_TOKENS: usize = 1024;
 const MAX_PENDING_AUTHORIZATIONS: usize = 64;
+const MAX_PENDING_METADATA_FETCHES: usize = 16;
+const MAX_CLIENT_METADATA_ADDRESSES: usize = 32;
+const METADATA_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_URI_BYTES: usize = 2048;
 const MAX_CLIENT_METADATA_BYTES: usize = 128 * 1024;
@@ -32,6 +35,7 @@ pub struct LocalOAuth {
     resource: String,
     approvals: ApprovalSender,
     approval_slots: Arc<Semaphore>,
+    metadata_slots: Arc<Semaphore>,
     state: Arc<Mutex<State>>,
 }
 
@@ -143,13 +147,19 @@ struct ClientMetadataDocument {
 
 impl LocalOAuth {
     pub fn new(public_url: String, approvals: ApprovalSender) -> Self {
-        Self::with_authorization_limit(public_url, approvals, MAX_PENDING_AUTHORIZATIONS)
+        Self::with_limits(
+            public_url,
+            approvals,
+            MAX_PENDING_AUTHORIZATIONS,
+            MAX_PENDING_METADATA_FETCHES,
+        )
     }
 
-    fn with_authorization_limit(
+    fn with_limits(
         public_url: String,
         approvals: ApprovalSender,
         max_pending_authorizations: usize,
+        max_pending_metadata_fetches: usize,
     ) -> Self {
         let resource = format!("{public_url}/mcp");
         Self {
@@ -157,6 +167,7 @@ impl LocalOAuth {
             resource,
             approvals,
             approval_slots: Arc::new(Semaphore::new(max_pending_authorizations)),
+            metadata_slots: Arc::new(Semaphore::new(max_pending_metadata_fetches)),
             state: Arc::new(Mutex::new(State::default())),
         }
     }
@@ -449,16 +460,32 @@ impl LocalOAuth {
                 "client metadata document host must be a public DNS name",
             ));
         }
+        let _metadata_permit = self.acquire_metadata_fetch_slot()?;
 
-        let addresses = tokio::net::lookup_host((host, 443))
-            .await
-            .map_err(|error| {
-                OAuthError::bad_request(
-                    "unauthorized_client",
-                    format!("cannot resolve client metadata host: {error}"),
-                )
-            })?
+        let resolved =
+            tokio::time::timeout(METADATA_DNS_TIMEOUT, tokio::net::lookup_host((host, 443)))
+                .await
+                .map_err(|_| {
+                    OAuthError::bad_request(
+                        "unauthorized_client",
+                        "timed out resolving client metadata host",
+                    )
+                })?
+                .map_err(|error| {
+                    OAuthError::bad_request(
+                        "unauthorized_client",
+                        format!("cannot resolve client metadata host: {error}"),
+                    )
+                })?;
+        let addresses = resolved
+            .take(MAX_CLIENT_METADATA_ADDRESSES + 1)
             .collect::<Vec<_>>();
+        if addresses.len() > MAX_CLIENT_METADATA_ADDRESSES {
+            return Err(OAuthError::bad_request(
+                "unauthorized_client",
+                "client metadata host resolves to too many addresses",
+            ));
+        }
         if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
             return Err(OAuthError::bad_request(
                 "unauthorized_client",
@@ -592,6 +619,18 @@ impl LocalOAuth {
             display_principal: Some(format!("local owner via {}", access.client_id)),
             email: None,
         })
+    }
+
+    fn acquire_metadata_fetch_slot(&self) -> std::result::Result<OwnedSemaphorePermit, OAuthError> {
+        self.metadata_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                OAuthError::bad_request(
+                    "temporarily_unavailable",
+                    "too many client metadata fetches are in progress",
+                )
+            })
     }
 
     fn validate_resource(&self, resource: &str) -> std::result::Result<(), OAuthError> {
@@ -1237,6 +1276,36 @@ mod tests {
     }
 
     #[test]
+    fn generated_metadata_fetch_slots_stay_bounded() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_484d_4554, 256, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 1..=8);
+            let releases = noprop::sample_usize_in(ctx, 0..=limit);
+            let (sender, _approvals) = approvals::approval_channel();
+            let oauth =
+                LocalOAuth::with_limits("https://node.example.ts.net".to_owned(), sender, 1, limit);
+            let mut permits = Vec::with_capacity(limit);
+            for _ in 0..limit {
+                permits.push(oauth.acquire_metadata_fetch_slot().unwrap());
+            }
+            let error = oauth.acquire_metadata_fetch_slot().unwrap_err();
+            assert_eq!(error.code, "temporarily_unavailable");
+
+            for _ in 0..releases {
+                permits.pop();
+            }
+            let mut recovered = Vec::with_capacity(releases);
+            for _ in 0..releases {
+                recovered.push(oauth.acquire_metadata_fetch_slot().unwrap());
+            }
+            assert!(oauth.acquire_metadata_fetch_slot().is_err());
+            drop(recovered);
+            drop(permits);
+            assert!(oauth.acquire_metadata_fetch_slot().is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
     fn generated_authorization_approval_queue_stays_bounded() -> noprop::TestResult {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1247,10 +1316,11 @@ mod tests {
             let limit = noprop::sample_usize_in(ctx, 1..=4);
             runtime.block_on(async {
                 let (sender, mut approvals) = approvals::approval_channel();
-                let oauth = LocalOAuth::with_authorization_limit(
+                let oauth = LocalOAuth::with_limits(
                     "https://node.example.ts.net".to_owned(),
                     sender,
                     limit,
+                    MAX_PENDING_METADATA_FETCHES,
                 );
                 let client_id = registered(&oauth).await;
                 let make_request = |state: String| AuthorizeRequest {
