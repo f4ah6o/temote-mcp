@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -20,6 +21,7 @@ const KINTONE_ENV_NAMES: &[&str] = &[
     "https_proxy",
 ];
 const CHILD_RUNTIME_ENV_NAMES: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+const MAX_CUSTOMIZE_MANIFEST_BYTES: usize = 1024 * 1024;
 const FORBIDDEN_OPTIONS: &[&str] = &[
     "--base-url",
     "--username",
@@ -491,11 +493,10 @@ fn option_value<'a>(arguments: &'a [String], names: &[&str]) -> Option<&'a str> 
 fn validate_customize_manifest(session: &config::Session, manifest_path: &Path) -> Result<()> {
     let manifest_path = config::resolve_existing_path(session, manifest_path)?;
     anyhow::ensure!(manifest_path.is_file(), "customize manifest must be a file");
-    let manifest: Value = serde_json::from_slice(
-        &std::fs::read(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?,
-    )
-    .with_context(|| format!("invalid customize manifest: {}", manifest_path.display()))?;
+    let manifest_bytes = read_bounded_regular_file(&manifest_path, MAX_CUSTOMIZE_MANIFEST_BYTES)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("invalid customize manifest: {}", manifest_path.display()))?;
     let base = manifest_path
         .parent()
         .context("customize manifest has no parent directory")?;
@@ -533,6 +534,33 @@ fn validate_customize_manifest(session: &config::Session, manifest_path: &Path) 
     Ok(())
 }
 
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "path is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= max_bytes as u64,
+        "file exceeds {max_bytes} bytes: {}",
+        path.display()
+    );
+    let file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= max_bytes,
+        "file exceeds {max_bytes} bytes: {}",
+        path.display()
+    );
+    Ok(bytes)
+}
+
 fn reject_symlinks_recursively(root: &Path) -> Result<()> {
     let mut pending = vec![root.to_owned()];
     let mut inspected = 0usize;
@@ -561,15 +589,39 @@ fn reject_symlinks_recursively(root: &Path) -> Result<()> {
 }
 
 fn reject_attachment_parent_traversal(csv_path: &Path) -> Result<()> {
-    let bytes = std::fs::read(csv_path)
+    let file = std::fs::File::open(csv_path)
         .with_context(|| format!("failed to read record import CSV {}", csv_path.display()))?;
     anyhow::ensure!(
-        !bytes
-            .windows(3)
-            .any(|window| window == b"../" || window == b"..\\"),
+        !reader_contains_parent_traversal(file)?,
         "record import CSV may not contain parent-directory traversal while --attachments-dir is used"
     );
     Ok(())
+}
+
+fn reader_contains_parent_traversal(mut reader: impl Read) -> std::io::Result<bool> {
+    let mut buffer = [0u8; 8192];
+    let mut previous = [0u8; 2];
+    let mut seen = 0usize;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        for &byte in &buffer[..read] {
+            if seen >= 2 && previous == [b'.', b'.'] && matches!(byte, b'/' | b'\\') {
+                return Ok(true);
+            }
+            if seen == 0 {
+                previous[0] = byte;
+            } else if seen == 1 {
+                previous[1] = byte;
+            } else {
+                previous[0] = previous[1];
+                previous[1] = byte;
+            }
+            seen = seen.saturating_add(1);
+        }
+    }
 }
 
 fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
@@ -910,6 +962,95 @@ mod tests {
         .unwrap();
         let session = session(root.path());
         validate_customize_manifest(&session, &manifest).unwrap();
+    }
+
+    #[test]
+    fn generated_bounded_regular_file_matches_size_limit() -> noprop::TestResult {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("bounded.bin");
+        test_support::run(0x424f_554e_4445_4446, 512, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=128);
+            let max = noprop::sample_usize_in(ctx, 0..=96);
+            let bytes = (0..len).map(|_| noprop::sample_u8(ctx)).collect::<Vec<_>>();
+            std::fs::write(&path, &bytes).unwrap();
+            let result = read_bounded_regular_file(&path, max);
+            assert_eq!(
+                result.is_ok(),
+                len <= max,
+                "bounded file mismatch: len={len} max={max}"
+            );
+            if let Ok(actual) = result {
+                assert_eq!(actual, bytes);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn customize_manifest_rejects_oversized_file() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("customize-manifest.json");
+        let file = std::fs::File::create(&manifest).unwrap();
+        file.set_len(MAX_CUSTOMIZE_MANIFEST_BYTES as u64 + 1)
+            .unwrap();
+        let session = session(root.path());
+        let error = validate_customize_manifest(&session, &manifest)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("failed to read"));
+        assert!(format!("{error:#}").contains("file exceeds"));
+    }
+
+    struct ChunkedReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+        chunk: usize,
+    }
+
+    impl Read for ChunkedReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset >= self.bytes.len() {
+                return Ok(0);
+            }
+            let len = self
+                .chunk
+                .min(buffer.len())
+                .min(self.bytes.len() - self.offset);
+            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
+        }
+    }
+
+    #[test]
+    fn generated_attachment_traversal_scanner_matches_naive_reference() -> noprop::TestResult {
+        test_support::run(0x4154_5441_4348_4353, test_support::DEFAULT_CASES, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=256);
+            let mut bytes = (0..len).map(|_| noprop::sample_u8(ctx)).collect::<Vec<_>>();
+            if bytes.len() >= 3 && noprop::sample_bool(ctx) {
+                let index = noprop::sample_usize_in(ctx, 0..=bytes.len() - 3);
+                bytes[index..index + 3].copy_from_slice(if noprop::sample_bool(ctx) {
+                    b"../"
+                } else {
+                    b"..\\"
+                });
+            }
+            let expected = bytes
+                .windows(3)
+                .any(|window| window == b"../" || window == b"..\\");
+            let chunk = noprop::sample_usize_in(ctx, 1..=17);
+            let actual = reader_contains_parent_traversal(ChunkedReader {
+                bytes: &bytes,
+                offset: 0,
+                chunk,
+            })
+            .unwrap();
+            assert_eq!(
+                actual, expected,
+                "traversal scanner mismatch: bytes={bytes:?} chunk={chunk}"
+            );
+            Ok(())
+        })
     }
 
     #[test]

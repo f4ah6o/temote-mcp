@@ -21,6 +21,9 @@ const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+const MAX_DIRECTORY_LIST_BYTES: usize = 1024 * 1024;
 const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -428,9 +431,7 @@ async fn call_tool(
         }
         "read_file" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
-            let result = tokio::fs::read_to_string(&path)
-                .await
-                .context("failed to read file");
+            let result = read_text_file(&path).await;
             report_result(
                 &session.id,
                 format!("Read {}", display_path(&path, &session.cwd)),
@@ -725,6 +726,52 @@ fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
 }
 
+async fn read_text_file(path: &Path) -> Result<String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("cannot inspect file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "path is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_TEXT_FILE_BYTES as u64,
+        "file exceeds {MAX_TEXT_FILE_BYTES} bytes: {}",
+        path.display()
+    );
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("cannot open file {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_TEXT_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("cannot read file {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_TEXT_FILE_BYTES,
+        "file exceeds {MAX_TEXT_FILE_BYTES} bytes: {}",
+        path.display()
+    );
+    String::from_utf8(bytes).context("file is not valid UTF-8")
+}
+
+async fn ensure_regular_write_target(path: &Path) -> Result<()> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_file(),
+            "write target is not a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect write target {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
 async fn get_image(path: &Path) -> Result<Value> {
     let path = tokio::fs::canonicalize(&path)
         .await
@@ -811,20 +858,54 @@ fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
 async fn list_directory(path: &Path) -> Result<String> {
     let mut entries = tokio::fs::read_dir(path).await?;
     let mut names = Vec::new();
+    let mut rendered_bytes = 0;
     while let Some(entry) = entries.next_entry().await? {
         let suffix = if entry.file_type().await?.is_dir() {
             "/"
         } else {
             ""
         };
-        names.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
+        let name = format!("{}{}", entry.file_name().to_string_lossy(), suffix);
+        push_directory_listing_entry(
+            &mut names,
+            &mut rendered_bytes,
+            name,
+            MAX_DIRECTORY_ENTRIES,
+            MAX_DIRECTORY_LIST_BYTES,
+        )?;
     }
     names.sort();
     Ok(names.join("\n"))
 }
 
+fn push_directory_listing_entry(
+    names: &mut Vec<String>,
+    rendered_bytes: &mut usize,
+    name: String,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        names.len() < max_entries,
+        "directory contains more than {max_entries} entries"
+    );
+    let separator = usize::from(!names.is_empty());
+    let next_bytes = rendered_bytes
+        .checked_add(separator)
+        .and_then(|value| value.checked_add(name.len()))
+        .context("directory listing size overflow")?;
+    anyhow::ensure!(
+        next_bytes <= max_bytes,
+        "directory listing exceeds {max_bytes} bytes"
+    );
+    names.push(name);
+    *rendered_bytes = next_bytes;
+    Ok(())
+}
+
 async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     let absolute = config::resolve_write_path(session, &required_path(args, "path")?)?;
+    ensure_regular_write_target(&absolute).await?;
     let parent = absolute.parent().context("file has no parent directory")?;
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("parent does not exist: {}", parent.display()))?;
@@ -832,9 +913,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         .get("content")
         .and_then(Value::as_str)
         .context("missing content")?;
-    let previous = tokio::fs::read_to_string(&absolute)
-        .await
-        .unwrap_or_default();
+    let previous = read_text_file(&absolute).await.unwrap_or_default();
     let command = vec![
         "sh".to_owned(),
         "-c".to_owned(),
@@ -1667,6 +1746,124 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn generated_directory_listing_budget_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x4449_5242_5544_4745, 512, |ctx| {
+            let max_entries = noprop::sample_usize_in(ctx, 0..=8);
+            let max_bytes = noprop::sample_usize_in(ctx, 0..=96);
+            let count = noprop::sample_usize_in(ctx, 0..=12);
+            let entries = (0..count)
+                .map(|_| test_support::safe_component(ctx))
+                .collect::<Vec<_>>();
+            let mut names = Vec::new();
+            let mut rendered_bytes = 0usize;
+            let mut reference_bytes = 0usize;
+
+            for name in entries {
+                let separator = usize::from(!names.is_empty());
+                let next = reference_bytes
+                    .checked_add(separator)
+                    .and_then(|value| value.checked_add(name.len()));
+                let expected =
+                    names.len() < max_entries && next.is_some_and(|value| value <= max_bytes);
+                let result = push_directory_listing_entry(
+                    &mut names,
+                    &mut rendered_bytes,
+                    name.clone(),
+                    max_entries,
+                    max_bytes,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "budget mismatch: name={name:?} entries={} bytes={reference_bytes} max_entries={max_entries} max_bytes={max_bytes}",
+                    names.len()
+                );
+                if !expected {
+                    break;
+                }
+                reference_bytes = next.unwrap();
+                assert_eq!(rendered_bytes, reference_bytes);
+                assert_eq!(names.join("\n").len(), reference_bytes);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_bounded_text_reads_round_trip_utf8() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("text.txt");
+
+        test_support::run(0x5445_5854_5245_4144, 256, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=128);
+            let text = (0..count)
+                .map(|_| test_support::safe_component(ctx))
+                .collect::<Vec<_>>()
+                .join(" ");
+            std::fs::write(&path, text.as_bytes()).unwrap();
+            let actual = runtime.block_on(read_text_file(&path)).unwrap();
+            assert_eq!(actual, text);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn bounded_text_read_rejects_oversized_and_invalid_utf8_files() {
+        let root = tempfile::tempdir().unwrap();
+        let oversized = root.path().join("oversized.txt");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_TEXT_FILE_BYTES as u64 + 1).unwrap();
+        assert!(
+            read_text_file(&oversized)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("file exceeds")
+        );
+
+        let invalid = root.path().join("invalid.txt");
+        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        assert!(
+            read_text_file(&invalid)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("valid UTF-8")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_tools_reject_special_file_targets_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("special.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        assert!(
+            read_text_file(&socket)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file")
+        );
+        assert!(
+            ensure_regular_write_target(&socket)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file")
+        );
     }
 
     #[test]
