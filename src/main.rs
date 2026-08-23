@@ -1024,6 +1024,31 @@ TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team.cloudflareaccess.com
     }
 
     #[test]
+    fn generated_unicode_dotenv_values_round_trip_literal() -> noprop::TestResult {
+        test_support::run(0x444f_5445_4e56_554e, test_support::DEFAULT_CASES, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=128);
+            let value = (0..len)
+                .map(|_| {
+                    let scalar = noprop::sample_u32(ctx) % 0x11_0000;
+                    let character = char::from_u32(scalar).unwrap_or('x');
+                    if matches!(character, '\0' | '\n' | '\r' | '\'') {
+                        'x'
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
+            let line = format!("VALUE={}\n", quote_dotenv_value(&value).unwrap());
+            let parsed = dotenvy::from_read_iter(std::io::Cursor::new(line))
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed, ("VALUE".to_owned(), value));
+            Ok(())
+        })
+    }
+
+    #[test]
     fn generated_ambiguous_dotenv_values_fail_closed() -> noprop::TestResult {
         test_support::run(0x444f_5445_4e56_4241, test_support::DEFAULT_CASES, |ctx| {
             let mut value = test_support::ascii_string(ctx, 128)

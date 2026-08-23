@@ -218,14 +218,7 @@ where
     Ok(BoundedCapture { bytes, truncated })
 }
 
-pub async fn configured_funnel_https_ports() -> Result<BTreeSet<u16>> {
-    let stdout = run_tailscale_status(
-        &["funnel", "status", "--json"],
-        "tailscale funnel status --json",
-    )
-    .await?;
-    let value: serde_json::Value = serde_json::from_slice(&stdout)
-        .context("invalid `tailscale funnel status --json` response")?;
+fn parse_configured_funnel_https_ports(value: &serde_json::Value) -> BTreeSet<u16> {
     let mut ports = BTreeSet::new();
     if let Some(tcp) = value.get("TCP").and_then(serde_json::Value::as_object) {
         for key in tcp.keys() {
@@ -245,21 +238,36 @@ pub async fn configured_funnel_https_ports() -> Result<BTreeSet<u16>> {
             }
         }
     }
-    Ok(ports)
+    ports
+}
+
+pub async fn configured_funnel_https_ports() -> Result<BTreeSet<u16>> {
+    let stdout = run_tailscale_status(
+        &["funnel", "status", "--json"],
+        "tailscale funnel status --json",
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_slice(&stdout)
+        .context("invalid `tailscale funnel status --json` response")?;
+    Ok(parse_configured_funnel_https_ports(&value))
 }
 
 pub async fn funnel_https_port_configured(port: u16) -> Result<bool> {
     Ok(configured_funnel_https_ports().await?.contains(&port))
 }
 
-pub async fn preferred_funnel_https_port() -> Result<u16> {
-    let configured = configured_funnel_https_ports().await?;
+fn preferred_funnel_https_port_from(configured: &BTreeSet<u16>) -> Result<u16> {
     TAILSCALE_HTTPS_PORTS
         .into_iter()
         .find(|port| !configured.contains(port))
         .context(
             "all supported Tailscale Funnel HTTPS ports (443, 8443, 10000) are already configured",
         )
+}
+
+pub async fn preferred_funnel_https_port() -> Result<u16> {
+    let configured = configured_funnel_https_ports().await?;
+    preferred_funnel_https_port_from(&configured)
 }
 
 pub fn tailscale_origin(hostname: &str, port: u16) -> String {
@@ -324,6 +332,80 @@ mod tests {
                 assert_eq!(captured.bytes, bytes[..bytes.len().min(limit)]);
                 assert_eq!(captured.truncated, bytes.len() > limit);
             });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_funnel_status_ports_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x5441_494c_504f_5254, test_support::DEFAULT_CASES, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=16);
+            let mut tcp = serde_json::Map::new();
+            let mut web = serde_json::Map::new();
+            let mut expected = BTreeSet::new();
+            for index in 0..count {
+                let port = noprop::sample_u16(ctx);
+                match noprop::sample_usize_in(ctx, 0..=3) {
+                    0 => {
+                        tcp.insert(port.to_string(), serde_json::json!({}));
+                        expected.insert(port);
+                    }
+                    1 => {
+                        web.insert(
+                            format!("https://node-{index}.example.ts.net:{port}"),
+                            serde_json::json!({}),
+                        );
+                        expected.insert(port);
+                    }
+                    2 => {
+                        tcp.insert(format!("bad-{port}"), serde_json::json!({}));
+                    }
+                    _ => {
+                        web.insert(
+                            format!("https://node-{index}.example.ts.net:not-{port}"),
+                            serde_json::json!({}),
+                        );
+                    }
+                }
+            }
+            let value = serde_json::json!({ "TCP": tcp, "Web": web });
+            assert_eq!(parse_configured_funnel_https_ports(&value), expected);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_preferred_funnel_port_matches_priority_order() -> noprop::TestResult {
+        test_support::run(0x5441_494c_5052_4546, test_support::DEFAULT_CASES, |ctx| {
+            let mask = noprop::sample_u8(ctx) & 0x07;
+            let mut configured = BTreeSet::new();
+            for (index, port) in TAILSCALE_HTTPS_PORTS.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    configured.insert(*port);
+                }
+            }
+            configured.insert(noprop::sample_u16(ctx));
+            let expected = TAILSCALE_HTTPS_PORTS
+                .into_iter()
+                .find(|port| !configured.contains(port));
+            assert_eq!(preferred_funnel_https_port_from(&configured).ok(), expected);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_tailscale_origins_round_trip_as_https_endpoints() -> noprop::TestResult {
+        test_support::run(0x5441_494c_4f52_4947, test_support::DEFAULT_CASES, |ctx| {
+            let hostname = format!("{}.example.ts.net", test_support::safe_component(ctx));
+            let port = 1 + (noprop::sample_u16(ctx) % 65535);
+            let origin = tailscale_origin(&hostname, port);
+            let parsed = PublicEndpoint::parse(&origin).unwrap().into_string();
+            let expected = if port == 443 {
+                format!("https://{hostname}")
+            } else {
+                format!("https://{hostname}:{port}")
+            };
+            assert_eq!(parsed, expected);
             Ok(())
         })
     }

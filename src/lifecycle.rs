@@ -558,6 +558,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generated_legacy_pid_pairs_match_positive_i32_reference_model() -> noprop::TestResult {
+        test_support::run(0x4c45_4741_4359_5049, test_support::DEFAULT_CASES, |ctx| {
+            let field_count = noprop::sample_usize_in(ctx, 0..=4);
+            let fields = (0..field_count)
+                .map(|_| match noprop::sample_usize_in(ctx, 0..=4) {
+                    0 => (1 + (noprop::sample_u32(ctx) % i32::MAX as u32)).to_string(),
+                    1 => "0".to_owned(),
+                    2 => format!("-{}", 1 + (noprop::sample_u32(ctx) % i32::MAX as u32)),
+                    3 => (i32::MAX as u64 + 1 + (noprop::sample_u32(ctx) as u64)).to_string(),
+                    _ => format!("bad{}", noprop::sample_u32(ctx)),
+                })
+                .collect::<Vec<_>>();
+            let separator = match noprop::sample_usize_in(ctx, 0..=3) {
+                0 => " ",
+                1 => "\t",
+                2 => "\n",
+                _ => "\r\n",
+            };
+            let leading = if noprop::sample_bool(ctx) {
+                separator
+            } else {
+                ""
+            };
+            let trailing = if noprop::sample_bool(ctx) {
+                separator
+            } else {
+                ""
+            };
+            let raw = format!("{leading}{}{trailing}", fields.join(separator));
+
+            let parsed = raw.split_whitespace().collect::<Vec<_>>();
+            let expected = (parsed.len() == 2)
+                .then(|| {
+                    let serve = parsed[0].parse::<i32>().ok().filter(|pid| *pid > 0)?;
+                    let tunnel = parsed[1].parse::<i32>().ok().filter(|pid| *pid > 0)?;
+                    Some(LegacyUpPids { serve, tunnel })
+                })
+                .flatten();
+            assert_eq!(
+                parse_legacy_up_pids(&raw).ok(),
+                expected,
+                "legacy PID pair mismatch for {raw:?}"
+            );
+            Ok(())
+        })
+    }
+
     #[cfg(unix)]
     #[test]
     fn legacy_pid_reader_rejects_symlink_and_oversize() {

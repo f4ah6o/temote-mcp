@@ -668,6 +668,50 @@ mod tests {
     use crate::test_support;
 
     #[test]
+    fn generated_tunnel_config_parser_is_fail_closed() -> noprop::TestResult {
+        test_support::run(0x4f50_454e_4346_4750, test_support::DEFAULT_CASES, |ctx| {
+            let tunnel_id = format!(
+                "tunnel_{:016x}{:016x}",
+                noprop::sample_u64(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let mode = noprop::sample_usize_in(ctx, 0..=6);
+            let (contents, expected) = match mode {
+                0 => (
+                    format!("# managed\n\nCONTROL_PLANE_TUNNEL_ID={tunnel_id}\n"),
+                    Ok(Some(tunnel_id.clone())),
+                ),
+                1 => (
+                    format!(" CONTROL_PLANE_TUNNEL_ID = \"{tunnel_id}\" \n"),
+                    Ok(Some(tunnel_id.clone())),
+                ),
+                2 => (
+                    format!(
+                        "CONTROL_PLANE_TUNNEL_ID={tunnel_id}\nCONTROL_PLANE_TUNNEL_ID={tunnel_id}\n"
+                    ),
+                    Err(()),
+                ),
+                3 => (
+                    format!("OPENAI_API_KEY=secret\nCONTROL_PLANE_TUNNEL_ID={tunnel_id}\n"),
+                    Err(()),
+                ),
+                4 => (format!("CONTROL_PLANE_TUNNEL_ID=\"{tunnel_id}\n"), Err(())),
+                5 => (
+                    "CONTROL_PLANE_TUNNEL_ID=tunnel_not-hex\n".to_owned(),
+                    Err(()),
+                ),
+                _ => ("# comments only\n\n".to_owned(), Ok(None)),
+            };
+            let actual = parse_configured_tunnel_id(&contents);
+            match expected {
+                Ok(expected) => assert_eq!(actual.unwrap(), expected, "{contents:?}"),
+                Err(()) => assert!(actual.is_err(), "accepted unsafe config {contents:?}"),
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn tunnel_id_grammar_matches_official_shape() {
         assert!(valid_tunnel_id("tunnel_0123456789abcdef0123456789abcdef"));
         assert!(!valid_tunnel_id("tunnel_0123456789ABCDEF0123456789ABCDEF"));
