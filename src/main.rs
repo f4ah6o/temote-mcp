@@ -22,6 +22,7 @@ mod named_roots;
 mod onepassword_mcp;
 #[cfg(feature = "network")]
 mod openai_tunnel;
+mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
@@ -513,11 +514,11 @@ const LEGACY_TUNNEL_TOKEN_KEY: &str = "TEMOTE_MCP_TUNNEL_TOKEN";
 #[cfg(feature = "network")]
 fn default_public_env_file() -> Result<PathBuf> {
     if cfg!(target_os = "macos") {
-        dirs::home_dir()
+        platform_paths::home_dir()
             .map(|home| home.join(".config").join("temote-mcp").join("public.env"))
             .context("could not determine HOME for the default public environment file")
     } else {
-        dirs::config_dir()
+        platform_paths::config_dir()
             .map(|config| config.join("temote-mcp").join("public.env"))
             .context("could not determine the default public environment directory")
     }
@@ -533,7 +534,7 @@ fn public_env_file() -> Result<PathBuf> {
 
 #[cfg(feature = "network")]
 fn default_tunnel_token_file() -> Result<PathBuf> {
-    dirs::home_dir()
+    platform_paths::home_dir()
         .map(|home| home.join(".config").join("temote-mcp").join("tunnel-token"))
         .context("could not determine HOME for the default tunnel token file")
 }
@@ -740,7 +741,7 @@ fn write_private_file_new(path: &Path, bytes: &[u8], label: &str) -> Result<()> 
 
 #[cfg(feature = "network")]
 fn legacy_platform_public_env_file(target: &Path) -> Option<PathBuf> {
-    dirs::config_dir()
+    platform_paths::config_dir()
         .map(|config| config.join("temote-mcp").join("public.env"))
         .filter(|path| path != target)
 }

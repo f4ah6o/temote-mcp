@@ -412,7 +412,7 @@ fn resolve_tunnel_token_file(override_path: Option<&Path>) -> (Option<PathBuf>, 
         }
     }
     (
-        dirs::home_dir().map(|home| home.join(".config/temote-mcp/tunnel-token")),
+        crate::platform_paths::home_dir().map(|home| home.join(".config/temote-mcp/tunnel-token")),
         false,
     )
 }

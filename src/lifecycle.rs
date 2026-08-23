@@ -346,13 +346,13 @@ fn runtime_directory() -> Result<PathBuf> {
     if let Some(path) = env_path("XDG_RUNTIME_DIR") {
         return Ok(path.join("temote-mcp"));
     }
-    dirs::home_dir()
+    crate::platform_paths::home_dir()
         .map(|home| home.join(".cache").join("temote-mcp"))
         .context("could not determine a runtime directory")
 }
 
 fn default_tunnel_token_file() -> Result<PathBuf> {
-    dirs::home_dir()
+    crate::platform_paths::home_dir()
         .map(|home| home.join(".config").join("temote-mcp").join("tunnel-token"))
         .context("could not determine HOME for the default tunnel token file")
 }

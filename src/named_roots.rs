@@ -170,10 +170,10 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
         .to_str()
         .context("configured named root path must be valid UTF-8")?;
     if text == "~" {
-        return dirs::home_dir().context("cannot determine HOME for named root");
+        return crate::platform_paths::home_dir().context("cannot determine HOME for named root");
     }
     if let Some(rest) = text.strip_prefix("~/") {
-        return Ok(dirs::home_dir()
+        return Ok(crate::platform_paths::home_dir()
             .context("cannot determine HOME for named root")?
             .join(rest));
     }

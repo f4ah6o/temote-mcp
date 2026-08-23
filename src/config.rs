@@ -25,8 +25,8 @@ pub struct Session {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
-    dirs::state_dir()
-        .or_else(dirs::data_local_dir)
+    crate::platform_paths::state_dir()
+        .or_else(crate::platform_paths::data_local_dir)
         .map(|path| path.join("temote-mcp"))
         .context("could not determine a local state directory")
 }

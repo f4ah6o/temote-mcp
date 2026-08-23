@@ -191,7 +191,7 @@ fn control_plane_base_url() -> Result<String> {
 }
 
 fn default_config_file() -> Result<PathBuf> {
-    dirs::home_dir()
+    crate::platform_paths::home_dir()
         .map(|home| {
             home.join(".config")
                 .join("temote-mcp")

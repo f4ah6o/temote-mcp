@@ -54,6 +54,19 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 - [x] full tests pass.
 - [x] `git diff --check` passes.
 
+### Phase 2
+
+- [x] `dirs` is no longer a direct dependency.
+- [x] HOME resolution preserves non-empty `HOME` first and Unix passwd fallback.
+- [x] macOS config/local-data semantics preserve `~/Library/Application Support`.
+- [x] documented macOS public env and tunnel-token paths remain under `~/.config/temote-mcp`.
+- [x] Linux/XDG config, state, and local-data variables are accepted only when absolute and otherwise fall back to the HOME-based XDG defaults.
+- [x] targeted platform-path tests pass.
+- [x] `cargo check --all-targets --no-default-features` passes.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- [x] full tests pass.
+- [x] `git diff --check` passes.
+
 ## Baseline
 
 Measured before Phase 1 on macOS:
@@ -81,3 +94,21 @@ Completed on 2026-08-23 against `main` starting at `8789b00`.
 - `git diff --check`: pass
 - macOS normal dependency graph: 146 -> 133 non-root packages (-13)
 - macOS `--no-default-features`: 43 -> 43 non-root packages
+
+
+## Phase 2 evidence
+
+Completed on 2026-08-23 after Phase 1 commit `061e980`.
+
+- direct `dirs` dependency removed from `Cargo.toml`
+- added a focused internal `platform_paths` module for HOME/config/state/local-data resolution only
+- Unix HOME fallback keeps passwd-database lookup when `HOME` is unset or empty
+- macOS keeps Application Support semantics for generic config/local-data while Temote's documented public env and tunnel-token paths continue to use `~/.config/temote-mcp` explicitly
+- Linux/XDG behavior keeps the prior absolute-path requirement and HOME fallbacks (`.config`, `.local/state`, `.local/share`)
+- targeted platform-path tests: 2 passed / 0 failed on macOS, including XDG helper semantics and macOS Application Support semantics
+- full tests: 304 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- no-default-features all-target check: pass (existing dead-code warnings only)
+- Clippy with `-D warnings`: pass
+- `git diff --check`: pass
+- macOS normal dependency graph: 133 -> 130 non-root packages (-3 in Phase 2, -16 from the original baseline)
+- macOS `--no-default-features`: 43 -> 40 non-root packages (-3)

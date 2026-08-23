@@ -1212,7 +1212,9 @@ mod tests {
     use uuid::Uuid;
 
     fn test_directory() -> PathBuf {
-        dirs::home_dir()
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join(format!(".temote-mcp-sandbox-test-{}", Uuid::new_v4()))
     }
