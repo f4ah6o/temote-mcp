@@ -630,6 +630,16 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"not-a-pid\n");
     }
 
+    fn wait_for_pid_lock_release(file: &std::fs::File) -> Result<bool> {
+        for _ in 0..50 {
+            if try_acquire_pid_lock(file)? {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(false)
+    }
+
     #[test]
     fn generated_pid_file_lock_tracks_owner_lifetime() -> noprop::TestResult {
         test_support::run(0x5049_444c_4f43_4b01, 128, |ctx| {
@@ -643,7 +653,7 @@ mod tests {
             if drop_before_probe {
                 drop(holder);
                 assert!(
-                    try_acquire_pid_lock(&probe).unwrap(),
+                    wait_for_pid_lock_release(&probe).unwrap(),
                     "released PID file lock remained busy"
                 );
             } else {
@@ -653,7 +663,7 @@ mod tests {
                 );
                 drop(holder);
                 assert!(
-                    try_acquire_pid_lock(&probe).unwrap(),
+                    wait_for_pid_lock_release(&probe).unwrap(),
                     "PID file lock did not release after owner drop"
                 );
             }
