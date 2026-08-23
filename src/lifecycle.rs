@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -8,6 +8,8 @@ use tokio::time::sleep;
 
 const PID_FILE_NAME: &str = "up.pid";
 const PROCESS_NAME: &str = env!("CARGO_PKG_NAME");
+const MAX_PID_FILE_BYTES: usize = 64;
+const MAX_TUNNEL_TOKEN_BYTES: u64 = 64 * 1024;
 
 pub async fn up(
     public_url: Option<String>,
@@ -28,21 +30,18 @@ pub async fn up(
 
 pub async fn down() -> Result<()> {
     let pid_file = pid_file(false)?;
-    let raw = match std::fs::read_to_string(&pid_file) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let pid = match read_pid_file(&pid_file) {
+        Ok(pid) => pid,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
             println!("no temote-mcp up process is recorded");
             return Ok(());
         }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", pid_file.display()));
-        }
-    };
-    let pid = match parse_pid(&raw) {
-        Ok(pid) => pid,
-        Err(error) => {
-            let _ = std::fs::remove_file(&pid_file);
-            return Err(error).with_context(|| format!("invalid {}", pid_file.display()));
         }
     };
 
@@ -88,6 +87,12 @@ impl PidFile {
                 .open(path)
             {
                 Ok(mut file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                            .with_context(|| format!("failed to protect {}", path.display()))?;
+                    }
                     writeln!(file, "{}", std::process::id())
                         .with_context(|| format!("failed to write {}", path.display()))?;
                     file.sync_all()
@@ -97,14 +102,17 @@ impl PidFile {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    let active = std::fs::read_to_string(path)
-                        .ok()
-                        .and_then(|raw| parse_pid(&raw).ok())
-                        .is_some_and(|pid| is_temote_process(pid).unwrap_or(false));
-                    if active {
+                    let pid = read_pid_file(path).with_context(|| {
+                        format!("cannot safely inspect existing PID file {}", path.display())
+                    })?;
+                    if is_temote_process(pid)
+                        .with_context(|| format!("cannot safely inspect recorded process {pid}"))?
+                    {
                         anyhow::bail!("temote-mcp is already running; use temote-mcp down first");
                     }
-                    let _ = std::fs::remove_file(path);
+                    std::fs::remove_file(path).with_context(|| {
+                        format!("failed to remove stale PID file {}", path.display())
+                    })?;
                 }
                 Err(error) => {
                     return Err(error)
@@ -151,22 +159,74 @@ fn default_tunnel_token_file() -> Result<PathBuf> {
 }
 
 fn ensure_tunnel_token_file(path: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(path)
+    let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("cannot read tunnel token file {}", path.display()))?;
     anyhow::ensure!(
-        metadata.is_file() && metadata.len() > 0,
-        "tunnel token file is missing or empty: {}",
+        metadata.file_type().is_file(),
+        "tunnel token file must be a regular file: {}",
         path.display()
     );
-    std::fs::File::open(path)
+    anyhow::ensure!(
+        metadata.len() > 0 && metadata.len() <= MAX_TUNNEL_TOKEN_BYTES,
+        "tunnel token file must contain 1..={MAX_TUNNEL_TOKEN_BYTES} bytes: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        anyhow::ensure!(
+            private_unix_mode(mode),
+            "tunnel token file must not be accessible by group or other users (mode {mode:04o}): {}",
+            path.display()
+        );
+    }
+    let mut probe = [0u8; 1];
+    let read = std::fs::File::open(path)
+        .with_context(|| format!("tunnel token file is not readable: {}", path.display()))?
+        .read(&mut probe)
         .with_context(|| format!("tunnel token file is not readable: {}", path.display()))?;
+    anyhow::ensure!(read == 1, "tunnel token file is empty: {}", path.display());
     Ok(())
+}
+
+#[cfg(unix)]
+fn private_unix_mode(mode: u32) -> bool {
+    mode & 0o077 == 0
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+fn read_pid_file(path: &Path) -> Result<i32> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect PID file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "PID file is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_PID_FILE_BYTES as u64,
+        "PID file exceeds {MAX_PID_FILE_BYTES} bytes: {}",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)
+        .with_context(|| format!("cannot open PID file {}", path.display()))?
+        .take((MAX_PID_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read PID file {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_PID_FILE_BYTES,
+        "PID file exceeds {MAX_PID_FILE_BYTES} bytes: {}",
+        path.display()
+    );
+    let raw = std::str::from_utf8(&bytes).context("PID file is not valid UTF-8")?;
+    parse_pid(raw)
 }
 
 fn parse_pid(raw: &str) -> Result<i32> {
@@ -243,6 +303,102 @@ fn send_signal(pid: i32, signal: libc::c_int) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn reads_small_regular_pid_files_and_rejects_oversized_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("up.pid");
+        std::fs::write(&path, b"123\n").unwrap();
+        assert_eq!(read_pid_file(&path).unwrap(), 123);
+
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_PID_FILE_BYTES as u64 + 1).unwrap();
+        assert!(
+            read_pid_file(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("PID file exceeds")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_file_rejects_symlink_and_malformed_existing_state_without_deleting_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let path = root.path().join("up.pid");
+        std::fs::write(&target, b"123\n").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_pid_file(&path).is_err());
+        assert!(PidFile::create(&path).is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::write(&path, b"not-a-pid\n").unwrap();
+        assert!(PidFile::create(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not-a-pid\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_file_is_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("up.pid");
+        {
+            let _pid_file = PidFile::create(&path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            assert_eq!(read_pid_file(&path).unwrap(), std::process::id() as i32);
+        }
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tunnel_token_file_rejects_symlink_public_mode_and_oversize() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("token");
+        std::fs::write(&path, b"token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(ensure_tunnel_token_file(&path).is_ok());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ensure_tunnel_token_file(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_TUNNEL_TOKEN_BYTES + 1).unwrap();
+        assert!(ensure_tunnel_token_file(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+
+        let target = root.path().join("target-token");
+        std::fs::write(&target, b"token").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(ensure_tunnel_token_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_private_file_modes_match_owner_only_reference() -> noprop::TestResult {
+        test_support::run(0x4c49_4645_4d4f_4445, test_support::DEFAULT_CASES, |ctx| {
+            let mode = u32::from(noprop::sample_u16(ctx)) & 0o777;
+            assert_eq!(private_unix_mode(mode), mode & 0o077 == 0);
+            Ok(())
+        })
+    }
 
     #[test]
     fn parses_only_positive_pids() {
