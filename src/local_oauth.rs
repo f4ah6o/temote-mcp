@@ -598,7 +598,7 @@ impl LocalOAuth {
             "Authorization scheme must be Bearer"
         );
         let token = token.trim();
-        anyhow::ensure!(!token.is_empty(), "Bearer token is empty");
+        validate_bearer_token(token)?;
 
         let mut state = self.state.lock().await;
         cleanup(&mut state);
@@ -1074,6 +1074,15 @@ fn validate_code_challenge(value: &str) -> std::result::Result<(), OAuthError> {
     Ok(())
 }
 
+fn validate_bearer_token(token: &str) -> Result<()> {
+    anyhow::ensure!(!token.is_empty(), "Bearer token is empty");
+    anyhow::ensure!(
+        token.len() <= MAX_OAUTH_TOKEN_VALUE_BYTES,
+        "Bearer token exceeds {MAX_OAUTH_TOKEN_VALUE_BYTES} bytes"
+    );
+    Ok(())
+}
+
 fn pkce_challenge(verifier: &str) -> std::result::Result<String, OAuthError> {
     let valid = (43..=128).contains(&verifier.len())
         && verifier
@@ -1156,6 +1165,7 @@ fn redirect_with_params<const N: usize>(
 mod tests {
     use super::*;
     use crate::approvals;
+    use crate::test_support;
 
     fn oauth() -> (LocalOAuth, approvals::ApprovalReceiver) {
         let (sender, receiver) = approvals::approval_channel();
@@ -1502,6 +1512,42 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn generated_bearer_token_lengths_match_authentication_bound() -> noprop::TestResult {
+        test_support::run(0x4f41_5554_4842_4541, 512, |ctx| {
+            let length = match noprop::sample_usize_in(ctx, 0..=5) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_OAUTH_TOKEN_VALUE_BYTES - 1,
+                3 => MAX_OAUTH_TOKEN_VALUE_BYTES,
+                4 => MAX_OAUTH_TOKEN_VALUE_BYTES + 1,
+                _ => noprop::sample_usize_in(ctx, 0..=MAX_OAUTH_TOKEN_VALUE_BYTES + 64),
+            };
+            let token = "t".repeat(length);
+            assert_eq!(
+                validate_bearer_token(&token).is_ok(),
+                length > 0 && length <= MAX_OAUTH_TOKEN_VALUE_BYTES,
+                "length={length}"
+            );
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn oversized_bearer_token_is_rejected_before_lookup() {
+        let (oauth, _approvals) = oauth();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", "t".repeat(MAX_OAUTH_TOKEN_VALUE_BYTES + 1))
+                .parse()
+                .unwrap(),
+        );
+        let error = oauth.authenticate(&headers).await.unwrap_err().to_string();
+        assert!(error.contains("exceeds"));
+        assert!(oauth.state.lock().await.tokens.is_empty());
     }
 
     #[tokio::test]
