@@ -19,7 +19,7 @@ temote-mcp doctor
 cargo install temote-mcp --locked
 ```
 
-旧 `just up` 構成を置き換える場合は、先に binary を更新してから旧 runtime ownership だけを migrate し、現在の supervisor を起動します。
+旧 `just up` 構成を置き換える場合は、先に binary を更新し、migration を確認・適用してから現在の supervisor を起動します。
 
 ```sh
 cargo binstall temote-mcp --force
@@ -28,7 +28,9 @@ temote-mcp migrate
 temote-mcp up --profile cloudflare
 ```
 
-`migrate` は connection 設定を書き換えず、別途 `temote-mcp start` した local session も停止しません。
+`migrate` は旧 runtime ownership に加えて、互換な旧 Cloudflare 設定も移行します。既存の `public.env` や内容の異なる既存 Tunnel token は上書きせず、checkout-local `.env` からは Temote が必要とする Cloudflare/runtime key だけをコピーします。別途 `temote-mcp start` した local session は停止しません。`temote-mcp up --profile cloudflare` も、移行先がまだ無い場合は同じ互換設定 migration を bootstrap できます。
+
+macOS の canonical default は `~/.config/temote-mcp/public.env` です。以前の実装で誤って使われる可能性があった `~/Library/Application Support/temote-mcp/public.env` は migration source として認識します。Linux は通常の config directory semantics を維持し、`TEMOTE_MCP_ENV_FILE` を明示した場合はその path を優先します。
 
 Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネイティブは未対応で、gateway endpoint では WSL2 を利用できます。
 
