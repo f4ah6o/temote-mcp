@@ -181,6 +181,16 @@ pub async fn remove_inactive_socket(id: &str) -> Result<()> {
     }
 }
 
+pub async fn remove_session_metadata(id: &str) -> Result<()> {
+    let path = session_path(id)?;
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove session metadata {}", path.display())),
+    }
+}
+
 pub async fn save_session(session: &Session) -> Result<()> {
     validate_session_id(&session.id)?;
     let path = session_path(&session.id)?;

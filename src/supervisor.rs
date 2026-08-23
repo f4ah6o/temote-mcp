@@ -121,7 +121,8 @@ impl SessionSupervisor {
             }
             anyhow::bail!("session {session_id} is not managed by this serve process");
         };
-        handle.shutdown().await
+        handle.shutdown().await?;
+        config::remove_session_metadata(session_id).await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -129,14 +130,17 @@ impl SessionSupervisor {
         self.closed.store(true, Ordering::Release);
         let handles = {
             let mut sessions = self.sessions.lock().await;
-            sessions
-                .drain()
-                .map(|(_, handle)| handle)
-                .collect::<Vec<_>>()
+            sessions.drain().collect::<Vec<_>>()
         };
         let mut first_error = None;
-        for handle in handles {
-            if let Err(error) = handle.shutdown().await
+        for (session_id, handle) in handles {
+            if let Err(error) = handle.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+            if let Err(error) = config::remove_session_metadata(&session_id).await
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -197,9 +201,8 @@ mod tests {
         supervisor.shutdown().await.unwrap();
         assert!(!config::session_is_active(&second_id).await.unwrap());
         assert!(!config::socket_path(&second_id).unwrap().exists());
-        let metadata = std::fs::read(config::session_path(&second_id).unwrap()).unwrap();
-        let session: config::Session = serde_json::from_slice(&metadata).unwrap();
-        assert_eq!(session.process_id, 0);
+        assert!(!config::session_path(&first_id).unwrap().exists());
+        assert!(!config::session_path(&second_id).unwrap().exists());
     }
 
     #[tokio::test]
@@ -394,6 +397,9 @@ mod tests {
                 .collect::<Vec<_>>();
 
             runtime.block_on(async {
+                for id in &ids {
+                    config::remove_session_metadata(id).await.unwrap();
+                }
                 let (supervisor, _approvals) =
                     SessionSupervisor::with_limit(roots, max_sessions);
                 let mut active = HashSet::new();
@@ -448,6 +454,12 @@ mod tests {
                             ));
                             break;
                         }
+                        if !expected && config::session_path(candidate).unwrap().exists() {
+                            failure = Some(format!(
+                                "stopped managed session retained metadata: id={candidate:?}"
+                            ));
+                            break;
+                        }
                     }
                     if failure.is_some() {
                         break;
@@ -457,6 +469,7 @@ mod tests {
                 supervisor.shutdown().await.unwrap();
                 for id in &ids {
                     assert!(!config::session_is_active(id).await.unwrap());
+                    assert!(!config::session_path(id).unwrap().exists());
                 }
                 if let Some(failure) = failure {
                     panic!("{failure}");
