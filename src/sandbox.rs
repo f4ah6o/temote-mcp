@@ -228,14 +228,26 @@ pub fn git_worktree_root(cwd: &Path) -> Result<PathBuf> {
 }
 
 fn read_git_control_file(path: &Path, label: &str) -> Result<Option<String>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("cannot inspect {label} {}", path.display()));
+                .with_context(|| format!("cannot open {label} {} safely", path.display()));
         }
     };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {label} {}", path.display()))?;
     anyhow::ensure!(
         metadata.file_type().is_file(),
         "{label} is not a regular file: {}",
@@ -246,13 +258,19 @@ fn read_git_control_file(path: &Path, label: &str) -> Result<Option<String>> {
         "{label} exceeds {MAX_GIT_POINTER_BYTES} bytes: {}",
         path.display()
     );
-    let contents = std::fs::read_to_string(path)
+    let mut bytes =
+        Vec::with_capacity((metadata.len() as usize).min(MAX_GIT_POINTER_BYTES as usize));
+    file.by_ref()
+        .take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read {label} {}", path.display()))?;
     anyhow::ensure!(
-        contents.len() as u64 <= MAX_GIT_POINTER_BYTES,
+        bytes.len() as u64 <= MAX_GIT_POINTER_BYTES,
         "{label} exceeds {MAX_GIT_POINTER_BYTES} bytes: {}",
         path.display()
     );
+    let contents = String::from_utf8(bytes)
+        .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))?;
     Ok(Some(contents))
 }
 
@@ -781,6 +799,29 @@ mod generic_tests {
             if let Ok(resolved) = result {
                 assert_eq!(resolved, target);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_git_control_file_size_bound_matches_reference_model() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("pointer");
+        test_support::run(0x4749_5443_5452_4c53, 256, |ctx| {
+            let extra = noprop::sample_usize_in(ctx, 0..=32);
+            let below = noprop::sample_bool(ctx);
+            let len = if below {
+                noprop::sample_usize_in(ctx, 0..=MAX_GIT_POINTER_BYTES as usize)
+            } else {
+                MAX_GIT_POINTER_BYTES as usize + 1 + extra
+            };
+            std::fs::write(&path, vec![b'x'; len]).unwrap();
+            let result = read_git_control_file(&path, "test pointer");
+            assert_eq!(
+                result.is_ok(),
+                len <= MAX_GIT_POINTER_BYTES as usize,
+                "len={len} result={result:?}"
+            );
             Ok(())
         })
     }
