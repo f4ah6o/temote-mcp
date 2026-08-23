@@ -274,8 +274,11 @@ export class GatewaySession {
   async connect(body) {
     const validation = validateHostIdentity(body, false);
     if (validation) return validation;
-    const previousGeneration = (await this.state.storage.get("generation")) || 0;
-    const generation = previousGeneration + 1;
+    const previousGeneration = await this.state.storage.get("generation");
+    const generation = nextGatewayGeneration(previousGeneration);
+    if (generation === null) {
+      return jsonResponse({ error: "generation_unavailable" }, 503);
+    }
     const now = Date.now();
     const host = {
       session_id: body.session_id,
@@ -559,6 +562,14 @@ export class GatewayRegistry {
     }
     return new Response(null, { status: 204 });
   }
+}
+
+export function nextGatewayGeneration(previous) {
+  if (previous === undefined || previous === null) return 1;
+  if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) {
+    return null;
+  }
+  return previous + 1;
 }
 
 export function shouldReplaceRegistrySession(existing, incoming) {

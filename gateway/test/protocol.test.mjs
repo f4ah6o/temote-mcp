@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, hostApiBodyLimit, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -83,6 +83,50 @@ test("Access email allowlist is fail-closed and case-insensitive", () => {
   for (const email of ["", "other2@example.com", null, undefined]) {
     assert.equal(accessEmailAllowed("user@example.com", email), false, String(email));
   }
+});
+
+test("gateway generation increment is safe and fail-closed", () => {
+  const cases = [
+    [undefined, 1],
+    [null, 1],
+    [0, 1],
+    [1, 2],
+    [42, 43],
+    [Number.MAX_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER],
+    [Number.MAX_SAFE_INTEGER, null],
+    [-1, null],
+    [1.5, null],
+    ["1", null],
+    [Number.NaN, null],
+    [Number.POSITIVE_INFINITY, null],
+  ];
+  for (const [previous, expected] of cases) {
+    assert.equal(nextGatewayGeneration(previous), expected, `previous=${String(previous)}`);
+  }
+});
+
+test("generation exhaustion does not replace active gateway state", async () => {
+  const storage = new MemoryStorage();
+  await storage.put("generation", Number.MAX_SAFE_INTEGER);
+  await storage.put("host", {
+    session_id: "existing",
+    instance_id: "old",
+    generation: Number.MAX_SAFE_INTEGER,
+    expires_at: Date.now() + 60_000,
+  });
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const response = await session.fetch(post("connect", {
+    session_id: "existing",
+    instance_id: "new",
+    platform: "linux",
+  }));
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).error, "generation_unavailable");
+  assert.equal((await storage.get("host")).instance_id, "old");
+  assert.equal(await storage.get("generation"), Number.MAX_SAFE_INTEGER);
 });
 
 test("registry expiry pruning matches the active-lease model", () => {
