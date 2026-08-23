@@ -1252,9 +1252,13 @@ fn redact_token(text: &str, token: &str) -> String {
 }
 
 fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
-    if value.len() <= max_bytes {
+    let console_safe = value
+        .chars()
+        .all(|character| !character.is_control() || matches!(character, '\n' | '\t'));
+    if console_safe && value.len() <= max_bytes {
         return std::borrow::Cow::Borrowed(value);
     }
+
     const SUFFIX: &str = "… [truncated]";
     let suffix = if max_bytes >= SUFFIX.len() {
         SUFFIX
@@ -1262,13 +1266,36 @@ fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, s
         ""
     };
     let budget = max_bytes.saturating_sub(suffix.len());
-    let mut end = budget.min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
     let mut bounded = String::with_capacity(max_bytes);
-    bounded.push_str(&value[..end]);
-    bounded.push_str(suffix);
+    let mut consumed = 0usize;
+
+    for character in value.chars() {
+        let escaped = if character.is_control() && !matches!(character, '\n' | '\t') {
+            Some(if character.is_ascii() {
+                format!("\\x{:02x}", character as u32)
+            } else {
+                format!("\\u{{{:x}}}", character as u32)
+            })
+        } else {
+            None
+        };
+        let rendered_bytes = escaped
+            .as_ref()
+            .map_or_else(|| character.len_utf8(), String::len);
+        if bounded.len().saturating_add(rendered_bytes) > budget {
+            break;
+        }
+        if let Some(escaped) = escaped {
+            bounded.push_str(&escaped);
+        } else {
+            bounded.push(character);
+        }
+        consumed += character.len_utf8();
+    }
+
+    if consumed < value.len() {
+        bounded.push_str(suffix);
+    }
     std::borrow::Cow::Owned(bounded)
 }
 
@@ -1352,6 +1379,17 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn console_text_escapes_terminal_controls_but_preserves_layout() {
+        let value = "ok\x1b[31m\r\n\tend\u{0085}";
+        let bounded = bounded_console_text(value, 1024);
+        assert_eq!(bounded, "ok\\x1b[31m\\x0d\n\tend\\u{85}");
+        assert!(!bounded.contains('\x1b'));
+        assert!(!bounded.contains('\r'));
+        assert!(bounded.contains('\n'));
+        assert!(bounded.contains('\t'));
     }
 
     #[test]
