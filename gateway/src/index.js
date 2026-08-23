@@ -25,6 +25,9 @@ const MAX_INTERNAL_DISPATCH_ENVELOPE_BYTES = 64 * 1024;
 const MAX_INTERNAL_DISPATCH_BODY_BYTES = MAX_BODY_BYTES + MAX_INTERNAL_DISPATCH_ENVELOPE_BYTES;
 // A 32 MiB image expands to ~42.7 MiB base64, and the JSON-RPC id may consume most of the 8 MiB public request budget.
 const MAX_HOST_RESPONSE_BODY_BYTES = 52 * 1024 * 1024;
+const MAX_INTERNAL_RPC_RESPONSE_BYTES = MAX_HOST_RESPONSE_BODY_BYTES;
+const MAX_INTERNAL_ERROR_RESPONSE_BYTES = 64 * 1024;
+const MAX_REGISTRY_RESPONSE_BYTES = 1024 * 1024;
 const MAX_JWKS_BYTES = 1024 * 1024;
 const jwksCache = new Map();
 
@@ -176,7 +179,10 @@ async function handleToolCall(rpc, env) {
     const registry = registryStub(env);
     const response = await registry.fetch("https://registry.internal/list");
     if (!response.ok) return mcpJson(rpcError(id, -32001, "session registry unavailable"));
-    const sessions = await response.json();
+    const sessions = await safeBoundedJson(response, MAX_REGISTRY_RESPONSE_BYTES, "session registry response");
+    if (!Array.isArray(sessions)) {
+      return mcpJson(rpcError(id, -32001, "session registry returned invalid JSON"));
+    }
     const result = textResult(JSON.stringify(sessions, null, 2));
     return mcpJson(rpcResult(
       id,
@@ -201,7 +207,7 @@ async function handleToolCall(rpc, env) {
     body: JSON.stringify({ request: rpc }),
   });
   if (response.ok) {
-    const payload = await safeJson(response);
+    const payload = await safeBoundedJson(response, MAX_INTERNAL_RPC_RESPONSE_BYTES, "host dispatch response");
     if (!payload) return mcpJson(rpcError(id, -32001, "host returned invalid JSON"));
     if (isModernRequest(rpc) && payload.result) {
       payload.result = modernizeResult(
@@ -213,7 +219,7 @@ async function handleToolCall(rpc, env) {
     return mcpJson(payload);
   }
 
-  const failure = await safeJson(response);
+  const failure = await safeBoundedJson(response, MAX_INTERNAL_ERROR_RESPONSE_BYTES, "host dispatch error");
   const message = failure?.error || "host request failed";
   return mcpJson(rpcError(id, -32001, message, {
     session_id: sessionId,
@@ -783,9 +789,9 @@ export async function readBoundedBytes(message, limit, label) {
   return bytes;
 }
 
-async function safeJson(response) {
+async function safeBoundedJson(response, limit, label) {
   try {
-    return await response.json();
+    return await readBoundedJson(response, limit, label);
   } catch {
     return null;
   }

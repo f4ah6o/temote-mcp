@@ -52,6 +52,22 @@ async function body(response) {
   return response.json();
 }
 
+function legacyToolCallRequest(name, toolArguments = {}) {
+  return new Request("https://gateway.example.test/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-token",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: `call-${name}`,
+      method: "tools/call",
+      params: { name, arguments: toolArguments },
+    }),
+  });
+}
+
 async function waitFor(predicate, message) {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (predicate()) return;
@@ -781,6 +797,74 @@ test("the MCP endpoint selects a Session Durable Object only by session_id", asy
   assert.equal((await response.json()).result.content[0].text, "routed");
 });
 
+
+test("internal registry responses are bounded before JSON parsing", async () => {
+  const registryStub = {
+    fetch: async () => new Response("[]", {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(1024 * 1024 + 1),
+      },
+    }),
+  };
+  const response = await worker.fetch(legacyToolCallRequest("session_list"), {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: {
+      idFromName: (name) => name,
+      get: () => registryStub,
+    },
+  });
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.error.code, -32001);
+  assert.match(payload.error.message, /registry returned invalid JSON/);
+});
+
+test("internal dispatch responses are bounded on success and error paths", async () => {
+  const oversizedSuccess = {
+    fetch: async () => new Response("{}", {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(52 * 1024 * 1024 + 1),
+      },
+    }),
+  };
+  const env = (stub) => ({
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: () => stub,
+    },
+  });
+
+  const successResponse = await worker.fetch(
+    legacyToolCallRequest("session_info", { session_id: "mac-main" }),
+    env(oversizedSuccess),
+  );
+  const successPayload = await successResponse.json();
+  assert.equal(successPayload.error.code, -32001);
+  assert.match(successPayload.error.message, /host returned invalid JSON/);
+
+  const oversizedFailure = {
+    fetch: async () => new Response("{}", {
+      status: 503,
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(64 * 1024 + 1),
+      },
+    }),
+  };
+  const failureResponse = await worker.fetch(
+    legacyToolCallRequest("session_info", { session_id: "mac-main" }),
+    env(oversizedFailure),
+  );
+  const failurePayload = await failureResponse.json();
+  assert.equal(failurePayload.error.code, -32001);
+  assert.equal(failurePayload.error.message, "host request failed");
+  assert.equal(failurePayload.error.data.gateway_status, 503);
+});
 
 test("modern server/discover advertises the 2026 protocol", async () => {
   const request = new Request("https://gateway.example.test/mcp", {
