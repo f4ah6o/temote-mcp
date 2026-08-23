@@ -12,6 +12,10 @@ use crate::{approvals, config, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GATEWAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GATEWAY_POLL_ENVELOPE_BYTES: usize = 64 * 1024;
+const MAX_GATEWAY_POLL_RESPONSE_BYTES: usize =
+    MAX_GATEWAY_RESPONSE_BYTES + MAX_GATEWAY_POLL_ENVELOPE_BYTES;
+const _: () = assert!(MAX_GATEWAY_POLL_ENVELOPE_BYTES >= 64 * 1024);
 const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -285,7 +289,8 @@ async fn run_generation(
             return Ok(GenerationExit::Replaced);
         }
         let response = require_success(response, "gateway poll").await?;
-        let bytes = read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway poll").await?;
+        let bytes =
+            read_bounded_body(response, MAX_GATEWAY_POLL_RESPONSE_BYTES, "gateway poll").await?;
         let envelope: PollEnvelope =
             serde_json::from_slice(&bytes).context("gateway poll returned invalid JSON")?;
         let rpc_response = dispatch_response(&envelope.request).await;

@@ -21,8 +21,8 @@ const MAX_PENDING_HOST_REQUESTS = 64;
 const MAX_REQUEST_ID_ATTEMPTS = 8;
 const MAX_REGISTRY_SESSIONS = 1024;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-// get_image permits 32 MiB raw images; base64 + JSON needs just under 43 MiB.
-const MAX_HOST_RESPONSE_BODY_BYTES = 43 * 1024 * 1024;
+// A 32 MiB image expands to ~42.7 MiB base64, and the JSON-RPC id may consume most of the 8 MiB public request budget.
+const MAX_HOST_RESPONSE_BODY_BYTES = 52 * 1024 * 1024;
 const MAX_JWKS_BYTES = 1024 * 1024;
 const jwksCache = new Map();
 

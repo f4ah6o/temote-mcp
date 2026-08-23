@@ -584,8 +584,13 @@ test("host respond budget covers maximum get_image payload without widening othe
   assert.equal(hostApiBodyLimit("connect"), 8 * 1024 * 1024);
   assert.equal(hostApiBodyLimit("poll"), 8 * 1024 * 1024);
   assert.equal(hostApiBodyLimit("disconnect"), 8 * 1024 * 1024);
-  assert.equal(hostApiBodyLimit("respond"), 43 * 1024 * 1024);
-  assert.ok(maximumBase64Bytes + 256 * 1024 < hostApiBodyLimit("respond"));
+  assert.equal(hostApiBodyLimit("respond"), 52 * 1024 * 1024);
+  const maximumRequestBytes = 8 * 1024 * 1024;
+  const conservativeEnvelopeBytes = 64 * 1024;
+  assert.ok(
+    maximumBase64Bytes + maximumRequestBytes + conservativeEnvelopeBytes
+      < hostApiBodyLimit("respond"),
+  );
 });
 
 test("host respond accepts payloads above the generic body limit while connect rejects them", async () => {
