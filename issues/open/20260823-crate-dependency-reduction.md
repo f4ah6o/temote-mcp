@@ -82,6 +82,23 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 - [x] full tests pass.
 - [x] `git diff --check` passes.
 
+### Phase 4
+
+- [x] `rpassword` and `rtoolbox` are no longer direct/transitive dependencies.
+- [x] supported Unix builds read interactive secrets from `/dev/tty` without echo using the existing `libc` dependency.
+- [x] terminal `ECHO`, `ECHONL`, `ICANON`, and `ISIG` are disabled only for secret entry and restored on all normal/error paths via an RAII guard.
+- [x] Ctrl-C is captured while echo is hidden, terminal state is restored first, then SIGINT is re-delivered.
+- [x] backspace, Ctrl-U, Ctrl-W, UTF-8 input, Enter, Ctrl-D, and common terminal escape sequences retain usable password-entry semantics.
+- [x] a pseudoterminal test proves the changed termios fields are restored after guard drop.
+- [x] PBT confirms generated local-mode flags only lose the four intended bits while hidden.
+- [x] non-Unix builds fail closed with environment-variable guidance rather than adding a new platform dependency; release targets remain macOS/Linux.
+- [x] targeted OpenAI tunnel tests pass.
+- [x] `cargo check --all-targets --all-features` passes.
+- [x] `cargo check --all-targets --no-default-features` passes.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- [x] full tests pass.
+- [x] `git diff --check` passes.
+
 ## Baseline
 
 Measured before Phase 1 on macOS:
@@ -147,4 +164,26 @@ Completed on 2026-08-23 after Phase 2 commit `667bbe0`.
 - Clippy with `-D warnings`: pass
 - `git diff --check`: pass
 - macOS normal dependency graph: 130 -> 116 non-root packages (-14 in Phase 3, -30 from the original baseline)
+- macOS `--no-default-features`: 40 -> 40 non-root packages
+
+
+## Phase 4 evidence
+
+Completed on 2026-08-23 after Phase 3 commit `98e49dd`.
+
+- removed `rpassword` from the `network` feature/dependency list and removed `rtoolbox` from `Cargo.lock`
+- interactive OpenAI admin/runtime secrets now use a focused `/dev/tty` reader backed by existing `libc` termios primitives
+- echo/canonical/signal handling is temporarily disabled for secret entry; a `TtyEchoGuard` restores the original changed fields on drop and explicit completion
+- Ctrl-C is read as input with `ISIG` disabled, the terminal is restored, then `SIGINT` is raised so abrupt process termination cannot strand the terminal with echo disabled
+- terminal editing coverage includes UTF-8, backspace, Ctrl-U, Ctrl-W, escape sequences, Ctrl-D, and content-preserving whitespace behavior
+- pseudoterminal restoration test: pass on macOS
+- terminal flag PBT: 1024 generated cases / 0 failures
+- targeted OpenAI tunnel tests: 22 passed / 0 failed
+- full tests: 308 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- all-target/all-feature check: pass
+- no-default-features all-target check: pass (existing dead-code warnings only)
+- Clippy with `-D warnings`: pass
+- `cargo fmt -- --check`: pass
+- `git diff --check`: pass
+- macOS normal dependency graph: 116 -> 114 non-root packages (-2 in Phase 4, -32 from the original baseline)
 - macOS `--no-default-features`: 40 -> 40 non-root packages

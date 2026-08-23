@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -514,14 +516,212 @@ fn secret_from_env_value(
     Ok(Some(Zeroizing::new(value)))
 }
 
+#[cfg(unix)]
+struct TtyEchoGuard {
+    fd: RawFd,
+    original: libc::termios,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl TtyEchoGuard {
+    fn hide(fd: RawFd) -> std::io::Result<Self> {
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hide_tty_input(&mut hidden);
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            original,
+            restored: false,
+        })
+    }
+
+    fn restore_inner(&mut self) -> std::io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TtyEchoGuard {
+    fn drop(&mut self) {
+        let _ = self.restore_inner();
+    }
+}
+
+#[cfg(unix)]
+fn hidden_tty_local_flags(flags: libc::tcflag_t) -> libc::tcflag_t {
+    flags & !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG)
+}
+
+#[cfg(unix)]
+fn hide_tty_input(term: &mut libc::termios) {
+    term.c_lflag = hidden_tty_local_flags(term.c_lflag);
+    term.c_cc[libc::VMIN] = 1;
+    term.c_cc[libc::VTIME] = 0;
+}
+
+#[cfg(unix)]
+enum SecretInput {
+    Value(Zeroizing<String>),
+    Interrupted,
+}
+
+#[cfg(unix)]
+fn pop_last_utf8_scalar(bytes: &mut Vec<u8>) {
+    let Some(mut start) = bytes.len().checked_sub(1) else {
+        return;
+    };
+    while start > 0 && bytes[start] & 0b1100_0000 == 0b1000_0000 {
+        start -= 1;
+    }
+    bytes.truncate(start);
+}
+
+#[cfg(unix)]
+fn clear_last_terminal_word(bytes: &mut Vec<u8>) {
+    while bytes.last() == Some(&b' ') {
+        bytes.pop();
+    }
+    while bytes.last().is_some_and(|byte| *byte != b' ') {
+        pop_last_utf8_scalar(bytes);
+    }
+}
+
+#[cfg(unix)]
+fn read_secret_byte(reader: &mut impl Read) -> std::io::Result<Option<u8>> {
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(byte[0])),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn discard_terminal_escape_sequence(reader: &mut impl Read) -> std::io::Result<()> {
+    let Some(prefix) = read_secret_byte(reader)? else {
+        return Ok(());
+    };
+    if !matches!(prefix, b'[' | b'O') {
+        return Ok(());
+    }
+    while let Some(byte) = read_secret_byte(reader)? {
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_hidden_secret(reader: &mut impl Read) -> std::io::Result<SecretInput> {
+    let mut bytes = Zeroizing::new(Vec::<u8>::new());
+    while let Some(byte) = read_secret_byte(reader)? {
+        match byte {
+            b'\n' | b'\r' => break,
+            0x08 | 0x7f => pop_last_utf8_scalar(&mut bytes),
+            0x15 => bytes.clear(),
+            0x17 => clear_last_terminal_word(&mut bytes),
+            0x03 => return Ok(SecretInput::Interrupted),
+            0x04 if bytes.is_empty() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected end of terminal input",
+                ));
+            }
+            0x04 => {}
+            0x1b => discard_terminal_escape_sequence(reader)?,
+            byte if byte.is_ascii_control() => {}
+            byte => bytes.push(byte),
+        }
+    }
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "terminal secret must be valid UTF-8",
+            )
+        })?
+        .to_owned();
+    Ok(SecretInput::Value(Zeroizing::new(value)))
+}
+
+#[cfg(unix)]
 fn secret_from_tty(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
-    let value = rpassword::prompt_password(prompt).with_context(|| {
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .with_context(|| {
+            format!(
+                "cannot read {label} from the controlling terminal; set the corresponding environment variable for non-interactive use"
+            )
+        })?;
+    tty.write_all(prompt.as_bytes()).with_context(|| {
+        format!(
+            "cannot write the {label} prompt to the controlling terminal; set the corresponding environment variable for non-interactive use"
+        )
+    })?;
+    tty.flush().context("failed to flush secret prompt")?;
+
+    let mut guard = TtyEchoGuard::hide(tty.as_raw_fd()).with_context(|| {
+        format!(
+            "cannot disable terminal echo for {label}; set the corresponding environment variable for non-interactive use"
+        )
+    })?;
+    let input = read_hidden_secret(&mut tty);
+    guard
+        .restore_inner()
+        .with_context(|| format!("failed to restore terminal state after reading {label}"))?;
+    tty.write_all(b"\n")
+        .context("failed to finish secret prompt")?;
+    tty.flush().context("failed to flush secret prompt")?;
+
+    let input = input.with_context(|| {
         format!(
             "cannot read {label} from the controlling terminal; set the corresponding environment variable for non-interactive use"
         )
     })?;
+    let value = match input {
+        SecretInput::Value(value) => value,
+        SecretInput::Interrupted => {
+            if unsafe { libc::raise(libc::SIGINT) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to deliver terminal interrupt");
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "interrupted",
+            ))
+            .context(format!("cannot read {label} from the controlling terminal"));
+        }
+    };
     anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
-    Ok(Zeroizing::new(value))
+    Ok(value)
+}
+
+#[cfg(not(unix))]
+fn secret_from_tty(_prompt: &str, label: &str) -> Result<Zeroizing<String>> {
+    anyhow::bail!(
+        "cannot read {label} from the controlling terminal on this platform; set the corresponding environment variable for non-interactive use"
+    )
 }
 
 pub async fn doctor_control_plane() -> Result<String> {
@@ -1058,6 +1258,103 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_secret_input_preserves_content_and_handles_terminal_editing() {
+        use std::io::Cursor;
+
+        let read_value = |input: &[u8]| {
+            let mut reader = Cursor::new(input);
+            match read_hidden_secret(&mut reader).unwrap() {
+                SecretInput::Value(value) => value.to_string(),
+                SecretInput::Interrupted => panic!("unexpected interrupt"),
+            }
+        };
+
+        assert_eq!(read_value(b" secret \n"), " secret ");
+        assert_eq!(read_value("秘密\n".as_bytes()), "秘密");
+        assert_eq!(read_value(b"ab\x7fcd\n"), "acd");
+        assert_eq!(read_value(b"discard\x15keep\n"), "keep");
+        assert_eq!(read_value(b"one two\x17three\n"), "one three");
+        assert_eq!(read_value(b"ab\x1b[Acd\n"), "abcd");
+
+        let mut interrupted = Cursor::new(b"secret\x03");
+        assert!(matches!(
+            read_hidden_secret(&mut interrupted).unwrap(),
+            SecretInput::Interrupted
+        ));
+
+        let mut eof = Cursor::new(b"\x04");
+        let error = match read_hidden_secret(&mut eof) {
+            Err(error) => error,
+            Ok(_) => panic!("Ctrl-D on empty input must fail"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hidden_tty_flags_only_clear_required_bits() -> noprop::TestResult {
+        test_support::run(0x4f50_454e_5454_5945, 1024, |ctx| {
+            let flags = noprop::sample_u64(ctx) as libc::tcflag_t;
+            let hidden = hidden_tty_local_flags(flags);
+            let hidden_mask = libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG;
+            assert_eq!(hidden & hidden_mask, 0);
+            assert_eq!(hidden & !hidden_mask, flags & !hidden_mask);
+            Ok(())
+        })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn tty_echo_guard_restores_pseudoterminal_state() {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(slave, original.as_mut_ptr()) }, 0);
+        let original = unsafe { original.assume_init() };
+
+        {
+            let _guard = TtyEchoGuard::hide(slave).unwrap();
+            let mut hidden = std::mem::MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(unsafe { libc::tcgetattr(slave, hidden.as_mut_ptr()) }, 0);
+            let hidden = unsafe { hidden.assume_init() };
+            let hidden_mask = libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG;
+            assert_eq!(hidden.c_lflag & hidden_mask, 0);
+            assert_eq!(hidden.c_cc[libc::VMIN], 1);
+            assert_eq!(hidden.c_cc[libc::VTIME], 0);
+        }
+
+        let mut restored = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(slave, restored.as_mut_ptr()) }, 0);
+        let restored = unsafe { restored.assume_init() };
+        let changed_mask = libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG;
+        assert_eq!(
+            restored.c_lflag & changed_mask,
+            original.c_lflag & changed_mask
+        );
+        assert_eq!(restored.c_cc[libc::VMIN], original.c_cc[libc::VMIN]);
+        assert_eq!(restored.c_cc[libc::VTIME], original.c_cc[libc::VTIME]);
+
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 
     #[test]
