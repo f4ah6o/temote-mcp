@@ -732,8 +732,9 @@ fn text_result(text: String) -> Result<Value> {
 }
 
 async fn read_text_file(path: &Path) -> Result<String> {
-    let metadata = tokio::fs::metadata(path)
-        .await
+    let file = open_readonly_nofollow(path, "file")?;
+    let metadata = file
+        .metadata()
         .with_context(|| format!("cannot inspect file {}", path.display()))?;
     anyhow::ensure!(
         metadata.is_file(),
@@ -745,9 +746,7 @@ async fn read_text_file(path: &Path) -> Result<String> {
         "file exceeds {MAX_TEXT_FILE_BYTES} bytes: {}",
         path.display()
     );
-    let file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("cannot open file {}", path.display()))?;
+    let file = tokio::fs::File::from_std(file);
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take((MAX_TEXT_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -759,6 +758,19 @@ async fn read_text_file(path: &Path) -> Result<String> {
         path.display()
     );
     String::from_utf8(bytes).context("file is not valid UTF-8")
+}
+
+fn open_readonly_nofollow(path: &Path, label: &str) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("cannot open {label} {} safely", path.display()))
 }
 
 async fn ensure_regular_write_target(path: &Path) -> Result<()> {
@@ -778,10 +790,10 @@ async fn ensure_regular_write_target(path: &Path) -> Result<()> {
 }
 
 async fn get_image(path: &Path) -> Result<Value> {
-    let path = tokio::fs::canonicalize(&path)
-        .await
-        .with_context(|| format!("cannot resolve image {}", path.display()))?;
-    let metadata = tokio::fs::metadata(&path).await?;
+    let file = open_readonly_nofollow(path, "image")?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect image {}", path.display()))?;
     anyhow::ensure!(
         metadata.is_file(),
         "image path is not a file: {}",
@@ -792,9 +804,7 @@ async fn get_image(path: &Path) -> Result<Value> {
         "image exceeds {MAX_IMAGE_BYTES} bytes: {}",
         path.display()
     );
-    let file = tokio::fs::File::open(&path)
-        .await
-        .with_context(|| format!("cannot open image {}", path.display()))?;
+    let file = tokio::fs::File::from_std(file);
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take((MAX_IMAGE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -1914,19 +1924,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn file_reads_reject_final_component_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let text_target = root.path().join("text-target.txt");
+        let text_link = root.path().join("text-link.txt");
+        std::fs::write(&text_target, b"secret").unwrap();
+        symlink(&text_target, &text_link).unwrap();
+        assert!(read_text_file(&text_link).await.is_err());
+
+        let image_target = root.path().join("image-target.png");
+        let image_link = root.path().join("image-link.png");
+        std::fs::write(&image_target, b"\x89PNG\r\n\x1a\n").unwrap();
+        symlink(&image_target, &image_link).unwrap();
+        assert!(get_image(&image_link).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn file_tools_reject_special_file_targets_without_blocking() {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("special.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 
-        assert!(
-            read_text_file(&socket)
-                .await
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("not a regular file")
-        );
+        assert!(read_text_file(&socket).await.is_err());
         assert!(
             ensure_regular_write_target(&socket)
                 .await
