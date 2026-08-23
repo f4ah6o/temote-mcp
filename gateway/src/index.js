@@ -19,6 +19,7 @@ const POLL_TIMEOUT_MS = 20_000;
 const RPC_TIMEOUT_MS = 35_000;
 const MAX_PENDING_HOST_REQUESTS = 64;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_JWKS_BYTES = 1024 * 1024;
 const jwksCache = new Map();
 
 export default {
@@ -608,7 +609,7 @@ async function getJwks(teamDomain) {
     cf: { cacheTtl: 300, cacheEverything: true },
   });
   if (!response.ok) throw new Error(`failed to fetch Access keys: ${response.status}`);
-  const body = await response.json();
+  const body = await readBoundedJson(response, MAX_JWKS_BYTES, "Access key response");
   if (!Array.isArray(body.keys)) throw new Error("invalid Access key response");
   jwksCache.set(teamDomain, { keys: body.keys, expiresAt: Date.now() + 300_000 });
   return body.keys;
@@ -626,13 +627,51 @@ function base64UrlBytes(value) {
 }
 
 async function readJson(request) {
-  const length = Number(request.headers.get("content-length") || 0);
-  if (length > MAX_BODY_BYTES) return { ok: false, error: "request body is too large" };
   try {
-    return { ok: true, value: await request.json() };
+    return { ok: true, value: await readBoundedJson(request, MAX_BODY_BYTES, "request body") };
   } catch (error) {
     return { ok: false, error: String(error) };
   }
+}
+
+async function readBoundedJson(message, limit, label) {
+  const bytes = await readBoundedBytes(message, limit, label);
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+export async function readBoundedBytes(message, limit, label) {
+  const rawLength = message.headers.get("content-length");
+  if (rawLength !== null) {
+    const length = Number(rawLength);
+    if (!Number.isSafeInteger(length) || length < 0 || length > limit) {
+      throw new Error(`${label} is too large`);
+    }
+  }
+  if (!message.body) return new Uint8Array();
+
+  const reader = message.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      if (chunk.byteLength > limit - total) throw new Error(`${label} is too large`);
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 async function safeJson(response) {

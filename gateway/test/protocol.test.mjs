@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewaySession } from "../src/index.js";
+import worker, { GatewaySession, readBoundedBytes } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -205,6 +205,68 @@ test("dispatch, poll, and respond complete one routed RPC", async () => {
   });
 });
 
+
+test("bounded stream reader matches the length model across chunking", async () => {
+  const limit = 64;
+  for (const length of [0, 1, 62, 63, 64, 65, 66, 96]) {
+    for (const chunkSize of [1, 7, 31, 64, 128]) {
+      const source = new Uint8Array(length).fill(0x61);
+      const stream = new ReadableStream({
+        start(controller) {
+          for (let offset = 0; offset < source.length; offset += chunkSize) {
+            controller.enqueue(source.slice(offset, Math.min(offset + chunkSize, source.length)));
+          }
+          controller.close();
+        },
+      });
+      const message = { headers: new Headers(), body: stream };
+      if (length <= limit) {
+        const actual = await readBoundedBytes(message, limit, "generated body");
+        assert.equal(actual.byteLength, length, `length=${length} chunk=${chunkSize}`);
+      } else {
+        await assert.rejects(
+          readBoundedBytes(message, limit, "generated body"),
+          /generated body is too large/,
+          `length=${length} chunk=${chunkSize}`,
+        );
+      }
+    }
+  }
+});
+
+test("chunked MCP request bodies cannot bypass the body limit", async () => {
+  const oversized = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/list",
+    padding: "x".repeat(8 * 1024 * 1024),
+  });
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(oversized);
+  const stream = new ReadableStream({
+    start(controller) {
+      const chunk = 64 * 1024;
+      for (let offset = 0; offset < bytes.length; offset += chunk) {
+        controller.enqueue(bytes.slice(offset, Math.min(offset + chunk, bytes.length)));
+      }
+      controller.close();
+    },
+  });
+  const request = new Request("https://gateway.example.test/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client-token",
+      "content-type": "application/json",
+    },
+    body: stream,
+    duplex: "half",
+  });
+  assert.equal(request.headers.has("content-length"), false);
+  const response = await worker.fetch(request, { CLIENT_TOKEN: "client-token" });
+  assert.equal(response.status, 400);
+  const rpc = await response.json();
+  assert.match(rpc.error.message, /request body is too large/);
+});
 
 test("the single MCP endpoint publishes the gateway tool list", async () => {
   const request = new Request("https://gateway.example.test/mcp", {
