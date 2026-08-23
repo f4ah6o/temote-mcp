@@ -357,51 +357,18 @@ impl LocalOAuth {
         }
         self.validate_resource(&request.resource)?;
         let challenge = pkce_challenge(&request.code_verifier)?;
-
-        // Consume the code before validating the binding. A failed redemption is
-        // still a use, preventing verifier/redirect probing and replay.
-        let code = {
-            let mut state = self.state.lock().await;
-            cleanup(&mut state);
-            state.codes.remove(&request.code).ok_or_else(|| {
-                OAuthError::bad_request(
-                    "invalid_grant",
-                    "authorization code is invalid, expired, or already used",
-                )
-            })?
-        };
-        if code.expires_at <= Instant::now()
-            || code.client_id != request.client_id
-            || code.redirect_uri != request.redirect_uri
-            || code.resource != request.resource
-            || code.code_challenge != challenge
-        {
-            return Err(OAuthError::bad_request(
-                "invalid_grant",
-                "authorization code binding or PKCE verification failed",
-            ));
-        }
-
         let token = random_token().map_err(internal_error)?;
-        let expires_at = Instant::now() + TOKEN_TTL;
+        let now = Instant::now();
         {
             let mut state = self.state.lock().await;
-            cleanup(&mut state);
-            if state.tokens.len() >= MAX_TOKENS {
-                return Err(OAuthError::bad_request(
-                    "temporarily_unavailable",
-                    "too many active local OAuth tokens",
-                ));
-            }
-            state.tokens.insert(
+            redeem_authorization_code(
+                &mut state,
+                &request,
+                &challenge,
                 token.clone(),
-                AccessToken {
-                    client_id: request.client_id,
-                    subject: "local-owner".to_owned(),
-                    resource: request.resource,
-                    expires_at,
-                },
-            );
+                now,
+                MAX_TOKENS,
+            )?;
         }
         Ok(json!({
             "access_token": token,
@@ -680,9 +647,64 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 fn cleanup(state: &mut State) {
-    let now = Instant::now();
+    cleanup_at(state, Instant::now());
+}
+
+fn cleanup_at(state: &mut State, now: Instant) {
     state.codes.retain(|_, code| code.expires_at > now);
     state.tokens.retain(|_, token| token.expires_at > now);
+}
+
+fn redeem_authorization_code(
+    state: &mut State,
+    request: &TokenRequest,
+    challenge: &str,
+    token: String,
+    now: Instant,
+    token_limit: usize,
+) -> std::result::Result<(), OAuthError> {
+    cleanup_at(state, now);
+    if state.tokens.len() >= token_limit {
+        return Err(OAuthError::bad_request(
+            "temporarily_unavailable",
+            "too many active local OAuth tokens",
+        ));
+    }
+
+    // A binding failure consumes the code, preventing verifier/redirect probing and replay.
+    // A temporary capacity failure above does not consume it, so the client can retry.
+    let code = state.codes.remove(&request.code).ok_or_else(|| {
+        OAuthError::bad_request(
+            "invalid_grant",
+            "authorization code is invalid, expired, or already used",
+        )
+    })?;
+    if code.expires_at <= now
+        || code.client_id != request.client_id
+        || code.redirect_uri != request.redirect_uri
+        || code.resource != request.resource
+        || code.code_challenge != challenge
+    {
+        return Err(OAuthError::bad_request(
+            "invalid_grant",
+            "authorization code binding or PKCE verification failed",
+        ));
+    }
+    if state.tokens.contains_key(&token) {
+        return Err(internal_error(anyhow::anyhow!(
+            "generated duplicate local OAuth access token"
+        )));
+    }
+    state.tokens.insert(
+        token,
+        AccessToken {
+            client_id: request.client_id.clone(),
+            subject: "local-owner".to_owned(),
+            resource: request.resource.clone(),
+            expires_at: now + TOKEN_TTL,
+        },
+    );
+    Ok(())
 }
 
 fn validate_scope(scope: Option<&str>) -> std::result::Result<(), OAuthError> {
@@ -1026,6 +1048,82 @@ mod tests {
             };
             let allowed = HashSet::from([registered.clone()]);
             assert_eq!(allowed.contains(&candidate), candidate == registered);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_token_capacity_preserves_retryable_codes() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4854_4f4b, 256, |ctx| {
+            let token_limit = noprop::sample_usize_in(ctx, 1..=8);
+            let occupancy = noprop::sample_usize_in(ctx, 0..=token_limit);
+            let binding_valid = noprop::sample_bool(ctx);
+            let now = Instant::now();
+            let verifier = "a".repeat(43);
+            let challenge = pkce_challenge(&verifier).unwrap();
+            let code_value = format!("code-{:x}", noprop::sample_u64(ctx));
+            let client_id = "client".to_owned();
+            let registered_redirect = "http://127.0.0.1:9876/callback".to_owned();
+            let resource = "https://node.example.ts.net/mcp".to_owned();
+            let request = TokenRequest {
+                grant_type: "authorization_code".to_owned(),
+                code: code_value.clone(),
+                client_id: client_id.clone(),
+                redirect_uri: if binding_valid {
+                    registered_redirect.clone()
+                } else {
+                    "http://127.0.0.1:9876/other".to_owned()
+                },
+                code_verifier: verifier,
+                resource: resource.clone(),
+            };
+            let mut state = State::default();
+            state.codes.insert(
+                code_value.clone(),
+                AuthorizationCode {
+                    client_id,
+                    redirect_uri: registered_redirect,
+                    code_challenge: challenge.clone(),
+                    resource,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+            for index in 0..occupancy {
+                state.tokens.insert(
+                    format!("existing-{index}"),
+                    AccessToken {
+                        client_id: "client".to_owned(),
+                        subject: "local-owner".to_owned(),
+                        resource: "https://node.example.ts.net/mcp".to_owned(),
+                        expires_at: now + Duration::from_secs(60),
+                    },
+                );
+            }
+
+            let result = redeem_authorization_code(
+                &mut state,
+                &request,
+                &challenge,
+                "issued-token".to_owned(),
+                now,
+                token_limit,
+            );
+            if occupancy == token_limit {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "temporarily_unavailable");
+                assert!(state.codes.contains_key(&code_value));
+                assert_eq!(state.tokens.len(), occupancy);
+            } else if binding_valid {
+                result.unwrap();
+                assert!(!state.codes.contains_key(&code_value));
+                assert_eq!(state.tokens.len(), occupancy + 1);
+                assert!(state.tokens.contains_key("issued-token"));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "invalid_grant");
+                assert!(!state.codes.contains_key(&code_value));
+                assert_eq!(state.tokens.len(), occupancy);
+            }
             Ok(())
         })
     }
