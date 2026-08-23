@@ -43,6 +43,7 @@ struct State {
 struct ClientRegistration {
     name: String,
     redirect_uris: HashSet<String>,
+    last_used_at: Instant,
 }
 
 struct AuthorizationCode {
@@ -243,10 +244,10 @@ impl LocalOAuth {
 
         let mut state = self.state.lock().await;
         cleanup(&mut state);
-        if state.clients.len() >= MAX_CLIENTS {
+        if !make_client_capacity_available(&mut state, MAX_CLIENTS) {
             return Err(OAuthError::bad_request(
                 "temporarily_unavailable",
-                "local OAuth client registry is full; restart temote-mcp to clear ephemeral registrations",
+                "local OAuth client registry is full of active registrations",
             ));
         }
         let client_id = format!("temote-{}", random_token().map_err(internal_error)?);
@@ -255,6 +256,7 @@ impl LocalOAuth {
             ClientRegistration {
                 name: name.clone(),
                 redirect_uris: redirect_uris.clone(),
+                last_used_at: Instant::now(),
             },
         );
         Ok(json!({
@@ -386,8 +388,9 @@ impl LocalOAuth {
         {
             let mut state = self.state.lock().await;
             cleanup(&mut state);
-            if let Some(client) = state.clients.get(client_id).cloned() {
-                return Ok(client);
+            if let Some(client) = state.clients.get_mut(client_id) {
+                client.last_used_at = Instant::now();
+                return Ok(client.clone());
             }
         }
         self.fetch_client_metadata(client_id, redirect_uri).await
@@ -548,6 +551,7 @@ impl LocalOAuth {
         Ok(ClientRegistration {
             name,
             redirect_uris,
+            last_used_at: Instant::now(),
         })
     }
 
@@ -642,6 +646,38 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
     {
         return false;
+    }
+    true
+}
+
+fn make_client_capacity_available(state: &mut State, max_clients: usize) -> bool {
+    if max_clients == 0 {
+        return false;
+    }
+    while state.clients.len() >= max_clients {
+        let candidate = state
+            .clients
+            .iter()
+            .filter(|(client_id, _)| {
+                !state
+                    .codes
+                    .values()
+                    .any(|code| code.client_id.as_str() == client_id.as_str())
+                    && !state
+                        .tokens
+                        .values()
+                        .any(|token| token.client_id.as_str() == client_id.as_str())
+            })
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.last_used_at
+                    .cmp(&right.last_used_at)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(client_id, _)| client_id.clone());
+        let Some(client_id) = candidate else {
+            return false;
+        };
+        state.clients.remove(&client_id);
     }
     true
 }
@@ -1048,6 +1084,74 @@ mod tests {
             };
             let allowed = HashSet::from([registered.clone()]);
             assert_eq!(allowed.contains(&candidate), candidate == registered);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_client_capacity_evicts_oldest_inactive_registration() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4843_4c49, 256, |ctx| {
+            let max_clients = noprop::sample_usize_in(ctx, 1..=8);
+            let protected_mask = noprop::sample_u64(ctx);
+            let now = Instant::now();
+            let mut state = State::default();
+            let mut protected = HashSet::new();
+            let mut inactive = Vec::new();
+
+            for index in 0..max_clients {
+                let client_id = format!("client-{index}");
+                state.clients.insert(
+                    client_id.clone(),
+                    ClientRegistration {
+                        name: client_id.clone(),
+                        redirect_uris: HashSet::from(["http://127.0.0.1:9876/callback".to_owned()]),
+                        last_used_at: now + Duration::from_nanos(index as u64),
+                    },
+                );
+                if protected_mask & (1 << index) != 0 {
+                    protected.insert(client_id.clone());
+                    if index % 2 == 0 {
+                        state.codes.insert(
+                            format!("code-{index}"),
+                            AuthorizationCode {
+                                client_id,
+                                redirect_uri: "http://127.0.0.1:9876/callback".to_owned(),
+                                code_challenge: "A".repeat(43),
+                                resource: "https://node.example.ts.net/mcp".to_owned(),
+                                expires_at: now + Duration::from_secs(60),
+                            },
+                        );
+                    } else {
+                        state.tokens.insert(
+                            format!("token-{index}"),
+                            AccessToken {
+                                client_id,
+                                subject: "local-owner".to_owned(),
+                                resource: "https://node.example.ts.net/mcp".to_owned(),
+                                expires_at: now + Duration::from_secs(60),
+                            },
+                        );
+                    }
+                } else {
+                    inactive.push(client_id);
+                }
+            }
+
+            let available = make_client_capacity_available(&mut state, max_clients);
+            if let Some(expected_evicted) = inactive.first() {
+                assert!(available);
+                assert_eq!(state.clients.len(), max_clients - 1);
+                assert!(!state.clients.contains_key(expected_evicted));
+                assert!(
+                    protected
+                        .iter()
+                        .all(|client_id| state.clients.contains_key(client_id)),
+                    "active OAuth client was evicted"
+                );
+            } else {
+                assert!(!available);
+                assert_eq!(state.clients.len(), max_clients);
+            }
             Ok(())
         })
     }
