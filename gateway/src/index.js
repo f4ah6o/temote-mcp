@@ -21,6 +21,8 @@ const MAX_PENDING_HOST_REQUESTS = 64;
 const MAX_REQUEST_ID_ATTEMPTS = 8;
 const MAX_REGISTRY_SESSIONS = 1024;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_INTERNAL_DISPATCH_ENVELOPE_BYTES = 64 * 1024;
+const MAX_INTERNAL_DISPATCH_BODY_BYTES = MAX_BODY_BYTES + MAX_INTERNAL_DISPATCH_ENVELOPE_BYTES;
 // A 32 MiB image expands to ~42.7 MiB base64, and the JSON-RPC id may consume most of the 8 MiB public request budget.
 const MAX_HOST_RESPONSE_BODY_BYTES = 52 * 1024 * 1024;
 const MAX_JWKS_BYTES = 1024 * 1024;
@@ -253,7 +255,7 @@ export class GatewaySession {
 
   async fetch(request) {
     const action = new URL(request.url).pathname.slice(1);
-    const body = await readJson(request);
+    const body = await readJson(request, gatewaySessionBodyLimit(action));
     if (!body.ok) return jsonResponse({ error: "invalid_json", detail: body.error }, 400);
     switch (action) {
       case "connect":
@@ -603,6 +605,12 @@ function validateHostIdentity(body, requireGeneration) {
 
 export function hostApiBodyLimit(action) {
   return action === "respond" ? MAX_HOST_RESPONSE_BODY_BYTES : MAX_BODY_BYTES;
+}
+
+export function gatewaySessionBodyLimit(action) {
+  if (action === "respond") return MAX_HOST_RESPONSE_BODY_BYTES;
+  if (action === "dispatch") return MAX_INTERNAL_DISPATCH_BODY_BYTES;
+  return MAX_BODY_BYTES;
 }
 
 function verifyGeneration(host, body) {

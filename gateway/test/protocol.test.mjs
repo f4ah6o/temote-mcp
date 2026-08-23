@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -591,6 +591,41 @@ test("host respond budget covers maximum get_image payload without widening othe
     maximumBase64Bytes + maximumRequestBytes + conservativeEnvelopeBytes
       < hostApiBodyLimit("respond"),
   );
+});
+
+test("Durable Object body budgets preserve dispatch envelopes and host responses", async () => {
+  assert.equal(gatewaySessionBodyLimit("connect"), 8 * 1024 * 1024);
+  assert.equal(gatewaySessionBodyLimit("poll"), 8 * 1024 * 1024);
+  assert.equal(gatewaySessionBodyLimit("disconnect"), 8 * 1024 * 1024);
+  assert.equal(gatewaySessionBodyLimit("dispatch"), 8 * 1024 * 1024 + 64 * 1024);
+  assert.equal(gatewaySessionBodyLimit("respond"), 52 * 1024 * 1024);
+
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const dispatchPadding = "x".repeat(8 * 1024 * 1024);
+  const dispatch = await session.fetch(post("dispatch", {
+    request: { jsonrpc: "2.0", id: 1, method: "tools/call", padding: dispatchPadding },
+  }));
+  assert.equal(dispatch.status, 503);
+  assert.equal((await dispatch.json()).error, "host_offline");
+
+  await session.fetch(post("connect", {
+    session_id: "budgeted",
+    instance_id: "budget-instance",
+    platform: "linux",
+  }));
+  const respondPadding = "x".repeat(8 * 1024 * 1024);
+  const respond = await session.fetch(post("respond", {
+    session_id: "budgeted",
+    instance_id: "budget-instance",
+    generation: 1,
+    request_id: "missing-request",
+    response: { jsonrpc: "2.0", id: 1, result: { padding: respondPadding } },
+  }));
+  assert.equal(respond.status, 409);
+  assert.equal((await respond.json()).error, "stale_request");
 });
 
 test("host respond accepts payloads above the generic body limit while connect rejects them", async () => {
