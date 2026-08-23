@@ -31,6 +31,8 @@ const MAX_OAUTH_STATE_BYTES: usize = 4096;
 const MAX_OAUTH_SCOPE_BYTES: usize = 256;
 const MAX_OAUTH_TOKEN_VALUE_BYTES: usize = 256;
 const MAX_OAUTH_FIXED_PARAMETER_BYTES: usize = 64;
+const MAX_OAUTH_CLIENT_NAME_BYTES: usize = 1024;
+const MAX_OAUTH_CAPABILITY_VALUES: usize = 8;
 const MAX_CLIENT_METADATA_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
@@ -208,6 +210,7 @@ impl LocalOAuth {
         &self,
         request: RegistrationRequest,
     ) -> std::result::Result<Value, OAuthError> {
+        validate_registration_request_bounds(&request)?;
         if request.redirect_uris.is_empty() || request.redirect_uris.len() > MAX_REDIRECT_URIS {
             return Err(OAuthError::bad_request(
                 "invalid_client_metadata",
@@ -907,6 +910,54 @@ fn redeem_authorization_code(
     Ok(())
 }
 
+fn validate_registration_request_bounds(
+    request: &RegistrationRequest,
+) -> std::result::Result<(), OAuthError> {
+    if let Some(name) = request.client_name.as_deref() {
+        validate_client_metadata_length(name, MAX_OAUTH_CLIENT_NAME_BYTES, "client_name")?;
+    }
+    for (name, value) in [
+        ("application_type", request.application_type.as_deref()),
+        (
+            "token_endpoint_auth_method",
+            request.token_endpoint_auth_method.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_client_metadata_length(value, MAX_OAUTH_FIXED_PARAMETER_BYTES, name)?;
+        }
+    }
+    for (name, values) in [
+        ("grant_types", &request.grant_types),
+        ("response_types", &request.response_types),
+    ] {
+        if values.len() > MAX_OAUTH_CAPABILITY_VALUES {
+            return Err(OAuthError::bad_request(
+                "invalid_client_metadata",
+                format!("{name} contains too many values"),
+            ));
+        }
+        for value in values {
+            validate_client_metadata_length(value, MAX_OAUTH_FIXED_PARAMETER_BYTES, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_client_metadata_length(
+    value: &str,
+    max_bytes: usize,
+    name: &str,
+) -> std::result::Result<(), OAuthError> {
+    if value.len() > max_bytes {
+        return Err(OAuthError::bad_request(
+            "invalid_client_metadata",
+            format!("{name} exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_parameter_length(
     value: &str,
     max_bytes: usize,
@@ -1129,6 +1180,74 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn generated_registration_bounds_match_reference_model() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4852_4547, 512, |ctx| {
+            let field = noprop::sample_usize_in(ctx, 0..5);
+            let mut request = RegistrationRequest {
+                redirect_uris: vec!["http://127.0.0.1:9876/callback".to_owned()],
+                client_name: Some("client".to_owned()),
+                application_type: Some("native".to_owned()),
+                grant_types: vec!["authorization_code".to_owned()],
+                response_types: vec!["code".to_owned()],
+                token_endpoint_auth_method: Some("none".to_owned()),
+            };
+            let expected = match field {
+                0 => {
+                    let len = noprop::sample_usize_in(
+                        ctx,
+                        MAX_OAUTH_CLIENT_NAME_BYTES.saturating_sub(2)
+                            ..=MAX_OAUTH_CLIENT_NAME_BYTES + 2,
+                    );
+                    request.client_name = Some("x".repeat(len));
+                    len <= MAX_OAUTH_CLIENT_NAME_BYTES
+                }
+                1 => {
+                    let len = noprop::sample_usize_in(
+                        ctx,
+                        MAX_OAUTH_FIXED_PARAMETER_BYTES.saturating_sub(2)
+                            ..=MAX_OAUTH_FIXED_PARAMETER_BYTES + 2,
+                    );
+                    request.application_type = Some("x".repeat(len));
+                    len <= MAX_OAUTH_FIXED_PARAMETER_BYTES
+                }
+                2 => {
+                    let len = noprop::sample_usize_in(
+                        ctx,
+                        MAX_OAUTH_FIXED_PARAMETER_BYTES.saturating_sub(2)
+                            ..=MAX_OAUTH_FIXED_PARAMETER_BYTES + 2,
+                    );
+                    request.token_endpoint_auth_method = Some("x".repeat(len));
+                    len <= MAX_OAUTH_FIXED_PARAMETER_BYTES
+                }
+                3 => {
+                    let count = noprop::sample_usize_in(
+                        ctx,
+                        MAX_OAUTH_CAPABILITY_VALUES.saturating_sub(2)
+                            ..=MAX_OAUTH_CAPABILITY_VALUES + 2,
+                    );
+                    request.grant_types = vec!["authorization_code".to_owned(); count];
+                    count <= MAX_OAUTH_CAPABILITY_VALUES
+                }
+                _ => {
+                    let count = noprop::sample_usize_in(
+                        ctx,
+                        MAX_OAUTH_CAPABILITY_VALUES.saturating_sub(2)
+                            ..=MAX_OAUTH_CAPABILITY_VALUES + 2,
+                    );
+                    request.response_types = vec!["code".to_owned(); count];
+                    count <= MAX_OAUTH_CAPABILITY_VALUES
+                }
+            };
+            assert_eq!(
+                validate_registration_request_bounds(&request).is_ok(),
+                expected,
+                "field={field}"
+            );
+            Ok(())
+        })
     }
 
     #[test]

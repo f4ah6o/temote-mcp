@@ -23,6 +23,9 @@ use crate::provider::AuthProvider;
 use crate::provider::PublicEndpoint;
 use crate::supervisor::SessionSupervisor;
 
+const MAX_OAUTH_REGISTER_BODY_BYTES: usize = 128 * 1024;
+const MAX_OAUTH_TOKEN_BODY_BYTES: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub struct Runtime {
     pub authenticator: AuthProvider,
@@ -62,9 +65,17 @@ pub fn router(runtime: Runtime) -> Router {
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server),
         )
-        .route("/register", axum::routing::post(oauth_register))
+        .route(
+            "/register",
+            axum::routing::post(oauth_register)
+                .layer(DefaultBodyLimit::max(MAX_OAUTH_REGISTER_BODY_BYTES)),
+        )
         .route("/authorize", get(oauth_authorize))
-        .route("/token", axum::routing::post(oauth_token))
+        .route(
+            "/token",
+            axum::routing::post(oauth_token)
+                .layer(DefaultBodyLimit::max(MAX_OAUTH_TOKEN_BODY_BYTES)),
+        )
         .route(
             "/mcp",
             get(mcp_get)
@@ -521,6 +532,55 @@ mod tests {
     async fn body_json(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth_routes_enforce_local_body_limits() {
+        let (runtime, _approvals) = local_runtime();
+        let register_body = serde_json::to_vec(&json!({
+            "redirect_uris": ["http://127.0.0.1:9876/callback"],
+            "client_name": "x".repeat(MAX_OAUTH_REGISTER_BODY_BYTES),
+            "application_type": "native",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none"
+        }))
+        .unwrap();
+        assert!(register_body.len() > MAX_OAUTH_REGISTER_BODY_BYTES);
+        let register = router(runtime.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(register_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("grant_type", "authorization_code")
+            .append_pair("code", &"x".repeat(MAX_OAUTH_TOKEN_BODY_BYTES))
+            .append_pair("client_id", "client")
+            .append_pair("redirect_uri", "http://127.0.0.1:9876/callback")
+            .append_pair("code_verifier", &"a".repeat(43))
+            .append_pair("resource", "https://node.example.ts.net/mcp");
+        let token_body = form.finish();
+        assert!(token_body.len() > MAX_OAUTH_TOKEN_BODY_BYTES);
+        let token = router(runtime)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(token_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
