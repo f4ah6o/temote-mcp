@@ -10,6 +10,8 @@ use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
 
+const MAX_MANAGED_SESSIONS: usize = 64;
+
 #[derive(Debug, Serialize)]
 pub struct ManagedSessionInfo {
     pub session_id: String,
@@ -24,10 +26,15 @@ pub struct SessionSupervisor {
     sessions: Mutex<HashMap<String, RuntimeHandle>>,
     transitions: Mutex<()>,
     closed: AtomicBool,
+    max_sessions: usize,
 }
 
 impl SessionSupervisor {
     pub fn new(roots: NamedRoots) -> (Arc<Self>, ApprovalReceiver) {
+        Self::with_limit(roots, MAX_MANAGED_SESSIONS)
+    }
+
+    fn with_limit(roots: NamedRoots, max_sessions: usize) -> (Arc<Self>, ApprovalReceiver) {
         let (approval_sender, approval_receiver) = approvals::approval_channel();
         (
             Arc::new(Self {
@@ -36,6 +43,7 @@ impl SessionSupervisor {
                 sessions: Mutex::new(HashMap::new()),
                 transitions: Mutex::new(()),
                 closed: AtomicBool::new(false),
+                max_sessions,
             }),
             approval_receiver,
         )
@@ -68,6 +76,11 @@ impl SessionSupervisor {
             anyhow::ensure!(
                 !sessions.contains_key(&id),
                 "session {id} is already managed by this serve process"
+            );
+            anyhow::ensure!(
+                sessions.len() < self.max_sessions,
+                "managed session limit reached ({})",
+                self.max_sessions
             );
         }
         anyhow::ensure!(
@@ -270,6 +283,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_session_capacity_recovers_after_stop() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::with_limit(roots, 2);
+        let first = format!("capacity-a-{}", uuid::Uuid::new_v4());
+        let second = format!("capacity-b-{}", uuid::Uuid::new_v4());
+        let third = format!("capacity-c-{}", uuid::Uuid::new_v4());
+
+        supervisor.start("src/repo-a", Some(&first)).await.unwrap();
+        supervisor.start("src/repo-b", Some(&second)).await.unwrap();
+        let error = supervisor
+            .start("src/repo-a", Some(&third))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session limit"));
+
+        supervisor.stop(&first).await.unwrap();
+        supervisor.start("src/repo-a", Some(&third)).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        assert!(!config::session_is_active(&second).await.unwrap());
+        assert!(!config::session_is_active(&third).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn start_after_shutdown_is_rejected() {
         let (_temp, roots) = fixture();
         let (supervisor, _approvals) = SessionSupervisor::new(roots);
@@ -338,6 +374,7 @@ mod tests {
         test_support::run(0x5355_5056_5354_4154, 64, |ctx| {
             let (_temp, roots) = fixture();
             let nonce = noprop::sample_u64(ctx);
+            let max_sessions = noprop::sample_usize_in(ctx, 1..=3);
             let ids = [
                 format!("pbt-{nonce:x}-a"),
                 format!("pbt-{nonce:x}-b"),
@@ -353,7 +390,8 @@ mod tests {
                 .collect::<Vec<_>>();
 
             runtime.block_on(async {
-                let (supervisor, _approvals) = SessionSupervisor::new(roots);
+                let (supervisor, _approvals) =
+                    SessionSupervisor::with_limit(roots, max_sessions);
                 let mut active = HashSet::new();
                 let mut failure = None::<String>;
 
@@ -362,7 +400,8 @@ mod tests {
                     match operation {
                         0 | 1 => {
                             let logical = if operation == 0 { "src/repo-a" } else { "src/repo-b" };
-                            let expected = !active.contains(id);
+                            let expected =
+                                !active.contains(id) && active.len() < max_sessions;
                             let result = supervisor.start(logical, Some(id)).await;
                             if result.is_ok() != expected {
                                 failure = Some(format!(
