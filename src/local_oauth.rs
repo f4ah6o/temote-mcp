@@ -265,23 +265,19 @@ impl LocalOAuth {
             name
         };
 
+        let client_id = format!("temote-{}", random_token().map_err(internal_error)?);
         let mut state = self.state.lock().await;
         cleanup(&mut state);
-        if !make_client_capacity_available(&mut state, MAX_CLIENTS) {
-            return Err(OAuthError::bad_request(
-                "temporarily_unavailable",
-                "local OAuth client registry is full of active registrations",
-            ));
-        }
-        let client_id = format!("temote-{}", random_token().map_err(internal_error)?);
-        state.clients.insert(
+        insert_client_registration(
+            &mut state,
             client_id.clone(),
             ClientRegistration {
                 name: name.clone(),
                 redirect_uris: redirect_uris.clone(),
                 last_used_at: Instant::now(),
             },
-        );
+            MAX_CLIENTS,
+        )?;
         Ok(json!({
             "client_id": client_id,
             "client_name": name,
@@ -358,13 +354,8 @@ impl LocalOAuth {
         {
             let mut state = self.state.lock().await;
             cleanup(&mut state);
-            if state.codes.len() >= MAX_CODES {
-                return Err(OAuthError::bad_request(
-                    "temporarily_unavailable",
-                    "too many pending authorization codes",
-                ));
-            }
-            state.codes.insert(
+            insert_authorization_code(
+                &mut state,
                 code.clone(),
                 AuthorizationCode {
                     client_id: request.client_id,
@@ -373,7 +364,8 @@ impl LocalOAuth {
                     resource: request.resource,
                     expires_at: Instant::now() + CODE_TTL,
                 },
-            );
+                MAX_CODES,
+            )?;
         }
         redirect_success(
             &request.redirect_uri,
@@ -766,6 +758,48 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         return false;
     }
     true
+}
+
+fn insert_client_registration(
+    state: &mut State,
+    client_id: String,
+    registration: ClientRegistration,
+    max_clients: usize,
+) -> std::result::Result<(), OAuthError> {
+    if state.clients.contains_key(&client_id) {
+        return Err(internal_error(anyhow::anyhow!(
+            "generated duplicate local OAuth client id"
+        )));
+    }
+    if !make_client_capacity_available(state, max_clients) {
+        return Err(OAuthError::bad_request(
+            "temporarily_unavailable",
+            "local OAuth client registry is full of active registrations",
+        ));
+    }
+    state.clients.insert(client_id, registration);
+    Ok(())
+}
+
+fn insert_authorization_code(
+    state: &mut State,
+    code: String,
+    authorization: AuthorizationCode,
+    max_codes: usize,
+) -> std::result::Result<(), OAuthError> {
+    if state.codes.contains_key(&code) {
+        return Err(internal_error(anyhow::anyhow!(
+            "generated duplicate local OAuth authorization code"
+        )));
+    }
+    if state.codes.len() >= max_codes {
+        return Err(OAuthError::bad_request(
+            "temporarily_unavailable",
+            "too many pending authorization codes",
+        ));
+    }
+    state.codes.insert(code, authorization);
+    Ok(())
 }
 
 fn make_client_capacity_available(state: &mut State, max_clients: usize) -> bool {
@@ -1393,6 +1427,139 @@ mod tests {
                         .contains("error=access_denied")
                 );
             });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_client_id_collisions_do_not_evict_existing_registrations() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4843_4c49, 256, |ctx| {
+            let max_clients = noprop::sample_usize_in(ctx, 1..=8);
+            let collision = noprop::sample_bool(ctx);
+            let now = Instant::now();
+            let mut state = State::default();
+            for index in 0..max_clients {
+                state.clients.insert(
+                    format!("client-{index}"),
+                    ClientRegistration {
+                        name: format!("existing-{index}"),
+                        redirect_uris: HashSet::from(["http://127.0.0.1:9876/callback".to_owned()]),
+                        last_used_at: now + Duration::from_secs(index as u64),
+                    },
+                );
+            }
+            let candidate = if collision {
+                "client-0".to_owned()
+            } else {
+                "new-client".to_owned()
+            };
+            let existing_names = state
+                .clients
+                .iter()
+                .map(|(id, client)| (id.clone(), client.name.clone()))
+                .collect::<HashMap<_, _>>();
+            let result = insert_client_registration(
+                &mut state,
+                candidate.clone(),
+                ClientRegistration {
+                    name: "new-registration".to_owned(),
+                    redirect_uris: HashSet::from(["http://127.0.0.1:9876/callback".to_owned()]),
+                    last_used_at: now + Duration::from_secs(60),
+                },
+                max_clients,
+            );
+
+            if collision {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "server_error");
+                assert_eq!(state.clients.len(), max_clients);
+                for (id, name) in existing_names {
+                    assert_eq!(
+                        state.clients.get(&id).map(|client| &client.name),
+                        Some(&name)
+                    );
+                }
+            } else {
+                result.unwrap();
+                assert_eq!(state.clients.len(), max_clients);
+                assert_eq!(
+                    state
+                        .clients
+                        .get(&candidate)
+                        .map(|client| client.name.as_str()),
+                    Some("new-registration")
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_authorization_code_collisions_preserve_existing_codes() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4843_4f44, 256, |ctx| {
+            let max_codes = noprop::sample_usize_in(ctx, 1..=8);
+            let occupancy = noprop::sample_usize_in(ctx, 0..=max_codes);
+            let collision = occupancy > 0 && noprop::sample_bool(ctx);
+            let now = Instant::now();
+            let mut state = State::default();
+            for index in 0..occupancy {
+                state.codes.insert(
+                    format!("code-{index}"),
+                    AuthorizationCode {
+                        client_id: format!("existing-client-{index}"),
+                        redirect_uri: "http://127.0.0.1:9876/callback".to_owned(),
+                        code_challenge: "A".repeat(43),
+                        resource: "https://node.example.ts.net/mcp".to_owned(),
+                        expires_at: now + Duration::from_secs(60),
+                    },
+                );
+            }
+            let candidate = if collision {
+                "code-0".to_owned()
+            } else {
+                "new-code".to_owned()
+            };
+            let old_client = state
+                .codes
+                .get(&candidate)
+                .map(|code| code.client_id.clone());
+            let result = insert_authorization_code(
+                &mut state,
+                candidate.clone(),
+                AuthorizationCode {
+                    client_id: "new-client".to_owned(),
+                    redirect_uri: "http://127.0.0.1:9876/callback".to_owned(),
+                    code_challenge: "B".repeat(43),
+                    resource: "https://node.example.ts.net/mcp".to_owned(),
+                    expires_at: now + Duration::from_secs(60),
+                },
+                max_codes,
+            );
+
+            if collision {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "server_error");
+                assert_eq!(state.codes.len(), occupancy);
+                assert_eq!(
+                    state.codes.get(&candidate).map(|code| &code.client_id),
+                    old_client.as_ref()
+                );
+            } else if occupancy == max_codes {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "temporarily_unavailable");
+                assert_eq!(state.codes.len(), occupancy);
+                assert!(!state.codes.contains_key(&candidate));
+            } else {
+                result.unwrap();
+                assert_eq!(state.codes.len(), occupancy + 1);
+                assert_eq!(
+                    state
+                        .codes
+                        .get(&candidate)
+                        .map(|code| code.client_id.as_str()),
+                    Some("new-client")
+                );
+            }
             Ok(())
         })
     }
