@@ -35,7 +35,7 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 
 ### Later candidates
 
-- Evaluate `uuid`, `similar`, and `dotenvy` only where replacement remains simpler than the dependency.
+- Evaluate `uuid` and `dotenvy` only where replacement remains simpler than the dependency. `similar` was evaluated on 2026-08-23 and is intentionally retained; see the evidence below.
 - Evaluate `clap` separately: it has a meaningful subtree, but Temote's CLI is a public product interface and should not be weakened merely to reduce package count.
 - Do not prioritize removal of `anyhow`, `axum`, or `reqwest` without a larger architectural reason; their current replacement cost is disproportionate to dependency savings.
 
@@ -189,3 +189,16 @@ Completed on 2026-08-23 after Phase 3 commit `98e49dd`.
 - `git diff --check`: pass
 - macOS normal dependency graph: 116 -> 114 non-root packages (-2 in Phase 4, -32 from the original baseline)
 - macOS `--no-default-features`: 40 -> 40 non-root packages
+
+## `similar` evaluation
+
+Evaluated on 2026-08-23 against `main` after commit `90e8120`. No production change was retained.
+
+- usage is isolated to `src/mcp.rs::render_diff`, where it provides line edit counts plus a 3-line-context unified diff for `write_file` activity
+- `similar 2.7.0` has no transitive dependencies in Temote's graph; removing it saves exactly one normal package in both default and no-default builds
+- `cargo llvm-lines --bin temote-mcp --release --all-features` baseline: 851,840 LLVM IR lines / 19,278 copies
+- functions under the `similar::` namespace account for about 18,094 LLVM IR lines / 97 copies in that baseline
+- a bounded internal prototype (exact small LCS, patience anchors for large regions, unified-diff rendering, missing-newline handling, and PBT) reduced the measured total to 828,917 LLVM IR lines / 18,949 copies (-22,923 lines, about -2.7%; -329 copies)
+- the prototype required about 653 lines including tests and introduced a custom diff algorithm/performance surface for inputs up to the existing 8 MiB text-file limit
+- targeted compatibility tests and 1,024 generated small diff programs passed, and the prototype was bounded against quadratic allocation for large inputs; nevertheless, the maintenance cost is disproportionate to removing a mature zero-transitive dependency
+- decision: retain `similar`; dependency count alone is not sufficient justification to own a bespoke diff engine
