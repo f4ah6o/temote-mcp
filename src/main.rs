@@ -601,7 +601,9 @@ fn read_private_public_env(path: &Path) -> Result<Option<Vec<u8>>> {
 #[cfg(feature = "network")]
 fn quote_dotenv_value(value: &str) -> Result<String> {
     anyhow::ensure!(
-        !value.chars().any(|character| matches!(character, '\0' | '\n' | '\r' | '\'')),
+        !value
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r' | '\'')),
         "legacy Temote env value contains characters that cannot be migrated safely"
     );
     Ok(format!("'{value}'"))
@@ -980,7 +982,12 @@ TEMOTE_MCP_ACCESS_TEAM_DOMAIN=https://team.cloudflareaccess.com
 
     #[test]
     fn quoted_dotenv_values_fail_closed_on_ambiguous_characters() {
-        for value in ["line\nbreak", "carriage\rreturn", "single'quote", "nul\0byte"] {
+        for value in [
+            "line\nbreak",
+            "carriage\rreturn",
+            "single'quote",
+            "nul\0byte",
+        ] {
             assert!(quote_dotenv_value(value).is_err(), "{value:?}");
         }
     }
