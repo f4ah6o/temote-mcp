@@ -1404,6 +1404,7 @@ fn release_job_slot(session_id: &str) {
     }
 }
 
+#[cfg(test)]
 fn remove_job(job_id: Uuid) -> Option<Job> {
     jobs().lock().unwrap().jobs.remove(&job_id)
 }
@@ -1489,44 +1490,55 @@ async fn wait_for_session_stop(session_id: String) {
     }
 }
 
+enum JobPollSnapshot {
+    Completed(CachedJobResult),
+    Running,
+    FinishedWithoutResult,
+}
+
+fn inspect_job(job_id: Uuid, session_id: &str) -> Result<JobPollSnapshot> {
+    let state = jobs().lock().unwrap();
+    let job = state.jobs.get(&job_id).context("unknown job_id")?;
+    anyhow::ensure!(
+        job.session_id == session_id,
+        "job does not belong to this session"
+    );
+    if let Some(result) = job.completion.lock().unwrap().result.clone() {
+        return Ok(JobPollSnapshot::Completed(result));
+    }
+    if job.handle.is_finished() {
+        Ok(JobPollSnapshot::FinishedWithoutResult)
+    } else {
+        Ok(JobPollSnapshot::Running)
+    }
+}
+
+fn take_job_for_session(job_id: Uuid, session_id: &str) -> Result<Job> {
+    let mut state = jobs().lock().unwrap();
+    let job = state.jobs.get(&job_id).context("unknown job_id")?;
+    anyhow::ensure!(
+        job.session_id == session_id,
+        "job does not belong to this session"
+    );
+    state.jobs.remove(&job_id).context("unknown job_id")
+}
+
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
-    let result = {
-        let state = jobs().lock().unwrap();
-        let job = state.jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
-        job.completion.lock().unwrap().result.clone()
-    };
-    if let Some(result) = result {
-        return cached_job_result(result);
+    match inspect_job(job_id, &session.id)? {
+        JobPollSnapshot::Completed(result) => cached_job_result(result),
+        JobPollSnapshot::Running => {
+            text_result(json!({"status":"running","job_id":job_id}).to_string())
+        }
+        JobPollSnapshot::FinishedWithoutResult => {
+            anyhow::bail!("background command task finished without a cached result")
+        }
     }
-
-    let task_finished_without_result = {
-        let state = jobs().lock().unwrap();
-        let job = state.jobs.get(&job_id).context("unknown job_id")?;
-        job.handle.is_finished()
-    };
-    if task_finished_without_result {
-        anyhow::bail!("background command task finished without a cached result")
-    }
-    text_result(json!({"status":"running","job_id":job_id}).to_string())
 }
 
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
-    let job = {
-        let state = jobs().lock().unwrap();
-        let job = state.jobs.get(&job_id).context("unknown job_id")?;
-        anyhow::ensure!(
-            job.session_id == session.id,
-            "job does not belong to this session"
-        );
-        drop(state);
-        remove_job(job_id).context("unknown job_id")?
-    };
+    let job = take_job_for_session(job_id, &session.id)?;
     job.handle.abort();
     let _ = job.handle.await;
     approvals::activity(
@@ -2505,6 +2517,142 @@ mod tests {
                 assert!(stop_job(&args, &other).await.is_err());
                 assert!(jobs().lock().unwrap().jobs.contains_key(&job_id));
                 assert!(stop_job(&args, &owner).await.is_ok());
+                assert!(!jobs().lock().unwrap().jobs.contains_key(&job_id));
+            });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_concurrent_poll_stop_is_linearizable() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4a4f_4252_4143_4501, 64, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let session = config::Session {
+                id: format!("poll-stop-{nonce:x}"),
+                cwd: std::env::current_dir().unwrap(),
+                permitted_directories: Vec::new(),
+                started_at: 0,
+                process_id: 0,
+                yolo: true,
+            };
+            let job_id = Uuid::new_v4();
+            let completion = Arc::new(Mutex::new(JobCompletion::default()));
+            let handle = runtime.spawn(async { std::future::pending::<()>().await });
+            jobs().lock().unwrap().jobs.insert(
+                job_id,
+                Job {
+                    session_id: session.id.clone(),
+                    command: "test".to_owned(),
+                    handle,
+                    completion,
+                },
+            );
+
+            runtime.block_on(async {
+                let barrier = Arc::new(tokio::sync::Barrier::new(3));
+                let poll_barrier = Arc::clone(&barrier);
+                let stop_barrier = Arc::clone(&barrier);
+                let poll_session = session.clone();
+                let stop_session = session.clone();
+                let poll_args = json!({"job_id": job_id.to_string()});
+                let stop_args = poll_args.clone();
+
+                let poll = tokio::spawn(async move {
+                    poll_barrier.wait().await;
+                    poll_job(&poll_args, &poll_session).await
+                });
+                let stop = tokio::spawn(async move {
+                    stop_barrier.wait().await;
+                    stop_job(&stop_args, &stop_session).await
+                });
+                barrier.wait().await;
+
+                let poll_result = poll.await.unwrap();
+                let stop_result = stop.await.unwrap();
+                assert!(
+                    stop_result.is_ok(),
+                    "owner stop unexpectedly failed: {stop_result:?}"
+                );
+                match poll_result {
+                    Ok(value) => {
+                        let text = value["content"][0]["text"].as_str().unwrap_or_default();
+                        assert!(
+                            text.contains("\"status\":\"running\""),
+                            "poll returned unexpected value: {value:?}"
+                        );
+                    }
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("unknown job_id"),
+                            "poll returned non-linearizable error: {error:#}"
+                        );
+                    }
+                }
+                assert!(!jobs().lock().unwrap().jobs.contains_key(&job_id));
+            });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_concurrent_stops_remove_job_exactly_once() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4a4f_4253_544f_5002, 64, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let session = config::Session {
+                id: format!("double-stop-{nonce:x}"),
+                cwd: std::env::current_dir().unwrap(),
+                permitted_directories: Vec::new(),
+                started_at: 0,
+                process_id: 0,
+                yolo: true,
+            };
+            let job_id = Uuid::new_v4();
+            let completion = Arc::new(Mutex::new(JobCompletion::default()));
+            let handle = runtime.spawn(async { std::future::pending::<()>().await });
+            jobs().lock().unwrap().jobs.insert(
+                job_id,
+                Job {
+                    session_id: session.id.clone(),
+                    command: "test".to_owned(),
+                    handle,
+                    completion,
+                },
+            );
+
+            runtime.block_on(async {
+                let barrier = Arc::new(tokio::sync::Barrier::new(3));
+                let args = json!({"job_id": job_id.to_string()});
+                let mut tasks = Vec::new();
+                for _ in 0..2 {
+                    let barrier = Arc::clone(&barrier);
+                    let session = session.clone();
+                    let args = args.clone();
+                    tasks.push(tokio::spawn(async move {
+                        barrier.wait().await;
+                        stop_job(&args, &session).await
+                    }));
+                }
+                barrier.wait().await;
+                let first = tasks.remove(0).await.unwrap();
+                let second = tasks.remove(0).await.unwrap();
+                assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+                let error = if first.is_err() {
+                    first.err()
+                } else {
+                    second.err()
+                }
+                .unwrap();
+                assert!(error.to_string().contains("unknown job_id"));
                 assert!(!jobs().lock().unwrap().jobs.contains_key(&job_id));
             });
             Ok(())
