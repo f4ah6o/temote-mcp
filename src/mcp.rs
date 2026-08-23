@@ -18,6 +18,8 @@ const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_JOBS_PER_SESSION: usize = 8;
 const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_COMPLETED_JOBS_PER_SESSION: usize = 128;
+const MAX_COMPLETED_JOBS_TOTAL: usize = 1024;
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -1313,6 +1315,7 @@ async fn spawn_sandboxed_command(
             completion.completed_at = Some(Instant::now());
         }
         drop(slot);
+        reap_jobs();
         report_command_finished(session_id, &task_command, &result).await;
     });
     Ok((rendered_command, handle, completion))
@@ -1339,15 +1342,19 @@ async fn store_job(
     activity: &str,
 ) -> Result<Value> {
     let job_id = Uuid::new_v4();
-    jobs().lock().unwrap().jobs.insert(
-        job_id,
-        Job {
-            session_id: session.id.clone(),
-            command: rendered_command.clone(),
-            handle,
-            completion,
-        },
-    );
+    {
+        let mut state = jobs().lock().unwrap();
+        state.jobs.insert(
+            job_id,
+            Job {
+                session_id: session.id.clone(),
+                command: rendered_command.clone(),
+                handle,
+                completion,
+            },
+        );
+        reap_jobs_at(&mut state, Instant::now());
+    }
     approvals::activity(
         &session.id,
         format!("{activity} {rendered_command}"),
@@ -1402,24 +1409,73 @@ fn remove_job(job_id: Uuid) -> Option<Job> {
 }
 
 fn reap_jobs() {
-    let now = Instant::now();
-    let expired = {
-        let state = jobs().lock().unwrap();
-        state
-            .jobs
-            .iter()
-            .filter_map(|(job_id, job)| {
-                let completed_at = job.completion.lock().unwrap().completed_at?;
-                (now.saturating_duration_since(completed_at) >= COMPLETED_JOB_TTL)
-                    .then_some(*job_id)
-            })
-            .collect::<Vec<_>>()
-    };
-    if expired.is_empty() {
-        return;
-    }
     let mut state = jobs().lock().unwrap();
-    for job_id in expired {
+    reap_jobs_at(&mut state, Instant::now());
+}
+
+fn reap_jobs_at(state: &mut JobState, now: Instant) {
+    reap_jobs_with_limits(
+        state,
+        now,
+        MAX_COMPLETED_JOBS_PER_SESSION,
+        MAX_COMPLETED_JOBS_TOTAL,
+    );
+}
+
+fn reap_jobs_with_limits(
+    state: &mut JobState,
+    now: Instant,
+    per_session_limit: usize,
+    total_limit: usize,
+) {
+    let completed = state
+        .jobs
+        .iter()
+        .filter_map(|(job_id, job)| {
+            let completed_at = job.completion.lock().unwrap().completed_at?;
+            Some((*job_id, job.session_id.clone(), completed_at))
+        })
+        .collect::<Vec<_>>();
+
+    let mut remove = completed
+        .iter()
+        .filter_map(|(job_id, _, completed_at)| {
+            (now.saturating_duration_since(*completed_at) >= COMPLETED_JOB_TTL).then_some(*job_id)
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut by_session = HashMap::<String, Vec<(Uuid, Instant)>>::new();
+    for (job_id, session_id, completed_at) in &completed {
+        if !remove.contains(job_id) {
+            by_session
+                .entry(session_id.clone())
+                .or_default()
+                .push((*job_id, *completed_at));
+        }
+    }
+    for entries in by_session.values_mut() {
+        if entries.len() <= per_session_limit {
+            continue;
+        }
+        entries.sort_by_key(|(job_id, completed_at)| (*completed_at, *job_id));
+        for (job_id, _) in entries.iter().take(entries.len() - per_session_limit) {
+            remove.insert(*job_id);
+        }
+    }
+
+    let mut remaining = completed
+        .iter()
+        .filter(|(job_id, _, _)| !remove.contains(job_id))
+        .map(|(job_id, _, completed_at)| (*job_id, *completed_at))
+        .collect::<Vec<_>>();
+    if remaining.len() > total_limit {
+        remaining.sort_by_key(|(job_id, completed_at)| (*completed_at, *job_id));
+        for (job_id, _) in remaining.iter().take(remaining.len() - total_limit) {
+            remove.insert(*job_id);
+        }
+    }
+
+    for job_id in remove {
         state.jobs.remove(&job_id);
     }
 }
@@ -2622,6 +2678,89 @@ mod tests {
                     .contains_key(&session_id),
                 "dropping all slots did not clear the session counter"
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_completed_job_cache_stays_bounded_and_preserves_active_jobs() -> noprop::TestResult
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4a4f_4243_4143_4845, 128, |ctx| {
+            let per_session_limit = noprop::sample_usize_in(ctx, 1..=8);
+            let total_limit = noprop::sample_usize_in(ctx, per_session_limit..=24);
+            let session_count = noprop::sample_usize_in(ctx, 1..=5);
+            let operation_count = noprop::sample_usize_in(ctx, 1..=48);
+            let now = Instant::now();
+            let campaign = noprop::sample_u64(ctx);
+            let mut state = JobState {
+                jobs: HashMap::new(),
+                active_by_session: HashMap::new(),
+            };
+            let mut active_ids = std::collections::HashSet::new();
+
+            for step in 0..operation_count {
+                let session_id = format!(
+                    "cache-pbt-{campaign}-{}",
+                    noprop::sample_usize_in(ctx, 0..session_count)
+                );
+                let job_id = Uuid::new_v4();
+                let active = noprop::sample_usize_in(ctx, 0..4) == 0;
+                let completion = Arc::new(Mutex::new(if active {
+                    JobCompletion::default()
+                } else {
+                    JobCompletion {
+                        result: Some(CachedJobResult::Success(format!("done-{step}"))),
+                        completed_at: Some(now + Duration::from_nanos(step as u64 + 1)),
+                    }
+                }));
+                let handle = if active {
+                    active_ids.insert(job_id);
+                    runtime.spawn(async { std::future::pending::<()>().await })
+                } else {
+                    runtime.spawn(async {})
+                };
+                state.jobs.insert(
+                    job_id,
+                    Job {
+                        session_id,
+                        command: "test".to_owned(),
+                        handle,
+                        completion,
+                    },
+                );
+                reap_jobs_with_limits(&mut state, now, per_session_limit, total_limit);
+
+                assert!(
+                    active_ids
+                        .iter()
+                        .all(|job_id| state.jobs.contains_key(job_id)),
+                    "active job was evicted"
+                );
+                let completed = state
+                    .jobs
+                    .values()
+                    .filter(|job| job.completion.lock().unwrap().completed_at.is_some())
+                    .collect::<Vec<_>>();
+                assert!(completed.len() <= total_limit);
+                let mut per_session = HashMap::<&str, usize>::new();
+                for job in completed {
+                    *per_session.entry(job.session_id.as_str()).or_default() += 1;
+                }
+                assert!(
+                    per_session
+                        .values()
+                        .all(|count| *count <= per_session_limit),
+                    "per-session completed cache exceeded limit"
+                );
+            }
+
+            for job in state.jobs.values() {
+                job.handle.abort();
+            }
             Ok(())
         })
     }
