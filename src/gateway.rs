@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -19,6 +19,7 @@ const _: () = assert!(MAX_GATEWAY_POLL_ENVELOPE_BYTES >= 64 * 1024);
 const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Platform {
@@ -271,6 +272,7 @@ async fn run_generation(
             return Ok(GenerationExit::Disconnected);
         }
 
+        let poll_started = Instant::now();
         let response = gateway
             .request(Method::POST, "/v1/hosts/poll")
             .json(&GenerationRequest {
@@ -283,6 +285,10 @@ async fn run_generation(
             .context("gateway poll request failed")?;
 
         if response.status() == StatusCode::NO_CONTENT {
+            let delay = empty_poll_delay(poll_started.elapsed());
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             continue;
         }
         if response.status() == StatusCode::CONFLICT {
@@ -312,6 +318,10 @@ async fn run_generation(
         }
         require_success(response, "gateway response upload").await?;
     }
+}
+
+fn empty_poll_delay(elapsed: Duration) -> Duration {
+    MIN_EMPTY_POLL_INTERVAL.saturating_sub(elapsed)
 }
 
 async fn dispatch_response(request: &Value) -> Value {
@@ -546,6 +556,23 @@ mod tests {
                 normalize_gateway_url(&unsafe_value).is_err(),
                 "accepted {unsafe_value:?}"
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_empty_poll_delay_enforces_minimum_interval() -> noprop::TestResult {
+        test_support::run(0x4741_5445_504f_4c4c, 512, |ctx| {
+            let elapsed_ms = noprop::sample_u64(ctx) % 1001;
+            let elapsed = Duration::from_millis(elapsed_ms);
+            let actual = empty_poll_delay(elapsed);
+            let expected = if elapsed < MIN_EMPTY_POLL_INTERVAL {
+                MIN_EMPTY_POLL_INTERVAL - elapsed
+            } else {
+                Duration::ZERO
+            };
+            assert_eq!(actual, expected, "elapsed_ms={elapsed_ms}");
+            assert!(elapsed.saturating_add(actual) >= MIN_EMPTY_POLL_INTERVAL);
             Ok(())
         })
     }
