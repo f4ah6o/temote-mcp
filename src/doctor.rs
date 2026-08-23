@@ -1,19 +1,17 @@
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
-#[cfg(target_os = "linux")]
-use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(feature = "network")]
 use serde::Deserialize;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::profile::Profile;
 use crate::sandbox;
-
-#[cfg(feature = "network")]
-use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 const BWRAP_INSTALL_HINT: &str =
@@ -24,6 +22,8 @@ sudo apt install apparmor-profiles apparmor-utils\
 sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict\
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict";
 const MAX_TUNNEL_TOKEN_BYTES: u64 = 16 * 1024;
+const DOCTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_DOCTOR_STREAM_BYTES: usize = 32 * 1024;
 
 #[derive(Default)]
 pub struct Options {
@@ -261,7 +261,7 @@ fn check_cloudflare_access_config(report: &mut Report) {
 
 #[cfg(feature = "network")]
 async fn check_tailscale_local(report: &mut Report) {
-    match Command::new("tailscale").arg("version").output().await {
+    match run_doctor_command("tailscale", &["version"]).await {
         Ok(output) if output.status.success() => report.add(Check::pass(
             "tailscale",
             display_output(&output).unwrap_or_else(|| "available".to_owned()),
@@ -415,7 +415,7 @@ fn resolve_tunnel_token_file(override_path: Option<&Path>) -> (Option<PathBuf>, 
 }
 
 async fn check_cloudflared(report: &mut Report) {
-    match Command::new("cloudflared").arg("--version").output().await {
+    match run_doctor_command("cloudflared", &["--version"]).await {
         Ok(output) if output.status.success() => report.add(Check::pass(
             "cloudflared",
             display_output(&output).unwrap_or_else(|| "available".to_owned()),
@@ -779,7 +779,7 @@ fn check_linux_helper(report: &mut Report) -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 async fn check_bwrap(report: &mut Report) -> bool {
-    let version = Command::new("bwrap").arg("--version").output().await;
+    let version = run_doctor_command("bwrap", &["--version"]).await;
     match version {
         Ok(output) if output.status.success() => {
             report.add(Check::pass(
@@ -805,8 +805,9 @@ async fn check_bwrap(report: &mut Report) -> bool {
         }
     }
 
-    match Command::new("bwrap")
-        .args([
+    match run_doctor_command(
+        "bwrap",
+        &[
             "--unshare-user",
             "--unshare-net",
             "--ro-bind",
@@ -818,9 +819,9 @@ async fn check_bwrap(report: &mut Report) -> bool {
             "/dev",
             "--",
             "/bin/true",
-        ])
-        .output()
-        .await
+        ],
+    )
+    .await
     {
         Ok(output) if output.status.success() => {
             report.add(Check::pass(
@@ -1014,20 +1015,106 @@ fn command_output_detail(output: &sandbox::Output) -> String {
     }
 }
 
-fn display_output(output: &std::process::Output) -> Option<String> {
+struct DoctorOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+async fn run_doctor_command(program: &str, args: &[&str]) -> Result<DoctorOutput> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("cannot execute {program}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("doctor command stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("doctor command stderr was not captured")?;
+    let captured = tokio::time::timeout(DOCTOR_COMMAND_TIMEOUT, async {
+        let (stdout, stderr, status) = tokio::join!(
+            read_doctor_stream(stdout, MAX_DOCTOR_STREAM_BYTES),
+            read_doctor_stream(stderr, MAX_DOCTOR_STREAM_BYTES),
+            child.wait(),
+        );
+        Result::<_>::Ok((stdout?, stderr?, status?))
+    })
+    .await;
+    let (stdout, stderr, status) = match captured {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "{program} timed out after {}s",
+                DOCTOR_COMMAND_TIMEOUT.as_secs()
+            );
+        }
+    };
+    Ok(DoctorOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        truncated: stdout.truncated || stderr.truncated,
+    })
+}
+
+struct DoctorStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_doctor_stream<R>(mut reader: R, limit: usize) -> std::io::Result<DoctorStream>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK: usize = 8192;
+    let mut bytes = Vec::with_capacity(limit.min(CHUNK));
+    let mut truncated = false;
+    let mut buffer = [0_u8; CHUNK];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let kept = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..kept]);
+        if kept < read {
+            truncated = true;
+        }
+    }
+    Ok(DoctorStream { bytes, truncated })
+}
+
+fn display_output(output: &DoctorOutput) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if !stderr.is_empty() {
+    let value = if !stderr.is_empty() {
         Some(stderr)
     } else if !stdout.is_empty() {
         Some(stdout)
     } else {
         None
-    }
+    };
+    value.map(|value| {
+        if output.truncated {
+            format!("{value} [output truncated]")
+        } else {
+            value
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn contains_loopback_permission_error(output: &std::process::Output) -> bool {
+fn contains_loopback_permission_error(output: &DoctorOutput) -> bool {
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1045,6 +1132,29 @@ fn contains_loopback_permission_error_text(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn generated_doctor_stream_capture_matches_prefix_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x444f_4354_4341_5001, 512, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 0..=128);
+            let len = noprop::sample_usize_in(ctx, 0..=256);
+            let input = (0..len).map(|_| noprop::sample_u8(ctx)).collect::<Vec<_>>();
+            runtime.block_on(async {
+                use tokio::io::AsyncWriteExt as _;
+                let (mut writer, reader) = tokio::io::duplex(input.len().max(1));
+                writer.write_all(&input).await.unwrap();
+                writer.shutdown().await.unwrap();
+                let captured = read_doctor_stream(reader, limit).await.unwrap();
+                assert_eq!(captured.bytes, input[..input.len().min(limit)]);
+                assert_eq!(captured.truncated, input.len() > limit);
+            });
+            Ok(())
+        })
+    }
 
     #[test]
     fn recognizes_the_bwrap_loopback_failure() {
