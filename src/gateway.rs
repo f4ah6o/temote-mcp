@@ -11,6 +11,9 @@ use uuid::Uuid;
 use crate::{approvals, config, mcp};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
+const MAX_GATEWAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
+const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -242,10 +245,9 @@ async fn connect(
         .await
         .context("gateway connect request failed")?;
     let response = require_success(response, "gateway connect").await?;
-    let body: ConnectResponse = response
-        .json()
-        .await
-        .context("gateway connect returned invalid JSON")?;
+    let bytes = read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway connect").await?;
+    let body: ConnectResponse =
+        serde_json::from_slice(&bytes).context("gateway connect returned invalid JSON")?;
     anyhow::ensure!(
         body.session_id == session_id,
         "gateway returned a different session_id"
@@ -283,10 +285,9 @@ async fn run_generation(
             return Ok(GenerationExit::Replaced);
         }
         let response = require_success(response, "gateway poll").await?;
-        let envelope: PollEnvelope = response
-            .json()
-            .await
-            .context("gateway poll returned invalid JSON")?;
+        let bytes = read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway poll").await?;
+        let envelope: PollEnvelope =
+            serde_json::from_slice(&bytes).context("gateway poll returned invalid JSON")?;
         let rpc_response = dispatch_response(&envelope.request).await;
 
         let response = gateway
@@ -358,8 +359,52 @@ async fn require_success(response: Response, operation: &str) -> Result<Response
         return Ok(response);
     }
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    anyhow::bail!("{operation} failed with HTTP {status}: {body}")
+    let body = read_bounded_body(response, MAX_GATEWAY_ERROR_BYTES, operation)
+        .await
+        .with_context(|| format!("{operation} failed with HTTP {status}"))?;
+    let detail = String::from_utf8_lossy(&body)
+        .chars()
+        .take(MAX_GATEWAY_ERROR_DISPLAY_CHARS)
+        .collect::<String>();
+    anyhow::bail!("{operation} failed with HTTP {status}: {detail}")
+}
+
+async fn read_bounded_body(
+    mut response: Response,
+    limit: usize,
+    operation: &str,
+) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(
+            length <= limit as u64,
+            "{operation} response exceeds {limit} bytes"
+        );
+    }
+    let mut body =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed to read {operation} response"))?
+    {
+        append_bounded_body_chunk(&mut body, &chunk, limit, operation)?;
+    }
+    Ok(body)
+}
+
+fn append_bounded_body_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    limit: usize,
+    operation: &str,
+) -> Result<()> {
+    let next = body
+        .len()
+        .checked_add(chunk.len())
+        .context("gateway response size overflow")?;
+    anyhow::ensure!(next <= limit, "{operation} response exceeds {limit} bytes");
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn normalize_gateway_url(value: &str) -> Result<String> {
@@ -496,6 +541,39 @@ mod tests {
                 normalize_gateway_url(&unsafe_value).is_err(),
                 "accepted {unsafe_value:?}"
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_gateway_body_budget_never_overreads() -> noprop::TestResult {
+        test_support::run(0x4741_5445_424f_4459, 512, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 0..=1024);
+            let chunk_count = noprop::sample_usize_in(ctx, 0..=16);
+            let mut body = Vec::new();
+            let mut reference_len = 0usize;
+            let mut rejected = false;
+            for _ in 0..chunk_count {
+                let len = noprop::sample_usize_in(ctx, 0..=256);
+                let chunk = vec![noprop::sample_u8(ctx); len];
+                let expected = reference_len
+                    .checked_add(len)
+                    .is_some_and(|next| next <= limit);
+                let result = append_bounded_body_chunk(&mut body, &chunk, limit, "test");
+                assert_eq!(result.is_ok(), expected);
+                if expected {
+                    reference_len += len;
+                    assert_eq!(body.len(), reference_len);
+                } else {
+                    rejected = true;
+                    assert_eq!(body.len(), reference_len);
+                    break;
+                }
+            }
+            assert!(body.len() <= limit);
+            if rejected {
+                assert!(reference_len <= limit);
+            }
             Ok(())
         })
     }
