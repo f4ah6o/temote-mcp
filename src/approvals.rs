@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -640,10 +640,32 @@ async fn read_session_message(stream: &mut UnixStream) -> Result<Option<String>>
     Ok(Some(line))
 }
 
+struct IncomingSessionMessage {
+    stream: UnixStream,
+    message: Message,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn queue_incoming_session_message(
+    sender: &mpsc::UnboundedSender<IncomingSessionMessage>,
+    stream: UnixStream,
+    message: Message,
+    permit: OwnedSemaphorePermit,
+) -> bool {
+    sender
+        .send(IncomingSessionMessage {
+            stream,
+            message,
+            _permit: permit,
+        })
+        .is_ok()
+}
+
 async fn receive_session_message(
     mut stream: UnixStream,
     session_id: String,
-    sender: mpsc::UnboundedSender<(UnixStream, Message)>,
+    sender: mpsc::UnboundedSender<IncomingSessionMessage>,
+    permit: OwnedSemaphorePermit,
 ) {
     let line = match tokio::time::timeout(
         SESSION_MESSAGE_READ_TIMEOUT,
@@ -669,7 +691,7 @@ async fn receive_session_message(
             return;
         }
     };
-    let _ = sender.send((stream, message));
+    let _ = queue_incoming_session_message(&sender, stream, message, permit);
 }
 
 async fn run_runtime(
@@ -699,12 +721,12 @@ async fn run_runtime(
                 let sender = incoming_sender.clone();
                 let session_id = session.id.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    receive_session_message(stream, session_id, sender).await;
+                    receive_session_message(stream, session_id, sender, permit).await;
                 });
             }
             incoming = incoming_receiver.recv() => {
-                let Some((mut stream, message)) = incoming else { continue };
+                let Some(IncomingSessionMessage { mut stream, message, _permit }) = incoming else { continue };
+                drop(_permit);
                 match message {
                     Message::Probe => {
                         stream.write_all(b"active\n").await?;
@@ -1301,6 +1323,50 @@ mod tests {
                     payload_len < LIMIT,
                     "response bound mismatch for payload_len={payload_len}"
                 );
+            });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_incoming_queue_holds_read_permits_until_dequeue() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4950_4351_5545_5545, 256, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 1..=8);
+            let attempts = noprop::sample_usize_in(ctx, 0..=limit + 8);
+            runtime.block_on(async {
+                let slots = Arc::new(Semaphore::new(limit));
+                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let mut peers = Vec::new();
+                let mut queued = 0usize;
+
+                for _ in 0..attempts {
+                    let permit = match Arc::clone(&slots).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
+                    let (stream, peer) = UnixStream::pair().unwrap();
+                    peers.push(peer);
+                    assert!(queue_incoming_session_message(
+                        &sender,
+                        stream,
+                        Message::Probe,
+                        permit,
+                    ));
+                    queued += 1;
+                }
+
+                assert_eq!(queued, attempts.min(limit));
+                assert_eq!(slots.available_permits(), limit - queued);
+                if queued > 0 {
+                    let incoming = receiver.try_recv().unwrap();
+                    drop(incoming);
+                    assert_eq!(slots.available_permits(), limit - queued + 1);
+                }
+                drop(peers);
             });
             Ok(())
         })
