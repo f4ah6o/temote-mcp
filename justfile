@@ -61,8 +61,8 @@ tunnel: env-check
     tunnel_token_file="${TUNNEL_TOKEN_FILE:-${HOME}/.config/temote-mcp/tunnel-token}"; \
     exec cloudflared tunnel run --token-file "$tunnel_token_file"
 
-# Run the origin and Tunnel together. This is a development wrapper around temote-mcp up.
-up: build env-check
+# Run the origin and Tunnel together. The binary bootstraps compatible legacy config when needed.
+up: build
     exec "{{ justfile_directory() }}/target/release/temote-mcp" up
 
 # Stop the foreground supervisor started by temote-mcp up.

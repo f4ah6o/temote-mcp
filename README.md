@@ -19,7 +19,7 @@ To build from source instead:
 cargo install temote-mcp --locked
 ```
 
-When replacing a legacy `just up` deployment, install the new binary first, then migrate only its old runtime ownership before starting the current supervisor:
+When replacing a legacy `just up` deployment, install the new binary first, inspect the migration, apply it, and then start the current supervisor:
 
 ```sh
 cargo binstall temote-mcp --force
@@ -28,7 +28,9 @@ temote-mcp migrate
 temote-mcp up --profile cloudflare
 ```
 
-`migrate` does not rewrite connection configuration or stop independently started local sessions.
+`migrate` handles both legacy runtime ownership and compatible legacy Cloudflare configuration. It never overwrites an existing `public.env` or a different existing Tunnel token, copies only supported Temote Cloudflare/runtime keys from checkout-local `.env`, and does not stop independently started local sessions. `temote-mcp up --profile cloudflare` can also bootstrap the compatible configuration migration when the destination is still missing.
+
+On macOS, the canonical default is `~/.config/temote-mcp/public.env`. A file left at the previous accidental `~/Library/Application Support/temote-mcp/public.env` location is recognized as a migration source. Linux continues to use its normal config directory semantics, and `TEMOTE_MCP_ENV_FILE` remains the explicit override.
 
 Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are not supported; WSL2 can be used for the gateway endpoint path.
 
