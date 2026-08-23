@@ -33,9 +33,10 @@ export TEMOTE_MCP_ROOTS='src=~/src'
 temote-mcp up --profile cloudflare
 # Tailscale Funnel + Temote local OAuth を使う場合:
 # temote-mcp up --profile tailscale
-# outbound-only の OpenAI Secure MCP Tunnel を bootstrap / 利用する場合:
-# OPENAI_ADMIN_KEY=... temote-mcp openai setup --workspace-id <workspace-id>
-# CONTROL_PLANE_API_KEY=... temote-mcp up --profile openai
+# outbound-only の OpenAI Secure MCP Tunnel を bootstrap / 利用する場合。
+# 対応する環境変数が無ければ、どちらも terminal echo 無効の hidden prompt で key を入力します:
+# temote-mcp openai setup --workspace-id <workspace-id>
+# temote-mcp up --profile openai
 ```
 
 認証済み MCP client からは次の順で利用します。

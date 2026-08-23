@@ -418,12 +418,14 @@ async fn serve_openai(addr: SocketAddr, manage_tunnel: bool) -> Result<()> {
             "not configured (session_start fails closed)"
         }
     );
-    let console = tokio::spawn(approvals::run_supervisor_console(approvals));
+    // Acquire/start the OpenAI tunnel before starting the approval console. Both may use the
+    // controlling terminal, and the secret prompt must be the only terminal reader while active.
     let mut tunnel = if manage_tunnel {
         Some(openai_tunnel::start(addr).await?)
     } else {
         None
     };
+    let console = tokio::spawn(approvals::run_supervisor_console(approvals));
     let serve = http::serve(
         addr,
         format!("http://{addr}"),

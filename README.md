@@ -33,9 +33,11 @@ export TEMOTE_MCP_ROOTS='src=~/src'
 temote-mcp up --profile cloudflare
 # Or use Tailscale Funnel + Temote local OAuth:
 # temote-mcp up --profile tailscale
-# Or bootstrap and use an outbound-only OpenAI Secure MCP Tunnel:
-# OPENAI_ADMIN_KEY=... temote-mcp openai setup --workspace-id <workspace-id>
-# CONTROL_PLANE_API_KEY=... temote-mcp up --profile openai
+# Or bootstrap and use an outbound-only OpenAI Secure MCP Tunnel.
+# Both commands prompt for the required API key without terminal echo when the
+# corresponding environment variable is absent:
+# temote-mcp openai setup --workspace-id <workspace-id>
+# temote-mcp up --profile openai
 ```
 
 An authenticated MCP client can then use:

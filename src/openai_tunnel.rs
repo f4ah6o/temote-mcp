@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
+use zeroize::Zeroizing;
 
 const TUNNEL_ID_PREFIX: &str = "tunnel_";
 const TUNNEL_ID_HEX_LEN: usize = 32;
@@ -57,6 +58,11 @@ pub struct OpenAiTunnelConfig {
     pub binary: OsString,
 }
 
+enum RuntimeCredential {
+    Inherited(&'static str),
+    Prompted(Zeroizing<String>),
+}
+
 pub fn config_from_env() -> Result<OpenAiTunnelConfig> {
     let tunnel_id = configured_tunnel_id()?;
     anyhow::ensure!(
@@ -64,19 +70,11 @@ pub fn config_from_env() -> Result<OpenAiTunnelConfig> {
         "CONTROL_PLANE_TUNNEL_ID must match tunnel_<32 lowercase hexadecimal characters>"
     );
 
-    let runtime_key_env = if nonempty_env("CONTROL_PLANE_API_KEY") {
-        "CONTROL_PLANE_API_KEY"
-    } else if nonempty_env("OPENAI_API_KEY") {
-        "OPENAI_API_KEY"
-    } else {
-        anyhow::bail!(
-            "CONTROL_PLANE_API_KEY is required for OpenAI Secure MCP Tunnel (OPENAI_API_KEY is accepted only as the official tunnel-client fallback)"
-        );
-    };
+    let runtime_key_env = inherited_runtime_key_env().context(
+        "CONTROL_PLANE_API_KEY is required for non-interactive OpenAI diagnostics (OPENAI_API_KEY is accepted only as the official tunnel-client fallback)",
+    )?;
 
-    let binary = std::env::var_os("TUNNEL_CLIENT_BIN")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| OsString::from("tunnel-client"));
+    let binary = tunnel_client_binary();
 
     Ok(OpenAiTunnelConfig {
         tunnel_id,
@@ -114,7 +112,11 @@ pub async fn setup(options: SetupOptions) -> Result<SetupResult> {
         );
     }
 
-    let admin_key = required_env("OPENAI_ADMIN_KEY")?;
+    let admin_key = secret_from_env_or_tty(
+        "OPENAI_ADMIN_KEY",
+        "OpenAI Admin API key: ",
+        "OpenAI Admin API key",
+    )?;
     let request = TunnelCreateRequest {
         name: name.to_owned(),
         description: description.to_owned(),
@@ -127,7 +129,8 @@ pub async fn setup(options: SetupOptions) -> Result<SetupResult> {
         .build()
         .context("failed to build OpenAI tunnel setup HTTP client")?;
     let base_url = control_plane_base_url()?;
-    let tunnel = create_tunnel(&client, &base_url, &admin_key, &request).await?;
+    let tunnel = create_tunnel(&client, &base_url, admin_key.as_str(), &request).await?;
+    drop(admin_key);
     anyhow::ensure!(
         valid_tunnel_id(&tunnel.id),
         "OpenAI Tunnel Management API returned an invalid tunnel id"
@@ -418,38 +421,103 @@ fn safe_api_error(body: &[u8]) -> String {
 
 pub async fn start(origin: SocketAddr) -> Result<Child> {
     ensure_loopback(origin)?;
-    let config = config_from_env()?;
+    let tunnel_id = configured_tunnel_id()?;
+    let binary = tunnel_client_binary();
+    let runtime_credential = runtime_credential(true)?;
     let mcp_url = local_mcp_url(origin);
-    let mut command = Command::new(&config.binary);
-    restrict_runtime_credentials(&mut command, config.runtime_key_env);
+    let mut command = Command::new(&binary);
     command
         .args([
             "run",
             "--control-plane.tunnel-id",
-            &config.tunnel_id,
+            &tunnel_id,
             "--mcp.server-url",
             &mcp_url,
             "--health.listen-addr",
             "127.0.0.1:0",
         ])
         .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start OpenAI Secure MCP tunnel-client; install the supported tunnel-client and ensure {} is configured",
-                config.runtime_key_env
-            )
-        })
+        .kill_on_drop(true);
+    configure_runtime_command(&mut command, &runtime_credential);
+    let child = command.spawn().with_context(|| {
+        "failed to start OpenAI Secure MCP tunnel-client; install the supported tunnel-client and provide a runtime API key"
+    })?;
+    drop(command);
+    drop(runtime_credential);
+    Ok(child)
+}
+
+fn tunnel_client_binary() -> OsString {
+    std::env::var_os("TUNNEL_CLIENT_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("tunnel-client"))
+}
+
+fn inherited_runtime_key_env() -> Option<&'static str> {
+    if nonempty_env("CONTROL_PLANE_API_KEY") {
+        Some("CONTROL_PLANE_API_KEY")
+    } else if nonempty_env("OPENAI_API_KEY") {
+        Some("OPENAI_API_KEY")
+    } else {
+        None
+    }
+}
+
+fn runtime_credential(interactive: bool) -> Result<RuntimeCredential> {
+    if let Some(name) = inherited_runtime_key_env() {
+        return Ok(RuntimeCredential::Inherited(name));
+    }
+    anyhow::ensure!(
+        interactive,
+        "CONTROL_PLANE_API_KEY is required (OPENAI_API_KEY is accepted only as the official tunnel-client fallback)"
+    );
+    Ok(RuntimeCredential::Prompted(secret_from_tty(
+        "OpenAI Runtime API key: ",
+        "OpenAI Runtime API key",
+    )?))
+}
+
+fn configure_runtime_command(command: &mut Command, credential: &RuntimeCredential) {
+    match credential {
+        RuntimeCredential::Inherited(name) => restrict_runtime_credentials(command, name),
+        RuntimeCredential::Prompted(secret) => {
+            scrub_openai_credentials(command);
+            command.env("CONTROL_PLANE_API_KEY", secret.as_str());
+        }
+    }
+}
+
+fn secret_from_env_or_tty(env_name: &str, prompt: &str, label: &str) -> Result<Zeroizing<String>> {
+    if let Some(value) = std::env::var_os(env_name) {
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{env_name} must be valid UTF-8"))?;
+        anyhow::ensure!(!value.is_empty(), "{env_name} must not be empty");
+        return Ok(Zeroizing::new(value));
+    }
+    secret_from_tty(prompt, label)
+}
+
+fn secret_from_tty(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
+    let value = rpassword::prompt_password(prompt).with_context(|| {
+        format!(
+            "cannot read {label} from the controlling terminal; set the corresponding environment variable for non-interactive use"
+        )
+    })?;
+    anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
+    Ok(Zeroizing::new(value))
 }
 
 pub async fn doctor_control_plane() -> Result<String> {
     let config = config_from_env()?;
     let mut command = Command::new(&config.binary);
-    restrict_runtime_credentials(&mut command, config.runtime_key_env);
     command
         .args(["admin", "tunnels", "get", &config.tunnel_id])
         .stdin(Stdio::null());
+    configure_runtime_command(
+        &mut command,
+        &RuntimeCredential::Inherited(config.runtime_key_env),
+    );
     let output = tokio::time::timeout(DOCTOR_TIMEOUT, command.output())
         .await
         .context("timed out while validating OpenAI Secure MCP Tunnel runtime access")?
@@ -523,13 +591,6 @@ pub fn ensure_loopback(origin: SocketAddr) -> Result<()> {
 
 pub fn local_mcp_url(origin: SocketAddr) -> String {
     format!("http://{origin}/mcp")
-}
-
-fn required_env(name: &str) -> Result<String> {
-    let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
-    let value = value.trim().to_owned();
-    anyhow::ensure!(!value.is_empty(), "{name} must not be empty");
-    Ok(value)
 }
 
 fn nonempty_env(name: &str) -> bool {
@@ -856,6 +917,48 @@ mod tests {
             safe_api_error(b"not json"),
             "request failed (response body omitted)"
         );
+    }
+
+    #[test]
+    fn prompted_runtime_secret_is_child_only_and_admin_is_removed() {
+        use std::ffi::OsStr;
+
+        let credential = RuntimeCredential::Prompted(Zeroizing::new("runtime-secret".to_owned()));
+        let mut command = Command::new("tunnel-client");
+        configure_runtime_command(&mut command, &credential);
+
+        let envs: Vec<_> = command.as_std().get_envs().collect();
+        let lookup = |name: &str| {
+            envs.iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(
+            lookup("CONTROL_PLANE_API_KEY"),
+            Some(Some(OsStr::new("runtime-secret")))
+        );
+        assert_eq!(lookup("OPENAI_API_KEY"), Some(None));
+        assert_eq!(lookup("OPENAI_ADMIN_KEY"), Some(None));
+    }
+
+    #[test]
+    fn inherited_runtime_key_removes_the_other_openai_key_and_admin_key() {
+        use std::ffi::OsStr;
+
+        let mut command = Command::new("tunnel-client");
+        configure_runtime_command(
+            &mut command,
+            &RuntimeCredential::Inherited("CONTROL_PLANE_API_KEY"),
+        );
+        let envs: Vec<_> = command.as_std().get_envs().collect();
+        let lookup = |name: &str| {
+            envs.iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(lookup("OPENAI_API_KEY"), Some(None));
+        assert_eq!(lookup("OPENAI_ADMIN_KEY"), Some(None));
+        assert_eq!(lookup("CONTROL_PLANE_API_KEY"), None);
     }
 
     #[tokio::test]
