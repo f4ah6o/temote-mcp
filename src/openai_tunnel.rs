@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -194,13 +194,23 @@ fn default_config_file() -> Result<PathBuf> {
 }
 
 fn read_configured_tunnel_id(path: &Path) -> Result<Option<String>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+            return Err(error).with_context(|| format!("cannot open {}", path.display()));
         }
     };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {}", path.display()))?;
     anyhow::ensure!(
         metadata.file_type().is_file(),
         "OpenAI tunnel config must be a regular file: {}",
@@ -217,8 +227,22 @@ fn read_configured_tunnel_id(path: &Path) -> Result<Option<String>> {
             path.display()
         );
     }
-    let contents =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(4096));
+    Read::take(&mut file, 4097)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    anyhow::ensure!(bytes.len() <= 4096, "OpenAI tunnel config is too large");
+    let contents = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "OpenAI tunnel config is not valid UTF-8: {}",
+            path.display()
+        )
+    })?;
+    parse_configured_tunnel_id(&contents)
+        .with_context(|| format!("invalid OpenAI tunnel config {}", path.display()))
+}
+
+fn parse_configured_tunnel_id(contents: &str) -> Result<Option<String>> {
     let mut tunnel_id = None;
     for line in contents.lines() {
         let line = line.trim();
@@ -226,22 +250,36 @@ fn read_configured_tunnel_id(path: &Path) -> Result<Option<String>> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            anyhow::bail!("invalid OpenAI tunnel config line in {}", path.display());
+            anyhow::bail!("config line must contain '='");
         };
         anyhow::ensure!(
             key.trim() == "CONTROL_PLANE_TUNNEL_ID",
             "OpenAI tunnel config may contain only CONTROL_PLANE_TUNNEL_ID; keep API keys in environment/secret storage"
         );
         anyhow::ensure!(tunnel_id.is_none(), "duplicate CONTROL_PLANE_TUNNEL_ID");
-        let value = value.trim().trim_matches('\"').to_owned();
-        anyhow::ensure!(
-            valid_tunnel_id(&value),
-            "invalid tunnel id in {}",
-            path.display()
-        );
-        tunnel_id = Some(value);
+        let value = parse_config_value(value)?;
+        anyhow::ensure!(valid_tunnel_id(value), "invalid tunnel id");
+        tunnel_id = Some(value.to_owned());
     }
     Ok(tunnel_id)
+}
+
+fn parse_config_value(value: &str) -> Result<&str> {
+    let value = value.trim();
+    if value.starts_with('"') || value.ends_with('"') {
+        anyhow::ensure!(
+            value.len() >= 2 && value.starts_with('"') && value.ends_with('"'),
+            "quoted config value must have matching double quotes"
+        );
+        let inner = &value[1..value.len() - 1];
+        anyhow::ensure!(
+            !inner.contains('"'),
+            "quoted config value contains an extra quote"
+        );
+        Ok(inner)
+    } else {
+        Ok(value)
+    }
 }
 
 fn prepare_config_parent(path: &Path) -> Result<()> {
@@ -276,22 +314,29 @@ fn write_configured_tunnel_id(path: &Path, tunnel_id: &str) -> Result<()> {
         ".{OPENAI_CONFIG_FILE}.{}.tmp",
         uuid::Uuid::new_v4()
     ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .with_context(|| format!("failed to create {}", temporary.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to protect {}", temporary.display()))?;
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to protect {}", temporary.display()))?;
+        }
+        writeln!(file, "CONTROL_PLANE_TUNNEL_ID={tunnel_id}")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("failed to install {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    writeln!(file, "CONTROL_PLANE_TUNNEL_ID={tunnel_id}")?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)
-        .with_context(|| format!("failed to install {}", path.display()))?;
-    Ok(())
+    result
 }
 
 fn normalized_scope_ids(values: Vec<String>) -> Result<Vec<String>> {
@@ -573,6 +618,80 @@ mod tests {
                 && parsed.path().trim_matches('/').is_empty()
                 && parsed.host_str().is_some();
             assert!(!accepted, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn generated_tunnel_config_value_quotes_are_unambiguous() -> noprop::TestResult {
+        test_support::run(0x4f50_454e_4346_4751, 512, |ctx| {
+            let id = format!(
+                "tunnel_{:016x}{:016x}",
+                noprop::sample_u64(ctx),
+                noprop::sample_u64(ctx)
+            );
+            let mode = noprop::sample_usize_in(ctx, 0..=5);
+            let contents = match mode {
+                0 => format!("CONTROL_PLANE_TUNNEL_ID={id}\n"),
+                1 => format!("CONTROL_PLANE_TUNNEL_ID=\"{id}\"\n"),
+                2 => format!("CONTROL_PLANE_TUNNEL_ID=\"{id}\n"),
+                3 => format!("CONTROL_PLANE_TUNNEL_ID={id}\"\n"),
+                4 => format!("CONTROL_PLANE_TUNNEL_ID=\"\"{id}\"\"\n"),
+                _ => format!("CONTROL_PLANE_TUNNEL_ID={id}\nCONTROL_PLANE_TUNNEL_ID={id}\n"),
+            };
+            let result = parse_configured_tunnel_id(&contents);
+            assert_eq!(
+                result.is_ok(),
+                mode <= 1,
+                "mode={mode} contents={contents:?}"
+            );
+            if let Ok(parsed) = result {
+                assert_eq!(parsed.as_deref(), Some(id.as_str()));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn failed_config_install_removes_atomic_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("openai.env");
+        std::fs::create_dir(&path).unwrap();
+        let tunnel_id = "tunnel_0123456789abcdef0123456789abcdef";
+        assert!(write_configured_tunnel_id(&path, tunnel_id).is_err());
+        let leftovers = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".openai.env.") && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "orphan temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn config_reader_rejects_oversized_regular_files_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let oversized = root.path().join("oversized.env");
+        std::fs::write(&oversized, vec![b'x'; 4097]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(read_configured_tunnel_id(&oversized).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = root.path().join("target.env");
+            std::fs::write(
+                &target,
+                "CONTROL_PLANE_TUNNEL_ID=tunnel_0123456789abcdef0123456789abcdef\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let link = root.path().join("link.env");
+            symlink(&target, &link).unwrap();
+            assert!(read_configured_tunnel_id(&link).is_err());
         }
     }
 
