@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -21,6 +22,8 @@ pub struct SessionSupervisor {
     roots: NamedRoots,
     approval_sender: ApprovalSender,
     sessions: Mutex<HashMap<String, RuntimeHandle>>,
+    transitions: Mutex<()>,
+    closed: AtomicBool,
 }
 
 impl SessionSupervisor {
@@ -31,6 +34,8 @@ impl SessionSupervisor {
                 roots,
                 approval_sender,
                 sessions: Mutex::new(HashMap::new()),
+                transitions: Mutex::new(()),
+                closed: AtomicBool::new(false),
             }),
             approval_receiver,
         )
@@ -45,6 +50,11 @@ impl SessionSupervisor {
         logical_path: &str,
         session_id: Option<&str>,
     ) -> Result<ManagedSessionInfo> {
+        let _transition = self.transitions.lock().await;
+        anyhow::ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "session supervisor is shutting down; new sessions are disabled"
+        );
         anyhow::ensure!(
             self.roots_configured(),
             "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
@@ -79,6 +89,7 @@ impl SessionSupervisor {
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<()> {
+        let _transition = self.transitions.lock().await;
         config::validate_session_id(session_id)?;
         let handle = {
             let mut sessions = self.sessions.lock().await;
@@ -97,6 +108,8 @@ impl SessionSupervisor {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.closed.store(true, Ordering::Release);
         let handles = {
             let mut sessions = self.sessions.lock().await;
             sessions
@@ -254,6 +267,65 @@ mod tests {
             .unwrap();
         assert!(!allowed);
         prompt.respond(true);
+    }
+
+    #[tokio::test]
+    async fn start_after_shutdown_is_rejected() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        supervisor.shutdown().await.unwrap();
+        let id = format!("closed-{}", uuid::Uuid::new_v4());
+
+        let error = supervisor.start("src/repo-a", Some(&id)).await.unwrap_err();
+        assert!(error.to_string().contains("shutting down"));
+        assert!(!config::session_is_active(&id).await.unwrap());
+    }
+
+    #[test]
+    fn generated_start_shutdown_races_leave_no_active_session() -> noprop::TestResult {
+        let (_temp, roots) = fixture();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x5355_5052_4143_4501, 64, |ctx| {
+            let id = format!("shutdown-race-{:x}", noprop::sample_u64(ctx));
+            let (supervisor, _approvals) = SessionSupervisor::new(roots.clone());
+            runtime.block_on(async {
+                let barrier = Arc::new(tokio::sync::Barrier::new(3));
+                let start_supervisor = Arc::clone(&supervisor);
+                let start_barrier = Arc::clone(&barrier);
+                let start_id = id.clone();
+                let start = tokio::spawn(async move {
+                    start_barrier.wait().await;
+                    start_supervisor.start("src/repo-a", Some(&start_id)).await
+                });
+
+                let shutdown_supervisor = Arc::clone(&supervisor);
+                let shutdown_barrier = Arc::clone(&barrier);
+                let shutdown = tokio::spawn(async move {
+                    shutdown_barrier.wait().await;
+                    shutdown_supervisor.shutdown().await
+                });
+
+                barrier.wait().await;
+                let start_result = start.await.unwrap();
+                shutdown.await.unwrap().unwrap();
+                if let Err(error) = start_result {
+                    assert!(
+                        error.to_string().contains("shutting down"),
+                        "unexpected start race error: {error:#}"
+                    );
+                }
+                assert!(
+                    !config::session_is_active(&id).await.unwrap(),
+                    "session survived supervisor shutdown: {id}"
+                );
+            });
+            Ok(())
+        })
     }
 
     #[test]
