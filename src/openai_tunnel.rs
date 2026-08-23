@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use zeroize::Zeroizing;
 
@@ -18,6 +19,7 @@ const MAX_SETUP_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_TUNNEL_NAME_BYTES: usize = 256;
 const MAX_TUNNEL_DESCRIPTION_BYTES: usize = 4096;
 const MAX_SCOPE_IDS_PER_KIND: usize = 128;
+const MAX_VERSION_OUTPUT_BYTES: usize = 4 * 1024;
 const DEFAULT_CONTROL_PLANE_BASE_URL: &str = "https://api.openai.com";
 const OPENAI_CONFIG_FILE: &str = "openai.env";
 
@@ -551,24 +553,77 @@ pub async fn binary_version() -> Result<String> {
         .unwrap_or_else(|| OsString::from("tunnel-client"));
     let mut command = Command::new(&binary);
     scrub_openai_credentials(&mut command);
-    let output = tokio::time::timeout(
-        DOCTOR_TIMEOUT,
-        command.arg("--version").stdin(Stdio::null()).output(),
-    )
-    .await
-    .context("timed out while checking tunnel-client version")?
-    .context("cannot execute tunnel-client")?;
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("cannot execute tunnel-client")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("tunnel-client --version stdout was not captured")?;
+    let captured = tokio::time::timeout(DOCTOR_TIMEOUT, async {
+        let (stdout, status) = tokio::join!(
+            read_bounded_version_output(stdout, MAX_VERSION_OUTPUT_BYTES),
+            child.wait(),
+        );
+        Result::<_>::Ok((stdout?, status?))
+    })
+    .await;
+    let (stdout, status) = match captured {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("timed out while checking tunnel-client version");
+        }
+    };
     anyhow::ensure!(
-        output.status.success(),
-        "tunnel-client --version failed with {}",
-        output.status
+        !stdout.truncated,
+        "tunnel-client --version output exceeds {MAX_VERSION_OUTPUT_BYTES} bytes"
     );
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    anyhow::ensure!(
+        status.success(),
+        "tunnel-client --version failed with {status}"
+    );
+    let value = String::from_utf8_lossy(&stdout.bytes).trim().to_owned();
     Ok(if value.is_empty() {
         "available".to_owned()
     } else {
         value
     })
+}
+
+struct BoundedVersionOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_version_output<R>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<BoundedVersionOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK: usize = 8192;
+    let mut bytes = Vec::with_capacity(limit.min(CHUNK));
+    let mut truncated = false;
+    let mut buffer = [0_u8; CHUNK];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let kept = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..kept]);
+        if kept < read {
+            truncated = true;
+        }
+    }
+    Ok(BoundedVersionOutput { bytes, truncated })
 }
 
 fn restrict_runtime_credentials(command: &mut Command, runtime_key_env: &str) {
@@ -929,6 +984,29 @@ mod tests {
             safe_api_error(b"not json"),
             "request failed (response body omitted)"
         );
+    }
+
+    #[test]
+    fn generated_version_output_capture_matches_prefix_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4f50_454e_5645_5253, 512, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 0..=128);
+            let len = noprop::sample_usize_in(ctx, 0..=256);
+            let input = (0..len).map(|_| noprop::sample_u8(ctx)).collect::<Vec<_>>();
+            runtime.block_on(async {
+                use tokio::io::AsyncWriteExt as _;
+                let (mut writer, reader) = tokio::io::duplex(input.len().max(1));
+                writer.write_all(&input).await.unwrap();
+                writer.shutdown().await.unwrap();
+                let captured = read_bounded_version_output(reader, limit).await.unwrap();
+                assert_eq!(captured.bytes, input[..input.len().min(limit)]);
+                assert_eq!(captured.truncated, input.len() > limit);
+            });
+            Ok(())
+        })
     }
 
     #[test]
