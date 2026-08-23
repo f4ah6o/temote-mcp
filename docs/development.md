@@ -56,6 +56,8 @@ git diff --check
 
 The installed-binary lifecycle commands are `temote-mcp up --profile cloudflare|tailscale|openai` and `temote-mcp down`. Omitting the profile remains equivalent to `cloudflare`. The `justfile` provides development-oriented Cloudflare wrappers through `just up/down`; Tailscale/OpenAI profile testing should invoke the checkout binary directly so Cloudflare-only environment checks are not applied. For OpenAI, `TUNNEL_CLIENT_BIN` can point at a checkout/test binary while production should use the supported `tunnel-client` distribution and a Restricted runtime key rather than an admin key.
 
+For OpenAI bootstrap testing, `temote-mcp openai setup --workspace-id <id>` calls the production Tunnel Management API using `OPENAI_ADMIN_KEY` and stores only the returned tunnel ID in `~/.config/temote-mcp/openai.env` (`0600`). Use `--config-file` for an isolated test path. The command refuses to overwrite an existing tunnel ID unless `--force` is explicit. Runtime keys are never persisted by this command.
+
 ### Property-based tests
 
 Security and path-containment invariants use [`noprop`](https://github.com/sile/noprop). The suite uses a deterministic default seed so failures reproduce under a normal `cargo test`. To replay or explore with another seed, set `TEMOTE_PBT_SEED` to a decimal or hexadecimal `u64`:

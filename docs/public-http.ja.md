@@ -122,13 +122,24 @@ registration、pending authorization code、access token は bounded な process
 
 `openai` profile は、OpenAI Secure MCP Tunnel を通じて private/local MCP server に到達できる supported OpenAI product 向けです。public Internet endpoint は作成せず、`TEMOTE_MCP_PUBLIC_URL`、Cloudflare、Tailscale を要求しません。
 
+Temote から OpenAI Tunnel Management API を呼んで tunnel record を作成できます。bootstrap 時だけ `OPENAI_ADMIN_KEY` を使います。
+
+```sh
+export OPENAI_ADMIN_KEY='...'
+temote-mcp openai setup --workspace-id '<CHATGPT_WORKSPACE_ID>'
+```
+
+`openai setup` は既定で `POST https://api.openai.com/v1/tunnels` を実行し、少なくとも1つの `--workspace-id` または `--organization-id` を要求します。返された `CONTROL_PLANE_TUNNEL_ID` だけを `~/.config/temote-mcp/openai.env` に private permission で保存し、API key は保存しません。既存 tunnel ID は `--force` を明示しない限り置換しません。公式の `CONTROL_PLANE_BASE_URL` override も、credential/path を含まない HTTPS origin に限って利用できます。
+
+Runtime API key は別 credential で、この command からは作成しません。**Tunnels Read + Use** を持つ Restricted Runtime API key を作成し、`CONTROL_PLANE_API_KEY` として渡します。long-lived daemon の environment に admin key は残しません。
+
 Temote は公式 `openai/tunnel-client` と統合します。runtime には以下が必要です。
 
 - `PATH` 上の `tunnel-client`、または binary を指す `TUNNEL_CLIENT_BIN`
-- 登録済み tunnel の `CONTROL_PLANE_TUNNEL_ID`
+- environment または bootstrap state `openai.env` に保存された `CONTROL_PLANE_TUNNEL_ID`
 - OpenAI tunnel client に必要な権限を持つ Restricted `CONTROL_PLANE_API_KEY`。公式 client の `OPENAI_API_KEY` fallback も受け付けます
 
-long-lived runtime に admin key は使用しません。credential は environment 経由で渡し、command-line argument や通常ログに値を出しません。
+long-lived runtime に admin key は使用しません。runtime credential は environment 経由で渡し、command-line argument や通常ログに値を出しません。
 
 診断と起動は次のとおりです。
 

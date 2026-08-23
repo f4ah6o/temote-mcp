@@ -118,6 +118,12 @@ enum Command {
     /// Stop the foreground supervisor started by temote-mcp up.
     Down,
     #[cfg(feature = "network")]
+    /// Manage OpenAI Secure MCP Tunnel setup.
+    Openai {
+        #[command(subcommand)]
+        command: OpenaiCommand,
+    },
+    #[cfg(feature = "network")]
     /// Connect an active local session to a Cloudflare gateway using outbound long polling.
     GatewayAgent {
         /// Cloudflare Worker origin, without a path.
@@ -145,6 +151,35 @@ enum Command {
         /// Delay before reconnecting after a disconnect or generation replacement.
         #[arg(long, default_value_t = 2)]
         reconnect_delay_seconds: u64,
+    },
+}
+
+#[cfg(feature = "network")]
+#[derive(Subcommand)]
+enum OpenaiCommand {
+    /// Create an OpenAI Secure MCP Tunnel through the Tunnel Management API.
+    Setup {
+        /// Operator-visible tunnel name.
+        #[arg(long, default_value = "Temote MCP")]
+        name: String,
+        /// Operator-visible tunnel description.
+        #[arg(
+            long,
+            default_value = "Routes OpenAI Secure MCP Tunnel traffic to Temote MCP"
+        )]
+        description: String,
+        /// Organization scope to attach. May be repeated.
+        #[arg(long = "organization-id")]
+        organization_ids: Vec<String>,
+        /// ChatGPT workspace scope to attach. May be repeated.
+        #[arg(long = "workspace-id")]
+        workspace_ids: Vec<String>,
+        /// Override the local file that stores only CONTROL_PLANE_TUNNEL_ID.
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+        /// Intentionally create a new tunnel and replace an existing saved tunnel ID.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -207,6 +242,44 @@ async fn main() -> Result<()> {
         } => lifecycle::up(profile, public_url, addr, tunnel_token_file).await,
         #[cfg(all(feature = "network", unix))]
         Command::Down => lifecycle::down().await,
+        #[cfg(feature = "network")]
+        Command::Openai { command } => match command {
+            OpenaiCommand::Setup {
+                name,
+                description,
+                organization_ids,
+                workspace_ids,
+                config_file,
+                force,
+            } => {
+                let result = openai_tunnel::setup(openai_tunnel::SetupOptions {
+                    name,
+                    description,
+                    organization_ids,
+                    workspace_ids,
+                    config_file,
+                    force,
+                })
+                .await?;
+                println!("Created OpenAI Secure MCP Tunnel {}", result.tunnel_id);
+                println!(
+                    "Saved CONTROL_PLANE_TUNNEL_ID to {}",
+                    result.config_file.display()
+                );
+                if std::env::var_os("CONTROL_PLANE_API_KEY").is_some()
+                    || std::env::var_os("OPENAI_API_KEY").is_some()
+                {
+                    println!(
+                        "Runtime key detected; run `temote-mcp doctor --profile openai` before `temote-mcp up --profile openai`."
+                    );
+                } else {
+                    println!(
+                        "Next: create a Restricted Runtime API key with Tunnels Read + Use and expose it as CONTROL_PLANE_API_KEY."
+                    );
+                }
+                Ok(())
+            }
+        },
         #[cfg(feature = "network")]
         Command::GatewayAgent {
             gateway_url,

@@ -124,13 +124,24 @@ Registrations, pending authorization codes, and access tokens are bounded proces
 
 The `openai` profile is for supported OpenAI products that can reach a private/local MCP server through OpenAI Secure MCP Tunnel. It does not create a public Internet endpoint and does not use `TEMOTE_MCP_PUBLIC_URL`, Cloudflare, or Tailscale.
 
+Temote can create the tunnel record through the OpenAI Tunnel Management API. This bootstrap uses `OPENAI_ADMIN_KEY` only for the create request:
+
+```sh
+export OPENAI_ADMIN_KEY='...'
+temote-mcp openai setup --workspace-id '<CHATGPT_WORKSPACE_ID>'
+```
+
+`openai setup` sends `POST https://api.openai.com/v1/tunnels` by default, requires at least one `--workspace-id` or `--organization-id`, and stores only the returned `CONTROL_PLANE_TUNNEL_ID` in `~/.config/temote-mcp/openai.env` with private permissions. API keys are deliberately not written to that file. Existing saved tunnel state is not replaced unless `--force` is supplied. The official `CONTROL_PLANE_BASE_URL` override is accepted only when it is an HTTPS origin without credentials or a path.
+
+The Runtime API key is a separate credential and is not created by this command. Create a Restricted Runtime API key with **Tunnels Read + Use** and expose it as `CONTROL_PLANE_API_KEY`. Keep the admin key out of the long-lived daemon environment.
+
 Temote integrates with the official `openai/tunnel-client`. The runtime requires:
 
 - `tunnel-client` on `PATH`, or `TUNNEL_CLIENT_BIN` pointing to the binary
-- `CONTROL_PLANE_TUNNEL_ID` for the registered tunnel
+- `CONTROL_PLANE_TUNNEL_ID` from the environment or the saved `openai.env` bootstrap state
 - a Restricted `CONTROL_PLANE_API_KEY` with the tunnel permissions required by the OpenAI tunnel client; the official `OPENAI_API_KEY` fallback is also accepted by the client
 
-The long-lived runtime must not use an admin key. Temote passes the credential through the environment, never as a command-line argument, and does not print its value.
+The long-lived runtime must not use an admin key. Temote passes the runtime credential through the environment, never as a command-line argument, and does not print its value.
 
 Run diagnostics and start the connection with:
 

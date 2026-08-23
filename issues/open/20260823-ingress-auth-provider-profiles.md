@@ -583,6 +583,8 @@ OpenAI Secure MCP Tunnel availability は OpenAI product / workspace / plan に�
 - [x] tunnel registration / credential / lifecycle ownership を安全に管理する。
 - [x] `temote-mcp down` が Temote-owned tunnel connection のみ停止する。
 - [x] `doctor --profile openai` を実装する。
+- [x] `temote-mcp openai setup` から Tunnel Management API で tunnel record を bootstrap する。
+- [x] `CONTROL_PLANE_TUNNEL_ID` だけを private local config に保存し admin/runtime API key を永続化しない。
 - [x] public bind / public URL を要求しないことを regression test で固定する。
 
 ### Phase 5: live acceptance
@@ -619,7 +621,7 @@ OpenAI Secure MCP Tunnel availability は OpenAI product / workspace / plan に�
 
 - `cargo fmt -- --check`: pass
 - `cargo clippy --all-targets --all-features -- -D warnings`: pass
-- `cargo test --all-targets --all-features`: 199 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- `cargo test --all-targets --all-features`: 211 passed / 0 failed / 1 intentional process-boundary E2E ignored
 - `cargo check --all-targets`: pass
 - remote tool list regression で `without_sandbox` 非公開を確認
 - Cloudflare / Tailscale / OpenAI は同じ `SessionSupervisor` / named-root / sandbox / local approval path を利用し、provider 固有 process control は connection boundary の外へ漏らさない
@@ -673,7 +675,11 @@ OpenAI official docs / `openai/tunnel-client` の current surface を確認し�
 - runtime credential は environment の `CONTROL_PLANE_API_KEY` を使用し command line / log に値を出さない
 - tunnel ID grammar / no-public-bind property tests: pass
 - official `openai/tunnel-client` を `/tmp` で source buildし version `0.0.13-dev+5ce4fed0a730da034c54c1de17f2610f8b2727f1` を Temote doctor が認識: pass
-- current host には `CONTROL_PLANE_TUNNEL_ID` / runtime credential がないため、`doctor --profile openai` は tunnel-client 認識後 `CONTROL_PLANE_TUNNEL_ID is required` と provider-specific に fail する: expected
+- `temote-mcp openai setup --workspace-id ...` が official `POST /v1/tunnels` contract を使う bootstrap command として追加済み
+- setup API contract test: admin bearer header / workspace scope / returned tunnel ID parse: pass
+- saved `~/.config/temote-mcp/openai.env` は `CONTROL_PLANE_TUNNEL_ID` のみ・mode `0600`; API key を含む config は reject: pass
+- existing saved tunnel ID は `--force` なしで replacement を拒否: implemented
+- current host には `OPENAI_ADMIN_KEY` / `CONTROL_PLANE_API_KEY` がないため production API create / supported OpenAI product live acceptance は未実施
 
 OpenAI control-plane / supported OpenAI product との live tunnel acceptance は credential / workspace entitlement がこの host に無いため未実施。Cloudflare/Tailscale へ暗黙 fallback せず、Phase 5 の OpenAI live 項目を open のままにする。
 
