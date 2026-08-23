@@ -488,14 +488,26 @@ fn configure_runtime_command(command: &mut Command, credential: &RuntimeCredenti
 }
 
 fn secret_from_env_or_tty(env_name: &str, prompt: &str, label: &str) -> Result<Zeroizing<String>> {
-    if let Some(value) = std::env::var_os(env_name) {
-        let value = value
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("{env_name} must be valid UTF-8"))?;
-        anyhow::ensure!(!value.is_empty(), "{env_name} must not be empty");
-        return Ok(Zeroizing::new(value));
+    if let Some(value) = secret_from_env_value(std::env::var_os(env_name), env_name)? {
+        return Ok(value);
     }
     secret_from_tty(prompt, label)
+}
+
+fn secret_from_env_value(
+    value: Option<OsString>,
+    env_name: &str,
+) -> Result<Option<Zeroizing<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{env_name} must be valid UTF-8"))?;
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Zeroizing::new(value)))
 }
 
 fn secret_from_tty(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
@@ -518,14 +530,14 @@ pub async fn doctor_control_plane() -> Result<String> {
         &mut command,
         &RuntimeCredential::Inherited(config.runtime_key_env),
     );
-    let output = tokio::time::timeout(DOCTOR_TIMEOUT, command.output())
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let status = tokio::time::timeout(DOCTOR_TIMEOUT, command.status())
         .await
         .context("timed out while validating OpenAI Secure MCP Tunnel runtime access")?
         .context("cannot execute tunnel-client")?;
     anyhow::ensure!(
-        output.status.success(),
-        "tunnel-client could not read the configured tunnel with the runtime credential (exit status {})",
-        output.status
+        status.success(),
+        "tunnel-client could not read the configured tunnel with the runtime credential (exit status {status})"
     );
     Ok(format!(
         "configured tunnel is readable with {}",
@@ -917,6 +929,25 @@ mod tests {
             safe_api_error(b"not json"),
             "request failed (response body omitted)"
         );
+    }
+
+    #[test]
+    fn generated_env_secret_selection_treats_only_empty_as_missing() -> noprop::TestResult {
+        test_support::run(0x4f50_454e_5345_4352, 512, |ctx| {
+            let value = test_support::ascii_string(ctx, 128);
+            let selected =
+                secret_from_env_value(Some(OsString::from(&value)), "TEST_SECRET").unwrap();
+            assert_eq!(selected.is_some(), !value.is_empty(), "value={value:?}");
+            if let Some(selected) = selected {
+                assert_eq!(selected.as_str(), value);
+            }
+            assert!(
+                secret_from_env_value(None, "TEST_SECRET")
+                    .unwrap()
+                    .is_none()
+            );
+            Ok(())
+        })
     }
 
     #[test]
