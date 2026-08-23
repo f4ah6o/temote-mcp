@@ -22,6 +22,7 @@ const MAX_APPROVAL_RESPONSE_BYTES: usize = 64;
 const SESSION_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_PENDING_SESSION_READS: usize = 64;
+const MAX_PENDING_APPROVALS: usize = 64;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -659,6 +660,7 @@ async fn run_runtime(
     let (approval_lifetime, _) = watch::channel(false);
     let (incoming_sender, mut incoming_receiver) = mpsc::unbounded_channel();
     let read_slots = Arc::new(Semaphore::new(MAX_PENDING_SESSION_READS));
+    let approval_slots = Arc::new(Semaphore::new(MAX_PENDING_APPROVALS));
     loop {
         tokio::select! {
             connection = listener.accept() => {
@@ -739,6 +741,16 @@ async fn run_runtime(
                         stream.write_all(b"allow\n").await?;
                     }
                     Message::Approval { request } => {
+                        let permit = match Arc::clone(&approval_slots).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                tokio::spawn(async move {
+                                    let _ = stream.write_all(b"deny\n").await;
+                                    let _ = stream.shutdown().await;
+                                });
+                                continue;
+                            }
+                        };
                         let (response, receiver) = oneshot::channel();
                         let prompt = ApprovalPrompt {
                             session_id: session.id.clone(),
@@ -747,10 +759,14 @@ async fn run_runtime(
                         };
                         if let Err(error) = approval_sender.send(prompt) {
                             error.0.respond(false);
+                            drop(permit);
+                            let _ = stream.write_all(b"deny\n").await;
+                            let _ = stream.shutdown().await;
                             continue;
                         }
                         let mut runtime_alive = approval_lifetime.subscribe();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let allowed = tokio::select! {
                                 response = receiver => response.unwrap_or(false),
                                 _ = runtime_alive.changed() => false,
@@ -1314,6 +1330,60 @@ mod tests {
         let snapshot = handle.snapshot().await.unwrap();
         assert_eq!(snapshot.id, id);
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_approval_capacity_denies_excess_without_queueing() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("approval-cap-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let mut requests = Vec::with_capacity(MAX_PENDING_APPROVALS);
+        let mut prompts = Vec::with_capacity(MAX_PENDING_APPROVALS);
+        for index in 0..MAX_PENDING_APPROVALS {
+            let request_id = id.clone();
+            let cwd = root.path().to_path_buf();
+            requests.push(tokio::spawn(async move {
+                request(&request_id, "capacity", format!("request-{index}"), cwd).await
+            }));
+            prompts.push(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .expect("approval prompt was not delivered")
+                    .expect("approval channel closed unexpectedly"),
+            );
+        }
+
+        let request_id = id.clone();
+        let cwd = root.path().to_path_buf();
+        let excess = tokio::spawn(async move {
+            request(&request_id, "capacity", "excess".to_owned(), cwd).await
+        });
+        let allowed = tokio::time::timeout(Duration::from_secs(1), excess)
+            .await
+            .expect("over-capacity approval did not resolve immediately")
+            .unwrap()
+            .unwrap();
+        assert!(!allowed, "over-capacity approval was allowed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err(),
+            "over-capacity approval was queued for human review"
+        );
+
+        handle.shutdown().await.unwrap();
+        drop(prompts);
+        for request in requests {
+            let allowed = tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("approval request did not resolve")
+                .unwrap()
+                .unwrap();
+            assert!(!allowed);
+        }
     }
 
     #[test]
