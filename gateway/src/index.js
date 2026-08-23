@@ -19,6 +19,8 @@ const POLL_TIMEOUT_MS = 20_000;
 const RPC_TIMEOUT_MS = 35_000;
 const MAX_PENDING_HOST_REQUESTS = 64;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+// get_image permits 32 MiB raw images; base64 + JSON needs just under 43 MiB.
+const MAX_HOST_RESPONSE_BODY_BYTES = 43 * 1024 * 1024;
 const MAX_JWKS_BYTES = 1024 * 1024;
 const jwksCache = new Map();
 
@@ -221,7 +223,7 @@ async function handleHostApi(request, env, action) {
   if (!["connect", "poll", "respond", "disconnect"].includes(action)) {
     return withCors(jsonResponse({ error: "not_found" }, 404));
   }
-  const body = await readJson(request);
+  const body = await readJson(request, hostApiBodyLimit(action));
   if (!body.ok) return withCors(jsonResponse({ error: "invalid_json", detail: body.error }, 400));
   const sessionId = body.value?.session_id;
   if (!validateSessionId(sessionId)) {
@@ -512,6 +514,10 @@ function validateHostIdentity(body, requireGeneration) {
   return null;
 }
 
+export function hostApiBodyLimit(action) {
+  return action === "respond" ? MAX_HOST_RESPONSE_BODY_BYTES : MAX_BODY_BYTES;
+}
+
 function verifyGeneration(host, body) {
   if (!host) return jsonResponse({ error: "host_offline" }, 409);
   if (host.generation !== body.generation || host.instance_id !== body.instance_id) {
@@ -634,9 +640,9 @@ function base64UrlBytes(value) {
   return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
 }
 
-async function readJson(request) {
+async function readJson(request, limit = MAX_BODY_BYTES) {
   try {
-    return { ok: true, value: await readBoundedJson(request, MAX_BODY_BYTES, "request body") };
+    return { ok: true, value: await readBoundedJson(request, limit, "request body") };
   } catch (error) {
     return { ok: false, error: String(error) };
   }

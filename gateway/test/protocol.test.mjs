@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewaySession, accessEmailAllowed, readBoundedBytes } from "../src/index.js";
+import worker, { GatewaySession, accessEmailAllowed, hostApiBodyLimit, readBoundedBytes } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -221,6 +221,47 @@ test("dispatch, poll, and respond complete one routed RPC", async () => {
   });
 });
 
+
+test("host respond budget covers maximum get_image payload without widening other host APIs", async () => {
+  const rawImageBytes = 32 * 1024 * 1024;
+  const maximumBase64Bytes = 4 * Math.ceil(rawImageBytes / 3);
+  assert.equal(hostApiBodyLimit("connect"), 8 * 1024 * 1024);
+  assert.equal(hostApiBodyLimit("poll"), 8 * 1024 * 1024);
+  assert.equal(hostApiBodyLimit("disconnect"), 8 * 1024 * 1024);
+  assert.equal(hostApiBodyLimit("respond"), 43 * 1024 * 1024);
+  assert.ok(maximumBase64Bytes + 256 * 1024 < hostApiBodyLimit("respond"));
+});
+
+test("host respond accepts payloads above the generic body limit while connect rejects them", async () => {
+  const padding = "x".repeat(8 * 1024 * 1024);
+  const hostApi = {
+    idFromName: (name) => name,
+    get: () => ({ fetch: async () => new Response(null, { status: 204 }) }),
+  };
+  const init = (action) => new Request(`https://gateway.example.test/v1/hosts/${action}`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer host-token",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      session_id: "mac-main",
+      instance_id: "instance-main",
+      generation: 1,
+      request_id: "request-1",
+      response: { jsonrpc: "2.0", id: 1, result: { content: [] } },
+      padding,
+    }),
+  });
+
+  const env = { HOST_TOKEN: "host-token", GATEWAY_SESSIONS: hostApi };
+  const responded = await worker.fetch(init("respond"), env);
+  assert.equal(responded.status, 204);
+
+  const connected = await worker.fetch(init("connect"), env);
+  assert.equal(connected.status, 400);
+  assert.match((await connected.json()).detail, /request body is too large/);
+});
 
 test("bounded stream reader matches the length model across chunking", async () => {
   const limit = 64;
