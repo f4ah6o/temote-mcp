@@ -592,8 +592,10 @@ fn validate_customize_manifest(session: &config::Session, manifest_path: &Path) 
 }
 
 fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    let mut file = open_readonly_nofollow(path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
     anyhow::ensure!(
         metadata.is_file(),
         "path is not a regular file: {}",
@@ -604,10 +606,9 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
         "file exceeds {max_bytes} bytes: {}",
         path.display()
     );
-    let file =
-        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take((max_bytes + 1) as u64)
+    file.by_ref()
+        .take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))?;
     anyhow::ensure!(
@@ -616,6 +617,19 @@ fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
         path.display()
     );
     Ok(bytes)
+}
+
+fn open_readonly_nofollow(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("failed to open {} safely", path.display()))
 }
 
 fn reject_symlinks_recursively(root: &Path) -> Result<()> {
@@ -646,7 +660,7 @@ fn reject_symlinks_recursively(root: &Path) -> Result<()> {
 }
 
 fn reject_attachment_parent_traversal(csv_path: &Path) -> Result<()> {
-    let file = std::fs::File::open(csv_path)
+    let file = open_readonly_nofollow(csv_path)
         .with_context(|| format!("failed to read record import CSV {}", csv_path.display()))?;
     anyhow::ensure!(
         !reader_contains_parent_traversal(file)?,
@@ -1092,6 +1106,19 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_regular_file_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.bin");
+        let link = root.path().join("link.bin");
+        std::fs::write(&target, b"secret").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_bounded_regular_file(&link, 1024).is_err());
+    }
+
     #[test]
     fn customize_manifest_rejects_oversized_file() {
         let root = tempfile::tempdir().unwrap();
@@ -1174,6 +1201,12 @@ mod tests {
             std::fs::create_dir(&attachments).unwrap();
             symlink(outside.path(), attachments.join("escape")).unwrap();
             assert!(reject_symlinks_recursively(&attachments).is_err());
+
+            let safe_csv = root.path().join("safe.csv");
+            let csv_link = root.path().join("records-link.csv");
+            std::fs::write(&safe_csv, "file\nattachments/a.txt\n").unwrap();
+            symlink(&safe_csv, &csv_link).unwrap();
+            assert!(reject_attachment_parent_traversal(&csv_link).is_err());
         }
     }
 
