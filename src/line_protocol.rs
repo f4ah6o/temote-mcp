@@ -55,6 +55,25 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RequestIdSequence {
+    next: u64,
+}
+
+impl Default for RequestIdSequence {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
+
+impl RequestIdSequence {
+    pub(crate) fn take(&mut self) -> u64 {
+        let id = self.next;
+        self.next = self.next.checked_add(1).unwrap_or(1);
+        id
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum ChildMessageKind {
     Response,
@@ -89,6 +108,20 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn generated_request_ids_roll_over_without_sticking() -> noprop::TestResult {
+        test_support::run(0x4348_494c_4449_4401, 1024, |ctx| {
+            let start = noprop::sample_u64(ctx);
+            let mut ids = RequestIdSequence { next: start };
+            let first = ids.take();
+            let second = ids.take();
+            assert_eq!(first, start);
+            assert_eq!(second, start.checked_add(1).unwrap_or(1));
+            assert_ne!(first, second, "request id sequence stuck at {start}");
+            Ok(())
+        })
+    }
 
     #[test]
     fn generated_child_message_interleavings_preserve_duplex_requests() -> noprop::TestResult {

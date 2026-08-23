@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::line_protocol::{
-    BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, classify_child_message, next_bounded_line,
+    BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
+    next_bounded_line,
 };
 use crate::{approvals, config};
 
@@ -24,7 +25,7 @@ struct Client {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    next_id: u64,
+    request_ids: RequestIdSequence,
     session_watcher: JoinHandle<()>,
 }
 
@@ -85,7 +86,7 @@ impl Client {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            next_id: 1,
+            request_ids: RequestIdSequence::default(),
             session_watcher,
         };
         client
@@ -119,8 +120,7 @@ impl Client {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let id = self.request_ids.take();
         self.write_json(&json!({
             "jsonrpc": "2.0",
             "id": id,
