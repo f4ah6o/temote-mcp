@@ -14,6 +14,7 @@ mod kintone_cli;
 mod kintone_mcp;
 #[cfg(all(feature = "network", unix))]
 mod lifecycle;
+mod line_diff;
 mod line_protocol;
 #[cfg(feature = "network")]
 mod local_oauth;

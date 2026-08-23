@@ -36,7 +36,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ring = { version = "0.17", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-similar = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -49,6 +48,7 @@ seccompiler = "0.5"
 libc = "0.2"
 
 [dev-dependencies]
+similar = "2"
 noprop = "=0.2.0"
 http-body-util = "0.1"
 tempfile = "3"

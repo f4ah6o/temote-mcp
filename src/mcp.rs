@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use similar::{ChangeTag, TextDiff};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -1946,18 +1945,7 @@ fn command_summary(text: &str) -> Option<String> {
 }
 
 fn render_diff(old: &str, new: &str) -> (usize, usize, String) {
-    let diff = TextDiff::from_lines(old, new);
-    let mut added = 0;
-    let mut removed = 0;
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => added += 1,
-            ChangeTag::Delete => removed += 1,
-            ChangeTag::Equal => {}
-        }
-    }
-    let rendered = diff.unified_diff().context_radius(3).to_string();
-    (added, removed, rendered.trim_end().to_owned())
+    crate::line_diff::render_diff(old, new)
 }
 
 fn render_output(output: sandbox::Output) -> Result<String> {

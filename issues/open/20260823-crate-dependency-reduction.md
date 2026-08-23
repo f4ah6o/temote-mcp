@@ -35,7 +35,7 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 
 ### Later candidates
 
-- Evaluate `uuid` and `dotenvy` only where replacement remains simpler than the dependency. `similar` was evaluated on 2026-08-23 and is intentionally retained; see the evidence below.
+- Evaluate `uuid` and `dotenvy` only where replacement remains simpler than the dependency. `similar` was internalized on 2026-08-23 with the crate retained only as a dev-dependency differential oracle; see the evidence below.
 - Evaluate `clap` separately: it has a meaningful subtree, but Temote's CLI is a public product interface and should not be weakened merely to reduce package count.
 - Do not prioritize removal of `anyhow`, `axum`, or `reqwest` without a larger architectural reason; their current replacement cost is disproportionate to dependency savings.
 
@@ -99,6 +99,21 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 - [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
 - [x] full tests pass.
 - [x] `git diff --check` passes.
+
+### `similar` internalization
+
+- [x] `similar` is absent from normal/default and no-default production dependency graphs.
+- [x] `similar` remains a dev-dependency and differential oracle only.
+- [x] production line diff uses bounded exact LCS for small/medium regions, unique-line patience anchors for large regions, and a bounded replace fallback for unresolved huge regions.
+- [x] unified diff preserves three lines of context and missing-final-newline markers for oracle-covered inputs.
+- [x] 4,096 generated unique-line edit programs match `similar` exactly for counts and unified-diff rendering.
+- [x] 4,096 generated small arbitrary edit programs match `similar` added/removed counts.
+- [x] a large 4,000-line fully distinct case proves the bounded fallback path without quadratic allocation.
+- [x] `cargo check --all-targets --all-features` passes.
+- [x] `cargo check --all-targets --no-default-features` passes.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- [x] full tests pass.
+- [x] `cargo fmt -- --check` and `git diff --check` pass.
 
 ## Baseline
 
@@ -190,15 +205,25 @@ Completed on 2026-08-23 after Phase 3 commit `98e49dd`.
 - macOS normal dependency graph: 116 -> 114 non-root packages (-2 in Phase 4, -32 from the original baseline)
 - macOS `--no-default-features`: 40 -> 40 non-root packages
 
-## `similar` evaluation
+## `similar` internalization evidence
 
-Evaluated on 2026-08-23 against `main` after commit `90e8120`. No production change was retained.
+Implemented on 2026-08-23 against `main` after commit `740a595`.
 
-- usage is isolated to `src/mcp.rs::render_diff`, where it provides line edit counts plus a 3-line-context unified diff for `write_file` activity
-- `similar 2.7.0` has no transitive dependencies in Temote's graph; removing it saves exactly one normal package in both default and no-default builds
-- `cargo llvm-lines --bin temote-mcp --release --all-features` baseline: 851,840 LLVM IR lines / 19,278 copies
-- functions under the `similar::` namespace account for about 18,094 LLVM IR lines / 97 copies in that baseline
-- a bounded internal prototype (exact small LCS, patience anchors for large regions, unified-diff rendering, missing-newline handling, and PBT) reduced the measured total to 828,917 LLVM IR lines / 18,949 copies (-22,923 lines, about -2.7%; -329 copies)
-- the prototype required about 653 lines including tests and introduced a custom diff algorithm/performance surface for inputs up to the existing 8 MiB text-file limit
-- targeted compatibility tests and 1,024 generated small diff programs passed, and the prototype was bounded against quadratic allocation for large inputs; nevertheless, the maintenance cost is disproportionate to removing a mature zero-transitive dependency
-- decision: retain `similar`; dependency count alone is not sufficient justification to own a bespoke diff engine
+- usage remains isolated behind `src/mcp.rs::render_diff`, now delegated to `src/line_diff.rs`
+- `similar 2.7.0` has no transitive dependencies, but it is removed from `[dependencies]` and retained under `[dev-dependencies]` only as a differential oracle
+- production implementation uses exact line LCS when the DP matrix is at most 1,000,000 cells; larger regions are split on order-preserving lines that are unique on both sides, with a bounded replace fallback when no safe anchors remain
+- three-line unified-diff context and missing-final-newline markers are preserved for the oracle-equivalence domain
+- differential PBT: 4,096 generated unique-line edit programs match `similar` exactly for added/removed counts and rendered unified diff
+- differential PBT: 4,096 generated small arbitrary programs match `similar` added/removed counts even when repeated lines make edit ordering non-unique
+- large-input invariant: 4,000 fully distinct old/new lines exercise the bounded fallback without quadratic allocation
+- targeted internal diff tests: 5 passed / 0 failed
+- full tests: 314 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- all-target/all-feature check: pass
+- no-default-features all-target check: pass (existing dead-code warnings only)
+- Clippy with `-D warnings`: pass
+- `cargo fmt -- --check`: pass
+- `git diff --check`: pass
+- macOS normal dependency graph: 114 -> 113 non-root packages; `similar` normal refs = 0, dev refs = 1
+- macOS `--no-default-features`: 40 -> 39 non-root packages
+- `cargo llvm-lines --bin temote-mcp --release --all-features`: 851,840 -> 829,303 LLVM IR lines (-22,537, about -2.65%) and 19,278 -> 18,972 copies (-306)
+- release llvm-lines contains no `similar::` functions; internal `temote_mcp::line_diff` accounts for about 2,771 LLVM IR lines
