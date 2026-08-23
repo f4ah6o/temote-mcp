@@ -35,6 +35,7 @@ const MAX_ACTIVITY_TITLE_BYTES: usize = 512;
 const MAX_ACTIVITY_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
+const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -997,7 +998,7 @@ fn show_supervisor_prompt(prompt: &ApprovalPrompt) -> Result<()> {
         "\n[session {}] approval {}\ncwd: {}\noperation: {}\n{}",
         prompt.session_id,
         prompt.request.id,
-        prompt.request.cwd.display(),
+        bounded_console_path(&prompt.request.cwd),
         bounded_console_text(&prompt.request.operation, MAX_APPROVAL_OPERATION_BYTES),
         bounded_console_text(&prompt.request.detail, MAX_APPROVAL_DETAIL_BYTES),
     );
@@ -1299,6 +1300,11 @@ fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, s
     std::borrow::Cow::Owned(bounded)
 }
 
+fn bounded_console_path(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    bounded_console_text(&rendered, MAX_CONSOLE_PATH_BYTES).into_owned()
+}
+
 fn show_activity_for_session(session_id: &str, title: &str, detail: Option<&str>) {
     let title = bounded_console_text(title, MAX_ACTIVITY_TITLE_BYTES);
     eprintln!("\n[session {session_id}] • {title}");
@@ -1324,7 +1330,7 @@ fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
 fn show_permissions(session: &Session) {
     eprintln!("Sandbox roots:");
     for path in &session.permitted_directories {
-        eprintln!("  {}", path.display());
+        eprintln!("  {}", bounded_console_path(path));
     }
 }
 
@@ -1390,6 +1396,16 @@ mod tests {
         assert!(!bounded.contains('\r'));
         assert!(bounded.contains('\n'));
         assert!(bounded.contains('\t'));
+    }
+
+    #[test]
+    fn console_paths_escape_terminal_controls() {
+        let path = Path::new("safe/\x1b[31m\rname");
+        let rendered = bounded_console_path(path);
+        assert_eq!(rendered, "safe/\\x1b[31m\\x0dname");
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.len() <= MAX_CONSOLE_PATH_BYTES);
     }
 
     #[test]
