@@ -434,16 +434,36 @@ async fn check_cloudflared(report: &mut Report) {
 }
 
 fn check_tunnel_token_file(report: &mut Report, path: &Path) {
-    let metadata = match std::fs::symlink_metadata(path) {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare tunnel token",
+                format!("cannot open {}: {error}", path.display()),
+                format!(
+                    "Create a readable regular Tunnel token file at {} and do not use a symlink.",
+                    path.display()
+                ),
+            ));
+            return;
+        }
+    };
+    let metadata = match file.metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
             report.add(Check::fail(
                 "cloudflare tunnel token",
-                format!("cannot read {}: {error}", path.display()),
-                format!(
-                    "Create a readable remotely managed Tunnel token file at {}.",
-                    path.display()
-                ),
+                format!("cannot inspect {}: {error}", path.display()),
+                "Replace the file with a readable regular Tunnel token file.",
             ));
             return;
         }
@@ -472,15 +492,21 @@ fn check_tunnel_token_file(report: &mut Report, path: &Path) {
         return;
     }
 
-    match std::fs::read_to_string(path) {
-        Ok(value) if value.trim().is_empty() => {
+    let mut bytes =
+        Vec::with_capacity((metadata.len() as usize).min(MAX_TUNNEL_TOKEN_BYTES as usize));
+    match file
+        .by_ref()
+        .take(MAX_TUNNEL_TOKEN_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        Ok(_) if bytes.len() > MAX_TUNNEL_TOKEN_BYTES as usize => {
             report.add(Check::fail(
                 "cloudflare tunnel token",
-                format!("{} is empty", path.display()),
                 format!(
-                    "Store the remotely managed Tunnel token in {}.",
+                    "{} exceeds the {MAX_TUNNEL_TOKEN_BYTES}-byte token-file limit",
                     path.display()
                 ),
+                "Replace the file with the remotely managed Tunnel bearer token only.",
             ));
             return;
         }
@@ -493,6 +519,28 @@ fn check_tunnel_token_file(report: &mut Report, path: &Path) {
             ));
             return;
         }
+    }
+    let value = match std::str::from_utf8(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare tunnel token",
+                format!("{} is not valid UTF-8: {error}", path.display()),
+                "Replace the file with the remotely managed Tunnel bearer token only.",
+            ));
+            return;
+        }
+    };
+    if value.trim().is_empty() {
+        report.add(Check::fail(
+            "cloudflare tunnel token",
+            format!("{} is empty", path.display()),
+            format!(
+                "Store the remotely managed Tunnel token in {}.",
+                path.display()
+            ),
+        ));
+        return;
     }
 
     #[cfg(unix)]

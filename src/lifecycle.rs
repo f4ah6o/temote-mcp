@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -108,6 +109,7 @@ impl PidFile {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(path)
             {
                 Ok(mut file) => {
@@ -183,8 +185,11 @@ fn default_tunnel_token_file() -> Result<PathBuf> {
 }
 
 fn ensure_tunnel_token_file(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("cannot read tunnel token file {}", path.display()))?;
+    let mut file = open_readonly_nofollow(path)
+        .with_context(|| format!("cannot open tunnel token file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect tunnel token file {}", path.display()))?;
     anyhow::ensure!(
         metadata.file_type().is_file(),
         "tunnel token file must be a regular file: {}",
@@ -195,7 +200,6 @@ fn ensure_tunnel_token_file(path: &Path) -> Result<()> {
         "tunnel token file must contain 1..={MAX_TUNNEL_TOKEN_BYTES} bytes: {}",
         path.display()
     );
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode() & 0o777;
@@ -206,12 +210,17 @@ fn ensure_tunnel_token_file(path: &Path) -> Result<()> {
         );
     }
     let mut probe = [0u8; 1];
-    let read = std::fs::File::open(path)
-        .with_context(|| format!("tunnel token file is not readable: {}", path.display()))?
+    let read = file
         .read(&mut probe)
         .with_context(|| format!("tunnel token file is not readable: {}", path.display()))?;
     anyhow::ensure!(read == 1, "tunnel token file is empty: {}", path.display());
     Ok(())
+}
+
+fn open_readonly_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    options.open(path)
 }
 
 #[cfg(unix)]
@@ -226,7 +235,10 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn read_pid_file(path: &Path) -> Result<i32> {
-    let metadata = std::fs::symlink_metadata(path)
+    let file = open_readonly_nofollow(path)
+        .with_context(|| format!("cannot open PID file {}", path.display()))?;
+    let metadata = file
+        .metadata()
         .with_context(|| format!("cannot inspect PID file {}", path.display()))?;
     anyhow::ensure!(
         metadata.file_type().is_file(),
@@ -239,9 +251,7 @@ fn read_pid_file(path: &Path) -> Result<i32> {
         path.display()
     );
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    std::fs::File::open(path)
-        .with_context(|| format!("cannot open PID file {}", path.display()))?
-        .take((MAX_PID_FILE_BYTES + 1) as u64)
+    file.take((MAX_PID_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read PID file {}", path.display()))?;
     anyhow::ensure!(
@@ -417,6 +427,29 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&target, &path).unwrap();
         assert!(ensure_tunnel_token_file(&path).is_err());
+    }
+
+    #[test]
+    fn generated_pid_file_byte_limits_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x5049_4442_4f55_4e44, 256, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=MAX_PID_FILE_BYTES + 8);
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("up.pid");
+            std::fs::write(&path, vec![b'1'; len]).unwrap();
+            let result = read_pid_file(&path);
+            let syntactically_valid = len > 0
+                && len <= 10
+                && std::str::from_utf8(&vec![b'1'; len])
+                    .ok()
+                    .and_then(|raw| raw.parse::<i32>().ok())
+                    .is_some_and(|pid| pid > 0);
+            assert_eq!(
+                result.is_ok(),
+                len <= MAX_PID_FILE_BYTES && syntactically_valid,
+                "len={len} result={result:?}"
+            );
+            Ok(())
+        })
     }
 
     #[cfg(unix)]
