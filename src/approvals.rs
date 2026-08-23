@@ -18,7 +18,9 @@ use crate::config::{self, Session};
 use crate::{kintone_cli, kintone_mcp, sandbox};
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_APPROVAL_RESPONSE_BYTES: usize = 64;
 const SESSION_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_PENDING_SESSION_READS: usize = 64;
 
 #[derive(Serialize, Deserialize)]
@@ -122,13 +124,32 @@ pub async fn request(
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
 
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
+    let response =
+        read_session_response(stream, MAX_APPROVAL_RESPONSE_BYTES, "approval response").await?;
     match response.trim() {
         "allow" => Ok(true),
         "deny" => Ok(false),
         value => anyhow::bail!("invalid response from session: {value:?}"),
     }
+}
+
+async fn read_session_response(
+    stream: UnixStream,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String> {
+    let mut response = String::new();
+    let read = tokio::time::timeout(SESSION_RESPONSE_TIMEOUT, async {
+        BufReader::new(stream)
+            .take((max_bytes + 1) as u64)
+            .read_line(&mut response)
+            .await
+    })
+    .await
+    .with_context(|| format!("timed out waiting for {label}"))??;
+    anyhow::ensure!(read > 0, "{label} closed without a response");
+    anyhow::ensure!(read <= max_bytes, "{label} exceeds {max_bytes} bytes");
+    Ok(response)
 }
 
 pub async fn onepassword_service_account_status(session_id: &str) -> Result<Value> {
@@ -209,8 +230,8 @@ async fn kintone_cli_request(session_id: &str, request: KintoneCliRequest) -> Re
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
 
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
+    let response =
+        read_session_response(stream, MAX_SESSION_MESSAGE_BYTES, "cli-kintone response").await?;
     let response: KintoneCliResponse =
         serde_json::from_str(response.trim()).context("invalid cli-kintone response")?;
     if let Some(error) = response.error {
@@ -232,8 +253,8 @@ async fn kintone_mcp_request(session_id: &str, request: KintoneMcpRequest) -> Re
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
 
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
+    let response =
+        read_session_response(stream, MAX_SESSION_MESSAGE_BYTES, "kintone MCP response").await?;
     let response: KintoneMcpResponse =
         serde_json::from_str(response.trim()).context("invalid kintone MCP response")?;
     if let Some(error) = response.error {
@@ -260,8 +281,12 @@ async fn service_account_request(
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
 
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
+    let response = read_session_response(
+        stream,
+        MAX_SESSION_MESSAGE_BYTES,
+        "1Password service-account response",
+    )
+    .await?;
     let response: ServiceAccountResponse = serde_json::from_str(response.trim())
         .context("invalid 1Password service-account response")?;
     if let Some(error) = response.error {
@@ -1213,6 +1238,32 @@ mod tests {
         assert_eq!(snapshot.id, id);
         assert!(!snapshot.yolo);
         handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn generated_session_response_bounds_match_wire_limit() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4150_5052_5253_504e, 256, |ctx| {
+            const LIMIT: usize = 64;
+            let payload_len = noprop::sample_usize_in(ctx, 0..=LIMIT + 16);
+            runtime.block_on(async {
+                let (mut writer, reader) = UnixStream::pair().unwrap();
+                let mut bytes = vec![b'x'; payload_len];
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+                writer.shutdown().await.unwrap();
+                let result = read_session_response(reader, LIMIT, "generated response").await;
+                assert_eq!(
+                    result.is_ok(),
+                    payload_len < LIMIT,
+                    "response bound mismatch for payload_len={payload_len}"
+                );
+            });
+            Ok(())
+        })
     }
 
     #[tokio::test]
