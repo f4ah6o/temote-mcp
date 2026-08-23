@@ -30,7 +30,7 @@ network = [
 anyhow = "1"
 axum = { version = "0.8", optional = true }
 base64 = "0.22"
-clap = { version = "4", features = ["derive", "env"] }
+noargs = "0.4.3"
 dotenvy = { version = "0.15", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 ring = { version = "0.17", optional = true }

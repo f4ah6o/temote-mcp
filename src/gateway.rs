@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::ValueEnum;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,13 +20,30 @@ const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
     Auto,
     Macos,
     Linux,
     Wsl2,
     Windows,
+}
+
+impl std::str::FromStr for Platform {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "macos" => Ok(Self::Macos),
+            "linux" => Ok(Self::Linux),
+            "wsl2" => Ok(Self::Wsl2),
+            "windows" => Ok(Self::Windows),
+            _ => Err(format!(
+                "unknown platform {value:?}; expected auto, macos, linux, wsl2, or windows"
+            )),
+        }
+    }
 }
 
 impl Platform {

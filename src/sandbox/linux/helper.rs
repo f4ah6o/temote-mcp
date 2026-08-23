@@ -12,7 +12,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
@@ -22,17 +21,37 @@ use super::policy::{
     LinuxSandboxPolicy, is_linked_worktree_metadata_root, missing_path_is_directory,
 };
 
-#[derive(Debug, Parser)]
-#[command(name = "temote-linux-sandbox")]
+#[derive(Debug)]
 struct HelperArgs {
-    /// JSON-serialized Temote Linux policy. This is an internal process
-    /// boundary, not a public configuration format.
-    #[arg(long = "policy", value_parser = parse_policy)]
     policy: LinuxSandboxPolicy,
-
-    /// Command to execute after `--`.
-    #[arg(trailing_var_arg = true)]
     command: Vec<String>,
+}
+
+fn parse_helper_args<I>(raw: I) -> Result<HelperArgs>
+where
+    I: IntoIterator<Item = String>,
+{
+    let raw = raw.into_iter().collect::<Vec<_>>();
+    let separator = raw
+        .iter()
+        .position(|arg| arg == "--")
+        .context("Linux sandbox helper requires '--' before the command")?;
+    let command = raw[separator + 1..].to_vec();
+    validate_command(&command)?;
+
+    let mut args = noargs::RawArgs::new(raw[..separator].iter().cloned());
+    args.metadata_mut().app_name = "temote-linux-sandbox";
+    args.metadata_mut().help_flag_name = None;
+    let policy = noargs::opt("policy")
+        .ty("JSON")
+        .doc("JSON-serialized Temote Linux sandbox policy")
+        .take(&mut args)
+        .then(|opt| parse_policy(opt.value()))
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    args.finish()
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+
+    Ok(HelperArgs { policy, command })
 }
 
 pub(super) fn command_args(policy: &LinuxSandboxPolicy, command: &[String]) -> Result<Vec<String>> {
@@ -45,10 +64,10 @@ pub(super) fn command_args(policy: &LinuxSandboxPolicy, command: &[String]) -> R
 }
 
 pub(super) fn run_main() -> ! {
-    let args = HelperArgs::parse();
-    if let Err(error) = validate_command(&args.command) {
-        fail(error);
-    }
+    let args = match parse_helper_args(std::env::args()) {
+        Ok(args) => args,
+        Err(error) => fail(error.context("invalid Linux sandbox helper arguments")),
+    };
 
     let bwrap = match find_bwrap() {
         Ok(path) => path,
@@ -408,16 +427,41 @@ mod tests {
         assert!(validate_command(&[]).is_err());
         assert!(validate_command(&["contains\0nul".to_owned()]).is_err());
         assert!(
-            HelperArgs::try_parse_from([
-                "temote-linux-sandbox",
-                "--apply-seccomp",
-                "--policy",
-                "{}",
-                "--",
-                "/bin/true",
-            ])
+            parse_helper_args(
+                [
+                    "temote-linux-sandbox",
+                    "--apply-seccomp",
+                    "--policy",
+                    "{}",
+                    "--",
+                    "/bin/true",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            )
             .is_err()
         );
+    }
+
+    #[test]
+    fn helper_terminator_keeps_child_options_out_of_noargs() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = LinuxSandboxPolicy::for_command(root.path(), &[], &[]).unwrap();
+        let policy = serde_json::to_string(&policy).unwrap();
+        let parsed = parse_helper_args(
+            [
+                "temote-linux-sandbox".to_owned(),
+                "--policy".to_owned(),
+                policy,
+                "--".to_owned(),
+                "/bin/echo".to_owned(),
+                "--policy".to_owned(),
+                "child-value".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(parsed.command, ["/bin/echo", "--policy", "child-value"]);
     }
 
     #[test]

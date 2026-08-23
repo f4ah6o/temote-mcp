@@ -36,7 +36,7 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 ### Later candidates
 
 - Evaluate `uuid` and `dotenvy` only where replacement remains simpler than the dependency. `similar` was internalized on 2026-08-23 with the crate retained only as a dev-dependency differential oracle; see the evidence below.
-- Evaluate `clap` separately: it has a meaningful subtree, but Temote's CLI is a public product interface and should not be weakened merely to reduce package count.
+- `clap` was replaced with dependency-free `noargs 0.4.3` on 2026-08-24 while preserving Temote's public CLI surface; see the acceptance and evidence below.
 - Do not prioritize removal of `anyhow`, `axum`, or `reqwest` without a larger architectural reason; their current replacement cost is disproportionate to dependency savings.
 
 ## Acceptance
@@ -99,6 +99,21 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 - [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
 - [x] full tests pass.
 - [x] `git diff --check` passes.
+
+### `clap` -> `noargs` migration
+
+- [x] `clap`, `clap_builder`, `clap_derive`, and `clap_lex` are absent from the lockfile and production graph.
+- [x] `noargs 0.4.3` is the sole CLI parsing dependency and has no transitive dependencies.
+- [x] root commands and defaults remain compatible, including bare `temote-mcp` -> `start`, `doctor`, `start`, `mcp`, `serve`, `up`, `down`, `migrate`, `openai setup`, and `gateway-agent`.
+- [x] `--help` / `-h`, `--version` / `-V`, parser error exit code 2, nested OpenAI help, option defaults, repeated scope options, and env-backed options are preserved.
+- [x] profile/platform enums are parsed explicitly without derive macros and fail closed on unknown values.
+- [x] Linux sandbox helper uses `noargs` only before the `--` command terminator, so child arguments cannot be consumed as helper options.
+- [x] Linux helper compiles for `x86_64-unknown-linux-gnu` with `--no-default-features`; the full Linux network cross-check remains host-toolchain-limited by missing `x86_64-linux-gnu-gcc` for `ring`.
+- [x] `cargo check --all-targets --all-features` passes.
+- [x] `cargo check --all-targets --no-default-features` passes.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- [x] full tests pass.
+- [x] `cargo fmt --all -- --check` and `git diff --check` pass.
 
 ### `similar` internalization
 
@@ -227,3 +242,24 @@ Implemented on 2026-08-23 against `main` after commit `740a595`.
 - macOS `--no-default-features`: 40 -> 39 non-root packages
 - `cargo llvm-lines --bin temote-mcp --release --all-features`: 851,840 -> 829,303 LLVM IR lines (-22,537, about -2.65%) and 19,278 -> 18,972 copies (-306)
 - release llvm-lines contains no `similar::` functions; internal `temote_mcp::line_diff` accounts for about 2,771 LLVM IR lines
+## `clap` -> `noargs` migration evidence
+
+Implemented on 2026-08-24 against `main` after `bd19696`.
+
+- replaced `clap = { version = "4", features = ["derive", "env"] }` with `noargs = "0.4.3"`; `noargs` reports zero dependencies and no macros/implicit I/O
+- moved the public CLI definition into `src/cli.rs` using imperative command/option/flag parsing; `Profile` and gateway `Platform` now use explicit `FromStr` implementations
+- migrated the Linux sandbox helper parser as well; it splits at the first exact `--` before passing helper arguments to `noargs`, preserving arbitrary child command flags after the terminator
+- added 10 CLI compatibility tests for bare-start default, optional session ID + `--yolo`, flag-before-positional ordering, unknown-option fail-closed handling, dash-prefixed session IDs after `--`, root help/version, unknown command/profile rejection, network defaults, nested OpenAI help, repeated OpenAI scopes, and gateway-agent required options/platform parsing
+- real binary checks: `--version` and `-V` print the package version; root and nested help render; unknown command exits with status 2; every root/nested help scope has the exact same long-option set as the previous `bd19696` clap implementation, and subcommand `--version` rejection remains unchanged
+- secret-backed gateway options expose only environment variable names in noargs help metadata, not environment values
+- Linux helper `--no-default-features` test target compiles for `x86_64-unknown-linux-gnu`; a full network cross-build is blocked locally before Temote code by the missing `x86_64-linux-gnu-gcc` required by `ring`
+- full tests: 324 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- all-target/all-feature check: pass
+- no-default-features all-target check: pass (existing dead-code warnings only)
+- Clippy with `-D warnings`: pass
+- `cargo fmt --all -- --check`: pass
+- `git diff --check`: pass
+- macOS normal dependency graph: 113 -> 101 non-root packages (-12 in this migration, -45 from the original 146-package baseline)
+- macOS `--no-default-features`: 39 -> 27 non-root packages (-12 in this migration, -16 from the original 43-package baseline)
+- `cargo llvm-lines --bin temote-mcp --release --all-features`: 829,303 -> 808,052 LLVM IR lines (-21,251, about -2.56%) and 18,972 -> 18,273 copies (-699, about -3.68%)
+- release llvm-lines contains no `clap` symbols; `noargs` plus Temote's explicit CLI parser replaces the derive/builder codegen while keeping the public command surface explicit
