@@ -30,6 +30,7 @@ const MAX_URI_BYTES: usize = 2048;
 const MAX_OAUTH_STATE_BYTES: usize = 4096;
 const MAX_OAUTH_SCOPE_BYTES: usize = 256;
 const MAX_OAUTH_TOKEN_VALUE_BYTES: usize = 256;
+const MAX_INTERNAL_ERROR_LOG_CHARS: usize = 1024;
 const MAX_OAUTH_FIXED_PARAMETER_BYTES: usize = 64;
 const MAX_OAUTH_CLIENT_NAME_BYTES: usize = 1024;
 const MAX_OAUTH_CAPABILITY_VALUES: usize = 8;
@@ -1105,10 +1106,15 @@ fn random_token() -> Result<String> {
 }
 
 fn internal_error(error: anyhow::Error) -> OAuthError {
+    let detail = format!("{error:#}")
+        .chars()
+        .take(MAX_INTERNAL_ERROR_LOG_CHARS)
+        .collect::<String>();
+    eprintln!("[oauth] internal operation failed: {detail}");
     OAuthError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "server_error",
-        description: format!("local OAuth operation failed: {error:#}"),
+        description: "local OAuth operation failed".to_owned(),
     }
 }
 
@@ -1512,6 +1518,16 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn internal_errors_do_not_expose_details_to_oauth_clients() {
+        let secret = "sensitive-internal-detail";
+        let error = internal_error(anyhow::anyhow!("{secret}"));
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code, "server_error");
+        assert_eq!(error.description, "local OAuth operation failed");
+        assert!(!error.description.contains(secret));
     }
 
     #[test]
