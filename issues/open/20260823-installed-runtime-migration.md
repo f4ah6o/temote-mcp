@@ -51,7 +51,7 @@ Independently running `temote-mcp start <session>` processes must not be killed 
 - [x] migrated files are `0600`, created without overwrite, and symlink/special/oversized inputs fail closed
 - [x] `temote-mcp migrate --dry-run` reports config migration without writing it
 - [x] `temote-mcp up --profile cloudflare` can bootstrap compatible config migration directly
-- [ ] normal Rust gates pass on the implementation branch
+- [x] normal Rust gates pass on the implementation branch
 
 ## Evidence
 
@@ -63,4 +63,9 @@ Existing runtime-migration evidence before this follow-up:
 - isolated stale-state migration removed only the legacy state file
 - live host dry-run detected `~/.cache/temote-mcp/up.pids` with the existing legacy `temote-mcp serve` and `cloudflared` PIDs, preserved both processes, and preserved the state file
 
-Follow-up config-migration CI evidence is recorded after the implementation branch runs the repository gates.
+Follow-up configuration-migration evidence:
+
+- GitHub Actions CI run 137: macOS 15 and Ubuntu jobs both passed
+- both platforms: rustfmt, all-target check, no-default-features check, Clippy, full tests, and CLI session E2E passed
+- Linux: sandbox helper build, live sandbox acceptance, dependency boundary, packaged crate manifest, and install-from-packaged-source passed
+- macOS: packaged crate manifest and dependency boundary passed
