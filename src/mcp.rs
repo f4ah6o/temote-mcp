@@ -30,6 +30,7 @@ const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MCP_RESPONSE_BYTES: usize = 52 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_DIRECTORY_LIST_BYTES: usize = 1024 * 1024;
@@ -134,11 +135,43 @@ pub async fn serve() -> Result<()> {
     Ok(())
 }
 
+fn encode_json_line_with_limit(message: &Value, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(message).context("failed to serialize MCP response")?;
+    let wire_bytes = bytes
+        .len()
+        .checked_add(1)
+        .context("MCP response size overflow")?;
+    anyhow::ensure!(
+        wire_bytes <= max_bytes,
+        "MCP response exceeds {max_bytes} bytes"
+    );
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn bounded_mcp_response_line(message: &Value, max_bytes: usize) -> Result<Vec<u8>> {
+    match encode_json_line_with_limit(message, max_bytes) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            encode_json_line_with_limit(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": format!("MCP response exceeds {max_bytes} bytes")
+                    }
+                }),
+                max_bytes,
+            )
+        }
+    }
+}
+
 async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
-    stdout
-        .write_all(serde_json::to_string(message)?.as_bytes())
-        .await?;
-    stdout.write_all(b"\n").await?;
+    let line = bounded_mcp_response_line(message, MAX_MCP_RESPONSE_BYTES)?;
+    stdout.write_all(&line).await?;
     stdout.flush().await?;
     Ok(())
 }
@@ -1901,6 +1934,78 @@ mod tests {
         assert_eq!(
             next_bounded_line(&mut reader, 64).await.unwrap(),
             Some(BoundedLine::Line("{}\n".to_owned()))
+        );
+    }
+
+    #[test]
+    fn generated_mcp_response_encoding_matches_wire_limit() -> noprop::TestResult {
+        test_support::run(0x4d43_5052_4553_5042, 512, |ctx| {
+            let max_bytes = noprop::sample_usize_in(ctx, 96..=512);
+            let payload_len = noprop::sample_usize_in(ctx, 0..=600);
+            let payload = (0..payload_len)
+                .map(|_| match noprop::sample_usize_in(ctx, 0..=3) {
+                    0 => 'x',
+                    1 => '"',
+                    2 => '\\',
+                    _ => '\n',
+                })
+                .collect::<String>();
+            let message = json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": {"content": [{"type": "text", "text": payload}]}
+            });
+            let serialized = serde_json::to_vec(&message).unwrap();
+            let expected = serialized
+                .len()
+                .checked_add(1)
+                .is_some_and(|wire| wire <= max_bytes);
+            let actual = encode_json_line_with_limit(&message, max_bytes);
+            assert_eq!(
+                actual.is_ok(),
+                expected,
+                "serialized={} max={max_bytes}",
+                serialized.len()
+            );
+            if let Ok(line) = actual {
+                assert_eq!(line.len(), serialized.len() + 1);
+                assert_eq!(line.last(), Some(&b'\n'));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn oversized_mcp_response_degrades_to_bounded_json_rpc_error() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": "request-7",
+            "result": {"content": [{"type": "text", "text": "x".repeat(2048)}]}
+        });
+        let line = bounded_mcp_response_line(&message, 512).unwrap();
+        assert!(line.len() <= 512);
+        assert_eq!(line.last(), Some(&b'\n'));
+        let response: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+        assert_eq!(response["id"], "request-7");
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("MCP response exceeds"))
+        );
+    }
+
+    #[test]
+    fn stdio_response_budget_covers_max_image_and_request_line() {
+        let base64_bytes = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let conservative_json_overhead = 64 * 1024;
+        let required = MAX_JSON_LINE_BYTES
+            .checked_add(base64_bytes)
+            .and_then(|bytes| bytes.checked_add(conservative_json_overhead))
+            .unwrap();
+        assert!(
+            required <= MAX_MCP_RESPONSE_BYTES,
+            "required={required} budget={MAX_MCP_RESPONSE_BYTES}"
         );
     }
 
