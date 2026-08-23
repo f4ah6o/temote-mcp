@@ -111,6 +111,42 @@ struct KintoneCliResponse {
     error: Option<String>,
 }
 
+fn encode_json_line_with_limit<T: Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value).context("failed to serialize session message")?;
+    let wire_bytes = bytes
+        .len()
+        .checked_add(1)
+        .context("session message size overflow")?;
+    anyhow::ensure!(
+        wire_bytes <= max_bytes,
+        "session message exceeds {max_bytes} bytes"
+    );
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn encode_session_json_line<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    encode_json_line_with_limit(value, MAX_SESSION_MESSAGE_BYTES)
+}
+
+fn encode_session_result(result: Result<Value>, label: &str) -> Vec<u8> {
+    let response = match result {
+        Ok(result) => json!({"result": result, "error": Value::Null}),
+        Err(error) => json!({"result": Value::Null, "error": format!("{error:#}")}),
+    };
+    match encode_session_json_line(&response) {
+        Ok(bytes) => bytes,
+        Err(_) => encode_session_json_line(&json!({
+            "result": Value::Null,
+            "error": format!("{label} exceeds {MAX_SESSION_MESSAGE_BYTES} bytes")
+        }))
+        .expect("bounded session error response must fit"),
+    }
+}
+
 pub async fn request(
     session_id: &str,
     operation: &str,
@@ -123,14 +159,12 @@ pub async fn request(
         detail,
         cwd,
     };
+    let message = encode_session_json_line(&Message::Approval { request })?;
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
-    stream
-        .write_all(&serde_json::to_vec(&Message::Approval { request })?)
-        .await?;
-    stream.write_all(b"\n").await?;
+    stream.write_all(&message).await?;
     stream.shutdown().await?;
 
     let response =
@@ -229,14 +263,12 @@ pub async fn kintone_cli_run(
 }
 
 async fn kintone_cli_request(session_id: &str, request: KintoneCliRequest) -> Result<Value> {
+    let message = encode_session_json_line(&Message::KintoneCli { request })?;
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
-    stream
-        .write_all(&serde_json::to_vec(&Message::KintoneCli { request })?)
-        .await?;
-    stream.write_all(b"\n").await?;
+    stream.write_all(&message).await?;
     stream.shutdown().await?;
 
     let response =
@@ -252,14 +284,12 @@ async fn kintone_cli_request(session_id: &str, request: KintoneCliRequest) -> Re
 }
 
 async fn kintone_mcp_request(session_id: &str, request: KintoneMcpRequest) -> Result<Value> {
+    let message = encode_session_json_line(&Message::KintoneMcp { request })?;
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
-    stream
-        .write_all(&serde_json::to_vec(&Message::KintoneMcp { request })?)
-        .await?;
-    stream.write_all(b"\n").await?;
+    stream.write_all(&message).await?;
     stream.shutdown().await?;
 
     let response =
@@ -278,16 +308,12 @@ async fn service_account_request(
     session_id: &str,
     request: ServiceAccountRequest,
 ) -> Result<Value> {
+    let message = encode_session_json_line(&Message::OnePasswordServiceAccount { request })?;
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
         .with_context(|| format!("session {session_id} is not running; run `temote-mcp start`"))?;
-    stream
-        .write_all(&serde_json::to_vec(&Message::OnePasswordServiceAccount {
-            request,
-        })?)
-        .await?;
-    stream.write_all(b"\n").await?;
+    stream.write_all(&message).await?;
     stream.shutdown().await?;
 
     let response = read_session_response(
@@ -320,11 +346,10 @@ pub async fn activity(session_id: &str, title: impl Into<String>, detail: Option
         title: title.into(),
         detail,
     };
-    let Ok(bytes) = serde_json::to_vec(&message) else {
+    let Ok(bytes) = encode_session_json_line(&message) else {
         return;
     };
     let _ = stream.write_all(&bytes).await;
-    let _ = stream.write_all(b"\n").await;
     let _ = stream.shutdown().await;
 }
 
@@ -747,15 +772,9 @@ async fn run_runtime(
                         let token = service_account_token.map(str::to_owned);
                         tokio::spawn(async move {
                             let response = handle_service_account_request(&session, token.as_deref(), request).await;
-                            let response = match response {
-                                Ok(result) => ServiceAccountResponse { result: Some(result), error: None },
-                                Err(error) => ServiceAccountResponse { result: None, error: Some(format!("{error:#}")) },
-                            };
-                            if let Ok(bytes) = serde_json::to_vec(&response) {
-                                let _ = stream.write_all(&bytes).await;
-                                let _ = stream.write_all(b"\n").await;
-                                let _ = stream.shutdown().await;
-                            }
+                            let bytes = encode_session_result(response, "1Password service-account response");
+                            let _ = stream.write_all(&bytes).await;
+                            let _ = stream.shutdown().await;
                         });
                     }
                     Message::KintoneMcp { request } => {
@@ -763,15 +782,9 @@ async fn run_runtime(
                         let bridge = Arc::clone(&kintone_bridge);
                         tokio::spawn(async move {
                             let response = handle_kintone_mcp_request(&session, bridge, request).await;
-                            let response = match response {
-                                Ok(result) => KintoneMcpResponse { result: Some(result), error: None },
-                                Err(error) => KintoneMcpResponse { result: None, error: Some(format!("{error:#}")) },
-                            };
-                            if let Ok(bytes) = serde_json::to_vec(&response) {
-                                let _ = stream.write_all(&bytes).await;
-                                let _ = stream.write_all(b"\n").await;
-                                let _ = stream.shutdown().await;
-                            }
+                            let bytes = encode_session_result(response, "kintone MCP response");
+                            let _ = stream.write_all(&bytes).await;
+                            let _ = stream.shutdown().await;
                         });
                     }
                     Message::KintoneCli { request } => {
@@ -779,15 +792,9 @@ async fn run_runtime(
                         let bridge = Arc::clone(&kintone_cli_bridge);
                         tokio::spawn(async move {
                             let response = handle_kintone_cli_request(&session, bridge, request).await;
-                            let response = match response {
-                                Ok(result) => KintoneCliResponse { result: Some(result), error: None },
-                                Err(error) => KintoneCliResponse { result: None, error: Some(format!("{error:#}")) },
-                            };
-                            if let Ok(bytes) = serde_json::to_vec(&response) {
-                                let _ = stream.write_all(&bytes).await;
-                                let _ = stream.write_all(b"\n").await;
-                                let _ = stream.shutdown().await;
-                            }
+                            let bytes = encode_session_result(response, "cli-kintone response");
+                            let _ = stream.write_all(&bytes).await;
+                            let _ = stream.shutdown().await;
                         });
                     }
                     Message::Approval { request } if session.yolo => {
@@ -1279,6 +1286,72 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[test]
+    fn generated_session_json_encoding_matches_wire_limit() -> noprop::TestResult {
+        test_support::run(0x5345_5353_4c49_4e45, 512, |ctx| {
+            let max_bytes = noprop::sample_usize_in(ctx, 1..=256);
+            let payload_len = noprop::sample_usize_in(ctx, 0..=300);
+            let payload = (0..payload_len)
+                .map(|_| match noprop::sample_usize_in(ctx, 0..=3) {
+                    0 => 'x',
+                    1 => '"',
+                    2 => '\\',
+                    _ => '\n',
+                })
+                .collect::<String>();
+            let message = Message::Activity {
+                title: payload,
+                detail: None,
+            };
+            let serialized = serde_json::to_vec(&message).unwrap();
+            let expected = serialized
+                .len()
+                .checked_add(1)
+                .is_some_and(|wire| wire <= max_bytes);
+            let actual = encode_json_line_with_limit(&message, max_bytes);
+            assert_eq!(
+                actual.is_ok(),
+                expected,
+                "serialized={} max={max_bytes}",
+                serialized.len()
+            );
+            if let Ok(line) = actual {
+                assert_eq!(line.len(), serialized.len() + 1);
+                assert_eq!(line.last(), Some(&b'\n'));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn oversized_session_request_is_rejected_before_socket_write() {
+        let message = Message::KintoneMcp {
+            request: KintoneMcpRequest::Call {
+                tool_name: "oversized".to_owned(),
+                arguments: json!({"payload": "x".repeat(MAX_SESSION_MESSAGE_BYTES)}),
+            },
+        };
+        let error = encode_session_json_line(&message).unwrap_err();
+        assert!(error.to_string().contains("session message exceeds"));
+    }
+
+    #[test]
+    fn oversized_session_result_degrades_to_bounded_error_response() {
+        let bytes = encode_session_result(
+            Ok(json!({"payload": "x".repeat(MAX_SESSION_MESSAGE_BYTES)})),
+            "generated response",
+        );
+        assert!(bytes.len() <= MAX_SESSION_MESSAGE_BYTES);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let response: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert!(response["result"].is_null());
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("generated response exceeds"))
+        );
     }
 
     #[tokio::test]
