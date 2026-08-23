@@ -27,6 +27,10 @@ const MAX_CLIENT_METADATA_ADDRESSES: usize = 32;
 const METADATA_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_URI_BYTES: usize = 2048;
+const MAX_OAUTH_STATE_BYTES: usize = 4096;
+const MAX_OAUTH_SCOPE_BYTES: usize = 256;
+const MAX_OAUTH_TOKEN_VALUE_BYTES: usize = 256;
+const MAX_OAUTH_FIXED_PARAMETER_BYTES: usize = 64;
 const MAX_CLIENT_METADATA_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
@@ -293,6 +297,7 @@ impl LocalOAuth {
         &self,
         request: AuthorizeRequest,
     ) -> std::result::Result<String, OAuthError> {
+        validate_authorize_request_lengths(&request)?;
         if request.response_type != "code" {
             return Err(OAuthError::bad_request(
                 "unsupported_response_type",
@@ -376,6 +381,7 @@ impl LocalOAuth {
     }
 
     pub async fn token(&self, request: TokenRequest) -> std::result::Result<Value, OAuthError> {
+        validate_token_request_lengths(&request)?;
         if request.grant_type != "authorization_code" {
             return Err(OAuthError::bad_request(
                 "unsupported_grant_type",
@@ -901,6 +907,68 @@ fn redeem_authorization_code(
     Ok(())
 }
 
+fn validate_parameter_length(
+    value: &str,
+    max_bytes: usize,
+    name: &str,
+) -> std::result::Result<(), OAuthError> {
+    if value.len() > max_bytes {
+        return Err(OAuthError::bad_request(
+            "invalid_request",
+            format!("{name} exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authorize_request_lengths(
+    request: &AuthorizeRequest,
+) -> std::result::Result<(), OAuthError> {
+    validate_parameter_length(
+        &request.response_type,
+        MAX_OAUTH_FIXED_PARAMETER_BYTES,
+        "response_type",
+    )?;
+    validate_parameter_length(&request.client_id, MAX_URI_BYTES, "client_id")?;
+    validate_parameter_length(&request.redirect_uri, MAX_URI_BYTES, "redirect_uri")?;
+    validate_parameter_length(
+        &request.code_challenge,
+        MAX_OAUTH_TOKEN_VALUE_BYTES,
+        "code_challenge",
+    )?;
+    validate_parameter_length(
+        &request.code_challenge_method,
+        MAX_OAUTH_FIXED_PARAMETER_BYTES,
+        "code_challenge_method",
+    )?;
+    validate_parameter_length(&request.resource, MAX_URI_BYTES, "resource")?;
+    if let Some(state) = request.state.as_deref() {
+        validate_parameter_length(state, MAX_OAUTH_STATE_BYTES, "state")?;
+    }
+    if let Some(scope) = request.scope.as_deref() {
+        validate_parameter_length(scope, MAX_OAUTH_SCOPE_BYTES, "scope")?;
+    }
+    Ok(())
+}
+
+fn validate_token_request_lengths(request: &TokenRequest) -> std::result::Result<(), OAuthError> {
+    validate_parameter_length(
+        &request.grant_type,
+        MAX_OAUTH_FIXED_PARAMETER_BYTES,
+        "grant_type",
+    )?;
+    validate_parameter_length(&request.code, MAX_OAUTH_TOKEN_VALUE_BYTES, "code")?;
+    validate_parameter_length(&request.client_id, MAX_URI_BYTES, "client_id")?;
+    validate_parameter_length(&request.redirect_uri, MAX_URI_BYTES, "redirect_uri")?;
+    validate_parameter_length(
+        &request.code_verifier,
+        MAX_OAUTH_TOKEN_VALUE_BYTES,
+        "code_verifier",
+    )?;
+    validate_parameter_length(&request.resource, MAX_URI_BYTES, "resource")?;
+    Ok(())
+}
+
 fn validate_scope(scope: Option<&str>) -> std::result::Result<(), OAuthError> {
     if scope.is_some_and(|scope| scope.split_ascii_whitespace().any(|value| value != "mcp")) {
         return Err(OAuthError::bad_request(
@@ -1061,6 +1129,84 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn generated_authorize_parameter_lengths_match_bounds() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_484c_454e, 512, |ctx| {
+            let field = noprop::sample_usize_in(ctx, 0..8);
+            let max = match field {
+                0 | 4 => MAX_OAUTH_FIXED_PARAMETER_BYTES,
+                1 | 2 | 5 => MAX_URI_BYTES,
+                3 => MAX_OAUTH_TOKEN_VALUE_BYTES,
+                6 => MAX_OAUTH_STATE_BYTES,
+                _ => MAX_OAUTH_SCOPE_BYTES,
+            };
+            let len = noprop::sample_usize_in(ctx, max.saturating_sub(2)..=max + 2);
+            let value = "x".repeat(len);
+            let mut request = AuthorizeRequest {
+                response_type: "code".to_owned(),
+                client_id: "client".to_owned(),
+                redirect_uri: "http://127.0.0.1:9876/callback".to_owned(),
+                code_challenge: "A".repeat(43),
+                code_challenge_method: "S256".to_owned(),
+                resource: "https://node.example.ts.net/mcp".to_owned(),
+                state: None,
+                scope: Some("mcp".to_owned()),
+            };
+            match field {
+                0 => request.response_type = value,
+                1 => request.client_id = value,
+                2 => request.redirect_uri = value,
+                3 => request.code_challenge = value,
+                4 => request.code_challenge_method = value,
+                5 => request.resource = value,
+                6 => request.state = Some(value),
+                _ => request.scope = Some(value),
+            }
+            assert_eq!(
+                validate_authorize_request_lengths(&request).is_ok(),
+                len <= max,
+                "field={field} len={len} max={max}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_token_parameter_lengths_match_bounds() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4854_4c45, 512, |ctx| {
+            let field = noprop::sample_usize_in(ctx, 0..6);
+            let max = match field {
+                0 => MAX_OAUTH_FIXED_PARAMETER_BYTES,
+                1 | 4 => MAX_OAUTH_TOKEN_VALUE_BYTES,
+                _ => MAX_URI_BYTES,
+            };
+            let len = noprop::sample_usize_in(ctx, max.saturating_sub(2)..=max + 2);
+            let value = "x".repeat(len);
+            let mut request = TokenRequest {
+                grant_type: "authorization_code".to_owned(),
+                code: "code".to_owned(),
+                client_id: "client".to_owned(),
+                redirect_uri: "http://127.0.0.1:9876/callback".to_owned(),
+                code_verifier: "a".repeat(43),
+                resource: "https://node.example.ts.net/mcp".to_owned(),
+            };
+            match field {
+                0 => request.grant_type = value,
+                1 => request.code = value,
+                2 => request.client_id = value,
+                3 => request.redirect_uri = value,
+                4 => request.code_verifier = value,
+                _ => request.resource = value,
+            }
+            assert_eq!(
+                validate_token_request_lengths(&request).is_ok(),
+                len <= max,
+                "field={field} len={len} max={max}"
+            );
+            Ok(())
+        })
     }
 
     #[test]
