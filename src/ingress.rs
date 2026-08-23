@@ -9,6 +9,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
+use crate::child_env;
 use crate::profile::Profile;
 use crate::provider::PublicEndpoint;
 
@@ -90,15 +91,16 @@ pub async fn start(
             let token_file = tunnel_token_file.context(
                 "Cloudflare profile requires a tunnel token file when temote-mcp owns ingress",
             )?;
-            Command::new("cloudflared")
+            let mut command = Command::new("cloudflared");
+            command
                 .args(["tunnel", "run", "--token-file"])
                 .arg(token_file)
                 .stdin(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .with_context(|| {
-                    format!("failed to start cloudflared with {}", token_file.display())
-                })?
+                .kill_on_drop(true);
+            child_env::scrub_sensitive(&mut command, &[]);
+            command.spawn().with_context(|| {
+                format!("failed to start cloudflared with {}", token_file.display())
+            })?
         }
         Profile::Openai => {
             anyhow::bail!("openai is a private connection profile, not a public ingress profile")
@@ -120,10 +122,13 @@ pub async fn start(
             );
             let target = format!("http://127.0.0.1:{}", addr.port());
             let https_arg = format!("--https={https_port}");
-            Command::new("tailscale")
+            let mut command = Command::new("tailscale");
+            command
                 .args(["funnel", "--yes", &https_arg, &target])
                 .stdin(Stdio::null())
-                .kill_on_drop(true)
+                .kill_on_drop(true);
+            child_env::scrub_sensitive(&mut command, &[]);
+            command
                 .spawn()
                 .with_context(|| format!("failed to start Tailscale Funnel for {target}"))?
         }
@@ -132,12 +137,15 @@ pub async fn start(
 }
 
 async fn run_tailscale_status(args: &[&str], label: &str) -> Result<Vec<u8>> {
-    let mut child = Command::new("tailscale")
+    let mut command = Command::new("tailscale");
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    child_env::scrub_sensitive(&mut command, &[]);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to execute `{label}`"))?;
     let stdout = child

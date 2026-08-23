@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+use crate::child_env;
 use crate::profile::Profile;
 use crate::sandbox;
 
@@ -1119,12 +1120,15 @@ struct DoctorOutput {
 }
 
 async fn run_doctor_command(program: &str, args: &[&str]) -> Result<DoctorOutput> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    child_env::scrub_sensitive(&mut command, &[]);
+    let mut child = command
         .spawn()
         .with_context(|| format!("cannot execute {program}"))?;
     let stdout = child

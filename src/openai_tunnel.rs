@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use zeroize::Zeroizing;
 
+use crate::child_env;
+
 const TUNNEL_ID_PREFIX: &str = "tunnel_";
 const TUNNEL_ID_HEX_LEN: usize = 32;
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(15);
@@ -627,25 +629,11 @@ where
 }
 
 fn restrict_runtime_credentials(command: &mut Command, runtime_key_env: &str) {
-    command.env_remove("OPENAI_ADMIN_KEY");
-    match runtime_key_env {
-        "CONTROL_PLANE_API_KEY" => {
-            command.env_remove("OPENAI_API_KEY");
-        }
-        "OPENAI_API_KEY" => {
-            command.env_remove("CONTROL_PLANE_API_KEY");
-        }
-        _ => {
-            command.env_remove("CONTROL_PLANE_API_KEY");
-            command.env_remove("OPENAI_API_KEY");
-        }
-    }
+    child_env::scrub_sensitive(command, &[runtime_key_env]);
 }
 
 fn scrub_openai_credentials(command: &mut Command) {
-    command.env_remove("OPENAI_ADMIN_KEY");
-    command.env_remove("CONTROL_PLANE_API_KEY");
-    command.env_remove("OPENAI_API_KEY");
+    child_env::scrub_sensitive(command, &[]);
 }
 
 pub fn ensure_loopback(origin: SocketAddr) -> Result<()> {
