@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -19,6 +19,8 @@ const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_MCP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -69,9 +71,29 @@ fn jobs() -> &'static Mutex<JobState> {
 }
 
 pub async fn serve() -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match next_bounded_line(&mut input, MAX_MCP_REQUEST_BYTES).await? {
+            Some(BoundedLine::Line(line)) => line,
+            Some(BoundedLine::TooLarge) => {
+                write_message(
+                    &mut stdout,
+                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":format!("MCP request exceeds {MAX_MCP_REQUEST_BYTES} bytes")}}),
+                )
+                .await?;
+                continue;
+            }
+            Some(BoundedLine::InvalidUtf8) => {
+                write_message(
+                    &mut stdout,
+                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"MCP request must be valid UTF-8"}}),
+                )
+                .await?;
+                continue;
+            }
+            None => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -95,6 +117,57 @@ pub async fn serve() -> Result<()> {
         write_message(&mut stdout, &response).await?;
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Line(String),
+    TooLarge,
+    InvalidUtf8,
+}
+
+async fn next_bounded_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<BoundedLine>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    let mut saw_any = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if !saw_any {
+                return Ok(None);
+            }
+            break;
+        }
+        saw_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if !oversized {
+            if bytes.len().saturating_add(consumed) > max_bytes {
+                oversized = true;
+            } else {
+                bytes.extend_from_slice(&available[..consumed]);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    if oversized {
+        return Ok(Some(BoundedLine::TooLarge));
+    }
+    match String::from_utf8(bytes) {
+        Ok(line) => Ok(Some(BoundedLine::Line(line))),
+        Err(_) => Ok(Some(BoundedLine::InvalidUtf8)),
+    }
 }
 
 async fn write_message(stdout: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
@@ -712,9 +785,24 @@ async fn get_image(path: &Path) -> Result<Value> {
         "image path is not a file: {}",
         path.display()
     );
-    let bytes = tokio::fs::read(&path)
+    anyhow::ensure!(
+        metadata.len() <= MAX_IMAGE_BYTES as u64,
+        "image exceeds {MAX_IMAGE_BYTES} bytes: {}",
+        path.display()
+    );
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("cannot open image {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_IMAGE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .await
         .with_context(|| format!("cannot read image {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_IMAGE_BYTES,
+        "image exceeds {MAX_IMAGE_BYTES} bytes: {}",
+        path.display()
+    );
     let mime_type = image_mime_type(&bytes)
         .with_context(|| format!("unsupported image format: {}", path.display()))?;
     Ok(json!({
@@ -1374,7 +1462,8 @@ fn required_job_id(args: &Value) -> Result<Uuid> {
 }
 
 fn required_command(args: &Value) -> Result<Vec<String>> {
-    args.get("command")
+    let command = args
+        .get("command")
         .and_then(Value::as_array)
         .context("missing command")?
         .iter()
@@ -1383,7 +1472,9 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
                 .map(str::to_owned)
                 .context("command entries must be strings")
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    Ok(command)
 }
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1570,6 +1661,64 @@ mod tests {
     use super::*;
     use crate::test_support;
 
+    #[tokio::test]
+    async fn bounded_stdio_reader_discards_oversized_line_and_recovers() {
+        let input = format!("{}\n{{\"ok\":true}}\n", "x".repeat(65));
+        let mut reader = BufReader::new(input.as_bytes());
+
+        assert_eq!(
+            next_bounded_line(&mut reader, 64).await.unwrap(),
+            Some(BoundedLine::TooLarge)
+        );
+        assert_eq!(
+            next_bounded_line(&mut reader, 64).await.unwrap(),
+            Some(BoundedLine::Line("{\"ok\":true}\n".to_owned()))
+        );
+        assert_eq!(next_bounded_line(&mut reader, 64).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_stdio_reader_discards_invalid_utf8_and_recovers() {
+        let input = [0xff, b'\n', b'{', b'}', b'\n'];
+        let mut reader = BufReader::new(input.as_slice());
+
+        assert_eq!(
+            next_bounded_line(&mut reader, 64).await.unwrap(),
+            Some(BoundedLine::InvalidUtf8)
+        );
+        assert_eq!(
+            next_bounded_line(&mut reader, 64).await.unwrap(),
+            Some(BoundedLine::Line("{}\n".to_owned()))
+        );
+    }
+
+    #[test]
+    fn generated_stdio_line_boundaries_match_wire_limit() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x5354_4449_4f4c_494e, 512, |ctx| {
+            const LIMIT: usize = 64;
+            let payload_len = noprop::sample_usize_in(ctx, 0..=LIMIT + 16);
+            let mut input = vec![b'x'; payload_len];
+            input.push(b'\n');
+            let result = runtime.block_on(async {
+                let mut reader = BufReader::new(input.as_slice());
+                next_bounded_line(&mut reader, LIMIT).await.unwrap()
+            });
+            if payload_len + 1 > LIMIT {
+                assert_eq!(result, Some(BoundedLine::TooLarge));
+            } else {
+                assert_eq!(
+                    result,
+                    Some(BoundedLine::Line(format!("{}\n", "x".repeat(payload_len))))
+                );
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn detects_supported_image_types() {
         assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
@@ -1577,6 +1726,37 @@ mod tests {
         assert_eq!(image_mime_type(b"GIF89a"), Some("image/gif"));
         assert_eq!(image_mime_type(b"RIFF\0\0\0\0WEBP"), Some("image/webp"));
         assert_eq!(image_mime_type(b"not an image"), None);
+    }
+
+    #[test]
+    fn generated_supported_image_prefixes_survive_arbitrary_suffixes() -> noprop::TestResult {
+        test_support::run(0x494d_4147_454d_494d, 512, |ctx| {
+            let (prefix, expected): (&[u8], &str) = match noprop::sample_usize_in(ctx, 0..7) {
+                0 => (b"\x89PNG\r\n\x1a\n", "image/png"),
+                1 => (b"\xff\xd8\xff", "image/jpeg"),
+                2 => (b"GIF89a", "image/gif"),
+                3 => (b"RIFF\0\0\0\0WEBP", "image/webp"),
+                4 => (b"BM", "image/bmp"),
+                5 => (b"II*\0", "image/tiff"),
+                _ => (b"\0\0\0\0ftypavif", "image/avif"),
+            };
+            let suffix_len = noprop::sample_usize_in(ctx, 0..=64);
+            let mut bytes = prefix.to_vec();
+            bytes.extend((0..suffix_len).map(|_| noprop::sample_u8(ctx)));
+            assert_eq!(image_mime_type(&bytes), Some(expected));
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn get_image_rejects_oversized_files_before_reading_them() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_IMAGE_BYTES as u64 + 1).unwrap();
+
+        let error = get_image(&path).await.unwrap_err();
+        assert!(error.to_string().contains("image exceeds"));
     }
 
     #[test]
@@ -1895,6 +2075,188 @@ mod tests {
                 validate_git_path(&session, &outside_path.to_string_lossy()).is_err(),
                 "outside path unexpectedly accepted: {outside_path:?}"
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_command_arguments_match_schema_contract() -> noprop::TestResult {
+        test_support::run(0x434f_4d4d_414e_4401, test_support::DEFAULT_CASES, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=8);
+            let mut items = (0..len)
+                .map(|_| Value::String(test_support::safe_component(ctx)))
+                .collect::<Vec<_>>();
+            let corrupt = !items.is_empty() && noprop::sample_bool(ctx);
+            if corrupt {
+                let index = noprop::sample_usize_in(ctx, 0..items.len());
+                items[index] = json!(noprop::sample_u64(ctx));
+            }
+            let args = json!({"command": items});
+            let parsed = required_command(&args);
+            let expected = len > 0 && !corrupt;
+            assert_eq!(
+                parsed.is_ok(),
+                expected,
+                "command parser mismatch: args={args:?}"
+            );
+            if let Ok(command) = parsed {
+                assert_eq!(command.len(), len);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_string_arrays_require_array_of_strings() -> noprop::TestResult {
+        test_support::run(0x5354_5241_5252_4159, test_support::DEFAULT_CASES, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=8);
+            let mut items = (0..len)
+                .map(|_| Value::String(test_support::safe_component(ctx)))
+                .collect::<Vec<_>>();
+            let corrupt = !items.is_empty() && noprop::sample_bool(ctx);
+            if corrupt {
+                let index = noprop::sample_usize_in(ctx, 0..items.len());
+                items[index] = Value::Bool(noprop::sample_bool(ctx));
+            }
+            let args = json!({"paths": items});
+            let parsed = required_string_array(&args, "paths");
+            assert_eq!(
+                parsed.is_ok(),
+                !corrupt,
+                "string-array parser mismatch: args={args:?}"
+            );
+            if let Ok(paths) = parsed {
+                assert_eq!(paths.len(), len);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_job_ids_accept_uuid_strings_only() -> noprop::TestResult {
+        test_support::run(0x4a4f_4249_4450_4254, test_support::DEFAULT_CASES, |ctx| {
+            let upper = noprop::sample_u64(ctx) as u128;
+            let lower = noprop::sample_u64(ctx) as u128;
+            let uuid = Uuid::from_u128((upper << 64) | lower);
+            let valid = noprop::sample_bool(ctx);
+            let value = if valid {
+                uuid.to_string()
+            } else {
+                format!("not-a-uuid-{}", test_support::safe_component(ctx))
+            };
+            let args = json!({"job_id": value});
+            assert_eq!(
+                required_job_id(&args).is_ok(),
+                valid,
+                "job id parser mismatch: args={args:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_cached_jobs_are_isolated_by_session() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4a4f_424f_574e_4552, 256, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let owner_id = format!("job-owner-{nonce:x}");
+            let other_id = format!("job-other-{nonce:x}");
+            let cwd = std::env::current_dir().unwrap();
+            let owner = config::Session {
+                id: owner_id.clone(),
+                cwd: cwd.clone(),
+                permitted_directories: Vec::new(),
+                started_at: 0,
+                process_id: 0,
+                yolo: true,
+            };
+            let other = config::Session {
+                id: other_id,
+                cwd,
+                permitted_directories: Vec::new(),
+                started_at: 0,
+                process_id: 0,
+                yolo: true,
+            };
+            let job_id = Uuid::new_v4();
+            let completion = Arc::new(Mutex::new(JobCompletion {
+                result: Some(CachedJobResult::Success("owned".to_owned())),
+                completed_at: Some(Instant::now()),
+            }));
+            let handle = runtime.spawn(async {});
+            jobs().lock().unwrap().jobs.insert(
+                job_id,
+                Job {
+                    session_id: owner_id,
+                    command: "test".to_owned(),
+                    handle,
+                    completion,
+                },
+            );
+            let args = json!({"job_id": job_id.to_string()});
+            runtime.block_on(async {
+                assert!(poll_job(&args, &other).await.is_err());
+                assert_eq!(
+                    poll_job(&args, &owner).await.unwrap()["content"][0]["text"],
+                    "owned"
+                );
+            });
+            remove_job(job_id);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_stop_job_cannot_cross_session_boundary() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4a4f_4253_544f_5058, 128, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let owner_id = format!("stop-owner-{nonce:x}");
+            let other_id = format!("stop-other-{nonce:x}");
+            let cwd = std::env::current_dir().unwrap();
+            let owner = config::Session {
+                id: owner_id.clone(),
+                cwd: cwd.clone(),
+                permitted_directories: Vec::new(),
+                started_at: 0,
+                process_id: 0,
+                yolo: true,
+            };
+            let other = config::Session {
+                id: other_id,
+                cwd,
+                permitted_directories: Vec::new(),
+                started_at: 0,
+                process_id: 0,
+                yolo: true,
+            };
+            let job_id = Uuid::new_v4();
+            let completion = Arc::new(Mutex::new(JobCompletion::default()));
+            let handle = runtime.spawn(async {
+                std::future::pending::<()>().await;
+            });
+            jobs().lock().unwrap().jobs.insert(
+                job_id,
+                Job {
+                    session_id: owner_id,
+                    command: "test".to_owned(),
+                    handle,
+                    completion,
+                },
+            );
+            let args = json!({"job_id": job_id.to_string()});
+            runtime.block_on(async {
+                assert!(stop_job(&args, &other).await.is_err());
+                assert!(jobs().lock().unwrap().jobs.contains_key(&job_id));
+                assert!(stop_job(&args, &owner).await.is_ok());
+                assert!(!jobs().lock().unwrap().jobs.contains_key(&job_id));
+            });
             Ok(())
         })
     }
