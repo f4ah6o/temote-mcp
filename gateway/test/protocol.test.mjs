@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validateAccessJwtShape } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -98,6 +98,47 @@ test("Access email allowlist is fail-closed and case-insensitive", () => {
   }
   for (const email of ["", "other2@example.com", null, undefined]) {
     assert.equal(accessEmailAllowed("user@example.com", email), false, String(email));
+  }
+});
+
+test("gateway log fields are bounded and reject structured values", () => {
+  for (const length of [0, 1, 255, 256, 257, 1024, 8192]) {
+    const value = "x".repeat(length);
+    const bounded = boundedLogField(value);
+    assert.equal(bounded.length <= 257, true, `length=${length}`);
+    if (length <= 256) assert.equal(bounded, value);
+    else {
+      assert.equal(bounded.endsWith("…"), true);
+      assert.equal(bounded.slice(0, -1), value.slice(0, 256));
+    }
+  }
+  for (const value of [null, undefined, 42, true, {}, [], { huge: "x".repeat(1000) }]) {
+    assert.equal(boundedLogField(value), "-");
+  }
+  assert.equal(boundedLogField(undefined, "unknown"), "unknown");
+});
+
+test("oversized RPC identifiers cannot amplify gateway request logs", async () => {
+  const originalLog = console.log;
+  const lines = [];
+  console.log = (line) => lines.push(String(line));
+  try {
+    const hugeTool = `tool-${"x".repeat(16 * 1024)}-tail-marker`;
+    const hugeSession = `session-${"y".repeat(16 * 1024)}-tail-marker`;
+    const response = await worker.fetch(
+      legacyToolCallRequest(hugeTool, { session_id: hugeSession }),
+      { CLIENT_TOKEN: "client-token" },
+    );
+    assert.equal(response.status, 200);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].length < 2048, true, `log bytes=${lines[0].length}`);
+    const logged = JSON.parse(lines[0]);
+    assert.equal(logged.tool.length, 257);
+    assert.equal(logged.session_id.length, 257);
+    assert.equal(logged.tool.includes("tail-marker"), false);
+    assert.equal(logged.session_id.includes("tail-marker"), false);
+  } finally {
+    console.log = originalLog;
   }
 });
 

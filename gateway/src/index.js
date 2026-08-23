@@ -33,6 +33,7 @@ const MAX_ACCESS_JWT_BYTES = 64 * 1024;
 const MAX_ACCESS_JWT_HEADER_BYTES = 8 * 1024;
 const MAX_ACCESS_JWT_CLAIMS_BYTES = 32 * 1024;
 const MAX_ACCESS_JWT_SIGNATURE_BYTES = 8 * 1024;
+const MAX_LOG_FIELD_CHARS = 256;
 const jwksCache = new Map();
 
 export default {
@@ -81,11 +82,11 @@ async function handleMcp(request, env, identity) {
 
   console.log(JSON.stringify({
     event: "mcp_request",
-    subject: identity.subject,
-    email: identity.email,
-    method: rpc?.method ?? "unknown",
-    tool: rpc?.params?.name ?? "-",
-    session_id: rpc?.params?.arguments?.session_id ?? "-",
+    subject: boundedLogField(identity.subject),
+    email: boundedLogField(identity.email),
+    method: boundedLogField(rpc?.method, "unknown"),
+    tool: boundedLogField(rpc?.params?.name),
+    session_id: boundedLogField(rpc?.params?.arguments?.session_id),
   }));
 
   switch (rpc?.method) {
@@ -708,6 +709,12 @@ async function verifyAccessJwt(token, env) {
   }
   if (typeof claims.sub !== "string" || !claims.sub) throw new Error("JWT subject missing");
   return { subject: claims.sub, email: claims.email || "-" };
+}
+
+export function boundedLogField(value, fallback = "-") {
+  if (typeof value !== "string") return fallback;
+  if (value.length <= MAX_LOG_FIELD_CHARS) return value;
+  return `${value.slice(0, MAX_LOG_FIELD_CHARS)}…`;
 }
 
 export function validateAccessJwtShape(token) {
