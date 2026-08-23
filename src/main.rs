@@ -118,6 +118,13 @@ enum Command {
     #[cfg(all(feature = "network", unix))]
     /// Stop the foreground supervisor started by temote-mcp up.
     Down,
+    #[cfg(all(feature = "network", unix))]
+    /// Migrate legacy pre-profile runtime ownership without changing configuration or local sessions.
+    Migrate {
+        /// Report legacy runtime state without signaling processes or deleting files.
+        #[arg(long)]
+        dry_run: bool,
+    },
     #[cfg(feature = "network")]
     /// Manage OpenAI Secure MCP Tunnel setup.
     Openai {
@@ -243,6 +250,8 @@ async fn main() -> Result<()> {
         } => lifecycle::up(profile, public_url, addr, tunnel_token_file).await,
         #[cfg(all(feature = "network", unix))]
         Command::Down => lifecycle::down().await,
+        #[cfg(all(feature = "network", unix))]
+        Command::Migrate { dry_run } => lifecycle::migrate(dry_run).await,
         #[cfg(feature = "network")]
         Command::Openai { command } => match command {
             OpenaiCommand::Setup {

@@ -11,6 +11,8 @@ use tokio::time::sleep;
 use crate::profile::Profile;
 
 const PID_FILE_NAME: &str = "up.pid";
+const LEGACY_PID_FILE_NAME: &str = "up.pids";
+const MAX_LEGACY_PID_FILE_BYTES: usize = 64;
 const PROCESS_NAME: &str = env!("CARGO_PKG_NAME");
 const MAX_PID_FILE_BYTES: usize = 64;
 const MAX_TUNNEL_TOKEN_BYTES: u64 = 64 * 1024;
@@ -52,6 +54,151 @@ pub async fn up(
         tunnel_token_file.as_deref(),
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LegacyUpPids {
+    serve: i32,
+    tunnel: i32,
+}
+
+pub async fn migrate(dry_run: bool) -> Result<()> {
+    let path = runtime_directory()?.join(LEGACY_PID_FILE_NAME);
+    let Some(pids) = read_legacy_up_pids(&path)? else {
+        println!("no legacy temote-mcp runtime state found");
+        return Ok(());
+    };
+
+    let serve_alive = process_exists(pids.serve);
+    let tunnel_alive = process_exists(pids.tunnel);
+    if serve_alive {
+        ensure_process_name(pids.serve, PROCESS_NAME, "legacy Temote supervisor")?;
+    }
+    if tunnel_alive {
+        ensure_process_name(pids.tunnel, "cloudflared", "legacy Cloudflare Tunnel")?;
+    }
+
+    if dry_run {
+        println!(
+            "legacy runtime migration required: {} (serve pid {}, tunnel pid {})",
+            path.display(),
+            pids.serve,
+            pids.tunnel
+        );
+        println!("dry run: no processes were signaled and no state was removed");
+        return Ok(());
+    }
+
+    if !serve_alive && !tunnel_alive {
+        remove_legacy_pid_file(&path)?;
+        println!("removed stale legacy runtime state {}", path.display());
+        return Ok(());
+    }
+
+    if serve_alive {
+        send_signal(pids.serve, libc::SIGTERM)?;
+    }
+    if tunnel_alive {
+        send_signal(pids.tunnel, libc::SIGTERM)?;
+    }
+
+    for _ in 0..15 {
+        if !process_exists(pids.serve) && !process_exists(pids.tunnel) {
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    if process_exists(pids.serve) {
+        ensure_process_name(pids.serve, PROCESS_NAME, "legacy Temote supervisor")?;
+        send_signal(pids.serve, libc::SIGKILL)?;
+    }
+    if process_exists(pids.tunnel) {
+        ensure_process_name(pids.tunnel, "cloudflared", "legacy Cloudflare Tunnel")?;
+        send_signal(pids.tunnel, libc::SIGKILL)?;
+    }
+
+    for _ in 0..10 {
+        if !process_exists(pids.serve) && !process_exists(pids.tunnel) {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(
+        !process_exists(pids.serve) && !process_exists(pids.tunnel),
+        "legacy Temote runtime did not stop cleanly; refusing to remove {}",
+        path.display()
+    );
+
+    remove_legacy_pid_file(&path)?;
+    println!("migrated legacy Temote runtime state");
+    println!("configuration and independently running local sessions were left unchanged");
+    println!("next: run `temote-mcp up --profile cloudflare`");
+    Ok(())
+}
+
+fn read_legacy_up_pids(path: &Path) -> Result<Option<LegacyUpPids>> {
+    let file = match open_readonly_nofollow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open legacy runtime state {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect legacy runtime state {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "legacy runtime state must be a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_LEGACY_PID_FILE_BYTES as u64,
+        "legacy runtime state exceeds {MAX_LEGACY_PID_FILE_BYTES} bytes: {}",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_LEGACY_PID_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read legacy runtime state {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_LEGACY_PID_FILE_BYTES,
+        "legacy runtime state exceeds {MAX_LEGACY_PID_FILE_BYTES} bytes: {}",
+        path.display()
+    );
+    let raw = std::str::from_utf8(&bytes).context("legacy runtime state is not valid UTF-8")?;
+    Ok(Some(parse_legacy_up_pids(raw)?))
+}
+
+fn parse_legacy_up_pids(raw: &str) -> Result<LegacyUpPids> {
+    let fields: Vec<_> = raw.split_whitespace().collect();
+    anyhow::ensure!(
+        fields.len() == 2,
+        "legacy runtime state must contain exactly two positive PIDs"
+    );
+    Ok(LegacyUpPids {
+        serve: parse_pid(fields[0]).context("invalid legacy Temote supervisor PID")?,
+        tunnel: parse_pid(fields[1]).context("invalid legacy Cloudflare Tunnel PID")?,
+    })
+}
+
+fn ensure_process_name(pid: i32, expected: &str, label: &str) -> Result<()> {
+    let actual = process_name(pid)?;
+    anyhow::ensure!(
+        actual.as_deref() == Some(expected),
+        "{label} PID {pid} belongs to an unexpected process ({actual:?}); refusing to signal it"
+    );
+    Ok(())
+}
+
+fn remove_legacy_pid_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 pub async fn down() -> Result<()> {
@@ -374,6 +521,63 @@ fn send_signal(pid: i32, signal: libc::c_int) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn parses_only_exact_legacy_pid_pairs() {
+        assert_eq!(
+            parse_legacy_up_pids("123 456\n").unwrap(),
+            LegacyUpPids {
+                serve: 123,
+                tunnel: 456,
+            }
+        );
+        for invalid in ["", "123", "123 456 789", "0 456", "123 -1", "abc 456"] {
+            assert!(parse_legacy_up_pids(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_pid_reader_rejects_symlink_and_oversize() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("up.pids");
+        let target = root.path().join("target");
+        std::fs::write(&target, b"123 456\n").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(read_legacy_up_pids(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_legacy_up_pids(&path).is_err());
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&path, vec![b'1'; MAX_LEGACY_PID_FILE_BYTES + 1]).unwrap();
+        assert!(read_legacy_up_pids(&path).is_err());
+        std::fs::write(&path, b"123 456\n").unwrap();
+        assert_eq!(
+            read_legacy_up_pids(&path).unwrap(),
+            Some(LegacyUpPids {
+                serve: 123,
+                tunnel: 456,
+            })
+        );
+    }
+
+    #[test]
+    fn process_name_guard_rejects_unexpected_live_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let result = ensure_process_name(pid, "cloudflared", "legacy Cloudflare Tunnel");
+        assert!(result.is_err());
+        assert!(process_exists(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn reads_small_regular_pid_files_and_rejects_oversized_files() {

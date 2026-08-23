@@ -19,6 +19,17 @@ To build from source instead:
 cargo install temote-mcp --locked
 ```
 
+When replacing a legacy `just up` deployment, install the new binary first, then migrate only its old runtime ownership before starting the current supervisor:
+
+```sh
+cargo binstall temote-mcp --force
+temote-mcp migrate --dry-run
+temote-mcp migrate
+temote-mcp up --profile cloudflare
+```
+
+`migrate` does not rewrite connection configuration or stop independently started local sessions.
+
 Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are not supported; WSL2 can be used for the gateway endpoint path.
 
 ## Start sessions

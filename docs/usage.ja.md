@@ -33,6 +33,21 @@ client は `session_list` を確認し、必要なら `session_start(path="src/p
 
 `session_stop` で停止できるのは現在の `serve` supervisor が作成した session だけです。別 terminal の `temote-mcp start` session は停止できません。managed session は常に non-yolo で、CLI session と同じ local approval gate を維持します。HTTP supervisor と Tunnel の停止は `temote-mcp down` で行います。repository checkout の `just up/down` は、この CLI command に委譲する開発用 wrapper です。
 
+## 旧 always-on runtime の migration
+
+古い repository checkout の `just up` は `temote-mcp serve` と `cloudflared` を sibling process として起動し、2つの PID を `~/.cache/temote-mcp/up.pids` に記録していました。現在の installed deployment は `temote-mcp up`、lock 付きの単一 `up.pid`、child-process ownership を使います。binary を置き換えても、すでに実行中の process 自体は新しくなりません。
+
+current binary を install した後、一度だけ legacy runtime state を migrate します。
+
+```sh
+cargo binstall temote-mcp --force
+temote-mcp migrate --dry-run
+temote-mcp migrate
+temote-mcp up --profile cloudflare
+```
+
+migration は legacy state file を安全に検証し、signal 前に live PID の process name を確認します。別 process へ PID が再利用されている場合は fail-closed です。削除するのは stale legacy state、停止するのは検証済みの旧 `temote-mcp serve` + `cloudflared` pair だけです。`public.env`、`tunnel-token`、session metadata、socket、別途起動した `temote-mcp start <session>` process は変更しません。legacy state が無い状態で `temote-mcp migrate` を再実行しても no-op です。
+
 ## 許可 root
 
 通常 session では起動ディレクトリだけが最初の許可 root です。session を起動した端末で変更します。

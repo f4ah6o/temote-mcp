@@ -19,6 +19,17 @@ temote-mcp doctor
 cargo install temote-mcp --locked
 ```
 
+旧 `just up` 構成を置き換える場合は、先に binary を更新してから旧 runtime ownership だけを migrate し、現在の supervisor を起動します。
+
+```sh
+cargo binstall temote-mcp --force
+temote-mcp migrate --dry-run
+temote-mcp migrate
+temote-mcp up --profile cloudflare
+```
+
+`migrate` は connection 設定を書き換えず、別途 `temote-mcp start` した local session も停止しません。
+
 Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネイティブは未対応で、gateway endpoint では WSL2 を利用できます。
 
 ## セッションを開始する

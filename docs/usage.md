@@ -33,6 +33,21 @@ The client calls `session_list`, then `session_start(path="src/project")` when n
 
 `session_stop` can stop only sessions created by the current `serve` supervisor. It cannot stop an independently started `temote-mcp start` session. Managed sessions are always non-yolo and retain the same local approval gates as CLI sessions. Stop the HTTP supervisor and its Tunnel with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
 
+## Migrating an older always-on runtime
+
+Older repository checkouts used `just up` to launch `temote-mcp serve` and `cloudflared` as sibling processes and recorded both PIDs in `~/.cache/temote-mcp/up.pids`. Current installed deployments use `temote-mcp up`, one locked `up.pid`, and child-process ownership. Replacing the executable does not replace an already-running process.
+
+After installing a current binary, migrate the legacy runtime state once:
+
+```sh
+cargo binstall temote-mcp --force
+temote-mcp migrate --dry-run
+temote-mcp migrate
+temote-mcp up --profile cloudflare
+```
+
+Migration validates the legacy state file and verifies live process names before signaling anything. It fails closed if a PID belongs to an unexpected process. It removes stale legacy state or stops only the validated legacy `temote-mcp serve` + `cloudflared` pair. `public.env`, `tunnel-token`, session metadata, sockets, and independently started `temote-mcp start <session>` processes are not changed. Re-running `temote-mcp migrate` when no legacy state remains is a no-op.
+
 ## Permission roots
 
 A normal session starts with its startup directory as the permitted root. Change roots in the session terminal:
