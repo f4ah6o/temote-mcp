@@ -592,14 +592,22 @@ async function verifyAccessJwt(token, env) {
   const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
   if (!audiences.includes(env.ACCESS_AUDIENCE)) throw new Error("invalid JWT audience");
 
-  const allowedEmails = (env.ACCESS_ALLOWED_EMAILS || "")
-    .split(",")
-    .map((email) => email.trim().toLowerCase())
-    .filter(Boolean);
-  const email = typeof claims.email === "string" ? claims.email.toLowerCase() : "";
-  if (allowedEmails.length > 0 && !allowedEmails.includes(email)) throw new Error("email is not allowed");
+  const email = typeof claims.email === "string" ? claims.email : "";
+  if (!accessEmailAllowed(env.ACCESS_ALLOWED_EMAILS, email)) {
+    throw new Error("email is not allowed or ACCESS_ALLOWED_EMAILS is empty");
+  }
   if (typeof claims.sub !== "string" || !claims.sub) throw new Error("JWT subject missing");
   return { subject: claims.sub, email: claims.email || "-" };
+}
+
+export function accessEmailAllowed(configured, email) {
+  const allowedEmails = (configured || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowedEmails.length === 0) return false;
+  const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+  return normalizedEmail.length > 0 && allowedEmails.includes(normalizedEmail);
 }
 
 async function getJwks(teamDomain) {

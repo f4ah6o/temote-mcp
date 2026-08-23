@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewaySession, readBoundedBytes } from "../src/index.js";
+import worker, { GatewaySession, accessEmailAllowed, readBoundedBytes } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -59,6 +59,22 @@ test("public gateway exposes the same twenty-five public tools", () => {
   assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "kintone_cli_status"), true);
   assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "kintone_cli_run"), true);
   assert.equal(PUBLIC_TOOLS.every((tool) => tool.inputSchema.additionalProperties === false), true);
+});
+
+test("Access email allowlist is fail-closed and case-insensitive", () => {
+  for (const configured of [undefined, null, "", "   ", ",,,", " , "]) {
+    assert.equal(accessEmailAllowed(configured, "user@example.com"), false);
+  }
+  for (const email of ["user@example.com", "USER@example.com", " user@example.com "]) {
+    assert.equal(
+      accessEmailAllowed("other@example.com, User@Example.com", email),
+      true,
+      email,
+    );
+  }
+  for (const email of ["", "other2@example.com", null, undefined]) {
+    assert.equal(accessEmailAllowed("user@example.com", email), false, String(email));
+  }
 });
 
 test("session IDs are safe Durable Object routing keys", () => {
