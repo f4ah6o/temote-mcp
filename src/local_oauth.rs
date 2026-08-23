@@ -825,30 +825,36 @@ fn redeem_authorization_code(
         ));
     }
 
-    // A binding failure consumes the code, preventing verifier/redirect probing and replay.
-    // A temporary capacity failure above does not consume it, so the client can retry.
-    let code = state.codes.remove(&request.code).ok_or_else(|| {
-        OAuthError::bad_request(
-            "invalid_grant",
-            "authorization code is invalid, expired, or already used",
-        )
-    })?;
-    if code.expires_at <= now
-        || code.client_id != request.client_id
-        || code.redirect_uri != request.redirect_uri
-        || code.resource != request.resource
-        || code.code_challenge != challenge
-    {
+    // A temporary capacity failure above does not consume the code, so the client can retry.
+    // A binding failure does consume it, preventing verifier/redirect probing and replay.
+    let binding_valid = {
+        let code = state.codes.get(&request.code).ok_or_else(|| {
+            OAuthError::bad_request(
+                "invalid_grant",
+                "authorization code is invalid, expired, or already used",
+            )
+        })?;
+        code.expires_at > now
+            && code.client_id == request.client_id
+            && code.redirect_uri == request.redirect_uri
+            && code.resource == request.resource
+            && code.code_challenge == challenge
+    };
+    if !binding_valid {
+        state.codes.remove(&request.code);
         return Err(OAuthError::bad_request(
             "invalid_grant",
             "authorization code binding or PKCE verification failed",
         ));
     }
+    // A generated-token collision is an internal, retryable failure. Do not consume a
+    // valid authorization code until a unique token can be committed atomically.
     if state.tokens.contains_key(&token) {
         return Err(internal_error(anyhow::anyhow!(
             "generated duplicate local OAuth access token"
         )));
     }
+    state.codes.remove(&request.code);
     state.tokens.insert(
         token,
         AccessToken {
@@ -1465,6 +1471,7 @@ mod tests {
             let token_limit = noprop::sample_usize_in(ctx, 1..=8);
             let occupancy = noprop::sample_usize_in(ctx, 0..=token_limit);
             let binding_valid = noprop::sample_bool(ctx);
+            let request_token_collision = noprop::sample_bool(ctx);
             let now = Instant::now();
             let verifier = "a".repeat(43);
             let challenge = pkce_challenge(&verifier).unwrap();
@@ -1507,11 +1514,17 @@ mod tests {
                 );
             }
 
+            let collision = request_token_collision && occupancy > 0;
+            let issued_token = if collision {
+                "existing-0".to_owned()
+            } else {
+                "issued-token".to_owned()
+            };
             let result = redeem_authorization_code(
                 &mut state,
                 &request,
                 &challenge,
-                "issued-token".to_owned(),
+                issued_token.clone(),
                 now,
                 token_limit,
             );
@@ -1520,16 +1533,21 @@ mod tests {
                 assert_eq!(error.code, "temporarily_unavailable");
                 assert!(state.codes.contains_key(&code_value));
                 assert_eq!(state.tokens.len(), occupancy);
-            } else if binding_valid {
-                result.unwrap();
-                assert!(!state.codes.contains_key(&code_value));
-                assert_eq!(state.tokens.len(), occupancy + 1);
-                assert!(state.tokens.contains_key("issued-token"));
-            } else {
+            } else if !binding_valid {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, "invalid_grant");
                 assert!(!state.codes.contains_key(&code_value));
                 assert_eq!(state.tokens.len(), occupancy);
+            } else if collision {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "server_error");
+                assert!(state.codes.contains_key(&code_value));
+                assert_eq!(state.tokens.len(), occupancy);
+            } else {
+                result.unwrap();
+                assert!(!state.codes.contains_key(&code_value));
+                assert_eq!(state.tokens.len(), occupancy + 1);
+                assert!(state.tokens.contains_key(&issued_token));
             }
             Ok(())
         })
