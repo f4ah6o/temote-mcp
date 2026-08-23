@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validateAccessJwtShape } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -100,6 +100,35 @@ test("Access email allowlist is fail-closed and case-insensitive", () => {
     assert.equal(accessEmailAllowed("user@example.com", email), false, String(email));
   }
 });
+
+test("Access JWT key IDs are bounded", () => {
+  for (const length of [0, 1, 255, 256, 257, 1024]) {
+    assert.equal(accessKidAllowed("k".repeat(length)), length > 0 && length <= 256, String(length));
+  }
+  for (const value of [null, undefined, 42, {}, []]) {
+    assert.equal(accessKidAllowed(value), false, String(value));
+  }
+});
+
+test("Access team domain accepts only HTTPS origins", () => {
+  for (const [value, expected] of [
+    ["team.cloudflareaccess.com", "https://team.cloudflareaccess.com"],
+    ["https://team.cloudflareaccess.com", "https://team.cloudflareaccess.com"],
+    ["https://team.cloudflareaccess.com/", "https://team.cloudflareaccess.com"],
+    ["https://team.cloudflareaccess.com///", "https://team.cloudflareaccess.com"],
+    ["https://team.cloudflareaccess.com:8443", "https://team.cloudflareaccess.com:8443"],
+  ]) {
+    assert.equal(normalizeAccessTeamDomain(value), expected, value);
+  }
+  for (const value of [
+    "", "   ", "http://team.cloudflareaccess.com", "https://user@team.cloudflareaccess.com",
+    "https://team.cloudflareaccess.com/path", "https://team.cloudflareaccess.com?q=1",
+    "https://team.cloudflareaccess.com#fragment", "not a host",
+  ]) {
+    assert.throws(() => normalizeAccessTeamDomain(value), undefined, value);
+  }
+});
+
 
 test("gateway log fields are bounded and reject structured values", () => {
   for (const length of [0, 1, 255, 256, 257, 1024, 8192]) {

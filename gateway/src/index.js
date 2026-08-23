@@ -33,6 +33,7 @@ const MAX_ACCESS_JWT_BYTES = 64 * 1024;
 const MAX_ACCESS_JWT_HEADER_BYTES = 8 * 1024;
 const MAX_ACCESS_JWT_CLAIMS_BYTES = 32 * 1024;
 const MAX_ACCESS_JWT_SIGNATURE_BYTES = 8 * 1024;
+const MAX_ACCESS_KID_CHARS = 256;
 const MAX_LOG_FIELD_CHARS = 256;
 const jwksCache = new Map();
 
@@ -674,11 +675,13 @@ async function verifyAccessJwt(token, env) {
   const parts = validateAccessJwtShape(token);
   const header = decodeJwtPart(parts[0]);
   const claims = decodeJwtPart(parts[1]);
-  if (header.alg !== "RS256" || typeof header.kid !== "string") throw new Error("unsupported JWT key");
+  if (
+    header.alg !== "RS256"
+    || !accessKidAllowed(header.kid)
+  ) throw new Error("unsupported JWT key");
 
-  const teamDomain = env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, "").replace(/\/$/, "");
-  const issuer = `https://${teamDomain}`;
-  const jwks = await getJwks(teamDomain);
+  const issuer = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
+  const jwks = await getJwks(issuer);
   const jwk = jwks.find((candidate) => candidate.kid === header.kid);
   if (!jwk) throw new Error("JWT signing key not found");
   const key = await crypto.subtle.importKey(
@@ -733,6 +736,36 @@ export function validateAccessJwtShape(token) {
   return parts;
 }
 
+export function accessKidAllowed(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_ACCESS_KID_CHARS;
+}
+
+export function normalizeAccessTeamDomain(value) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error("ACCESS_TEAM_DOMAIN is invalid");
+  }
+  const raw = value.trim();
+  const candidate = raw.includes("://") ? raw : `https://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error("ACCESS_TEAM_DOMAIN is invalid");
+  }
+  if (
+    parsed.protocol !== "https:"
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.search !== ""
+    || parsed.hash !== ""
+    || parsed.pathname.replaceAll("/", "") !== ""
+    || parsed.hostname === ""
+  ) {
+    throw new Error("ACCESS_TEAM_DOMAIN must be an HTTPS origin without a path");
+  }
+  return parsed.origin;
+}
+
 export function accessEmailAllowed(configured, email) {
   const allowedEmails = (configured || "")
     .split(",")
@@ -743,16 +776,16 @@ export function accessEmailAllowed(configured, email) {
   return normalizedEmail.length > 0 && allowedEmails.includes(normalizedEmail);
 }
 
-async function getJwks(teamDomain) {
-  const cached = jwksCache.get(teamDomain);
+async function getJwks(teamOrigin) {
+  const cached = jwksCache.get(teamOrigin);
   if (cached && cached.expiresAt > Date.now()) return cached.keys;
-  const response = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, {
+  const response = await fetch(`${teamOrigin}/cdn-cgi/access/certs`, {
     cf: { cacheTtl: 300, cacheEverything: true },
   });
   if (!response.ok) throw new Error(`failed to fetch Access keys: ${response.status}`);
   const body = await readBoundedJson(response, MAX_JWKS_BYTES, "Access key response");
   if (!Array.isArray(body.keys)) throw new Error("invalid Access key response");
-  jwksCache.set(teamDomain, { keys: body.keys, expiresAt: Date.now() + 300_000 });
+  jwksCache.set(teamOrigin, { keys: body.keys, expiresAt: Date.now() + 300_000 });
   return body.keys;
 }
 
