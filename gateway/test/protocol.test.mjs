@@ -188,6 +188,82 @@ test("reconnect increments generation and rejects the old host", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("queued generation filtering never delivers work to a replacement host", () => {
+  for (let count = 0; count <= 64; count += 1) {
+    for (let modulus = 2; modulus <= 7; modulus += 1) {
+      const session = new GatewaySession(
+        { storage: new MemoryStorage() },
+        { GATEWAY_REGISTRY: noOpRegistry() },
+      );
+      const failed = [];
+      const expectedCurrent = [];
+      for (let index = 0; index < count; index += 1) {
+        const generation = index % modulus === 0 ? 1 : 2;
+        const request_id = `request-${index}`;
+        session.queue.push({ request_id, request: { id: index }, generation });
+        session.pending.set(request_id, {
+          generation,
+          timer: undefined,
+          resolve: (result) => failed.push([request_id, result]),
+        });
+        if (generation === 2) expectedCurrent.push(index);
+      }
+
+      const delivered = [];
+      while (true) {
+        const envelope = session.takeQueuedRequest(2);
+        if (!envelope) break;
+        delivered.push(envelope.request.id);
+      }
+      assert.deepEqual(delivered, expectedCurrent, `count=${count} modulus=${modulus}`);
+      assert.equal(session.queue.length, 0);
+      assert.deepEqual(
+        [...session.pending.entries()]
+          .filter(([, pending]) => pending.generation === 2)
+          .map(([requestId]) => Number(requestId.slice("request-".length))),
+        expectedCurrent,
+        `current pending count=${count} modulus=${modulus}`,
+      );
+      assert.equal(
+        failed.every(([, result]) => result.status === 502 && result.error === "host_replaced"),
+        true,
+      );
+      assert.equal(failed.length, count - expectedCurrent.length);
+    }
+  }
+});
+
+test("a waiting replacement poll ignores stale queued work and receives only its generation", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const staleFailures = [];
+  let delivered = null;
+  session.waitingPoll = {
+    generation: 2,
+    instance_id: "new-host",
+    timer: undefined,
+    resolve: (response) => { delivered = response; },
+  };
+  session.pending.set("old", {
+    generation: 1,
+    timer: undefined,
+    resolve: (result) => staleFailures.push(result),
+  });
+  session.queue.push({ request_id: "old", request: { id: 1 }, generation: 1 });
+  session.flushWaitingPoll();
+  assert.equal(delivered, null);
+  assert.equal(session.waitingPoll?.generation, 2);
+  assert.deepEqual(staleFailures, [{ status: 502, error: "host_replaced" }]);
+
+  session.pending.set("new", { generation: 2, timer: undefined, resolve: () => {} });
+  session.queue.push({ request_id: "new", request: { id: 2 }, generation: 2 });
+  session.flushWaitingPoll();
+  assert.equal(session.waitingPoll, null);
+  assert.equal((await delivered.json()).request.id, 2);
+});
+
 test("request ID collisions never overwrite pending RPC state", async () => {
   const ids = ["same", "same", "second"];
   const session = new GatewaySession(

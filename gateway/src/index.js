@@ -312,7 +312,8 @@ export class GatewaySession {
     await this.state.storage.put("host", host);
     await this.upsertRegistry(host);
 
-    if (this.queue.length > 0) return jsonResponse(this.queue.shift());
+    const queued = this.takeQueuedRequest(host.generation);
+    if (queued) return jsonResponse(queued);
     this.replaceWaitingPoll("poll_replaced");
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -390,7 +391,7 @@ export class GatewaySession {
       }, this.rpcTimeoutMs);
       this.pending.set(requestId, { resolve, timer, generation: host.generation });
     });
-    this.queue.push({ request_id: requestId, request });
+    this.queue.push({ request_id: requestId, request, generation: host.generation });
     this.flushWaitingPoll();
 
     const result = await outcome;
@@ -417,6 +418,22 @@ export class GatewaySession {
     return null;
   }
 
+  takeQueuedRequest(generation) {
+    while (this.queue.length > 0) {
+      const entry = this.queue.shift();
+      if (entry.generation === generation) {
+        return { request_id: entry.request_id, request: entry.request };
+      }
+      const pending = this.pending.get(entry.request_id);
+      if (pending && pending.generation === entry.generation) {
+        clearTimeout(pending.timer);
+        this.pending.delete(entry.request_id);
+        pending.resolve({ status: 502, error: "host_replaced" });
+      }
+    }
+    return null;
+  }
+
   removeQueuedRequest(requestId) {
     const index = this.queue.findIndex((entry) => entry.request_id === requestId);
     if (index >= 0) this.queue.splice(index, 1);
@@ -425,9 +442,11 @@ export class GatewaySession {
   flushWaitingPoll() {
     if (!this.waitingPoll || this.queue.length === 0) return;
     const waiting = this.waitingPoll;
+    const queued = this.takeQueuedRequest(waiting.generation);
+    if (!queued) return;
     this.waitingPoll = null;
     clearTimeout(waiting.timer);
-    waiting.resolve(jsonResponse(this.queue.shift()));
+    waiting.resolve(jsonResponse(queued));
   }
 
   replaceWaitingPoll(error) {
