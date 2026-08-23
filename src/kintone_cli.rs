@@ -5,6 +5,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::{config, sandbox};
@@ -22,6 +23,7 @@ const KINTONE_ENV_NAMES: &[&str] = &[
 ];
 const CHILD_RUNTIME_ENV_NAMES: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
 const MAX_CUSTOMIZE_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_STDERR_BYTES: usize = sandbox::MAX_COMMAND_OUTPUT_BYTES;
 const FORBIDDEN_OPTIONS: &[&str] = &[
     "--base-url",
     "--username",
@@ -397,16 +399,43 @@ async fn run_with_stdout_file(
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::piped());
-    let output = process
-        .output()
-        .await
-        .context("failed to run cli-kintone")?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error).context("failed to run cli-kintone");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = tokio::fs::remove_file(&temporary).await;
+            anyhow::bail!("cli-kintone stderr was not captured");
+        }
+    };
+    let result = async {
+        let (stderr, status) =
+            tokio::join!(read_bounded_stderr(stderr, MAX_STDERR_BYTES), child.wait(),);
+        Result::<_>::Ok((stderr?, status?))
+    }
+    .await;
+    let (stderr, status) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error).context("failed to run cli-kintone");
+        }
+    };
+    let exit_code = status.code().unwrap_or(-1);
     if exit_code == 0 {
-        tokio::fs::rename(&temporary, target)
-            .await
-            .with_context(|| format!("failed to publish {}", target.display()))?;
+        if let Err(error) = tokio::fs::rename(&temporary, target).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error).with_context(|| format!("failed to publish {}", target.display()));
+        }
     } else {
         let _ = tokio::fs::remove_file(&temporary).await;
     }
@@ -414,9 +443,37 @@ async fn run_with_stdout_file(
         "exit_code": exit_code,
         "stdout": "",
         "stdout_path": if exit_code == 0 { Some(target.display().to_string()) } else { None },
-        "stderr": stderr,
-        "truncated": false,
+        "stderr": String::from_utf8_lossy(&stderr.bytes).into_owned(),
+        "truncated": stderr.truncated,
     }))
+}
+
+struct BoundedStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_stderr<R>(mut reader: R, limit: usize) -> std::io::Result<BoundedStderr>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK: usize = 8192;
+    let mut bytes = Vec::with_capacity(limit.min(CHUNK));
+    let mut truncated = false;
+    let mut buffer = [0_u8; CHUNK];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let kept = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..kept]);
+        if kept < read {
+            truncated = true;
+        }
+    }
+    Ok(BoundedStderr { bytes, truncated })
 }
 
 fn preflight_local_references(
@@ -634,6 +691,55 @@ fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn generated_bounded_stderr_matches_prefix_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x4b49_4e54_5354_4445, 512, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 0..=128);
+            let len = noprop::sample_usize_in(ctx, 0..=256);
+            let input = (0..len).map(|_| noprop::sample_u8(ctx)).collect::<Vec<_>>();
+            runtime.block_on(async {
+                use tokio::io::AsyncWriteExt as _;
+                let (mut writer, reader) = tokio::io::duplex(input.len().max(1));
+                writer.write_all(&input).await.unwrap();
+                writer.shutdown().await.unwrap();
+                let captured = read_bounded_stderr(reader, limit).await.unwrap();
+                assert_eq!(captured.bytes, input[..input.len().min(limit)]);
+                assert_eq!(captured.truncated, input.len() > limit);
+            });
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn stdout_file_spawn_failure_leaves_no_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("export.jsonl");
+        let command = vec![
+            root.path()
+                .join("missing-cli-kintone")
+                .display()
+                .to_string(),
+            "record".to_owned(),
+            "export".to_owned(),
+        ];
+        let error = run_with_stdout_file(&command, root.path(), &HashMap::new(), &target)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to run cli-kintone"));
+        assert!(!target.exists());
+        let leftovers = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".temote-") && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "orphan temp files: {leftovers:?}");
+    }
 
     fn bridge(environment: &[(&str, &str)]) -> Bridge {
         Bridge {
