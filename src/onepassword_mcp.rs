@@ -17,6 +17,7 @@ use crate::line_protocol::{
 use crate::{approvals, config};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CACHED_CLIENTS: usize = 64;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 struct Client {
@@ -352,10 +353,24 @@ async fn ensure_client(
     clients: &mut HashMap<String, Client>,
     session: &config::Session,
 ) -> Result<()> {
-    if !clients.contains_key(&session.id) {
-        clients.insert(session.id.clone(), Client::spawn(session).await?);
+    retain_live_entries(clients, |client| !client.session_watcher.is_finished());
+    if clients.contains_key(&session.id) {
+        return Ok(());
     }
+    anyhow::ensure!(
+        client_capacity_available(false, clients.len()),
+        "1Password MCP client limit reached ({MAX_CACHED_CLIENTS})"
+    );
+    clients.insert(session.id.clone(), Client::spawn(session).await?);
     Ok(())
+}
+
+fn retain_live_entries<T>(entries: &mut HashMap<String, T>, mut is_live: impl FnMut(&T) -> bool) {
+    entries.retain(|_, entry| is_live(entry));
+}
+
+fn client_capacity_available(existing: bool, live_count: usize) -> bool {
+    existing || live_count < MAX_CACHED_CLIENTS
 }
 
 fn enforce_path_boundary(
@@ -427,6 +442,34 @@ fn executable_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn generated_client_registry_reaps_finished_entries_and_respects_capacity() -> noprop::TestResult
+    {
+        test_support::run(0x4f50_434c_4945_4e54, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=MAX_CACHED_CLIENTS + 16);
+            let mut entries = HashMap::new();
+            let mut expected_live = 0usize;
+            for index in 0..count {
+                let finished = noprop::sample_bool(ctx);
+                entries.insert(format!("client-{index}"), finished);
+                if !finished {
+                    expected_live += 1;
+                }
+            }
+
+            retain_live_entries(&mut entries, |finished| !*finished);
+            assert_eq!(entries.len(), expected_live);
+            assert!(entries.values().all(|finished| !*finished));
+
+            let existing = noprop::sample_bool(ctx);
+            assert_eq!(
+                client_capacity_available(existing, entries.len()),
+                existing || entries.len() < MAX_CACHED_CLIENTS
+            );
+            Ok(())
+        })
+    }
 
     #[test]
     fn generated_session_watcher_stops_only_on_explicit_inactive() -> noprop::TestResult {
