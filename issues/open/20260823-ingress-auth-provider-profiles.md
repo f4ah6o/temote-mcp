@@ -550,45 +550,45 @@ OpenAI Secure MCP Tunnel availability は OpenAI product / workspace / plan に�
 
 ### Phase 1: connection boundary
 
-- [ ] `ConnectionProfile` を導入する。
-- [ ] 現在の Cloudflare lifecycle を provider boundary へ移す。
-- [ ] `AccessAuthenticator` を provider-specific auth boundary へ移す。
-- [ ] provider-neutral `ConnectionIdentity` / endpoint model を定義する。
-- [ ] Cloudflare existing behavior を regression test で固定する。
-- [ ] `up/down/doctor` を profile-aware にする。
+- [x] `ConnectionProfile` を導入する。
+- [x] 現在の Cloudflare lifecycle を provider boundary へ移す。
+- [x] `AccessAuthenticator` を provider-specific auth boundary へ移す。
+- [x] provider-neutral `ConnectionIdentity` / endpoint model を定義する。
+- [x] Cloudflare existing behavior を regression test で固定する。
+- [x] `up/down/doctor` を profile-aware にする。
 
 ### Phase 2: Tailscale local OAuth
 
-- [ ] OAuth authorization server metadata を実装する。
-- [ ] OAuth protected resource metadata を実装する。
-- [ ] authorization code + PKCE S256 を実装する。
-- [ ] access token issuance / validation を実装する。
-- [ ] local owner approval を実装する。
-- [ ] redirect / resource / client binding negative tests を追加する。
-- [ ] token / code replay tests を追加する。
+- [x] OAuth authorization server metadata を実装する。
+- [x] OAuth protected resource metadata を実装する。
+- [x] authorization code + PKCE S256 を実装する。
+- [x] access token issuance / validation を実装する。
+- [x] local owner approval を実装する。
+- [x] redirect / resource / client binding negative tests を追加する。
+- [x] token / code replay tests を追加する。
 
 ### Phase 3: Tailscale Funnel
 
-- [ ] Tailscale connection provider を実装する。
-- [ ] `temote-mcp up --profile tailscale` を実装する。
-- [ ] Temote-owned Funnel lifecycle のみ stop する。
-- [ ] `doctor --profile tailscale` を実装する。
-- [ ] canonical `*.ts.net` public URL 解決を実装する。
+- [x] Tailscale connection provider を実装する。
+- [x] `temote-mcp up --profile tailscale` を実装する。
+- [x] Temote-owned Funnel lifecycle のみ stop する。
+- [x] `doctor --profile tailscale` を実装する。
+- [x] canonical `*.ts.net` public URL 解決を実装する。
 
 ### Phase 4: OpenAI Secure MCP Tunnel
 
-- [ ] 実装時点の OpenAI official Secure MCP Tunnel documentation / protocol / client tooling を確認する。
-- [ ] OpenAI Secure MCP Tunnel connection provider を実装する。
-- [ ] `temote-mcp up --profile openai` を実装する。
-- [ ] tunnel registration / credential / lifecycle ownership を安全に管理する。
-- [ ] `temote-mcp down` が Temote-owned tunnel connection のみ停止する。
-- [ ] `doctor --profile openai` を実装する。
-- [ ] public bind / public URL を要求しないことを regression test で固定する。
+- [x] 実装時点の OpenAI official Secure MCP Tunnel documentation / protocol / client tooling を確認する。
+- [x] OpenAI Secure MCP Tunnel connection provider を実装する。
+- [x] `temote-mcp up --profile openai` を実装する。
+- [x] tunnel registration / credential / lifecycle ownership を安全に管理する。
+- [x] `temote-mcp down` が Temote-owned tunnel connection のみ停止する。
+- [x] `doctor --profile openai` を実装する。
+- [x] public bind / public URL を要求しないことを regression test で固定する。
 
 ### Phase 5: live acceptance
 
 - [ ] Cloudflare profile の既存 MCP client 接続を再検証する。
-- [ ] Tailscale profile で external MCP client の OAuth discovery / authorization / `/mcp` を検証する。
+- [x] Tailscale profile で external MCP client の OAuth discovery / authorization / `/mcp` を検証する。
 - [ ] OpenAI Secure MCP Tunnel 経由で supported OpenAI product から Temote を live 検証する。
 - [ ] 3 profile で managed session start / stop semantics を検証する。
 - [ ] 3 profile で approval / sandbox boundary が同一であることを検証する。
@@ -596,22 +596,86 @@ OpenAI Secure MCP Tunnel availability は OpenAI product / workspace / plan に�
 ## 受け入れ条件
 
 - [ ] `temote-mcp up --profile cloudflare` が existing Cloudflare Tunnel + Access behavior を維持する。
-- [ ] `temote-mcp up --profile tailscale` が Tailscale Funnel + local OAuth で public MCP endpoint を提供する。
+- [x] `temote-mcp up --profile tailscale` が Tailscale Funnel + local OAuth で public MCP endpoint を提供する。
 - [ ] `temote-mcp up --profile openai` が OpenAI Secure MCP Tunnel を利用し public Internet endpoint を要求せず supported OpenAI product と接続できる。
-- [ ] Tailscale profile は Cloudflare account / Tunnel token / Access application を要求しない。
-- [ ] OpenAI profile は Cloudflare / Tailscale dependency を要求しない。
-- [ ] Cloudflare profile は local OAuth state を要求しない。
-- [ ] unauthenticated public `/mcp` request は Cloudflare/Tailscale profile で拒否される。
-- [ ] Cloudflare profile は invalid Access JWT を拒否する。
-- [ ] Tailscale profile は invalid / expired / wrong-resource OAuth token を拒否する。
-- [ ] local OAuth は PKCE downgrade / code replay / redirect mismatch を拒否する。
-- [ ] OpenAI profile は local origin の public bind を必要としない。
-- [ ] provider-neutral MCP dispatch に Cloudflare / Tailscale / OpenAI 固有 process control が漏れない。
-- [ ] `session_start` / `session_stop` / named roots security semantics が3 profileで同一である。
-- [ ] `without_sandbox` が remote tool list に現れない。
-- [ ] `doctor` が選択 profile に不要な dependency / secret を failure にしない。
+- [x] Tailscale profile は Cloudflare account / Tunnel token / Access application を要求しない。
+- [x] OpenAI profile は Cloudflare / Tailscale dependency を要求しない。
+- [x] Cloudflare profile は local OAuth state を要求しない。
+- [x] unauthenticated public `/mcp` request は Cloudflare/Tailscale profile で拒否される。
+- [x] Cloudflare profile は invalid Access JWT を拒否する。
+- [x] Tailscale profile は invalid / expired / wrong-resource OAuth token を拒否する。
+- [x] local OAuth は PKCE downgrade / code replay / redirect mismatch を拒否する。
+- [x] OpenAI profile は local origin の public bind を必要としない。
+- [x] provider-neutral MCP dispatch に Cloudflare / Tailscale / OpenAI 固有 process control が漏れない。
+- [x] `session_start` / `session_stop` / named roots security semantics が3 profileで同一である。
+- [x] `without_sandbox` が remote tool list に現れない。
+- [x] `doctor` が選択 profile に不要な dependency / secret を failure にしない。
 - [ ] 3 profile の live acceptance evidence を残す。
-- [ ] README / `docs/public-http*.md` / development docs を connection profile architecture に更新する。
+- [x] README / `docs/public-http*.md` / development docs を connection profile architecture に更新する。
+
+## 実装 evidence (2026-08-23)
+
+### Common / regression
+
+- `cargo fmt -- --check`: pass
+- `cargo clippy --all-targets --all-features -- -D warnings`: pass
+- `cargo test --all-targets --all-features`: 199 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- `cargo check --all-targets`: pass
+- remote tool list regression で `without_sandbox` 非公開を確認
+- Cloudflare / Tailscale / OpenAI は同じ `SessionSupervisor` / named-root / sandbox / local approval path を利用し、provider 固有 process control は connection boundary の外へ漏らさない
+
+### Cloudflare
+
+`./target/debug/temote-mcp doctor --profile cloudflare`:
+
+- `cloudflared 2026.6.1`: pass
+- tunnel token file mode `0600`: pass
+- Access team domain / audience / email allowlist: pass
+- summary: `0 failure(s), 0 warning(s)`
+
+Cloudflare Access JWT rejection / unauthenticated `/mcp` は regression tests で維持している。実 Cloudflare Managed OAuth client の browser/external live acceptance はこの作業では未実施のため Phase 5 の該当項目は open のままにする。
+
+### Tailscale + local OAuth live acceptance
+
+実 host には既存 Funnel `:443 -> http://localhost:7135` がある状態で検証した。Temote はこれを変更せず、利用可能な `8443` を選択した。
+
+`temote-mcp doctor --profile tailscale`:
+
+- connected `*.ts.net` node: pass
+- existing `{443}` ownership detection: pass
+- selected safe port `8443`: pass
+- local OAuth state: pass
+- summary: `0 failure(s), 0 warning(s)`
+
+外部 HTTPS `:8443` を通した acceptance:
+
+- protected-resource metadata: pass
+- authorization-server metadata: pass
+- DCR registration: pass
+- local terminal owner approval: pass
+- Authorization Code + PKCE S256: pass
+- access-token exchange: pass
+- authenticated `tools/list`: pass
+- `without_sandbox` absent: pass
+- managed `session_start`: pass (`yolo=false`)
+- managed `session_stop`: pass
+- shutdown 後 `:8443` foreground Funnel のみ消滅: pass
+- 既存 `:443 -> http://localhost:7135` が before/during/after で不変: pass
+
+### OpenAI Secure MCP Tunnel
+
+OpenAI official docs / `openai/tunnel-client` の current surface を確認し、Temote は public ingress abstraction へ押し込めず private connection profile として実装した。
+
+- local MCP origin は loopback-only: regression pass
+- `TEMOTE_MCP_PUBLIC_URL` 不要: pass
+- Cloudflare / Tailscale dependency 不要: pass
+- Temote-owned `tunnel-client run --control-plane.tunnel-id ... --mcp.server-url http://127.0.0.1:<port>/mcp` lifecycle: implemented
+- runtime credential は environment の `CONTROL_PLANE_API_KEY` を使用し command line / log に値を出さない
+- tunnel ID grammar / no-public-bind property tests: pass
+- official `openai/tunnel-client` を `/tmp` で source buildし version `0.0.13-dev+5ce4fed0a730da034c54c1de17f2610f8b2727f1` を Temote doctor が認識: pass
+- current host には `CONTROL_PLANE_TUNNEL_ID` / runtime credential がないため、`doctor --profile openai` は tunnel-client 認識後 `CONTROL_PLANE_TUNNEL_ID is required` と provider-specific に fail する: expected
+
+OpenAI control-plane / supported OpenAI product との live tunnel acceptance は credential / workspace entitlement がこの host に無いため未実施。Cloudflare/Tailscale へ暗黙 fallback せず、Phase 5 の OpenAI live 項目を open のままにする。
 
 ## テスト方針
 
@@ -679,9 +743,10 @@ OpenAI Secure MCP Tunnel は supported OpenAI products との private connection
 OpenAI Help Center（2026-08-23確認）では、ChatGPT は local MCP server へ直接接続せず、private network / on-premises / developer machine 上の MCP server を public Internet に露出せず supported OpenAI products に接続する用途として Secure MCP Tunnel を案内している。
 
 - https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt
+- https://github.com/openai/tunnel-client
 
 仕様・availability は変化し得るため、実装開始時に公式情報を再確認する。
 
 ## 変更履歴
 
-`CHANGES.md` impact: no（proposal only）
+`CHANGES.md` impact: n/a（repository に CHANGES.md は存在しないため README / docs / issue evidence を更新）

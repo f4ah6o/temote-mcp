@@ -339,6 +339,30 @@ pub fn approval_channel() -> (ApprovalSender, ApprovalReceiver) {
     mpsc::unbounded_channel()
 }
 
+pub async fn request_supervisor_approval(
+    sender: &ApprovalSender,
+    operation: &str,
+    detail: String,
+) -> Result<bool> {
+    let (response, receiver) = oneshot::channel();
+    let request = Request {
+        id: Uuid::new_v4(),
+        operation: operation.to_owned(),
+        detail,
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let prompt = ApprovalPrompt {
+        session_id: "oauth".to_owned(),
+        request,
+        response,
+    };
+    sender.send(prompt).map_err(|error| {
+        error.0.respond(false);
+        anyhow::anyhow!("local approval console is unavailable")
+    })?;
+    Ok(receiver.await.unwrap_or(false))
+}
+
 enum RuntimeCommand {
     SetYolo {
         value: bool,

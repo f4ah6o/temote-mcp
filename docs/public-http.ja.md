@@ -1,22 +1,30 @@
-# 公開 HTTP endpoint
+# Remote connection profile
 
 [English](public-http.md)
 
-Temote MCP は `/mcp` を Cloudflare Access で保護した on-demand Cloudflare Tunnel 経由で公開できます。
+Temote MCP は3つの production connection profile を提供します。Cloudflare / Tailscale は general-purpose な public HTTPS endpoint、OpenAI Secure MCP Tunnel は supported OpenAI product 向けの outbound-only private connection です。
+
+| Profile | Connection | Authentication / trust boundary |
+| --- | --- | --- |
+| `cloudflare` | Cloudflare Tunnel public HTTPS | Cloudflare Access Managed OAuth |
+| `tailscale` | Tailscale Funnel public HTTPS | Temote local OAuth |
+| `openai` | OpenAI Secure MCP Tunnel | OpenAI tunnel connection + Temote local sandbox/approval |
+
+`--profile` を省略した場合は既存互換のため `cloudflare` として動作します。3 profile とも同じ provider-neutral MCP core に到達します。remote access に `without_sandbox` は出ず、managed session の named root、sandbox、runtime approval の境界も profile によって変わりません。
+
+## Cloudflare profile
 
 ```text
 MCP client
-    | OAuth
+    | Managed OAuth
     v
 Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                |
                                                v
-                                        temote-mcp up
+                               temote-mcp up --profile cloudflare
 ```
 
-## environment
-
-設定ファイルは repository 外に置き、mode 0600 にします。
+Cloudflare の deployment 設定は repository 外に置き、mode `0600` にします。
 
 ```sh
 install -d -m 700 ~/.config/temote-mcp
@@ -32,71 +40,145 @@ chmod 600 ~/.config/temote-mcp/public.env
 - `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS`
 - `~/.config/temote-mcp/tunnel-token`（mode `0600`。変更する場合は `TUNNEL_TOKEN_FILE`）
 
-`temote-mcp up` は `just` なしでこの設定を読み込み、runtime configuration を検証します。repository checkout の `just env-check` は secret value を表示しない開発用 preflight として残っています。
+Cloudflare profile は `~/.config/temote-mcp/public.env`（または `TEMOTE_MCP_ENV_FILE`）を読み込みます。origin 側でも、転送された `Cf-Access-Jwt-Assertion` の signature、issuer、audience、expiry、subject、設定済み email allow list を検証する既存 defense-in-depth を維持します。
 
-ローカルの Tunnel 診断では `temote-mcp doctor` が `cloudflared` と token file を検査します。Cloudflare API に設定済み Tunnel の状態を問い合わせる場合は `--cloudflare` を付けます。必要な account ID、Tunnel ID、API token は [development diagnostics](development.md) に記載しています。
+origin と Tunnel をまとめて起動します。
 
-## 起動
+```sh
+temote-mcp up --profile cloudflare
+```
 
-`temote-mcp up` で origin と Tunnel をまとめて起動し、`temote-mcp down` で停止します。repository checkout の `just up/down` は開発用 wrapper です。個別に起動する場合:
+`--profile` なしの `temote-mcp up` も同じ動作です。停止は `temote-mcp down` で、Temote supervisor と Temote が起動した Tunnel child を停止します。
+
+`cloudflared` を Temote から起動せず origin だけ実行する場合:
 
 ```sh
 set -a
 . ~/.config/temote-mcp/public.env
 set +a
-temote-mcp serve
+temote-mcp serve --profile cloudflare
 ```
-
-```sh
-set -a
-. ~/.config/temote-mcp/public.env
-set +a
-cloudflared tunnel run --token-file "${TUNNEL_TOKEN_FILE:-$HOME/.config/temote-mcp/tunnel-token}"
-```
-
-`TEMOTE_MCP_ROOTS` を設定すると、direct HTTP client から `session_start` で managed project session を作成できます。別 process で起動する従来の CLI session も引き続き利用できます。
-
-## Cloudflare Access
 
 `https://temotemcp.example.com/mcp` のような route では次の構成にします。
 
 1. remotely managed Tunnel の hostname を `http://127.0.0.1:8791` へ向けます。
-2. hostname 全体を self-hosted Cloudflare Access application で保護します。Managed OAuth discovery が host root の `/.well-known/` を使うため、application を `/mcp` だけに制限しません。
-3. 利用対象 identity だけを Allow policy に入れます。公開 MCP route に Bypass は使いません。
-4. 利用する MCP/OAuth client 向けに Managed OAuth を有効化します。dynamic client registration、token/grant lifetime、redirect URI、loopback option は client 要件に合わせます。
-5. hostname を保護する self-hosted application の `AUD` を `TEMOTE_MCP_ACCESS_AUDIENCE` に設定します。
+2. hostname 全体を self-hosted Cloudflare Access application で保護します。Managed OAuth discovery が host root の `/.well-known/` を使うため、Access を `/mcp` だけに限定しません。
+3. 利用対象 identity だけを Allow policy に入れ、公開 MCP route に Bypass は使いません。
+4. 対象 client 向けに Managed OAuth を有効化します。
+5. self-hosted application の `AUD` を `TEMOTE_MCP_ACCESS_AUDIENCE` に設定します。
 
 Cloudflare の `AI controls > MCP servers` に作る portal registration は、hostname を保護する self-hosted Access application とは別です。
 
-Rust origin は転送された `Cf-Access-Jwt-Assertion` の signature、issuer、audience、expiry、subject、email allow list を検証します。
+## Tailscale profile
+
+```text
+MCP client
+    | Authorization Code + PKCE S256
+    v
+Temote local OAuth -- Tailscale Funnel -- 127.0.0.1:8791
+                                               |
+                                               v
+                                temote-mcp up --profile tailscale
+```
+
+Tailscale profile には、Funnel を利用可能な接続済み Tailscale CLI/node が必要です。Cloudflare account、Tunnel token、Access application、Access audience、email allow list は不要です。
+
+```sh
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp doctor --profile tailscale
+temote-mcp up --profile tailscale
+```
+
+public URL を明示しない場合、Temote は `tailscale status --json` の `Self.DNSName` から canonical `*.ts.net` hostname を導出し、Funnel が利用できる HTTPS port を `443` → `8443` → `10000` の順で自動選択します。Temote 管理の Funnel は local `127.0.0.1` origin にのみ proxy します。既存 Funnel 設定は上書きせず、3 port がすべて使用中なら fail-closed します。
+
+Tailscale daemon 自体は停止しません。`temote-mcp down` が停止するのは Temote supervisor と、その process が直接起動した `tailscale funnel` child だけです。
+
+`temote-mcp serve --profile tailscale --public-url <https-origin>` は Funnel を起動せず local OAuth/MCP origin のみを実行します。ingress を別に管理する場合に利用できます。`temote-mcp up --profile tailscale` で public URL を明示する場合は、現在の node の `*.ts.net` hostname と Funnel 対応 HTTPS port (`443` / `8443` / `10000`) を使う必要があります。
+
+Tailscale profile は Cloudflare 用 `public.env` を読みません。shell の `TEMOTE_MCP_PUBLIC_URL` は Tailscale hostname を導出できない場合の fallback で、`serve` で明示的に上書きする場合は `--public-url` を使います。
+
+### Temote local OAuth
+
+local authorization server は以下を公開します。
+
+```text
+/.well-known/oauth-protected-resource
+/.well-known/oauth-authorization-server
+/register
+/authorize
+/token
+/mcp
+```
+
+Authorization Code flow と mandatory PKCE `S256` を使用します。authorization code は短時間のみ有効・single-use で、exact `client_id`、redirect URI、MCP resource に binding されます。access token は exact `/mcp` resource に binding された短寿命 opaque bearer token です。code/token value は通常ログや approval summary に出しません。
+
+client discovery は現行の Client ID Metadata Documents に対応し、client compatibility のため Dynamic Client Registration `/register` も維持します。metadata document の取得先は HTTPS port 443 の public DNS のみに限定し、redirect は追跡せず、private / loopback / special-use address と過大 response を拒否します。
+
+初回 authorization は `temote-mcp up` / `serve` を実行しているローカル端末で owner が承認します。表示するのは client、redirect URI、resource、scope です。この OAuth approval と、その後の host/network-sensitive tool の runtime approval は別の security decision です。authentication に成功しても yolo session は作りません。
+
+registration、pending authorization code、access token は bounded な process-local state です。Temote を再起動すると local OAuth state は無効になります。password database、email database、persistent bearer-token file は不要です。
+
+## OpenAI Secure MCP Tunnel profile
+
+`openai` profile は、OpenAI Secure MCP Tunnel を通じて private/local MCP server に到達できる supported OpenAI product 向けです。public Internet endpoint は作成せず、`TEMOTE_MCP_PUBLIC_URL`、Cloudflare、Tailscale を要求しません。
+
+Temote は公式 `openai/tunnel-client` と統合します。runtime には以下が必要です。
+
+- `PATH` 上の `tunnel-client`、または binary を指す `TUNNEL_CLIENT_BIN`
+- 登録済み tunnel の `CONTROL_PLANE_TUNNEL_ID`
+- OpenAI tunnel client に必要な権限を持つ Restricted `CONTROL_PLANE_API_KEY`。公式 client の `OPENAI_API_KEY` fallback も受け付けます
+
+long-lived runtime に admin key は使用しません。credential は environment 経由で渡し、command-line argument や通常ログに値を出しません。
+
+診断と起動は次のとおりです。
+
+```sh
+export CONTROL_PLANE_TUNNEL_ID='tunnel_...'
+export CONTROL_PLANE_API_KEY='...'
+temote-mcp doctor --profile openai
+temote-mcp up --profile openai
+```
+
+`temote-mcp up --profile openai` は local MCP origin を loopback にだけ bind し、概念上次の Temote-owned child を起動します。
+
+```text
+tunnel-client run \
+  --control-plane.tunnel-id <configured tunnel> \
+  --mcp.server-url http://127.0.0.1:8791/mcp
+```
+
+local port は `--addr` に従い、non-loopback bind は拒否します。`temote-mcp down` が停止するのは Temote supervisor と直接起動した `tunnel-client` child だけです。public listener、public OAuth server、Cloudflare Tunnel、Tailscale Funnel は作成しません。
+
+tunnel 接続成功を yolo の根拠にはしません。remote tool call は同じ managed-session / named-root / sandbox / host・network-sensitive approval 境界へ入ります。OpenAI tunnel から提供されない identity claim を Temote 側で推測して生成しません。
+
+公式資料: [OpenAI tunnel-client](https://github.com/openai/tunnel-client)、[ChatGPT developer mode / MCP connectors](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt)。
+
+## 診断
+
+profile-aware な診断は明示的に実行できます。
+
+```sh
+temote-mcp doctor --profile cloudflare
+temote-mcp doctor --profile tailscale
+temote-mcp doctor --profile openai
+```
+
+Cloudflare profile は `cloudflared`、private Tunnel token file、Access configuration を検査します。Cloudflare API から Tunnel status も取得する場合は `--cloudflare` を追加します。追加の diagnostic environment variable は [development diagnostics](development.md) に記載しています。
+
+Tailscale profile は CLI/node connection、canonical `*.ts.net` endpoint、HTTPS port `443` / `8443` / `10000` の既存 Funnel ownership、安全に利用できる次の port、local OAuth state を検査します。Cloudflare credential は検査しません。
+
+OpenAI profile は公式 `tunnel-client`、tunnel ID/runtime key 設定、credential がある場合の control-plane access、loopback-only local bind policy を検査します。Cloudflare / Tailscale の設定は要求しません。
+
+bare `temote-mcp doctor` は従来の local behavior を維持し、Cloudflare Tunnel 設定が存在する場合または明示指定された場合だけ Cloudflare local check を行います。
 
 ## MCP protocol compatibility
 
 公開 endpoint は MCP `2026-07-28` と既存の 2025 系 handshake の両方に対応します。modern request は `server/discover`、request ごとの `_meta`、`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` HTTP header を使います。legacy client は従来どおり `initialize` を使い、modern request では `Mcp-Session-Id` を作りません。
 
-## probe
+Tailscale profile の未認証 `/mcp` は `401` と Bearer `WWW-Authenticate` challenge を返し、protected-resource metadata URL を含めます。Cloudflare profile では引き続き Cloudflare Access が外部 Managed OAuth boundary であり、Rust origin も invalid / missing Access assertion を拒否します。
 
-MCP client を接続する前に Access が origin より手前で応答することを確認できます。
+## Remote tool / managed session の境界
 
-```sh
-curl -i -X POST https://temotemcp.example.com/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0"}}}'
+`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` は現在の `serve` process が所有する session に限定されます。
 
-curl -i https://temotemcp.example.com/.well-known/oauth-authorization-server
-curl -i https://temotemcp.example.com/.well-known/oauth-protected-resource
-```
-
-未認証の `/mcp` は Cloudflare の `WWW-Authenticate` 付き `401`、discovery endpoint は JSON metadata を返すのが正常です。`530` は通常 Tunnel または origin が停止しています。Cloudflare challenge のない Rust JSON `401` や discovery `404` は、Access application が想定 hostname/path を保護していない可能性があります。
-
-origin が Access audience 不一致を報告した場合は、hostname を保護する self-hosted application の `AUD` を設定し直して `temote-mcp serve` を再起動します。
-
-## 公開 tool の境界
-
-公開 HTTP も local stdio と同じ session model を使いますが、`without_sandbox` は公開しません。ただし明示的に `--yolo` で起動した session の通常 command tool は unrestricted host permission で動きます。Cloudflare Access は authentication boundary であり、session mode の代替ではありません。
-
-## managed session lifecycle
-
-`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み direct HTTP endpoint は `session_start` / `session_stop` を公開します。`session_start` は logical named-root-relative path のみを受け付け、yolo option はありません。absolute path、unknown root、traversal / symlink escape、roots 未設定時の fallback は拒否します。`session_stop` は現在の `serve` process が所有する session に限定されます。公開 endpoint で `without_sandbox` が使えない既存境界も維持します。
-
-`temote-mcp up` は `temote-mcp serve` を foreground に置き、`cloudflared` を child process として管理します。これにより local approval console が stdin を所有し、shutdown 時に managed session と Tunnel をまとめて cleanup します。停止は `temote-mcp down` で行います。
+remote profile に `without_sandbox` は出ません。通常 session は filesystem containment と network-disabled sandbox を維持し、host/network-sensitive operation は引き続き local approval が必要です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。

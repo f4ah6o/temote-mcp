@@ -6,26 +6,50 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::time::sleep;
 
+use crate::profile::Profile;
+
 const PID_FILE_NAME: &str = "up.pid";
 const PROCESS_NAME: &str = env!("CARGO_PKG_NAME");
 const MAX_PID_FILE_BYTES: usize = 64;
 const MAX_TUNNEL_TOKEN_BYTES: u64 = 64 * 1024;
 
 pub async fn up(
+    profile: Profile,
     public_url: Option<String>,
     addr: std::net::SocketAddr,
     tunnel_token_file: Option<PathBuf>,
 ) -> Result<()> {
-    crate::load_public_env()?;
+    if profile == Profile::Cloudflare {
+        crate::load_public_env()?;
+    }
 
-    let tunnel_token_file = tunnel_token_file
-        .or_else(|| env_path("TUNNEL_TOKEN_FILE"))
-        .unwrap_or(default_tunnel_token_file()?);
-    ensure_tunnel_token_file(&tunnel_token_file)?;
+    let tunnel_token_file = match profile {
+        Profile::Cloudflare => {
+            let path = tunnel_token_file
+                .or_else(|| env_path("TUNNEL_TOKEN_FILE"))
+                .unwrap_or(default_tunnel_token_file()?);
+            ensure_tunnel_token_file(&path)?;
+            Some(path)
+        }
+        Profile::Tailscale | Profile::Openai => {
+            anyhow::ensure!(
+                tunnel_token_file.is_none(),
+                "--tunnel-token-file is only valid for the cloudflare profile"
+            );
+            None
+        }
+    };
 
     let pid_file = pid_file(true)?;
     let _pid_file = PidFile::create(&pid_file)?;
-    crate::serve_http(public_url, addr, Some(&tunnel_token_file)).await
+    crate::serve_http(
+        profile,
+        public_url,
+        addr,
+        true,
+        tunnel_token_file.as_deref(),
+    )
+    .await
 }
 
 pub async fn down() -> Result<()> {
@@ -267,7 +291,7 @@ fn executable_name(command: &str) -> &str {
 
 fn child_processes(parent_pid: i32) -> Vec<i32> {
     let Ok(output) = Command::new("pgrep")
-        .args(["-P", &parent_pid.to_string(), "-x", "cloudflared"])
+        .args(["-P", &parent_pid.to_string()])
         .output()
     else {
         return Vec::new();
@@ -279,6 +303,11 @@ fn child_processes(parent_pid: i32) -> Vec<i32> {
         .lines()
         .filter_map(|line| line.trim().parse::<i32>().ok())
         .filter(|pid| *pid > 0)
+        .filter(|pid| {
+            process_name(*pid).ok().flatten().is_some_and(|name| {
+                name == "cloudflared" || name == "tailscale" || name == "tunnel-client"
+            })
+        })
         .collect()
 }
 

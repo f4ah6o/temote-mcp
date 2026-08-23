@@ -29,7 +29,12 @@ Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネ
 # host の例:
 # ~/src -> /Volumes/devstorage/Developer
 export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp up
+# 既存構成は Cloudflare profile が default です。
+temote-mcp up --profile cloudflare
+# Tailscale Funnel + Temote local OAuth を使う場合:
+# temote-mcp up --profile tailscale
+# outbound-only の OpenAI Secure MCP Tunnel を使う場合:
+# temote-mcp up --profile openai
 ```
 
 認証済み MCP client からは次の順で利用します。
@@ -65,7 +70,7 @@ gh skill install f4ah6o/temote-mcp temote-mcp --scope user
 
 - [session と tool の使い方](docs/usage.ja.md)
 - [managed session と named root](docs/managed-sessions.ja.md)
-- [公開 HTTP endpoint と Cloudflare Access](docs/public-http.ja.md)
+- [remote connection profile: Cloudflare / Tailscale / OpenAI Secure MCP Tunnel](docs/public-http.ja.md)
 - [1Password / kintone 連携](docs/integrations.ja.md)
 - [multi-host Cloudflare gateway](docs/gateway.ja.md)
 - [Linux sandbox と crates.io packaging](docs/linux-sandbox.ja.md)

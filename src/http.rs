@@ -1,8 +1,8 @@
 //! Streamable HTTP MCP endpoint for remote clients such as ChatGPT.
 //!
-//! Cloudflare Access terminates Managed OAuth at the edge. This origin never
-//! implements its own public OAuth server; it accepts only requests carrying a
-//! valid Cloudflare Access JWT assertion.
+//! Authentication is selected by the active production profile. Cloudflare
+//! uses Access JWT assertions; Tailscale uses Temote local OAuth. MCP dispatch
+//! remains provider-neutral.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,27 +10,29 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use url::Url;
 
-use crate::access::AccessAuthenticator;
+use crate::local_oauth::{AuthorizeRequest, OAuthError, RegistrationRequest, TokenRequest};
+use crate::provider::AuthProvider;
+#[cfg(test)]
+use crate::provider::PublicEndpoint;
 use crate::supervisor::SessionSupervisor;
 
 #[derive(Clone)]
 pub struct Runtime {
-    pub authenticator: AccessAuthenticator,
+    pub authenticator: AuthProvider,
     pub supervisor: Arc<SessionSupervisor>,
 }
 
 pub async fn serve(
     addr: SocketAddr,
     public_url: String,
-    authenticator: AccessAuthenticator,
+    authenticator: AuthProvider,
     supervisor: Arc<SessionSupervisor>,
 ) -> Result<()> {
     let runtime = Runtime {
@@ -42,7 +44,7 @@ pub async fn serve(
         .with_context(|| format!("cannot listen on {addr}"))?;
     eprintln!("temote-mcp HTTP server listening on http://{addr}");
     eprintln!("MCP endpoint for remote clients: {public_url}/mcp");
-    eprintln!("Authentication: Cloudflare Access Managed OAuth");
+    eprintln!("Authentication: {}", runtime.authenticator.name());
     axum::serve(listener, router(runtime))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -52,6 +54,17 @@ pub async fn serve(
 pub fn router(runtime: Runtime) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_authorization_server),
+        )
+        .route("/register", axum::routing::post(oauth_register))
+        .route("/authorize", get(oauth_authorize))
+        .route("/token", axum::routing::post(oauth_token))
         .route(
             "/mcp",
             get(mcp_get)
@@ -63,26 +76,9 @@ pub fn router(runtime: Runtime) -> Router {
         .with_state(runtime)
 }
 
+#[cfg(test)]
 pub fn normalize_public_url(value: &str) -> Result<String> {
-    let parsed = Url::parse(value.trim()).context("TEMOTE_MCP_PUBLIC_URL is invalid")?;
-    anyhow::ensure!(
-        parsed.scheme() == "https"
-            && parsed.username().is_empty()
-            && parsed.password().is_none()
-            && parsed.query().is_none()
-            && parsed.fragment().is_none()
-            && parsed.path().trim_matches('/').is_empty(),
-        "TEMOTE_MCP_PUBLIC_URL must be an HTTPS origin without a path"
-    );
-    anyhow::ensure!(
-        parsed.host_str().is_some(),
-        "TEMOTE_MCP_PUBLIC_URL has no host"
-    );
-    Ok(parsed
-        .origin()
-        .ascii_serialization()
-        .trim_end_matches('/')
-        .to_owned())
+    PublicEndpoint::parse(value).map(PublicEndpoint::into_string)
 }
 
 async fn shutdown_signal() {
@@ -114,6 +110,81 @@ async fn healthz() -> Response {
     Json(json!({"status": "ok", "service": "temote-mcp"})).into_response()
 }
 
+async fn oauth_protected_resource(State(runtime): State<Runtime>) -> Response {
+    match runtime.authenticator.local_oauth() {
+        Some(local) => no_store(Json(local.protected_resource_metadata()).into_response()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn oauth_authorization_server(State(runtime): State<Runtime>) -> Response {
+    match runtime.authenticator.local_oauth() {
+        Some(local) => no_store(Json(local.authorization_server_metadata()).into_response()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn oauth_register(
+    State(runtime): State<Runtime>,
+    Json(request): Json<RegistrationRequest>,
+) -> Response {
+    let Some(local) = runtime.authenticator.local_oauth() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match local.register(request).await {
+        Ok(value) => no_store((StatusCode::CREATED, Json(value)).into_response()),
+        Err(error) => oauth_error(error),
+    }
+}
+
+async fn oauth_authorize(
+    State(runtime): State<Runtime>,
+    Query(request): Query<AuthorizeRequest>,
+) -> Response {
+    let Some(local) = runtime.authenticator.local_oauth() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match local.authorize(request).await {
+        Ok(location) => {
+            let Ok(location) = HeaderValue::from_str(&location) else {
+                return oauth_error(OAuthError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "server_error",
+                    description: "generated redirect URI is invalid".to_owned(),
+                });
+            };
+            let mut response = StatusCode::FOUND.into_response();
+            response.headers_mut().insert(header::LOCATION, location);
+            no_store(response)
+        }
+        Err(error) => oauth_error(error),
+    }
+}
+
+async fn oauth_token(
+    State(runtime): State<Runtime>,
+    Form(request): Form<TokenRequest>,
+) -> Response {
+    let Some(local) = runtime.authenticator.local_oauth() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match local.token(request).await {
+        Ok(value) => no_store(Json(value).into_response()),
+        Err(error) => oauth_error(error),
+    }
+}
+
+fn oauth_error(error: OAuthError) -> Response {
+    no_store((error.status, Json(error.json())).into_response())
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 /// Streamable HTTP uses POST for this stateless endpoint. SSE is deliberately
 /// not exposed.
 async fn mcp_get() -> Response {
@@ -125,7 +196,7 @@ async fn mcp_get() -> Response {
 
 async fn mcp_delete(headers: HeaderMap, State(runtime): State<Runtime>) -> Response {
     if let Err(error) = runtime.authenticator.authenticate(&headers).await {
-        return unauthorized(error);
+        return unauthorized(&runtime, error);
     }
     with_cors(StatusCode::OK)
 }
@@ -136,7 +207,7 @@ async fn mcp_options() -> Response {
 
 async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Bytes) -> Response {
     if let Err(error) = runtime.authenticator.authenticate(&headers).await {
-        return unauthorized(error);
+        return unauthorized(&runtime, error);
     }
     let request: Value = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -345,18 +416,40 @@ impl AuditContext {
     }
 }
 
-fn unauthorized(error: anyhow::Error) -> Response {
+fn unauthorized(runtime: &Runtime, error: anyhow::Error) -> Response {
     eprintln!("[auth] rejected HTTP request: {error:#}");
+    let (code, description) = if runtime.authenticator.local_oauth().is_some() {
+        (
+            "invalid_token",
+            "valid Temote OAuth Bearer authentication is required",
+        )
+    } else {
+        (
+            "access_unauthorized",
+            "valid Cloudflare Access authentication is required",
+        )
+    };
     let mut response = with_cors((
         StatusCode::UNAUTHORIZED,
         Json(json!({
-            "error": "access_unauthorized",
-            "error_description": "valid Cloudflare Access authentication is required"
+            "error": code,
+            "error_description": description
         })),
     ));
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Some(local) = runtime.authenticator.local_oauth() {
+        let challenge = format!(
+            "Bearer resource_metadata=\"{}\", scope=\"mcp\"",
+            local.resource_metadata_url()
+        );
+        if let Ok(value) = HeaderValue::from_str(&challenge) {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, value);
+        }
+    }
     response
 }
 
@@ -385,26 +478,44 @@ fn with_cors(response: impl IntoResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::AccessIdentity;
+    use crate::access::{AccessAuthenticator, AccessIdentity};
+    use crate::local_oauth::LocalOAuth;
     use crate::test_support;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+    use url::Url;
 
     fn runtime() -> Runtime {
         let (supervisor, _approvals) =
             SessionSupervisor::new(crate::named_roots::NamedRoots::default());
         Runtime {
-            authenticator: AccessAuthenticator::test(
+            authenticator: AuthProvider::Cloudflare(AccessAuthenticator::test(
                 "test-token",
                 AccessIdentity {
                     email: "test@example.com".to_owned(),
                     subject: "test-subject".to_owned(),
                 },
-            ),
+            )),
             supervisor,
         }
+    }
+
+    fn local_runtime() -> (Runtime, crate::approvals::ApprovalReceiver) {
+        let (supervisor, approvals) =
+            SessionSupervisor::new(crate::named_roots::NamedRoots::default());
+        let local = LocalOAuth::new(
+            "https://node.example.ts.net".to_owned(),
+            supervisor.approval_sender(),
+        );
+        (
+            Runtime {
+                authenticator: AuthProvider::Local(local),
+                supervisor,
+            },
+            approvals,
+        )
     }
 
     async fn body_json(response: Response) -> Value {
@@ -465,6 +576,168 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_json(response).await["error"], "access_unauthorized");
+    }
+
+    #[tokio::test]
+    async fn local_oauth_http_flow_discovers_authorizes_and_authenticates_mcp() {
+        let (runtime, mut approvals) = local_runtime();
+
+        let metadata = router(runtime.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-protected-resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(metadata).await["resource"],
+            "https://node.example.ts.net/mcp"
+        );
+
+        let unauthorized = router(runtime.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            unauthorized
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("oauth-protected-resource")
+        );
+
+        let registration = router(runtime.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_name": "HTTP test client",
+                            "application_type": "native",
+                            "redirect_uris": ["http://127.0.0.1:9876/callback"],
+                            "grant_types": ["authorization_code"],
+                            "response_types": ["code"],
+                            "token_endpoint_auth_method": "none"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registration.status(), StatusCode::CREATED);
+        let client_id = body_json(registration).await["client_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client_id)
+            .append_pair("redirect_uri", "http://127.0.0.1:9876/callback")
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("resource", "https://node.example.ts.net/mcp")
+            .append_pair("scope", "mcp")
+            .append_pair("state", "state-123");
+        let authorize_uri = format!("/authorize?{}", query.finish());
+        let authorize_task = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                router(runtime)
+                    .oneshot(
+                        Request::builder()
+                            .uri(authorize_uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        let prompt = approvals.recv().await.unwrap();
+        assert_eq!(prompt.request.operation, "oauth_authorize");
+        prompt.respond(true);
+        let authorize = authorize_task.await.unwrap();
+        assert_eq!(authorize.status(), StatusCode::FOUND);
+        let location = authorize
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let location = Url::parse(location).unwrap();
+        let params = location
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(params.get("state").map(String::as_str), Some("state-123"));
+        let code = params.get("code").unwrap();
+
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("grant_type", "authorization_code")
+            .append_pair("code", code)
+            .append_pair("client_id", &client_id)
+            .append_pair("redirect_uri", "http://127.0.0.1:9876/callback")
+            .append_pair("code_verifier", verifier)
+            .append_pair("resource", "https://node.example.ts.net/mcp");
+        let token = router(runtime.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form.finish()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.status(), StatusCode::OK);
+        let access_token = body_json(token).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mcp = router(runtime)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::OK);
+        let tools = body_json(mcp).await["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(!tools.iter().any(|tool| tool["name"] == "without_sandbox"));
     }
 
     #[tokio::test]
@@ -621,13 +894,13 @@ mod tests {
             .unwrap();
         let (supervisor, approvals) = SessionSupervisor::new(roots);
         let runtime = Runtime {
-            authenticator: AccessAuthenticator::test(
+            authenticator: AuthProvider::Cloudflare(AccessAuthenticator::test(
                 "test-token",
                 AccessIdentity {
                     email: "test@example.com".to_owned(),
                     subject: "test-subject".to_owned(),
                 },
-            ),
+            )),
             supervisor: Arc::clone(&supervisor),
         };
         (runtime, supervisor, approvals)

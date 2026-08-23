@@ -25,9 +25,17 @@ Keep `--locked`: the committed lockfile prevents incompatible transitive version
 temote-mcp doctor
 ```
 
-On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status. When a Tunnel token file is configured or present at the default path, it also checks `cloudflared`, token-file readability, and Unix token-file permissions without printing the token.
+On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status. Bare `doctor` preserves the legacy Cloudflare auto-detection behavior. Provider-specific deployment checks are explicit:
 
-To query the Cloudflare control plane, run:
+```sh
+temote-mcp doctor --profile cloudflare
+temote-mcp doctor --profile tailscale
+temote-mcp doctor --profile openai
+```
+
+The Cloudflare profile checks `cloudflared`, token-file readability/private permissions, and Cloudflare Access configuration. The Tailscale profile checks the CLI/node, canonical `*.ts.net` identity, existing Funnel ownership on HTTPS ports `443`/`8443`/`10000`, the first port Temote can safely own, and the process-local OAuth state. Tailscale diagnostics do not require or load the Cloudflare `public.env`. The OpenAI profile checks the official `tunnel-client`, `CONTROL_PLANE_TUNNEL_ID`, runtime-key availability/control-plane access, and the loopback-only local origin policy without requiring Cloudflare or Tailscale.
+
+To additionally query the Cloudflare control plane, run:
 
 ```sh
 temote-mcp doctor --cloudflare
@@ -46,7 +54,7 @@ cargo check --no-default-features --all-targets
 git diff --check
 ```
 
-The installed-binary lifecycle commands are `temote-mcp up` and `temote-mcp down`. The `justfile` provides development-oriented `just build`, `just install`, `just doctor`, `just check`, and wrappers that delegate `just up/down` to the checkout binary.
+The installed-binary lifecycle commands are `temote-mcp up --profile cloudflare|tailscale|openai` and `temote-mcp down`. Omitting the profile remains equivalent to `cloudflare`. The `justfile` provides development-oriented Cloudflare wrappers through `just up/down`; Tailscale/OpenAI profile testing should invoke the checkout binary directly so Cloudflare-only environment checks are not applied. For OpenAI, `TUNNEL_CLIENT_BIN` can point at a checkout/test binary while production should use the supported `tunnel-client` distribution and a Restricted runtime key rather than an admin key.
 
 ### Property-based tests
 

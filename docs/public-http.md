@@ -1,22 +1,30 @@
-# Public HTTP endpoint
+# Remote connection profiles
 
 [日本語](public-http.ja.md)
 
-Temote MCP can expose `/mcp` through an on-demand Cloudflare Tunnel protected by Cloudflare Access.
+Temote MCP supports three production connection profiles. Cloudflare and Tailscale provide general-purpose public HTTPS endpoints; OpenAI Secure MCP Tunnel is an outbound-only private connection for supported OpenAI products.
+
+| Profile | Connection | Authentication / trust boundary |
+| --- | --- | --- |
+| `cloudflare` | Cloudflare Tunnel public HTTPS | Cloudflare Access Managed OAuth |
+| `tailscale` | Tailscale Funnel public HTTPS | Temote local OAuth |
+| `openai` | OpenAI Secure MCP Tunnel | OpenAI tunnel connection + Temote local sandbox/approval |
+
+Omitting `--profile` keeps the existing `cloudflare` behavior for compatibility. All three profiles terminate at the same provider-neutral MCP core. Remote access never exposes `without_sandbox`; managed sessions keep the same named-root, sandbox, and local runtime-approval rules regardless of profile.
+
+## Cloudflare profile
 
 ```text
 MCP client
-    | OAuth
+    | Managed OAuth
     v
 Cloudflare Access -- Cloudflare Tunnel -- 127.0.0.1:8791
                                                |
                                                v
-                                        temote-mcp up
+                               temote-mcp up --profile cloudflare
 ```
 
-## Environment
-
-Keep the deployment environment outside the repository and mode 0600:
+Keep Cloudflare deployment settings outside the repository and mode `0600`:
 
 ```sh
 install -d -m 700 ~/.config/temote-mcp
@@ -32,71 +40,147 @@ Required values are:
 - `TEMOTE_MCP_ACCESS_ALLOWED_EMAILS`
 - `~/.config/temote-mcp/tunnel-token` (mode `0600`; override with `TUNNEL_TOKEN_FILE`)
 
-`temote-mcp up` loads this file and validates the runtime configuration without requiring `just`. In a repository checkout, `just env-check` remains a development-only preflight that does not print secret values.
+The Cloudflare profile loads `~/.config/temote-mcp/public.env` (or `TEMOTE_MCP_ENV_FILE`) and keeps the existing Access defense in depth: the origin validates the forwarded `Cf-Access-Jwt-Assertion` signature, issuer, audience, expiry, subject, and configured email allow list.
 
-For local Tunnel diagnostics, `temote-mcp doctor` checks `cloudflared` and the token file. Add `--cloudflare` to query the configured Tunnel status through the Cloudflare API; this requires the account ID, Tunnel ID, and API token environment variables documented in [development diagnostics](development.md).
+Run the origin and Tunnel together with:
 
-## Run
+```sh
+temote-mcp up --profile cloudflare
+```
 
-Use `temote-mcp up` to run the origin and Tunnel together. Stop it with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers. To run them separately:
+`temote-mcp up` without `--profile` is equivalent. Stop the Temote-owned supervisor and Tunnel child with `temote-mcp down`.
+
+To run the origin without starting `cloudflared`:
 
 ```sh
 set -a
 . ~/.config/temote-mcp/public.env
 set +a
-temote-mcp serve
+temote-mcp serve --profile cloudflare
 ```
-
-```sh
-set -a
-. ~/.config/temote-mcp/public.env
-set +a
-cloudflared tunnel run --token-file "${TUNNEL_TOKEN_FILE:-$HOME/.config/temote-mcp/tunnel-token}"
-```
-
-With `TEMOTE_MCP_ROOTS` configured, the direct HTTP client can create managed project sessions with `session_start`. Separately started CLI sessions remain supported.
-
-## Cloudflare Access
 
 For a route such as `https://temotemcp.example.com/mcp`:
 
 1. Route a remotely managed Tunnel hostname to `http://127.0.0.1:8791`.
-2. Protect the entire hostname with a self-hosted Cloudflare Access application. Do not scope the application only to `/mcp`, because Managed OAuth discovery uses host-root `/.well-known/` paths.
-3. Add an Allow policy for the intended identity set. Do not use Bypass for the public MCP route.
-4. Enable Managed OAuth for the intended MCP/OAuth clients. Configure dynamic client registration, token/grant lifetimes, redirect URIs, and loopback options according to those clients.
+2. Protect the entire hostname with a self-hosted Cloudflare Access application. Managed OAuth discovery uses host-root `/.well-known/` paths, so do not scope Access only to `/mcp`.
+3. Add an Allow policy for the intended identities; do not use Bypass for the public MCP route.
+4. Enable Managed OAuth for the intended clients.
 5. Put the self-hosted application's `AUD` in `TEMOTE_MCP_ACCESS_AUDIENCE`.
 
-A Cloudflare `AI controls > MCP servers` portal registration is separate from the self-hosted Access application that protects the hostname.
+A Cloudflare `AI controls > MCP servers` portal registration is separate from the self-hosted Access application protecting the hostname.
 
-The Rust origin validates the forwarded `Cf-Access-Jwt-Assertion` signature, issuer, audience, expiry, subject, and configured email allow list.
+## Tailscale profile
+
+```text
+MCP client
+    | Authorization Code + PKCE S256
+    v
+Temote local OAuth -- Tailscale Funnel -- 127.0.0.1:8791
+                                               |
+                                               v
+                                temote-mcp up --profile tailscale
+```
+
+The Tailscale profile requires a connected Tailscale CLI/node with Funnel available. It does **not** require a Cloudflare account, Tunnel token, Access application, Access audience, or email allow list.
+
+Start it with:
+
+```sh
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp doctor --profile tailscale
+temote-mcp up --profile tailscale
+```
+
+When no public URL is explicitly supplied, Temote derives the canonical `*.ts.net` hostname from `tailscale status --json` and selects the first free supported Funnel HTTPS port in the order `443`, `8443`, `10000`. The managed Funnel proxies only to the local `127.0.0.1` origin. Existing Funnel configuration is never replaced; if all three supported ports are occupied, startup fails closed.
+
+The Tailscale daemon itself is never stopped. `temote-mcp down` terminates only the Temote supervisor and its direct `tailscale funnel` child.
+
+`temote-mcp serve --profile tailscale --public-url <https-origin>` runs the local OAuth/MCP origin without starting Funnel. This is useful when ingress is managed separately. For `temote-mcp up --profile tailscale`, an explicit public URL must use the current node's `*.ts.net` hostname and one of the supported Funnel HTTPS ports (`443`, `8443`, `10000`).
+
+The Tailscale profile does not load the Cloudflare-oriented `public.env`. A shell-level `TEMOTE_MCP_PUBLIC_URL` is only a fallback when the Tailscale node hostname cannot be derived; `--public-url` is the explicit override for `serve`.
+
+### Temote local OAuth
+
+The local authorization server exposes:
+
+```text
+/.well-known/oauth-protected-resource
+/.well-known/oauth-authorization-server
+/register
+/authorize
+/token
+/mcp
+```
+
+The flow uses Authorization Code with mandatory PKCE `S256`. Authorization codes are short-lived, single-use, and bound to the exact `client_id`, redirect URI, and MCP resource. Access tokens are opaque, short-lived bearer tokens bound to the exact `/mcp` resource. Code/token values are not included in normal logs or approval summaries.
+
+Client discovery supports current Client ID Metadata Documents and keeps Dynamic Client Registration at `/register` for client compatibility. Metadata-document fetches are limited to HTTPS port 443 public DNS destinations, do not follow redirects, reject private/loopback/special-use addresses, and enforce a bounded response size.
+
+The first authorization decision is local-owner approval in the terminal running `temote-mcp up`/`serve`. It shows the client, redirect URI, resource, and scope. This OAuth approval is separate from later host/network-sensitive tool approvals. Authentication never creates a yolo session.
+
+Registrations, pending authorization codes, and access tokens are bounded process-local state. Restarting Temote invalidates that local OAuth state; no password database, email database, or persistent bearer-token file is required.
+
+## OpenAI Secure MCP Tunnel profile
+
+The `openai` profile is for supported OpenAI products that can reach a private/local MCP server through OpenAI Secure MCP Tunnel. It does not create a public Internet endpoint and does not use `TEMOTE_MCP_PUBLIC_URL`, Cloudflare, or Tailscale.
+
+Temote integrates with the official `openai/tunnel-client`. The runtime requires:
+
+- `tunnel-client` on `PATH`, or `TUNNEL_CLIENT_BIN` pointing to the binary
+- `CONTROL_PLANE_TUNNEL_ID` for the registered tunnel
+- a Restricted `CONTROL_PLANE_API_KEY` with the tunnel permissions required by the OpenAI tunnel client; the official `OPENAI_API_KEY` fallback is also accepted by the client
+
+The long-lived runtime must not use an admin key. Temote passes the credential through the environment, never as a command-line argument, and does not print its value.
+
+Run diagnostics and start the connection with:
+
+```sh
+export CONTROL_PLANE_TUNNEL_ID='tunnel_...'
+export CONTROL_PLANE_API_KEY='...'
+temote-mcp doctor --profile openai
+temote-mcp up --profile openai
+```
+
+`temote-mcp up --profile openai` binds the local MCP origin only to loopback and starts a Temote-owned child equivalent to:
+
+```text
+tunnel-client run \
+  --control-plane.tunnel-id <configured tunnel> \
+  --mcp.server-url http://127.0.0.1:8791/mcp
+```
+
+The exact local port follows `--addr`; non-loopback bind addresses are rejected. `temote-mcp down` stops the Temote supervisor and its direct `tunnel-client` child only. It does not create a public listener, public OAuth server, Cloudflare Tunnel, or Tailscale Funnel.
+
+The tunnel transport is not treated as a reason to enable yolo mode. Remote tool calls still enter the same managed-session, named-root, sandbox, and host/network-sensitive approval boundaries. OpenAI tunnel identity fields that are not supplied by the tunnel are not invented by Temote.
+
+Official references: [OpenAI tunnel-client](https://github.com/openai/tunnel-client) and [ChatGPT developer mode / MCP connectors](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt).
+
+## Diagnostics
+
+Profile-aware checks are explicit:
+
+```sh
+temote-mcp doctor --profile cloudflare
+temote-mcp doctor --profile tailscale
+temote-mcp doctor --profile openai
+```
+
+Cloudflare checks cover `cloudflared`, the private Tunnel token file, and Access configuration. Add `--cloudflare` to query the configured Tunnel through the Cloudflare API; the additional diagnostic environment variables are documented in [development diagnostics](development.md).
+
+Tailscale checks cover the CLI/node connection, canonical `*.ts.net` endpoint, current Funnel ownership across HTTPS ports `443`/`8443`/`10000`, the next port Temote can safely own, and local OAuth state. Cloudflare credentials are not checked for the Tailscale profile.
+
+OpenAI checks cover the official `tunnel-client`, tunnel ID/runtime-key configuration, control-plane access when credentials are present, and the loopback-only local bind policy. OpenAI diagnostics do not require Cloudflare or Tailscale configuration.
+
+Bare `temote-mcp doctor` preserves the previous local behavior and only performs Cloudflare Tunnel checks when that configuration is present or explicitly requested.
 
 ## MCP protocol compatibility
 
-The public endpoint supports both MCP `2026-07-28` and the existing 2025-era handshake. Modern requests use `server/discover`, per-request `_meta`, and the `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` HTTP headers. Legacy clients continue to use `initialize`; no `Mcp-Session-Id` is created for modern requests.
+The HTTP MCP origin supports MCP `2026-07-28` and the existing 2025-era handshake. Modern requests use `server/discover`, per-request `_meta`, and the `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` HTTP headers. Legacy clients continue to use `initialize`; no `Mcp-Session-Id` is created for modern requests.
 
-## Probe
+For the Tailscale profile, an unauthenticated `/mcp` request returns `401` with a Bearer `WWW-Authenticate` challenge containing the protected-resource metadata URL. For the Cloudflare profile, Cloudflare Access remains the external Managed OAuth boundary and the Rust origin still rejects an invalid or missing Access assertion.
 
-Before attaching an MCP client, verify that Access intercepts the origin:
+## Remote tool and managed-session boundary
 
-```sh
-curl -i -X POST https://temotemcp.example.com/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0"}}}'
+With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` is limited to sessions owned by the current `serve` process.
 
-curl -i https://temotemcp.example.com/.well-known/oauth-authorization-server
-curl -i https://temotemcp.example.com/.well-known/oauth-protected-resource
-```
-
-Expected unauthenticated behavior is a Cloudflare `401` with `WWW-Authenticate` for `/mcp` and JSON metadata from the discovery endpoints. A `530` normally means the Tunnel or origin is not running. A Rust JSON `401` without Cloudflare's challenge, or discovery `404`, indicates the Access application is not protecting the expected hostname/path.
-
-If the origin reports an invalid Access audience, copy the `AUD` from the hostname-protecting self-hosted application and restart `temote-mcp serve`.
-
-## Public tool boundary
-
-Public HTTP uses the same session model as local stdio. It does not expose `without_sandbox`. A session explicitly started with `--yolo` still gives its ordinary public command tools unrestricted host permissions, so Cloudflare Access is an authentication boundary, not a replacement for session-mode decisions.
-
-## Managed session lifecycle
-
-When `TEMOTE_MCP_ROOTS` is configured, the authenticated direct HTTP endpoint exposes `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal/symlink escapes, and roots-unset fallback are rejected. `session_stop` is limited to sessions owned by the current `serve` process. `without_sandbox` remains unavailable on the public endpoint.
-
-`temote-mcp up` keeps `temote-mcp serve` in the foreground and runs `cloudflared` as its child. The local approval console therefore owns stdin, and shutdown cleans up managed sessions and the Tunnel together. Stop it with `temote-mcp down`.
+Remote profiles do not expose `without_sandbox`. Normal sessions keep filesystem containment and a network-disabled sandbox, while host/network-sensitive operations still require local approval. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.

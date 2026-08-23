@@ -40,7 +40,7 @@ supervisor は自身が作成した runtime handle だけを追跡します。`s
 
 active session ID collision は既存 runtime/socket を置換せず失敗します。`serve` 終了時は managed runtime をすべて drain し、metadata を inactive (`process_id = 0`) にして Unix socket を削除します。
 
-`temote-mcp up` は `temote-mcp serve` を foreground process にし、`cloudflared` を child として管理します。これにより approval console が端末 stdin を所有し、Tunnel cleanup も同じ shutdown path に結合されます。`temote-mcp down` は同じ graceful shutdown を要求し、不要になった lifecycle state を削除します。
+`temote-mcp up` は HTTP server を foreground process にし、選択した connection child（`cloudflared`、`tailscale funnel`、`tunnel-client`）だけを管理します。これにより approval console が端末 stdin を所有し、Temote が所有する connection cleanup も同じ shutdown path に結合されます。Tailscale daemon や無関係な ingress / tunnel 設定は停止しません。`temote-mcp down` は同じ graceful shutdown を要求し、不要になった lifecycle state を削除します。
 
 ## endpoint scope
 

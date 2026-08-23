@@ -7,14 +7,23 @@ mod doctor;
 mod gateway;
 #[cfg(feature = "network")]
 mod http;
+#[cfg(feature = "network")]
+mod ingress;
 mod kintone_cli;
 mod kintone_mcp;
 #[cfg(all(feature = "network", unix))]
 mod lifecycle;
 mod line_protocol;
+#[cfg(feature = "network")]
+mod local_oauth;
 mod mcp;
 mod named_roots;
 mod onepassword_mcp;
+#[cfg(feature = "network")]
+mod openai_tunnel;
+mod profile;
+#[cfg(feature = "network")]
+mod provider;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
@@ -26,8 +35,6 @@ use std::net::SocketAddr;
 #[cfg(feature = "network")]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "network")]
-use std::process::Stdio;
 #[cfg(feature = "network")]
 use std::sync::Arc;
 #[cfg(feature = "network")]
@@ -49,6 +56,9 @@ struct Cli {
 enum Command {
     /// Diagnose temote-mcp, local Tunnel prerequisites, and the host sandbox.
     Doctor {
+        /// Production ingress/auth profile to diagnose. Bare doctor preserves legacy auto-detection.
+        #[arg(long, value_enum)]
+        profile: Option<profile::Profile>,
         /// Also query the Cloudflare API for the configured Tunnel status.
         #[arg(long)]
         cloudflare: bool,
@@ -68,12 +78,15 @@ enum Command {
     /// Run the session-independent MCP server over stdin/stdout.
     Mcp,
     #[cfg(feature = "network")]
-    /// Run the MCP server over HTTP behind Cloudflare Access.
+    /// Run the MCP server over HTTP using the selected authentication profile.
     Serve {
+        /// Production ingress/auth profile. Existing installations default to cloudflare.
+        #[arg(long, value_enum, default_value_t = profile::Profile::Cloudflare)]
+        profile: profile::Profile,
         /// Public HTTPS base URL clients reach this server through. When
         /// omitted, TEMOTE_MCP_PUBLIC_URL or ~/.config/temote-mcp/public.env is
         /// used.
-        #[arg(long, env = "TEMOTE_MCP_PUBLIC_URL")]
+        #[arg(long)]
         public_url: Option<String>,
         /// Local address to listen on.
         #[arg(long, default_value = "127.0.0.1:8791")]
@@ -83,12 +96,15 @@ enum Command {
         tunnel_token_file: Option<PathBuf>,
     },
     #[cfg(all(feature = "network", unix))]
-    /// Start the HTTP server and Cloudflare Tunnel as one foreground supervisor.
+    /// Start the HTTP server and selected ingress as one foreground supervisor.
     Up {
+        /// Production ingress/auth profile. Existing installations default to cloudflare.
+        #[arg(long, value_enum, default_value_t = profile::Profile::Cloudflare)]
+        profile: profile::Profile,
         /// Public HTTPS base URL clients reach this server through. When
         /// omitted, TEMOTE_MCP_PUBLIC_URL or ~/.config/temote-mcp/public.env is
         /// used.
-        #[arg(long, env = "TEMOTE_MCP_PUBLIC_URL")]
+        #[arg(long)]
         public_url: Option<String>,
         /// Local address to listen on.
         #[arg(long, default_value = "127.0.0.1:8791")]
@@ -140,12 +156,16 @@ async fn main() -> Result<()> {
         yolo: false,
     }) {
         Command::Doctor {
+            profile,
             cloudflare,
             tunnel_token_file,
         } => {
             #[cfg(feature = "network")]
-            load_public_env()?;
+            if profile.is_none() || profile == Some(profile::Profile::Cloudflare) {
+                load_public_env()?;
+            }
             doctor::run(doctor::Options {
+                profile,
                 cloudflare,
                 tunnel_token_file,
             })
@@ -155,19 +175,36 @@ async fn main() -> Result<()> {
         Command::Mcp => mcp::serve().await,
         #[cfg(feature = "network")]
         Command::Serve {
+            profile,
             public_url,
             addr,
             tunnel_token_file,
         } => {
-            load_public_env()?;
-            serve_http(public_url, addr, tunnel_token_file.as_deref()).await
+            if profile == profile::Profile::Cloudflare {
+                load_public_env()?;
+            }
+            if profile != profile::Profile::Cloudflare && tunnel_token_file.is_some() {
+                anyhow::bail!("--tunnel-token-file is only valid for the cloudflare profile");
+            }
+            if profile == profile::Profile::Openai && public_url.is_some() {
+                anyhow::bail!("--public-url is not used by the openai profile");
+            }
+            serve_http(
+                profile,
+                public_url,
+                addr,
+                false,
+                tunnel_token_file.as_deref(),
+            )
+            .await
         }
         #[cfg(all(feature = "network", unix))]
         Command::Up {
+            profile,
             public_url,
             addr,
             tunnel_token_file,
-        } => lifecycle::up(public_url, addr, tunnel_token_file).await,
+        } => lifecycle::up(profile, public_url, addr, tunnel_token_file).await,
         #[cfg(all(feature = "network", unix))]
         Command::Down => lifecycle::down().await,
         #[cfg(feature = "network")]
@@ -196,19 +233,61 @@ async fn main() -> Result<()> {
 
 #[cfg(feature = "network")]
 async fn serve_http(
+    profile: profile::Profile,
     public_url: Option<String>,
     addr: SocketAddr,
+    manage_ingress: bool,
     tunnel_token_file: Option<&Path>,
 ) -> Result<()> {
-    let public_url = public_url
-        .or_else(|| std::env::var("TEMOTE_MCP_PUBLIC_URL").ok())
-        .context(
-            "TEMOTE_MCP_PUBLIC_URL is required; pass --public-url or create ~/.config/temote-mcp/public.env",
-        )?;
-    let public_url = http::normalize_public_url(&public_url)?;
-    let authenticator = access::AccessAuthenticator::from_env().await?;
+    if profile == profile::Profile::Openai {
+        anyhow::ensure!(
+            public_url.is_none(),
+            "OpenAI Secure MCP Tunnel does not use a public URL"
+        );
+        anyhow::ensure!(
+            tunnel_token_file.is_none(),
+            "OpenAI Secure MCP Tunnel does not use a Cloudflare tunnel token"
+        );
+        return serve_openai(addr, manage_ingress).await;
+    }
+
+    let public_url = ingress::resolve_public_url(profile, public_url, manage_ingress)
+        .await?
+        .into_string();
+    let tailscale_https_port = if manage_ingress && profile == profile::Profile::Tailscale {
+        let hostname = ingress::tailscale_dns_name().await?;
+        let parsed =
+            url::Url::parse(&public_url).context("managed Tailscale public URL is invalid")?;
+        anyhow::ensure!(
+            parsed.host_str() == Some(hostname.as_str()),
+            "managed Tailscale Funnel public URL must use the node hostname {hostname}"
+        );
+        let port = parsed
+            .port_or_known_default()
+            .context("managed Tailscale public URL has no HTTPS port")?;
+        anyhow::ensure!(
+            ingress::TAILSCALE_HTTPS_PORTS.contains(&port),
+            "managed Tailscale Funnel HTTPS port must be one of 443, 8443, or 10000"
+        );
+        Some(port)
+    } else {
+        None
+    };
     let roots = named_roots::NamedRoots::from_env()?;
     let (supervisor, approvals) = supervisor::SessionSupervisor::new(roots);
+    let authenticator = match profile {
+        profile::Profile::Cloudflare => {
+            provider::AuthProvider::Cloudflare(access::AccessAuthenticator::from_env().await?)
+        }
+        profile::Profile::Tailscale => provider::AuthProvider::Local(local_oauth::LocalOAuth::new(
+            public_url.clone(),
+            supervisor.approval_sender(),
+        )),
+        profile::Profile::Openai => unreachable!("handled before public profile setup"),
+    };
+    eprintln!("Profile: {}", profile.name());
+    eprintln!("Ingress: {}", profile.ingress_name());
+    eprintln!("Auth: {}", profile.auth_name());
     eprintln!(
         "Managed session roots: {}",
         if supervisor.roots_configured() {
@@ -218,35 +297,78 @@ async fn serve_http(
         }
     );
     let console = tokio::spawn(approvals::run_supervisor_console(approvals));
-    let mut tunnel = if let Some(token_file) = tunnel_token_file {
-        let child = tokio::process::Command::new("cloudflared")
-            .args(["tunnel", "run", "--token-file"])
-            .arg(token_file)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!("failed to start cloudflared with {}", token_file.display())
-            })?;
-        Some(child)
+    let should_start_ingress = manage_ingress || tunnel_token_file.is_some();
+    let mut managed_ingress = if should_start_ingress {
+        Some(ingress::start(profile, addr, tunnel_token_file, tailscale_https_port).await?)
     } else {
         None
     };
 
     let serve = http::serve(addr, public_url, authenticator, Arc::clone(&supervisor));
     tokio::pin!(serve);
-    let serve_result = if let Some(child) = tunnel.as_mut() {
+    let serve_result = if let Some(ingress) = managed_ingress.as_mut() {
+        let ingress_name = ingress.profile().ingress_name();
         tokio::select! {
             result = &mut serve => result,
-            status = child.wait() => {
-                let status = status.context("failed while waiting for cloudflared")?;
-                Err(anyhow::anyhow!("cloudflared exited while temote-mcp serve was active: {status}"))
+            status = ingress.child_mut().wait() => {
+                let status = status.with_context(|| format!("failed while waiting for {ingress_name}"))?;
+                Err(anyhow::anyhow!("{ingress_name} exited while temote-mcp serve was active: {status}"))
             }
         }
     } else {
         serve.await
     };
 
+    if let Some(ingress) = managed_ingress.as_mut() {
+        stop_child(ingress.child_mut()).await;
+    }
+    let shutdown_result = supervisor.shutdown().await;
+    console.abort();
+    serve_result?;
+    shutdown_result
+}
+
+#[cfg(feature = "network")]
+async fn serve_openai(addr: SocketAddr, manage_tunnel: bool) -> Result<()> {
+    openai_tunnel::ensure_loopback(addr)?;
+    let roots = named_roots::NamedRoots::from_env()?;
+    let (supervisor, approvals) = supervisor::SessionSupervisor::new(roots);
+    let authenticator = provider::AuthProvider::OpenAiTunnel;
+    eprintln!("Profile: openai");
+    eprintln!("Connection: OpenAI Secure MCP Tunnel");
+    eprintln!("Local MCP origin: {}", openai_tunnel::local_mcp_url(addr));
+    eprintln!(
+        "Managed session roots: {}",
+        if supervisor.roots_configured() {
+            "configured"
+        } else {
+            "not configured (session_start fails closed)"
+        }
+    );
+    let console = tokio::spawn(approvals::run_supervisor_console(approvals));
+    let mut tunnel = if manage_tunnel {
+        Some(openai_tunnel::start(addr).await?)
+    } else {
+        None
+    };
+    let serve = http::serve(
+        addr,
+        format!("http://{addr}"),
+        authenticator,
+        Arc::clone(&supervisor),
+    );
+    tokio::pin!(serve);
+    let serve_result = if let Some(child) = tunnel.as_mut() {
+        tokio::select! {
+            result = &mut serve => result,
+            status = child.wait() => {
+                let status = status.context("failed while waiting for OpenAI tunnel-client")?;
+                Err(anyhow::anyhow!("OpenAI tunnel-client exited while temote-mcp serve was active: {status}"))
+            }
+        }
+    } else {
+        serve.await
+    };
     if let Some(child) = tunnel.as_mut() {
         stop_child(child).await;
     }

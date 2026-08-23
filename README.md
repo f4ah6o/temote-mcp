@@ -29,7 +29,12 @@ For an always-on host, configure a named root and run the HTTP supervisor:
 # Example host layout:
 # ~/src -> /Volumes/devstorage/Developer
 export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp up
+# Existing deployments default to the Cloudflare profile.
+temote-mcp up --profile cloudflare
+# Or use Tailscale Funnel + Temote local OAuth:
+# temote-mcp up --profile tailscale
+# Or an outbound-only OpenAI Secure MCP Tunnel:
+# temote-mcp up --profile openai
 ```
 
 An authenticated MCP client can then use:
@@ -65,7 +70,7 @@ Specify `--agent codex`, `--agent claude-code`, or another supported agent when 
 
 - [Using sessions and tools](docs/usage.md)
 - [Managed sessions and named roots](docs/managed-sessions.md)
-- [Public HTTP endpoint and Cloudflare Access](docs/public-http.md)
+- [Remote connection profiles: Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel](docs/public-http.md)
 - [1Password and kintone integrations](docs/integrations.md)
 - [Multi-host Cloudflare gateway](docs/gateway.md)
 - [Linux sandbox and crates.io packaging](docs/linux-sandbox.md)

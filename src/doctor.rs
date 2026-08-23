@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::os::unix::fs::PermissionsExt;
 use tokio::process::Command;
 
+use crate::profile::Profile;
 use crate::sandbox;
 
 #[cfg(feature = "network")]
@@ -26,6 +27,7 @@ const MAX_TUNNEL_TOKEN_BYTES: u64 = 16 * 1024;
 
 #[derive(Default)]
 pub struct Options {
+    pub profile: Option<Profile>,
     pub cloudflare: bool,
     pub tunnel_token_file: Option<PathBuf>,
 }
@@ -169,12 +171,49 @@ pub async fn run(options: Options) -> Result<()> {
         check_sandbox_runtime_environment(&mut report).await;
     }
 
-    check_cloudflare_local(
-        &mut report,
-        options.tunnel_token_file.as_deref(),
-        options.cloudflare,
-    )
-    .await;
+    anyhow::ensure!(
+        !(options
+            .profile
+            .is_some_and(|profile| profile != Profile::Cloudflare)
+            && options.cloudflare),
+        "--cloudflare can only be combined with --profile cloudflare"
+    );
+
+    match options.profile {
+        Some(Profile::Cloudflare) => {
+            check_cloudflare_local(&mut report, options.tunnel_token_file.as_deref(), true).await;
+            #[cfg(feature = "network")]
+            check_cloudflare_access_config(&mut report);
+        }
+        Some(Profile::Tailscale) => {
+            #[cfg(feature = "network")]
+            check_tailscale_local(&mut report).await;
+            #[cfg(not(feature = "network"))]
+            report.add(Check::fail(
+                "tailscale profile",
+                "this binary was built without the network feature",
+                "Use the default temote-mcp build for remote connection profiles.",
+            ));
+        }
+        Some(Profile::Openai) => {
+            #[cfg(feature = "network")]
+            check_openai_tunnel(&mut report).await;
+            #[cfg(not(feature = "network"))]
+            report.add(Check::fail(
+                "openai profile",
+                "this binary was built without the network feature",
+                "Use the default temote-mcp build for remote connection profiles.",
+            ));
+        }
+        None => {
+            check_cloudflare_local(
+                &mut report,
+                options.tunnel_token_file.as_deref(),
+                options.cloudflare,
+            )
+            .await;
+        }
+    }
 
     #[cfg(feature = "network")]
     if options.cloudflare {
@@ -203,6 +242,138 @@ fn check_platform(report: &mut Report) {
             "temote-mcp sandbox execution currently supports Linux and macOS only.",
         ));
     }
+}
+
+#[cfg(feature = "network")]
+fn check_cloudflare_access_config(report: &mut Report) {
+    match crate::access::AccessConfig::from_env() {
+        Ok(_) => report.add(Check::pass(
+            "cloudflare access",
+            "team domain, audience, and email allowlist are configured",
+        )),
+        Err(error) => report.add(Check::fail(
+            "cloudflare access",
+            format!("configuration is incomplete: {error}"),
+            "Set TEMOTE_MCP_ACCESS_TEAM_DOMAIN, TEMOTE_MCP_ACCESS_AUDIENCE, and TEMOTE_MCP_ACCESS_ALLOWED_EMAILS for the cloudflare profile.",
+        )),
+    }
+}
+
+#[cfg(feature = "network")]
+async fn check_tailscale_local(report: &mut Report) {
+    match Command::new("tailscale").arg("version").output().await {
+        Ok(output) if output.status.success() => report.add(Check::pass(
+            "tailscale",
+            display_output(&output).unwrap_or_else(|| "available".to_owned()),
+        )),
+        Ok(output) => {
+            report.add(Check::fail(
+                "tailscale",
+                format!("tailscale version failed with {}", output.status),
+                "Install and connect Tailscale before using --profile tailscale.",
+            ));
+            return;
+        }
+        Err(error) => {
+            report.add(Check::fail(
+                "tailscale",
+                format!("cannot execute tailscale: {error}"),
+                "Install Tailscale CLI and make sure it is available on PATH.",
+            ));
+            return;
+        }
+    }
+
+    match crate::ingress::tailscale_dns_name().await {
+        Ok(hostname) => {
+            report.add(Check::pass(
+                "tailscale node",
+                format!("connected with canonical HTTPS origin https://{hostname}"),
+            ));
+        }
+        Err(error) => report.add(Check::fail(
+            "tailscale node",
+            error.to_string(),
+            "Run `tailscale up`, enable MagicDNS/HTTPS, and ensure Self.DNSName is available.",
+        )),
+    }
+
+    match crate::ingress::configured_funnel_https_ports().await {
+        Ok(configured) => match crate::ingress::TAILSCALE_HTTPS_PORTS
+            .into_iter()
+            .find(|port| !configured.contains(port))
+        {
+            Some(port) => report.add(Check::pass(
+                "tailscale funnel",
+                format!(
+                    "Funnel is available; Temote will use HTTPS port {port} without replacing existing ports {:?}",
+                    configured
+                ),
+            )),
+            None => report.add(Check::fail(
+                "tailscale funnel",
+                "all supported HTTPS ports (443, 8443, 10000) already have Funnel configuration owned outside this temote-mcp process",
+                "Free one supported Funnel port before `temote-mcp up --profile tailscale`; Temote will not replace existing Funnel configuration.",
+            )),
+        },
+        Err(error) => report.add(Check::fail(
+            "tailscale funnel",
+            error.to_string(),
+            "Enable Funnel for this node/tailnet and verify the funnel node attribute and HTTPS prerequisites.",
+        )),
+    }
+
+    report.add(Check::pass(
+        "local OAuth state",
+        "authorization codes, registrations, and access tokens use bounded process-local memory; no Cloudflare credentials or persistent OAuth key file is required",
+    ));
+}
+
+#[cfg(feature = "network")]
+async fn check_openai_tunnel(report: &mut Report) {
+    match crate::openai_tunnel::binary_version().await {
+        Ok(version) => report.add(Check::pass("OpenAI tunnel-client", version)),
+        Err(error) => {
+            report.add(Check::fail(
+                "OpenAI tunnel-client",
+                error.to_string(),
+                "Install the supported OpenAI tunnel-client from Platform Tunnels management or the openai/tunnel-client release, then put it on PATH (or set TUNNEL_CLIENT_BIN).",
+            ));
+            return;
+        }
+    }
+
+    match crate::openai_tunnel::config_from_env() {
+        Ok(config) => report.add(Check::pass(
+            "OpenAI tunnel configuration",
+            format!(
+                "CONTROL_PLANE_TUNNEL_ID is valid and runtime credential is provided via {}",
+                config.runtime_key_env
+            ),
+        )),
+        Err(error) => {
+            report.add(Check::fail(
+                "OpenAI tunnel configuration",
+                error.to_string(),
+                "Set CONTROL_PLANE_TUNNEL_ID and a Restricted CONTROL_PLANE_API_KEY with Tunnels Read + Use. Do not use an admin key for the long-lived runtime.",
+            ));
+            return;
+        }
+    }
+
+    match crate::openai_tunnel::doctor_control_plane().await {
+        Ok(detail) => report.add(Check::pass("OpenAI tunnel control plane", detail)),
+        Err(error) => report.add(Check::fail(
+            "OpenAI tunnel control plane",
+            error.to_string(),
+            "Verify tunnel/workspace association and that the runtime-key principal has Tunnels Read + Use for the configured tunnel.",
+        )),
+    }
+
+    report.add(Check::pass(
+        "OpenAI local bind policy",
+        "temote-mcp up --profile openai enforces a loopback-only HTTP origin and does not require TEMOTE_MCP_PUBLIC_URL, Cloudflare, or Tailscale",
+    ));
 }
 
 async fn check_cloudflare_local(report: &mut Report, override_path: Option<&Path>, force: bool) {

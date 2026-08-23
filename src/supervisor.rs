@@ -53,6 +53,10 @@ impl SessionSupervisor {
         !self.roots.is_empty()
     }
 
+    pub fn approval_sender(&self) -> ApprovalSender {
+        self.approval_sender.clone()
+    }
+
     pub async fn start(
         &self,
         logical_path: &str,
