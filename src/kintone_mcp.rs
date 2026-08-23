@@ -11,7 +11,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use crate::config;
 use crate::line_protocol::{
     BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
-    next_bounded_line,
+    encode_bounded_json_line, next_bounded_line,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -403,10 +403,8 @@ impl Client {
     }
 
     async fn write_json(&mut self, value: &Value) -> Result<()> {
-        self.stdin
-            .write_all(serde_json::to_string(value)?.as_bytes())
-            .await?;
-        self.stdin.write_all(b"\n").await?;
+        let line = encode_bounded_json_line(value, MAX_JSON_LINE_BYTES)?;
+        self.stdin.write_all(&line).await?;
         self.stdin.flush().await?;
         Ok(())
     }

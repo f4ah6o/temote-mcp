@@ -1,8 +1,22 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub(crate) const MAX_JSON_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) fn encode_bounded_json_line(value: &Value, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value).context("failed to serialize child MCP message")?;
+    let wire_bytes = bytes
+        .len()
+        .checked_add(1)
+        .context("child MCP message size overflow")?;
+    anyhow::ensure!(
+        wire_bytes <= max_bytes,
+        "child MCP message exceeds {max_bytes} bytes"
+    );
+    bytes.push(b'\n');
+    Ok(bytes)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BoundedLine {
@@ -108,6 +122,41 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn generated_json_line_encoding_matches_wire_budget() -> noprop::TestResult {
+        test_support::run(0x4a53_4f4e_4c49_4e45, 512, |ctx| {
+            let max_bytes = noprop::sample_usize_in(ctx, 1..=256);
+            let payload_len = noprop::sample_usize_in(ctx, 0..=300);
+            let payload = (0..payload_len)
+                .map(|_| match noprop::sample_usize_in(ctx, 0..=3) {
+                    0 => 'x',
+                    1 => '"',
+                    2 => '\\',
+                    _ => '\n',
+                })
+                .collect::<String>();
+            let value = json!({"payload": payload});
+            let serialized = serde_json::to_vec(&value).unwrap();
+            let expected = serialized
+                .len()
+                .checked_add(1)
+                .is_some_and(|wire| wire <= max_bytes);
+            let result = encode_bounded_json_line(&value, max_bytes);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "serialized={} max={max_bytes}",
+                serialized.len()
+            );
+            if let Ok(line) = result {
+                assert_eq!(line.len(), serialized.len() + 1);
+                assert_eq!(line.last(), Some(&b'\n'));
+                assert_eq!(&line[..line.len() - 1], serialized.as_slice());
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn generated_request_ids_roll_over_without_sticking() -> noprop::TestResult {
