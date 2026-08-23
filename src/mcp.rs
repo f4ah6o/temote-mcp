@@ -23,6 +23,9 @@ const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_COMPLETED_JOBS_PER_SESSION: usize = 128;
 const MAX_COMPLETED_JOBS_TOTAL: usize = 1024;
 const MAX_GIT_ADD_PATHS: usize = 256;
+const MAX_COMMAND_ARGUMENTS: usize = 256;
+const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
+const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -632,6 +635,7 @@ async fn call_tool(
                 arguments.len() >= 2,
                 "kintone_cli_run requires a cli-kintone command pair"
             );
+            validate_command_budget(&arguments)?;
             let cwd = cwd(&args, &session)?;
             let stdout_path = args
                 .get("stdout_path")
@@ -1650,8 +1654,39 @@ fn required_command(args: &Value) -> Result<Vec<String>> {
                 .context("command entries must be strings")
         })
         .collect::<Result<Vec<_>>>()?;
-    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    validate_command_budget(&command)?;
     Ok(command)
+}
+
+fn validate_command_budget(command: &[String]) -> Result<()> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    anyhow::ensure!(
+        !command[0].is_empty(),
+        "command executable must not be empty"
+    );
+    anyhow::ensure!(
+        command.len() <= MAX_COMMAND_ARGUMENTS,
+        "command must contain at most {MAX_COMMAND_ARGUMENTS} arguments"
+    );
+    let mut total = 0usize;
+    for argument in command {
+        anyhow::ensure!(
+            !argument.contains('\0'),
+            "command arguments must not contain NUL bytes"
+        );
+        anyhow::ensure!(
+            argument.len() <= MAX_COMMAND_ARGUMENT_BYTES,
+            "command argument exceeds {MAX_COMMAND_ARGUMENT_BYTES} bytes"
+        );
+        total = total
+            .checked_add(argument.len())
+            .context("command argument size overflow")?;
+        anyhow::ensure!(
+            total <= MAX_COMMAND_TOTAL_BYTES,
+            "command arguments exceed {MAX_COMMAND_TOTAL_BYTES} bytes in total"
+        );
+    }
+    Ok(())
 }
 
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
@@ -2516,6 +2551,56 @@ mod tests {
             if let Ok(command) = parsed {
                 assert_eq!(command.len(), len);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_command_budget_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x434f_4d4d_4255_4447, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=MAX_COMMAND_ARGUMENTS + 8);
+            let width = noprop::sample_usize_in(ctx, 0..=1024);
+            let mut command = (0..count)
+                .map(|index| {
+                    if index == 0 {
+                        "x".repeat(width.max(1))
+                    } else {
+                        "x".repeat(width)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mutation = noprop::sample_usize_in(ctx, 0..=4);
+            if !command.is_empty() {
+                match mutation {
+                    1 => command[0].clear(),
+                    2 => {
+                        let index = noprop::sample_usize_in(ctx, 0..command.len());
+                        command[index].push('\0');
+                    }
+                    3 => {
+                        let index = noprop::sample_usize_in(ctx, 0..command.len());
+                        command[index] = "x".repeat(MAX_COMMAND_ARGUMENT_BYTES + 1);
+                    }
+                    _ => {}
+                }
+            }
+            let total = command
+                .iter()
+                .try_fold(0usize, |sum, argument| sum.checked_add(argument.len()));
+            let expected = !command.is_empty()
+                && !command[0].is_empty()
+                && command.len() <= MAX_COMMAND_ARGUMENTS
+                && command.iter().all(|argument| {
+                    !argument.contains('\0') && argument.len() <= MAX_COMMAND_ARGUMENT_BYTES
+                })
+                && total.is_some_and(|bytes| bytes <= MAX_COMMAND_TOTAL_BYTES);
+            let result = validate_command_budget(&command);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "count={} width={width} mutation={mutation} total={total:?}",
+                command.len()
+            );
             Ok(())
         })
     }
