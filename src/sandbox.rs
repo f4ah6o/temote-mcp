@@ -114,15 +114,10 @@ async fn run_with_metadata_roots(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = process
+    let child = process
         .spawn()
         .context("failed to start sandboxed command")?;
-    if let Some(bytes) = stdin
-        && let Some(mut child_stdin) = child.stdin.take()
-    {
-        child_stdin.write_all(bytes).await?;
-    }
-    wait_with_limited_output(child).await
+    wait_with_limited_output(child, stdin).await
 }
 
 /// Resolves the worktree's private Git directory and its common repository
@@ -397,18 +392,17 @@ async fn run_unrestricted_with_env_mode(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = process
+    let child = process
         .spawn()
         .context("failed to start unsandboxed command")?;
-    if let Some(bytes) = stdin
-        && let Some(mut child_stdin) = child.stdin.take()
-    {
-        child_stdin.write_all(bytes).await?;
-    }
-    wait_with_limited_output(child).await
+    wait_with_limited_output(child, stdin).await
 }
 
-async fn wait_with_limited_output(mut child: tokio::process::Child) -> Result<Output> {
+async fn wait_with_limited_output(
+    mut child: tokio::process::Child,
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    let child_stdin = child.stdin.take();
     let stdout = child
         .stdout
         .take()
@@ -418,12 +412,22 @@ async fn wait_with_limited_output(mut child: tokio::process::Child) -> Result<Ou
         .take()
         .context("sandbox command stderr was not captured")?;
     let remaining = Arc::new(AtomicUsize::new(MAX_COMMAND_OUTPUT_BYTES));
-    let (stdout, stderr) = tokio::join!(
+    let write_stdin = async move {
+        if let Some(bytes) = stdin {
+            let mut child_stdin = child_stdin.context("sandbox command stdin was not captured")?;
+            child_stdin.write_all(bytes).await?;
+            child_stdin.shutdown().await?;
+        }
+        Result::<()>::Ok(())
+    };
+    let (stdout, stderr, stdin_result) = tokio::join!(
         read_limited(stdout, remaining.clone()),
-        read_limited(stderr, remaining)
+        read_limited(stderr, remaining),
+        write_stdin
     );
     let (stdout, stdout_truncated) = stdout?;
     let (stderr, stderr_truncated) = stderr?;
+    stdin_result?;
     let status = child.wait().await?;
     Ok(Output {
         status: status.code().unwrap_or(-1),
@@ -518,6 +522,41 @@ mod generic_tests {
 
         assert_eq!(output, b"01234567");
         assert!(truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_bidirectional_process_io_does_not_deadlock() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        test_support::run(0x5049_5045_494f_0001, 32, |ctx| {
+            let input_len = noprop::sample_usize_in(ctx, 64 * 1024..=256 * 1024);
+            let output_len = noprop::sample_usize_in(ctx, 64 * 1024..=256 * 1024);
+            let input = vec![b'i'; input_len];
+            let command = vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                format!("head -c {output_len} /dev/zero; cat >/dev/null"),
+            ];
+
+            let output = runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    run_unrestricted(&command, &cwd, Some(&input)),
+                )
+                .await
+                .expect("bidirectional child I/O deadlocked")
+                .unwrap()
+            });
+            assert_eq!(output.status, 0);
+            assert_eq!(output.stdout.as_bytes().len(), output_len);
+            assert!(!output.truncated);
+            Ok(())
+        })
     }
 
     #[test]
