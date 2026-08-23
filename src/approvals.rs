@@ -36,6 +36,7 @@ const MAX_ACTIVITY_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
+const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
@@ -431,7 +432,7 @@ pub struct RuntimeHandle {
     service_account_configured: bool,
     kintone_mcp_configured: bool,
     kintone_cli_configured: bool,
-    commands: mpsc::UnboundedSender<RuntimeCommand>,
+    commands: mpsc::Sender<RuntimeCommand>,
     join: JoinHandle<Result<()>>,
 }
 
@@ -452,6 +453,7 @@ impl RuntimeHandle {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::SetYolo { value, response })
+            .await
             .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
         receiver
             .await
@@ -463,6 +465,7 @@ impl RuntimeHandle {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::AllowDirectory { path, response })
+            .await
             .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
         receiver
             .await
@@ -474,6 +477,7 @@ impl RuntimeHandle {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::RevokeDirectory { path, response })
+            .await
             .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
         receiver
             .await
@@ -485,6 +489,7 @@ impl RuntimeHandle {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::Snapshot { response })
+            .await
             .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
         receiver
             .await
@@ -492,7 +497,7 @@ impl RuntimeHandle {
     }
 
     pub async fn shutdown(self) -> Result<()> {
-        let _ = self.commands.send(RuntimeCommand::Shutdown);
+        let _ = self.commands.send(RuntimeCommand::Shutdown).await;
         self.join
             .await
             .context("session runtime task failed to join")??;
@@ -533,7 +538,7 @@ pub async fn spawn_runtime(
 
     let id_for_handle = session.id.clone();
     let cwd_for_handle = session.cwd.clone();
-    let (commands, command_receiver) = mpsc::unbounded_channel();
+    let (commands, command_receiver) = mpsc::channel(MAX_PENDING_RUNTIME_COMMANDS);
     let join = tokio::spawn(async move {
         let result = run_runtime(
             listener,
@@ -740,7 +745,7 @@ async fn receive_session_message(
 async fn run_runtime(
     listener: UnixListener,
     session: &mut Session,
-    mut commands: mpsc::UnboundedReceiver<RuntimeCommand>,
+    mut commands: mpsc::Receiver<RuntimeCommand>,
     approval_sender: ApprovalSender,
     service_account_token: Option<&str>,
     kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
