@@ -89,9 +89,11 @@ pub async fn load_session(id: &str) -> Result<Session> {
 
 pub async fn read_session_metadata(id: &str) -> Result<Session> {
     let path = session_path(id)?;
-    let metadata = tokio::fs::symlink_metadata(&path)
-        .await
-        .with_context(|| format!("session {id} was not found; run `temote-mcp start` first"))?;
+    let file = open_session_metadata_nofollow(&path)
+        .with_context(|| format!("session {id} was not found or could not be opened safely"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect session metadata {}", path.display()))?;
     anyhow::ensure!(
         metadata.file_type().is_file(),
         "session metadata is not a regular file: {}",
@@ -103,9 +105,7 @@ pub async fn read_session_metadata(id: &str) -> Result<Session> {
         path.display()
     );
     use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(&path)
-        .await
-        .with_context(|| format!("cannot open session metadata {}", path.display()))?;
+    let file = tokio::fs::File::from_std(file);
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take((MAX_SESSION_METADATA_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -119,6 +119,19 @@ pub async fn read_session_metadata(id: &str) -> Result<Session> {
     let session: Session = serde_json::from_slice(&bytes).context("invalid temote-mcp session")?;
     validate_loaded_session(id, &session)?;
     Ok(session)
+}
+
+fn open_session_metadata_nofollow(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("cannot open session metadata {}", path.display()))
 }
 
 pub async fn session_is_active(id: &str) -> Result<bool> {
@@ -653,7 +666,7 @@ mod tests {
         symlink(&target, &path).unwrap();
 
         let error = read_session_metadata(&id).await.err().unwrap();
-        assert!(error.to_string().contains("not a regular file"));
+        assert!(error.to_string().contains("could not be opened safely"));
         tokio::fs::remove_file(path).await.unwrap();
     }
 
