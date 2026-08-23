@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -55,26 +56,27 @@ pub async fn up(
 
 pub async fn down() -> Result<()> {
     let pid_file = pid_file(false)?;
-    let pid = match read_pid_file(&pid_file) {
-        Ok(pid) => pid,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-        {
+    let mut pid_handle = match open_readonly_nofollow(&pid_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             println!("no temote-mcp up process is recorded");
             return Ok(());
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", pid_file.display()));
+            return Err(error).with_context(|| format!("failed to open {}", pid_file.display()));
         }
     };
-
-    if !is_temote_process(pid)? {
+    let pid = read_pid_from_open_file(&mut pid_handle, &pid_file)
+        .with_context(|| format!("failed to read {}", pid_file.display()))?;
+    if try_acquire_pid_lock(&pid_handle)? {
         let _ = std::fs::remove_file(&pid_file);
         println!("recorded temote-mcp process is not running");
         return Ok(());
     }
+    anyhow::ensure!(
+        is_temote_process(pid)?,
+        "PID file is locked by an unexpected process; refusing to signal PID {pid}"
+    );
 
     let tunnel_pids = child_processes(pid);
     send_signal(pid, libc::SIGTERM)?;
@@ -101,6 +103,7 @@ pub async fn down() -> Result<()> {
 
 struct PidFile {
     path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl PidFile {
@@ -113,7 +116,8 @@ impl PidFile {
                 .open(path)
             {
                 Ok(mut file) => {
-                    #[cfg(unix)]
+                    acquire_pid_lock(&file)
+                        .with_context(|| format!("failed to lock {}", path.display()))?;
                     {
                         use std::os::unix::fs::PermissionsExt;
                         file.set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -125,15 +129,17 @@ impl PidFile {
                         .with_context(|| format!("failed to sync {}", path.display()))?;
                     return Ok(Self {
                         path: path.to_owned(),
+                        _file: file,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    let pid = read_pid_file(path).with_context(|| {
+                    let mut existing = open_readonly_nofollow(path).with_context(|| {
+                        format!("cannot safely open existing PID file {}", path.display())
+                    })?;
+                    let _pid = read_pid_from_open_file(&mut existing, path).with_context(|| {
                         format!("cannot safely inspect existing PID file {}", path.display())
                     })?;
-                    if is_temote_process(pid)
-                        .with_context(|| format!("cannot safely inspect recorded process {pid}"))?
-                    {
+                    if !try_acquire_pid_lock(&existing)? {
                         anyhow::bail!("temote-mcp is already running; use temote-mcp down first");
                     }
                     std::fs::remove_file(path).with_context(|| {
@@ -234,9 +240,14 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+#[cfg(test)]
 fn read_pid_file(path: &Path) -> Result<i32> {
-    let file = open_readonly_nofollow(path)
+    let mut file = open_readonly_nofollow(path)
         .with_context(|| format!("cannot open PID file {}", path.display()))?;
+    read_pid_from_open_file(&mut file, path)
+}
+
+fn read_pid_from_open_file(file: &mut std::fs::File, path: &Path) -> Result<i32> {
     let metadata = file
         .metadata()
         .with_context(|| format!("cannot inspect PID file {}", path.display()))?;
@@ -261,6 +272,27 @@ fn read_pid_file(path: &Path) -> Result<i32> {
     );
     let raw = std::str::from_utf8(&bytes).context("PID file is not valid UTF-8")?;
     parse_pid(raw)
+}
+
+fn try_acquire_pid_lock(file: &std::fs::File) -> Result<bool> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    let raw = error.raw_os_error();
+    if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+        return Ok(false);
+    }
+    Err(error).context("failed to inspect PID file lock")
+}
+
+fn acquire_pid_lock(file: &std::fs::File) -> Result<()> {
+    anyhow::ensure!(
+        try_acquire_pid_lock(file)?,
+        "PID file is already locked by another process"
+    );
+    Ok(())
 }
 
 fn parse_pid(raw: &str) -> Result<i32> {
@@ -384,6 +416,49 @@ mod tests {
         std::fs::write(&path, b"not-a-pid\n").unwrap();
         assert!(PidFile::create(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"not-a-pid\n");
+    }
+
+    #[test]
+    fn generated_pid_file_lock_tracks_owner_lifetime() -> noprop::TestResult {
+        test_support::run(0x5049_444c_4f43_4b01, 128, |ctx| {
+            let root = tempfile::tempdir().unwrap();
+            let path = root
+                .path()
+                .join(format!("up-{:x}.pid", noprop::sample_u64(ctx)));
+            let holder = PidFile::create(&path).unwrap();
+            let probe = open_readonly_nofollow(&path).unwrap();
+            let drop_before_probe = noprop::sample_bool(ctx);
+            if drop_before_probe {
+                drop(holder);
+                assert!(
+                    try_acquire_pid_lock(&probe).unwrap(),
+                    "released PID file lock remained busy"
+                );
+            } else {
+                assert!(
+                    !try_acquire_pid_lock(&probe).unwrap(),
+                    "live PID file lock was unexpectedly acquirable"
+                );
+                drop(holder);
+                assert!(
+                    try_acquire_pid_lock(&probe).unwrap(),
+                    "PID file lock did not release after owner drop"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn unlocked_pid_file_is_stale_even_when_recorded_pid_is_live() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("up.pid");
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+        let holder = PidFile::create(&path).unwrap();
+        assert_eq!(read_pid_file(&path).unwrap(), std::process::id() as i32);
+        drop(holder);
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
