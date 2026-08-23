@@ -127,6 +127,61 @@ test("reconnect increments generation and rejects the old host", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("timed-out queued requests are removed before a host can execute them", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+    { rpcTimeoutMs: 5 },
+  );
+  const connected = await body(await session.fetch(post("connect", {
+    session_id: "timeout-safe",
+    instance_id: "instance-timeout",
+    platform: "linux",
+  })));
+
+  const timedOut = await session.fetch(post("dispatch", {
+    request: {
+      jsonrpc: "2.0",
+      id: 99,
+      method: "tools/call",
+      params: { name: "git_push", arguments: { session_id: "timeout-safe" } },
+    },
+  }));
+  assert.equal(timedOut.status, 504);
+  assert.equal((await timedOut.json()).error, "host_request_timeout");
+  assert.equal(session.pending.size, 0);
+  assert.equal(session.queue.length, 0);
+  assert.equal(connected.generation, 1);
+});
+
+test("queued request cancellation preserves every unrelated request across positions", () => {
+  for (let count = 1; count <= 64; count += 1) {
+    const positions = new Set([0, Math.floor(count / 2), count - 1]);
+    for (const position of positions) {
+      const session = new GatewaySession(
+        { storage: new MemoryStorage() },
+        { GATEWAY_REGISTRY: noOpRegistry() },
+      );
+      session.queue = Array.from({ length: count }, (_, index) => ({
+        request_id: `request-${index}`,
+        request: { id: index },
+      }));
+      session.removeQueuedRequest(`request-${position}`);
+      assert.equal(session.queue.length, count - 1, `count=${count} position=${position}`);
+      assert.equal(
+        session.queue.some((entry) => entry.request_id === `request-${position}`),
+        false,
+        `count=${count} position=${position}`,
+      );
+      assert.deepEqual(
+        session.queue.map((entry) => entry.request.id),
+        Array.from({ length: count }, (_, index) => index).filter((index) => index !== position),
+        `count=${count} position=${position}`,
+      );
+    }
+  }
+});
+
 test("dispatch capacity is bounded and excess work fails without disturbing pending calls", async () => {
   const session = new GatewaySession(
     { storage: new MemoryStorage() },

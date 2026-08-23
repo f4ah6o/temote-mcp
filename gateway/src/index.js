@@ -239,9 +239,10 @@ async function handleHostApi(request, env, action) {
 }
 
 export class GatewaySession {
-  constructor(state, env) {
+  constructor(state, env, options = {}) {
     this.state = state;
     this.env = env;
+    this.rpcTimeoutMs = options.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
     this.pending = new Map();
     this.queue = [];
     this.waitingPoll = null;
@@ -378,8 +379,9 @@ export class GatewaySession {
     const outcome = new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
+        this.removeQueuedRequest(requestId);
         resolve({ status: 504, error: "host_request_timeout" });
-      }, RPC_TIMEOUT_MS);
+      }, this.rpcTimeoutMs);
       this.pending.set(requestId, { resolve, timer, generation: host.generation });
     });
     this.queue.push({ request_id: requestId, request });
@@ -392,6 +394,11 @@ export class GatewaySession {
 
   async currentHost() {
     return (await this.state.storage.get("host")) || null;
+  }
+
+  removeQueuedRequest(requestId) {
+    const index = this.queue.findIndex((entry) => entry.request_id === requestId);
+    if (index >= 0) this.queue.splice(index, 1);
   }
 
   flushWaitingPoll() {
