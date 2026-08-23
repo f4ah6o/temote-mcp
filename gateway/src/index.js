@@ -20,6 +20,7 @@ const RPC_TIMEOUT_MS = 35_000;
 const MAX_PENDING_HOST_REQUESTS = 64;
 const MAX_REQUEST_ID_ATTEMPTS = 8;
 const MAX_REGISTRY_SESSIONS = 1024;
+const MAX_SESSION_STATUS_CHECK_CONCURRENCY = 16;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_INTERNAL_DISPATCH_ENVELOPE_BYTES = 64 * 1024;
 const MAX_INTERNAL_DISPATCH_BODY_BYTES = MAX_BODY_BYTES + MAX_INTERNAL_DISPATCH_ENVELOPE_BYTES;
@@ -192,10 +193,11 @@ async function handleToolCall(rpc, env) {
     const response = await registry.fetch("https://registry.internal/list");
     if (!response.ok) return mcpJson(rpcError(id, -32001, "session registry unavailable"));
     const sessions = await safeBoundedJson(response, MAX_REGISTRY_RESPONSE_BYTES, "session registry response");
-    if (!Array.isArray(sessions)) {
+    if (!Array.isArray(sessions) || sessions.length > MAX_REGISTRY_SESSIONS) {
       return mcpJson(rpcError(id, -32001, "session registry returned invalid JSON"));
     }
-    const result = textResult(JSON.stringify(sessions, null, 2));
+    const onlineSessions = await filterOnlineRegistrySessions(sessions, env);
+    const result = textResult(JSON.stringify(onlineSessions, null, 2));
     return mcpJson(rpcResult(
       id,
       isModernRequest(rpc)
@@ -273,6 +275,7 @@ export class GatewaySession {
 
   async fetch(request) {
     const action = new URL(request.url).pathname.slice(1);
+    if (action === "status") return this.status();
     const body = await readJson(request, gatewaySessionBodyLimit(action));
     if (!body.ok) return jsonResponse({ error: "invalid_json", detail: body.error }, 400);
     switch (action) {
@@ -289,6 +292,16 @@ export class GatewaySession {
       default:
         return jsonResponse({ error: "not_found" }, 404);
     }
+  }
+
+  async status() {
+    const host = await this.currentHost();
+    if (!host) return new Response(null, { status: 404 });
+    if (!Number.isSafeInteger(host.expires_at) || host.expires_at <= Date.now()) {
+      await this.clearHost(host, "host_lease_expired");
+      return new Response(null, { status: 404 });
+    }
+    return new Response(null, { status: 204 });
   }
 
   async connect(body) {
@@ -674,6 +687,32 @@ function verifyGeneration(host, body) {
 
 function normalizePlatform(value) {
   return ["macos", "linux", "wsl2", "windows"].includes(value) ? value : "unknown";
+}
+
+export async function filterOnlineRegistrySessions(
+  sessions,
+  env,
+  concurrency = MAX_SESSION_STATUS_CHECK_CONCURRENCY,
+) {
+  const online = [];
+  const limit = Math.max(1, Math.min(MAX_SESSION_STATUS_CHECK_CONCURRENCY, concurrency));
+  for (let offset = 0; offset < sessions.length; offset += limit) {
+    const batch = sessions.slice(offset, offset + limit);
+    const checked = await Promise.all(batch.map(async (session) => {
+      const sessionId = session?.session_id;
+      if (!validateSessionId(sessionId)) return null;
+      try {
+        const response = await sessionStub(env, sessionId).fetch("https://session.internal/status");
+        return response.ok ? session : null;
+      } catch {
+        return null;
+      }
+    }));
+    for (const session of checked) {
+      if (session) online.push(session);
+    }
+  }
+  return online;
 }
 
 function sessionStub(env, sessionId) {

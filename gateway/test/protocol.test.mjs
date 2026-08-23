@@ -794,6 +794,33 @@ test("mismatched host response preserves pending RPC for a correct retry", async
   assert.equal((await dispatched).status, 200);
 });
 
+test("session status reflects the current host lease", async () => {
+  const storage = new MemoryStorage();
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const connected = await session.fetch(post("connect", {
+    session_id: "status-check",
+    instance_id: "instance-status",
+    platform: "macos",
+  }));
+  assert.equal(connected.status, 200);
+  assert.equal(
+    (await session.fetch(new Request("https://session.internal/status"))).status,
+    204,
+  );
+
+  const host = await storage.get("host");
+  host.expires_at = Date.now() - 1;
+  await storage.put("host", host);
+  assert.equal(
+    (await session.fetch(new Request("https://session.internal/status"))).status,
+    404,
+  );
+  assert.equal(await storage.get("host"), undefined);
+});
+
 test("host respond budget covers maximum get_image payload without widening other host APIs", async () => {
   const rawImageBytes = 32 * 1024 * 1024;
   const maximumBase64Bytes = 4 * Math.ceil(rawImageBytes / 3);
@@ -997,6 +1024,85 @@ test("the MCP endpoint selects a Session Durable Object only by session_id", asy
   assert.equal((await response.json()).result.content[0].text, "routed");
 });
 
+
+test("session_list performs bounded final online checks and preserves registry order", async () => {
+  const sessions = Array.from({ length: 40 }, (_, index) => ({
+    session_id: `session-${String(index).padStart(2, "0")}`,
+    generation: 1,
+    expires_at: Date.now() + 60_000,
+  }));
+  let activeChecks = 0;
+  let maxActiveChecks = 0;
+  const registryStub = {
+    fetch: async () => new Response(JSON.stringify(sessions), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  };
+  const sessionNamespace = {
+    idFromName: (name) => name,
+    get: (sessionId) => ({
+      fetch: async () => {
+        activeChecks += 1;
+        maxActiveChecks = Math.max(maxActiveChecks, activeChecks);
+        await new Promise((resolve) => setImmediate(resolve));
+        activeChecks -= 1;
+        const index = Number(sessionId.slice("session-".length));
+        return new Response(null, { status: index % 3 === 0 ? 404 : 204 });
+      },
+    }),
+  };
+
+  const response = await worker.fetch(legacyToolCallRequest("session_list"), {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: {
+      idFromName: (name) => name,
+      get: () => registryStub,
+    },
+    GATEWAY_SESSIONS: sessionNamespace,
+  });
+  const payload = await response.json();
+  const online = JSON.parse(payload.result.content[0].text);
+  assert.deepEqual(
+    online.map((session) => session.session_id),
+    sessions.filter((_, index) => index % 3 !== 0).map((session) => session.session_id),
+  );
+  assert.ok(maxActiveChecks > 1);
+  assert.ok(maxActiveChecks <= 16, `maxActiveChecks=${maxActiveChecks}`);
+});
+
+test("session_list rejects oversized registry cardinality before status fan-out", async () => {
+  const sessions = Array.from({ length: 1025 }, (_, index) => ({
+    session_id: `s-${index}`,
+    generation: 1,
+    expires_at: Date.now() + 60_000,
+  }));
+  let statusChecks = 0;
+  const response = await worker.fetch(legacyToolCallRequest("session_list"), {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async () => new Response(JSON.stringify(sessions), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      }),
+    },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async () => {
+          statusChecks += 1;
+          return new Response(null, { status: 204 });
+        },
+      }),
+    },
+  });
+  const payload = await response.json();
+  assert.equal(payload.error.code, -32001);
+  assert.equal(statusChecks, 0);
+});
 
 test("internal registry responses are bounded before JSON parsing", async () => {
   const registryStub = {
