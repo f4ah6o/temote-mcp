@@ -11,7 +11,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
+use crate::line_protocol::{
+    BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, classify_child_message, next_bounded_line,
+};
 use crate::{approvals, config};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -148,31 +150,33 @@ impl Client {
                 }
                 let message: Value = serde_json::from_str(&line)
                     .context("1Password MCP server returned invalid JSON")?;
-                if message.get("id") == Some(&json!(id)) {
-                    if let Some(error) = message.get("error") {
-                        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-                        let message = error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown 1Password MCP error");
-                        anyhow::bail!("1Password MCP error {code}: {message}")
-                    }
-                    return message
-                        .get("result")
-                        .cloned()
-                        .context("1Password MCP response is missing result");
-                }
-                if message.get("id").is_some() && message.get("method").is_some() {
-                    let request_id = message.get("id").cloned().unwrap_or(Value::Null);
-                    self.write_json(&json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "error": {
-                            "code": -32601,
-                            "message": "temote-mcp does not expose client-side MCP capabilities to 1Password"
+                match classify_child_message(&message, id)? {
+                    ChildMessageKind::Response => {
+                        if let Some(error) = message.get("error") {
+                            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+                            let message = error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown 1Password MCP error");
+                            anyhow::bail!("1Password MCP error {code}: {message}")
                         }
-                    }))
-                    .await?;
+                        return message
+                            .get("result")
+                            .cloned()
+                            .context("1Password MCP response is missing result");
+                    }
+                    ChildMessageKind::ServerRequest(request_id) => {
+                        self.write_json(&json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {
+                                "code": -32601,
+                                "message": "temote-mcp does not expose client-side MCP capabilities to 1Password"
+                            }
+                        }))
+                        .await?;
+                    }
+                    ChildMessageKind::Notification => {}
                 }
             }
         })
