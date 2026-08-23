@@ -308,7 +308,9 @@ fn rsa_key(key: &JsonWebKey) -> Result<DecodingKey> {
 }
 
 fn valid_access_kid(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_ACCESS_KID_BYTES
+    !value.is_empty()
+        && value.len() <= MAX_ACCESS_KID_BYTES
+        && value.chars().all(|character| !character.is_control())
 }
 
 fn valid_access_jwt_segment(value: &str, max_bytes: usize) -> bool {
@@ -530,10 +532,14 @@ mod tests {
                 3 => MAX_ACCESS_KID_BYTES,
                 _ => MAX_ACCESS_KID_BYTES + 1,
             };
-            let kid = "k".repeat(length);
+            let mut kid = "k".repeat(length);
+            let has_control = noprop::sample_bool(ctx) && !kid.is_empty();
+            if has_control {
+                kid.replace_range(0..1, "\n");
+            }
             assert_eq!(
                 valid_access_kid(&kid),
-                length > 0 && length <= MAX_ACCESS_KID_BYTES
+                length > 0 && length <= MAX_ACCESS_KID_BYTES && !has_control
             );
             Ok(())
         })
