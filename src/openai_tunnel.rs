@@ -14,6 +14,9 @@ const TUNNEL_ID_HEX_LEN: usize = 32;
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SETUP_RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_TUNNEL_NAME_BYTES: usize = 256;
+const MAX_TUNNEL_DESCRIPTION_BYTES: usize = 4096;
+const MAX_SCOPE_IDS_PER_KIND: usize = 128;
 const DEFAULT_CONTROL_PLANE_BASE_URL: &str = "https://api.openai.com";
 const OPENAI_CONFIG_FILE: &str = "openai.env";
 
@@ -87,10 +90,17 @@ pub async fn setup(options: SetupOptions) -> Result<SetupResult> {
         !options.organization_ids.is_empty() || !options.workspace_ids.is_empty(),
         "at least one --organization-id or --workspace-id is required"
     );
-    anyhow::ensure!(!options.name.trim().is_empty(), "--name must not be empty");
+    let name = options.name.trim();
+    anyhow::ensure!(!name.is_empty(), "--name must not be empty");
     anyhow::ensure!(
-        !options.description.trim().is_empty(),
-        "--description must not be empty"
+        name.len() <= MAX_TUNNEL_NAME_BYTES,
+        "--name exceeds {MAX_TUNNEL_NAME_BYTES} bytes"
+    );
+    let description = options.description.trim();
+    anyhow::ensure!(!description.is_empty(), "--description must not be empty");
+    anyhow::ensure!(
+        description.len() <= MAX_TUNNEL_DESCRIPTION_BYTES,
+        "--description exceeds {MAX_TUNNEL_DESCRIPTION_BYTES} bytes"
     );
 
     let config_file = options.config_file.unwrap_or(default_config_file()?);
@@ -106,8 +116,8 @@ pub async fn setup(options: SetupOptions) -> Result<SetupResult> {
 
     let admin_key = required_env("OPENAI_ADMIN_KEY")?;
     let request = TunnelCreateRequest {
-        name: options.name.trim().to_owned(),
-        description: options.description.trim().to_owned(),
+        name: name.to_owned(),
+        description: description.to_owned(),
         organization_ids: normalized_scope_ids(options.organization_ids)?,
         workspace_ids: normalized_scope_ids(options.workspace_ids)?,
     };
@@ -285,6 +295,10 @@ fn write_configured_tunnel_id(path: &Path, tunnel_id: &str) -> Result<()> {
 }
 
 fn normalized_scope_ids(values: Vec<String>) -> Result<Vec<String>> {
+    anyhow::ensure!(
+        values.len() <= MAX_SCOPE_IDS_PER_KIND,
+        "at most {MAX_SCOPE_IDS_PER_KIND} scope IDs are allowed per kind"
+    );
     let mut normalized = Vec::new();
     for value in values {
         let value = value.trim();
@@ -361,7 +375,9 @@ pub async fn start(origin: SocketAddr) -> Result<Child> {
     ensure_loopback(origin)?;
     let config = config_from_env()?;
     let mcp_url = local_mcp_url(origin);
-    Command::new(&config.binary)
+    let mut command = Command::new(&config.binary);
+    restrict_runtime_credentials(&mut command, config.runtime_key_env);
+    command
         .args([
             "run",
             "--control-plane.tunnel-id",
@@ -385,9 +401,9 @@ pub async fn start(origin: SocketAddr) -> Result<Child> {
 pub async fn doctor_control_plane() -> Result<String> {
     let config = config_from_env()?;
     let mut command = Command::new(&config.binary);
+    restrict_runtime_credentials(&mut command, config.runtime_key_env);
     command
         .args(["admin", "tunnels", "get", &config.tunnel_id])
-        .env_remove("OPENAI_ADMIN_KEY")
         .stdin(Stdio::null());
     let output = tokio::time::timeout(DOCTOR_TIMEOUT, command.output())
         .await
@@ -408,12 +424,11 @@ pub async fn binary_version() -> Result<String> {
     let binary = std::env::var_os("TUNNEL_CLIENT_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from("tunnel-client"));
+    let mut command = Command::new(&binary);
+    scrub_openai_credentials(&mut command);
     let output = tokio::time::timeout(
         DOCTOR_TIMEOUT,
-        Command::new(&binary)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .output(),
+        command.arg("--version").stdin(Stdio::null()).output(),
     )
     .await
     .context("timed out while checking tunnel-client version")?
@@ -429,6 +444,28 @@ pub async fn binary_version() -> Result<String> {
     } else {
         value
     })
+}
+
+fn restrict_runtime_credentials(command: &mut Command, runtime_key_env: &str) {
+    command.env_remove("OPENAI_ADMIN_KEY");
+    match runtime_key_env {
+        "CONTROL_PLANE_API_KEY" => {
+            command.env_remove("OPENAI_API_KEY");
+        }
+        "OPENAI_API_KEY" => {
+            command.env_remove("CONTROL_PLANE_API_KEY");
+        }
+        _ => {
+            command.env_remove("CONTROL_PLANE_API_KEY");
+            command.env_remove("OPENAI_API_KEY");
+        }
+    }
+}
+
+fn scrub_openai_credentials(command: &mut Command) {
+    command.env_remove("OPENAI_ADMIN_KEY");
+    command.env_remove("CONTROL_PLANE_API_KEY");
+    command.env_remove("OPENAI_API_KEY");
 }
 
 pub fn ensure_loopback(origin: SocketAddr) -> Result<()> {
@@ -588,6 +625,95 @@ mod tests {
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(read_configured_tunnel_id(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn generated_scope_id_lists_are_bounded_and_deduplicated() -> noprop::TestResult {
+        test_support::run(0x4f50_454e_5343_4f50, 512, |ctx| {
+            let count = noprop::sample_usize_in(ctx, 0..=MAX_SCOPE_IDS_PER_KIND + 8);
+            let mut values = Vec::with_capacity(count);
+            for index in 0..count {
+                let base = format!("scope_{}", index % 8);
+                values.push(if noprop::sample_bool(ctx) {
+                    format!(" {base} ")
+                } else {
+                    base
+                });
+            }
+            let result = normalized_scope_ids(values.clone());
+            if count > MAX_SCOPE_IDS_PER_KIND {
+                assert!(result.is_err());
+            } else {
+                let normalized = result.unwrap();
+                assert!(normalized.len() <= values.len().min(8));
+                let mut seen = std::collections::HashSet::new();
+                for value in normalized {
+                    assert!(seen.insert(value.clone()), "duplicate scope id: {value}");
+                    assert!(!value.starts_with(' ') && !value.ends_with(' '));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn tunnel_client_commands_apply_least_privilege_credentials() {
+        fn env_value(command: &Command, name: &str) -> Option<Option<String>> {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        }
+
+        let mut control_plane = Command::new("tunnel-client");
+        for name in [
+            "OPENAI_ADMIN_KEY",
+            "CONTROL_PLANE_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            control_plane.env(name, "sentinel");
+        }
+        restrict_runtime_credentials(&mut control_plane, "CONTROL_PLANE_API_KEY");
+        assert_eq!(env_value(&control_plane, "OPENAI_ADMIN_KEY"), Some(None));
+        assert_eq!(
+            env_value(&control_plane, "CONTROL_PLANE_API_KEY"),
+            Some(Some("sentinel".to_owned()))
+        );
+        assert_eq!(env_value(&control_plane, "OPENAI_API_KEY"), Some(None));
+
+        let mut fallback = Command::new("tunnel-client");
+        for name in [
+            "OPENAI_ADMIN_KEY",
+            "CONTROL_PLANE_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            fallback.env(name, "sentinel");
+        }
+        restrict_runtime_credentials(&mut fallback, "OPENAI_API_KEY");
+        assert_eq!(env_value(&fallback, "OPENAI_ADMIN_KEY"), Some(None));
+        assert_eq!(env_value(&fallback, "CONTROL_PLANE_API_KEY"), Some(None));
+        assert_eq!(
+            env_value(&fallback, "OPENAI_API_KEY"),
+            Some(Some("sentinel".to_owned()))
+        );
+
+        let mut version = Command::new("tunnel-client");
+        for name in [
+            "OPENAI_ADMIN_KEY",
+            "CONTROL_PLANE_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            version.env(name, "sentinel");
+        }
+        scrub_openai_credentials(&mut version);
+        for name in [
+            "OPENAI_ADMIN_KEY",
+            "CONTROL_PLANE_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            assert_eq!(env_value(&version, name), Some(None));
         }
     }
 
