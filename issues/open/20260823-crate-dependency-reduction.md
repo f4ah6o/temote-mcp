@@ -67,6 +67,21 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 - [x] full tests pass.
 - [x] `git diff --check` passes.
 
+### Phase 3
+
+- [x] `jsonwebtoken` is no longer a direct or transitive dependency.
+- [x] Cloudflare Access accepts only JWT header `alg=RS256` and a bounded valid `kid`.
+- [x] JWKS keys must be RSA and may only declare `RS256`; modulus/exponent are decoded as base64url and verified with `ring`.
+- [x] a fixed RS256 fixture verifies successfully and signing-input/signature mutation is rejected.
+- [x] `exp` remains required with zero leeway and optional `nbf` retains the previous boundary semantics.
+- [x] expiry/not-before behavior is checked against an independent PBT reference model.
+- [x] issuer, audience, subject, email allow-list, malformed-token, and size-limit checks remain in place.
+- [x] targeted Access tests pass.
+- [x] `cargo check --all-targets --no-default-features` passes.
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- [x] full tests pass.
+- [x] `git diff --check` passes.
+
 ## Baseline
 
 Measured before Phase 1 on macOS:
@@ -112,3 +127,24 @@ Completed on 2026-08-23 after Phase 1 commit `061e980`.
 - `git diff --check`: pass
 - macOS normal dependency graph: 133 -> 130 non-root packages (-3 in Phase 2, -16 from the original baseline)
 - macOS `--no-default-features`: 43 -> 40 non-root packages (-3)
+
+
+## Phase 3 evidence
+
+Completed on 2026-08-23 after Phase 2 commit `667bbe0`.
+
+- removed `jsonwebtoken` from the `network` feature and dependency list
+- removed its now-unused transitive subtree, including `simple_asn1`, `num-bigint`, and `pem` from `Cargo.lock`
+- Cloudflare Access JWT verification now uses existing `ring::signature::RSA_PKCS1_2048_8192_SHA256`, `base64`, and `serde_json` primitives
+- header parsing keeps RS256 and key-id fail-closed checks before key selection
+- RSA JWK `kty` / optional `alg` / modulus / exponent are validated before signature acceptance
+- `exp` remains mandatory; `exp < now` is rejected with zero leeway; parsed `nbf > now` is rejected
+- fixed 2048-bit RS256 fixture: valid signature passes; mutated signing input and mutated signature both fail
+- Access temporal PBT: 1024 generated cases against an independent boundary model
+- targeted Access tests: 10 passed / 0 failed
+- full tests: 305 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- no-default-features all-target check: pass (existing dead-code warnings only)
+- Clippy with `-D warnings`: pass
+- `git diff --check`: pass
+- macOS normal dependency graph: 130 -> 116 non-root packages (-14 in Phase 3, -30 from the original baseline)
+- macOS `--no-default-features`: 40 -> 40 non-root packages

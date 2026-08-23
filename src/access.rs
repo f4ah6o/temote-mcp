@@ -7,11 +7,12 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Client;
+use ring::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -100,13 +101,11 @@ struct JsonWebKey {
     e: String,
 }
 
-fn jwt_validation(audience: &str) -> Validation {
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.validate_exp = true;
-    validation.validate_nbf = true;
-    validation.leeway = 0;
-    validation.set_audience(&[audience]);
-    validation
+#[derive(Debug, Deserialize)]
+struct JwtHeader {
+    alg: String,
+    #[serde(default)]
+    kid: Option<String>,
 }
 
 impl AccessAuthenticator {
@@ -147,9 +146,14 @@ impl AccessAuthenticator {
         }
 
         validate_access_assertion_shape(token)?;
-        let header = decode_header(token).context("invalid Cloudflare Access JWT header")?;
+        let (header_segment, claims_segment, signature_segment) = access_jwt_parts(token)?;
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(header_segment)
+            .context("invalid Cloudflare Access JWT header encoding")?;
+        let header: JwtHeader = serde_json::from_slice(&header_bytes)
+            .context("invalid Cloudflare Access JWT header")?;
         anyhow::ensure!(
-            header.alg == Algorithm::RS256,
+            header.alg == "RS256",
             "Cloudflare Access JWT must use RS256"
         );
         let kid = header.kid.context("Cloudflare Access JWT has no key ID")?;
@@ -158,10 +162,22 @@ impl AccessAuthenticator {
             "Cloudflare Access JWT key ID is invalid"
         );
         let key = self.key_for(&kid).await?;
-        let validation = jwt_validation(&self.config.audience);
-        let claims = decode::<Value>(token, &key, &validation)
-            .context("Cloudflare Access JWT signature or expiry is invalid")?
-            .claims;
+        let signing_input_len = header_segment.len() + 1 + claims_segment.len();
+        verify_rs256(
+            &key,
+            &token.as_bytes()[..signing_input_len],
+            signature_segment,
+        )?;
+        let claims_bytes = URL_SAFE_NO_PAD
+            .decode(claims_segment)
+            .context("invalid Cloudflare Access JWT claims encoding")?;
+        let claims: Value = serde_json::from_slice(&claims_bytes)
+            .context("invalid Cloudflare Access JWT claims")?;
+        anyhow::ensure!(
+            claims.is_object(),
+            "Cloudflare Access JWT claims must be an object"
+        );
+        validate_access_times(&claims, current_unix_timestamp()?)?;
 
         let issuer = claims.get("iss").and_then(Value::as_str);
         anyhow::ensure!(
@@ -197,16 +213,14 @@ impl AccessAuthenticator {
         })
     }
 
-    async fn key_for(&self, kid: &str) -> Result<DecodingKey> {
+    async fn key_for(&self, kid: &str) -> Result<JsonWebKey> {
         if let Some(key) = self.find_key(kid).await {
-            return rsa_key(&key);
+            return Ok(key);
         }
         self.refresh_keys().await?;
-        let key = self
-            .find_key(kid)
+        self.find_key(kid)
             .await
-            .with_context(|| format!("Cloudflare Access key {kid} was not found"))?;
-        rsa_key(&key)
+            .with_context(|| format!("Cloudflare Access key {kid} was not found"))
     }
 
     async fn find_key(&self, kid: &str) -> Option<JsonWebKey> {
@@ -294,7 +308,7 @@ fn append_bounded_jwks_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn rsa_key(key: &JsonWebKey) -> Result<DecodingKey> {
+fn verify_rs256(key: &JsonWebKey, signing_input: &[u8], signature_segment: &str) -> Result<()> {
     anyhow::ensure!(
         key.kty.as_deref() == Some("RSA"),
         "Access signing key is not RSA"
@@ -303,8 +317,60 @@ fn rsa_key(key: &JsonWebKey) -> Result<DecodingKey> {
         key.alg.as_deref().is_none_or(|alg| alg == "RS256"),
         "Access signing key algorithm is not RS256"
     );
-    DecodingKey::from_rsa_components(&key.n, &key.e)
-        .context("invalid Cloudflare Access RSA signing key")
+    let modulus = URL_SAFE_NO_PAD
+        .decode(&key.n)
+        .context("invalid Cloudflare Access RSA modulus")?;
+    let exponent = URL_SAFE_NO_PAD
+        .decode(&key.e)
+        .context("invalid Cloudflare Access RSA exponent")?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature_segment)
+        .context("invalid Cloudflare Access JWT signature encoding")?;
+    anyhow::ensure!(
+        !modulus.is_empty() && !exponent.is_empty(),
+        "invalid Cloudflare Access RSA signing key"
+    );
+    RsaPublicKeyComponents {
+        n: &modulus,
+        e: &exponent,
+    }
+    .verify(&RSA_PKCS1_2048_8192_SHA256, signing_input, &signature)
+    .map_err(|_| anyhow::anyhow!("Cloudflare Access JWT signature is invalid"))
+}
+
+fn access_jwt_parts(token: &str) -> Result<(&str, &str, &str)> {
+    let mut parts = token.split('.');
+    let header = parts.next().unwrap_or_default();
+    let claims = parts.next().unwrap_or_default();
+    let signature = parts.next().unwrap_or_default();
+    anyhow::ensure!(parts.next().is_none(), "Cloudflare Access JWT is malformed");
+    Ok((header, claims, signature))
+}
+
+fn numeric_date(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(integer) = value.as_u64() {
+        return Some(integer);
+    }
+    let number = value.as_f64()?;
+    (number.is_finite() && number >= 0.0 && number < u64::MAX as f64).then(|| number.round() as u64)
+}
+
+fn validate_access_times(claims: &Value, now: u64) -> Result<()> {
+    let expires =
+        numeric_date(claims.get("exp")).context("Cloudflare Access JWT has no valid expiry")?;
+    anyhow::ensure!(expires >= now, "Cloudflare Access JWT is expired");
+    if let Some(not_before) = numeric_date(claims.get("nbf")) {
+        anyhow::ensure!(not_before <= now, "Cloudflare Access JWT is not valid yet");
+    }
+    Ok(())
+}
+
+fn current_unix_timestamp() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
 }
 
 fn valid_access_kid(value: &str) -> bool {
@@ -414,13 +480,99 @@ mod tests {
     }
 
     #[test]
-    fn configures_the_expected_audience_for_jwt_validation() {
-        let validation = jwt_validation("self-hosted-audience");
-        assert!(validation.validate_aud);
-        assert_eq!(
-            validation.aud,
-            Some(["self-hosted-audience".to_owned()].into_iter().collect())
+    fn rs256_fixture_accepts_valid_signature_and_rejects_mutation() {
+        const MODULUS: &str = "rJPosGzIUEOuDHwYF2gvUO_Yt5CkpRApV_dHgfCztDhN5nMvF4v86tszOALCeeN-FnMO3Ys5XhYoaJ4B3mPdqfBH3S134yhU7vQhWphIMWdCd_KjHrVGHfrrk2DgkkNddLrzP6zjqQ3LNSepIlYE_TSolwIET927Kw7eFoLNikI7VB5pMYIGSo_CjaK4iz5tRF_eBiHpHAGH8j-UcJcFhvLayNB-NEB0qDuigfpf2YUmxq6XWqZ94JRzGXYwSKTRL_0kV-bvt339e_KShb5xAgnKDhfeDhgc6IQWS6v_wa2WngzNA_AaXRlOilFOWnnOEzuUjcCijVVn5ZSikAG-CQ";
+        const HEADER: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+        const CLAIMS: &str = "eyJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImZpeHR1cmUifQ";
+        const SIGNATURE: &str = "T1cpTaIQSjpDzd0HxEdjwOauRxRQx23rnt7MvozroXRNNJpF60uff0hK1L3wBC-wbNC0iv_dY0RIceuvqu8P9L60GOlh_-KpO7-n1pgRYyPKZm6G0E63Vldd46UTPrsfn9RtTPyN-rTFMY-8_BXx7kM05eo9pOsdHl0IPrBBZ1Q9p6SFPG9GrD-FLlnWg42ANw2vJljQzTVD6TmaqHGcSGVcaQf2hAwsCC-3ExlxKvPyH4ZyWraObOlDsZFMmSLlQtGTxR6fZPiDJRcsnVCgy3BY59i2QS8qAU0bNwsd5diz93cVGr7dIhZaLRq0NUglFHKi4XBlJFyOa6BvKlFcww";
+        let key = JsonWebKey {
+            kid: Some("test-key".to_owned()),
+            kty: Some("RSA".to_owned()),
+            alg: Some("RS256".to_owned()),
+            n: MODULUS.to_owned(),
+            e: "AQAB".to_owned(),
+        };
+        let signing_input = format!("{HEADER}.{CLAIMS}");
+        assert!(verify_rs256(&key, signing_input.as_bytes(), SIGNATURE).is_ok());
+
+        let mut mutated_input = signing_input.into_bytes();
+        let last = mutated_input.last_mut().expect("fixture signing input");
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        assert!(verify_rs256(&key, &mutated_input, SIGNATURE).is_err());
+
+        let mut mutated_signature = SIGNATURE.as_bytes().to_vec();
+        let first = mutated_signature.first_mut().expect("fixture signature");
+        *first = if *first == b'A' { b'B' } else { b'A' };
+        let mutated_signature = String::from_utf8(mutated_signature).unwrap();
+        assert!(
+            verify_rs256(
+                &key,
+                format!("{HEADER}.{CLAIMS}").as_bytes(),
+                &mutated_signature
+            )
+            .is_err()
         );
+    }
+
+    #[test]
+    fn generated_access_time_validation_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x4143_4345_5353_5449, 1024, |ctx| {
+            let now = noprop::sample_u64_in(ctx, 1..=4_000_000_000);
+            let exp_case = noprop::sample_usize_in(ctx, 0..=5);
+            let nbf_case = noprop::sample_usize_in(ctx, 0..=4);
+            let mut claims = serde_json::Map::new();
+
+            let exp_ok = match exp_case {
+                0 => false,
+                1 => {
+                    claims.insert("exp".to_owned(), serde_json::json!(now - 1));
+                    false
+                }
+                2 => {
+                    claims.insert("exp".to_owned(), serde_json::json!(now));
+                    true
+                }
+                3 => {
+                    claims.insert("exp".to_owned(), serde_json::json!(now + 1));
+                    true
+                }
+                4 => {
+                    claims.insert("exp".to_owned(), Value::String(now.to_string()));
+                    false
+                }
+                _ => {
+                    claims.insert("exp".to_owned(), serde_json::json!(now as f64 + 0.6));
+                    true
+                }
+            };
+
+            let nbf_ok = match nbf_case {
+                0 => true,
+                1 => {
+                    claims.insert("nbf".to_owned(), serde_json::json!(now - 1));
+                    true
+                }
+                2 => {
+                    claims.insert("nbf".to_owned(), serde_json::json!(now));
+                    true
+                }
+                3 => {
+                    claims.insert("nbf".to_owned(), serde_json::json!(now + 1));
+                    false
+                }
+                _ => {
+                    claims.insert("nbf".to_owned(), Value::String("invalid".to_owned()));
+                    true
+                }
+            };
+
+            let claims = Value::Object(claims);
+            assert_eq!(
+                validate_access_times(&claims, now).is_ok(),
+                exp_ok && nbf_ok
+            );
+            Ok(())
+        })
     }
 
     #[test]
