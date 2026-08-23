@@ -12,7 +12,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
-use crate::{approvals, config, onepassword_mcp, sandbox, supervisor::SessionSupervisor};
+use crate::{
+    approvals, child_env, config, onepassword_mcp, sandbox, supervisor::SessionSupervisor,
+};
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_JOBS_PER_SESSION: usize = 8;
@@ -1147,7 +1149,19 @@ async fn run_approved_git_command(
     {
         anyhow::bail!("user denied {operation}")
     }
-    run_and_report(session.id.clone(), command, repository_root, true, &[]).await
+    let rendered_command = render_command(&command);
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    let output = sandbox::run_unrestricted_with_env(
+        &command,
+        &repository_root,
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await;
+    let result = output.and_then(render_output);
+    report_command_finished(session.id.clone(), &rendered_command, &result).await;
+    text_result(result?)
 }
 
 fn required_string_array(args: &Value, name: &str) -> Result<Vec<String>> {
