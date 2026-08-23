@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import worker, { GatewaySession, accessEmailAllowed, hostApiBodyLimit, readBoundedBytes } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, hostApiBodyLimit, pruneExpiredRegistrySessions, readBoundedBytes } from "../src/index.js";
 import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
@@ -75,6 +75,59 @@ test("Access email allowlist is fail-closed and case-insensitive", () => {
   for (const email of ["", "other2@example.com", null, undefined]) {
     assert.equal(accessEmailAllowed("user@example.com", email), false, String(email));
   }
+});
+
+test("registry expiry pruning matches the active-lease model", () => {
+  const now = 10_000;
+  for (let count = 0; count <= 64; count += 1) {
+    for (let expiredEvery = 1; expiredEvery <= 7; expiredEvery += 1) {
+      const sessions = {};
+      const expected = [];
+      for (let index = 0; index < count; index += 1) {
+        const expired = index % expiredEvery === 0;
+        const expires_at = expired ? now - index - 1 : now + index + 1;
+        sessions[`session-${index}`] = { session_id: `session-${index}`, expires_at };
+        if (!expired) expected.push(`session-${index}`);
+      }
+      const changed = pruneExpiredRegistrySessions(sessions, now);
+      assert.equal(changed, expected.length !== count);
+      assert.deepEqual(Object.keys(sessions), expected);
+    }
+  }
+});
+
+test("registry capacity prunes expired leases and preserves existing refreshes", async () => {
+  const now = 50_000;
+  const storage = new MemoryStorage();
+  const registry = new GatewayRegistry(
+    { storage },
+    {},
+    { maxSessions: 3, now: () => now },
+  );
+  await storage.put("sessions", {
+    stale: { session_id: "stale", generation: 1, expires_at: now - 1 },
+    a: { session_id: "a", generation: 1, expires_at: now + 100 },
+    b: { session_id: "b", generation: 1, expires_at: now + 100 },
+  });
+
+  const add = (session_id, generation = 1) => registry.fetch(post("upsert", {
+    session_id,
+    generation,
+    expires_at: now + 100,
+  }));
+  assert.equal((await add("c")).status, 204);
+  assert.deepEqual(Object.keys(await storage.get("sessions")).sort(), ["a", "b", "c"]);
+
+  const full = await add("d");
+  assert.equal(full.status, 503);
+  assert.equal((await full.json()).error, "registry_full");
+  assert.deepEqual(Object.keys(await storage.get("sessions")).sort(), ["a", "b", "c"]);
+
+  assert.equal((await add("b", 2)).status, 204);
+  assert.equal((await storage.get("sessions")).b.generation, 2);
+
+  const invalid = await registry.fetch(post("upsert", { session_id: "z", generation: 1 }));
+  assert.equal(invalid.status, 400);
 });
 
 test("session IDs are safe Durable Object routing keys", () => {

@@ -18,6 +18,7 @@ const HOST_LEASE_MS = 90_000;
 const POLL_TIMEOUT_MS = 20_000;
 const RPC_TIMEOUT_MS = 35_000;
 const MAX_PENDING_HOST_REQUESTS = 64;
+const MAX_REGISTRY_SESSIONS = 1024;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // get_image permits 32 MiB raw images; base64 + JSON needs just under 43 MiB.
 const MAX_HOST_RESPONSE_BODY_BYTES = 43 * 1024 * 1024;
@@ -459,8 +460,10 @@ export class GatewaySession {
 }
 
 export class GatewayRegistry {
-  constructor(state) {
+  constructor(state, _env, options = {}) {
     this.state = state;
+    this.maxSessions = options.maxSessions ?? MAX_REGISTRY_SESSIONS;
+    this.now = options.now ?? (() => Date.now());
   }
 
   async fetch(request) {
@@ -475,23 +478,28 @@ export class GatewayRegistry {
 
   async list() {
     const sessions = (await this.state.storage.get("sessions")) || {};
-    const now = Date.now();
-    let changed = false;
-    for (const [sessionId, session] of Object.entries(sessions)) {
-      if (session.expires_at <= now) {
-        delete sessions[sessionId];
-        changed = true;
-      }
-    }
+    const changed = pruneExpiredRegistrySessions(sessions, this.now());
     if (changed) await this.state.storage.put("sessions", sessions);
     return jsonResponse(Object.values(sessions).sort((a, b) => a.session_id.localeCompare(b.session_id)));
   }
 
   async upsert(host) {
-    if (!validateSessionId(host?.session_id) || !Number.isSafeInteger(host?.generation)) {
+    if (
+      !validateSessionId(host?.session_id)
+      || !Number.isSafeInteger(host?.generation)
+      || host.generation < 1
+      || !Number.isSafeInteger(host?.expires_at)
+      || host.expires_at <= 0
+    ) {
       return jsonResponse({ error: "invalid_host" }, 400);
     }
     const sessions = (await this.state.storage.get("sessions")) || {};
+    pruneExpiredRegistrySessions(sessions, this.now());
+    const existing = Object.hasOwn(sessions, host.session_id);
+    if (!existing && Object.keys(sessions).length >= this.maxSessions) {
+      await this.state.storage.put("sessions", sessions);
+      return jsonResponse({ error: "registry_full" }, 503);
+    }
     sessions[host.session_id] = host;
     await this.state.storage.put("sessions", sessions);
     return new Response(null, { status: 204 });
@@ -508,6 +516,17 @@ export class GatewayRegistry {
     }
     return new Response(null, { status: 204 });
   }
+}
+
+export function pruneExpiredRegistrySessions(sessions, now) {
+  let changed = false;
+  for (const [sessionId, session] of Object.entries(sessions)) {
+    if (!Number.isSafeInteger(session?.expires_at) || session.expires_at <= now) {
+      delete sessions[sessionId];
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function validateHostIdentity(body, requireGeneration) {
