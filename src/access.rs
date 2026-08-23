@@ -20,6 +20,11 @@ use url::Url;
 const ACCESS_ASSERTION_HEADER: &str = "cf-access-jwt-assertion";
 const JWKS_PATH: &str = "/cdn-cgi/access/certs";
 const MAX_JWKS_BYTES: usize = 1024 * 1024;
+const MAX_ACCESS_ASSERTION_BYTES: usize = 64 * 1024;
+const MAX_ACCESS_HEADER_SEGMENT_BYTES: usize = 8 * 1024;
+const MAX_ACCESS_CLAIMS_SEGMENT_BYTES: usize = 32 * 1024;
+const MAX_ACCESS_SIGNATURE_SEGMENT_BYTES: usize = 8 * 1024;
+const MAX_ACCESS_KID_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct AccessConfig {
@@ -141,12 +146,17 @@ impl AccessAuthenticator {
                 .context("test authenticator has no identity");
         }
 
+        validate_access_assertion_shape(token)?;
         let header = decode_header(token).context("invalid Cloudflare Access JWT header")?;
         anyhow::ensure!(
             header.alg == Algorithm::RS256,
             "Cloudflare Access JWT must use RS256"
         );
         let kid = header.kid.context("Cloudflare Access JWT has no key ID")?;
+        anyhow::ensure!(
+            valid_access_kid(&kid),
+            "Cloudflare Access JWT key ID is invalid"
+        );
         let key = self.key_for(&kid).await?;
         let validation = jwt_validation(&self.config.audience);
         let claims = decode::<Value>(token, &key, &validation)
@@ -297,6 +307,37 @@ fn rsa_key(key: &JsonWebKey) -> Result<DecodingKey> {
         .context("invalid Cloudflare Access RSA signing key")
 }
 
+fn valid_access_kid(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_ACCESS_KID_BYTES
+}
+
+fn valid_access_jwt_segment(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_access_assertion_shape(token: &str) -> Result<()> {
+    anyhow::ensure!(
+        token.len() <= MAX_ACCESS_ASSERTION_BYTES,
+        "Cloudflare Access JWT is too large"
+    );
+    let mut parts = token.split('.');
+    let header = parts.next().unwrap_or_default();
+    let claims = parts.next().unwrap_or_default();
+    let signature = parts.next().unwrap_or_default();
+    anyhow::ensure!(parts.next().is_none(), "Cloudflare Access JWT is malformed");
+    anyhow::ensure!(
+        valid_access_jwt_segment(header, MAX_ACCESS_HEADER_SEGMENT_BYTES)
+            && valid_access_jwt_segment(claims, MAX_ACCESS_CLAIMS_SEGMENT_BYTES)
+            && valid_access_jwt_segment(signature, MAX_ACCESS_SIGNATURE_SEGMENT_BYTES),
+        "Cloudflare Access JWT is malformed"
+    );
+    Ok(())
+}
+
 fn audience_matches(value: Option<&Value>, expected: &str) -> bool {
     value.is_some_and(|value| {
         value.as_str() == Some(expected)
@@ -404,6 +445,96 @@ mod tests {
                     })
             });
             assert_eq!(audience_matches(value.as_ref(), &expected), model);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_access_assertion_shape_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x4143_4345_5353_4a54, 512, |ctx| {
+            let header_len = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_ACCESS_HEADER_SEGMENT_BYTES - 1,
+                3 => MAX_ACCESS_HEADER_SEGMENT_BYTES,
+                _ => MAX_ACCESS_HEADER_SEGMENT_BYTES + 1,
+            };
+            let claims_len = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_ACCESS_CLAIMS_SEGMENT_BYTES - 1,
+                3 => MAX_ACCESS_CLAIMS_SEGMENT_BYTES,
+                _ => MAX_ACCESS_CLAIMS_SEGMENT_BYTES + 1,
+            };
+            let signature_len = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_ACCESS_SIGNATURE_SEGMENT_BYTES - 1,
+                3 => MAX_ACCESS_SIGNATURE_SEGMENT_BYTES,
+                _ => MAX_ACCESS_SIGNATURE_SEGMENT_BYTES + 1,
+            };
+            let mut header = "A".repeat(header_len);
+            let mut claims = "B".repeat(claims_len);
+            let mut signature = "C".repeat(signature_len);
+            match noprop::sample_usize_in(ctx, 0..=4) {
+                1 => header.push('='),
+                2 => claims.push('+'),
+                3 => signature.push('/'),
+                _ => {}
+            }
+            let extra_part = noprop::sample_bool(ctx);
+            let mut token = format!("{header}.{claims}.{signature}");
+            if extra_part {
+                token.push_str(".extra");
+            }
+            let valid_segment = |value: &str, max_bytes: usize| {
+                !value.is_empty()
+                    && value.len() <= max_bytes
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            };
+            let model = token.len() <= MAX_ACCESS_ASSERTION_BYTES
+                && !extra_part
+                && valid_segment(&header, MAX_ACCESS_HEADER_SEGMENT_BYTES)
+                && valid_segment(&claims, MAX_ACCESS_CLAIMS_SEGMENT_BYTES)
+                && valid_segment(&signature, MAX_ACCESS_SIGNATURE_SEGMENT_BYTES);
+            assert_eq!(
+                validate_access_assertion_shape(&token).is_ok(),
+                model,
+                "header={} claims={} signature={} extra={extra_part}",
+                header.len(),
+                claims.len(),
+                signature.len()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn oversized_access_assertions_fail_before_jwt_decode() {
+        let token = format!("{}.e30.c2ln", "A".repeat(MAX_ACCESS_ASSERTION_BYTES));
+        let error = validate_access_assertion_shape(&token)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too large"));
+    }
+
+    #[test]
+    fn generated_access_key_ids_match_length_policy() -> noprop::TestResult {
+        test_support::run(0x4143_4345_5353_4b49, 512, |ctx| {
+            let length = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_ACCESS_KID_BYTES - 1,
+                3 => MAX_ACCESS_KID_BYTES,
+                _ => MAX_ACCESS_KID_BYTES + 1,
+            };
+            let kid = "k".repeat(length);
+            assert_eq!(
+                valid_access_kid(&kid),
+                length > 0 && length <= MAX_ACCESS_KID_BYTES
+            );
             Ok(())
         })
     }
