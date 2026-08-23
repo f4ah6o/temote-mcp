@@ -690,13 +690,13 @@ struct IncomingSessionMessage {
 }
 
 fn queue_incoming_session_message(
-    sender: &mpsc::UnboundedSender<IncomingSessionMessage>,
+    sender: &mpsc::Sender<IncomingSessionMessage>,
     stream: UnixStream,
     message: Message,
     permit: OwnedSemaphorePermit,
 ) -> bool {
     sender
-        .send(IncomingSessionMessage {
+        .try_send(IncomingSessionMessage {
             stream,
             message,
             _permit: permit,
@@ -707,7 +707,7 @@ fn queue_incoming_session_message(
 async fn receive_session_message(
     mut stream: UnixStream,
     session_id: String,
-    sender: mpsc::UnboundedSender<IncomingSessionMessage>,
+    sender: mpsc::Sender<IncomingSessionMessage>,
     permit: OwnedSemaphorePermit,
 ) {
     let line = match tokio::time::timeout(
@@ -747,7 +747,7 @@ async fn run_runtime(
     kintone_cli_bridge: Arc<kintone_cli::Bridge>,
 ) -> Result<()> {
     let (approval_lifetime, _) = watch::channel(false);
-    let (incoming_sender, mut incoming_receiver) = mpsc::unbounded_channel();
+    let (incoming_sender, mut incoming_receiver) = mpsc::channel(MAX_PENDING_SESSION_READS);
     let read_slots = Arc::new(Semaphore::new(MAX_PENDING_SESSION_READS));
     let approval_slots = Arc::new(Semaphore::new(MAX_PENDING_APPROVALS));
     loop {
@@ -1702,7 +1702,7 @@ mod tests {
             let attempts = noprop::sample_usize_in(ctx, 0..=limit + 8);
             runtime.block_on(async {
                 let slots = Arc::new(Semaphore::new(limit));
-                let (sender, mut receiver) = mpsc::unbounded_channel();
+                let (sender, mut receiver) = mpsc::channel(limit);
                 let mut peers = Vec::new();
                 let mut queued = 0usize;
 
