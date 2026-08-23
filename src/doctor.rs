@@ -24,6 +24,8 @@ sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict";
 const MAX_TUNNEL_TOKEN_BYTES: u64 = 16 * 1024;
 const DOCTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DOCTOR_STREAM_BYTES: usize = 32 * 1024;
+#[cfg(feature = "network")]
+const MAX_CLOUDFLARE_API_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 pub struct Options {
@@ -680,15 +682,23 @@ async fn check_cloudflare_api(report: &mut Report) {
     };
 
     let http_status = response.status();
-    let body = match response
-        .json::<CloudflareApiResponse<CloudflareTunnel>>()
-        .await
-    {
-        Ok(body) => body,
+    let bytes = match read_bounded_cloudflare_response(response).await {
+        Ok(bytes) => bytes,
         Err(error) => {
             report.add(Check::fail(
                 "cloudflare API",
                 format!("Cloudflare returned an unreadable response ({http_status}): {error}"),
+                "Check the Cloudflare API endpoint and token permissions.",
+            ));
+            return;
+        }
+    };
+    let body: CloudflareApiResponse<CloudflareTunnel> = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(error) => {
+            report.add(Check::fail(
+                "cloudflare API",
+                format!("Cloudflare returned invalid JSON ({http_status}): {error}"),
                 "Check the Cloudflare API endpoint and token permissions.",
             ));
             return;
@@ -771,6 +781,44 @@ fn cloudflare_status_level(status: Option<&str>) -> Level {
         }
         _ => Level::Fail,
     }
+}
+
+#[cfg(feature = "network")]
+async fn read_bounded_cloudflare_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(
+            length <= MAX_CLOUDFLARE_API_RESPONSE_BYTES as u64,
+            "Cloudflare API response exceeds {MAX_CLOUDFLARE_API_RESPONSE_BYTES} bytes"
+        );
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_CLOUDFLARE_API_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read Cloudflare API response")?
+    {
+        append_bounded_cloudflare_chunk(&mut bytes, &chunk)?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "network")]
+fn append_bounded_cloudflare_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+    let next = bytes
+        .len()
+        .checked_add(chunk.len())
+        .context("Cloudflare API response size overflow")?;
+    anyhow::ensure!(
+        next <= MAX_CLOUDFLARE_API_RESPONSE_BYTES,
+        "Cloudflare API response exceeds {MAX_CLOUDFLARE_API_RESPONSE_BYTES} bytes"
+    );
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[cfg(feature = "network")]
@@ -1230,6 +1278,32 @@ mod tests {
                 expected,
                 "account id={value:?}"
             );
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn generated_cloudflare_response_budget_never_overreads() -> noprop::TestResult {
+        test_support::run(0x4346_4150_4942_4f44, 512, |ctx| {
+            let start = if noprop::sample_bool(ctx) {
+                noprop::sample_usize_in(ctx, 0..=2048)
+            } else {
+                MAX_CLOUDFLARE_API_RESPONSE_BYTES - noprop::sample_usize_in(ctx, 0..=2048)
+            };
+            let chunk_len = noprop::sample_usize_in(ctx, 0..=4096);
+            let mut bytes = vec![0_u8; start];
+            let chunk = vec![noprop::sample_u8(ctx); chunk_len];
+            let expected = start
+                .checked_add(chunk_len)
+                .is_some_and(|next| next <= MAX_CLOUDFLARE_API_RESPONSE_BYTES);
+            let result = append_bounded_cloudflare_chunk(&mut bytes, &chunk);
+            assert_eq!(result.is_ok(), expected);
+            assert_eq!(
+                bytes.len(),
+                if expected { start + chunk_len } else { start }
+            );
+            assert!(bytes.len() <= MAX_CLOUDFLARE_API_RESPONSE_BYTES);
             Ok(())
         })
     }
