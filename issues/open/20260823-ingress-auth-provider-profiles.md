@@ -615,13 +615,20 @@ OpenAI Secure MCP Tunnel availability は OpenAI product / workspace / plan に�
 - [ ] 3 profile の live acceptance evidence を残す。
 - [x] README / `docs/public-http*.md` / development docs を connection profile architecture に更新する。
 
+## Release decision (2026-08-23)
+
+- current implementation / regression / release-build gates are release-ready and are shipped as the next CalVer version.
+- OpenAI Secure MCP Tunnel の supported OpenAI product live acceptance は workspace credential / entitlement が必要なため post-release pending として残す。
+- この pending item のために Cloudflare / Tailscale へ fallback したり、OpenAI profile の security boundary を弱めたりしない。
+- Phase 5 の未実施 live evidence は完了扱いにせず、この issue を open のまま追跡する。
+
 ## 実装 evidence (2026-08-23)
 
 ### Common / regression
 
 - `cargo fmt -- --check`: pass
 - `cargo clippy --all-targets --all-features -- -D warnings`: pass
-- `cargo test --all-targets --all-features`: 223 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- `cargo test --all-targets --all-features`: 258 passed / 0 failed / 1 intentional process-boundary E2E ignored
 - `cargo check --all-targets`: pass
 - remote tool list regression で `without_sandbox` 非公開を確認
 - Cloudflare / Tailscale / OpenAI は同じ `SessionSupervisor` / named-root / sandbox / local approval path を利用し、provider 固有 process control は connection boundary の外へ漏らさない
