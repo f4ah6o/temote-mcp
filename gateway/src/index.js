@@ -18,6 +18,7 @@ const HOST_LEASE_MS = 90_000;
 const POLL_TIMEOUT_MS = 20_000;
 const RPC_TIMEOUT_MS = 35_000;
 const MAX_PENDING_HOST_REQUESTS = 64;
+const MAX_REQUEST_ID_ATTEMPTS = 8;
 const MAX_REGISTRY_SESSIONS = 1024;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // get_image permits 32 MiB raw images; base64 + JSON needs just under 43 MiB.
@@ -244,6 +245,7 @@ export class GatewaySession {
     this.state = state;
     this.env = env;
     this.rpcTimeoutMs = options.rpcTimeoutMs ?? RPC_TIMEOUT_MS;
+    this.requestId = options.requestId ?? (() => crypto.randomUUID());
     this.pending = new Map();
     this.queue = [];
     this.waitingPoll = null;
@@ -376,7 +378,10 @@ export class GatewaySession {
       return jsonResponse({ error: "gateway_busy", detail: "too many pending host requests" }, 503);
     }
 
-    const requestId = crypto.randomUUID();
+    const requestId = this.allocateRequestId();
+    if (!requestId) {
+      return jsonResponse({ error: "request_id_unavailable" }, 503);
+    }
     const outcome = new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
@@ -395,6 +400,21 @@ export class GatewaySession {
 
   async currentHost() {
     return (await this.state.storage.get("host")) || null;
+  }
+
+  allocateRequestId() {
+    for (let attempt = 0; attempt < MAX_REQUEST_ID_ATTEMPTS; attempt += 1) {
+      const requestId = this.requestId();
+      if (
+        typeof requestId === "string"
+        && requestId.length > 0
+        && !this.pending.has(requestId)
+        && !this.queue.some((entry) => entry.request_id === requestId)
+      ) {
+        return requestId;
+      }
+    }
+    return null;
   }
 
   removeQueuedRequest(requestId) {

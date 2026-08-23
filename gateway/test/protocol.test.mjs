@@ -52,6 +52,14 @@ async function body(response) {
   return response.json();
 }
 
+async function waitFor(predicate, message) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(message);
+}
+
 test("public gateway exposes the same twenty-five public tools", () => {
   assert.equal(PUBLIC_TOOLS.length, 25);
   assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "without_sandbox"), false);
@@ -178,6 +186,80 @@ test("reconnect increments generation and rejects the old host", async () => {
   }));
   assert.equal(stale.status, 409);
   assert.equal((await stale.json()).error, "stale_generation");
+});
+
+test("request ID collisions never overwrite pending RPC state", async () => {
+  const ids = ["same", "same", "second"];
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+    { requestId: () => ids.shift() },
+  );
+  await session.fetch(post("connect", {
+    session_id: "collision-safe",
+    instance_id: "instance-a",
+    platform: "linux",
+  }));
+
+  const dispatch = (id) => session.fetch(post("dispatch", {
+    request: {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "session_info", arguments: { session_id: "collision-safe" } },
+    },
+  }));
+  const first = dispatch(1);
+  await waitFor(() => session.pending.size === 1, "first collision request was not registered");
+  const second = dispatch(2);
+  await waitFor(() => session.pending.size === 2, "second collision request was not registered");
+  assert.deepEqual([...session.pending.keys()], ["same", "second"]);
+  assert.deepEqual(session.queue.map((entry) => entry.request_id), ["same", "second"]);
+
+  await session.fetch(post("connect", {
+    session_id: "collision-safe",
+    instance_id: "instance-b",
+    platform: "linux",
+  }));
+  const settled = await Promise.all([first, second]);
+  assert.equal(settled.every((response) => response.status === 502), true);
+});
+
+test("request ID collision exhaustion fails without mutating existing pending state", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+    { requestId: () => "same" },
+  );
+  await session.fetch(post("connect", {
+    session_id: "collision-full",
+    instance_id: "instance-a",
+    platform: "linux",
+  }));
+  const makeRequest = (id) => post("dispatch", {
+    request: {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "session_info", arguments: { session_id: "collision-full" } },
+    },
+  });
+  const first = session.fetch(makeRequest(1));
+  await waitFor(() => session.pending.size === 1, "collision fixture did not register first request");
+  assert.deepEqual([...session.pending.keys()], ["same"]);
+
+  const rejected = await session.fetch(makeRequest(2));
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).error, "request_id_unavailable");
+  assert.deepEqual([...session.pending.keys()], ["same"]);
+  assert.deepEqual(session.queue.map((entry) => entry.request_id), ["same"]);
+
+  await session.fetch(post("connect", {
+    session_id: "collision-full",
+    instance_id: "instance-b",
+    platform: "linux",
+  }));
+  assert.equal((await first).status, 502);
 });
 
 test("timed-out queued requests are removed before a host can execute them", async () => {
