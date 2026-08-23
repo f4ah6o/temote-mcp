@@ -1296,6 +1296,98 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn generated_hidden_secret_state_machine_matches_reference_editor() -> noprop::TestResult {
+        use std::io::Cursor;
+
+        enum ExpectedOutcome {
+            Value(String),
+            Interrupted,
+            UnexpectedEof,
+        }
+
+        test_support::run(0x4f50_454e_5345_4354, 1024, |ctx| {
+            let steps = noprop::sample_usize_in(ctx, 0..=96);
+            let mut input = Vec::new();
+            let mut model = String::new();
+            let mut expected = None;
+
+            for _ in 0..steps {
+                if expected.is_some() {
+                    break;
+                }
+                match noprop::sample_usize_in(ctx, 0..=13) {
+                    0..=6 => {
+                        const TEXT: &[&str] = &["a", "Z", "0", " ", "é", "日", "秘密", "😀", "🦀"];
+                        let text = TEXT[noprop::sample_usize_in(ctx, 0..TEXT.len())];
+                        input.extend_from_slice(text.as_bytes());
+                        model.push_str(text);
+                    }
+                    7 => {
+                        input.push(0x7f);
+                        model.pop();
+                    }
+                    8 => {
+                        input.push(0x15);
+                        model.clear();
+                    }
+                    9 => {
+                        input.push(0x17);
+                        while model.ends_with(' ') {
+                            model.pop();
+                        }
+                        while !model.is_empty() && !model.ends_with(' ') {
+                            model.pop();
+                        }
+                    }
+                    10 => {
+                        input.push(0x04);
+                        if model.is_empty() {
+                            expected = Some(ExpectedOutcome::UnexpectedEof);
+                        }
+                    }
+                    11 => {
+                        const ESCAPES: &[&[u8]] = &[b"\x1b[A", b"\x1bOP", b"\x1b[1;5D"];
+                        let escape = ESCAPES[noprop::sample_usize_in(ctx, 0..ESCAPES.len())];
+                        input.extend_from_slice(escape);
+                    }
+                    12 => {
+                        input.push(b'\n');
+                        expected = Some(ExpectedOutcome::Value(model.clone()));
+                    }
+                    _ => {
+                        input.push(0x03);
+                        expected = Some(ExpectedOutcome::Interrupted);
+                    }
+                }
+            }
+
+            let expected = expected.unwrap_or_else(|| {
+                input.push(b'\n');
+                ExpectedOutcome::Value(model)
+            });
+            let mut reader = Cursor::new(input);
+            let actual = read_hidden_secret(&mut reader);
+
+            match expected {
+                ExpectedOutcome::Value(expected) => match actual {
+                    Ok(SecretInput::Value(actual)) => assert_eq!(actual.as_str(), expected),
+                    Ok(SecretInput::Interrupted) => panic!("unexpected interrupt"),
+                    Err(error) => panic!("unexpected hidden-secret error: {error}"),
+                },
+                ExpectedOutcome::Interrupted => {
+                    assert!(matches!(actual, Ok(SecretInput::Interrupted)));
+                }
+                ExpectedOutcome::UnexpectedEof => match actual {
+                    Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+                    Ok(_) => panic!("Ctrl-D on empty generated input must fail"),
+                },
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn generated_hidden_tty_flags_only_clear_required_bits() -> noprop::TestResult {
         test_support::run(0x4f50_454e_5454_5945, 1024, |ctx| {
             let flags = noprop::sample_u64(ctx) as libc::tcflag_t;

@@ -91,6 +91,7 @@ The goal is not to replace mature crates indiscriminately. Dependency removal sh
 - [x] backspace, Ctrl-U, Ctrl-W, UTF-8 input, Enter, Ctrl-D, and common terminal escape sequences retain usable password-entry semantics.
 - [x] a pseudoterminal test proves the changed termios fields are restored after guard drop.
 - [x] PBT confirms generated local-mode flags only lose the four intended bits while hidden.
+- [x] secret-input state-machine PBT compares generated UTF-8/edit/control/escape programs against an independent reference editor.
 - [x] non-Unix builds fail closed with environment-variable guidance rather than adding a new platform dependency; release targets remain macOS/Linux.
 - [x] targeted OpenAI tunnel tests pass.
 - [x] `cargo check --all-targets --all-features` passes.
@@ -178,8 +179,9 @@ Completed on 2026-08-23 after Phase 3 commit `98e49dd`.
 - terminal editing coverage includes UTF-8, backspace, Ctrl-U, Ctrl-W, escape sequences, Ctrl-D, and content-preserving whitespace behavior
 - pseudoterminal restoration test: pass on macOS
 - terminal flag PBT: 1024 generated cases / 0 failures
-- targeted OpenAI tunnel tests: 22 passed / 0 failed
-- full tests: 308 passed / 0 failed / 1 intentional process-boundary E2E ignored
+- secret-input state-machine PBT: 1024 generated programs / 0 failures; covers UTF-8, backspace, Ctrl-U/W/D/C, Enter, and CSI/SS3 escape sequences against an independent `String` reference editor
+- targeted OpenAI tunnel tests: 23 passed / 0 failed
+- full tests: 309 passed / 0 failed / 1 intentional process-boundary E2E ignored
 - all-target/all-feature check: pass
 - no-default-features all-target check: pass (existing dead-code warnings only)
 - Clippy with `-D warnings`: pass
