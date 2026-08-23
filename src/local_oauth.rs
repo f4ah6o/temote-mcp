@@ -24,6 +24,7 @@ const MAX_TOKENS: usize = 1024;
 const MAX_PENDING_AUTHORIZATIONS: usize = 64;
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_URI_BYTES: usize = 2048;
+const MAX_CLIENT_METADATA_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
 pub struct LocalOAuth {
@@ -492,27 +493,7 @@ impl LocalOAuth {
                 ),
             ));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > 128 * 1024)
-        {
-            return Err(OAuthError::bad_request(
-                "unauthorized_client",
-                "client metadata document is too large",
-            ));
-        }
-        let bytes = response.bytes().await.map_err(|error| {
-            OAuthError::bad_request(
-                "unauthorized_client",
-                format!("cannot read client metadata document: {error}"),
-            )
-        })?;
-        if bytes.len() > 128 * 1024 {
-            return Err(OAuthError::bad_request(
-                "unauthorized_client",
-                "client metadata document is too large",
-            ));
-        }
+        let bytes = read_client_metadata_body(response).await?;
         let metadata: ClientMetadataDocument = serde_json::from_slice(&bytes).map_err(|error| {
             OAuthError::bad_request(
                 "unauthorized_client",
@@ -622,6 +603,51 @@ impl LocalOAuth {
         }
         Ok(())
     }
+}
+
+async fn read_client_metadata_body(
+    mut response: reqwest::Response,
+) -> std::result::Result<Vec<u8>, OAuthError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CLIENT_METADATA_BYTES as u64)
+    {
+        return Err(client_metadata_too_large());
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(MAX_CLIENT_METADATA_BYTES);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        OAuthError::bad_request(
+            "unauthorized_client",
+            format!("cannot read client metadata document: {error}"),
+        )
+    })? {
+        append_bounded_metadata_chunk(&mut body, &chunk, MAX_CLIENT_METADATA_BYTES)?;
+    }
+    Ok(body)
+}
+
+fn append_bounded_metadata_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> std::result::Result<(), OAuthError> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(client_metadata_too_large());
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn client_metadata_too_large() -> OAuthError {
+    OAuthError::bad_request(
+        "unauthorized_client",
+        "client metadata document is too large",
+    )
 }
 
 fn is_public_ip(ip: IpAddr) -> bool {
@@ -1071,6 +1097,42 @@ mod tests {
         ] {
             assert!(!is_public_ip(value.parse().unwrap()), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn generated_metadata_chunk_budget_never_overreads() -> noprop::TestResult {
+        crate::test_support::run(0x4f41_5554_4842_4f44, 1024, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 0..=1024);
+            let chunk_count = noprop::sample_usize_in(ctx, 0..=16);
+            let chunk_lengths = (0..chunk_count)
+                .map(|_| noprop::sample_usize_in(ctx, 0..=256))
+                .collect::<Vec<_>>();
+            let mut body = Vec::new();
+            let mut accepted = 0usize;
+            let mut rejected = false;
+
+            for length in chunk_lengths {
+                let before = body.len();
+                let chunk = vec![b'x'; length];
+                let result = append_bounded_metadata_chunk(&mut body, &chunk, limit);
+                if accepted.saturating_add(length) <= limit {
+                    result.unwrap();
+                    accepted += length;
+                    assert_eq!(body.len(), accepted);
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(body.len(), before, "rejected chunk was partially retained");
+                    rejected = true;
+                    break;
+                }
+                assert!(body.len() <= limit);
+            }
+            assert_eq!(body.len(), accepted);
+            if rejected {
+                assert!(body.len() <= limit);
+            }
+            Ok(())
+        })
     }
 
     #[test]
