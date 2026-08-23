@@ -11,7 +11,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use crate::config;
 use crate::line_protocol::{
     BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
-    encode_bounded_json_line, next_bounded_line,
+    encode_bounded_json_line, next_bounded_line, validate_child_tool_call,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -104,11 +104,7 @@ impl Bridge {
         tool_name: &str,
         arguments: Value,
     ) -> Result<Value> {
-        anyhow::ensure!(!tool_name.is_empty(), "kintone tool name must not be empty");
-        anyhow::ensure!(
-            arguments.is_object(),
-            "kintone tool arguments must be an object"
-        );
+        validate_child_tool_call(tool_name, &arguments).context("invalid kintone MCP tool call")?;
         self.ensure_client(session).await?;
 
         let listed = self

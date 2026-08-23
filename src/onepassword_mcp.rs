@@ -14,7 +14,8 @@ use tokio::task::JoinHandle;
 use crate::child_env;
 use crate::line_protocol::{
     BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
-    encode_bounded_json_line, next_bounded_line,
+    encode_bounded_json_line, next_bounded_line, validate_child_resource_uri,
+    validate_child_tool_call,
 };
 use crate::{approvals, config};
 
@@ -229,10 +230,7 @@ pub async fn discover(session: &config::Session) -> Result<Value> {
 }
 
 pub async fn read_resource(session: &config::Session, uri: &str) -> Result<Value> {
-    anyhow::ensure!(
-        uri.starts_with("1password://"),
-        "unsupported 1Password resource URI"
-    );
+    validate_child_resource_uri(uri, "1password://").context("invalid 1Password resource URI")?;
     let result = {
         let mut clients = clients().lock().await;
         ensure_client(&mut clients, session).await?;
@@ -275,14 +273,7 @@ pub async fn call_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value> {
-    anyhow::ensure!(
-        !tool_name.is_empty(),
-        "1Password tool name must not be empty"
-    );
-    anyhow::ensure!(
-        arguments.is_object(),
-        "1Password tool arguments must be an object"
-    );
+    validate_child_tool_call(tool_name, &arguments).context("invalid 1Password MCP tool call")?;
     enforce_path_boundary(session, tool_name, &arguments)?;
 
     let descriptor = {

@@ -11,7 +11,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
+use crate::line_protocol::{
+    BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
+};
 use crate::{
     approvals, child_env, config, onepassword_mcp, sandbox, supervisor::SessionSupervisor,
 };
@@ -583,12 +585,9 @@ async fn call_tool(
                 .get("tool_name")
                 .and_then(Value::as_str)
                 .context("missing tool_name")?;
-            anyhow::ensure!(!tool_name.is_empty(), "kintone tool name must not be empty");
             let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            anyhow::ensure!(
-                arguments.is_object(),
-                "kintone tool arguments must be an object"
-            );
+            validate_child_tool_call(tool_name, &arguments)
+                .context("invalid kintone MCP tool call")?;
             let listed = approvals::kintone_mcp_discover(&session.id).await?;
             let known = listed["tools"].as_array().is_some_and(|tools| {
                 tools

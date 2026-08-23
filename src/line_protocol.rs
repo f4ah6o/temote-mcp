@@ -3,6 +3,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub(crate) const MAX_JSON_LINE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_CHILD_TOOL_NAME_BYTES: usize = 256;
+pub(crate) const MAX_CHILD_ARGUMENT_KEYS: usize = 256;
+pub(crate) const MAX_CHILD_ARGUMENT_KEY_BYTES: usize = 256;
+pub(crate) const MAX_CHILD_RESOURCE_URI_BYTES: usize = 4096;
 
 pub(crate) fn encode_bounded_json_line(value: &Value, max_bytes: usize) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value).context("failed to serialize child MCP message")?;
@@ -23,6 +27,62 @@ pub(crate) enum BoundedLine {
     Line(String),
     TooLarge,
     InvalidUtf8,
+}
+
+pub(crate) fn validate_child_tool_call(tool_name: &str, arguments: &Value) -> Result<()> {
+    anyhow::ensure!(
+        !tool_name.is_empty(),
+        "child MCP tool name must not be empty"
+    );
+    anyhow::ensure!(
+        tool_name.len() <= MAX_CHILD_TOOL_NAME_BYTES,
+        "child MCP tool name exceeds {MAX_CHILD_TOOL_NAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !tool_name.contains('\0'),
+        "child MCP tool name must not contain NUL bytes"
+    );
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("child MCP tool arguments must be an object"))?;
+    anyhow::ensure!(
+        object.len() <= MAX_CHILD_ARGUMENT_KEYS,
+        "child MCP tool arguments exceed {MAX_CHILD_ARGUMENT_KEYS} keys"
+    );
+    for key in object.keys() {
+        anyhow::ensure!(
+            key.len() <= MAX_CHILD_ARGUMENT_KEY_BYTES,
+            "child MCP argument key exceeds {MAX_CHILD_ARGUMENT_KEY_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            !key.contains('\0'),
+            "child MCP argument keys must not contain NUL bytes"
+        );
+    }
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    });
+    encode_bounded_json_line(&request, MAX_JSON_LINE_BYTES)?;
+    Ok(())
+}
+
+pub(crate) fn validate_child_resource_uri(uri: &str, required_prefix: &str) -> Result<()> {
+    anyhow::ensure!(
+        uri.len() <= MAX_CHILD_RESOURCE_URI_BYTES,
+        "child MCP resource URI exceeds {MAX_CHILD_RESOURCE_URI_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !uri.contains('\0'),
+        "child MCP resource URI must not contain NUL bytes"
+    );
+    anyhow::ensure!(
+        uri.starts_with(required_prefix),
+        "unsupported child MCP resource URI"
+    );
+    Ok(())
 }
 
 pub(crate) async fn next_bounded_line<R>(
@@ -154,6 +214,100 @@ mod tests {
                 assert_eq!(line.last(), Some(&b'\n'));
                 assert_eq!(&line[..line.len() - 1], serialized.as_slice());
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_child_tool_call_bounds_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x4348_494c_4442_4f55, 512, |ctx| {
+            let name_len = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_CHILD_TOOL_NAME_BYTES - 1,
+                3 => MAX_CHILD_TOOL_NAME_BYTES,
+                _ => MAX_CHILD_TOOL_NAME_BYTES + 1,
+            };
+            let mut tool_name = "t".repeat(name_len);
+            let name_nul = name_len > 0 && noprop::sample_bool(ctx);
+            if name_nul {
+                tool_name.replace_range(0..1, "\0");
+            }
+
+            let key_count = match noprop::sample_usize_in(ctx, 0..=3) {
+                0 => 0,
+                1 => 1,
+                2 => MAX_CHILD_ARGUMENT_KEYS,
+                _ => MAX_CHILD_ARGUMENT_KEYS + 1,
+            };
+            let key_len = match noprop::sample_usize_in(ctx, 0..=3) {
+                0 => 1,
+                1 => MAX_CHILD_ARGUMENT_KEY_BYTES - 1,
+                2 => MAX_CHILD_ARGUMENT_KEY_BYTES,
+                _ => MAX_CHILD_ARGUMENT_KEY_BYTES + 1,
+            };
+            let key_nul = key_count > 0 && noprop::sample_bool(ctx);
+            let mut object = serde_json::Map::new();
+            for index in 0..key_count {
+                let suffix = format!("_{index:x}");
+                let prefix_len = key_len.saturating_sub(suffix.len());
+                let mut key = format!("{}{}", "k".repeat(prefix_len), suffix);
+                if key_nul && index == 0 {
+                    key.replace_range(0..1, "\0");
+                }
+                object.insert(key, json!(index));
+            }
+            let arguments = Value::Object(object);
+            let expected = name_len > 0
+                && name_len <= MAX_CHILD_TOOL_NAME_BYTES
+                && !name_nul
+                && key_count <= MAX_CHILD_ARGUMENT_KEYS
+                && (key_count == 0 || key_len <= MAX_CHILD_ARGUMENT_KEY_BYTES)
+                && !key_nul;
+            let actual = validate_child_tool_call(&tool_name, &arguments);
+            assert_eq!(
+                actual.is_ok(),
+                expected,
+                "name_len={name_len} key_count={key_count} key_len={key_len} name_nul={name_nul} key_nul={key_nul}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn child_tool_call_rejects_wire_oversize_before_write() {
+        let arguments = json!({"payload": "x".repeat(MAX_JSON_LINE_BYTES)});
+        let error = validate_child_tool_call("oversized", &arguments).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn generated_child_resource_uri_bounds_match_reference_model() -> noprop::TestResult {
+        test_support::run(0x4348_494c_4455_5249, 512, |ctx| {
+            let prefix = "1password://";
+            let target_len = match noprop::sample_usize_in(ctx, 0..=4) {
+                0 => prefix.len(),
+                1 => MAX_CHILD_RESOURCE_URI_BYTES - 1,
+                2 => MAX_CHILD_RESOURCE_URI_BYTES,
+                3 => MAX_CHILD_RESOURCE_URI_BYTES + 1,
+                _ => noprop::sample_usize_in(ctx, prefix.len()..=MAX_CHILD_RESOURCE_URI_BYTES + 1),
+            };
+            let valid_prefix = noprop::sample_bool(ctx);
+            let actual_prefix = if valid_prefix { prefix } else { "other://" };
+            let mut uri = actual_prefix.to_owned();
+            uri.push_str(&"x".repeat(target_len.saturating_sub(actual_prefix.len())));
+            let has_nul = !uri.is_empty() && noprop::sample_bool(ctx);
+            if has_nul {
+                uri.push('\0');
+            }
+            let expected =
+                uri.len() <= MAX_CHILD_RESOURCE_URI_BYTES && !has_nul && uri.starts_with(prefix);
+            assert_eq!(
+                validate_child_resource_uri(&uri, prefix).is_ok(),
+                expected,
+                "len={} valid_prefix={valid_prefix} has_nul={has_nul}",
+                uri.len()
+            );
             Ok(())
         })
     }
