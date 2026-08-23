@@ -11,6 +11,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::child_env;
 use crate::line_protocol::{
     BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
     next_bounded_line,
@@ -20,6 +21,18 @@ use crate::{approvals, config};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CACHED_CLIENTS: usize = 64;
 const PROTOCOL_VERSION: &str = "2025-06-18";
+
+fn onepassword_child_command(executable: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    child_env::scrub_sensitive(&mut command, &[]);
+    command
+}
 
 struct Client {
     child: Arc<Mutex<Child>>,
@@ -47,19 +60,13 @@ fn clients() -> &'static Mutex<HashMap<String, Client>> {
 impl Client {
     async fn spawn(session: &config::Session) -> Result<Self> {
         let executable = executable_path()?;
-        let mut child = Command::new(&executable)
-            .current_dir(&session.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start 1Password MCP server at {}",
-                    executable.display()
-                )
-            })?;
+        let mut command = onepassword_child_command(&executable, &session.cwd);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start 1Password MCP server at {}",
+                executable.display()
+            )
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -442,6 +449,25 @@ fn executable_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn onepassword_child_command_scrubs_temote_credentials() {
+        use std::ffi::OsStr;
+
+        let mut command = onepassword_child_command(Path::new("op-mcp"), Path::new("."));
+        for name in child_env::SENSITIVE_ENV_NAMES {
+            command.env(name, "sentinel");
+        }
+        child_env::scrub_sensitive(&mut command, &[]);
+        let envs = command.as_std().get_envs().collect::<Vec<_>>();
+        for name in child_env::SENSITIVE_ENV_NAMES {
+            let value = envs
+                .iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value);
+            assert_eq!(value, Some(None), "credential leaked: {name}");
+        }
+    }
 
     #[test]
     fn generated_client_registry_reaps_finished_entries_and_respects_capacity() -> noprop::TestResult
