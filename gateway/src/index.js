@@ -17,6 +17,7 @@ import {
 const HOST_LEASE_MS = 90_000;
 const POLL_TIMEOUT_MS = 20_000;
 const RPC_TIMEOUT_MS = 35_000;
+const MAX_PENDING_HOST_REQUESTS = 64;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const jwksCache = new Map();
 
@@ -364,6 +365,10 @@ export class GatewaySession {
     if (host.expires_at <= Date.now()) {
       await this.clearHost(host, "host_lease_expired");
       return jsonResponse({ error: "host_offline", detail: "lease expired" }, 503);
+    }
+
+    if (this.pending.size >= MAX_PENDING_HOST_REQUESTS) {
+      return jsonResponse({ error: "gateway_busy", detail: "too many pending host requests" }, 503);
     }
 
     const requestId = crypto.randomUUID();

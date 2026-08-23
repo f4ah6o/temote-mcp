@@ -111,6 +111,58 @@ test("reconnect increments generation and rejects the old host", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("dispatch capacity is bounded and excess work fails without disturbing pending calls", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  await session.fetch(post("connect", {
+    session_id: "bounded",
+    instance_id: "instance-cap",
+    platform: "linux",
+  }));
+
+  const pending = [];
+  for (let index = 0; index < 64; index += 1) {
+    pending.push(session.fetch(post("dispatch", {
+      request: {
+        jsonrpc: "2.0",
+        id: index,
+        method: "tools/call",
+        params: { name: "session_info", arguments: { session_id: "bounded" } },
+      },
+    })));
+  }
+  for (let spin = 0; spin < 20 && session.pending.size < 64; spin += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(session.pending.size, 64);
+  assert.equal(session.queue.length, 64);
+
+  const excess = await session.fetch(post("dispatch", {
+    request: {
+      jsonrpc: "2.0",
+      id: "excess",
+      method: "tools/call",
+      params: { name: "session_info", arguments: { session_id: "bounded" } },
+    },
+  }));
+  assert.equal(excess.status, 503);
+  assert.equal((await excess.json()).error, "gateway_busy");
+  assert.equal(session.pending.size, 64);
+  assert.equal(session.queue.length, 64);
+
+  await session.fetch(post("connect", {
+    session_id: "bounded",
+    instance_id: "instance-replacement",
+    platform: "linux",
+  }));
+  const replaced = await Promise.all(pending);
+  assert.equal(replaced.every((response) => response.status === 502), true);
+  assert.equal(session.pending.size, 0);
+  assert.equal(session.queue.length, 0);
+});
+
 test("dispatch, poll, and respond complete one routed RPC", async () => {
   const session = new GatewaySession(
     { storage: new MemoryStorage() },
