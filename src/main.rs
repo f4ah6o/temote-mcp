@@ -470,12 +470,114 @@ async fn stop_child(child: &mut tokio::process::Child) {
 }
 
 #[cfg(feature = "network")]
+const MAX_PUBLIC_ENV_BYTES: usize = 64 * 1024;
+
+#[cfg(feature = "network")]
+fn read_private_public_env(path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot open {}", path.display())),
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "public env must be a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_PUBLIC_ENV_BYTES as u64,
+        "public env exceeds {MAX_PUBLIC_ENV_BYTES} bytes: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "public env must not be accessible by group or other users (mode {mode:04o}): {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(MAX_PUBLIC_ENV_BYTES));
+    std::io::Read::take(&mut file, (MAX_PUBLIC_ENV_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_PUBLIC_ENV_BYTES,
+        "public env exceeds {MAX_PUBLIC_ENV_BYTES} bytes: {}",
+        path.display()
+    );
+    Ok(Some(bytes))
+}
+
+#[cfg(feature = "network")]
 pub(crate) fn load_public_env() -> Result<()> {
     let path = std::env::var_os("TEMOTE_MCP_ENV_FILE")
         .map(PathBuf::from)
         .or_else(|| dirs::config_dir().map(|config| config.join("temote-mcp").join("public.env")));
-    if let Some(path) = path.filter(|path| path.is_file()) {
-        dotenvy::from_path(&path).with_context(|| format!("failed to load {}", path.display()))?;
+    if let Some(path) = path
+        && let Some(bytes) = read_private_public_env(&path)?
+    {
+        dotenvy::from_read(std::io::Cursor::new(bytes))
+            .with_context(|| format!("failed to load {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "network"))]
+mod public_env_tests {
+    use super::*;
+    use crate::test_support;
+
+    #[test]
+    fn generated_public_env_size_bound_is_exact() -> noprop::TestResult {
+        test_support::run(0x5055_4245_4e56_5349, 64, |ctx| {
+            let len = noprop::sample_usize_in(ctx, 0..=MAX_PUBLIC_ENV_BYTES + 1024);
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("public.env");
+            std::fs::write(&path, vec![b'x'; len]).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let result = read_private_public_env(&path);
+            assert_eq!(result.is_ok(), len <= MAX_PUBLIC_ENV_BYTES, "len={len}");
+            if let Ok(Some(bytes)) = result {
+                assert_eq!(bytes.len(), len);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn public_env_rejects_symlinks_and_public_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.env");
+        std::fs::write(&target, b"TEMOTE_MCP_PUBLIC_URL=https://example.com\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let link = root.path().join("link.env");
+            symlink(&target, &link).unwrap();
+            assert!(read_private_public_env(&link).is_err());
+
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_private_public_env(&target).is_err());
+        }
+    }
 }
