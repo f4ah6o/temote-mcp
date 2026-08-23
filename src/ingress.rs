@@ -2,15 +2,20 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use crate::profile::Profile;
 use crate::provider::PublicEndpoint;
 
 pub const TAILSCALE_HTTPS_PORTS: [u16; 3] = [443, 8443, 10000];
+const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_TAILSCALE_STATUS_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TAILSCALE_STDERR_BYTES: usize = 64 * 1024;
 
 pub struct ManagedIngress {
     profile: Profile,
@@ -126,22 +131,92 @@ pub async fn start(
     Ok(ManagedIngress { profile, child })
 }
 
+async fn run_tailscale_status(args: &[&str], label: &str) -> Result<Vec<u8>> {
+    let mut child = Command::new("tailscale")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to execute `{label}`"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("tailscale status stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("tailscale status stderr was not captured")?;
+
+    let captured = tokio::time::timeout(TAILSCALE_STATUS_TIMEOUT, async {
+        let (stdout, stderr, status) = tokio::join!(
+            read_bounded_stream(stdout, MAX_TAILSCALE_STATUS_BYTES),
+            read_bounded_stream(stderr, MAX_TAILSCALE_STDERR_BYTES),
+            child.wait(),
+        );
+        Result::<_>::Ok((stdout?, stderr?, status?))
+    })
+    .await;
+    let (stdout, stderr, status) = match captured {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("`{label}` timed out");
+        }
+    };
+    anyhow::ensure!(
+        !stdout.truncated,
+        "`{label}` response exceeds {MAX_TAILSCALE_STATUS_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        status.success(),
+        "`{label}` failed: {}{}",
+        String::from_utf8_lossy(&stderr.bytes).trim(),
+        if stderr.truncated {
+            " [stderr truncated]"
+        } else {
+            ""
+        }
+    );
+    Ok(stdout.bytes)
+}
+
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_stream<R>(mut reader: R, limit: usize) -> std::io::Result<BoundedCapture>
+where
+    R: AsyncRead + Unpin,
+{
+    const CHUNK: usize = 8192;
+    let mut bytes = Vec::with_capacity(limit.min(CHUNK));
+    let mut truncated = false;
+    let mut buffer = [0_u8; CHUNK];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let kept = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..kept]);
+        if kept < read {
+            truncated = true;
+        }
+    }
+    Ok(BoundedCapture { bytes, truncated })
+}
+
 pub async fn configured_funnel_https_ports() -> Result<BTreeSet<u16>> {
-    let output = Command::new("tailscale")
-        .args(["funnel", "status", "--json"])
-        .output()
-        .await
-        .context("failed to execute `tailscale funnel status --json`")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "`tailscale funnel status --json` failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    anyhow::ensure!(
-        output.stdout.len() <= 4 * 1024 * 1024,
-        "tailscale funnel status response is too large"
-    );
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let stdout = run_tailscale_status(
+        &["funnel", "status", "--json"],
+        "tailscale funnel status --json",
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_slice(&stdout)
         .context("invalid `tailscale funnel status --json` response")?;
     let mut ports = BTreeSet::new();
     if let Some(tcp) = value.get("TCP").and_then(serde_json::Value::as_object) {
@@ -188,22 +263,9 @@ pub fn tailscale_origin(hostname: &str, port: u16) -> String {
 }
 
 pub async fn tailscale_dns_name() -> Result<String> {
-    let output = Command::new("tailscale")
-        .args(["status", "--json"])
-        .output()
-        .await
-        .context("failed to execute `tailscale status --json`")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "`tailscale status --json` failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    anyhow::ensure!(
-        output.stdout.len() <= 4 * 1024 * 1024,
-        "tailscale status response is too large"
-    );
-    let status: TailscaleStatus = serde_json::from_slice(&output.stdout)
-        .context("invalid `tailscale status --json` response")?;
+    let stdout = run_tailscale_status(&["status", "--json"], "tailscale status --json").await?;
+    let status: TailscaleStatus =
+        serde_json::from_slice(&stdout).context("invalid `tailscale status --json` response")?;
     let dns_name = status
         .self_node
         .and_then(|node| node.dns_name)
@@ -232,6 +294,31 @@ struct TailscaleSelf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
+    use tokio::io::AsyncWriteExt as _;
+
+    #[test]
+    fn generated_bounded_status_capture_matches_prefix_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        test_support::run(0x5441_494c_4341_5001, 512, |ctx| {
+            let limit = noprop::sample_usize_in(ctx, 0..=128);
+            let len = noprop::sample_usize_in(ctx, 0..=256);
+            let bytes = (0..len).map(|_| noprop::sample_u8(ctx)).collect::<Vec<_>>();
+            runtime.block_on(async {
+                let capacity = bytes.len().max(1);
+                let (mut writer, reader) = tokio::io::duplex(capacity);
+                writer.write_all(&bytes).await.unwrap();
+                writer.shutdown().await.unwrap();
+                let captured = read_bounded_stream(reader, limit).await.unwrap();
+                assert_eq!(captured.bytes, bytes[..bytes.len().min(limit)]);
+                assert_eq!(captured.truncated, bytes.len() > limit);
+            });
+            Ok(())
+        })
+    }
 
     #[test]
     fn formats_tailscale_origins() {
