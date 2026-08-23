@@ -23,6 +23,14 @@ const SESSION_MESSAGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_PENDING_SESSION_READS: usize = 64;
 const MAX_PENDING_APPROVALS: usize = 64;
+const MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENTS: usize = 256;
+const MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
+const MAX_SERVICE_ACCOUNT_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
+const MAX_SERVICE_ACCOUNT_ENV_FILES: usize = 32;
+const MAX_SERVICE_ACCOUNT_ENV_FILE_PATH_BYTES: usize = 4096;
+const MAX_SERVICE_ACCOUNT_ENV_VARS: usize = 64;
+const MAX_SERVICE_ACCOUNT_ENV_NAME_BYTES: usize = 128;
+const MAX_SERVICE_ACCOUNT_ENV_REF_BYTES: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -1095,7 +1103,7 @@ async fn service_account_run(
     env_files: Vec<PathBuf>,
     environment_refs: BTreeMap<String, String>,
 ) -> Result<Value> {
-    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    validate_service_account_run_input(&command, &env_files, &environment_refs)?;
     let cwd = config::resolve_cwd(session, Some(&cwd))?;
     let env_files = env_files
         .into_iter()
@@ -1108,21 +1116,6 @@ async fn service_account_run(
             config::resolve_existing_path(session, &path)
         })
         .collect::<Result<Vec<_>>>()?;
-    for (name, reference) in &environment_refs {
-        anyhow::ensure!(
-            valid_environment_name(name),
-            "invalid environment variable name: {name}"
-        );
-        anyhow::ensure!(
-            !name.starts_with("OP_"),
-            "environment variables beginning with OP_ are reserved for 1Password CLI"
-        );
-        anyhow::ensure!(
-            reference.starts_with("op://"),
-            "1Password environment values must be op:// secret references"
-        );
-    }
-
     let mut op_command = vec!["op".to_owned(), "run".to_owned()];
     for path in &env_files {
         op_command.push(format!("--env-file={}", path.display()));
@@ -1152,6 +1145,80 @@ async fn service_account_run(
         "stderr": stderr,
         "truncated": output.truncated,
     }))
+}
+
+pub(crate) fn validate_service_account_run_input(
+    command: &[String],
+    env_files: &[PathBuf],
+    environment_refs: &BTreeMap<String, String>,
+) -> Result<()> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    anyhow::ensure!(
+        !command[0].is_empty(),
+        "command executable must not be empty"
+    );
+    anyhow::ensure!(
+        command.len() <= MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENTS,
+        "command must contain at most {MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENTS} arguments"
+    );
+    let mut command_bytes = 0usize;
+    for argument in command {
+        anyhow::ensure!(
+            !argument.contains('\0'),
+            "command arguments must not contain NUL bytes"
+        );
+        anyhow::ensure!(
+            argument.len() <= MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENT_BYTES,
+            "command argument exceeds {MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENT_BYTES} bytes"
+        );
+        command_bytes = command_bytes
+            .checked_add(argument.len())
+            .context("command argument size overflow")?;
+        anyhow::ensure!(
+            command_bytes <= MAX_SERVICE_ACCOUNT_COMMAND_TOTAL_BYTES,
+            "command arguments exceed {MAX_SERVICE_ACCOUNT_COMMAND_TOTAL_BYTES} bytes in total"
+        );
+    }
+
+    anyhow::ensure!(
+        env_files.len() <= MAX_SERVICE_ACCOUNT_ENV_FILES,
+        "at most {MAX_SERVICE_ACCOUNT_ENV_FILES} 1Password env files are allowed"
+    );
+    for path in env_files {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        anyhow::ensure!(
+            !bytes.contains(&0),
+            "1Password env file paths must not contain NUL bytes"
+        );
+        anyhow::ensure!(
+            bytes.len() <= MAX_SERVICE_ACCOUNT_ENV_FILE_PATH_BYTES,
+            "1Password env file path exceeds {MAX_SERVICE_ACCOUNT_ENV_FILE_PATH_BYTES} bytes"
+        );
+    }
+
+    anyhow::ensure!(
+        environment_refs.len() <= MAX_SERVICE_ACCOUNT_ENV_VARS,
+        "at most {MAX_SERVICE_ACCOUNT_ENV_VARS} 1Password secret environment variables are allowed"
+    );
+    for (name, reference) in environment_refs {
+        anyhow::ensure!(
+            name.len() <= MAX_SERVICE_ACCOUNT_ENV_NAME_BYTES && valid_environment_name(name),
+            "invalid environment variable name: {name}"
+        );
+        anyhow::ensure!(
+            !name.starts_with("OP_"),
+            "environment variables beginning with OP_ are reserved for 1Password CLI"
+        );
+        anyhow::ensure!(
+            reference.len() <= MAX_SERVICE_ACCOUNT_ENV_REF_BYTES,
+            "1Password secret reference exceeds {MAX_SERVICE_ACCOUNT_ENV_REF_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            !reference.contains('\0') && reference.starts_with("op://"),
+            "1Password environment values must be op:// secret references"
+        );
+    }
+    Ok(())
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -1240,6 +1307,104 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("op:// secret references"));
+    }
+
+    #[test]
+    fn generated_service_account_input_budget_matches_reference_model() -> noprop::TestResult {
+        test_support::run(0x4f50_5341_4255_4447, 256, |ctx| {
+            let command_count =
+                noprop::sample_usize_in(ctx, 1..=MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENTS + 4);
+            let env_file_count =
+                noprop::sample_usize_in(ctx, 0..=MAX_SERVICE_ACCOUNT_ENV_FILES + 4);
+            let env_var_count = noprop::sample_usize_in(ctx, 0..=MAX_SERVICE_ACCOUNT_ENV_VARS + 4);
+            let mutation = noprop::sample_usize_in(ctx, 0..=9);
+
+            let mut command = (0..command_count)
+                .map(|index| format!("arg-{index}"))
+                .collect::<Vec<_>>();
+            let mut env_files = (0..env_file_count)
+                .map(|index| PathBuf::from(format!("env-{index}.env")))
+                .collect::<Vec<_>>();
+            let mut environment_refs = (0..env_var_count)
+                .map(|index| {
+                    (
+                        format!("SECRET_{index}"),
+                        format!("op://vault/item/field-{index}"),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            match mutation {
+                1 => command[0].clear(),
+                2 => command[0].push('\0'),
+                3 => command[0] = "x".repeat(MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENT_BYTES + 1),
+                4 => {
+                    command = (0..5)
+                        .map(|index| format!("{index}{}", "x".repeat(30 * 1024)))
+                        .collect();
+                }
+                5 => env_files.push(PathBuf::from(
+                    "x".repeat(MAX_SERVICE_ACCOUNT_ENV_FILE_PATH_BYTES + 1),
+                )),
+                6 => {
+                    environment_refs.insert(
+                        "OP_ACCOUNT".to_owned(),
+                        "op://vault/item/account".to_owned(),
+                    );
+                }
+                7 => {
+                    environment_refs.insert("BAD-NAME".to_owned(), "op://vault/item/x".to_owned());
+                }
+                8 => {
+                    environment_refs.insert("SECRET_BAD".to_owned(), "plaintext".to_owned());
+                }
+                9 => {
+                    environment_refs.insert(
+                        "SECRET_LONG".to_owned(),
+                        format!("op://{}", "x".repeat(MAX_SERVICE_ACCOUNT_ENV_REF_BYTES + 1)),
+                    );
+                }
+                _ => {}
+            }
+
+            let command_total = command
+                .iter()
+                .try_fold(0usize, |total, argument| total.checked_add(argument.len()));
+            let expected_command = !command.is_empty()
+                && !command[0].is_empty()
+                && command.len() <= MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENTS
+                && command.iter().all(|argument| {
+                    !argument.contains('\0')
+                        && argument.len() <= MAX_SERVICE_ACCOUNT_COMMAND_ARGUMENT_BYTES
+                })
+                && command_total
+                    .is_some_and(|bytes| bytes <= MAX_SERVICE_ACCOUNT_COMMAND_TOTAL_BYTES);
+            let expected_files = env_files.len() <= MAX_SERVICE_ACCOUNT_ENV_FILES
+                && env_files.iter().all(|path| {
+                    let bytes = path.as_os_str().as_encoded_bytes();
+                    !bytes.contains(&0) && bytes.len() <= MAX_SERVICE_ACCOUNT_ENV_FILE_PATH_BYTES
+                });
+            let expected_refs = environment_refs.len() <= MAX_SERVICE_ACCOUNT_ENV_VARS
+                && environment_refs.iter().all(|(name, reference)| {
+                    name.len() <= MAX_SERVICE_ACCOUNT_ENV_NAME_BYTES
+                        && valid_environment_name(name)
+                        && !name.starts_with("OP_")
+                        && reference.len() <= MAX_SERVICE_ACCOUNT_ENV_REF_BYTES
+                        && !reference.contains('\0')
+                        && reference.starts_with("op://")
+                });
+            let result =
+                validate_service_account_run_input(&command, &env_files, &environment_refs);
+            assert_eq!(
+                result.is_ok(),
+                expected_command && expected_files && expected_refs,
+                "command_count={} env_files={} env_vars={} mutation={mutation}",
+                command.len(),
+                env_files.len(),
+                environment_refs.len()
+            );
+            Ok(())
+        })
     }
 
     #[tokio::test]

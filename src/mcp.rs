@@ -530,6 +530,7 @@ async fn call_tool(
                 })
                 .transpose()?
                 .unwrap_or_default();
+            approvals::validate_service_account_run_input(&command, &env_files, &environment)?;
             let detail = format!(
                 "argv: {}\nenv files: {}\nsecret env names: {}",
                 render_command(&command),
