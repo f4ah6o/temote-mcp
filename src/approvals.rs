@@ -31,6 +31,10 @@ const MAX_SERVICE_ACCOUNT_ENV_FILE_PATH_BYTES: usize = 4096;
 const MAX_SERVICE_ACCOUNT_ENV_VARS: usize = 64;
 const MAX_SERVICE_ACCOUNT_ENV_NAME_BYTES: usize = 128;
 const MAX_SERVICE_ACCOUNT_ENV_REF_BYTES: usize = 4096;
+const MAX_ACTIVITY_TITLE_BYTES: usize = 512;
+const MAX_ACTIVITY_DETAIL_BYTES: usize = 16 * 1024;
+const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
+const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -798,7 +802,12 @@ async fn run_runtime(
                         });
                     }
                     Message::Approval { request } if session.yolo => {
-                        eprintln!("[session {}] [yolo] allowing {}: {}", session.id, request.operation, request.detail);
+                        eprintln!(
+                            "[session {}] [yolo] allowing {}: {}",
+                            session.id,
+                            bounded_console_text(&request.operation, MAX_APPROVAL_OPERATION_BYTES),
+                            bounded_console_text(&request.detail, MAX_APPROVAL_DETAIL_BYTES),
+                        );
                         stream.write_all(b"allow\n").await?;
                     }
                     Message::Approval { request } => {
@@ -989,8 +998,8 @@ fn show_supervisor_prompt(prompt: &ApprovalPrompt) -> Result<()> {
         prompt.session_id,
         prompt.request.id,
         prompt.request.cwd.display(),
-        prompt.request.operation,
-        prompt.request.detail
+        bounded_console_text(&prompt.request.operation, MAX_APPROVAL_OPERATION_BYTES),
+        bounded_console_text(&prompt.request.detail, MAX_APPROVAL_DETAIL_BYTES),
     );
     eprint!("Allow operation? [y/N] ");
     std::io::stderr().flush()?;
@@ -1242,9 +1251,32 @@ fn redact_token(text: &str, token: &str) -> String {
     }
 }
 
+fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+    if value.len() <= max_bytes {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    const SUFFIX: &str = "… [truncated]";
+    let suffix = if max_bytes >= SUFFIX.len() {
+        SUFFIX
+    } else {
+        ""
+    };
+    let budget = max_bytes.saturating_sub(suffix.len());
+    let mut end = budget.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(max_bytes);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(suffix);
+    std::borrow::Cow::Owned(bounded)
+}
+
 fn show_activity_for_session(session_id: &str, title: &str, detail: Option<&str>) {
+    let title = bounded_console_text(title, MAX_ACTIVITY_TITLE_BYTES);
     eprintln!("\n[session {session_id}] • {title}");
     if let Some(detail) = detail.filter(|value| !value.is_empty()) {
+        let detail = bounded_console_text(detail, MAX_ACTIVITY_DETAIL_BYTES);
         for line in detail.lines() {
             eprintln!("  {line}");
         }
@@ -1286,6 +1318,40 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[test]
+    fn generated_console_text_bounds_are_utf8_safe() -> noprop::TestResult {
+        test_support::run(0x434f_4e53_4f4c_4501, 1024, |ctx| {
+            let max_bytes = noprop::sample_usize_in(ctx, 0..=1024);
+            let count = noprop::sample_usize_in(ctx, 0..=1024);
+            let character = match noprop::sample_usize_in(ctx, 0..4) {
+                0 => "x",
+                1 => "é",
+                2 => "界",
+                _ => "😀",
+            };
+            let value = character.repeat(count);
+            let bounded = bounded_console_text(&value, max_bytes);
+            assert!(
+                bounded.len() <= max_bytes,
+                "max={max_bytes} actual={}",
+                bounded.len()
+            );
+            if value.len() <= max_bytes {
+                assert_eq!(bounded, value);
+            } else {
+                const SUFFIX: &str = "… [truncated]";
+                if max_bytes >= SUFFIX.len() {
+                    assert!(bounded.ends_with(SUFFIX));
+                    let prefix = bounded.strip_suffix(SUFFIX).unwrap();
+                    assert!(value.starts_with(prefix));
+                } else {
+                    assert!(value.starts_with(bounded.as_ref()));
+                }
+            }
+            Ok(())
+        })
     }
 
     #[test]
