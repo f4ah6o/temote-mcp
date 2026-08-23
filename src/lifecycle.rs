@@ -16,6 +16,18 @@ const MAX_LEGACY_PID_FILE_BYTES: usize = 64;
 const PROCESS_NAME: &str = env!("CARGO_PKG_NAME");
 const MAX_PID_FILE_BYTES: usize = 64;
 const MAX_TUNNEL_TOKEN_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const PS_COMMAND: &str = "/bin/ps";
+#[cfg(target_os = "macos")]
+const PGREP_COMMAND: &str = "/usr/bin/pgrep";
+#[cfg(target_os = "linux")]
+const PS_COMMAND: &str = "/usr/bin/ps";
+#[cfg(target_os = "linux")]
+const PGREP_COMMAND: &str = "/usr/bin/pgrep";
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+const PS_COMMAND: &str = "/bin/ps";
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+const PGREP_COMMAND: &str = "/usr/bin/pgrep";
 
 pub async fn up(
     profile: Profile,
@@ -464,7 +476,8 @@ fn is_temote_process(pid: i32) -> Result<bool> {
 }
 
 fn process_name(pid: i32) -> Result<Option<String>> {
-    let output = Command::new("ps")
+    let output = Command::new(PS_COMMAND)
+        .env_clear()
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .output()
         .context("failed to inspect the temote-mcp process")?;
@@ -487,7 +500,8 @@ fn executable_name(command: &str) -> &str {
 }
 
 fn child_processes(parent_pid: i32) -> Vec<i32> {
-    let Ok(output) = Command::new("pgrep")
+    let Ok(output) = Command::new(PGREP_COMMAND)
+        .env_clear()
         .args(["-P", &parent_pid.to_string()])
         .output()
     else {
@@ -765,6 +779,22 @@ mod tests {
         assert!(parse_pid("").is_err());
         assert!(parse_pid("0").is_err());
         assert!(parse_pid("-1").is_err());
+    }
+
+    #[test]
+    fn process_inspection_uses_absolute_system_utilities() {
+        assert!(Path::new(PS_COMMAND).is_absolute());
+        assert!(Path::new(PGREP_COMMAND).is_absolute());
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(PS_COMMAND, "/bin/ps");
+            assert_eq!(PGREP_COMMAND, "/usr/bin/pgrep");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(PS_COMMAND, "/usr/bin/ps");
+            assert_eq!(PGREP_COMMAND, "/usr/bin/pgrep");
+        }
     }
 
     #[test]
