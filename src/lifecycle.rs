@@ -23,6 +23,14 @@ pub async fn up(
     addr: std::net::SocketAddr,
     tunnel_token_file: Option<PathBuf>,
 ) -> Result<()> {
+    let legacy_pid_file = runtime_directory()?.join(LEGACY_PID_FILE_NAME);
+    if read_legacy_up_pids(&legacy_pid_file)?.is_some() {
+        anyhow::bail!(
+            "legacy Temote runtime state exists at {}; run `temote-mcp migrate --dry-run` and `temote-mcp migrate` before `temote-mcp up`",
+            legacy_pid_file.display()
+        );
+    }
+
     if profile == Profile::Cloudflare {
         crate::load_public_env()?;
     }

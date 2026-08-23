@@ -11,6 +11,7 @@ Configuration files (`public.env`, `tunnel-token`) and local session metadata re
 ## Implementation
 
 - Add idempotent `temote-mcp migrate` on Unix network builds.
+- Make current `temote-mcp up` fail closed with migration guidance while legacy `up.pids` exists, preventing accidental dual supervisors.
 - Detect only the known legacy `up.pids` state.
 - Read the legacy PID file with `O_NOFOLLOW`, regular-file checks, and a strict byte/grammar bound.
 - Before signaling a live PID, verify the recorded process name is exactly the expected legacy owner (`temote-mcp` / `cloudflared`). Fail closed on PID reuse or unexpected processes.
@@ -28,6 +29,7 @@ Configuration files (`public.env`, `tunnel-token`) and local session metadata re
 - [ ] valid live legacy `serve + cloudflared` state can be stopped
 - [x] `--dry-run` does not signal or delete
 - [x] current `up.pid` lifecycle remains unchanged
+- [x] current `up` refuses to start while legacy `up.pids` remains
 - [x] docs describe `install -> migrate -> up`
 - [x] normal Rust gates pass
 
