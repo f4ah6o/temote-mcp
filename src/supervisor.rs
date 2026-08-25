@@ -153,6 +153,15 @@ impl SessionSupervisor {
         handle.shutdown().await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn crash_for_test(&self, session_id: &str) -> Result<()> {
+        let sessions = self.sessions.lock().await;
+        let handle = sessions.get(session_id).with_context(|| {
+            format!("session {session_id} is not managed by this supervisor process")
+        })?;
+        handle.crash_for_test().await
+    }
+
     pub async fn reap_finished(&self) {
         let finished = {
             let sessions = self.sessions.lock().await;

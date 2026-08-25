@@ -497,6 +497,18 @@ impl RuntimeHandle {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        if config::read_session_lifecycle(&self.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.status == config::LifecycleStatus::Crashed)
+        {
+            let session_id = self.id.clone();
+            if let Err(error) = self.wait().await {
+                eprintln!("session {session_id} was already crashed before shutdown: {error:#}");
+            }
+            return Ok(());
+        }
         if self.join.is_finished() {
             return self.wait().await;
         }
@@ -1760,7 +1772,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(handle.shutdown().await.is_err());
+        handle.shutdown().await.unwrap();
 
         let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
         assert_eq!(lifecycle.status, config::LifecycleStatus::Crashed);

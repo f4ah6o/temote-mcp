@@ -559,14 +559,13 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
     let mut lifecycle = config::read_session_lifecycle(id).await?;
     let liveness = config::session_is_active(id).await;
 
-    if matches!(liveness, Ok(false))
-        && lifecycle.as_ref().is_some_and(|state| {
-            matches!(
-                state.status,
-                LifecycleStatus::Starting | LifecycleStatus::Active | LifecycleStatus::Stopping
-            )
-        })
-    {
+    let claims_live_runtime = lifecycle.as_ref().map_or(session.process_id != 0, |state| {
+        matches!(
+            state.status,
+            LifecycleStatus::Starting | LifecycleStatus::Active | LifecycleStatus::Stopping
+        )
+    });
+    if matches!(liveness, Ok(false)) && claims_live_runtime {
         persist_crash(
             id,
             lifecycle.take(),
@@ -721,6 +720,7 @@ mod tests {
 
     use super::*;
     use crate::approvals;
+    use crate::test_support;
 
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
@@ -801,6 +801,231 @@ mod tests {
         broker.abort();
         let _ = broker.await;
         cleanup(&id).await;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ModelState {
+        Absent,
+        Active,
+        Stopped,
+        Crashed,
+    }
+
+    #[test]
+    fn generated_lifecycle_sequences_match_reference_model() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x4c49_4645_4359_434c, 32, |ctx| {
+            let (_temp, roots) = fixture();
+            let nonce = noprop::sample_u64(ctx);
+            let ids = [
+                format!("lifecycle-{nonce:x}-a"),
+                format!("lifecycle-{nonce:x}-b"),
+                format!("lifecycle-{nonce:x}-c"),
+            ];
+            let steps = (0..16)
+                .map(|_| {
+                    (
+                        noprop::sample_usize_in(ctx, 0..5),
+                        noprop::sample_usize_in(ctx, 0..ids.len()),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            runtime.block_on(async {
+                for id in &ids {
+                    cleanup(id).await;
+                }
+                let (supervisor, _approvals) = SessionSupervisor::new(roots);
+                let mut model = [ModelState::Absent; 3];
+
+                for (operation, index) in steps {
+                    let id = &ids[index];
+                    match operation {
+                        0 => {
+                            let expected = model[index] != ModelState::Active;
+                            let result = supervisor.start("src/repo", Some(id)).await;
+                            assert_eq!(
+                                result.is_ok(),
+                                expected,
+                                "start mismatch for {id}: state={:?}, result={result:?}",
+                                model[index]
+                            );
+                            if expected {
+                                model[index] = ModelState::Active;
+                            }
+                        }
+                        1 => {
+                            let expected = model[index] == ModelState::Active;
+                            let result = supervisor.stop(id).await;
+                            assert_eq!(
+                                result.is_ok(),
+                                expected,
+                                "stop mismatch for {id}: state={:?}, result={result:?}",
+                                model[index]
+                            );
+                            if expected {
+                                model[index] = ModelState::Stopped;
+                            }
+                        }
+                        2 => {
+                            let expected = model[index] == ModelState::Active;
+                            let result = supervisor.crash_for_test(id).await;
+                            assert_eq!(
+                                result.is_ok(),
+                                expected,
+                                "crash mismatch for {id}: state={:?}, result={result:?}",
+                                model[index]
+                            );
+                            if expected {
+                                tokio::time::timeout(Duration::from_secs(1), async {
+                                    loop {
+                                        if config::read_session_lifecycle(id)
+                                            .await
+                                            .unwrap()
+                                            .is_some_and(|state| {
+                                                state.status == LifecycleStatus::Crashed
+                                            })
+                                        {
+                                            break;
+                                        }
+                                        tokio::task::yield_now().await;
+                                    }
+                                })
+                                .await
+                                .expect("injected crash did not persist crashed lifecycle");
+                                supervisor.reap_finished().await;
+                                model[index] = ModelState::Crashed;
+                            }
+                        }
+                        3 => {
+                            let expected = model[index] != ModelState::Absent;
+                            let result = restart_session(&supervisor, id).await;
+                            assert_eq!(
+                                result.is_ok(),
+                                expected,
+                                "restart mismatch for {id}: state={:?}, result={result:?}",
+                                model[index]
+                            );
+                            if expected {
+                                model[index] = ModelState::Active;
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    for (candidate_index, candidate) in ids.iter().enumerate() {
+                        match model[candidate_index] {
+                            ModelState::Absent => {
+                                assert!(inspect_session(candidate).await.is_err());
+                                assert!(!config::session_is_active(candidate).await.unwrap());
+                            }
+                            ModelState::Active => {
+                                let view = inspect_session(candidate).await.unwrap();
+                                assert_eq!(view.status, "active", "candidate={candidate}");
+                                assert!(config::session_is_active(candidate).await.unwrap());
+                            }
+                            ModelState::Stopped => {
+                                let view = inspect_session(candidate).await.unwrap();
+                                assert_eq!(view.status, "stopped", "candidate={candidate}");
+                                assert!(!config::session_is_active(candidate).await.unwrap());
+                            }
+                            ModelState::Crashed => {
+                                let view = inspect_session(candidate).await.unwrap();
+                                assert_eq!(view.status, "crashed", "candidate={candidate}");
+                                assert!(!config::session_is_active(candidate).await.unwrap());
+                            }
+                        }
+                    }
+                }
+
+                supervisor.shutdown().await.unwrap();
+                for id in &ids {
+                    cleanup(id).await;
+                }
+            });
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_dead_socket_states_never_report_active() -> noprop::TestResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        test_support::run(0x5354_414c_4553_5441, 128, |ctx| {
+            let nonce = noprop::sample_u64(ctx);
+            let variant = noprop::sample_usize_in(ctx, 0..6);
+            let has_process_id = noprop::sample_bool(ctx);
+            runtime.block_on(async {
+                let root = tempfile::tempdir().unwrap();
+                let id = format!("stale-pbt-{nonce:x}");
+                cleanup(&id).await;
+                let mut session = config::new_session(root.path(), Some(&id), false).unwrap();
+                session.process_id = if has_process_id {
+                    std::process::id()
+                } else {
+                    0
+                };
+                config::save_session(&session).await.unwrap();
+
+                let configured_status = match variant {
+                    0 => None,
+                    1 => Some(LifecycleStatus::Starting),
+                    2 => Some(LifecycleStatus::Active),
+                    3 => Some(LifecycleStatus::Stopping),
+                    4 => Some(LifecycleStatus::Stopped),
+                    _ => Some(LifecycleStatus::Crashed),
+                };
+                if let Some(status) = configured_status {
+                    let mut lifecycle =
+                        SessionLifecycle::starting(session.started_at, Some("src/repo".to_owned()));
+                    lifecycle.status = status;
+                    if matches!(status, LifecycleStatus::Stopped | LifecycleStatus::Crashed) {
+                        lifecycle.stopped_at = Some(config::unix_time());
+                    }
+                    config::save_session_lifecycle(&id, &lifecycle)
+                        .await
+                        .unwrap();
+                }
+
+                let expected = match configured_status {
+                    Some(LifecycleStatus::Stopped) => "stopped",
+                    Some(LifecycleStatus::Crashed) => "crashed",
+                    Some(
+                        LifecycleStatus::Starting
+                        | LifecycleStatus::Active
+                        | LifecycleStatus::Stopping,
+                    ) => "crashed",
+                    None if has_process_id => "crashed",
+                    None => "stopped",
+                };
+                let view = inspect_session(&id).await.unwrap();
+                assert_eq!(
+                    view.status, expected,
+                    "variant={variant} has_process_id={has_process_id}"
+                );
+                assert_ne!(view.status, "active");
+                assert!(view.pid.is_none());
+                assert!(!config::session_is_active(&id).await.unwrap());
+
+                if expected == "crashed" {
+                    let persisted = config::read_session_lifecycle(&id)
+                        .await
+                        .unwrap()
+                        .expect("crashed state must be durable");
+                    assert_eq!(persisted.status, LifecycleStatus::Crashed);
+                    assert!(persisted.stopped_at.is_some());
+                }
+                cleanup(&id).await;
+            });
+            Ok(())
+        })
     }
 
     #[tokio::test]
