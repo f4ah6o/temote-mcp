@@ -82,9 +82,13 @@ approval console は runtime owner ではなく attachment です。terminal clo
 
 互換用に `cd ~/src/my-project && temote-mcp start my-project` は current directory を local supervisor 配下で起動する shorthand として残します。先に `temote-mcp supervisor` が必要です。`--yolo` はこの local CLI path だけで利用でき、remote MCP `session_start` から yolo session は作成できません。local stdio client は `temote-mcp mcp` を起動します。
 
-## Agent Skill
+## Codex Plugin と Agent Skill
 
-Temote MCP には、session、Git 専用ツール、background job、bridge MCP を AI が適切に使うための Agent Skill が含まれています。
+この repository 自体を local Codex Plugin として利用できます。`.codex-plugin/plugin.json` が既存の `skills/temote-mcp` を公開し、`.mcp.json` がインストール済みの `temote-mcp mcp` stdio server を起動します。native `temote-mcp` binary はあらかじめ `PATH` 上に必要です。
+
+Plugin は意図的に薄く保ちます。session lifecycle、named-root resolution、sandbox、approval、OAuth、ingress は native Temote binary が引き続き所有します。local managed session を使う前に `temote-mcp supervisor` は通常どおり起動します。ChatGPT やその他の remote client は local stdio Plugin 経路ではなく、Cloudflare / Tailscale / OpenAI Secure MCP Tunnel profile を利用します。
+
+Codex Plugin を利用しない Agent Skill 対応 coding agent には、同じ同梱 Skill を直接導入できます。
 
 ```sh
 gh skill install f4ah6o/temote-mcp temote-mcp --scope user
