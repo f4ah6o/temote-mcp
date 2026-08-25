@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "temoteMcp": {
+      "cwd": ".",
+      "command": "temote-mcp",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}
