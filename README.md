@@ -85,7 +85,17 @@ For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains 
 
 ## Codex plugin and Agent Skill
 
-This repository is also a local Codex plugin. Its `.codex-plugin/plugin.json` exposes the existing `skills/temote-mcp` guidance and `.mcp.json` launches the installed `temote-mcp mcp` stdio server. The native `temote-mcp` binary must already be available on `PATH`.
+For an installed Temote binary, the normal local Codex path is binary-owned plugin installation:
+
+```sh
+temote-mcp codex plugin install
+temote-mcp codex status
+temote-mcp codex diagnose --json
+```
+
+The installer writes the plugin under `CODEX_HOME` (or `~/.codex`), enables `temote-mcp@debug` in Codex configuration, and pins the exact Temote executable that performed the install in both the generated MCP configuration and `.temote-mcp-bin`. It does not silently fall back to a different ambient `temote-mcp` on `PATH`. After upgrading Temote, run `temote-mcp codex plugin install` again so the installed plugin moves to the new binary/version. Remove it with `temote-mcp codex plugin uninstall`. Restart an already-running Codex session after install or uninstall so its loaded plugin inventory matches disk.
+
+The repository root remains a directly inspectable local Codex plugin for development: `.codex-plugin/plugin.json` exposes the existing `skills/temote-mcp` guidance and `.mcp.json` launches `temote-mcp mcp` from `PATH`.
 
 The plugin is intentionally thin: session lifecycle, named-root resolution, sandboxing, approvals, OAuth, and ingress remain owned by the native Temote binary. Start `temote-mcp supervisor` normally before using local managed sessions. ChatGPT and other remote clients continue to use the Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel profiles rather than the local stdio plugin path.
 
