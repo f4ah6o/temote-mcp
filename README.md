@@ -83,9 +83,13 @@ The approval console is an attachment, not the runtime owner. Closing its termin
 
 For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains a local-supervisor shorthand for starting the current directory. It requires `temote-mcp supervisor` to be running. `--yolo` remains available only on this local CLI path; remote MCP `session_start` cannot create yolo sessions. Local stdio clients can launch `temote-mcp mcp`.
 
-## Agent skill
+## Codex plugin and Agent Skill
 
-Temote MCP ships an Agent Skill that teaches compatible coding agents how to use sessions, Git tools, background jobs, and bridged MCP servers effectively.
+This repository is also a local Codex plugin. Its `.codex-plugin/plugin.json` exposes the existing `skills/temote-mcp` guidance and `.mcp.json` launches the installed `temote-mcp mcp` stdio server. The native `temote-mcp` binary must already be available on `PATH`.
+
+The plugin is intentionally thin: session lifecycle, named-root resolution, sandboxing, approvals, OAuth, and ingress remain owned by the native Temote binary. Start `temote-mcp supervisor` normally before using local managed sessions. ChatGPT and other remote clients continue to use the Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel profiles rather than the local stdio plugin path.
+
+For coding agents that consume Agent Skills without Codex plugins, install the same bundled Skill directly:
 
 ```sh
 gh skill install f4ah6o/temote-mcp temote-mcp --scope user
