@@ -14,7 +14,7 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    approvals, child_env, config, onepassword_mcp, sandbox, supervisor::SessionSupervisor,
+    approvals, child_env, config, onepassword_mcp, sandbox, session_control::SessionBackend,
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,7 +43,7 @@ const MAX_SESSION_LIST_BYTES: usize = 4 * 1024 * 1024;
 const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the serve supervisor has no session for the required project, create one with session_start using a configured named-root path, then call session_info before normal tools. Existing tools require session_id except session_list and session_start.";
+const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the local session supervisor has no session for the required project, create one with session_start using a configured named-root path, then call session_info before normal tools. Existing tools require session_id except session_list and session_start.";
 
 #[derive(Clone)]
 enum CachedJobResult {
@@ -194,15 +194,15 @@ pub(crate) async fn dispatch(request: &Value) -> Result<Value> {
 #[cfg(feature = "network")]
 pub(crate) async fn dispatch_public(
     request: &Value,
-    supervisor: Option<&Arc<SessionSupervisor>>,
+    sessions: Option<&SessionBackend>,
 ) -> Result<Value> {
-    dispatch_with_mode(request, true, supervisor).await
+    dispatch_with_mode(request, true, sessions).await
 }
 
 async fn dispatch_with_mode(
     request: &Value,
     public: bool,
-    supervisor: Option<&Arc<SessionSupervisor>>,
+    sessions: Option<&SessionBackend>,
 ) -> Result<Value> {
     validate_rpc_request_shape(request)?;
     let modern = modern_request(request);
@@ -223,12 +223,12 @@ async fn dispatch_with_mode(
         })),
         "server/discover" => Ok(discover_result()),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools(public, supervisor.is_some())})),
+        "tools/list" => Ok(json!({"tools": tools(public, sessions.is_some())})),
         "tools/call" => {
             call_tool(
                 request.get("params").unwrap_or(&Value::Null),
                 public,
-                supervisor,
+                sessions,
             )
             .await
         }
@@ -377,7 +377,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
-        {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created by this serve supervisor. Independently started CLI sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB from the local machine. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
@@ -437,7 +437,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
 async fn call_tool(
     params: &Value,
     public: bool,
-    supervisor: Option<&Arc<SessionSupervisor>>,
+    sessions: Option<&SessionBackend>,
 ) -> Result<Value> {
     let name = params
         .get("name")
@@ -461,7 +461,7 @@ async fn call_tool(
             public,
             "session_start is available only from temote-mcp serve"
         );
-        let supervisor = supervisor.context("session supervisor is unavailable")?;
+        let sessions = sessions.context("session supervisor is unavailable")?;
         let object = args
             .as_object()
             .context("session_start arguments must be an object")?;
@@ -480,7 +480,7 @@ async fn call_tool(
             .get("session_id")
             .map(|value| value.as_str().context("session_id must be a string"))
             .transpose()?;
-        let info = supervisor.start(path, session_id).await?;
+        let info = sessions.start(path, session_id).await?;
         return text_result(serde_json::to_string_pretty(&info)?);
     }
     if name == "session_stop" {
@@ -488,7 +488,7 @@ async fn call_tool(
             public,
             "session_stop is available only from temote-mcp serve"
         );
-        let supervisor = supervisor.context("session supervisor is unavailable")?;
+        let sessions = sessions.context("session supervisor is unavailable")?;
         let object = args
             .as_object()
             .context("session_stop arguments must be an object")?;
@@ -500,7 +500,7 @@ async fn call_tool(
             .get("session_id")
             .and_then(Value::as_str)
             .context("missing session_id")?;
-        supervisor.stop(session_id).await?;
+        sessions.stop(session_id).await?;
         return text_result(serde_json::to_string_pretty(&json!({
             "session_id": session_id,
             "status": "stopped"

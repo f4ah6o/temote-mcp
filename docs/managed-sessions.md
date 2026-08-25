@@ -1,11 +1,10 @@
 # Managed sessions and named roots
 
-Temote has two supervisor entry points that share the same `SessionSupervisor` / session runtime implementation:
+Temote has one session-lifecycle owner: `temote-mcp supervisor`. It owns every `RuntimeHandle`, the durable lifecycle state, and the reconnectable local approval broker.
 
-- `temote-mcp supervisor`: local session-lifecycle supervisor controlled by `temote-mcp session ...`
-- `temote-mcp serve` / `temote-mcp up`: authenticated HTTP supervisor used by MCP `session_start` / `session_stop`
+`temote-mcp serve` / `temote-mcp up` are authenticated HTTP/ingress processes only. They connect to the existing local supervisor through the same-user `0600` Unix control socket for public `session_start` / `session_stop`. Tailscale local-OAuth approvals are proxied through that socket to `temote-mcp session console`; the public HTTP endpoint never exposes approval attachment.
 
-Both own `RuntimeHandle`s directly. tmux, Herdr, systemd, or another terminal/process keeper may keep a Temote supervisor process visible, but they are not the session-level source of truth.
+tmux, Herdr, systemd, or another process keeper may keep the lifecycle supervisor visible or restart it, but they are not the session-level source of truth.
 
 ## Named-root configuration
 
@@ -58,7 +57,7 @@ temote-mcp session console
 
 The approval console is not the runtime owner. stdin EOF, Ctrl-C, PTY disconnect, or terminal close detaches the console without stopping session runtimes. While no console is attached, approval-required operations fail closed. A later `session console` can reconnect and service subsequent approval requests.
 
-The HTTP `serve` supervisor retains its existing local approval console behavior. If that console disappears, approval delivery fails closed; managed runtimes remain owned by `serve` until the supervisor itself terminates.
+HTTP `serve/up` has no separate approval console and owns no session runtimes. `serve/up` verifies the local control-protocol version at startup and fails closed if the lifecycle supervisor must be upgraded/restarted first. Tailscale OAuth approval and runtime host approvals use the same reconnectable `temote-mcp session console`. If the HTTP origin or ingress restarts, session runtimes remain owned by the lifecycle supervisor.
 
 ## Runtime and failure isolation
 
@@ -92,7 +91,7 @@ session_info(session_id="my-project")
 session_stop(session_id="my-project")
 ```
 
-HTTP managed sessions are always `yolo=false`. Existing approval-gated host operations remain approval-gated. `session_stop` stops only runtimes owned by the current HTTP `SessionSupervisor`.
+HTTP managed sessions are always `yolo=false`. Existing approval-gated host operations remain approval-gated. The lifecycle supervisor marks HTTP-created runtimes in memory; public `session_stop` accepts only that set and cannot stop local CLI/yolo sessions. HTTP ownership is intentionally not a permission persisted into session metadata.
 
 `session_list` and `session_info` expose durable stopped/crashed state as well as active sessions. Other session-bound MCP tools still require a live runtime socket.
 

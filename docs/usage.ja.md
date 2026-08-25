@@ -23,23 +23,27 @@ local approval input が必要な場合は `temote-mcp session console` を使�
 
 相対 path は session の working directory を基準に解決されます。
 
-### `temote-mcp up` から作る managed session
+### HTTP から作る managed session
 
-host で `TEMOTE_MCP_ROOTS` を設定し、`temote-mcp up` を端末で常駐させます。単一 root は `name=path` 形式です。
+host で `TEMOTE_MCP_ROOTS` を lifecycle supervisor に設定して常駐させ、`temote-mcp up` は別 process として起動します。
 
 ```sh
-TEMOTE_MCP_ROOTS='src=~/src' temote-mcp up
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+# 別 terminal/service
+temote-mcp up
 ```
 
-複数 root は区切り文字の ad-hoc list ではなく JSON object を使います。
+複数 root は区切り文字の ad-hoc list ではなく、supervisor process に JSON object で設定します。
 
 ```sh
-TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' temote-mcp up
+export TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}'
+temote-mcp supervisor
 ```
 
 client は `session_list` を確認し、必要なら `session_start(path="src/project")`、続いて `session_info` を呼びます。configured root 自体は canonicalize されるため、`~/src -> /Volumes/devstorage/Developer` のような host alias は利用できます。一方、その配下の symlink や `..` が canonical physical root の外へ解決される場合は拒否されます。roots 未設定時は HOME、`/`、cwd、repository cwd へ fallback しません。
 
-`session_stop` で停止できるのは現在の `serve` supervisor が作成した session だけです。HTTP managed session は常に non-yolo で、従来どおり local approval gate を維持します。stopped / crashed metadata は `session_list` / `session_info` から確認できますが、それ以外の session-bound tool は引き続き active socket を要求します。HTTP supervisor と Tunnel の停止は `temote-mcp down` で行います。repository checkout の `just up/down` は、この CLI command に委譲する開発用 wrapper です。
+`session_stop` で停止できるのは lifecycle supervisor が HTTP-owned として記録している session だけです。同じ supervisor process 配下でも local CLI / yolo session は remote `session_stop` から停止できません。HTTP managed session は常に non-yolo で、approval は `temote-mcp session console` に集約します。stopped / crashed metadata は `session_list` / `session_info` から確認できますが、それ以外の session-bound tool は引き続き active socket を要求します。`temote-mcp down` が停止するのは HTTP origin と managed ingress child だけで、lifecycle supervisor と session は停止しません。repository checkout の `just up/down` は、この CLI command に委譲する開発用 wrapper です。
 
 ## 旧 always-on runtime の migration
 
@@ -51,6 +55,8 @@ current binary を install した後、一度だけ legacy runtime state を mig
 cargo binstall temote-mcp --force
 temote-mcp migrate --dry-run
 temote-mcp migrate
+TEMOTE_MCP_ROOTS='src=~/src' temote-mcp supervisor
+# 別 terminal/service
 temote-mcp up --profile cloudflare
 ```
 

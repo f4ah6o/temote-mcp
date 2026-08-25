@@ -36,13 +36,15 @@ Apple Silicon Mac と Linux に対応しています。Intel Mac と Windows ネ
 
 ## セッションを開始する
 
-常駐 host では named root を設定して HTTP supervisor を起動します。
+常駐 host では named root を設定し、lifecycle supervisor を1つ起動してから HTTP ingress を別 process として起動します。
 
 ```sh
 # host の例:
 # ~/src -> /Volumes/devstorage/Developer
 export TEMOTE_MCP_ROOTS='src=~/src'
-# 既存構成は Cloudflare profile が default です。
+temote-mcp supervisor
+
+# 別 terminal/service から。既存構成は Cloudflare profile が default です。
 temote-mcp up --profile cloudflare
 # Tailscale Funnel + Temote local OAuth を使う場合:
 # temote-mcp up --profile tailscale
@@ -60,7 +62,7 @@ session_start(path="src/my-project", session_id="my-project")
 session_info(session_id="my-project")
 ```
 
-managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。host/network 操作の承認は `temote-mcp up` を実行しているローカル端末で行います。停止は `temote-mcp down` です。
+managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。HTTP `serve/up` は owner-only Unix socket 経由で local lifecycle supervisor に session ownership と Tailscale OAuth approval を委譲します。承認は `temote-mcp session console` で行います。`temote-mcp down` が停止するのは HTTP origin / managed ingress だけで、lifecycle supervisor と session runtime は生存します。
 
 local session は Temote の session supervisor を1つ起動し、その配下で runtime を管理します。
 

@@ -77,7 +77,7 @@ pub fn session_lifecycle_path(id: &str) -> Result<PathBuf> {
 }
 
 pub fn supervisor_socket_path() -> Result<PathBuf> {
-    Ok(socket_dir().join("supervisor.sock"))
+    Ok(socket_dir()?.join("supervisor.sock"))
 }
 
 pub fn sessions_dir() -> Result<PathBuf> {
@@ -86,7 +86,7 @@ pub fn sessions_dir() -> Result<PathBuf> {
 
 pub fn socket_path(id: &str) -> Result<PathBuf> {
     validate_session_id(id)?;
-    Ok(socket_dir().join(format!("{id}.sock")))
+    Ok(socket_dir()?.join(format!("{id}.sock")))
 }
 
 /// Returns a short, per-user directory for Unix-domain session sockets.
@@ -94,11 +94,40 @@ pub fn socket_path(id: &str) -> Result<PathBuf> {
 /// Socket paths have a platform-specific length limit (104 bytes on macOS),
 /// so they cannot live below the regular state directory, which may include
 /// a long home-directory path. Session metadata remains in `state_dir()`.
-fn socket_dir() -> PathBuf {
+fn socket_dir() -> Result<PathBuf> {
     // `TMPDIR` on macOS can itself be long, so use the conventional short
-    // system temporary directory rather than `std::env::temp_dir()`.
+    // system temporary directory rather than `std::env::temp_dir()`. A short
+    // optional namespace exists for isolated process-boundary tests or
+    // deliberately parallel supervisors owned by the same user.
     let uid = unsafe { libc::geteuid() };
-    PathBuf::from("/tmp").join(format!("temote-mcp-{uid}"))
+    let namespace = std::env::var("TEMOTE_MCP_SOCKET_NAMESPACE")
+        .ok()
+        .filter(|value| !value.is_empty());
+    socket_dir_for(uid, namespace.as_deref())
+}
+
+fn socket_dir_for(uid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
+    match namespace {
+        None => Ok(PathBuf::from("/tmp").join(format!("temote-mcp-{uid}"))),
+        Some(namespace) => {
+            validate_socket_namespace(namespace)?;
+            Ok(PathBuf::from("/tmp").join(format!("tmcp-{uid}-{namespace}")))
+        }
+    }
+}
+
+fn validate_socket_namespace(namespace: &str) -> Result<()> {
+    anyhow::ensure!(
+        !namespace.is_empty() && namespace.len() <= 12,
+        "TEMOTE_MCP_SOCKET_NAMESPACE must contain 1..=12 ASCII characters"
+    );
+    anyhow::ensure!(
+        namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "TEMOTE_MCP_SOCKET_NAMESPACE accepts only ASCII letters, digits, '-' and '_'"
+    );
+    Ok(())
 }
 
 pub fn session_id(id: Option<&str>) -> Result<String> {
@@ -513,9 +542,21 @@ mod tests {
     }
 
     #[test]
+    fn socket_namespace_is_short_and_fail_closed() {
+        let path = socket_dir_for(1000, Some("e2e123abc")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/tmcp-1000-e2e123abc"));
+        for invalid in ["", "contains/slash", "contains space", "1234567890123"] {
+            assert!(validate_socket_namespace(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_socket_namespace("abc-DEF_12").is_ok());
+        let longest_socket = path.join(format!("{}.sock", "x".repeat(64)));
+        assert!(longest_socket.as_os_str().len() < 104);
+    }
+
+    #[test]
     fn puts_sockets_in_a_short_per_user_directory() {
         let path = socket_path("7418eda5-fd07-4e00-ace5-c1ece2f68a02").unwrap();
-        assert_eq!(path.parent(), Some(socket_dir().as_path()));
+        assert_eq!(path.parent(), Some(socket_dir().unwrap().as_path()));
         assert!(path.as_os_str().len() < 104);
     }
 
@@ -534,7 +575,7 @@ mod tests {
             assert_eq!(session_path(&id_a).unwrap(), state_a);
             assert_ne!(socket_a, socket_b);
             assert_ne!(state_a, state_b);
-            assert_eq!(socket_a.parent(), Some(socket_dir().as_path()));
+            assert_eq!(socket_a.parent(), Some(socket_dir().unwrap().as_path()));
             assert!(
                 socket_a.as_os_str().len() < 104,
                 "socket path too long: {socket_a:?}"

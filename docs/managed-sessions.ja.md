@@ -1,11 +1,10 @@
 # managed session と named root
 
-Temote には、同じ `SessionSupervisor` / session runtime 実装を使う2つの supervisor entry point があります。
+Temote の session lifecycle owner は `temote-mcp supervisor` の1つだけです。全 `RuntimeHandle`、durable lifecycle state、再接続可能な local approval broker をこの process が所有します。
 
-- `temote-mcp supervisor`: `temote-mcp session ...` で操作する local session lifecycle supervisor
-- `temote-mcp serve` / `temote-mcp up`: MCP `session_start` / `session_stop` を提供する authenticated HTTP supervisor
+`temote-mcp serve` / `temote-mcp up` は authenticated HTTP / ingress process に限定します。public `session_start` / `session_stop` は same-user の `0600` Unix control socket 経由で既存 local supervisor に委譲します。Tailscale local OAuth approval も同じ socket から `temote-mcp session console` へ転送し、public HTTP endpoint に approval attachment は公開しません。
 
-どちらも `RuntimeHandle` を Temote 自身が所有します。tmux、Herdr、systemd などで Temote supervisor process を保持・表示することはできますが、session 単位の正本にはしません。
+tmux、Herdr、systemd などで lifecycle supervisor process を保持・再起動することはできますが、session 単位の正本にはしません。
 
 ## named root 設定
 
@@ -58,7 +57,7 @@ temote-mcp session console
 
 approval console は runtime owner ではありません。stdin EOF、Ctrl-C、PTY disconnect、terminal close では console だけが detach し、session runtime は生存します。console 不在中の approval-required operation は fail closed します。後から `session console` を再実行すれば、以後の approval request を処理できます。
 
-HTTP `serve` supervisor は既存の local approval console を維持します。その console が切断された場合も approval delivery は fail closed し、managed runtime 自体は `serve` supervisor が終了するまで保持されます。
+HTTP `serve/up` は独自の approval console を持たず、session runtime も所有しません。`serve/up` は起動時に local control protocol version を検証し、lifecycle supervisor の upgrade/restart が必要な場合は fail closed します。Tailscale OAuth approval と runtime の host approval は同じ再接続可能な `temote-mcp session console` を使います。HTTP origin / ingress が再起動しても session runtime は lifecycle supervisor 配下で生存します。
 
 ## runtime と failure isolation
 
@@ -92,7 +91,7 @@ session_info(session_id="my-project")
 session_stop(session_id="my-project")
 ```
 
-HTTP managed session は常に `yolo=false` です。既存の approval-gated host operation は引き続き approval が必要です。`session_stop` で停止できるのは現在の HTTP `SessionSupervisor` が所有する runtime だけです。
+HTTP managed session は常に `yolo=false` です。既存の approval-gated host operation は引き続き approval が必要です。lifecycle supervisor は HTTP から作成した runtime を memory 内で識別し、public `session_stop` はその集合だけを停止できます。local CLI / yolo session は同じ supervisor 配下でも remote から停止できません。HTTP ownership は session metadata に permission として永続化しません。
 
 `session_list` / `session_info` は active だけでなく stopped / crashed の durable state も表示します。それ以外の session-bound MCP tool は従来どおり live runtime socket を要求します。
 

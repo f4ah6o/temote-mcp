@@ -40,7 +40,6 @@ use std::net::SocketAddr;
 #[cfg(feature = "network")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "network")]
-use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::time::Duration;
 
@@ -246,15 +245,15 @@ async fn serve_http(
     } else {
         None
     };
-    let roots = named_roots::NamedRoots::from_env()?;
-    let (supervisor, approvals) = supervisor::SessionSupervisor::new(roots);
+    let sessions = session_control::SessionBackend::local_control().await?;
+    let roots_configured = sessions.roots_configured().await?;
     let authenticator = match profile {
         profile::Profile::Cloudflare => {
             provider::AuthProvider::Cloudflare(access::AccessAuthenticator::from_env().await?)
         }
         profile::Profile::Tailscale => provider::AuthProvider::Local(local_oauth::LocalOAuth::new(
             public_url.clone(),
-            supervisor.approval_sender(),
+            session_control::approval_proxy_sender(),
         )),
         profile::Profile::Openai => unreachable!("handled before public profile setup"),
     };
@@ -263,13 +262,12 @@ async fn serve_http(
     eprintln!("Auth: {}", profile.auth_name());
     eprintln!(
         "Managed session roots: {}",
-        if supervisor.roots_configured() {
+        if roots_configured {
             "configured"
         } else {
             "not configured (session_start fails closed)"
         }
     );
-    let console = tokio::spawn(approvals::run_supervisor_console(approvals));
     let should_start_ingress = manage_ingress || tunnel_token_file.is_some();
     let mut managed_ingress = if should_start_ingress {
         Some(ingress::start(profile, addr, tunnel_token_file, tailscale_https_port).await?)
@@ -277,7 +275,7 @@ async fn serve_http(
         None
     };
 
-    let serve = http::serve(addr, public_url, authenticator, Arc::clone(&supervisor));
+    let serve = http::serve(addr, public_url, authenticator, sessions);
     tokio::pin!(serve);
     let serve_result = if let Some(ingress) = managed_ingress.as_mut() {
         let ingress_name = ingress.profile().ingress_name();
@@ -295,24 +293,21 @@ async fn serve_http(
     if let Some(ingress) = managed_ingress.as_mut() {
         stop_child(ingress.child_mut()).await;
     }
-    let shutdown_result = supervisor.shutdown().await;
-    console.abort();
-    serve_result?;
-    shutdown_result
+    serve_result
 }
 
 #[cfg(feature = "network")]
 async fn serve_openai(addr: SocketAddr, manage_tunnel: bool) -> Result<()> {
     openai_tunnel::ensure_loopback(addr)?;
-    let roots = named_roots::NamedRoots::from_env()?;
-    let (supervisor, approvals) = supervisor::SessionSupervisor::new(roots);
+    let sessions = session_control::SessionBackend::local_control().await?;
+    let roots_configured = sessions.roots_configured().await?;
     let authenticator = provider::AuthProvider::OpenAiTunnel;
     eprintln!("Profile: openai");
     eprintln!("Connection: OpenAI Secure MCP Tunnel");
     eprintln!("Local MCP origin: {}", openai_tunnel::local_mcp_url(addr));
     eprintln!(
         "Managed session roots: {}",
-        if supervisor.roots_configured() {
+        if roots_configured {
             "configured"
         } else {
             "not configured (session_start fails closed)"
@@ -325,13 +320,7 @@ async fn serve_openai(addr: SocketAddr, manage_tunnel: bool) -> Result<()> {
     } else {
         None
     };
-    let console = tokio::spawn(approvals::run_supervisor_console(approvals));
-    let serve = http::serve(
-        addr,
-        format!("http://{addr}"),
-        authenticator,
-        Arc::clone(&supervisor),
-    );
+    let serve = http::serve(addr, format!("http://{addr}"), authenticator, sessions);
     tokio::pin!(serve);
     let serve_result = if let Some(child) = tunnel.as_mut() {
         tokio::select! {
@@ -347,10 +336,7 @@ async fn serve_openai(addr: SocketAddr, manage_tunnel: bool) -> Result<()> {
     if let Some(child) = tunnel.as_mut() {
         stop_child(child).await;
     }
-    let shutdown_result = supervisor.shutdown().await;
-    console.abort();
-    serve_result?;
-    shutdown_result
+    serve_result
 }
 
 #[cfg(feature = "network")]

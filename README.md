@@ -36,13 +36,15 @@ Apple Silicon macOS and Linux are supported. Intel macOS and native Windows are 
 
 ## Start sessions
 
-For an always-on host, configure a named root and run the HTTP supervisor:
+For an always-on host, configure a named root, run one lifecycle supervisor, then start the HTTP ingress separately:
 
 ```sh
 # Example host layout:
 # ~/src -> /Volumes/devstorage/Developer
 export TEMOTE_MCP_ROOTS='src=~/src'
-# Existing deployments default to the Cloudflare profile.
+temote-mcp supervisor
+
+# From another terminal/service. Existing deployments default to Cloudflare.
 temote-mcp up --profile cloudflare
 # Or use Tailscale Funnel + Temote local OAuth:
 # temote-mcp up --profile tailscale
@@ -61,7 +63,7 @@ session_start(path="src/my-project", session_id="my-project")
 session_info(session_id="my-project")
 ```
 
-Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode; host/network-sensitive operations still require approval in the local `temote-mcp up` terminal. Stop this supervisor with `temote-mcp down`.
+Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode. HTTP `serve/up` delegates session ownership and Tailscale OAuth approval to the local lifecycle supervisor over its owner-only Unix socket. Use `temote-mcp session console` for approvals. `temote-mcp down` stops only the HTTP origin/managed ingress; the lifecycle supervisor and its sessions remain alive.
 
 For local sessions, run one Temote session supervisor and manage runtimes through it:
 

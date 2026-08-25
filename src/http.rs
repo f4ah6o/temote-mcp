@@ -5,6 +5,7 @@
 //! remains provider-neutral.
 
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +22,7 @@ use crate::local_oauth::{AuthorizeRequest, OAuthError, RegistrationRequest, Toke
 use crate::provider::AuthProvider;
 #[cfg(test)]
 use crate::provider::PublicEndpoint;
-use crate::supervisor::SessionSupervisor;
+use crate::session_control::SessionBackend;
 
 const MAX_OAUTH_REGISTER_BODY_BYTES: usize = 128 * 1024;
 const MAX_OAUTH_TOKEN_BODY_BYTES: usize = 64 * 1024;
@@ -30,18 +31,18 @@ const MAX_AUDIT_FIELD_BYTES: usize = 256;
 #[derive(Clone)]
 pub struct Runtime {
     pub authenticator: AuthProvider,
-    pub supervisor: Arc<SessionSupervisor>,
+    pub sessions: SessionBackend,
 }
 
 pub async fn serve(
     addr: SocketAddr,
     public_url: String,
     authenticator: AuthProvider,
-    supervisor: Arc<SessionSupervisor>,
+    sessions: SessionBackend,
 ) -> Result<()> {
     let runtime = Runtime {
         authenticator,
-        supervisor,
+        sessions,
     };
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -253,15 +254,15 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
         audit.finish(response.status(), started);
         return response;
     };
-    let response_value =
-        match crate::mcp::dispatch_public(&request, Some(&runtime.supervisor)).await {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err(error) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32000, "message": format!("{error:#}")}
-            }),
-        };
+    let response_value = match crate::mcp::dispatch_public(&request, Some(&runtime.sessions)).await
+    {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(error) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": format!("{error:#}")}
+        }),
+    };
     let response = with_cors(Json(response_value));
     audit.finish(response.status(), started);
     response
@@ -520,6 +521,7 @@ mod tests {
     use super::*;
     use crate::access::{AccessAuthenticator, AccessIdentity};
     use crate::local_oauth::LocalOAuth;
+    use crate::supervisor::SessionSupervisor;
     use crate::test_support;
     use axum::body::Body;
     use axum::http::Request;
@@ -538,7 +540,7 @@ mod tests {
                     subject: "test-subject".to_owned(),
                 },
             )),
-            supervisor,
+            sessions: SessionBackend::in_process(supervisor),
         }
     }
 
@@ -552,7 +554,7 @@ mod tests {
         (
             Runtime {
                 authenticator: AuthProvider::Local(local),
-                supervisor,
+                sessions: SessionBackend::in_process(supervisor),
             },
             approvals,
         )
@@ -1068,7 +1070,7 @@ mod tests {
                     subject: "test-subject".to_owned(),
                 },
             )),
-            supervisor: Arc::clone(&supervisor),
+            sessions: SessionBackend::in_process(Arc::clone(&supervisor)),
         };
         (runtime, supervisor, approvals)
     }
@@ -1304,9 +1306,29 @@ mod tests {
             response["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("not managed")
+                .contains("not created through the public HTTP supervisor")
         );
         assert!(crate::config::session_is_active(&id).await.unwrap());
         handle.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn public_session_stop_cannot_stop_local_supervisor_session() {
+        let fixture = tempfile::tempdir().unwrap();
+        let volume = fixture.path().join("volume");
+        std::fs::create_dir_all(volume.join("repo-a")).unwrap();
+        let (runtime, supervisor, _approvals) = runtime_with_root(volume);
+        let id = format!("local-supervisor-owned-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+
+        let response = call_public_tool(&runtime, "session_stop", json!({"session_id": id})).await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not created through the public HTTP supervisor")
+        );
+        assert!(crate::config::session_is_active(&id).await.unwrap());
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
     }
 }

@@ -42,13 +42,16 @@ chmod 600 ~/.config/temote-mcp/public.env
 
 Cloudflare profile は `~/.config/temote-mcp/public.env`（または `TEMOTE_MCP_ENV_FILE`）を読み込みます。origin 側でも、転送された `Cf-Access-Jwt-Assertion` の signature、issuer、audience、expiry、subject、設定済み email allow list を検証する既存 defense-in-depth を維持します。
 
-origin と Tunnel をまとめて起動します。
+lifecycle supervisor を先に起動し、origin と Tunnel は別 process として起動します。
 
 ```sh
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+# 別 terminal/service
 temote-mcp up --profile cloudflare
 ```
 
-`--profile` なしの `temote-mcp up` も同じ動作です。停止は `temote-mcp down` で、Temote supervisor と Temote が起動した Tunnel child を停止します。
+`--profile` なしの `temote-mcp up` も同じ動作です。`up/serve` は local supervisor control socket を必須とし、session runtime を所有しません。`temote-mcp down` が停止するのは HTTP origin と Temote が起動した Tunnel child だけで、lifecycle supervisor と session は生存します。
 
 `cloudflared` を Temote から起動せず origin だけ実行する場合:
 
@@ -85,13 +88,15 @@ Tailscale profile には、Funnel を利用可能な接続済み Tailscale CLI/n
 
 ```sh
 export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+# 別 terminal/service
 temote-mcp doctor --profile tailscale
 temote-mcp up --profile tailscale
 ```
 
 public URL を明示しない場合、Temote は `tailscale status --json` の `Self.DNSName` から canonical `*.ts.net` hostname を導出し、Funnel が利用できる HTTPS port を `443` → `8443` → `10000` の順で自動選択します。Temote 管理の Funnel は local `127.0.0.1` origin にのみ proxy します。既存 Funnel 設定は上書きせず、3 port がすべて使用中なら fail-closed します。
 
-Tailscale daemon 自体は停止しません。`temote-mcp down` が停止するのは Temote supervisor と、その process が直接起動した `tailscale funnel` child だけです。
+Tailscale daemon 自体は停止しません。`temote-mcp down` が停止するのは Temote の HTTP origin と、その process が直接起動した `tailscale funnel` child だけです。lifecycle supervisor と session は停止しません。
 
 `temote-mcp serve --profile tailscale --public-url <https-origin>` は Funnel を起動せず local OAuth/MCP origin のみを実行します。ingress を別に管理する場合に利用できます。`temote-mcp up --profile tailscale` で public URL を明示する場合は、現在の node の `*.ts.net` hostname と Funnel 対応 HTTPS port (`443` / `8443` / `10000`) を使う必要があります。
 
@@ -114,7 +119,7 @@ Authorization Code flow と mandatory PKCE `S256` を使用します。authoriza
 
 client discovery は現行の Client ID Metadata Documents に対応し、client compatibility のため Dynamic Client Registration `/register` も維持します。metadata document の取得先は HTTPS port 443 の public DNS のみに限定し、redirect は追跡せず、private / loopback / special-use address と過大 response を拒否します。
 
-初回 authorization は `temote-mcp up` / `serve` を実行しているローカル端末で owner が承認します。表示するのは client、redirect URI、resource、scope です。この OAuth approval と、その後の host/network-sensitive tool の runtime approval は別の security decision です。authentication に成功しても yolo session は作りません。
+初回 authorization は `temote-mcp session console` で owner が承認します。`serve/up` は owner-only supervisor control socket 経由で request を転送し、HTTP 上に approval interface は公開しません。表示するのは client、redirect URI、resource、scope です。この OAuth approval と、その後の host/network-sensitive tool の runtime approval は別の security decision です。authentication に成功しても yolo session は作りません。
 
 registration、pending authorization code、access token は bounded な process-local state です。Temote を再起動すると local OAuth state は無効になります。password database、email database、persistent bearer-token file は不要です。
 
@@ -152,7 +157,7 @@ tunnel-client run \
   --mcp.server-url http://127.0.0.1:8791/mcp
 ```
 
-local port は `--addr` に従い、non-loopback bind は拒否します。`temote-mcp down` が停止するのは Temote supervisor と直接起動した `tunnel-client` child だけです。public listener、public OAuth server、Cloudflare Tunnel、Tailscale Funnel は作成しません。
+local port は `--addr` に従い、non-loopback bind は拒否します。`temote-mcp down` が停止するのは Temote の HTTP origin と直接起動した `tunnel-client` child だけで、lifecycle supervisor と session は停止しません。public listener、public OAuth server、Cloudflare Tunnel、Tailscale Funnel は作成しません。
 
 tunnel 接続成功を yolo の根拠にはしません。remote tool call は同じ managed-session / named-root / sandbox / host・network-sensitive approval 境界へ入ります。OpenAI tunnel から提供されない identity claim を Temote 側で推測して生成しません。
 

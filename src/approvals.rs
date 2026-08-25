@@ -1,6 +1,5 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +37,7 @@ const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
 const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
+#[cfg(test)]
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_CAPTURED_START_ENV_TOTAL_BYTES: usize = 56 * 1024;
@@ -128,7 +128,7 @@ impl CapturedStartEnvironment {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: Uuid,
     pub operation: String,
@@ -472,20 +472,14 @@ pub fn approval_channel() -> (ApprovalSender, ApprovalReceiver) {
     approval_channel_with_capacity(MAX_PENDING_APPROVAL_PROMPTS)
 }
 
-pub async fn request_supervisor_approval(
+pub async fn request_approval(
     sender: &ApprovalSender,
-    operation: &str,
-    detail: String,
+    session_id: impl Into<String>,
+    request: Request,
 ) -> Result<bool> {
     let (response, receiver) = oneshot::channel();
-    let request = Request {
-        id: Uuid::new_v4(),
-        operation: operation.to_owned(),
-        detail,
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
     let prompt = ApprovalPrompt {
-        session_id: "oauth".to_owned(),
+        session_id: session_id.into(),
         request,
         response,
     };
@@ -494,6 +488,20 @@ pub async fn request_supervisor_approval(
         anyhow::anyhow!("local approval console is unavailable or busy")
     })?;
     Ok(receiver.await.unwrap_or(false))
+}
+
+pub async fn request_supervisor_approval(
+    sender: &ApprovalSender,
+    operation: &str,
+    detail: String,
+) -> Result<bool> {
+    let request = Request {
+        id: Uuid::new_v4(),
+        operation: operation.to_owned(),
+        detail,
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    request_approval(sender, "oauth", request).await
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -786,30 +794,6 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     })
 }
 
-pub async fn run_supervisor_console(mut approvals: ApprovalReceiver) -> Result<()> {
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut pending = VecDeque::<ApprovalPrompt>::new();
-    loop {
-        tokio::select! {
-            prompt = approvals.recv() => {
-                let Some(prompt) = prompt else { return Ok(()) };
-                let show_now = pending.is_empty();
-                pending.push_back(prompt);
-                if show_now {
-                    show_supervisor_prompt(pending.front().unwrap())?;
-                }
-            }
-            line = input.next_line() => {
-                let Some(line) = line? else {
-                    deny_all(&mut pending);
-                    return Ok(());
-                };
-                handle_supervisor_input(line.trim(), &mut pending)?;
-            }
-        }
-    }
-}
-
 async fn read_session_message(stream: &mut UnixStream) -> Result<Option<String>> {
     let mut line = String::new();
     let read = BufReader::new(stream)
@@ -1056,56 +1040,6 @@ async fn run_runtime(
             }
         }
     }
-}
-
-fn handle_supervisor_input(input: &str, pending: &mut VecDeque<ApprovalPrompt>) -> Result<()> {
-    match input {
-        "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
-            pending.pop_front().unwrap().respond(true);
-            show_next_prompt(pending)?;
-        }
-        "n" | "N" | "no" | "NO" if !pending.is_empty() => {
-            pending.pop_front().unwrap().respond(false);
-            show_next_prompt(pending)?;
-        }
-        "" => {}
-        command if !pending.is_empty() => {
-            pending.pop_front().unwrap().respond(false);
-            eprintln!("Denied request (unrecognized response: {command})");
-            show_next_prompt(pending)?;
-        }
-        command => eprintln!(
-            "Unknown supervisor command: {command}. Managed-session approvals use y/yes or n/no."
-        ),
-    }
-    Ok(())
-}
-
-fn deny_all(pending: &mut VecDeque<ApprovalPrompt>) {
-    while let Some(prompt) = pending.pop_front() {
-        prompt.respond(false);
-    }
-}
-
-fn show_supervisor_prompt(prompt: &ApprovalPrompt) -> Result<()> {
-    eprintln!(
-        "\n[session {}] approval {}\ncwd: {}\noperation: {}\n{}",
-        prompt.session_id,
-        prompt.request.id,
-        bounded_console_path(&prompt.request.cwd),
-        bounded_console_text(&prompt.request.operation, MAX_APPROVAL_OPERATION_BYTES),
-        bounded_console_text(&prompt.request.detail, MAX_APPROVAL_DETAIL_BYTES),
-    );
-    eprint!("Allow operation? [y/N] ");
-    std::io::stderr().flush()?;
-    Ok(())
-}
-
-fn show_next_prompt(pending: &VecDeque<ApprovalPrompt>) -> Result<()> {
-    if let Some(prompt) = pending.front() {
-        show_supervisor_prompt(prompt)?;
-    }
-    Ok(())
 }
 
 async fn handle_kintone_cli_request(
@@ -1403,6 +1337,7 @@ fn bounded_console_text(value: &str, max_bytes: usize) -> std::borrow::Cow<'_, s
     bounded_console_text_with_layout(value, max_bytes, true)
 }
 
+#[cfg(test)]
 fn bounded_console_path(path: &Path) -> String {
     let rendered = path.to_string_lossy();
     bounded_console_text_with_layout(&rendered, MAX_CONSOLE_PATH_BYTES, false).into_owned()
@@ -1433,6 +1368,7 @@ fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::Path;
 
     use super::*;

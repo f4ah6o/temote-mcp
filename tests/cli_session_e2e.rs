@@ -11,6 +11,10 @@ use tempfile::TempDir;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn socket_namespace() -> String {
+    format!("e2e{:x}", std::process::id())
+}
+
 struct ChildGuard {
     child: Child,
 }
@@ -67,6 +71,7 @@ impl McpClient {
         command
             .arg("mcp")
             .env("XDG_STATE_HOME", state_home)
+            .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -202,6 +207,7 @@ fn spawn_supervisor(binary: &Path, project: &Path, state_home: &Path) -> ChildGu
         .arg("supervisor")
         .env("XDG_STATE_HOME", state_home)
         .env("TEMOTE_MCP_ROOTS", roots_env(project))
+        .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -213,6 +219,7 @@ fn run_cli(binary: &Path, args: &[&str], cwd: &Path, state_home: &Path) -> Outpu
         .args(args)
         .current_dir(cwd)
         .env("XDG_STATE_HOME", state_home)
+        .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
         .stdin(Stdio::null())
         .output()
         .expect("failed to run temote-mcp CLI")

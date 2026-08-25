@@ -30,3 +30,7 @@ Give the HTTP supervisor the same reconnectable approval-console model without m
 - approval routing identifies the target session
 - public clients cannot attach or approve through HTTP
 - reconnecting one console does not alter sandbox/permission state
+
+## Resolution
+
+Implemented by converging ownership instead of adding a second HTTP-specific console. `temote-mcp supervisor` is the sole `RuntimeHandle` owner. `serve/up` uses the private local control socket for public session start/stop and proxies Tailscale OAuth approval to the same reconnectable `temote-mcp session console`. Public stop is restricted to sessions marked HTTP-owned in supervisor memory, so local CLI/yolo sessions cannot be stopped remotely. HTTP restart no longer tears down session runtimes.

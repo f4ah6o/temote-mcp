@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,6 +24,7 @@ pub struct SessionSupervisor {
     roots: NamedRoots,
     approval_sender: ApprovalSender,
     sessions: Mutex<HashMap<String, RuntimeHandle>>,
+    public_sessions: Mutex<HashSet<String>>,
     transitions: Mutex<()>,
     closed: AtomicBool,
     max_sessions: usize,
@@ -41,6 +42,7 @@ impl SessionSupervisor {
                 roots,
                 approval_sender,
                 sessions: Mutex::new(HashMap::new()),
+                public_sessions: Mutex::new(HashSet::new()),
                 transitions: Mutex::new(()),
                 closed: AtomicBool::new(false),
                 max_sessions,
@@ -57,6 +59,7 @@ impl SessionSupervisor {
         self.approval_sender.clone()
     }
 
+    #[cfg(test)]
     pub async fn start(
         &self,
         logical_path: &str,
@@ -76,6 +79,27 @@ impl SessionSupervisor {
         session_id: Option<&str>,
         environment: approvals::CapturedStartEnvironment,
     ) -> Result<ManagedSessionInfo> {
+        self.start_named_with_environment(logical_path, session_id, environment, false)
+            .await
+    }
+
+    pub async fn start_public_with_environment(
+        &self,
+        logical_path: &str,
+        session_id: Option<&str>,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<ManagedSessionInfo> {
+        self.start_named_with_environment(logical_path, session_id, environment, true)
+            .await
+    }
+
+    async fn start_named_with_environment(
+        &self,
+        logical_path: &str,
+        session_id: Option<&str>,
+        environment: approvals::CapturedStartEnvironment,
+        public: bool,
+    ) -> Result<ManagedSessionInfo> {
         let _transition = self.transitions.lock().await;
         self.reap_finished().await;
         anyhow::ensure!(
@@ -84,8 +108,19 @@ impl SessionSupervisor {
         );
         let cwd = self.roots.resolve(logical_path)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, false, Some(logical_path.to_owned()), environment)
-            .await
+        let info = self
+            .start_resolved(
+                cwd,
+                id.clone(),
+                false,
+                Some(logical_path.to_owned()),
+                environment,
+            )
+            .await?;
+        if public {
+            self.public_sessions.lock().await.insert(id);
+        }
+        Ok(info)
     }
 
     pub async fn start_local_with_environment(
@@ -152,9 +187,22 @@ impl SessionSupervisor {
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<()> {
+        self.stop_owned(session_id, false).await
+    }
+
+    pub async fn stop_public(&self, session_id: &str) -> Result<()> {
+        self.stop_owned(session_id, true).await
+    }
+
+    async fn stop_owned(&self, session_id: &str, public_only: bool) -> Result<()> {
         let _transition = self.transitions.lock().await;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
+        if public_only && !self.public_sessions.lock().await.contains(session_id) {
+            anyhow::bail!(
+                "session {session_id} was not created through the public HTTP supervisor"
+            );
+        }
         let handle = {
             let mut sessions = self.sessions.lock().await;
             sessions.remove(session_id)
@@ -162,11 +210,12 @@ impl SessionSupervisor {
         let Some(handle) = handle else {
             if config::session_is_active(session_id).await? {
                 anyhow::bail!(
-                    "session {session_id} is active but is not managed by this serve process"
+                    "session {session_id} is active but is not managed by this supervisor process"
                 );
             }
-            anyhow::bail!("session {session_id} is not managed by this serve process");
+            anyhow::bail!("session {session_id} is not managed by this supervisor process");
         };
+        self.public_sessions.lock().await.remove(session_id);
         handle.shutdown().await
     }
 
@@ -189,10 +238,11 @@ impl SessionSupervisor {
         };
         for id in finished {
             let handle = self.sessions.lock().await.remove(&id);
-            if let Some(handle) = handle
-                && let Err(error) = handle.wait().await
-            {
-                eprintln!("managed session {id} exited: {error:#}");
+            if let Some(handle) = handle {
+                self.public_sessions.lock().await.remove(&id);
+                if let Err(error) = handle.wait().await {
+                    eprintln!("managed session {id} exited: {error:#}");
+                }
             }
         }
     }
@@ -204,6 +254,7 @@ impl SessionSupervisor {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect::<Vec<_>>()
         };
+        self.public_sessions.lock().await.clear();
         let mut first_error = None;
         for (session_id, handle) in handles {
             if let Err(error) = handle.shutdown().await {

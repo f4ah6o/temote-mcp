@@ -42,13 +42,16 @@ Required values are:
 
 The Cloudflare profile loads `~/.config/temote-mcp/public.env` (or `TEMOTE_MCP_ENV_FILE`) and keeps the existing Access defense in depth: the origin validates the forwarded `Cf-Access-Jwt-Assertion` signature, issuer, audience, expiry, subject, and configured email allow list.
 
-Run the origin and Tunnel together with:
+Run the lifecycle supervisor first, then start the origin and Tunnel separately:
 
 ```sh
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+# another terminal/service
 temote-mcp up --profile cloudflare
 ```
 
-`temote-mcp up` without `--profile` is equivalent. Stop the Temote-owned supervisor and Tunnel child with `temote-mcp down`.
+`temote-mcp up` without `--profile` is equivalent. `up/serve` requires the local supervisor control socket and never owns session runtimes. `temote-mcp down` stops the HTTP origin and its managed Tunnel child only; the lifecycle supervisor and sessions remain alive.
 
 To run the origin without starting `cloudflared`:
 
@@ -87,13 +90,15 @@ Start it with:
 
 ```sh
 export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+# another terminal/service
 temote-mcp doctor --profile tailscale
 temote-mcp up --profile tailscale
 ```
 
 When no public URL is explicitly supplied, Temote derives the canonical `*.ts.net` hostname from `tailscale status --json` and selects the first free supported Funnel HTTPS port in the order `443`, `8443`, `10000`. The managed Funnel proxies only to the local `127.0.0.1` origin. Existing Funnel configuration is never replaced; if all three supported ports are occupied, startup fails closed.
 
-The Tailscale daemon itself is never stopped. `temote-mcp down` terminates only the Temote supervisor and its direct `tailscale funnel` child.
+The Tailscale daemon itself is never stopped. `temote-mcp down` terminates only the Temote HTTP origin and its direct `tailscale funnel` child; it does not stop the lifecycle supervisor or sessions.
 
 `temote-mcp serve --profile tailscale --public-url <https-origin>` runs the local OAuth/MCP origin without starting Funnel. This is useful when ingress is managed separately. For `temote-mcp up --profile tailscale`, an explicit public URL must use the current node's `*.ts.net` hostname and one of the supported Funnel HTTPS ports (`443`, `8443`, `10000`).
 
@@ -116,7 +121,7 @@ The flow uses Authorization Code with mandatory PKCE `S256`. Authorization codes
 
 Client discovery supports current Client ID Metadata Documents and keeps Dynamic Client Registration at `/register` for client compatibility. Metadata-document fetches are limited to HTTPS port 443 public DNS destinations, do not follow redirects, reject private/loopback/special-use addresses, and enforce a bounded response size.
 
-The first authorization decision is local-owner approval in the terminal running `temote-mcp up`/`serve`. It shows the client, redirect URI, resource, and scope. This OAuth approval is separate from later host/network-sensitive tool approvals. Authentication never creates a yolo session.
+The first authorization decision is local-owner approval through `temote-mcp session console`. `serve/up` proxies that request over the owner-only supervisor control socket and does not expose approval over HTTP. The console shows the client, redirect URI, resource, and scope. This OAuth approval is separate from later host/network-sensitive tool approvals. Authentication never creates a yolo session.
 
 Registrations, pending authorization codes, and access tokens are bounded process-local state. Restarting Temote invalidates that local OAuth state; no password database, email database, or persistent bearer-token file is required.
 
@@ -154,7 +159,7 @@ tunnel-client run \
   --mcp.server-url http://127.0.0.1:8791/mcp
 ```
 
-The exact local port follows `--addr`; non-loopback bind addresses are rejected. `temote-mcp down` stops the Temote supervisor and its direct `tunnel-client` child only. It does not create a public listener, public OAuth server, Cloudflare Tunnel, or Tailscale Funnel.
+The exact local port follows `--addr`; non-loopback bind addresses are rejected. `temote-mcp down` stops the Temote HTTP origin and its direct `tunnel-client` child only; the lifecycle supervisor and sessions remain alive. It does not create a public listener, public OAuth server, Cloudflare Tunnel, or Tailscale Funnel.
 
 The tunnel transport is not treated as a reason to enable yolo mode. Remote tool calls still enter the same managed-session, named-root, sandbox, and host/network-sensitive approval boundaries. OpenAI tunnel identity fields that are not supplied by the tunnel are not invented by Temote.
 
@@ -186,6 +191,6 @@ For the Tailscale profile, an unauthenticated `/mcp` request returns `401` with 
 
 ## Remote tool and managed-session boundary
 
-With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` is limited to sessions owned by the current `serve` process.
+With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` is limited to sessions marked HTTP-owned by the lifecycle supervisor; local CLI/yolo sessions cannot be stopped remotely.
 
 Remote profiles do not expose `without_sandbox`. Normal sessions keep filesystem containment and a network-disabled sandbox, while host/network-sensitive operations still require local approval. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.

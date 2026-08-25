@@ -11,7 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::approvals::{ApprovalPrompt, ApprovalReceiver, CapturedStartEnvironment};
+use crate::approvals::{
+    self, ApprovalPrompt, ApprovalReceiver, ApprovalSender, CapturedStartEnvironment, Request,
+};
 use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::named_roots::NamedRoots;
 use crate::supervisor::SessionSupervisor;
@@ -19,16 +21,23 @@ use crate::supervisor::SessionSupervisor;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
+const CONTROL_PROTOCOL_VERSION: u64 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ControlRequest {
     Ping,
+    Approval {
+        session_id: String,
+        request: Request,
+    },
     Start {
         path: String,
         session_id: String,
         #[serde(default)]
         environment: CapturedStartEnvironment,
+        #[serde(default)]
+        public: bool,
     },
     StartLocal {
         cwd: PathBuf,
@@ -43,6 +52,8 @@ enum ControlRequest {
     },
     Stop {
         session_id: String,
+        #[serde(default)]
+        public: bool,
     },
     Restart {
         session_id: String,
@@ -69,6 +80,92 @@ pub struct SessionView {
     pub yolo: bool,
     pub logical_path: Option<String>,
     pub restart_policy: String,
+}
+
+#[derive(Clone)]
+pub enum SessionBackend {
+    #[cfg(test)]
+    InProcess(Arc<SessionSupervisor>),
+    LocalControl,
+}
+
+impl SessionBackend {
+    #[cfg(test)]
+    pub fn in_process(supervisor: Arc<SessionSupervisor>) -> Self {
+        Self::InProcess(supervisor)
+    }
+
+    pub async fn local_control() -> Result<Self> {
+        let status = request(ControlRequest::Ping).await?;
+        anyhow::ensure!(
+            status.get("status").and_then(Value::as_str) == Some("active"),
+            "Temote session supervisor did not report active status"
+        );
+        anyhow::ensure!(
+            status.get("control_protocol").and_then(Value::as_u64)
+                == Some(CONTROL_PROTOCOL_VERSION),
+            "Temote session supervisor control protocol is incompatible; upgrade/restart the lifecycle supervisor before serve/up"
+        );
+        Ok(Self::LocalControl)
+    }
+
+    pub async fn roots_configured(&self) -> Result<bool> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => Ok(supervisor.roots_configured()),
+            Self::LocalControl => Ok(request(ControlRequest::Ping)
+                .await?
+                .get("roots_configured")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)),
+        }
+    }
+
+    pub async fn start(&self, path: &str, session_id: Option<&str>) -> Result<Value> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => Ok(serde_json::to_value(
+                supervisor
+                    .start_public_with_environment(
+                        path,
+                        session_id,
+                        CapturedStartEnvironment::default(),
+                    )
+                    .await?,
+            )?),
+            Self::LocalControl => {
+                let session_id = config::session_id(session_id)?;
+                let result = request(ControlRequest::Start {
+                    path: path.to_owned(),
+                    session_id,
+                    environment: CapturedStartEnvironment::default(),
+                    public: true,
+                })
+                .await?;
+                Ok(json!({
+                    "session_id": result.get("session_id").cloned().unwrap_or(Value::Null),
+                    "cwd": result.get("cwd").cloned().unwrap_or(Value::Null),
+                    "status": result.get("status").cloned().unwrap_or(Value::Null),
+                    "yolo": result.get("yolo").cloned().unwrap_or(Value::Bool(false)),
+                }))
+            }
+        }
+    }
+
+    pub async fn stop(&self, session_id: &str) -> Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => supervisor.stop_public(session_id).await,
+            Self::LocalControl => {
+                request(ControlRequest::Stop {
+                    session_id: session_id.to_owned(),
+                    public: true,
+                })
+                .await?;
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +244,7 @@ pub async fn start_named(session_id: String, path: String) -> Result<()> {
         path,
         session_id,
         environment: CapturedStartEnvironment::capture(),
+        public: false,
     })
     .await?;
     print_json(&result)
@@ -190,7 +288,11 @@ pub async fn info(session_id: String) -> Result<()> {
 }
 
 pub async fn stop(session_id: String) -> Result<()> {
-    let result = request(ControlRequest::Stop { session_id }).await?;
+    let result = request(ControlRequest::Stop {
+        session_id,
+        public: false,
+    })
+    .await?;
     print_json(&result)
 }
 
@@ -201,6 +303,25 @@ pub async fn restart(session_id: String) -> Result<()> {
     })
     .await?;
     print_json(&result)
+}
+
+pub fn approval_proxy_sender() -> ApprovalSender {
+    let (sender, mut receiver) = approvals::approval_channel();
+    tokio::spawn(async move {
+        while let Some(prompt) = receiver.recv().await {
+            let control_request = ControlRequest::Approval {
+                session_id: prompt.session_id.clone(),
+                request: prompt.request.clone(),
+            };
+            let allowed = request(control_request)
+                .await
+                .ok()
+                .and_then(|value| value.get("allow").and_then(Value::as_bool))
+                .unwrap_or(false);
+            prompt.respond(allowed);
+        }
+    });
+    sender
 }
 
 pub async fn run_console() -> Result<()> {
@@ -296,16 +417,36 @@ async fn dispatch_request(
 ) -> Result<Value> {
     supervisor.reap_finished().await;
     match request {
-        ControlRequest::Ping => Ok(json!({"status": "active"})),
+        ControlRequest::Ping => Ok(json!({
+            "status": "active",
+            "control_protocol": CONTROL_PROTOCOL_VERSION,
+            "roots_configured": supervisor.roots_configured(),
+        })),
+        ControlRequest::Approval {
+            session_id,
+            request,
+        } => {
+            let allowed =
+                approvals::request_approval(&supervisor.approval_sender(), session_id, request)
+                    .await?;
+            Ok(json!({"allow": allowed}))
+        }
         ControlRequest::Start {
             path,
             session_id,
             environment,
+            public,
         } => {
             environment.validate()?;
-            supervisor
-                .start_with_environment(&path, Some(&session_id), environment)
-                .await?;
+            if public {
+                supervisor
+                    .start_public_with_environment(&path, Some(&session_id), environment)
+                    .await?;
+            } else {
+                supervisor
+                    .start_with_environment(&path, Some(&session_id), environment)
+                    .await?;
+            }
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::StartLocal {
@@ -326,8 +467,12 @@ async fn dispatch_request(
         ControlRequest::Info { session_id } => {
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
-        ControlRequest::Stop { session_id } => {
-            supervisor.stop(&session_id).await?;
+        ControlRequest::Stop { session_id, public } => {
+            if public {
+                supervisor.stop_public(&session_id).await?;
+            } else {
+                supervisor.stop(&session_id).await?;
+            }
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::Restart {
@@ -824,6 +969,78 @@ mod tests {
             )]))
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn ping_advertises_control_protocol_and_root_capability() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let result = dispatch_request(ControlRequest::Ping, &supervisor)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "active");
+        assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(result["roots_configured"], true);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_approval_routes_through_reconnectable_console_and_fails_closed() {
+        let (_temp, roots) = fixture();
+        let (supervisor, approvals) = SessionSupervisor::new(roots);
+        let (registration, registrations) = mpsc::channel(8);
+        let broker = tokio::spawn(run_approval_broker(approvals, registrations));
+
+        let (console, mut console_rx) = mpsc::channel(1);
+        registration.send(console).await.unwrap();
+
+        let request = Request {
+            id: uuid::Uuid::new_v4(),
+            operation: "Authorize OAuth client".to_owned(),
+            detail: "proxy approval".to_owned(),
+            cwd: std::env::current_dir().unwrap(),
+        };
+        let supervisor_for_request = Arc::clone(&supervisor);
+        let allowed = tokio::spawn(async move {
+            dispatch_request(
+                ControlRequest::Approval {
+                    session_id: "oauth".to_owned(),
+                    request,
+                },
+                &supervisor_for_request,
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(1), console_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.session_id, "oauth");
+        assert_eq!(prompt.request.operation, "Authorize OAuth client");
+        prompt.respond(true);
+        let result = allowed.await.unwrap().unwrap();
+        assert_eq!(result["allow"], true);
+
+        drop(console_rx);
+        let denied = dispatch_request(
+            ControlRequest::Approval {
+                session_id: "oauth".to_owned(),
+                request: Request {
+                    id: uuid::Uuid::new_v4(),
+                    operation: "Authorize OAuth client".to_owned(),
+                    detail: "console disconnected".to_owned(),
+                    cwd: std::env::current_dir().unwrap(),
+                },
+            },
+            &supervisor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied["allow"], false);
+
+        supervisor.shutdown().await.unwrap();
+        broker.abort();
+        let _ = broker.await;
     }
 
     #[tokio::test]

@@ -23,23 +23,27 @@ For compatibility, `cd ~/src/my-project && temote-mcp start my-project` asks the
 
 Relative paths resolve from the session working directory.
 
-### Managed sessions from `temote-mcp up`
+### Managed sessions from HTTP
 
-Set `TEMOTE_MCP_ROOTS` on the host and keep `temote-mcp up` running in a terminal. A single root uses `name=path`:
+Set `TEMOTE_MCP_ROOTS` on the lifecycle supervisor, keep that supervisor running, and start `temote-mcp up` separately:
 
 ```sh
-TEMOTE_MCP_ROOTS='src=~/src' temote-mcp up
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+# another terminal/service
+temote-mcp up
 ```
 
-For multiple roots, use a JSON object instead of a separator-based list:
+For multiple roots, use a JSON object on the supervisor process instead of a separator-based list:
 
 ```sh
-TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' temote-mcp up
+export TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}'
+temote-mcp supervisor
 ```
 
 The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. Missing roots fail closed with no HOME, `/`, cwd, or repository fallback.
 
-`session_stop` can stop only sessions created by the current `serve` supervisor. HTTP managed sessions are always non-yolo and retain the same local approval gates. Stopped/crashed metadata remains visible through `session_list` / `session_info`; ordinary session-bound tools still require an active socket. Stop the HTTP supervisor and its Tunnel with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
+`session_stop` can stop only sessions marked as HTTP-owned by the lifecycle supervisor; it cannot stop local CLI/yolo sessions even though they share the same supervisor process. HTTP managed sessions are always non-yolo and retain the same local approval gates through `temote-mcp session console`. Stopped/crashed metadata remains visible through `session_list` / `session_info`; ordinary session-bound tools still require an active socket. `temote-mcp down` stops only the HTTP origin and its managed ingress child, not the lifecycle supervisor or its sessions. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
 
 ## Migrating an older always-on runtime
 
@@ -51,6 +55,8 @@ After installing a current binary, migrate the legacy runtime state once:
 cargo binstall temote-mcp --force
 temote-mcp migrate --dry-run
 temote-mcp migrate
+TEMOTE_MCP_ROOTS='src=~/src' temote-mcp supervisor
+# another terminal/service
 temote-mcp up --profile cloudflare
 ```
 
