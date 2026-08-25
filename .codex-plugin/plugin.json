@@ -1,0 +1,39 @@
+{
+  "name": "temote-mcp",
+  "version": "0.1.0",
+  "description": "Use Temote MCP local sessions, files, commands, Git, and host integrations from Codex.",
+  "author": {
+    "name": "f4ah6o",
+    "url": "https://github.com/f4ah6o"
+  },
+  "homepage": "https://github.com/f4ah6o/temote-mcp",
+  "repository": "https://github.com/f4ah6o/temote-mcp",
+  "license": "MIT AND Apache-2.0",
+  "keywords": [
+    "codex",
+    "mcp",
+    "local-mcp",
+    "temote-mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Temote MCP",
+    "shortDescription": "Use a local machine safely through Temote MCP.",
+    "longDescription": "Connect Codex to Temote MCP local sessions while keeping session lifecycle, named-root resolution, sandboxing, approvals, and host integration policy inside the native temote-mcp binary.",
+    "developerName": "f4ah6o",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write",
+      "Shell"
+    ],
+    "websiteURL": "https://github.com/f4ah6o/temote-mcp",
+    "defaultPrompt": [
+      "Show the available Temote sessions and summarize their state.",
+      "Use Temote MCP to work on the matching local repository session.",
+      "Diagnose why the selected Temote session cannot run the requested task."
+    ]
+  }
+}
