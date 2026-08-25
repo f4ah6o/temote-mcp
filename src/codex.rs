@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 const PLUGIN_NAME: &str = "temote-mcp";
 const MARKETPLACE: &str = "debug";
 const BINARY_HINT: &str = ".temote-mcp-bin";
-const PLUGIN_MANIFEST: &str = include_str!("../.codex-plugin/plugin.json");
 const SKILL: &str = include_str!("../skills/temote-mcp/SKILL.md");
 
 pub fn run(args: &[String]) -> Result<String, String> {
@@ -17,9 +16,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
         [plugin, action] if plugin == "plugin" && action == "install" => install_current(),
         [plugin, action] if plugin == "plugin" && action == "uninstall" => uninstall_current(),
         [status] if status == "status" => status_current(false),
-        [status, json] if status == "status" && json == "--json" => status_current(true),
+        [status, flag] if status == "status" && flag == "--json" => status_current(true),
         [diagnose] if diagnose == "diagnose" => diagnose_current(false),
-        [diagnose, json] if diagnose == "diagnose" && json == "--json" => diagnose_current(true),
+        [diagnose, flag] if diagnose == "diagnose" && flag == "--json" => diagnose_current(true),
         _ => Err(format!(
             "unsupported Codex command: {}\n\n{}",
             args.join(" "),
@@ -66,11 +65,7 @@ fn status_current(as_json: bool) -> Result<String, String> {
     let codex_home = resolve_codex_home()?;
     let current = current_binary()?;
     let status = inspect(&codex_home, &current)?;
-    if as_json {
-        serde_json::to_string_pretty(&status.to_json()).map_err(|error| error.to_string())
-    } else {
-        Ok(status.to_text())
-    }
+    render_status(&status, as_json)
 }
 
 fn diagnose_current(as_json: bool) -> Result<String, String> {
@@ -88,6 +83,10 @@ fn diagnose_current(as_json: bool) -> Result<String, String> {
             .problems
             .push("the selected temote-mcp binary did not accept `mcp --help`".to_owned());
     }
+    render_status(&status, as_json)
+}
+
+fn render_status(status: &Status, as_json: bool) -> Result<String, String> {
     if as_json {
         serde_json::to_string_pretty(&status.to_json()).map_err(|error| error.to_string())
     } else {
@@ -101,21 +100,35 @@ fn resolve_codex_home() -> Result<PathBuf, String> {
     }
     crate::platform_paths::home_dir()
         .map(|home| home.join(".codex"))
-        .ok_or_else(|| "could not determine CODEX_HOME or the current user's home directory".to_owned())
+        .ok_or_else(|| {
+            "could not determine CODEX_HOME or the current user's home directory".to_owned()
+        })
 }
 
 fn current_binary() -> Result<PathBuf, String> {
-    let path = std::env::current_exe().map_err(|error| format!("could not resolve current temote-mcp binary: {error}"))?;
+    let path = std::env::current_exe()
+        .map_err(|error| format!("could not resolve current temote-mcp binary: {error}"))?;
     canonical_binary(&path)
 }
 
 fn canonical_binary(path: &Path) -> Result<PathBuf, String> {
-    let path = fs::canonicalize(path)
-        .map_err(|error| format!("could not resolve temote-mcp binary {}: {error}", path.display()))?;
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("could not inspect temote-mcp binary {}: {error}", path.display()))?;
+    let path = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "could not resolve temote-mcp binary {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = fs::metadata(&path).map_err(|error| {
+        format!(
+            "could not inspect temote-mcp binary {}: {error}",
+            path.display()
+        )
+    })?;
     if !metadata.is_file() {
-        return Err(format!("temote-mcp binary is not a regular file: {}", path.display()));
+        return Err(format!(
+            "temote-mcp binary is not a regular file: {}",
+            path.display()
+        ));
     }
     Ok(path)
 }
@@ -156,20 +169,34 @@ fn install_at(codex_home: &Path, binary: &Path) -> Result<InstallStatus, String>
     let binary = canonical_binary(binary)?;
     let root = plugin_root(codex_home);
     remove_owned_plugin_root(&root)?;
-    let target = plugin_dir(codex_home);
-    fs::create_dir_all(target.join(".codex-plugin"))
-        .map_err(|error| format!("could not create plugin directory {}: {error}", target.display()))?;
-    fs::create_dir_all(target.join("skills").join("temote-mcp"))
-        .map_err(|error| format!("could not create plugin skill directory {}: {error}", target.display()))?;
 
-    let manifest = rendered_manifest()?;
-    write_text(&target.join(".codex-plugin").join("plugin.json"), &manifest)?;
+    let target = plugin_dir(codex_home);
+    fs::create_dir_all(target.join(".codex-plugin")).map_err(|error| {
+        format!(
+            "could not create plugin directory {}: {error}",
+            target.display()
+        )
+    })?;
+    fs::create_dir_all(target.join("skills").join("temote-mcp")).map_err(|error| {
+        format!(
+            "could not create plugin skill directory {}: {error}",
+            target.display()
+        )
+    })?;
+
+    write_text(
+        &target.join(".codex-plugin").join("plugin.json"),
+        &rendered_manifest()?,
+    )?;
     write_text(&target.join(".mcp.json"), &rendered_mcp_config(&binary)?)?;
     write_text(
         &target.join("skills").join("temote-mcp").join("SKILL.md"),
         SKILL,
     )?;
-    write_text(&target.join(BINARY_HINT), &format!("{}\n", binary.display()))?;
+    write_text(
+        &target.join(BINARY_HINT),
+        &format!("{}\n", binary.display()),
+    )?;
 
     let config = config_path(codex_home);
     set_config_enabled(&config, true)?;
@@ -180,8 +207,7 @@ fn install_at(codex_home: &Path, binary: &Path) -> Result<InstallStatus, String>
 }
 
 fn uninstall_at(codex_home: &Path) -> Result<UninstallStatus, String> {
-    let root = plugin_root(codex_home);
-    let removed_plugin = remove_owned_plugin_root(&root)?;
+    let removed_plugin = remove_owned_plugin_root(&plugin_root(codex_home))?;
     let removed_config = set_config_enabled(&config_path(codex_home), false)?;
     Ok(UninstallStatus {
         removed_plugin,
@@ -193,23 +219,64 @@ fn remove_owned_plugin_root(path: &Path) -> Result<bool, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("could not inspect plugin directory {}: {error}", path.display())),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect plugin directory {}: {error}",
+                path.display()
+            ));
+        }
     };
     if metadata.file_type().is_symlink() {
-        return Err(format!("refusing to remove symlinked plugin directory: {}", path.display()));
+        return Err(format!(
+            "refusing to remove symlinked plugin directory: {}",
+            path.display()
+        ));
     }
     if !metadata.is_dir() {
-        return Err(format!("plugin cache path is not a directory: {}", path.display()));
+        return Err(format!(
+            "plugin cache path is not a directory: {}",
+            path.display()
+        ));
     }
-    fs::remove_dir_all(path)
-        .map_err(|error| format!("could not remove plugin directory {}: {error}", path.display()))?;
+    fs::remove_dir_all(path).map_err(|error| {
+        format!(
+            "could not remove plugin directory {}: {error}",
+            path.display()
+        )
+    })?;
     Ok(true)
 }
 
 fn rendered_manifest() -> Result<String, String> {
-    let mut value: Value = serde_json::from_str(PLUGIN_MANIFEST)
-        .map_err(|error| format!("embedded Codex plugin manifest is invalid: {error}"))?;
-    value["version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
+    let value = json!({
+        "name": PLUGIN_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Use Temote MCP local sessions, files, commands, Git, and host integrations from Codex.",
+        "author": {
+            "name": "f4ah6o",
+            "url": "https://github.com/f4ah6o"
+        },
+        "homepage": "https://github.com/f4ah6o/temote-mcp",
+        "repository": "https://github.com/f4ah6o/temote-mcp",
+        "license": "MIT AND Apache-2.0",
+        "keywords": ["codex", "mcp", "local-mcp", "temote-mcp"],
+        "skills": "./skills/",
+        "mcpServers": "./.mcp.json",
+        "interface": {
+            "displayName": "Temote MCP",
+            "shortDescription": "Use a local machine safely through Temote MCP.",
+            "longDescription": "Connect Codex to Temote MCP local sessions while keeping session lifecycle, named-root resolution, sandboxing, approvals, and host integration policy inside the native temote-mcp binary.",
+            "developerName": "f4ah6o",
+            "category": "Developer Tools",
+            "capabilities": ["Interactive", "Read", "Write", "Shell"],
+            "websiteURL": "https://github.com/f4ah6o/temote-mcp",
+            "defaultPrompt": [
+                "Show the available Temote sessions and summarize their state.",
+                "Use Temote MCP to work on the matching local repository session.",
+                "Diagnose why the selected Temote session cannot run the requested task."
+            ]
+        }
+    });
     serde_json::to_string_pretty(&value)
         .map(|mut text| {
             text.push('\n');
@@ -237,8 +304,7 @@ fn rendered_mcp_config(binary: &Path) -> Result<String, String> {
 }
 
 fn write_text(path: &Path, content: &str) -> Result<(), String> {
-    fs::write(path, content)
-        .map_err(|error| format!("could not write {}: {error}", path.display()))
+    fs::write(path, content).map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn section_header() -> String {
@@ -249,7 +315,12 @@ fn set_config_enabled(path: &Path, enabled: bool) -> Result<bool, String> {
     let existing = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("could not read Codex config {}: {error}", path.display())),
+        Err(error) => {
+            return Err(format!(
+                "could not read Codex config {}: {error}",
+                path.display()
+            ));
+        }
     };
     let (mut updated, removed) = remove_plugin_config_section(&existing);
     if enabled {
@@ -266,8 +337,12 @@ fn set_config_enabled(path: &Path, enabled: bool) -> Result<bool, String> {
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("could not create Codex config directory {}: {error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create Codex config directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
     fs::write(path, updated)
         .map_err(|error| format!("could not update Codex config {}: {error}", path.display()))?;
@@ -295,13 +370,6 @@ fn remove_plugin_config_section(input: &str) -> (String, bool) {
         }
         if !skipping {
             output.push_str(line);
-        }
-    }
-
-    if !input.ends_with('\n') {
-        let tail = input.rsplit_once('\n').map_or(input, |(_, tail)| tail);
-        if !tail.is_empty() && !output.ends_with(tail) && !skipping {
-            output.push_str(tail);
         }
     }
 
@@ -392,12 +460,19 @@ fn inspect(codex_home: &Path, current_binary: &Path) -> Result<Status, String> {
     let header = section_header();
     let config_text = fs::read_to_string(&config).unwrap_or_default();
     let enabled = config_section_enabled(&config_text, &header);
+
     let manifest_path = target.join(".codex-plugin").join("plugin.json");
     let installed = manifest_path.is_file();
     let manifest_version = fs::read_to_string(&manifest_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.get("version").and_then(Value::as_str).map(str::to_owned));
+        .and_then(|value| {
+            value
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+
     let binary_hint_path = target.join(BINARY_HINT);
     let binary_hint = fs::read_to_string(&binary_hint_path)
         .ok()
@@ -415,7 +490,8 @@ fn inspect(codex_home: &Path, current_binary: &Path) -> Result<Status, String> {
         problems.push("the Temote plugin manifest is missing from the Codex cache".to_owned());
     }
     if installed && manifest_version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
-        problems.push("the installed plugin version does not match this temote-mcp binary".to_owned());
+        problems
+            .push("the installed plugin version does not match this temote-mcp binary".to_owned());
     }
     if binary_hint.is_none() {
         problems.push("the installed plugin has no pinned temote-mcp binary hint".to_owned());
@@ -425,7 +501,9 @@ fn inspect(codex_home: &Path, current_binary: &Path) -> Result<Status, String> {
     if mcp_command.is_none() {
         problems.push("the installed plugin MCP command is missing or invalid".to_owned());
     } else if !mcp_command_matches {
-        problems.push("the installed plugin MCP command does not use this exact temote-mcp binary".to_owned());
+        problems.push(
+            "the installed plugin MCP command does not use this exact temote-mcp binary".to_owned(),
+        );
     }
 
     Ok(Status {
@@ -516,8 +594,18 @@ mod tests {
         let canonical = fs::canonicalize(&binary).unwrap();
 
         let installed = install_at(&codex_home, &binary).unwrap();
-        assert!(installed.plugin_dir.join(".codex-plugin/plugin.json").is_file());
-        assert!(installed.plugin_dir.join("skills/temote-mcp/SKILL.md").is_file());
+        assert!(
+            installed
+                .plugin_dir
+                .join(".codex-plugin/plugin.json")
+                .is_file()
+        );
+        assert!(
+            installed
+                .plugin_dir
+                .join("skills/temote-mcp/SKILL.md")
+                .is_file()
+        );
         assert_eq!(
             fs::read_to_string(installed.plugin_dir.join(BINARY_HINT))
                 .unwrap()
