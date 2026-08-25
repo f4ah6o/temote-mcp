@@ -9,7 +9,7 @@ Temote MCP は、手元のファイル・コマンド・一部のホスト連携
 ビルド済みバイナリは `cargo-binstall` で導入できます。
 
 ```sh
-cargo bininstall temote-mcp
+cargo binstall temote-mcp
 temote-mcp doctor
 ```
 
@@ -122,6 +122,6 @@ repository checkout では `just up` / `just down` が checkout の binary を b
 
 ## 由来とライセンス
 
-このプロジェクトは [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生しています。**Temote** の名前は、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), coined as the opposite of “remote.” See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution details.
+このプロジェクトは [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生しています。**Temote** の名前は、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46) に着想を得ています。詳細な attribution は [THIRD_PARTY_NOTICES.ja.md](THIRD_PARTY_NOTICES.ja.md) を参照してください。
 
 ライセンスはリポジトリ内の MIT / Apache-2.0 ライセンスファイルに従います。
