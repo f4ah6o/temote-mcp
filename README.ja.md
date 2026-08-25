@@ -9,7 +9,7 @@ Temote MCP は、手元のファイル・コマンド・一部のホスト連携
 ビルド済みバイナリは `cargo-binstall` で導入できます。
 
 ```sh
-cargo binstall temote-mcp
+cargo bininstall temote-mcp
 temote-mcp doctor
 ```
 
@@ -84,7 +84,17 @@ approval console は runtime owner ではなく attachment です。terminal clo
 
 ## Codex Plugin と Agent Skill
 
-この repository 自体を local Codex Plugin として利用できます。`.codex-plugin/plugin.json` が既存の `skills/temote-mcp` を公開し、`.mcp.json` がインストール済みの `temote-mcp mcp` stdio server を起動します。native `temote-mcp` binary はあらかじめ `PATH` 上に必要です。
+インストール済み Temote binary から local Codex を利用する場合は、binary-owned Plugin installation を標準経路にします。
+
+```sh
+temote-mcp codex plugin install
+temote-mcp codex status
+temote-mcp codex diagnose --json
+```
+
+installer は Plugin を `CODEX_HOME`（未指定時は `~/.codex`）配下へ配置し、Codex 設定で `temote-mcp@debug` を有効化します。さらに、install を実行した Temote executable の exact path を生成した MCP 設定と `.temote-mcp-bin` の両方へ固定します。`PATH` 上の別の `temote-mcp` へ暗黙に切り替えません。Temote を更新した場合は `temote-mcp codex plugin install` を再実行し、新しい binary/version へ Plugin を移します。削除は `temote-mcp codex plugin uninstall` です。install / uninstall 後、既に起動中の Codex session は再起動して disk 上の Plugin inventory と揃えます。
+
+repository root 自体も開発・確認用の local Codex Plugin として利用できます。`.codex-plugin/plugin.json` が既存の `skills/temote-mcp` を公開し、`.mcp.json` は `PATH` 上の `temote-mcp mcp` を起動します。
 
 Plugin は意図的に薄く保ちます。session lifecycle、named-root resolution、sandbox、approval、OAuth、ingress は native Temote binary が引き続き所有します。local managed session を使う前に `temote-mcp supervisor` は通常どおり起動します。ChatGPT やその他の remote client は local stdio Plugin 経路ではなく、Cloudflare / Tailscale / OpenAI Secure MCP Tunnel profile を利用します。
 
@@ -112,6 +122,6 @@ repository checkout では `just up` / `just down` が checkout の binary を b
 
 ## 由来とライセンス
 
-このプロジェクトは [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生しています。**Temote** の名前は、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46) に着想を得ています。詳細な attribution は [THIRD_PARTY_NOTICES.ja.md](THIRD_PARTY_NOTICES.ja.md) を参照してください。
+このプロジェクトは [nakasyou/local-mcp](https://github.com/nakasyou/local-mcp) から派生しています。**Temote** の名前は、[@mr_konn が「remote」の対義語として提唱した「テモート」](https://x.com/mr_konn/status/1318116448519114752?s=46), coined as the opposite of “remote.” See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution details.
 
 ライセンスはリポジトリ内の MIT / Apache-2.0 ライセンスファイルに従います。
