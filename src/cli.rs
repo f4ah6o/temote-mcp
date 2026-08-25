@@ -2,6 +2,9 @@ use std::path::PathBuf;
 #[cfg(feature = "network")]
 use std::{net::SocketAddr, str::FromStr};
 
+#[path = "codex.rs"]
+mod codex;
+
 #[cfg(feature = "network")]
 use crate::gateway;
 use crate::profile;
@@ -88,7 +91,11 @@ pub enum ParseOutcome {
 }
 
 pub fn parse_env() -> Result<ParseOutcome, String> {
-    parse(std::env::args())
+    let raw = std::env::args().collect::<Vec<_>>();
+    if raw.get(1).map(String::as_str) == Some("codex") {
+        return codex::run(&raw[2..]).map(ParseOutcome::Print);
+    }
+    parse(raw.into_iter())
 }
 
 fn parse<I>(raw: I) -> Result<ParseOutcome, String>
@@ -163,6 +170,13 @@ where
         .is_present()
     {
         return finish(args, Command::Mcp);
+    }
+    if noargs::cmd("codex")
+        .doc("Install and diagnose the local Codex plugin integration")
+        .take(&mut args)
+        .is_present()
+    {
+        return Ok(ParseOutcome::Print(codex::usage()));
     }
     #[cfg(feature = "network")]
     if noargs::cmd("serve")
@@ -718,6 +732,7 @@ mod tests {
         assert!(help.contains("doctor"));
         assert!(help.contains("start"));
         assert!(help.contains("mcp"));
+        assert!(help.contains("codex"));
         assert!(help.contains("--version"));
 
         let ParseOutcome::Print(start_help) =
@@ -731,6 +746,15 @@ mod tests {
             panic!("expected version");
         };
         assert!(version.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn codex_help_is_available_from_parser_surface() {
+        let ParseOutcome::Print(help) = parse(argv(&["temote-mcp", "codex"])).unwrap() else {
+            panic!("expected codex help");
+        };
+        assert!(help.contains("codex plugin install"));
+        assert!(help.contains("codex diagnose"));
     }
 
     #[test]
