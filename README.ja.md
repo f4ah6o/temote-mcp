@@ -62,14 +62,23 @@ session_info(session_id="my-project")
 
 managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。host/network 操作の承認は `temote-mcp up` を実行しているローカル端末で行います。停止は `temote-mcp down` です。
 
-従来どおり、ローカル session を直接起動することもできます。
+local session は Temote の session supervisor を1つ起動し、その配下で runtime を管理します。
 
 ```sh
-cd ~/src/my-project
-temote-mcp start my-project
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+
+# 別 terminal から:
+temote-mcp session start my-project --path src/my-project
+temote-mcp session list
+temote-mcp session info my-project
+temote-mcp session console
+temote-mcp session stop my-project
 ```
 
-local stdio client は `temote-mcp mcp` を起動します。制限を意図的に外す CLI session は `temote-mcp start my-project --yolo` で利用できます。
+approval console は runtime owner ではなく attachment です。terminal close / stdin EOF でも session runtime は生存し、console 不在中の approval-required operation は fail closed します。console は再接続できます。lifecycle metadata には `starting` / `active` / `stopping` / `stopped` / `crashed` と crash reason / last error を保存します。`session list` は socket を probe するため、死んだ runtime を `active` と表示しません。manual `session restart` は利用できます。現時点の restart policy は `never` で、自動 restart は行いません。
+
+互換用に `cd ~/src/my-project && temote-mcp start my-project` は current directory を local supervisor 配下で起動する shorthand として残します。先に `temote-mcp supervisor` が必要です。`--yolo` はこの local CLI path だけで利用でき、remote MCP `session_start` から yolo session は作成できません。local stdio client は `temote-mcp mcp` を起動します。
 
 ## Agent Skill
 

@@ -20,6 +20,10 @@ pub enum Command {
         session_id: Option<String>,
         yolo: bool,
     },
+    Supervisor,
+    Session {
+        command: SessionCommand,
+    },
     Mcp,
     #[cfg(feature = "network")]
     Serve {
@@ -67,6 +71,15 @@ pub enum OpenaiCommand {
         config_file: Option<PathBuf>,
         force: bool,
     },
+}
+
+pub enum SessionCommand {
+    Start { session_id: String, path: String },
+    List,
+    Info { session_id: String },
+    Stop { session_id: String },
+    Restart { session_id: String },
+    Console,
 }
 
 pub enum ParseOutcome {
@@ -128,6 +141,21 @@ where
     {
         let command = parse_start(&mut args).map_err(format_error)?;
         return finish(args, command);
+    }
+    if noargs::cmd("supervisor")
+        .doc("Run the local Temote session supervisor")
+        .take(&mut args)
+        .is_present()
+    {
+        return finish(args, Command::Supervisor);
+    }
+    if noargs::cmd("session")
+        .doc("Manage sessions owned by the local Temote supervisor")
+        .take(&mut args)
+        .is_present()
+    {
+        let command = parse_session(&mut args).map_err(format_error)?;
+        return finish(args, Command::Session { command });
     }
     if noargs::cmd("mcp")
         .doc("Run the session-independent MCP server over stdin/stdout")
@@ -197,6 +225,79 @@ where
         Some(help) => Ok(ParseOutcome::Print(help)),
         None => unreachable!("a command or help should have been selected"),
     }
+}
+
+fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
+    if noargs::cmd("start")
+        .doc("Start a supervisor-owned session under a configured named root")
+        .take(args)
+        .is_present()
+    {
+        let path = noargs::opt("path")
+            .ty("PATH")
+            .doc("Named-root-relative path such as src/my-project")
+            .take(args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(opt.value().to_owned()))?;
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        return Ok(SessionCommand::Start { session_id, path });
+    }
+    if noargs::cmd("list")
+        .doc("List active, stopped, and crashed sessions")
+        .take(args)
+        .is_present()
+    {
+        return Ok(SessionCommand::List);
+    }
+    if noargs::cmd("info")
+        .doc("Show durable lifecycle details for one session")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        return Ok(SessionCommand::Info { session_id });
+    }
+    if noargs::cmd("stop")
+        .doc("Gracefully stop a supervisor-owned session")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        return Ok(SessionCommand::Stop { session_id });
+    }
+    if noargs::cmd("restart")
+        .doc("Restart a stopped, crashed, or active supervisor-owned session")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        return Ok(SessionCommand::Restart { session_id });
+    }
+    if noargs::cmd("console")
+        .doc("Attach a reconnectable local approval console")
+        .take(args)
+        .is_present()
+    {
+        return Ok(SessionCommand::Console);
+    }
+    if args.metadata().help_mode {
+        return Ok(SessionCommand::List);
+    }
+    Err(noargs::Error::other(
+        args,
+        "session command is not specified (expected start, list, info, stop, restart, or console)",
+    ))
 }
 
 fn parse_doctor(args: &mut noargs::RawArgs) -> noargs::Result<Command> {

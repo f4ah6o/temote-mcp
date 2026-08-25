@@ -63,14 +63,23 @@ session_info(session_id="my-project")
 
 Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode; host/network-sensitive operations still require approval in the local `temote-mcp up` terminal. Stop this supervisor with `temote-mcp down`.
 
-For a traditional local session, run:
+For local sessions, run one Temote session supervisor and manage runtimes through it:
 
 ```sh
-cd ~/src/my-project
-temote-mcp start my-project
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+
+# From another terminal:
+temote-mcp session start my-project --path src/my-project
+temote-mcp session list
+temote-mcp session info my-project
+temote-mcp session console
+temote-mcp session stop my-project
 ```
 
-Local stdio clients can launch `temote-mcp mcp`. A deliberately unrestricted CLI session remains available with `temote-mcp start my-project --yolo`.
+The approval console is an attachment, not the runtime owner. Closing its terminal or sending stdin EOF leaves session runtimes alive; approval-required operations fail closed until a console reconnects. Lifecycle metadata records `starting`, `active`, `stopping`, `stopped`, and `crashed`, including crash reason and last error. `session list` probes the socket and never reports dead runtime metadata as `active`. Manual `session restart` is supported; the current restart policy is `never` (no automatic restart).
+
+For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains a local-supervisor shorthand for starting the current directory. It requires `temote-mcp supervisor` to be running. `--yolo` remains available only on this local CLI path; remote MCP `session_start` cannot create yolo sessions. Local stdio clients can launch `temote-mcp mcp`.
 
 ## Agent skill
 

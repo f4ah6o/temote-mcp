@@ -1,47 +1,103 @@
 # managed session と named root
 
-`temote-mcp serve` は、認証済み direct HTTP MCP client から作成された複数の通常 session を supervisor として管理できます。
+Temote には、同じ `SessionSupervisor` / session runtime 実装を使う2つの supervisor entry point があります。
+
+- `temote-mcp supervisor`: `temote-mcp session ...` で操作する local session lifecycle supervisor
+- `temote-mcp serve` / `temote-mcp up`: MCP `session_start` / `session_stop` を提供する authenticated HTTP supervisor
+
+どちらも `RuntimeHandle` を Temote 自身が所有します。tmux、Herdr、systemd などで Temote supervisor process を保持・表示することはできますが、session 単位の正本にはしません。
 
 ## named root 設定
 
 `TEMOTE_MCP_ROOTS` で MCP 上の logical namespace と host filesystem path を分離します。
 
-単一 root:
-
 ```sh
 TEMOTE_MCP_ROOTS='src=~/src'
 ```
 
-複数 root は区切り文字 list ではなく JSON object を使います。
+複数 root は JSON を推奨します。
 
 ```sh
 TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}'
 ```
 
-root name は ASCII 英数字、`-`、`_` のみです。configured root path は先に canonicalize します。これにより administrator が明示した次のような root alias を許容します。
+root 名は ASCII 英数字、`-`、`_` のみです。configured root 自体を最初に canonicalize するため、`~/src -> /Volumes/devstorage/Developer` のような管理者が選んだ alias は利用できます。一方、配下の symlink や `..` が canonical physical root の外へ解決される場合は拒否します。root 未設定時に HOME、`/`、cwd、repository cwd へ fallback しません。
 
-```text
-~/src -> /Volumes/devstorage/Developer
+## local session supervisor
+
+foreground supervisor を1つ起動します。
+
+```sh
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
 ```
 
-canonical target が physical containment boundary になります。`src/foo` はその配下へ join した後 canonicalize し、directory であることと、root 自身または descendant であることを確認します。descendant symlink や `..` が physical root の外へ解決される場合は拒否します。roots 未設定時は HOME、`/`、process cwd、repository cwd へ fallback しません。
+別 terminal から session を操作します。
 
-## runtime と supervisor
+```sh
+temote-mcp session start mitsumori --path src/mitsumori-core
+temote-mcp session list
+temote-mcp session info mitsumori
+temote-mcp session stop mitsumori
+temote-mcp session restart mitsumori
+```
 
-session socket は MCP operation と host bridge の runtime boundary として維持します。CLI session と managed session は、metadata、Unix socket lifecycle、approval state、1Password/kintone bridge state、cleanup を同じ reusable session runtime で処理します。
+`session list` は `starting` / `active` / `stopping` / `stopped` / `crashed` を表示し、live 判定時には runtime socket を probe します。metadata が `active` を示していても socket が死んでいる session を `active` とは表示しません。
 
-`temote-mcp start` は単一 runtime に従来の terminal UI を付けます。`temote-mcp serve` は `SessionSupervisor` と共有 local approval console を所有します。approval prompt には local `y/yes` または `n/no` を受け付ける前に、対象 `session_id`、cwd、operation を表示します。
+`session info` では cwd、permitted directory、permission mode、started/stopped timestamp、exit reason、last error、利用可能な場合は logical named-root path、restart policy を確認できます。
 
-managed session は常に `yolo=false` です。MCP `session_start` schema に yolo option はなく、余分な field も拒否します。Git network operation、1Password service-account command、kintone call など既存の approval-gated host operation は引き続き local approval を待ちます。
+互換用の `temote-mcp start <id>` も残します。runtime をその terminal process が直接所有するのではなく、起動中の local supervisor に current directory の session 作成を依頼します。`--yolo` は local CLI のみで利用可能です。public MCP `session_start` から yolo mode は指定できません。
 
-## ownership と lifecycle
+## approval console attachment
 
-supervisor は自身が作成した runtime handle だけを追跡します。`session_stop` はそれらだけを graceful shutdown できます。別 terminal で起動した CLI session は `session_list` に見えても、remote client から `session_stop` で停止できません。
+approval input は別 attachment として接続します。
 
-active session ID collision は既存 runtime/socket を置換せず失敗します。`serve` 終了時は managed runtime をすべて drain し、metadata を inactive (`process_id = 0`) にして Unix socket を削除します。
+```sh
+temote-mcp session console
+```
 
-`temote-mcp up` は HTTP server を foreground process にし、選択した connection child（`cloudflared`、`tailscale funnel`、`tunnel-client`）だけを管理します。これにより approval console が端末 stdin を所有し、Temote が所有する connection cleanup も同じ shutdown path に結合されます。Tailscale daemon や無関係な ingress / tunnel 設定は停止しません。`temote-mcp down` は同じ graceful shutdown を要求し、不要になった lifecycle state を削除します。
+approval console は runtime owner ではありません。stdin EOF、Ctrl-C、PTY disconnect、terminal close では console だけが detach し、session runtime は生存します。console 不在中の approval-required operation は fail closed します。後から `session console` を再実行すれば、以後の approval request を処理できます。
 
-## endpoint scope
+HTTP `serve` supervisor は既存の local approval console を維持します。その console が切断された場合も approval delivery は fail closed し、managed runtime 自体は `serve` supervisor が終了するまで保持されます。
 
-`session_start` / `session_stop` は認証済み direct HTTP `serve` endpoint だけで公開します。Cloudflare Workers + Durable Objects multi-host gateway では公開せず、この設計では host-selection contract を追加しません。公開 endpoint で `without_sandbox` を除外する既存境界も維持します。
+## runtime と failure isolation
+
+session Unix socket は MCP operation と host bridge の runtime boundary として維持します。local CLI session と HTTP managed session は、sandbox permission、approval state、1Password bridge、kintone bridge、metadata、socket lifecycle を同じ runtime 実装で処理します。
+
+connection-local failure は runtime から隔離します。Broken pipe、connection reset、malformed message、oversized message、read timeout、client disconnect、response write failure はその connection だけを終了します。特に probe response と yolo approval response の write failure は runtime loop へ伝播しません。
+
+listener failure、runtime task panic/join failure など core runtime の予期しない終了は、その session に限って runtime-fatal とします。monitor は `crashed`、`stopped_at`、exit reason、last error を保存します。1 session の failure が同じ supervisor の他 session を停止させることはありません。
+
+## lifecycle state の永続化
+
+通常の session metadata に加えて private lifecycle state file を保持します。
+
+```text
+starting -> active -> stopping -> stopped
+                    \-> crashed
+```
+
+明示的な graceful stop は `stopped`、予期しない終了は `crashed` です。local supervisor の起動時には stale socket を処理し、live runtime を示す metadata に対して socket が死んでいれば `crashed` に reconcile します。
+
+第一段階の restart policy は安全側の `never` です。`temote-mcp session restart <id>` による manual restart は stopped / crashed / active session に利用できます。bounded backoff / rate limit を備えた自動 `on-failure` restart は別 issue で管理します。
+
+## HTTP managed session
+
+認証済み direct HTTP MCP client は以下を利用できます。
+
+```text
+session_list
+session_start(path="src/my-project", session_id="my-project")
+session_info(session_id="my-project")
+session_stop(session_id="my-project")
+```
+
+HTTP managed session は常に `yolo=false` です。既存の approval-gated host operation は引き続き approval が必要です。`session_stop` で停止できるのは現在の HTTP `SessionSupervisor` が所有する runtime だけです。
+
+`session_list` / `session_info` は active だけでなく stopped / crashed の durable state も表示します。それ以外の session-bound MCP tool は従来どおり live runtime socket を要求します。
+
+`session_start` / `session_stop` は authenticated direct HTTP `serve` endpoint だけで公開します。Cloudflare Workers + Durable Objects multi-host gateway には公開せず、この lifecycle 変更で host-selection contract も追加しません。公開 endpoint で `without_sandbox` を除外する既存境界も維持します。
+
+## optional terminal integration
+
+Herdr や tmux で `temote-mcp supervisor` の terminal を保持・整理することはできます。ただし optional な UI / process-retention layer に留め、session ownership、lifecycle metadata、crash detection、restart command の正本は Temote とします。

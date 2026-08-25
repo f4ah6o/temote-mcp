@@ -63,23 +63,46 @@ impl SessionSupervisor {
         session_id: Option<&str>,
     ) -> Result<ManagedSessionInfo> {
         let _transition = self.transitions.lock().await;
-        anyhow::ensure!(
-            !self.closed.load(Ordering::Acquire),
-            "session supervisor is shutting down; new sessions are disabled"
-        );
+        self.reap_finished().await;
         anyhow::ensure!(
             self.roots_configured(),
             "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
         );
         let cwd = self.roots.resolve(logical_path)?;
         let id = config::session_id(session_id)?;
+        self.start_resolved(cwd, id, false, Some(logical_path.to_owned()))
+            .await
+    }
 
+    pub async fn start_local(
+        &self,
+        cwd: &std::path::Path,
+        session_id: Option<&str>,
+        yolo: bool,
+    ) -> Result<ManagedSessionInfo> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        let cwd = config::canonical_directory(cwd)?;
+        let id = config::session_id(session_id)?;
+        self.start_resolved(cwd, id, yolo, None).await
+    }
+
+    async fn start_resolved(
+        &self,
+        cwd: std::path::PathBuf,
+        id: String,
+        yolo: bool,
+        logical_path: Option<String>,
+    ) -> Result<ManagedSessionInfo> {
+        anyhow::ensure!(
+            !self.closed.load(Ordering::Acquire),
+            "session supervisor is shutting down; new sessions are disabled"
+        );
         {
-            let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.is_finished());
+            let sessions = self.sessions.lock().await;
             anyhow::ensure!(
                 !sessions.contains_key(&id),
-                "session {id} is already managed by this serve process"
+                "session {id} is already managed by this supervisor process"
             );
             anyhow::ensure!(
                 sessions.len() < self.max_sessions,
@@ -92,14 +115,20 @@ impl SessionSupervisor {
             "session {id} is already running"
         );
 
-        let handle = approvals::spawn_runtime(&cwd, Some(&id), false, self.approval_sender.clone())
-            .await
-            .with_context(|| format!("failed to start managed session {id}"))?;
+        let handle = approvals::spawn_runtime_with_logical_path(
+            &cwd,
+            Some(&id),
+            yolo,
+            self.approval_sender.clone(),
+            logical_path,
+        )
+        .await
+        .with_context(|| format!("failed to start managed session {id}"))?;
         let info = ManagedSessionInfo {
             session_id: id.clone(),
             cwd: handle.cwd().to_owned(),
             status: "active",
-            yolo: false,
+            yolo,
         };
         self.sessions.lock().await.insert(id, handle);
         Ok(info)
@@ -107,10 +136,10 @@ impl SessionSupervisor {
 
     pub async fn stop(&self, session_id: &str) -> Result<()> {
         let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
         config::validate_session_id(session_id)?;
         let handle = {
             let mut sessions = self.sessions.lock().await;
-            sessions.retain(|_, handle| !handle.is_finished());
             sessions.remove(session_id)
         };
         let Some(handle) = handle else {
@@ -121,8 +150,25 @@ impl SessionSupervisor {
             }
             anyhow::bail!("session {session_id} is not managed by this serve process");
         };
-        handle.shutdown().await?;
-        config::remove_session_metadata(session_id).await
+        handle.shutdown().await
+    }
+
+    pub async fn reap_finished(&self) {
+        let finished = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter_map(|(id, handle)| handle.is_finished().then_some(id.clone()))
+                .collect::<Vec<_>>()
+        };
+        for id in finished {
+            let handle = self.sessions.lock().await.remove(&id);
+            if let Some(handle) = handle
+                && let Err(error) = handle.wait().await
+            {
+                eprintln!("managed session {id} exited: {error:#}");
+            }
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -140,11 +186,7 @@ impl SessionSupervisor {
                 }
                 continue;
             }
-            if let Err(error) = config::remove_session_metadata(&session_id).await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+            let _ = session_id;
         }
         if let Some(error) = first_error {
             return Err(error).context("failed to stop all managed sessions");
@@ -159,6 +201,12 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+
+    async fn cleanup_session(id: &str) {
+        let _ = tokio::fs::remove_file(config::socket_path(id).unwrap()).await;
+        let _ = tokio::fs::remove_file(config::session_path(id).unwrap()).await;
+        let _ = tokio::fs::remove_file(config::session_lifecycle_path(id).unwrap()).await;
+    }
 
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
@@ -198,11 +246,29 @@ mod tests {
 
         supervisor.stop(&first_id).await.unwrap();
         assert!(!config::session_is_active(&first_id).await.unwrap());
+        assert_eq!(
+            config::read_session_lifecycle(&first_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            config::LifecycleStatus::Stopped
+        );
         supervisor.shutdown().await.unwrap();
         assert!(!config::session_is_active(&second_id).await.unwrap());
         assert!(!config::socket_path(&second_id).unwrap().exists());
-        assert!(!config::session_path(&first_id).unwrap().exists());
-        assert!(!config::session_path(&second_id).unwrap().exists());
+        assert!(config::session_path(&first_id).unwrap().exists());
+        assert!(config::session_path(&second_id).unwrap().exists());
+        assert_eq!(
+            config::read_session_lifecycle(&second_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            config::LifecycleStatus::Stopped
+        );
+        cleanup_session(&first_id).await;
+        cleanup_session(&second_id).await;
     }
 
     #[tokio::test]
@@ -398,7 +464,7 @@ mod tests {
 
             runtime.block_on(async {
                 for id in &ids {
-                    config::remove_session_metadata(id).await.unwrap();
+                    cleanup_session(id).await;
                 }
                 let (supervisor, _approvals) =
                     SessionSupervisor::with_limit(roots, max_sessions);
@@ -454,12 +520,6 @@ mod tests {
                             ));
                             break;
                         }
-                        if !expected && config::session_path(candidate).unwrap().exists() {
-                            failure = Some(format!(
-                                "stopped managed session retained metadata: id={candidate:?}"
-                            ));
-                            break;
-                        }
                     }
                     if failure.is_some() {
                         break;
@@ -469,7 +529,10 @@ mod tests {
                 supervisor.shutdown().await.unwrap();
                 for id in &ids {
                     assert!(!config::session_is_active(id).await.unwrap());
-                    assert!(!config::session_path(id).unwrap().exists());
+                    if let Some(lifecycle) = config::read_session_lifecycle(id).await.unwrap() {
+                        assert_eq!(lifecycle.status, config::LifecycleStatus::Stopped);
+                    }
+                    cleanup_session(id).await;
                 }
                 if let Some(failure) = failure {
                     panic!("{failure}");
@@ -477,6 +540,63 @@ mod tests {
             });
             Ok(())
         })
+    }
+
+    #[tokio::test]
+    async fn one_runtime_failure_does_not_stop_other_session() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let failed_id = format!("isolated-failure-{}", uuid::Uuid::new_v4());
+        let healthy_id = format!("isolated-healthy-{}", uuid::Uuid::new_v4());
+        supervisor
+            .start("src/repo-a", Some(&failed_id))
+            .await
+            .unwrap();
+        supervisor
+            .start("src/repo-b", Some(&healthy_id))
+            .await
+            .unwrap();
+
+        {
+            let sessions = supervisor.sessions.lock().await;
+            sessions
+                .get(&failed_id)
+                .unwrap()
+                .crash_for_test()
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if config::read_session_lifecycle(&failed_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|state| state.status == config::LifecycleStatus::Crashed)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed runtime did not persist crashed state");
+        supervisor.reap_finished().await;
+
+        let failed = config::read_session_lifecycle(&failed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, config::LifecycleStatus::Crashed);
+        assert!(config::session_is_active(&healthy_id).await.unwrap());
+
+        supervisor.shutdown().await.unwrap();
+        let healthy = config::read_session_lifecycle(&healthy_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(healthy.status, config::LifecycleStatus::Stopped);
+        cleanup_session(&failed_id).await;
+        cleanup_session(&healthy_id).await;
     }
 
     #[tokio::test]

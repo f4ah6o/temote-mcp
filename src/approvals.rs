@@ -407,6 +407,7 @@ pub async fn request_supervisor_approval(
     Ok(receiver.await.unwrap_or(false))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum RuntimeCommand {
     SetYolo {
         value: bool,
@@ -423,24 +424,19 @@ enum RuntimeCommand {
     Snapshot {
         response: oneshot::Sender<Session>,
     },
+    #[cfg(test)]
+    CrashForTest,
     Shutdown,
 }
 
 pub struct RuntimeHandle {
     id: String,
     cwd: PathBuf,
-    service_account_configured: bool,
-    kintone_mcp_configured: bool,
-    kintone_cli_configured: bool,
     commands: mpsc::Sender<RuntimeCommand>,
     join: JoinHandle<Result<()>>,
 }
 
 impl RuntimeHandle {
-    pub fn session_id(&self) -> &str {
-        &self.id
-    }
-
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -449,6 +445,7 @@ impl RuntimeHandle {
         self.join.is_finished()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn set_yolo(&self, value: bool) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
@@ -461,6 +458,7 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn allow_directory(&self, path: PathBuf) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
@@ -473,6 +471,7 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn revoke_directory(&self, path: PathBuf) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
@@ -485,6 +484,7 @@ impl RuntimeHandle {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn snapshot(&self) -> Result<Session> {
         let (response, receiver) = oneshot::channel();
         self.commands
@@ -497,7 +497,33 @@ impl RuntimeHandle {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        if self.join.is_finished() {
+            return self.wait().await;
+        }
+        if let Ok(Some(mut lifecycle)) = config::read_session_lifecycle(&self.id).await {
+            lifecycle.status = config::LifecycleStatus::Stopping;
+            lifecycle.exit_reason = Some("graceful shutdown requested".to_owned());
+            lifecycle.last_error = None;
+            if let Err(error) = config::save_session_lifecycle(&self.id, &lifecycle).await {
+                eprintln!("failed to mark session {} stopping: {error:#}", self.id);
+            }
+        }
         let _ = self.commands.send(RuntimeCommand::Shutdown).await;
+        self.join
+            .await
+            .context("session runtime task failed to join")??;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn crash_for_test(&self) -> Result<()> {
+        self.commands
+            .send(RuntimeCommand::CrashForTest)
+            .await
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))
+    }
+
+    pub async fn wait(self) -> Result<()> {
         self.join
             .await
             .context("session runtime task failed to join")??;
@@ -505,20 +531,28 @@ impl RuntimeHandle {
     }
 }
 
+#[cfg(test)]
 pub async fn spawn_runtime(
     cwd: &Path,
     session_id: Option<&str>,
     yolo: bool,
     approval_sender: ApprovalSender,
 ) -> Result<RuntimeHandle> {
+    spawn_runtime_with_logical_path(cwd, session_id, yolo, approval_sender, None).await
+}
+
+pub async fn spawn_runtime_with_logical_path(
+    cwd: &Path,
+    session_id: Option<&str>,
+    yolo: bool,
+    approval_sender: ApprovalSender,
+    logical_path: Option<String>,
+) -> Result<RuntimeHandle> {
     let service_account_token = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let kintone_bridge = Arc::new(tokio::sync::Mutex::new(kintone_mcp::Bridge::capture()));
     let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture());
-    let service_account_configured = service_account_token.is_some();
-    let kintone_mcp_configured = kintone_bridge.lock().await.configured();
-    let kintone_cli_configured = kintone_cli_bridge.configured();
     let id = config::session_id(session_id)?;
     config::remove_inactive_socket(&id).await?;
     let mut session = config::new_session(cwd, Some(&id), yolo)?;
@@ -531,15 +565,44 @@ pub async fn spawn_runtime(
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     session.process_id = std::process::id();
+    let mut lifecycle = config::SessionLifecycle::starting(session.started_at, logical_path);
+    if let Err(error) = config::save_session_lifecycle(&session.id, &lifecycle).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
     if let Err(error) = config::save_session(&session).await {
+        lifecycle.status = config::LifecycleStatus::Crashed;
+        lifecycle.stopped_at = Some(config::unix_time());
+        lifecycle.exit_reason = Some("failed to persist runtime metadata".to_owned());
+        lifecycle.last_error = Some(format!("{error:#}"));
+        let _ = config::save_session_lifecycle(&session.id, &lifecycle).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
+    lifecycle.status = config::LifecycleStatus::Active;
+    if let Err(error) = config::save_session_lifecycle(&session.id, &lifecycle).await {
+        session.process_id = 0;
+        if let Err(save_error) = config::save_session(&session).await {
+            eprintln!(
+                "failed to roll back session metadata for {} after lifecycle save failure: {save_error:#}",
+                session.id
+            );
+        }
+        lifecycle.status = config::LifecycleStatus::Crashed;
+        lifecycle.stopped_at = Some(config::unix_time());
+        lifecycle.exit_reason = Some("failed to persist active lifecycle state".to_owned());
+        lifecycle.last_error = Some(format!("{error:#}"));
+        let _ = config::save_session_lifecycle(&session.id, &lifecycle).await;
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error);
     }
 
     let id_for_handle = session.id.clone();
     let cwd_for_handle = session.cwd.clone();
+    let fallback_session = session.clone();
+    let final_path = path.clone();
     let (commands, command_receiver) = mpsc::channel(MAX_PENDING_RUNTIME_COMMANDS);
-    let join = tokio::spawn(async move {
+    let runtime_join = tokio::spawn(async move {
         let result = run_runtime(
             listener,
             &mut session,
@@ -550,69 +613,62 @@ pub async fn spawn_runtime(
             kintone_cli_bridge,
         )
         .await;
+        (session, result)
+    });
+    let join = tokio::spawn(async move {
+        let (mut session, result) = match runtime_join.await {
+            Ok((session, result)) => (session, result),
+            Err(error) => (
+                fallback_session,
+                Err(anyhow::anyhow!("session runtime task failed: {error}")),
+            ),
+        };
         session.process_id = 0;
         if let Err(error) = config::save_session(&session).await {
-            eprintln!("failed to mark session {} stopped: {error:#}", session.id);
+            eprintln!(
+                "failed to persist final session metadata for {}: {error:#}",
+                session.id
+            );
         }
-        let _ = tokio::fs::remove_file(&path).await;
+
+        let mut lifecycle = config::read_session_lifecycle(&session.id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| config::SessionLifecycle::starting(session.started_at, None));
+        lifecycle.stopped_at = Some(config::unix_time());
+        match &result {
+            Ok(()) => {
+                lifecycle.status = config::LifecycleStatus::Stopped;
+                lifecycle.exit_reason = Some("graceful shutdown".to_owned());
+                lifecycle.last_error = None;
+            }
+            Err(error) => {
+                lifecycle.status = config::LifecycleStatus::Crashed;
+                lifecycle.exit_reason = Some("unexpected runtime termination".to_owned());
+                lifecycle.last_error = Some(format!("{error:#}"));
+            }
+        }
+        if let Err(error) = config::save_session_lifecycle(&session.id, &lifecycle).await {
+            eprintln!("failed to persist lifecycle for {}: {error:#}", session.id);
+        }
+        if let Err(error) = tokio::fs::remove_file(&final_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to clean up session socket {}: {error}",
+                final_path.display()
+            );
+        }
         result
     });
 
     Ok(RuntimeHandle {
         id: id_for_handle,
         cwd: cwd_for_handle,
-        service_account_configured,
-        kintone_mcp_configured,
-        kintone_cli_configured,
         commands,
         join,
     })
-}
-
-pub async fn start(session_id: Option<&str>, yolo: bool) -> Result<()> {
-    let (approval_sender, approval_receiver) = approval_channel();
-    let handle =
-        spawn_runtime(&std::env::current_dir()?, session_id, yolo, approval_sender).await?;
-    eprintln!(
-        "temote-mcp session: {}\ncwd: {}\nmode: {}\n\
-         Give this session ID to the agent so it can include it in temote-mcp tool calls.\n\
-         Commands: /permission ask|yolo|allow <directory>|revoke <directory>|list|status\n\
-         Press Ctrl-C to stop.",
-        handle.session_id(),
-        handle.cwd().display(),
-        if yolo { "yolo" } else { "ask" }
-    );
-    if yolo {
-        eprintln!(
-            "WARNING: YOLO mode grants MCP tools this user's full filesystem, process, environment, and network permissions without local approval."
-        );
-    }
-    eprintln!(
-        "1Password service account: {}",
-        if handle.service_account_configured {
-            "configured (token kept only by this session process)"
-        } else {
-            "not configured"
-        }
-    );
-    eprintln!(
-        "kintone MCP: {}",
-        if handle.kintone_mcp_configured {
-            "configured (credentials kept only by this session process)"
-        } else {
-            "not configured"
-        }
-    );
-    eprintln!(
-        "cli-kintone: {}",
-        if handle.kintone_cli_configured {
-            "configured (credentials kept only by this session process)"
-        } else {
-            "not configured"
-        }
-    );
-    run_cli_console(&handle, approval_receiver).await?;
-    handle.shutdown().await
 }
 
 pub async fn run_supervisor_console(mut approvals: ApprovalReceiver) -> Result<()> {
@@ -634,38 +690,6 @@ pub async fn run_supervisor_console(mut approvals: ApprovalReceiver) -> Result<(
                     return Ok(());
                 };
                 handle_supervisor_input(line.trim(), &mut pending)?;
-            }
-        }
-    }
-}
-
-async fn run_cli_console(handle: &RuntimeHandle, mut approvals: ApprovalReceiver) -> Result<()> {
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
-    let mut pending = VecDeque::<ApprovalPrompt>::new();
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    loop {
-        tokio::select! {
-            prompt = approvals.recv() => {
-                let Some(prompt) = prompt else { return Ok(()) };
-                let show_now = pending.is_empty();
-                pending.push_back(prompt);
-                if show_now {
-                    show_supervisor_prompt(pending.front().unwrap())?;
-                }
-            }
-            line = input.next_line() => {
-                let Some(line) = line? else {
-                    deny_all(&mut pending);
-                    return Ok(());
-                };
-                handle_cli_input(line.trim(), handle, &mut pending).await?;
-            }
-            signal = &mut ctrl_c => {
-                signal.context("failed to receive Ctrl-C")?;
-                eprintln!("Stopping temote-mcp session {}", handle.session_id());
-                deny_all(&mut pending);
-                return Ok(());
             }
         }
     }
@@ -777,7 +801,9 @@ async fn run_runtime(
                 drop(_permit);
                 match message {
                     Message::Probe => {
-                        stream.write_all(b"active\n").await?;
+                        if let Err(error) = stream.write_all(b"active\n").await {
+                            eprintln!("[session {}] probe client disconnected before response: {error}", session.id);
+                        }
                     }
                     Message::Activity { title, detail } => {
                         show_activity_for_session(&session.id, &title, detail.as_deref());
@@ -819,7 +845,9 @@ async fn run_runtime(
                             bounded_console_text(&request.operation, MAX_APPROVAL_OPERATION_BYTES),
                             bounded_console_text(&request.detail, MAX_APPROVAL_DETAIL_BYTES),
                         );
-                        stream.write_all(b"allow\n").await?;
+                        if let Err(error) = stream.write_all(b"allow\n").await {
+                            eprintln!("[session {}] approval client disconnected before response: {error}", session.id);
+                        }
                     }
                     Message::Approval { request } => {
                         let permit = match Arc::clone(&approval_slots).try_acquire_owned() {
@@ -861,7 +889,9 @@ async fn run_runtime(
                 }
             }
             command = commands.recv() => {
-                let Some(command) = command else { return Ok(()) };
+                let Some(command) = command else {
+                    anyhow::bail!("runtime command channel closed unexpectedly");
+                };
                 match command {
                     RuntimeCommand::SetYolo { value, response } => {
                         session.yolo = value;
@@ -899,6 +929,10 @@ async fn run_runtime(
                     RuntimeCommand::Snapshot { response } => {
                         let _ = response.send(session.clone());
                     }
+                    #[cfg(test)]
+                    RuntimeCommand::CrashForTest => {
+                        anyhow::bail!("injected runtime crash for test");
+                    }
                     RuntimeCommand::Shutdown => {
                         let _ = approval_lifetime.send(true);
                         return Ok(());
@@ -907,71 +941,6 @@ async fn run_runtime(
             }
         }
     }
-}
-
-async fn handle_cli_input(
-    input: &str,
-    handle: &RuntimeHandle,
-    pending: &mut VecDeque<ApprovalPrompt>,
-) -> Result<()> {
-    match input {
-        "/permissions yolo" | "/permission yolo" => {
-            handle.set_yolo(true).await?;
-            eprintln!("Permissions: yolo (full host permissions; no local approvals)");
-            while let Some(prompt) = pending.pop_front() {
-                eprintln!(
-                    "[session {}] [yolo] allowing {}: {}",
-                    prompt.session_id, prompt.request.operation, prompt.request.detail
-                );
-                prompt.respond(true);
-            }
-        }
-        "/permissions ask" | "/permission ask" => {
-            handle.set_yolo(false).await?;
-            eprintln!("Permissions: ask");
-        }
-        "y" | "Y" | "yes" | "YES" if !pending.is_empty() => {
-            pending.pop_front().unwrap().respond(true);
-            show_next_prompt(pending)?;
-        }
-        "n" | "N" | "no" | "NO" if !pending.is_empty() => {
-            pending.pop_front().unwrap().respond(false);
-            show_next_prompt(pending)?;
-        }
-        "/permission list" | "/permissions list" => {
-            show_permissions(&handle.snapshot().await?);
-        }
-        "/permission status" | "/permissions status" => {
-            let session = handle.snapshot().await?;
-            eprintln!("Permissions: {}", if session.yolo { "yolo" } else { "ask" });
-            show_permissions(&session);
-        }
-        command if permission_arg(command, "allow").is_some() => {
-            let directory = PathBuf::from(permission_arg(command, "allow").unwrap());
-            handle.allow_directory(directory.clone()).await?;
-            eprintln!(
-                "Allowed sandbox root: {}",
-                config::canonical_directory(&directory)?.display()
-            );
-        }
-        command if permission_arg(command, "revoke").is_some() => {
-            let directory = PathBuf::from(permission_arg(command, "revoke").unwrap());
-            let canonical = config::canonical_directory(&directory)?;
-            handle.revoke_directory(directory).await?;
-            eprintln!("Revoked sandbox root: {}", canonical.display());
-        }
-        "/permission" | "/permissions" | "/permission help" | "/permissions help" => {
-            eprintln!("/permission ask|yolo|allow <directory>|revoke <directory>|list|status");
-        }
-        "" => {}
-        command if !pending.is_empty() => {
-            pending.pop_front().unwrap().respond(false);
-            eprintln!("Denied request (unrecognized response: {command})");
-            show_next_prompt(pending)?;
-        }
-        command => eprintln!("Unknown command: {command}"),
-    }
-    Ok(())
 }
 
 fn handle_supervisor_input(input: &str, pending: &mut VecDeque<ApprovalPrompt>) -> Result<()> {
@@ -1335,6 +1304,7 @@ fn show_activity_for_session(session_id: &str, title: &str, detail: Option<&str>
     }
 }
 
+#[cfg(test)]
 fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
     ["/permission", "/permissions"]
         .into_iter()
@@ -1344,13 +1314,6 @@ fn permission_arg<'a>(command: &'a str, action: &str) -> Option<&'a str> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         })
-}
-
-fn show_permissions(session: &Session) {
-    eprintln!("Sandbox roots:");
-    for path in &session.permitted_directories {
-        eprintln!("  {}", bounded_console_path(path));
-    }
 }
 
 #[cfg(test)]
@@ -1694,6 +1657,117 @@ mod tests {
         assert_eq!(snapshot.id, id);
         assert!(!snapshot.yolo);
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_response_clients_do_not_stop_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("disconnect-ipc-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), true, sender)
+            .await
+            .unwrap();
+        let path = config::socket_path(&id).unwrap();
+
+        let mut probe = UnixStream::connect(&path).await.unwrap();
+        probe.write_all(b"{\"type\":\"probe\"}\n").await.unwrap();
+        drop(probe);
+
+        let request = Message::Approval {
+            request: Request {
+                id: Uuid::new_v4(),
+                operation: "disconnect-test".to_owned(),
+                detail: "client closes before allow response".to_owned(),
+                cwd: root.path().to_path_buf(),
+            },
+        };
+        let mut approval = UnixStream::connect(&path).await.unwrap();
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        approval.write_all(&bytes).await.unwrap();
+        drop(approval);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snapshot = handle.snapshot().await.unwrap();
+        assert_eq!(snapshot.id, id);
+        assert!(snapshot.yolo);
+        assert!(config::session_is_active(&id).await.unwrap());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_persists_stopped_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("graceful-lifecycle-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+
+        handle.shutdown().await.unwrap();
+        let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(lifecycle.status, config::LifecycleStatus::Stopped);
+        assert!(lifecycle.stopped_at.is_some());
+        assert_eq!(lifecycle.exit_reason.as_deref(), Some("graceful shutdown"));
+        assert!(lifecycle.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_persists_crashed_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("crashed-lifecycle-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+
+        handle.crash_for_test().await.unwrap();
+        let error = handle.wait().await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected runtime crash"));
+        let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(lifecycle.status, config::LifecycleStatus::Crashed);
+        assert!(lifecycle.stopped_at.is_some());
+        assert_eq!(
+            lifecycle.exit_reason.as_deref(),
+            Some("unexpected runtime termination")
+        );
+        assert!(
+            lifecycle
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("injected runtime crash"))
+        );
+        assert!(!config::session_is_active(&id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_runtime_failure_does_not_overwrite_crashed_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("crashed-shutdown-race-{}", Uuid::new_v4());
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+
+        handle.crash_for_test().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if handle.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handle.shutdown().await.is_err());
+
+        let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(lifecycle.status, config::LifecycleStatus::Crashed);
+        assert_eq!(
+            lifecycle.exit_reason.as_deref(),
+            Some("unexpected runtime termination")
+        );
     }
 
     #[test]

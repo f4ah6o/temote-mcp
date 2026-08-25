@@ -1,47 +1,103 @@
 # Managed sessions and named roots
 
-`temote-mcp serve` can supervise multiple normal sessions created by an authenticated direct HTTP MCP client.
+Temote has two supervisor entry points that share the same `SessionSupervisor` / session runtime implementation:
+
+- `temote-mcp supervisor`: local session-lifecycle supervisor controlled by `temote-mcp session ...`
+- `temote-mcp serve` / `temote-mcp up`: authenticated HTTP supervisor used by MCP `session_start` / `session_stop`
+
+Both own `RuntimeHandle`s directly. tmux, Herdr, systemd, or another terminal/process keeper may keep a Temote supervisor process visible, but they are not the session-level source of truth.
 
 ## Named-root configuration
 
-`TEMOTE_MCP_ROOTS` separates the MCP logical namespace from host filesystem paths.
-
-For one root:
+`TEMOTE_MCP_ROOTS` separates the logical namespace from host filesystem paths.
 
 ```sh
 TEMOTE_MCP_ROOTS='src=~/src'
 ```
 
-For multiple roots, use a JSON object rather than a separator-based list:
+For multiple roots, prefer JSON:
 
 ```sh
 TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}'
 ```
 
-Root names accept only ASCII letters, digits, `-`, and `_`. The configured root path is canonicalized first. This intentionally allows an administrator-selected root alias such as:
+Root names accept only ASCII letters, digits, `-`, and `_`. The configured root is canonicalized first. This allows an administrator-selected alias such as `~/src -> /Volumes/devstorage/Developer`, while descendant symlinks or `..` traversal that escape the canonical physical root are rejected. Missing root configuration fails closed; there is no HOME, `/`, cwd, or repository fallback.
 
-```text
-~/src -> /Volumes/devstorage/Developer
+## Local session supervisor
+
+Run one foreground supervisor:
+
+```sh
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
 ```
 
-The canonical target becomes the physical containment boundary. `src/foo` is joined under that boundary, canonicalized, required to be a directory, and then checked to be the root itself or a descendant. A descendant symlink or `..` traversal that resolves outside the physical root is rejected. Missing root configuration fails closed; there is no fallback to HOME, `/`, process cwd, or repository cwd.
+Manage sessions from another terminal:
 
-## Runtime and supervisor
+```sh
+temote-mcp session start mitsumori --path src/mitsumori-core
+temote-mcp session list
+temote-mcp session info mitsumori
+temote-mcp session stop mitsumori
+temote-mcp session restart mitsumori
+```
 
-The session socket remains the runtime boundary for MCP operations and host bridges. CLI and managed sessions both use the same reusable session runtime for metadata, Unix socket lifecycle, approval state, 1Password/kintone bridge state, and cleanup.
+`session list` reports `starting`, `active`, `stopping`, `stopped`, or `crashed` and probes the runtime socket before treating a session as live. Stale metadata with a dead socket is never shown as `active`.
 
-`temote-mcp start` wraps one runtime with the traditional single-session terminal UI. `temote-mcp serve` owns a `SessionSupervisor` and one shared local approval console. Approval prompts include the target `session_id`, cwd, and operation before a local `y/yes` or `n/no` response is accepted.
+`session info` includes the cwd, permitted directories, permission mode, start/stop timestamps, exit reason, last error, logical named-root path when available, and restart policy.
 
-Managed sessions are always created with `yolo=false`. The MCP `session_start` schema has no yolo option, and extra input fields are rejected. Git network operations, 1Password service-account commands, kintone calls, and other existing approval-gated host operations therefore continue to wait for local approval.
+For compatibility, `temote-mcp start <id>` remains available. It asks the running local supervisor to start the current directory instead of owning the runtime itself. `--yolo` remains a local-only option. The public MCP `session_start` contract still cannot request yolo mode.
 
-## Ownership and lifecycle
+## Approval console attachment
 
-The supervisor tracks only runtimes it created. `session_stop` removes and gracefully shuts down only such a runtime. An independently running CLI session can still appear in `session_list`, but a remote client cannot stop it through `session_stop`.
+Attach approval input separately:
 
-Active session-ID collisions fail instead of replacing the existing socket/runtime. When `serve` terminates, it drains all managed runtime handles, marks their metadata inactive (`process_id = 0`), and removes their Unix sockets.
+```sh
+temote-mcp session console
+```
 
-`temote-mcp up` keeps the HTTP server as the foreground process and owns only the selected connection child (`cloudflared`, `tailscale funnel`, or `tunnel-client`). This gives the approval console the terminal stdin and ties Temote-owned connection cleanup to the same shutdown path without stopping the Tailscale daemon or unrelated ingress/tunnel configuration. `temote-mcp down` requests the same graceful shutdown and removes stale lifecycle state.
+The approval console is not the runtime owner. stdin EOF, Ctrl-C, PTY disconnect, or terminal close detaches the console without stopping session runtimes. While no console is attached, approval-required operations fail closed. A later `session console` can reconnect and service subsequent approval requests.
 
-## Endpoint scope
+The HTTP `serve` supervisor retains its existing local approval console behavior. If that console disappears, approval delivery fails closed; managed runtimes remain owned by `serve` until the supervisor itself terminates.
 
-`session_start` and `session_stop` are exposed only by the authenticated direct HTTP `serve` endpoint. The Cloudflare Workers + Durable Objects multi-host gateway does not advertise them and has no host-selection contract in this design. The existing public exclusion of `without_sandbox` remains unchanged.
+## Runtime and failure isolation
+
+The session Unix socket remains the runtime boundary for MCP operations and host bridges. CLI and HTTP-managed sessions use the same runtime implementation for sandbox permissions, approval state, 1Password bridge state, kintone bridges, metadata, and socket lifecycle.
+
+Per-connection failures are isolated from the runtime. Broken pipes, connection resets, malformed messages, oversized messages, read timeouts, client disconnects, and response write failures terminate only that connection. In particular, probe and yolo-approval response writes do not propagate through the runtime loop.
+
+Listener failure, runtime task panic/join failure, or another unexpected core-runtime termination is runtime-fatal for that session. The monitor records `crashed`, `stopped_at`, an exit reason, and the last error. One session failure does not stop other sessions owned by the same supervisor.
+
+## Persistent lifecycle state
+
+Each session keeps normal session metadata plus a private lifecycle state file. Lifecycle transitions are:
+
+```text
+starting -> active -> stopping -> stopped
+                    \-> crashed
+```
+
+A graceful explicit stop becomes `stopped`. Unexpected termination becomes `crashed`. On local supervisor startup, stale sockets are removed and metadata that claimed a live runtime but has no live socket is reconciled to `crashed`.
+
+The first implementation intentionally uses restart policy `never`. `temote-mcp session restart <id>` provides manual restart for stopped, crashed, or currently active local-supervisor sessions. Automatic `on-failure` restart with bounded backoff/rate limiting is tracked separately.
+
+## HTTP managed sessions
+
+An authenticated direct HTTP MCP client can use:
+
+```text
+session_list
+session_start(path="src/my-project", session_id="my-project")
+session_info(session_id="my-project")
+session_stop(session_id="my-project")
+```
+
+HTTP managed sessions are always `yolo=false`. Existing approval-gated host operations remain approval-gated. `session_stop` stops only runtimes owned by the current HTTP `SessionSupervisor`.
+
+`session_list` and `session_info` expose durable stopped/crashed state as well as active sessions. Other session-bound MCP tools still require a live runtime socket.
+
+`session_start` and `session_stop` are exposed only by the authenticated direct HTTP `serve` endpoint. The Cloudflare Workers + Durable Objects multi-host gateway does not advertise them and gains no host-selection contract from this lifecycle change. The existing public exclusion of `without_sandbox` remains unchanged.
+
+## Optional terminal integration
+
+Herdr or tmux may be used to keep the single `temote-mcp supervisor` terminal organized or visible. They are optional UI/process-retention layers only; Temote remains responsible for session ownership, lifecycle metadata, crash detection, and restart commands.

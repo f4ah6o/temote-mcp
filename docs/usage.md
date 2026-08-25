@@ -4,14 +4,22 @@
 
 ## Sessions
 
-Start Temote MCP from the directory an agent should be able to work in:
+For local work, start one Temote lifecycle supervisor and then create named-root sessions from another terminal:
 
 ```sh
-cd ~/src/my-project
-temote-mcp start my-project
+export TEMOTE_MCP_ROOTS='src=~/src'
+temote-mcp supervisor
+
+temote-mcp session start my-project --path src/my-project
+temote-mcp session list
+temote-mcp session info my-project
 ```
 
-`session_list` discovers active sessions. Session-bound tools require `session_id`; `session_start` is the exception because it creates one. Use `session_info` to inspect the working directory, permitted roots, and whether the session is in yolo mode.
+Use `temote-mcp session console` when local approval input is required. Closing that console or sending stdin EOF detaches it without stopping the runtime. While no console is attached, approval-required operations fail closed.
+
+`session list` includes durable `starting`, `active`, `stopping`, `stopped`, and `crashed` states. `session info` includes the working directory, permitted roots, permission mode, timestamps, exit reason, and last error. A dead or ambiguous socket is never silently treated as active. Manual restart is available with `temote-mcp session restart <id>`; automatic restart is not enabled.
+
+For compatibility, `cd ~/src/my-project && temote-mcp start my-project` asks the running local supervisor to start the current directory. `temote-mcp start my-project --yolo` remains the deliberately unrestricted local-only form.
 
 Relative paths resolve from the session working directory.
 
@@ -31,7 +39,7 @@ TEMOTE_MCP_ROOTS='{"src":"~/src","work":"~/work"}' temote-mcp up
 
 The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. Missing roots fail closed with no HOME, `/`, cwd, or repository fallback.
 
-`session_stop` can stop only sessions created by the current `serve` supervisor. It cannot stop an independently started `temote-mcp start` session. Managed sessions are always non-yolo and retain the same local approval gates as CLI sessions. Stop the HTTP supervisor and its Tunnel with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
+`session_stop` can stop only sessions created by the current `serve` supervisor. HTTP managed sessions are always non-yolo and retain the same local approval gates. Stopped/crashed metadata remains visible through `session_list` / `session_info`; ordinary session-bound tools still require an active socket. Stop the HTTP supervisor and its Tunnel with `temote-mcp down`. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
 
 ## Migrating an older always-on runtime
 
@@ -50,16 +58,9 @@ Migration validates the legacy state file and verifies live process names before
 
 ## Permission roots
 
-A normal session starts with its startup directory as the permitted root. Change roots in the session terminal:
+A normal session starts with its canonical startup directory as its permitted root. Local named-root selection determines which project directory is used; remote `session_start` can only resolve paths below administrator-configured named roots. Normal sessions reject paths, symlink targets, and command working directories that escape their permitted roots.
 
-```text
-/permission allow ../another-project
-/permission revoke ../another-project
-/permission list
-/permission status
-```
-
-Normal sessions reject paths, symlink targets, and command working directories that escape the permitted roots.
+The legacy inline `/permission ...` terminal command UI is not the owner of detached runtimes and is not exposed through the first supervisor control surface. This does not widen permissions: the runtime remains fail-closed with its persisted permitted roots.
 
 ## Commands
 
@@ -96,7 +97,7 @@ temote-mcp start my-project --yolo
 
 Yolo mode intentionally removes Temote MCP's path restrictions, command sandbox, and local approval prompts. Commands run with the filesystem, environment, process, and network permissions of the user running Temote MCP. This does not disable authorization or confirmation imposed by an MCP client or another external system.
 
-Switch a running session with `/permission ask` or `/permission yolo`.
+The detached supervisor does not automatically promote a running normal session to yolo mode. Start yolo explicitly through the local-only compatibility command when that trust level is intended.
 
 ## Local stdio
 

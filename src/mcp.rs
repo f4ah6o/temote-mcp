@@ -378,7 +378,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created by this serve supervisor. Independently started CLI sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show a temote-mcp session's ID, working directory, allowed sandbox roots, and yolo mode state.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB from the local machine. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
@@ -511,12 +511,15 @@ async fn call_tool(
         "without_sandbox is unavailable on the public MCP endpoint"
     );
     let session_id = required_session_id(&args)?;
+    if name == "session_info" {
+        let view = crate::session_control::inspect_session(&session_id).await?;
+        if matches!(view.status.as_str(), "starting" | "active" | "stopping") {
+            approvals::activity(&view.session_id, "Read session info", None).await;
+        }
+        return text_result(serde_json::to_string_pretty(&view)?);
+    }
     let session = config::load_session(&session_id).await?;
     match name {
-        "session_info" => {
-            approvals::activity(&session.id, "Read session info", None).await;
-            text_result(serde_json::to_string_pretty(&session)?)
-        }
         "get_image" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = get_image(&path).await;
@@ -842,17 +845,17 @@ fn push_session_list_entry(
 }
 
 async fn session_list_entry(id: &str) -> Option<Value> {
-    let session = config::read_session_metadata(id).await.ok()?;
-    let status = match config::session_is_active(&session.id).await {
-        Ok(true) => "active",
-        Ok(false) => return None,
-        Err(_) => "unknown",
-    };
+    let session = crate::session_control::inspect_session(id).await.ok()?;
     Some(json!({
-        "session_id": session.id,
+        "session_id": session.session_id,
         "cwd": session.cwd,
         "started_at": session.started_at,
-        "status": status,
+        "stopped_at": session.stopped_at,
+        "status": session.status,
+        "pid": session.pid,
+        "exit_reason": session.exit_reason,
+        "last_error": session.last_error,
+        "permission_mode": session.permission_mode,
         "yolo": session.yolo,
     }))
 }

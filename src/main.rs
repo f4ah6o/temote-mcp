@@ -28,6 +28,7 @@ mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
+mod session_control;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
@@ -81,8 +82,21 @@ async fn main() -> Result<()> {
             .await
         }
         cli::Command::Start { session_id, yolo } => {
-            approvals::start(session_id.as_deref(), yolo).await
+            session_control::start_legacy(session_id, yolo).await
         }
+        cli::Command::Supervisor => session_control::run_supervisor().await,
+        cli::Command::Session { command } => match command {
+            cli::SessionCommand::Start { session_id, path } => {
+                session_control::start_named(session_id, path).await
+            }
+            cli::SessionCommand::List => session_control::list().await,
+            cli::SessionCommand::Info { session_id } => session_control::info(session_id).await,
+            cli::SessionCommand::Stop { session_id } => session_control::stop(session_id).await,
+            cli::SessionCommand::Restart { session_id } => {
+                session_control::restart(session_id).await
+            }
+            cli::SessionCommand::Console => session_control::run_console().await,
+        },
         cli::Command::Mcp => mcp::serve().await,
         #[cfg(feature = "network")]
         cli::Command::Serve {

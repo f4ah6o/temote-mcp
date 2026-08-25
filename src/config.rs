@@ -10,6 +10,41 @@ const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SESSION_PROBE_RESPONSE_BYTES: usize = 64;
 const MAX_SESSION_METADATA_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleStatus {
+    Starting,
+    Active,
+    Stopping,
+    Stopped,
+    Crashed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionLifecycle {
+    pub status: LifecycleStatus,
+    pub started_at: u64,
+    pub stopped_at: Option<u64>,
+    pub exit_reason: Option<String>,
+    pub last_error: Option<String>,
+    pub logical_path: Option<String>,
+    pub restart_policy: String,
+}
+
+impl SessionLifecycle {
+    pub fn starting(started_at: u64, logical_path: Option<String>) -> Self {
+        Self {
+            status: LifecycleStatus::Starting,
+            started_at,
+            stopped_at: None,
+            exit_reason: None,
+            last_error: None,
+            logical_path,
+            restart_policy: "never".to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -34,6 +69,15 @@ pub fn state_dir() -> Result<PathBuf> {
 pub fn session_path(id: &str) -> Result<PathBuf> {
     validate_session_id(id)?;
     Ok(sessions_dir()?.join(format!("{id}.json")))
+}
+
+pub fn session_lifecycle_path(id: &str) -> Result<PathBuf> {
+    validate_session_id(id)?;
+    Ok(sessions_dir()?.join(format!("{id}.state")))
+}
+
+pub fn supervisor_socket_path() -> Result<PathBuf> {
+    Ok(socket_dir().join("supervisor.sock"))
 }
 
 pub fn sessions_dir() -> Result<PathBuf> {
@@ -194,14 +238,90 @@ pub async fn remove_inactive_socket(id: &str) -> Result<()> {
     }
 }
 
-pub async fn remove_session_metadata(id: &str) -> Result<()> {
-    let path = session_path(id)?;
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to remove session metadata {}", path.display())),
+pub async fn read_session_lifecycle(id: &str) -> Result<Option<SessionLifecycle>> {
+    let path = session_lifecycle_path(id)?;
+    let file = match open_session_metadata_nofollow(&path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read session lifecycle {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect session lifecycle {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "session lifecycle is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_SESSION_METADATA_BYTES as u64,
+        "session lifecycle exceeds {MAX_SESSION_METADATA_BYTES} bytes: {}",
+        path.display()
+    );
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::from_std(file);
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_SESSION_METADATA_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("cannot read session lifecycle {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_SESSION_METADATA_BYTES,
+        "session lifecycle exceeds {MAX_SESSION_METADATA_BYTES} bytes: {}",
+        path.display()
+    );
+    let lifecycle =
+        serde_json::from_slice(&bytes).context("invalid temote-mcp session lifecycle")?;
+    Ok(Some(lifecycle))
+}
+
+pub async fn save_session_lifecycle(id: &str, lifecycle: &SessionLifecycle) -> Result<()> {
+    validate_session_id(id)?;
+    let path = session_lifecycle_path(id)?;
+    tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+    let temporary = path.with_extension(format!(
+        "state.{}.{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec_pretty(lifecycle)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_SESSION_METADATA_BYTES,
+        "session lifecycle exceeds {MAX_SESSION_METADATA_BYTES} bytes"
+    );
+    let result = async {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, &path).await?;
+        Result::<()>::Ok(())
     }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 pub async fn save_session(session: &Session) -> Result<()> {
@@ -372,7 +492,7 @@ fn resolve_from_cwd(cwd: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn unix_time() -> u64 {
+pub fn unix_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
