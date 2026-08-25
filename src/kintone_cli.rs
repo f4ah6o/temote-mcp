@@ -60,14 +60,15 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn capture() -> Self {
-        let executable_override = std::env::var_os("TEMOTE_MCP_KINTONE_CLI").map(PathBuf::from);
+    pub(crate) fn capture_from(source: &BTreeMap<String, String>) -> Self {
+        let executable_override = source.get("TEMOTE_MCP_KINTONE_CLI").map(PathBuf::from);
         let environment = KINTONE_ENV_NAMES
             .iter()
             .chain(CHILD_RUNTIME_ENV_NAMES.iter())
             .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
+                source
+                    .get(*name)
+                    .cloned()
                     .filter(|value| !value.is_empty())
                     .map(|value| ((*name).to_owned(), value))
             })

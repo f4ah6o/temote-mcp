@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::approvals::{ApprovalPrompt, ApprovalReceiver};
+use crate::approvals::{ApprovalPrompt, ApprovalReceiver, CapturedStartEnvironment};
 use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::named_roots::NamedRoots;
 use crate::supervisor::SessionSupervisor;
@@ -27,11 +27,15 @@ enum ControlRequest {
     Start {
         path: String,
         session_id: String,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
     },
     StartLocal {
         cwd: PathBuf,
         session_id: Option<String>,
         yolo: bool,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
     },
     List,
     Info {
@@ -42,6 +46,8 @@ enum ControlRequest {
     },
     Restart {
         session_id: String,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
     },
     AttachConsole,
 }
@@ -137,7 +143,12 @@ pub async fn run_supervisor() -> Result<()> {
 }
 
 pub async fn start_named(session_id: String, path: String) -> Result<()> {
-    let result = request(ControlRequest::Start { path, session_id }).await?;
+    let result = request(ControlRequest::Start {
+        path,
+        session_id,
+        environment: CapturedStartEnvironment::capture(),
+    })
+    .await?;
     print_json(&result)
 }
 
@@ -147,6 +158,7 @@ pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> 
         cwd,
         session_id,
         yolo,
+        environment: CapturedStartEnvironment::capture(),
     })
     .await?;
     print_json(&result)
@@ -183,7 +195,11 @@ pub async fn stop(session_id: String) -> Result<()> {
 }
 
 pub async fn restart(session_id: String) -> Result<()> {
-    let result = request(ControlRequest::Restart { session_id }).await?;
+    let result = request(ControlRequest::Restart {
+        session_id,
+        environment: CapturedStartEnvironment::capture(),
+    })
+    .await?;
     print_json(&result)
 }
 
@@ -281,17 +297,26 @@ async fn dispatch_request(
     supervisor.reap_finished().await;
     match request {
         ControlRequest::Ping => Ok(json!({"status": "active"})),
-        ControlRequest::Start { path, session_id } => {
-            supervisor.start(&path, Some(&session_id)).await?;
+        ControlRequest::Start {
+            path,
+            session_id,
+            environment,
+        } => {
+            environment.validate()?;
+            supervisor
+                .start_with_environment(&path, Some(&session_id), environment)
+                .await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::StartLocal {
             cwd,
             session_id,
             yolo,
+            environment,
         } => {
+            environment.validate()?;
             let info = supervisor
-                .start_local(&cwd, session_id.as_deref(), yolo)
+                .start_local_with_environment(&cwd, session_id.as_deref(), yolo, environment)
                 .await?;
             Ok(serde_json::to_value(
                 inspect_session(&info.session_id).await?,
@@ -305,15 +330,23 @@ async fn dispatch_request(
             supervisor.stop(&session_id).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
-        ControlRequest::Restart { session_id } => {
-            restart_session(supervisor, &session_id).await?;
+        ControlRequest::Restart {
+            session_id,
+            environment,
+        } => {
+            environment.validate()?;
+            restart_session(supervisor, &session_id, environment).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::AttachConsole => unreachable!("handled before dispatch"),
     }
 }
 
-async fn restart_session(supervisor: &Arc<SessionSupervisor>, session_id: &str) -> Result<()> {
+async fn restart_session(
+    supervisor: &Arc<SessionSupervisor>,
+    session_id: &str,
+    environment: CapturedStartEnvironment,
+) -> Result<()> {
     config::validate_session_id(session_id)?;
     supervisor.reap_finished().await;
     let session = config::read_session_metadata(session_id).await?;
@@ -325,10 +358,12 @@ async fn restart_session(supervisor: &Arc<SessionSupervisor>, session_id: &str) 
         .as_ref()
         .and_then(|state| state.logical_path.as_deref())
     {
-        supervisor.start(path, Some(session_id)).await?;
+        supervisor
+            .start_with_environment(path, Some(session_id), environment)
+            .await?;
     } else {
         supervisor
-            .start_local(&session.cwd, Some(session_id), session.yolo)
+            .start_local_with_environment(&session.cwd, Some(session_id), session.yolo, environment)
             .await?;
     }
     Ok(())
@@ -740,6 +775,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_start_environment_is_session_scoped_and_not_persisted() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("captured-env-{}", uuid::Uuid::new_v4());
+        let secret = "credential-sentinel-not-for-disk";
+        let environment = CapturedStartEnvironment::from_values(BTreeMap::from([
+            (
+                "KINTONE_BASE_URL".to_owned(),
+                "https://example.cybozu.com".to_owned(),
+            ),
+            ("KINTONE_USERNAME".to_owned(), "user".to_owned()),
+            ("KINTONE_PASSWORD".to_owned(), secret.to_owned()),
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
+            ("HOME".to_owned(), std::env::var("HOME").unwrap_or_default()),
+        ]))
+        .unwrap();
+        assert!(!format!("{environment:?}").contains(secret));
+
+        supervisor
+            .start_with_environment("src/repo", Some(&id), environment)
+            .await
+            .unwrap();
+
+        let mcp_status = approvals::kintone_mcp_status(&id).await.unwrap();
+        assert_eq!(mcp_status["configured"], true);
+        assert_eq!(mcp_status["auth_mode"], "password");
+        let cli_status = approvals::kintone_cli_status(&id).await.unwrap();
+        assert_eq!(cli_status["configured"], true);
+        assert_eq!(cli_status["auth_mode"], "password");
+
+        let metadata = tokio::fs::read_to_string(config::session_path(&id).unwrap())
+            .await
+            .unwrap();
+        let lifecycle = tokio::fs::read_to_string(config::session_lifecycle_path(&id).unwrap())
+            .await
+            .unwrap();
+        assert!(!metadata.contains(secret));
+        assert!(!lifecycle.contains(secret));
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
+
+        assert!(
+            CapturedStartEnvironment::from_values(BTreeMap::from([(
+                "LD_PRELOAD".to_owned(),
+                "not-allowlisted".to_owned(),
+            )]))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn approval_console_absence_disconnect_and_reconnect_fail_closed() {
         let (_temp, roots) = fixture();
         let (supervisor, approvals) = SessionSupervisor::new(roots);
@@ -903,7 +990,12 @@ mod tests {
                         }
                         3 => {
                             let expected = model[index] != ModelState::Absent;
-                            let result = restart_session(&supervisor, id).await;
+                            let result = restart_session(
+                                &supervisor,
+                                id,
+                                CapturedStartEnvironment::default(),
+                            )
+                            .await;
                             assert_eq!(
                                 result.is_ok(),
                                 expected,

@@ -62,6 +62,20 @@ impl SessionSupervisor {
         logical_path: &str,
         session_id: Option<&str>,
     ) -> Result<ManagedSessionInfo> {
+        self.start_with_environment(
+            logical_path,
+            session_id,
+            approvals::CapturedStartEnvironment::capture(),
+        )
+        .await
+    }
+
+    pub async fn start_with_environment(
+        &self,
+        logical_path: &str,
+        session_id: Option<&str>,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<ManagedSessionInfo> {
         let _transition = self.transitions.lock().await;
         self.reap_finished().await;
         anyhow::ensure!(
@@ -70,21 +84,22 @@ impl SessionSupervisor {
         );
         let cwd = self.roots.resolve(logical_path)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, false, Some(logical_path.to_owned()))
+        self.start_resolved(cwd, id, false, Some(logical_path.to_owned()), environment)
             .await
     }
 
-    pub async fn start_local(
+    pub async fn start_local_with_environment(
         &self,
         cwd: &std::path::Path,
         session_id: Option<&str>,
         yolo: bool,
+        environment: approvals::CapturedStartEnvironment,
     ) -> Result<ManagedSessionInfo> {
         let _transition = self.transitions.lock().await;
         self.reap_finished().await;
         let cwd = config::canonical_directory(cwd)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, yolo, None).await
+        self.start_resolved(cwd, id, yolo, None, environment).await
     }
 
     async fn start_resolved(
@@ -93,6 +108,7 @@ impl SessionSupervisor {
         id: String,
         yolo: bool,
         logical_path: Option<String>,
+        environment: approvals::CapturedStartEnvironment,
     ) -> Result<ManagedSessionInfo> {
         anyhow::ensure!(
             !self.closed.load(Ordering::Acquire),
@@ -115,12 +131,13 @@ impl SessionSupervisor {
             "session {id} is already running"
         );
 
-        let handle = approvals::spawn_runtime_with_logical_path(
+        let handle = approvals::spawn_runtime_with_logical_path_and_environment(
             &cwd,
             Some(&id),
             yolo,
             self.approval_sender.clone(),
             logical_path,
+            environment,
         )
         .await
         .with_context(|| format!("failed to start managed session {id}"))?;

@@ -78,6 +78,8 @@ npm install -g @kintone/cli
 
 `temote-mcp start` は同じ `KINTONE_BASE_URL`、`KINTONE_USERNAME` / `KINTONE_PASSWORD`、`KINTONE_API_TOKEN`、Basic auth、proxy、`KINTONE_GUEST_SPACE_ID` を capture します。`cli-kintone` が標準外の場所にある場合だけ `TEMOTE_MCP_KINTONE_CLI` に absolute path を指定します。
 
+local session supervisor を使う場合も、`temote-mcp start` / `temote-mcp session start` は allow-list 済みの integration environment を owner-only control socket 経由で対象 session runtime に渡します。credential は supervisor の process environment、session metadata、lifecycle state には保存しません。`session restart` でも呼び出し元 environment を再 capture するため、credential を注入していた session は restart 時にも同じ secret-injection wrapper から実行してください。
+
 最初に `kintone_cli_status` を使います。`kintone_cli_run` は API を使う次の command pair だけを受け付けます。
 
 - `record export`

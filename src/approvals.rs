@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,94 @@ const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
 const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
+const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
+const MAX_CAPTURED_START_ENV_TOTAL_BYTES: usize = 56 * 1024;
+const CAPTURED_START_ENV_NAMES: &[&str] = &[
+    "OP_SERVICE_ACCOUNT_TOKEN",
+    "KINTONE_BASE_URL",
+    "KINTONE_USERNAME",
+    "KINTONE_PASSWORD",
+    "KINTONE_API_TOKEN",
+    "KINTONE_BASIC_AUTH_USERNAME",
+    "KINTONE_BASIC_AUTH_PASSWORD",
+    "KINTONE_PFX_FILE_PATH",
+    "KINTONE_PFX_FILE_PASSWORD",
+    "KINTONE_ATTACHMENTS_DIR",
+    "KINTONE_GUEST_SPACE_ID",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "TEMOTE_MCP_KINTONE_MCP",
+    "TEMOTE_MCP_KINTONE_CLI",
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+];
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct CapturedStartEnvironment {
+    #[serde(default)]
+    values: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for CapturedStartEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedStartEnvironment")
+            .field("keys", &self.values.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl CapturedStartEnvironment {
+    pub fn capture() -> Self {
+        let values = CAPTURED_START_ENV_NAMES
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ((*name).to_owned(), value))
+            })
+            .collect();
+        Self { values }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let mut total = 0usize;
+        for (name, value) in &self.values {
+            anyhow::ensure!(
+                CAPTURED_START_ENV_NAMES.contains(&name.as_str()),
+                "unsupported captured start environment variable: {name}"
+            );
+            anyhow::ensure!(
+                value.len() <= MAX_CAPTURED_START_ENV_VALUE_BYTES,
+                "captured start environment variable {name} exceeds {MAX_CAPTURED_START_ENV_VALUE_BYTES} bytes"
+            );
+            total = total
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .context("captured start environment size overflow")?;
+        }
+        anyhow::ensure!(
+            total <= MAX_CAPTURED_START_ENV_TOTAL_BYTES,
+            "captured start environment exceeds {MAX_CAPTURED_START_ENV_TOTAL_BYTES} bytes"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn values(&self) -> &BTreeMap<String, String> {
+        &self.values
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values(values: BTreeMap<String, String>) -> Result<Self> {
+        let environment = Self { values };
+        environment.validate()?;
+        Ok(environment)
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
@@ -550,21 +639,35 @@ pub async fn spawn_runtime(
     yolo: bool,
     approval_sender: ApprovalSender,
 ) -> Result<RuntimeHandle> {
-    spawn_runtime_with_logical_path(cwd, session_id, yolo, approval_sender, None).await
+    spawn_runtime_with_logical_path_and_environment(
+        cwd,
+        session_id,
+        yolo,
+        approval_sender,
+        None,
+        CapturedStartEnvironment::capture(),
+    )
+    .await
 }
 
-pub async fn spawn_runtime_with_logical_path(
+pub async fn spawn_runtime_with_logical_path_and_environment(
     cwd: &Path,
     session_id: Option<&str>,
     yolo: bool,
     approval_sender: ApprovalSender,
     logical_path: Option<String>,
+    environment: CapturedStartEnvironment,
 ) -> Result<RuntimeHandle> {
-    let service_account_token = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let kintone_bridge = Arc::new(tokio::sync::Mutex::new(kintone_mcp::Bridge::capture()));
-    let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture());
+    environment.validate()?;
+    let service_account_token = environment
+        .values()
+        .get("OP_SERVICE_ACCOUNT_TOKEN")
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    let kintone_bridge = Arc::new(tokio::sync::Mutex::new(kintone_mcp::Bridge::capture_from(
+        environment.values(),
+    )));
+    let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture_from(environment.values()));
     let id = config::session_id(session_id)?;
     config::remove_inactive_socket(&id).await?;
     let mut session = config::new_session(cwd, Some(&id), yolo)?;

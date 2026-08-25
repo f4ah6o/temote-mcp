@@ -78,6 +78,8 @@ npm install -g @kintone/cli
 
 The same `KINTONE_BASE_URL`, `KINTONE_USERNAME` / `KINTONE_PASSWORD`, `KINTONE_API_TOKEN`, Basic-auth, proxy, and `KINTONE_GUEST_SPACE_ID` settings are captured by `temote-mcp start`. Set `TEMOTE_MCP_KINTONE_CLI` only when `cli-kintone` is installed at a non-standard absolute path.
 
+When using the local session supervisor, `temote-mcp start` / `temote-mcp session start` forwards only the allow-listed integration environment to the target session runtime over the owner-only control socket. Credentials are not placed in the supervisor process environment, session metadata, or lifecycle state. `session restart` captures the caller environment again, so sessions that use secret-injection wrappers must be restarted through the same wrapper.
+
 Use `kintone_cli_status` first. `kintone_cli_run` then accepts only these API-backed command pairs:
 
 - `record export`
