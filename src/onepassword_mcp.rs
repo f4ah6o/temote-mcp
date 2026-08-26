@@ -10,11 +10,16 @@ use tokio::sync::Mutex;
 
 use crate::child_env;
 use crate::line_protocol::{
-    ChildMcp, session_probe_means_stopped, validate_child_resource_uri, validate_child_tool_call,
+    ChildMcp, integration, session_probe_means_stopped, validate_child_resource_uri,
+    validate_child_tool_call,
 };
 use crate::{approvals, config};
 
 const MAX_CACHED_CLIENTS: usize = 64;
+
+pub(crate) fn integration_spec() -> &'static integration::IntegrationSpec {
+    &integration::ONEPASSWORD_MCP
+}
 
 fn onepassword_child_command(executable: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(executable);
@@ -195,7 +200,7 @@ async fn ensure_client(
         ChildMcp::spawn(
             command,
             "1Password MCP",
-            "1Password",
+            integration_spec().title,
             Some(session.id.clone()),
         )
         .await?,
@@ -244,12 +249,11 @@ fn safe_call_summary(tool_name: &str, arguments: &Value) -> String {
 }
 
 fn executable_path() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("TEMOTE_MCP_ONEPASSWORD_MCP") {
+    if let Some(name) = integration_spec().executable_override_env
+        && let Ok(value) = std::env::var(name)
+    {
         let path = PathBuf::from(value);
-        anyhow::ensure!(
-            path.is_absolute(),
-            "TEMOTE_MCP_ONEPASSWORD_MCP must be an absolute path"
-        );
+        anyhow::ensure!(path.is_absolute(), "{name} must be an absolute path");
         anyhow::ensure!(
             path.is_file(),
             "1Password MCP executable not found: {}",
@@ -280,6 +284,12 @@ fn executable_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn registry_spec_is_the_onepassword_mcp_source_of_truth() {
+        assert_eq!(integration_spec(), &integration::ONEPASSWORD_MCP);
+        assert_eq!(integration_spec().id, "onepassword");
+    }
 
     #[test]
     fn onepassword_child_command_scrubs_temote_credentials() {
