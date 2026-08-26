@@ -1,27 +1,20 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 use crate::child_env;
 use crate::line_protocol::{
-    BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
-    encode_bounded_json_line, next_bounded_line, validate_child_resource_uri,
-    validate_child_tool_call,
+    ChildMcp, session_probe_means_stopped, validate_child_resource_uri, validate_child_tool_call,
 };
 use crate::{approvals, config};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CACHED_CLIENTS: usize = 64;
-const PROTOCOL_VERSION: &str = "2025-06-18";
 
 fn onepassword_child_command(executable: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(executable);
@@ -35,171 +28,9 @@ fn onepassword_child_command(executable: &Path, cwd: &Path) -> Command {
     command
 }
 
-struct Client {
-    child: Arc<Mutex<Child>>,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    request_ids: RequestIdSequence,
-    session_watcher: JoinHandle<()>,
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.session_watcher.abort();
-    }
-}
-
-fn session_probe_means_stopped(probe: &Result<bool>) -> bool {
-    matches!(probe, Ok(false))
-}
-
-fn clients() -> &'static Mutex<HashMap<String, Client>> {
-    static CLIENTS: OnceLock<Mutex<HashMap<String, Client>>> = OnceLock::new();
+fn clients() -> &'static Mutex<HashMap<String, ChildMcp>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, ChildMcp>>> = OnceLock::new();
     CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-impl Client {
-    async fn spawn(session: &config::Session) -> Result<Self> {
-        let executable = executable_path()?;
-        let mut command = onepassword_child_command(&executable, &session.cwd);
-        let mut child = command.spawn().with_context(|| {
-            format!(
-                "failed to start 1Password MCP server at {}",
-                executable.display()
-            )
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("1Password MCP stdin is unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("1Password MCP stdout is unavailable")?;
-        let child = Arc::new(Mutex::new(child));
-        let watched_child = Arc::clone(&child);
-        let watched_session_id = session.id.clone();
-        let session_watcher = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let probe = config::session_is_active(&watched_session_id).await;
-                if session_probe_means_stopped(&probe) {
-                    let mut child = watched_child.lock().await;
-                    let _ = child.kill().await;
-                    return;
-                }
-            }
-        });
-        let mut client = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            request_ids: RequestIdSequence::default(),
-            session_watcher,
-        };
-        client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "temote-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            )
-            .await
-            .context("failed to initialize 1Password MCP server")?;
-        client
-            .notify("notifications/initialized", json!({}))
-            .await
-            .context("failed to finish 1Password MCP initialization")?;
-        Ok(client)
-    }
-
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        self.write_json(&json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }))
-        .await
-    }
-
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.request_ids.take();
-        self.write_json(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .await?;
-
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
-            loop {
-                let line = match next_bounded_line(&mut self.stdout, MAX_JSON_LINE_BYTES).await? {
-                    Some(BoundedLine::Line(line)) => line,
-                    Some(BoundedLine::TooLarge) => {
-                        anyhow::bail!(
-                            "1Password MCP server response exceeds {MAX_JSON_LINE_BYTES} bytes"
-                        )
-                    }
-                    Some(BoundedLine::InvalidUtf8) => {
-                        anyhow::bail!("1Password MCP server returned invalid UTF-8")
-                    }
-                    None => {
-                        let status = self.child.lock().await.try_wait().ok().flatten();
-                        anyhow::bail!("1Password MCP server closed stdout (status: {status:?})")
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let message: Value = serde_json::from_str(&line)
-                    .context("1Password MCP server returned invalid JSON")?;
-                match classify_child_message(&message, id)? {
-                    ChildMessageKind::Response => {
-                        if let Some(error) = message.get("error") {
-                            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-                            let message = error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown 1Password MCP error");
-                            anyhow::bail!("1Password MCP error {code}: {message}")
-                        }
-                        return message
-                            .get("result")
-                            .cloned()
-                            .context("1Password MCP response is missing result");
-                    }
-                    ChildMessageKind::ServerRequest(request_id) => {
-                        self.write_json(&json!({
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "error": {
-                                "code": -32601,
-                                "message": "temote-mcp does not expose client-side MCP capabilities to 1Password"
-                            }
-                        }))
-                        .await?;
-                    }
-                    ChildMessageKind::Notification => {}
-                }
-            }
-        })
-        .await
-        .context("timed out waiting for 1Password MCP server")??;
-        Ok(response)
-    }
-
-    async fn write_json(&mut self, value: &Value) -> Result<()> {
-        let line = encode_bounded_json_line(value, MAX_JSON_LINE_BYTES)?;
-        self.stdin.write_all(&line).await?;
-        self.stdin.flush().await?;
-        Ok(())
-    }
 }
 
 pub async fn discover(session: &config::Session) -> Result<Value> {
@@ -346,10 +177,10 @@ pub async fn call_tool(
 }
 
 async fn ensure_client(
-    clients: &mut HashMap<String, Client>,
+    clients: &mut HashMap<String, ChildMcp>,
     session: &config::Session,
 ) -> Result<()> {
-    retain_live_entries(clients, |client| !client.session_watcher.is_finished());
+    retain_live_entries(clients, |client| !client.watcher_finished());
     if clients.contains_key(&session.id) {
         return Ok(());
     }
@@ -357,7 +188,18 @@ async fn ensure_client(
         client_capacity_available(false, clients.len()),
         "1Password MCP client limit reached ({MAX_CACHED_CLIENTS})"
     );
-    clients.insert(session.id.clone(), Client::spawn(session).await?);
+    let executable = executable_path()?;
+    let command = onepassword_child_command(&executable, &session.cwd);
+    clients.insert(
+        session.id.clone(),
+        ChildMcp::spawn(
+            command,
+            "1Password MCP",
+            "1Password",
+            Some(session.id.clone()),
+        )
+        .await?,
+    );
     Ok(())
 }
 
