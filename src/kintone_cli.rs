@@ -8,20 +8,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+use crate::line_protocol::integration;
 use crate::{config, sandbox};
 
-const KINTONE_ENV_NAMES: &[&str] = &[
-    "KINTONE_BASE_URL",
-    "KINTONE_USERNAME",
-    "KINTONE_PASSWORD",
-    "KINTONE_API_TOKEN",
-    "KINTONE_BASIC_AUTH_USERNAME",
-    "KINTONE_BASIC_AUTH_PASSWORD",
-    "KINTONE_GUEST_SPACE_ID",
-    "HTTPS_PROXY",
-    "https_proxy",
-];
-const CHILD_RUNTIME_ENV_NAMES: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
 const MAX_CUSTOMIZE_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = sandbox::MAX_COMMAND_OUTPUT_BYTES;
 const FORBIDDEN_OPTIONS: &[&str] = &[
@@ -61,22 +50,17 @@ pub struct Bridge {
 
 impl Bridge {
     pub(crate) fn capture_from(source: &BTreeMap<String, String>) -> Self {
-        let executable_override = source.get("TEMOTE_MCP_KINTONE_CLI").map(PathBuf::from);
-        let environment = KINTONE_ENV_NAMES
-            .iter()
-            .chain(CHILD_RUNTIME_ENV_NAMES.iter())
-            .filter_map(|name| {
-                source
-                    .get(*name)
-                    .cloned()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| ((*name).to_owned(), value))
-            })
-            .collect();
+        let spec = &integration::KINTONE_CLI;
+        let executable_override = spec.executable_override(source).map(PathBuf::from);
+        let environment = spec.capture_environment(source);
         Self {
             executable_override,
             environment,
         }
+    }
+
+    pub(crate) fn integration_spec() -> &'static integration::IntegrationSpec {
+        &integration::KINTONE_CLI
     }
 
     pub fn configured(&self) -> bool {
@@ -706,6 +690,12 @@ fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn registry_spec_is_the_kintone_cli_source_of_truth() {
+        assert_eq!(Bridge::integration_spec(), &integration::KINTONE_CLI);
+        assert_eq!(Bridge::integration_spec().id, "kintone-cli");
+    }
 
     #[test]
     fn generated_bounded_stderr_matches_prefix_model() -> noprop::TestResult {
