@@ -7,22 +7,7 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::config;
-use crate::line_protocol::{ChildMcp, validate_child_tool_call};
-
-const KINTONE_ENV_NAMES: &[&str] = &[
-    "KINTONE_BASE_URL",
-    "KINTONE_USERNAME",
-    "KINTONE_PASSWORD",
-    "KINTONE_API_TOKEN",
-    "KINTONE_BASIC_AUTH_USERNAME",
-    "KINTONE_BASIC_AUTH_PASSWORD",
-    "KINTONE_PFX_FILE_PATH",
-    "KINTONE_PFX_FILE_PASSWORD",
-    "KINTONE_ATTACHMENTS_DIR",
-    "HTTPS_PROXY",
-    "https_proxy",
-];
-const CHILD_RUNTIME_ENV_NAMES: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+use crate::line_protocol::{ChildMcp, integration, validate_child_tool_call};
 
 pub struct Bridge {
     executable_override: Option<PathBuf>,
@@ -32,23 +17,18 @@ pub struct Bridge {
 
 impl Bridge {
     pub(crate) fn capture_from(source: &BTreeMap<String, String>) -> Self {
-        let executable_override = source.get("TEMOTE_MCP_KINTONE_MCP").map(PathBuf::from);
-        let environment = KINTONE_ENV_NAMES
-            .iter()
-            .chain(CHILD_RUNTIME_ENV_NAMES.iter())
-            .filter_map(|name| {
-                source
-                    .get(*name)
-                    .cloned()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| ((*name).to_owned(), value))
-            })
-            .collect();
+        let spec = &integration::KINTONE_MCP;
+        let executable_override = spec.executable_override(source).map(PathBuf::from);
+        let environment = spec.capture_environment(source);
         Self {
             executable_override,
             environment,
             client: None,
         }
+    }
+
+    pub(crate) fn integration_spec() -> &'static integration::IntegrationSpec {
+        &integration::KINTONE_MCP
     }
 
     pub fn configured(&self) -> bool {
@@ -295,6 +275,12 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[test]
+    fn registry_spec_is_the_kintone_mcp_source_of_truth() {
+        assert_eq!(Bridge::integration_spec(), &integration::KINTONE_MCP);
+        assert_eq!(Bridge::integration_spec().id, "kintone");
     }
 
     #[test]
