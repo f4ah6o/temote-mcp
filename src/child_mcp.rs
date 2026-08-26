@@ -138,8 +138,9 @@ impl ChildMcp {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let message: Value = serde_json::from_str(&line)
-                    .with_context(|| format!("{} server returned invalid JSON", self.server_label))?;
+                let message: Value = serde_json::from_str(&line).with_context(|| {
+                    format!("{} server returned invalid JSON", self.server_label)
+                })?;
                 match classify_child_message(&message, id)? {
                     ChildMessageKind::Response => {
                         if let Some(error) = message.get("error") {
@@ -150,10 +151,9 @@ impl ChildMcp {
                                 .unwrap_or("unknown child MCP error");
                             anyhow::bail!("{} error {code}: {message}", self.server_label)
                         }
-                        return message
-                            .get("result")
-                            .cloned()
-                            .with_context(|| format!("{} response is missing result", self.server_label));
+                        return message.get("result").cloned().with_context(|| {
+                            format!("{} response is missing result", self.server_label)
+                        });
                     }
                     ChildMessageKind::ServerRequest(request_id) => {
                         self.write_json(&json!({
