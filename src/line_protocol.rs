@@ -1,5 +1,7 @@
 #[path = "child_mcp.rs"]
 mod child_mcp;
+#[path = "integration.rs"]
+pub(crate) mod integration;
 pub(crate) use child_mcp::{ChildMcp, session_probe_means_stopped};
 
 use anyhow::{Context, Result};
