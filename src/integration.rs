@@ -215,7 +215,10 @@ mod tests {
     #[test]
     fn capture_environment_is_allow_listed_and_drops_empty_values() {
         let source = [
-            ("KINTONE_BASE_URL".to_owned(), "https://example.invalid".to_owned()),
+            (
+                "KINTONE_BASE_URL".to_owned(),
+                "https://example.invalid".to_owned(),
+            ),
             ("KINTONE_API_TOKEN".to_owned(), "secret".to_owned()),
             ("HOME".to_owned(), "/tmp/home".to_owned()),
             ("UNRELATED_SECRET".to_owned(), "must-not-pass".to_owned()),
@@ -224,7 +227,10 @@ mod tests {
         .into_iter()
         .collect();
         let captured = KINTONE_MCP.capture_environment(&source);
-        assert_eq!(captured.get("KINTONE_API_TOKEN").map(String::as_str), Some("secret"));
+        assert_eq!(
+            captured.get("KINTONE_API_TOKEN").map(String::as_str),
+            Some("secret")
+        );
         assert_eq!(captured.get("HOME").map(String::as_str), Some("/tmp/home"));
         assert!(!captured.contains_key("UNRELATED_SECRET"));
         assert!(!captured.contains_key("LANG"));
