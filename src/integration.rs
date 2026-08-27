@@ -171,7 +171,8 @@ pub(crate) fn get(id: &str) -> Option<&'static IntegrationSpec> {
             crate::kintone_mcp::Bridge::integration_spec() == spec,
         Some(spec) if spec.id == KINTONE_CLI.id =>
             crate::kintone_cli::Bridge::integration_spec() == spec,
-        Some(spec) if spec.id == ONEPASSWORD_MCP.id => crate::onepassword_mcp::integration_spec() == spec,
+        Some(spec) if spec.id == ONEPASSWORD_MCP.id =>
+            crate::onepassword_mcp::integration_spec() == spec,
         Some(_) | None => true,
     });
     spec
