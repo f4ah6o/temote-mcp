@@ -9,9 +9,10 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::child_env;
+#[cfg(test)]
+use crate::line_protocol::session_probe_means_stopped;
 use crate::line_protocol::{
-    ChildMcp, integration, session_probe_means_stopped, validate_child_resource_uri,
-    validate_child_tool_call,
+    ChildMcp, integration, validate_child_resource_uri, validate_child_tool_call,
 };
 use crate::{approvals, config};
 
@@ -296,12 +297,13 @@ mod tests {
         use std::ffi::OsStr;
 
         let mut command = onepassword_child_command(Path::new("op-mcp"), Path::new("."));
-        for name in child_env::SENSITIVE_ENV_NAMES {
+        let sensitive_names = child_env::sensitive_environment_names();
+        for name in &sensitive_names {
             command.env(name, "sentinel");
         }
         child_env::scrub_sensitive(&mut command, &[]);
         let envs = command.as_std().get_envs().collect::<Vec<_>>();
-        for name in child_env::SENSITIVE_ENV_NAMES {
+        for name in &sensitive_names {
             let value = envs
                 .iter()
                 .find(|(key, _)| *key == OsStr::new(name))
