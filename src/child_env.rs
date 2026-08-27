@@ -16,10 +16,7 @@ pub const SENSITIVE_ENV_NAMES: &[&str] = &[
 ];
 
 pub fn sensitive_environment_names() -> Vec<&'static str> {
-    let mut names = SENSITIVE_ENV_NAMES
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let mut names = SENSITIVE_ENV_NAMES.iter().copied().collect::<BTreeSet<_>>();
     names.extend(integration::secret_environment_names());
     names.into_iter().collect()
 }
