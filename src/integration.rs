@@ -165,12 +165,22 @@ pub(crate) fn all() -> &'static [IntegrationSpec] {
 }
 
 pub(crate) fn get(id: &str) -> Option<&'static IntegrationSpec> {
-    INTEGRATIONS.iter().find(|integration| integration.id == id)
+    let spec = INTEGRATIONS.iter().find(|integration| integration.id == id);
+    debug_assert!(match spec {
+        Some(spec) if spec.id == KINTONE_MCP.id =>
+            crate::kintone_mcp::Bridge::integration_spec() == spec,
+        Some(spec) if spec.id == KINTONE_CLI.id =>
+            crate::kintone_cli::Bridge::integration_spec() == spec,
+        Some(spec) if spec.id == ONEPASSWORD_MCP.id => crate::onepassword_mcp::integration_spec() == spec,
+        Some(_) | None => true,
+    });
+    spec
 }
 
 pub(crate) fn captured_start_environment_names() -> Vec<&'static str> {
     let mut names = BTreeSet::new();
     for integration in all() {
+        debug_assert_eq!(get(integration.id), Some(integration));
         names.extend(integration.captured_env.iter().copied());
         if let Some(name) = integration.executable_override_env {
             names.insert(name);
