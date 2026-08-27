@@ -1,3 +1,11 @@
+#[path = "child_mcp.rs"]
+mod child_mcp;
+#[path = "integration.rs"]
+pub(crate) mod integration;
+pub(crate) use child_mcp::ChildMcp;
+#[cfg(test)]
+pub(crate) use child_mcp::session_probe_means_stopped;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};

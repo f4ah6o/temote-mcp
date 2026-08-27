@@ -1,61 +1,34 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::Command;
 
 use crate::config;
-use crate::line_protocol::{
-    BoundedLine, ChildMessageKind, MAX_JSON_LINE_BYTES, RequestIdSequence, classify_child_message,
-    encode_bounded_json_line, next_bounded_line, validate_child_tool_call,
-};
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const PROTOCOL_VERSION: &str = "2025-06-18";
-const KINTONE_ENV_NAMES: &[&str] = &[
-    "KINTONE_BASE_URL",
-    "KINTONE_USERNAME",
-    "KINTONE_PASSWORD",
-    "KINTONE_API_TOKEN",
-    "KINTONE_BASIC_AUTH_USERNAME",
-    "KINTONE_BASIC_AUTH_PASSWORD",
-    "KINTONE_PFX_FILE_PATH",
-    "KINTONE_PFX_FILE_PASSWORD",
-    "KINTONE_ATTACHMENTS_DIR",
-    "HTTPS_PROXY",
-    "https_proxy",
-];
-const CHILD_RUNTIME_ENV_NAMES: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+use crate::line_protocol::{ChildMcp, integration, validate_child_tool_call};
 
 pub struct Bridge {
     executable_override: Option<PathBuf>,
     environment: BTreeMap<String, String>,
-    client: Option<Client>,
+    client: Option<ChildMcp>,
 }
 
 impl Bridge {
     pub(crate) fn capture_from(source: &BTreeMap<String, String>) -> Self {
-        let executable_override = source.get("TEMOTE_MCP_KINTONE_MCP").map(PathBuf::from);
-        let environment = KINTONE_ENV_NAMES
-            .iter()
-            .chain(CHILD_RUNTIME_ENV_NAMES.iter())
-            .filter_map(|name| {
-                source
-                    .get(*name)
-                    .cloned()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| ((*name).to_owned(), value))
-            })
-            .collect();
+        let spec = &integration::KINTONE_MCP;
+        let executable_override = spec.executable_override(source).map(PathBuf::from);
+        let environment = spec.capture_environment(source);
         Self {
             executable_override,
             environment,
             client: None,
         }
+    }
+
+    pub(crate) fn integration_spec() -> &'static integration::IntegrationSpec {
+        &integration::KINTONE_MCP
     }
 
     pub fn configured(&self) -> bool {
@@ -150,7 +123,16 @@ impl Bridge {
         let environment = self.validated_environment(session)?;
         if self.client.is_none() {
             let executable = self.executable_path()?;
-            self.client = Some(Client::spawn(&executable, &session.cwd, &environment).await?);
+            let mut command = Command::new(&executable);
+            command
+                .current_dir(&session.cwd)
+                .env_clear()
+                .envs(&environment)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            self.client = Some(ChildMcp::spawn(command, "kintone MCP", "kintone", None).await?);
         }
         Ok(())
     }
@@ -261,152 +243,6 @@ impl Bridge {
     }
 }
 
-struct Client {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    request_ids: RequestIdSequence,
-}
-
-impl Client {
-    async fn spawn(
-        executable: &Path,
-        cwd: &Path,
-        environment: &BTreeMap<String, String>,
-    ) -> Result<Self> {
-        let mut command = Command::new(executable);
-        command
-            .current_dir(cwd)
-            .env_clear()
-            .envs(environment)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let mut child = command.spawn().with_context(|| {
-            format!(
-                "failed to start kintone MCP server at {}",
-                executable.display()
-            )
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("kintone MCP stdin is unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("kintone MCP stdout is unavailable")?;
-        let mut client = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            request_ids: RequestIdSequence::default(),
-        };
-        client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "temote-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            )
-            .await
-            .context("failed to initialize kintone MCP server")?;
-        client
-            .notify("notifications/initialized", json!({}))
-            .await
-            .context("failed to finish kintone MCP initialization")?;
-        Ok(client)
-    }
-
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        self.write_json(&json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }))
-        .await
-    }
-
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.request_ids.take();
-        self.write_json(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .await?;
-
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
-            loop {
-                let line = match next_bounded_line(&mut self.stdout, MAX_JSON_LINE_BYTES).await? {
-                    Some(BoundedLine::Line(line)) => line,
-                    Some(BoundedLine::TooLarge) => {
-                        anyhow::bail!(
-                            "kintone MCP server response exceeds {MAX_JSON_LINE_BYTES} bytes"
-                        )
-                    }
-                    Some(BoundedLine::InvalidUtf8) => {
-                        anyhow::bail!("kintone MCP server returned invalid UTF-8")
-                    }
-                    None => {
-                        let status = self.child.try_wait().ok().flatten();
-                        anyhow::bail!("kintone MCP server closed stdout (status: {status:?})")
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let message: Value = serde_json::from_str(&line)
-                    .context("kintone MCP server returned invalid JSON")?;
-                match classify_child_message(&message, id)? {
-                    ChildMessageKind::Response => {
-                        if let Some(error) = message.get("error") {
-                            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-                            let message = error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown kintone MCP error");
-                            anyhow::bail!("kintone MCP error {code}: {message}")
-                        }
-                        return message
-                            .get("result")
-                            .cloned()
-                            .context("kintone MCP response is missing result");
-                    }
-                    ChildMessageKind::ServerRequest(request_id) => {
-                        self.write_json(&json!({
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "error": {
-                                "code": -32601,
-                                "message": "temote-mcp does not expose client-side MCP capabilities to kintone"
-                            }
-                        }))
-                        .await?;
-                    }
-                    ChildMessageKind::Notification => {}
-                }
-            }
-        })
-        .await
-        .context("timed out waiting for kintone MCP server")?
-    }
-
-    async fn write_json(&mut self, value: &Value) -> Result<()> {
-        let line = encode_bounded_json_line(value, MAX_JSON_LINE_BYTES)?;
-        self.stdin.write_all(&line).await?;
-        self.stdin.flush().await?;
-        Ok(())
-    }
-}
-
 fn find_on_path(executable: &str, path: &str) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|directory| directory.join(executable))
@@ -439,6 +275,12 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[test]
+    fn registry_spec_is_the_kintone_mcp_source_of_truth() {
+        assert_eq!(Bridge::integration_spec(), &integration::KINTONE_MCP);
+        assert_eq!(Bridge::integration_spec().id, "kintone");
     }
 
     #[test]

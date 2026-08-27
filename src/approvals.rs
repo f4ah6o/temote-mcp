@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{self, Session};
+use crate::line_protocol::integration;
 use crate::{kintone_cli, kintone_mcp, sandbox};
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -41,28 +42,6 @@ const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_CAPTURED_START_ENV_TOTAL_BYTES: usize = 56 * 1024;
-const CAPTURED_START_ENV_NAMES: &[&str] = &[
-    "OP_SERVICE_ACCOUNT_TOKEN",
-    "KINTONE_BASE_URL",
-    "KINTONE_USERNAME",
-    "KINTONE_PASSWORD",
-    "KINTONE_API_TOKEN",
-    "KINTONE_BASIC_AUTH_USERNAME",
-    "KINTONE_BASIC_AUTH_PASSWORD",
-    "KINTONE_PFX_FILE_PATH",
-    "KINTONE_PFX_FILE_PASSWORD",
-    "KINTONE_ATTACHMENTS_DIR",
-    "KINTONE_GUEST_SPACE_ID",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "TEMOTE_MCP_KINTONE_MCP",
-    "TEMOTE_MCP_KINTONE_CLI",
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "LANG",
-    "LC_ALL",
-];
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct CapturedStartEnvironment {
@@ -81,23 +60,24 @@ impl fmt::Debug for CapturedStartEnvironment {
 
 impl CapturedStartEnvironment {
     pub fn capture() -> Self {
-        let values = CAPTURED_START_ENV_NAMES
-            .iter()
+        let values = integration::captured_start_environment_names()
+            .into_iter()
             .filter_map(|name| {
                 std::env::var(name)
                     .ok()
                     .filter(|value| !value.is_empty())
-                    .map(|value| ((*name).to_owned(), value))
+                    .map(|value| (name.to_owned(), value))
             })
             .collect();
         Self { values }
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        let allowed = integration::captured_start_environment_names();
         let mut total = 0usize;
         for (name, value) in &self.values {
             anyhow::ensure!(
-                CAPTURED_START_ENV_NAMES.contains(&name.as_str()),
+                allowed.contains(&name.as_str()),
                 "unsupported captured start environment variable: {name}"
             );
             anyhow::ensure!(
@@ -1384,6 +1364,22 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[test]
+    fn captured_start_environment_is_registry_driven_and_fail_closed() {
+        let allowed = integration::captured_start_environment_names();
+        assert!(allowed.contains(&"OP_SERVICE_ACCOUNT_TOKEN"));
+        assert!(allowed.contains(&"KINTONE_API_TOKEN"));
+        assert!(allowed.contains(&"TEMOTE_MCP_KINTONE_MCP"));
+        assert!(allowed.contains(&"TEMOTE_MCP_KINTONE_CLI"));
+        assert!(
+            CapturedStartEnvironment::from_values(BTreeMap::from([(
+                "UNKNOWN_SECRET".to_owned(),
+                "secret".to_owned(),
+            )]))
+            .is_err()
+        );
     }
 
     #[test]
