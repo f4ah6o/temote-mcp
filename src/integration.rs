@@ -151,6 +151,8 @@ pub(crate) const KINTONE_CLI: IntegrationSpec = IntegrationSpec {
     executable_override_env: Some("TEMOTE_MCP_KINTONE_CLI"),
 };
 
+// Security boundary: integration specs are host-owned and static. Never expose a
+// client-controlled registration path that can inject arbitrary commands or env.
 const INTEGRATIONS: &[IntegrationSpec] = &[
     ONEPASSWORD_MCP,
     ONEPASSWORD_SERVICE_ACCOUNT,
