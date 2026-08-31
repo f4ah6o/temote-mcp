@@ -1,7 +1,7 @@
 # Transactional Codex plugin installation and removal
 
 Date: 2026-08-31
-Status: open
+Status: done
 Branch: main
 
 ## Background
@@ -121,3 +121,18 @@ For every injected failure, assert the complete postcondition rather than only t
 - no enabled config points to an incomplete bundle;
 - retry converges to the requested state;
 - no unowned path is removed.
+
+
+## Implementation evidence
+
+Completed on 2026-08-31.
+
+- Install/uninstall operations use one same-user advisory lock under `CODEX_HOME`; concurrent operations fail safely and crash releases the OS lock.
+- A complete owner-private sibling bundle is written, flushed, structurally validated, and committed with Linux `renameat2(RENAME_EXCHANGE)` or macOS `renamex_np(RENAME_SWAP)`. Reinstall keeps the previous bundle until config commit succeeds and rolls back on every injected pre-commit failure.
+- Codex config reads reject symlinks, special files, non-UTF-8/oversized inputs, duplicate or malformed owned sections, and preserve unrelated bytes and permission bits. Updates use a flushed private sibling file, concurrent-content comparison, and atomic rename.
+- Uninstall atomically disables config before bundle removal. A removal failure leaves a disabled diagnosable bundle instead of an enabled dangling entry.
+- `status --json` and `diagnose --json` expose `transaction_artifacts`, `stale_versions`, `dangling_config`, and `disabled_bundle`.
+- Deterministic tests inject failure after lock acquisition, staging creation, every staged file write, staged validation, bundle swap, and config temporary-file sync. They verify rollback, staging cleanup, retry convergence, config concurrency protection, and uninstall ordering.
+- Transaction-focused tests passed 12/12. The full all-target/all-feature suite passed 318 binary tests plus 33 library tests and the publishability test; one documented process-boundary E2E remains intentionally ignored in the normal suite.
+- macOS live acceptance passed install, healthy JSON status, same-version reinstall, uninstall, and cleanup in an isolated `CODEX_HOME`.
+- Clippy with `-D warnings`, local and Linux-target no-default-feature checks, rustfmt, and `git diff --check` passed. The full Linux all-feature target remains delegated to CI because the macOS host lacks `x86_64-linux-gnu-gcc`.

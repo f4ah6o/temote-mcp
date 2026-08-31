@@ -92,7 +92,7 @@ temote-mcp codex status
 temote-mcp codex diagnose --json
 ```
 
-installer は Plugin を `CODEX_HOME`（未指定時は `~/.codex`）配下へ配置し、Codex 設定で `temote-mcp@debug` を有効化します。さらに、install を実行した Temote executable の exact path を生成した MCP 設定と `.temote-mcp-bin` の両方へ固定します。`PATH` 上の別の `temote-mcp` へ暗黙に切り替えません。Temote を更新した場合は `temote-mcp codex plugin install` を再実行し、新しい binary/version へ Plugin を移します。削除は `temote-mcp codex plugin uninstall` です。install / uninstall 後、既に起動中の Codex session は再起動して disk 上の Plugin inventory と揃えます。
+installer は Plugin を `CODEX_HOME`（未指定時は `~/.codex`）配下へ配置し、Codex 設定で `temote-mcp@debug` を有効化します。さらに、install を実行した Temote executable の exact path を生成した MCP 設定と `.temote-mcp-bin` の両方へ固定します。`PATH` 上の別の `temote-mcp` へ暗黙に切り替えません。Temote を更新した場合は `temote-mcp codex plugin install` を再実行し、新しい binary/version へ Plugin を移します。削除は `temote-mcp codex plugin uninstall` です。install / uninstall 後、既に起動中の Codex session は再起動して disk 上の Plugin inventory と揃えます。 install / uninstall は排他制御付きの transaction として実行します。完全に検証した bundle を atomic swap し、Codex config は symlink を辿らず atomic replace します。uninstall は config を先に無効化してから bundle を削除します。`codex status --json` は recoverable transaction artifact、dangling config、disabled bundle、stale version を報告します。
 
 repository root 自体も開発・確認用の local Codex Plugin として利用できます。`.codex-plugin/plugin.json` が既存の `skills/temote-mcp` を公開し、`.mcp.json` は `PATH` 上の `temote-mcp mcp` を起動します。
 
