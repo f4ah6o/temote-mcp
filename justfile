@@ -17,7 +17,7 @@ fmt:
     cargo fmt --all
 
 # Run the checks used before publishing changes.
-check: fmt-check test clippy diff-check
+check: fmt-check test clippy gateway-test diff-check
 
 fmt-check:
     cargo fmt --all -- --check
@@ -27,6 +27,9 @@ test:
 
 clippy:
     cargo clippy --all-targets -- -D warnings
+
+gateway-test:
+    npm test --prefix gateway
 
 diff-check:
     git diff --check

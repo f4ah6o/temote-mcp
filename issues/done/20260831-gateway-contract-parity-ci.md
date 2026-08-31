@@ -1,7 +1,7 @@
 # Gateway protocol parity and CI gates
 
 Date: 2026-08-31
-Status: open
+Status: done
 Branch: main
 
 ## Background
@@ -129,3 +129,15 @@ The contract test must explicitly prove that:
 - Generated artifacts must be deterministic and checked for staleness.
 - The parity mechanism must not require network access.
 - The Rust host remains the final authorization and validation boundary; contract parity is defense in depth, not a replacement for host validation.
+
+
+## Implementation evidence
+
+Completed on 2026-08-31.
+
+- Rust emits a deterministic normalized snapshot for `tools(public = true, managed_sessions = false)`; Rust tests fail when the checked-in snapshot is stale.
+- Worker tests compare all routed tool names, annotations, schemas, required fields, bounds, defaults, and protocol versions against that snapshot. Prose-only title/description differences remain an explicit normalization boundary.
+- Negative fixtures prove schema drift, protocol drift, and `without_sandbox` exposure fail the parity assertion.
+- `just check`, GitHub Actions, and release validation run the gateway suite.
+- Gateway `serverInfo.version` now uses Cloudflare's `GATEWAY_DEPLOYMENT` version metadata binding. The private npm package uses `0.0.0` and no CalVer fallback remains in Worker source.
+- Rust snapshot test passed; Node gateway suite passed 46/46; `git diff --check` passed.

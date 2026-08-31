@@ -3,8 +3,10 @@ main = "src/index.js"
 compatibility_date = "2026-08-01"
 workers_dev = false
 
+[version_metadata]
+binding = "GATEWAY_DEPLOYMENT"
+
 [vars]
-GATEWAY_VERSION = "2026.8.0"
 ACCESS_TEAM_DOMAIN = "replace-me.cloudflareaccess.com"
 ACCESS_AUDIENCE = "replace-with-access-application-aud"
 ACCESS_ALLOWED_EMAILS = "replace@example.com"

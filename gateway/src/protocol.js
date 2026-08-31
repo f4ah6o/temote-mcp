@@ -41,12 +41,13 @@ const sessionProperty = {
 };
 
 function schema(properties, required = []) {
-  return {
+  const value = {
     type: "object",
     properties,
-    required,
     additionalProperties: false,
   };
+  if (required.length > 0) value.required = required;
+  return value;
 }
 
 function tool(name, title, description, annotations, inputSchema) {
@@ -159,7 +160,7 @@ export const PUBLIC_TOOLS = [
     "execute",
     "Run a sandboxed command",
     "Execute argv in the selected host's network-disabled sandbox.",
-    mutation,
+    { ...mutation, openWorldHint: true },
     schema(
       {
         ...sessionProperty,
@@ -173,7 +174,7 @@ export const PUBLIC_TOOLS = [
     "start_command",
     "Start a sandboxed command",
     "Start a background command in the selected host's network-disabled sandbox.",
-    mutation,
+    { ...mutation, openWorldHint: true },
     schema(
       {
         ...sessionProperty,
@@ -355,11 +356,19 @@ export function validateModernRequestBody(request) {
   return null;
 }
 
-export function serverInfo(version = "2026.8.0") {
+export function gatewayVersion(env) {
+  const version = env?.GATEWAY_DEPLOYMENT?.id;
+  if (typeof version !== "string" || version.length === 0 || version.length > 128) {
+    throw new Error("GATEWAY_DEPLOYMENT version metadata binding is missing or invalid");
+  }
+  return version;
+}
+
+export function serverInfo(version) {
   return { name: "temote-mcp-gateway", title: "Temote MCP Gateway", version };
 }
 
-export function discoverResult(version = "2026.8.0") {
+export function discoverResult(version) {
   return {
     resultType: "complete",
     supportedVersions: [MODERN_PROTOCOL_VERSION],
@@ -372,7 +381,7 @@ export function discoverResult(version = "2026.8.0") {
   };
 }
 
-export function modernizeResult(method, result, version = "2026.8.0") {
+export function modernizeResult(method, result, version) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result;
   if (method === "server/discover") return result;
   const modern = {

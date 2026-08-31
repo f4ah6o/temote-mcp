@@ -17,6 +17,8 @@ host reconnect 時は generation を増やし、古い generation や process `i
 
 gateway は MCP `2026-07-28` と既存の 2025 系 handshake の両方に対応します。modern request は dispatch 前に request ごとの `_meta` と標準 HTTP routing header を検証します。modern の `server/discover`、`tools/list`、tool result には 2026 仕様で必要な result metadata を付け、legacy の `initialize` は従来どおり維持します。
 
+routed tool schema と protocol version は Rust 生成の contract snapshot に対して Rust/Node の両テストで照合します。`serverInfo.version` は Temote CLI の CalVer ではなく、`GATEWAY_DEPLOYMENT` version-metadata binding が供給する Cloudflare deployment revision です。手動同期する source fallback をなくし、Worker の deploy ごとに identity が変わります。
+
 ## deploy
 
 1. `gateway/wrangler.toml` に non-secret の `ACCESS_TEAM_DOMAIN`、`ACCESS_AUDIENCE`、`ACCESS_ALLOWED_EMAILS` を設定します。

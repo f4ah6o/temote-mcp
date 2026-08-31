@@ -17,6 +17,8 @@ A reconnect increments the host generation. Requests/responses from an older gen
 
 The gateway serves both MCP `2026-07-28` and the existing 2025-era handshake. Modern requests are validated for per-request `_meta` and the standard HTTP routing headers before dispatch. Modern `server/discover`, `tools/list`, and tool results include the required 2026 result metadata while legacy `initialize` behavior remains unchanged.
 
+The routed tool schemas and protocol versions are checked against a Rust-generated contract snapshot in both Rust and Node tests. `serverInfo.version` is the Cloudflare deployment revision supplied by the `GATEWAY_DEPLOYMENT` version-metadata binding, not the Temote CLI CalVer. This avoids a manually synchronized source fallback and changes identity on every Worker deployment.
+
 ## Deploy
 
 1. Set non-secret Access values in `gateway/wrangler.toml`: `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, and `ACCESS_ALLOWED_EMAILS`.

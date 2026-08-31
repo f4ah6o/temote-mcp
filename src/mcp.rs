@@ -2619,6 +2619,58 @@ mod tests {
         );
     }
 
+    fn strip_gateway_contract_prose(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("title");
+                object.remove("description");
+                for child in object.values_mut() {
+                    strip_gateway_contract_prose(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip_gateway_contract_prose(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn routed_gateway_contract() -> Value {
+        let mut routed_tools = tools(true, false);
+        strip_gateway_contract_prose(&mut routed_tools);
+        json!({
+            "latestLegacyProtocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+            "supportedLegacyProtocolVersions": SUPPORTED_LEGACY_PROTOCOL_VERSIONS,
+            "modernProtocolVersion": MODERN_PROTOCOL_VERSION,
+            "tools": routed_tools,
+        })
+    }
+
+    #[test]
+    fn routed_gateway_contract_matches_checked_in_snapshot() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("gateway")
+            .join("contract")
+            .join("routed-tools.json");
+        let mut rendered = serde_json::to_string_pretty(&routed_gateway_contract()).unwrap();
+        rendered.push('\n');
+        if std::env::var_os("TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &rendered).unwrap();
+        }
+        let checked_in = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not read gateway contract {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test routed_gateway_contract_matches_checked_in_snapshot",
+                path.display()
+            )
+        });
+        assert_eq!(checked_in, rendered, "gateway contract snapshot is stale");
+    }
+
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();

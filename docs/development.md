@@ -50,9 +50,11 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo check --no-default-features --all-targets
-(cd gateway && npm test)
+npm test --prefix gateway
 git diff --check
 ```
+
+`just check`, pull-request CI, and release validation all run the gateway suite. The checked-in `gateway/contract/routed-tools.json` snapshot is generated from Rust's public non-supervisor tool surface and compared with the Worker export. Regenerate an intentional contract change with `TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test routed_gateway_contract_matches_checked_in_snapshot`, then review the structural diff.
 
 The installed HTTP/ingress lifecycle commands are `temote-mcp up --profile cloudflare|tailscale|openai` and `temote-mcp down`. They require a separately running `temote-mcp supervisor`; `down` does not stop that lifecycle supervisor or its sessions. Omitting the profile remains equivalent to `cloudflare`. The `justfile` provides development-oriented Cloudflare wrappers through `just up/down`; Tailscale/OpenAI profile testing should invoke the checkout binary directly so Cloudflare-only environment checks are not applied. For OpenAI, `TUNNEL_CLIENT_BIN` can point at a checkout/test binary while production should use the supported `tunnel-client` distribution and a Restricted runtime key rather than an admin key.
 

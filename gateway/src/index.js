@@ -2,6 +2,7 @@ import {
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
   discoverResult,
+  gatewayVersion,
   isModernRequest,
   modernProtocolVersion,
   modernizeResult,
@@ -105,16 +106,16 @@ async function handleMcp(request, env, identity) {
         serverInfo: {
           name: "temote-mcp-gateway",
           title: "Temote MCP Gateway",
-          version: env.GATEWAY_VERSION || "2026.8.0",
+          version: gatewayVersion(env),
         },
         instructions:
           "This is one MCP gateway for multiple endpoint sessions. Use session_list, then pass the selected session_id to every other tool. Mac and Windows/WSL2 sessions use different IDs.",
       }));
     case "server/discover":
-      return mcpJson(rpcResult(id, discoverResult(env.GATEWAY_VERSION || "2026.8.0")));
+      return mcpJson(rpcResult(id, discoverResult(gatewayVersion(env))));
     case "ping": {
       const result = isModernRequest(rpc)
-        ? modernizeResult("ping", {}, env.GATEWAY_VERSION || "2026.8.0")
+        ? modernizeResult("ping", {}, gatewayVersion(env))
         : {};
       return mcpJson(rpcResult(id, result));
     }
@@ -123,7 +124,7 @@ async function handleMcp(request, env, identity) {
       return mcpJson(rpcResult(
         id,
         isModernRequest(rpc)
-          ? modernizeResult("tools/list", result, env.GATEWAY_VERSION || "2026.8.0")
+          ? modernizeResult("tools/list", result, gatewayVersion(env))
           : result,
       ));
     }
@@ -201,7 +202,7 @@ async function handleToolCall(rpc, env) {
     return mcpJson(rpcResult(
       id,
       isModernRequest(rpc)
-        ? modernizeResult("tools/call", result, env.GATEWAY_VERSION || "2026.8.0")
+        ? modernizeResult("tools/call", result, gatewayVersion(env))
         : result,
     ));
   }
@@ -227,7 +228,7 @@ async function handleToolCall(rpc, env) {
       payload.result = modernizeResult(
         rpc.method,
         payload.result,
-        env.GATEWAY_VERSION || "2026.8.0",
+        gatewayVersion(env),
       );
     }
     return mcpJson(payload);

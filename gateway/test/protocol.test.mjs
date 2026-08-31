@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 
 import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
 import {
+  LEGACY_PROTOCOL_VERSION,
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
+  SUPPORTED_LEGACY_PROTOCOL_VERSIONS,
+  gatewayVersion,
   negotiateProtocolVersion,
   sessionIdFromRpc,
   validateSessionId,
 } from "../src/protocol.js";
+
+const ROUTED_CONTRACT = JSON.parse(fs.readFileSync(
+  new URL("../contract/routed-tools.json", import.meta.url),
+  "utf8",
+));
 
 class MemoryStorage {
   constructor() {
@@ -76,13 +85,68 @@ async function waitFor(predicate, message) {
   assert.fail(message);
 }
 
-test("public gateway exposes the same twenty-five public tools", () => {
-  assert.equal(PUBLIC_TOOLS.length, 25);
-  assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "without_sandbox"), false);
-  assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "session_list"), true);
-  assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "kintone_cli_status"), true);
-  assert.equal(PUBLIC_TOOLS.some((tool) => tool.name === "kintone_cli_run"), true);
-  assert.equal(PUBLIC_TOOLS.every((tool) => tool.inputSchema.additionalProperties === false), true);
+function stripContractProse(value) {
+  if (Array.isArray(value)) return value.map(stripContractProse);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "title" && key !== "description")
+      .map(([key, child]) => [key, stripContractProse(child)]),
+  );
+}
+
+function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
+  const actual = {
+    latestLegacyProtocolVersion:
+      versions.latestLegacyProtocolVersion ?? LEGACY_PROTOCOL_VERSION,
+    supportedLegacyProtocolVersions:
+      versions.supportedLegacyProtocolVersions
+      ?? [...SUPPORTED_LEGACY_PROTOCOL_VERSIONS],
+    modernProtocolVersion:
+      versions.modernProtocolVersion ?? MODERN_PROTOCOL_VERSION,
+    tools: stripContractProse(tools),
+  };
+  assert.deepEqual(actual, ROUTED_CONTRACT);
+}
+
+test("gateway routed tools and protocol versions match the Rust contract", () => {
+  assertGatewayContractParity();
+  const names = PUBLIC_TOOLS.map((tool) => tool.name);
+  assert.equal(names.length, 25);
+  for (const forbidden of ["without_sandbox", "session_start", "session_stop"]) {
+    assert.equal(names.includes(forbidden), false, forbidden);
+  }
+});
+
+test("gateway contract parity detects schema, forbidden-tool, and protocol drift", () => {
+  const changedSchema = structuredClone(PUBLIC_TOOLS);
+  changedSchema[0].inputSchema.additionalProperties = true;
+  assert.throws(() => assertGatewayContractParity(changedSchema), assert.AssertionError);
+
+  const forbiddenTool = structuredClone(PUBLIC_TOOLS);
+  forbiddenTool.push({
+    name: "without_sandbox",
+    annotations: {},
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  });
+  assert.throws(() => assertGatewayContractParity(forbiddenTool), assert.AssertionError);
+
+  assert.throws(
+    () => assertGatewayContractParity(PUBLIC_TOOLS, { modernProtocolVersion: "future" }),
+    assert.AssertionError,
+  );
+});
+
+test("gateway identity comes only from deployment version metadata", () => {
+  assert.equal(gatewayVersion({ GATEWAY_DEPLOYMENT: { id: "deployment-123" } }), "deployment-123");
+  for (const env of [
+    {},
+    { GATEWAY_DEPLOYMENT: {} },
+    { GATEWAY_DEPLOYMENT: { id: "" } },
+    { GATEWAY_DEPLOYMENT: { id: "x".repeat(129) } },
+  ]) {
+    assert.throws(() => gatewayVersion(env), /version metadata binding/);
+  }
 });
 
 test("Access email allowlist is fail-closed and case-insensitive", () => {
@@ -975,7 +1039,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
   });
   const response = await worker.fetch(request, {
     CLIENT_TOKEN: "client-token",
-    GATEWAY_VERSION: "test",
+    GATEWAY_DEPLOYMENT: { id: "test" },
   });
 
   assert.equal(response.status, 200);
@@ -1195,7 +1259,7 @@ test("modern server/discover advertises the 2026 protocol", async () => {
   });
   const response = await worker.fetch(request, {
     CLIENT_TOKEN: "client-token",
-    GATEWAY_VERSION: "test",
+    GATEWAY_DEPLOYMENT: { id: "test" },
   });
 
   assert.equal(response.status, 200);
@@ -1239,7 +1303,7 @@ test("modern tools/list requires Mcp-Method and returns cacheable result fields"
       "mcp-method": "tools/list",
     },
     body: JSON.stringify(rpc),
-  }), { CLIENT_TOKEN: "client-token", GATEWAY_VERSION: "test" });
+  }), { CLIENT_TOKEN: "client-token", GATEWAY_DEPLOYMENT: { id: "test" } });
   assert.equal(response.status, 200);
   const result = (await response.json()).result;
   assert.equal(result.resultType, "complete");
@@ -1284,7 +1348,7 @@ test("modern routed tool responses are normalized to the 2026 result shape", asy
   });
   const response = await worker.fetch(request, {
     CLIENT_TOKEN: "client-token",
-    GATEWAY_VERSION: "test",
+    GATEWAY_DEPLOYMENT: { id: "test" },
     GATEWAY_SESSIONS: {
       idFromName: (name) => name,
       get: () => sessionStub,
