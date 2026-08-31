@@ -765,3 +765,8 @@ OpenAI Help Center（2026-08-23確認）では、ChatGPT は local MCP server �
 ## 変更履歴
 
 `CHANGES.md` impact: n/a（repository に CHANGES.md は存在しないため README / docs / issue evidence を更新）
+
+
+## Tracking-only status — 2026-09-01
+
+No repository-local implementation gap remains in this issue. The unchecked Phase 5 items are intentionally retained for real Cloudflare/OpenAI/product live acceptance and cross-profile external validation; they remain open until those credentials/entitlements and endpoints are available.

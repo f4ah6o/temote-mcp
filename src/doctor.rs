@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::child_env;
+use crate::host_identity;
 use crate::profile::Profile;
 use crate::sandbox;
 
@@ -148,6 +149,8 @@ pub async fn run(options: Options) -> Result<()> {
     println!("platform: {}", std::env::consts::OS);
 
     let mut report = Report::new();
+    let host_id = host_identity::resolve()?;
+    report.add(Check::pass("host identity", format!("host_id={host_id}")));
     check_platform(&mut report);
     #[cfg(target_os = "macos")]
     report.add(Check::pass("sandbox backend", "native macOS Seatbelt"));
@@ -184,6 +187,17 @@ pub async fn run(options: Options) -> Result<()> {
 
     match options.profile {
         Some(Profile::Cloudflare) => {
+            let public_endpoint = std::env::var("TEMOTE_MCP_PUBLIC_URL")
+                .unwrap_or_else(|_| "<not configured>".to_owned());
+            let tunnel_id = std::env::var("TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID")
+                .or_else(|_| std::env::var("CLOUDFLARE_TUNNEL_ID"))
+                .unwrap_or_else(|_| "<not configured>".to_owned());
+            report.add(Check::pass(
+                "direct ingress identity",
+                format!(
+                    "host_id={host_id}, public_endpoint={public_endpoint}, tunnel_id={tunnel_id}"
+                ),
+            ));
             check_cloudflare_local(&mut report, options.tunnel_token_file.as_deref(), true).await;
             #[cfg(feature = "network")]
             check_cloudflare_access_config(&mut report);

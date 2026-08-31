@@ -37,15 +37,23 @@ Manage sessions from another terminal:
 temote-mcp session start mitsumori --path src/mitsumori-core
 temote-mcp session list
 temote-mcp session info mitsumori
+temote-mcp session permission mitsumori status
+temote-mcp session permission mitsumori allow /path/to/extra-root
+temote-mcp session permission mitsumori revoke /path/to/extra-root
+temote-mcp session permission mitsumori ask
+temote-mcp session permission mitsumori yolo
+temote-mcp session restart-policy mitsumori on-failure
 temote-mcp session stop mitsumori
 temote-mcp session restart mitsumori
 ```
 
 `session list` reports `starting`, `active`, `stopping`, `stopped`, or `crashed` and probes the runtime socket before treating a session as live. Stale metadata with a dead socket is never shown as `active`.
 
-`session info` includes the cwd, permitted directories, permission mode, start/stop timestamps, exit reason, last error, logical named-root path when available, and restart policy.
+`session info` includes the non-secret `host_id`, cwd, permitted directories, permission mode, start/stop timestamps, exit reason, last error, logical named-root path when available, restart policy, restart count, most recent restart time, pending restart time, and any terminal restart-limit reason.
 
 For compatibility, `temote-mcp start <id>` remains available. It asks the running local supervisor to start the current directory instead of owning the runtime itself. `--yolo` remains a local-only option. The public MCP `session_start` contract still cannot request yolo mode.
+
+Detached permission management is local-only and travels over the same owner-only supervisor Unix socket. `permission allow/revoke` keeps the existing canonical-path and symlink containment rules; the session cwd cannot be revoked. `permission ask/yolo` is explicit, and none of these mutations restart the runtime or discard runtime state. Persisted permitted roots are restored when that same session/cwd is explicitly restarted.
 
 ## Approval console attachment
 
@@ -78,7 +86,7 @@ starting -> active -> stopping -> stopped
 
 A graceful explicit stop becomes `stopped`. Unexpected termination becomes `crashed`. On local supervisor startup, stale sockets are removed and metadata that claimed a live runtime but has no live socket is reconciled to `crashed`.
 
-The first implementation intentionally uses restart policy `never`. `temote-mcp session restart <id>` provides manual restart for stopped, crashed, or currently active local-supervisor sessions. Automatic `on-failure` restart with bounded backoff/rate limiting is tracked separately.
+Restart policy defaults to `never`. `temote-mcp session restart-policy <id> on-failure` enables automatic restart only after unexpected runtime failure; graceful stop never restarts. Automatic restart uses bounded exponential delays of 1, 2, 4, 8, and 16 seconds and then settles in `crashed` after five attempts. Lifecycle state records `restart_count`, `last_restart_at`, `next_restart_at`, and `restart_limit_reason`. The original captured start environment is retained only in supervisor memory and is never persisted; after the supervisor process itself restarts, pending credential-bearing automatic restart is intentionally not resumed and the session remains `crashed` with an explanatory reason until an explicit `session restart`.
 
 ## HTTP managed sessions
 
@@ -95,7 +103,7 @@ HTTP managed sessions are always `yolo=false`. Existing approval-gated host oper
 
 `session_list` and `session_info` expose durable stopped/crashed state as well as active sessions. Other session-bound MCP tools still require a live runtime socket.
 
-`session_start` and `session_stop` are exposed only by the authenticated direct HTTP `serve` endpoint. The Cloudflare Workers + Durable Objects multi-host gateway does not advertise them and gains no host-selection contract from this lifecycle change. The existing public exclusion of `without_sandbox` remains unchanged.
+`session_start` and `session_stop` are exposed only by the authenticated direct HTTP `serve` endpoint. Direct `temote-mcp up` is single-host per public endpoint: one endpoint maps to one local lifecycle supervisor and host-local session store. Reusing one Cloudflare Tunnel token/hostname concurrently across multiple direct-ingress hosts is unsupported because Cloudflare replica routing is not session-aware. Set `TEMOTE_MCP_HOST_ID` for a stable non-secret diagnostic identity (OS hostname is the fallback). For a single public endpoint routing to multiple Temote hosts, use `temote-mcp gateway-agent` with the Worker/Durable Objects gateway. The gateway generation/lease routing contract is unchanged. The existing public exclusion of `without_sandbox` remains unchanged.
 
 ## Optional terminal integration
 

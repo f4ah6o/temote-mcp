@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,6 +12,17 @@ use crate::config;
 use crate::named_roots::NamedRoots;
 
 const MAX_MANAGED_SESSIONS: usize = 64;
+const MAX_AUTOMATIC_RESTARTS: u32 = 5;
+const MAX_RESTART_BACKOFF_SECONDS: u64 = 30;
+
+#[derive(Clone)]
+struct RestartSpec {
+    cwd: PathBuf,
+    yolo: bool,
+    logical_path: Option<String>,
+    environment: approvals::CapturedStartEnvironment,
+    public: bool,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ManagedSessionInfo {
@@ -24,6 +36,7 @@ pub struct SessionSupervisor {
     roots: NamedRoots,
     approval_sender: ApprovalSender,
     sessions: Mutex<HashMap<String, RuntimeHandle>>,
+    restart_specs: Mutex<HashMap<String, RestartSpec>>,
     public_sessions: Mutex<HashSet<String>>,
     transitions: Mutex<()>,
     closed: AtomicBool,
@@ -42,6 +55,7 @@ impl SessionSupervisor {
                 roots,
                 approval_sender,
                 sessions: Mutex::new(HashMap::new()),
+                restart_specs: Mutex::new(HashMap::new()),
                 public_sessions: Mutex::new(HashSet::new()),
                 transitions: Mutex::new(()),
                 closed: AtomicBool::new(false),
@@ -115,11 +129,9 @@ impl SessionSupervisor {
                 false,
                 Some(logical_path.to_owned()),
                 environment,
+                public,
             )
             .await?;
-        if public {
-            self.public_sessions.lock().await.insert(id);
-        }
         Ok(info)
     }
 
@@ -134,7 +146,8 @@ impl SessionSupervisor {
         self.reap_finished().await;
         let cwd = config::canonical_directory(cwd)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, yolo, None, environment).await
+        self.start_resolved(cwd, id, yolo, None, environment, false)
+            .await
     }
 
     async fn start_resolved(
@@ -144,6 +157,7 @@ impl SessionSupervisor {
         yolo: bool,
         logical_path: Option<String>,
         environment: approvals::CapturedStartEnvironment,
+        public: bool,
     ) -> Result<ManagedSessionInfo> {
         anyhow::ensure!(
             !self.closed.load(Ordering::Acquire),
@@ -166,6 +180,13 @@ impl SessionSupervisor {
             "session {id} is already running"
         );
 
+        let spec = RestartSpec {
+            cwd: cwd.clone(),
+            yolo,
+            logical_path: logical_path.clone(),
+            environment: environment.clone(),
+            public,
+        };
         let handle = approvals::spawn_runtime_with_logical_path_and_environment(
             &cwd,
             Some(&id),
@@ -182,7 +203,11 @@ impl SessionSupervisor {
             status: "active",
             yolo,
         };
-        self.sessions.lock().await.insert(id, handle);
+        self.sessions.lock().await.insert(id.clone(), handle);
+        self.restart_specs.lock().await.insert(id.clone(), spec);
+        if public {
+            self.public_sessions.lock().await.insert(id);
+        }
         Ok(info)
     }
 
@@ -192,6 +217,142 @@ impl SessionSupervisor {
 
     pub async fn stop_public(&self, session_id: &str) -> Result<()> {
         self.stop_owned(session_id, true).await
+    }
+
+    pub async fn set_permission_yolo(&self, session_id: &str, value: bool) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let sessions = self.sessions.lock().await;
+        let handle = sessions.get(session_id).with_context(|| {
+            format!("session {session_id} is not managed by this supervisor process")
+        })?;
+        handle.set_yolo(value).await?;
+        drop(sessions);
+        if let Some(spec) = self.restart_specs.lock().await.get_mut(session_id) {
+            spec.yolo = value;
+        }
+        Ok(())
+    }
+
+    pub async fn allow_directory(&self, session_id: &str, path: std::path::PathBuf) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let sessions = self.sessions.lock().await;
+        let handle = sessions.get(session_id).with_context(|| {
+            format!("session {session_id} is not managed by this supervisor process")
+        })?;
+        handle.allow_directory(path).await
+    }
+
+    pub async fn revoke_directory(&self, session_id: &str, path: std::path::PathBuf) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let sessions = self.sessions.lock().await;
+        let handle = sessions.get(session_id).with_context(|| {
+            format!("session {session_id} is not managed by this supervisor process")
+        })?;
+        handle.revoke_directory(path).await
+    }
+
+    pub async fn set_restart_policy(&self, session_id: &str, policy: &str) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        anyhow::ensure!(
+            matches!(policy, "never" | "on-failure"),
+            "restart policy must be never or on-failure"
+        );
+        let mut lifecycle = config::read_session_lifecycle(session_id)
+            .await?
+            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+        lifecycle.restart_policy = policy.to_owned();
+        if policy == "never" {
+            lifecycle.next_restart_at = None;
+            lifecycle.restart_limit_reason = None;
+        } else if lifecycle.status == config::LifecycleStatus::Crashed
+            && self.restart_specs.lock().await.contains_key(session_id)
+            && lifecycle.restart_count < MAX_AUTOMATIC_RESTARTS
+        {
+            lifecycle.next_restart_at = Some(config::unix_time() + 1);
+            lifecycle.restart_limit_reason = None;
+        }
+        config::save_session_lifecycle(session_id, &lifecycle).await
+    }
+
+    async fn schedule_restart(&self, session_id: &str, reason: &str) -> Result<()> {
+        let mut lifecycle = config::read_session_lifecycle(session_id)
+            .await?
+            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+        if lifecycle.restart_policy != "on-failure" {
+            return Ok(());
+        }
+        if lifecycle.restart_count >= MAX_AUTOMATIC_RESTARTS {
+            lifecycle.next_restart_at = None;
+            lifecycle.restart_limit_reason = Some(format!(
+                "automatic restart limit reached after {} attempts",
+                lifecycle.restart_count
+            ));
+            lifecycle.exit_reason = lifecycle.restart_limit_reason.clone();
+            config::save_session_lifecycle(session_id, &lifecycle).await?;
+            return Ok(());
+        }
+        let shift = lifecycle.restart_count.min(5);
+        let backoff = (1_u64 << shift).min(MAX_RESTART_BACKOFF_SECONDS);
+        lifecycle.restart_count += 1;
+        lifecycle.next_restart_at = Some(config::unix_time() + backoff);
+        lifecycle.restart_limit_reason = None;
+        lifecycle.exit_reason = Some(format!(
+            "{reason}; automatic restart {} scheduled in {backoff}s",
+            lifecycle.restart_count
+        ));
+        config::save_session_lifecycle(session_id, &lifecycle).await
+    }
+
+    async fn restart_due_sessions(&self) {
+        let now = config::unix_time();
+        let specs = self.restart_specs.lock().await.clone();
+        for (id, spec) in specs {
+            if self.sessions.lock().await.contains_key(&id) {
+                continue;
+            }
+            let Ok(Some(mut lifecycle)) = config::read_session_lifecycle(&id).await else {
+                continue;
+            };
+            if lifecycle.restart_policy != "on-failure"
+                || lifecycle.status != config::LifecycleStatus::Crashed
+                || lifecycle.next_restart_at.is_none_or(|at| at > now)
+            {
+                continue;
+            }
+            lifecycle.last_restart_at = Some(now);
+            lifecycle.next_restart_at = None;
+            if let Err(error) = config::save_session_lifecycle(&id, &lifecycle).await {
+                eprintln!("failed to persist restart attempt for {id}: {error:#}");
+                continue;
+            }
+            if let Err(error) = self
+                .start_resolved(
+                    spec.cwd.clone(),
+                    id.clone(),
+                    spec.yolo,
+                    spec.logical_path.clone(),
+                    spec.environment.clone(),
+                    spec.public,
+                )
+                .await
+            {
+                eprintln!("automatic restart for session {id} failed: {error:#}");
+                if let Err(save_error) = self
+                    .schedule_restart(&id, &format!("automatic restart attempt failed: {error:#}"))
+                    .await
+                {
+                    eprintln!("failed to schedule another restart for {id}: {save_error:#}");
+                }
+            }
+        }
     }
 
     async fn stop_owned(&self, session_id: &str, public_only: bool) -> Result<()> {
@@ -213,8 +374,22 @@ impl SessionSupervisor {
                     "session {session_id} is active but is not managed by this supervisor process"
                 );
             }
+            if self.restart_specs.lock().await.remove(session_id).is_some() {
+                self.public_sessions.lock().await.remove(session_id);
+                if let Some(mut lifecycle) = config::read_session_lifecycle(session_id).await? {
+                    lifecycle.status = config::LifecycleStatus::Stopped;
+                    lifecycle.stopped_at = Some(config::unix_time());
+                    lifecycle.next_restart_at = None;
+                    lifecycle.exit_reason =
+                        Some("graceful stop cancelled pending automatic restart".to_owned());
+                    lifecycle.last_error = None;
+                    config::save_session_lifecycle(session_id, &lifecycle).await?;
+                }
+                return Ok(());
+            }
             anyhow::bail!("session {session_id} is not managed by this supervisor process");
         };
+        self.restart_specs.lock().await.remove(session_id);
         self.public_sessions.lock().await.remove(session_id);
         handle.shutdown().await
     }
@@ -239,12 +414,36 @@ impl SessionSupervisor {
         for id in finished {
             let handle = self.sessions.lock().await.remove(&id);
             if let Some(handle) = handle {
-                self.public_sessions.lock().await.remove(&id);
-                if let Err(error) = handle.wait().await {
-                    eprintln!("managed session {id} exited: {error:#}");
+                match handle.wait().await {
+                    Ok(()) => {
+                        self.restart_specs.lock().await.remove(&id);
+                        self.public_sessions.lock().await.remove(&id);
+                    }
+                    Err(error) => {
+                        eprintln!("managed session {id} exited: {error:#}");
+                        let should_restart = config::read_session_lifecycle(&id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|state| state.restart_policy == "on-failure");
+                        if should_restart && self.restart_specs.lock().await.contains_key(&id) {
+                            if let Err(schedule_error) = self
+                                .schedule_restart(&id, "unexpected runtime failure")
+                                .await
+                            {
+                                eprintln!(
+                                    "failed to schedule automatic restart for {id}: {schedule_error:#}"
+                                );
+                            }
+                        } else {
+                            self.restart_specs.lock().await.remove(&id);
+                            self.public_sessions.lock().await.remove(&id);
+                        }
+                    }
                 }
             }
         }
+        self.restart_due_sessions().await;
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -254,6 +453,7 @@ impl SessionSupervisor {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect::<Vec<_>>()
         };
+        self.restart_specs.lock().await.clear();
         self.public_sessions.lock().await.clear();
         let mut first_error = None;
         for (session_id, handle) in handles {
@@ -674,6 +874,81 @@ mod tests {
         assert_eq!(healthy.status, config::LifecycleStatus::Stopped);
         cleanup_session(&failed_id).await;
         cleanup_session(&healthy_id).await;
+    }
+
+    #[tokio::test]
+    async fn on_failure_policy_restarts_crash_and_graceful_stop_does_not_restart() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("auto-restart-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        let initial = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(initial.restart_policy, "never");
+        assert_eq!(initial.restart_count, 0);
+
+        supervisor
+            .set_restart_policy(&id, "on-failure")
+            .await
+            .unwrap();
+        supervisor.crash_for_test(&id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                supervisor.reap_finished().await;
+                let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+                if lifecycle.status == config::LifecycleStatus::Active
+                    && lifecycle.restart_count == 1
+                    && lifecycle.last_restart_at.is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("crashed session was not automatically restarted");
+
+        supervisor.stop(&id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        supervisor.reap_finished().await;
+        let stopped = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(stopped.status, config::LifecycleStatus::Stopped);
+        assert_eq!(stopped.restart_count, 1);
+        assert!(stopped.next_restart_at.is_none());
+        assert!(!config::session_is_active(&id).await.unwrap());
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_rate_limit_is_bounded() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("restart-limit-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        supervisor
+            .set_restart_policy(&id, "on-failure")
+            .await
+            .unwrap();
+
+        for _ in 0..=MAX_AUTOMATIC_RESTARTS {
+            supervisor
+                .schedule_restart(&id, "test crash")
+                .await
+                .unwrap();
+        }
+        let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(lifecycle.restart_count, MAX_AUTOMATIC_RESTARTS);
+        assert!(lifecycle.next_restart_at.is_none());
+        assert!(
+            lifecycle
+                .restart_limit_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("restart limit reached"))
+        );
+
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
     }
 
     #[tokio::test]

@@ -54,6 +54,8 @@ temote-mcp up --profile cloudflare
 # temote-mcp up --profile openai
 ```
 
+Direct `temote-mcp up` ingress は **public endpoint ごとに single-host** が契約です。`TEMOTE_MCP_HOST_ID=ubuntu1` のような stable かつ non-secret な host ID を設定すると、startup / `doctor` / supervisor / session diagnostics で host ownership を明示できます。未設定時は OS hostname に fallback します。同じ Cloudflare Tunnel token / hostname を複数 Temote host で direct-ingress replica として同時利用する構成は非対応です。Cloudflare の replica routing は Temote の session ownership を認識せず、session state は host-local のままだからです。1つの public endpoint から複数 host を扱う場合は、[multi-host Cloudflare gateway](docs/gateway.ja.md) の `temote-mcp gateway-agent` + Worker/Durable Objects gateway を使用します。
+
 認証済み MCP client からは次の順で利用します。
 
 ```text
@@ -74,11 +76,14 @@ temote-mcp supervisor
 temote-mcp session start my-project --path src/my-project
 temote-mcp session list
 temote-mcp session info my-project
+temote-mcp session permission my-project status
+temote-mcp session permission my-project allow /path/to/extra-root
+temote-mcp session restart-policy my-project on-failure
 temote-mcp session console
 temote-mcp session stop my-project
 ```
 
-approval console は runtime owner ではなく attachment です。terminal close / stdin EOF でも session runtime は生存し、console 不在中の approval-required operation は fail closed します。console は再接続できます。lifecycle metadata には `starting` / `active` / `stopping` / `stopped` / `crashed` と crash reason / last error を保存します。`session list` は socket を probe するため、死んだ runtime を `active` と表示しません。manual `session restart` は利用できます。現時点の restart policy は `never` で、自動 restart は行いません。
+approval console は runtime owner ではなく attachment です。terminal close / stdin EOF でも session runtime は生存し、console 不在中の approval-required operation は fail closed します。console は再接続できます。lifecycle metadata には `starting` / `active` / `stopping` / `stopped` / `crashed` と crash reason / last error を保存します。`session list` は socket を probe するため、死んだ runtime を `active` と表示しません。detached permission 変更は owner-only supervisor socket 経由で行い、runtime を再起動しません。restart policy の既定値は `never` で、明示的な `on-failure` は bounded exponential backoff と最大5回の restart limit を使い、restart count / timestamp / limit reason を保存します。start 時に capture した credential は memory-only のため、supervisor process 自体の再起動後に credential-bearing auto restart を暗黙再開しません。その場合は明示的な `session restart` を使います。
 
 互換用に `cd ~/src/my-project && temote-mcp start my-project` は current directory を local supervisor 配下で起動する shorthand として残します。先に `temote-mcp supervisor` が必要です。`--yolo` はこの local CLI path だけで利用でき、remote MCP `session_start` から yolo session は作成できません。local stdio client は `temote-mcp mcp` を起動します。
 

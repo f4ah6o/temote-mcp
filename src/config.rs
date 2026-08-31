@@ -29,6 +29,14 @@ pub struct SessionLifecycle {
     pub last_error: Option<String>,
     pub logical_path: Option<String>,
     pub restart_policy: String,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub last_restart_at: Option<u64>,
+    #[serde(default)]
+    pub next_restart_at: Option<u64>,
+    #[serde(default)]
+    pub restart_limit_reason: Option<String>,
 }
 
 impl SessionLifecycle {
@@ -41,6 +49,10 @@ impl SessionLifecycle {
             last_error: None,
             logical_path,
             restart_policy: "never".to_owned(),
+            restart_count: 0,
+            last_restart_at: None,
+            next_restart_at: None,
+            restart_limit_reason: None,
         }
     }
 }

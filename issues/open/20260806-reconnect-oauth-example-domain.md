@@ -88,3 +88,8 @@ Cloudflare Access の self-hosted application と Tunnel を新ドメイン `tem
 ## 注記
 
 - [20260806-purge-example-domain-history.md](../done/20260806-purge-example-domain-history.md) の完了後に着手する。
+
+
+## Tracking-only status — 2026-09-01
+
+Repository-local implementation and unauthenticated discovery/401 probes are complete. The two remaining acceptance items require a configured real Cloudflare Access/Tunnel deployment and ChatGPT connector authentication, so they are not marked complete without external live evidence.

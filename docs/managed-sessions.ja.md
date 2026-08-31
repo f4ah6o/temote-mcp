@@ -37,15 +37,23 @@ temote-mcp supervisor
 temote-mcp session start mitsumori --path src/mitsumori-core
 temote-mcp session list
 temote-mcp session info mitsumori
+temote-mcp session permission mitsumori status
+temote-mcp session permission mitsumori allow /path/to/extra-root
+temote-mcp session permission mitsumori revoke /path/to/extra-root
+temote-mcp session permission mitsumori ask
+temote-mcp session permission mitsumori yolo
+temote-mcp session restart-policy mitsumori on-failure
 temote-mcp session stop mitsumori
 temote-mcp session restart mitsumori
 ```
 
 `session list` は `starting` / `active` / `stopping` / `stopped` / `crashed` を表示し、live 判定時には runtime socket を probe します。metadata が `active` を示していても socket が死んでいる session を `active` とは表示しません。
 
-`session info` では cwd、permitted directory、permission mode、started/stopped timestamp、exit reason、last error、利用可能な場合は logical named-root path、restart policy を確認できます。
+`session info` では non-secret な `host_id`、cwd、permitted directory、permission mode、started/stopped timestamp、exit reason、last error、利用可能な場合は logical named-root path、restart policy、restart count、直近 restart time、pending restart time、restart limit reason を確認できます。
 
 互換用の `temote-mcp start <id>` も残します。runtime をその terminal process が直接所有するのではなく、起動中の local supervisor に current directory の session 作成を依頼します。`--yolo` は local CLI のみで利用可能です。public MCP `session_start` から yolo mode は指定できません。
+
+detached permission 管理は local-only で、同じ owner-only supervisor Unix socket を通します。`permission allow/revoke` は既存の canonical-path / symlink containment rule を維持し、session cwd の revoke は拒否します。`permission ask/yolo` は明示操作であり、これらの mutation は runtime を restart せず runtime state を失いません。同じ session/cwd を明示 restart した場合、persist 済み permitted root は復元されます。
 
 ## approval console attachment
 
@@ -78,7 +86,7 @@ starting -> active -> stopping -> stopped
 
 明示的な graceful stop は `stopped`、予期しない終了は `crashed` です。local supervisor の起動時には stale socket を処理し、live runtime を示す metadata に対して socket が死んでいれば `crashed` に reconcile します。
 
-第一段階の restart policy は安全側の `never` です。`temote-mcp session restart <id>` による manual restart は stopped / crashed / active session に利用できます。bounded backoff / rate limit を備えた自動 `on-failure` restart は別 issue で管理します。
+restart policy の既定値は安全側の `never` です。`temote-mcp session restart-policy <id> on-failure` で、予期しない runtime failure に限って automatic restart を有効化できます。graceful stop は再起動しません。automatic restart は 1, 2, 4, 8, 16 秒の bounded exponential delay を使い、5回で limit に達して `crashed` に確定します。lifecycle state には `restart_count` / `last_restart_at` / `next_restart_at` / `restart_limit_reason` を保存します。start 時に capture した environment は supervisor memory のみに保持して永続化しません。そのため supervisor process 自体が再起動した後は pending な credential-bearing automatic restart を暗黙再開せず、理由を残して `crashed` のままにし、明示的な `session restart` を要求します。
 
 ## HTTP managed session
 
@@ -95,7 +103,7 @@ HTTP managed session は常に `yolo=false` です。既存の approval-gated ho
 
 `session_list` / `session_info` は active だけでなく stopped / crashed の durable state も表示します。それ以外の session-bound MCP tool は従来どおり live runtime socket を要求します。
 
-`session_start` / `session_stop` は authenticated direct HTTP `serve` endpoint だけで公開します。Cloudflare Workers + Durable Objects multi-host gateway には公開せず、この lifecycle 変更で host-selection contract も追加しません。公開 endpoint で `without_sandbox` を除外する既存境界も維持します。
+`session_start` / `session_stop` は authenticated direct HTTP `serve` endpoint だけで公開します。direct `temote-mcp up` は public endpoint ごとに single-host であり、1 endpoint は1つの local lifecycle supervisor と host-local session store に対応します。同じ Cloudflare Tunnel token / hostname を複数 direct-ingress host で同時利用する構成は、Cloudflare replica routing が session-aware ではないため非対応です。stable な non-secret diagnostic identity には `TEMOTE_MCP_HOST_ID` を設定し、未設定時は OS hostname を使います。1つの public endpoint から複数 Temote host へ route する場合は `temote-mcp gateway-agent` + Worker/Durable Objects gateway を使用します。gateway の generation/lease routing contract は変更しません。公開 endpoint で `without_sandbox` を除外する既存境界も維持します。
 
 ## optional terminal integration
 

@@ -126,3 +126,8 @@ Cloudflare Worker (/mcp)
 ## 変更履歴
 
 `CHANGES.md` impact: no
+
+
+## Tracking-only status — 2026-09-01
+
+Repository-local gateway implementation, generation/lease routing, and regression coverage are complete. The remaining two items require applying configuration/secrets to a real Cloudflare account and a live ChatGPT Managed OAuth test across two physical endpoints; no external evidence is fabricated.

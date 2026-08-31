@@ -263,3 +263,8 @@ Implemented on 2026-08-24 against `main` after `bd19696`.
 - macOS `--no-default-features`: 39 -> 27 non-root packages (-12 in this migration, -16 from the original 43-package baseline)
 - `cargo llvm-lines --bin temote-mcp --release --all-features`: 829,303 -> 808,052 LLVM IR lines (-21,251, about -2.56%) and 18,972 -> 18,273 copies (-699, about -3.68%)
 - release llvm-lines contains no `clap` symbols; `noargs` plus Temote's explicit CLI parser replaces the derive/builder codegen while keeping the public command surface explicit
+
+
+## Completed — 2026-09-01
+
+All repository-local acceptance criteria are complete. The campaign remains intentionally bounded: later removal of mature dependencies is not an open requirement without a new architectural or measured cost reason. Current all-target/all-feature check and full tests remain green after subsequent lifecycle work.

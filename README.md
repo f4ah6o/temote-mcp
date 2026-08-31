@@ -55,6 +55,8 @@ temote-mcp up --profile cloudflare
 # temote-mcp up --profile openai
 ```
 
+Direct `temote-mcp up` ingress is **single-host per public endpoint**. Set `TEMOTE_MCP_HOST_ID=ubuntu1` (or another stable non-secret identifier) to make host ownership explicit in startup, `doctor`, supervisor, and session diagnostics; when unset, Temote falls back to the OS hostname. Do not run the same Cloudflare Tunnel token/hostname concurrently on multiple Temote hosts as direct-ingress replicas: Cloudflare routing is not Temote-session-aware, while session state remains host-local. For one public endpoint spanning multiple hosts, use `temote-mcp gateway-agent` with the Worker/Durable Objects gateway described in [multi-host Cloudflare gateway](docs/gateway.md).
+
 An authenticated MCP client can then use:
 
 ```text
@@ -75,11 +77,14 @@ temote-mcp supervisor
 temote-mcp session start my-project --path src/my-project
 temote-mcp session list
 temote-mcp session info my-project
+temote-mcp session permission my-project status
+temote-mcp session permission my-project allow /path/to/extra-root
+temote-mcp session restart-policy my-project on-failure
 temote-mcp session console
 temote-mcp session stop my-project
 ```
 
-The approval console is an attachment, not the runtime owner. Closing its terminal or sending stdin EOF leaves session runtimes alive; approval-required operations fail closed until a console reconnects. Lifecycle metadata records `starting`, `active`, `stopping`, `stopped`, and `crashed`, including crash reason and last error. `session list` probes the socket and never reports dead runtime metadata as `active`. Manual `session restart` is supported; the current restart policy is `never` (no automatic restart).
+The approval console is an attachment, not the runtime owner. Closing its terminal or sending stdin EOF leaves session runtimes alive; approval-required operations fail closed until a console reconnects. Lifecycle metadata records `starting`, `active`, `stopping`, `stopped`, and `crashed`, including crash reason and last error. `session list` probes the socket and never reports dead runtime metadata as `active`. Detached permission changes use the owner-only supervisor socket and do not restart the runtime. Restart policy defaults to `never`; explicit `on-failure` uses bounded exponential backoff with a five-attempt limit and records restart count/timestamps/limit reason. Captured start credentials remain memory-only, so a supervisor process restart never silently resumes credential-bearing automatic restarts; use explicit `session restart` after such a supervisor restart.
 
 For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains a local-supervisor shorthand for starting the current directory. It requires `temote-mcp supervisor` to be running. `--yolo` remains available only on this local CLI path; remote MCP `session_start` cannot create yolo sessions. Local stdio clients can launch `temote-mcp mcp`.
 

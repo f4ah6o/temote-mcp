@@ -77,12 +77,37 @@ pub enum OpenaiCommand {
 }
 
 pub enum SessionCommand {
-    Start { session_id: String, path: String },
+    Start {
+        session_id: String,
+        path: String,
+    },
     List,
-    Info { session_id: String },
-    Stop { session_id: String },
-    Restart { session_id: String },
+    Info {
+        session_id: String,
+    },
+    Stop {
+        session_id: String,
+    },
+    Restart {
+        session_id: String,
+    },
+    RestartPolicy {
+        session_id: String,
+        policy: String,
+    },
+    Permission {
+        session_id: String,
+        command: SessionPermissionCommand,
+    },
     Console,
+}
+
+pub enum SessionPermissionCommand {
+    Status,
+    Ask,
+    Yolo,
+    Allow { path: PathBuf },
+    Revoke { path: PathBuf },
 }
 
 pub enum ParseOutcome {
@@ -298,6 +323,87 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
             .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
         return Ok(SessionCommand::Restart { session_id });
     }
+    if noargs::cmd("restart-policy")
+        .doc("Set the automatic restart policy for a supervisor-owned session")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        let policy = noargs::arg("<POLICY>")
+            .doc("Restart policy: never or on-failure")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        if !matches!(policy.as_str(), "never" | "on-failure") {
+            return Err(noargs::Error::other(
+                args,
+                "restart policy must be never or on-failure",
+            ));
+        }
+        return Ok(SessionCommand::RestartPolicy { session_id, policy });
+    }
+    if noargs::cmd("permission")
+        .doc("Inspect or change permissions for a supervisor-owned session")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        let command = if noargs::cmd("status")
+            .doc("Show the persisted permission mode and allowed directories")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Status
+        } else if noargs::cmd("ask")
+            .doc("Use the normal sandbox and local approval policy")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Ask
+        } else if noargs::cmd("yolo")
+            .doc("Explicitly use unrestricted local execution for this session")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Yolo
+        } else if noargs::cmd("allow")
+            .doc("Add a canonical directory to the session sandbox roots")
+            .take(args)
+            .is_present()
+        {
+            let path = noargs::arg("<DIRECTORY>")
+                .doc("Directory to allow")
+                .take(args)
+                .then(|arg| Ok::<_, std::convert::Infallible>(PathBuf::from(arg.value())))?;
+            SessionPermissionCommand::Allow { path }
+        } else if noargs::cmd("revoke")
+            .doc("Remove a canonical directory from the session sandbox roots")
+            .take(args)
+            .is_present()
+        {
+            let path = noargs::arg("<DIRECTORY>")
+                .doc("Directory to revoke")
+                .take(args)
+                .then(|arg| Ok::<_, std::convert::Infallible>(PathBuf::from(arg.value())))?;
+            SessionPermissionCommand::Revoke { path }
+        } else if args.metadata().help_mode {
+            SessionPermissionCommand::Status
+        } else {
+            return Err(noargs::Error::other(
+                args,
+                "permission command is not specified (expected status, ask, yolo, allow, or revoke)",
+            ));
+        };
+        return Ok(SessionCommand::Permission {
+            session_id,
+            command,
+        });
+    }
     if noargs::cmd("console")
         .doc("Attach a reconnectable local approval console")
         .take(args)
@@ -310,7 +416,7 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
     }
     Err(noargs::Error::other(
         args,
-        "session command is not specified (expected start, list, info, stop, restart, or console)",
+        "session command is not specified (expected start, list, info, stop, restart, restart-policy, permission, or console)",
     ))
 }
 
@@ -761,6 +867,44 @@ mod tests {
     fn invalid_command_and_profile_fail_closed() {
         assert!(parse(argv(&["temote-mcp", "wat"])).is_err());
         assert!(parse(argv(&["temote-mcp", "doctor", "--profile", "wat"])).is_err());
+    }
+
+    #[test]
+    fn session_permission_commands_parse_explicitly() {
+        assert!(matches!(
+            command(&["temote-mcp", "session", "permission", "work", "status"]),
+            Command::Session {
+                command: SessionCommand::Permission {
+                    session_id,
+                    command: SessionPermissionCommand::Status,
+                }
+            } if session_id == "work"
+        ));
+        assert!(matches!(
+            command(&[
+                "temote-mcp",
+                "session",
+                "permission",
+                "work",
+                "allow",
+                "/tmp/example",
+            ]),
+            Command::Session {
+                command: SessionCommand::Permission {
+                    session_id,
+                    command: SessionPermissionCommand::Allow { path },
+                }
+            } if session_id == "work" && path == std::path::Path::new("/tmp/example")
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "session", "permission", "work", "yolo"]),
+            Command::Session {
+                command: SessionCommand::Permission {
+                    session_id,
+                    command: SessionPermissionCommand::Yolo,
+                }
+            } if session_id == "work"
+        ));
     }
 
     #[cfg(feature = "network")]

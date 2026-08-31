@@ -110,21 +110,21 @@ Listener failure remains runtime-fatal. Runtime command-channel closure without 
 
 ## Acceptance criteria
 
-- [ ] terminal/stdin disconnect is not a session runtime stop reason
-- [ ] approval console disconnect leaves all runtimes alive
-- [ ] approval-required operations fail closed while no console is attached
-- [ ] approval console can reconnect
-- [ ] malformed, oversized, timed-out, disconnected, and response-write-failing IPC clients do not stop the runtime
-- [ ] runtime crash is persisted as `crashed` with exit reason / last error
-- [ ] graceful stop is persisted as `stopped`
-- [ ] stale metadata/socket state is reconciled after supervisor restart
-- [ ] multiple sessions are owned by one supervisor
-- [ ] failure of one session does not stop another
-- [ ] `session list` never reports a dead socket as `active`
-- [ ] existing sandbox, approval, 1Password, kintone MCP, and cli-kintone security boundaries remain unchanged
-- [ ] existing `temote-mcp start` remains compatible where safely possible and shares the same runtime abstraction
-- [ ] README / managed session / usage documentation is updated in English and Japanese
-- [ ] tests pass
+- [x] terminal/stdin disconnect is not a session runtime stop reason
+- [x] approval console disconnect leaves all runtimes alive
+- [x] approval-required operations fail closed while no console is attached
+- [x] approval console can reconnect
+- [x] malformed, oversized, timed-out, disconnected, and response-write-failing IPC clients do not stop the runtime
+- [x] runtime crash is persisted as `crashed` with exit reason / last error
+- [x] graceful stop is persisted as `stopped`
+- [x] stale metadata/socket state is reconciled after supervisor restart
+- [x] multiple sessions are owned by one supervisor
+- [x] failure of one session does not stop another
+- [x] `session list` never reports a dead socket as `active`
+- [x] existing sandbox, approval, 1Password, kintone MCP, and cli-kintone security boundaries remain unchanged
+- [x] existing `temote-mcp start` remains compatible where safely possible and shares the same runtime abstraction
+- [x] README / managed session / usage documentation is updated in English and Japanese
+- [x] tests pass
 
 ## Required tests
 
@@ -142,3 +142,10 @@ Listener failure remains runtime-fatal. Runtime command-channel closure without 
 ## Deferred follow-up
 
 Automatic restart policy (`on-failure`) with bounded exponential backoff or a restart-rate window is deferred unless implementation remains small after lifecycle persistence and local supervisor control are complete.
+
+
+## Completion evidence — 2026-09-01
+
+Repository-local lifecycle hardening is complete. The local supervisor owns multiple runtimes independently; console EOF/disconnect leaves runtimes alive and approval-required operations fail closed; console reconnection is covered; malformed/oversized/timed-out/disconnected IPC and response-write failures are connection-local; unexpected runtime failure persists `crashed`; graceful stop persists `stopped`; stale state is reconciled on supervisor startup; dead sockets are never surfaced as active; and one runtime failure does not stop another. Detached permission mutation and bounded `on-failure` restart were completed in the follow-up issues without widening remote yolo or host-bridge boundaries.
+
+Validation on 2026-09-01: `cargo check --all-targets --all-features` passed; `cargo test --all-targets --all-features` passed with 326 main binary tests + 33 sandbox tests + 1 publishability test, 0 failures, and the existing process-boundary E2E intentionally ignored; README and managed-session docs are updated in English and Japanese.

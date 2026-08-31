@@ -543,7 +543,7 @@ impl RuntimeHandle {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn set_yolo(&self, value: bool) -> Result<()> {
+    pub(crate) async fn set_yolo(&self, value: bool) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::SetYolo { value, response })
@@ -556,7 +556,7 @@ impl RuntimeHandle {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn allow_directory(&self, path: PathBuf) -> Result<()> {
+    pub(crate) async fn allow_directory(&self, path: PathBuf) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::AllowDirectory { path, response })
@@ -569,7 +569,7 @@ impl RuntimeHandle {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn revoke_directory(&self, path: PathBuf) -> Result<()> {
+    pub(crate) async fn revoke_directory(&self, path: PathBuf) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::RevokeDirectory { path, response })
@@ -582,7 +582,7 @@ impl RuntimeHandle {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn snapshot(&self) -> Result<Session> {
+    pub(crate) async fn snapshot(&self) -> Result<Session> {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(RuntimeCommand::Snapshot { response })
@@ -677,8 +677,18 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     )));
     let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture_from(environment.values()));
     let id = config::session_id(session_id)?;
+    let previous_session = config::read_session_metadata(&id).await.ok();
     config::remove_inactive_socket(&id).await?;
     let mut session = config::new_session(cwd, Some(&id), yolo)?;
+    if let Some(previous) = previous_session
+        && previous.cwd == session.cwd
+    {
+        session.permitted_directories = previous.permitted_directories;
+        if !session.permitted_directories.contains(&session.cwd) {
+            session.permitted_directories.push(session.cwd.clone());
+            session.permitted_directories.sort();
+        }
+    }
     let path = config::socket_path(&session.id)?;
     let state_dir = path.parent().context("session socket has no parent")?;
     tokio::fs::create_dir_all(state_dir).await?;
@@ -688,7 +698,18 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     session.process_id = std::process::id();
+    let previous_lifecycle = config::read_session_lifecycle(&session.id)
+        .await
+        .ok()
+        .flatten();
     let mut lifecycle = config::SessionLifecycle::starting(session.started_at, logical_path);
+    if let Some(previous) = previous_lifecycle {
+        lifecycle.restart_policy = previous.restart_policy;
+        lifecycle.restart_count = previous.restart_count;
+        lifecycle.last_restart_at = previous.last_restart_at;
+        lifecycle.next_restart_at = None;
+        lifecycle.restart_limit_reason = previous.restart_limit_reason;
+    }
     if let Err(error) = config::save_session_lifecycle(&session.id, &lifecycle).await {
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error);

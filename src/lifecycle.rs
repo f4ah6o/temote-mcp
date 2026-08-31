@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::time::sleep;
 
+use crate::host_identity;
 use crate::profile::Profile;
 
 const PID_FILE_NAME: &str = "up.pid";
@@ -46,6 +47,17 @@ pub async fn up(
     if profile == Profile::Cloudflare {
         crate::load_public_env()?;
     }
+
+    let host_id = host_identity::resolve()?;
+    let endpoint = public_url
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("TEMOTE_MCP_PUBLIC_URL").ok())
+        .unwrap_or_else(|| "<profile-managed/private>".to_owned());
+    eprintln!(
+        "Temote direct ingress: topology=single-host host_id={host_id} profile={} endpoint={endpoint}",
+        profile.name()
+    );
 
     let tunnel_token_file = match profile {
         Profile::Cloudflare => {

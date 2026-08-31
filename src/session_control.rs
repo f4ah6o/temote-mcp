@@ -15,6 +15,7 @@ use crate::approvals::{
     self, ApprovalPrompt, ApprovalReceiver, ApprovalSender, CapturedStartEnvironment, Request,
 };
 use crate::config::{self, LifecycleStatus, SessionLifecycle};
+use crate::host_identity;
 use crate::named_roots::NamedRoots;
 use crate::supervisor::SessionSupervisor;
 
@@ -22,6 +23,7 @@ const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
 const CONTROL_PROTOCOL_VERSION: u64 = 1;
+const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -60,11 +62,31 @@ enum ControlRequest {
         #[serde(default)]
         environment: CapturedStartEnvironment,
     },
+    RestartPolicy {
+        session_id: String,
+        policy: String,
+    },
+    PermissionStatus {
+        session_id: String,
+    },
+    PermissionMode {
+        session_id: String,
+        yolo: bool,
+    },
+    PermissionAllow {
+        session_id: String,
+        path: PathBuf,
+    },
+    PermissionRevoke {
+        session_id: String,
+        path: PathBuf,
+    },
     AttachConsole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
+    pub host_id: String,
     pub id: String,
     pub session_id: String,
     pub status: String,
@@ -80,6 +102,10 @@ pub struct SessionView {
     pub yolo: bool,
     pub logical_path: Option<String>,
     pub restart_policy: String,
+    pub restart_count: u32,
+    pub last_restart_at: Option<u64>,
+    pub next_restart_at: Option<u64>,
+    pub restart_limit_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -199,6 +225,8 @@ pub async fn run_supervisor() -> Result<()> {
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let mut maintenance = tokio::time::interval(Duration::from_millis(250));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let serve_result: Result<()> = loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -214,6 +242,9 @@ pub async fn run_supervisor() -> Result<()> {
                     }
                     Err(error) => break Err(error).context("session supervisor listener failed"),
                 }
+            }
+            _ = maintenance.tick() => {
+                supervisor.reap_finished().await;
             }
             signal = &mut ctrl_c => {
                 match signal {
@@ -302,6 +333,38 @@ pub async fn restart(session_id: String) -> Result<()> {
         environment: CapturedStartEnvironment::capture(),
     })
     .await?;
+    print_json(&result)
+}
+
+pub async fn restart_policy(session_id: String, policy: String) -> Result<()> {
+    let result = request(ControlRequest::RestartPolicy { session_id, policy }).await?;
+    print_json(&result)
+}
+
+pub async fn permission(
+    session_id: String,
+    command: crate::cli::SessionPermissionCommand,
+) -> Result<()> {
+    let control_request = match command {
+        crate::cli::SessionPermissionCommand::Status => {
+            ControlRequest::PermissionStatus { session_id }
+        }
+        crate::cli::SessionPermissionCommand::Ask => ControlRequest::PermissionMode {
+            session_id,
+            yolo: false,
+        },
+        crate::cli::SessionPermissionCommand::Yolo => ControlRequest::PermissionMode {
+            session_id,
+            yolo: true,
+        },
+        crate::cli::SessionPermissionCommand::Allow { path } => {
+            ControlRequest::PermissionAllow { session_id, path }
+        }
+        crate::cli::SessionPermissionCommand::Revoke { path } => {
+            ControlRequest::PermissionRevoke { session_id, path }
+        }
+    };
+    let result = request(control_request).await?;
     print_json(&result)
 }
 
@@ -419,6 +482,7 @@ async fn dispatch_request(
     match request {
         ControlRequest::Ping => Ok(json!({
             "status": "active",
+            "host_id": host_identity::resolve()?,
             "control_protocol": CONTROL_PROTOCOL_VERSION,
             "roots_configured": supervisor.roots_configured(),
         })),
@@ -481,6 +545,25 @@ async fn dispatch_request(
         } => {
             environment.validate()?;
             restart_session(supervisor, &session_id, environment).await?;
+            Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
+        }
+        ControlRequest::RestartPolicy { session_id, policy } => {
+            supervisor.set_restart_policy(&session_id, &policy).await?;
+            Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
+        }
+        ControlRequest::PermissionStatus { session_id } => {
+            Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
+        }
+        ControlRequest::PermissionMode { session_id, yolo } => {
+            supervisor.set_permission_yolo(&session_id, yolo).await?;
+            Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
+        }
+        ControlRequest::PermissionAllow { session_id, path } => {
+            supervisor.allow_directory(&session_id, path).await?;
+            Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
+        }
+        ControlRequest::PermissionRevoke { session_id, path } => {
+            supervisor.revoke_directory(&session_id, path).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::AttachConsole => unreachable!("handled before dispatch"),
@@ -683,8 +766,19 @@ async fn reconcile_stale_sessions() -> Result<()> {
                 let _ = config::remove_inactive_socket(id).await;
                 let lifecycle = config::read_session_lifecycle(id).await?;
                 match lifecycle.as_ref().map(|state| state.status) {
-                    Some(LifecycleStatus::Stopped | LifecycleStatus::Crashed) => {}
+                    Some(LifecycleStatus::Stopped) => {}
+                    Some(LifecycleStatus::Crashed) => {
+                        if let Some(state) = lifecycle
+                            && state.restart_policy == "on-failure"
+                            && state.next_restart_at.is_some()
+                        {
+                            mark_restart_not_resumed(id, state).await?;
+                        }
+                    }
                     Some(_) => {
+                        let on_failure = lifecycle
+                            .as_ref()
+                            .is_some_and(|state| state.restart_policy == "on-failure");
                         persist_crash(
                             id,
                             lifecycle,
@@ -692,6 +786,11 @@ async fn reconcile_stale_sessions() -> Result<()> {
                             "session was active when its owning supervisor stopped",
                         )
                         .await?;
+                        if on_failure
+                            && let Some(state) = config::read_session_lifecycle(id).await?
+                        {
+                            mark_restart_not_resumed(id, state).await?;
+                        }
                     }
                     None if session.process_id == 0 => {
                         let mut state = SessionLifecycle::starting(session.started_at, None);
@@ -717,6 +816,13 @@ async fn reconcile_stale_sessions() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn mark_restart_not_resumed(id: &str, mut state: SessionLifecycle) -> Result<()> {
+    state.next_restart_at = None;
+    state.restart_limit_reason = Some(RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART.to_owned());
+    state.exit_reason = state.restart_limit_reason.clone();
+    config::save_session_lifecycle(id, &state).await
 }
 
 async fn persist_crash(
@@ -789,6 +895,7 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
         .filter(|pid| *pid != 0);
 
     Ok(SessionView {
+        host_id: host_identity::resolve()?,
         id: session.id.clone(),
         session_id: session.id,
         status,
@@ -804,6 +911,10 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
         yolo: session.yolo,
         logical_path: inferred.logical_path,
         restart_policy: inferred.restart_policy,
+        restart_count: inferred.restart_count,
+        last_restart_at: inferred.last_restart_at,
+        next_restart_at: inferred.next_restart_at,
+        restart_limit_reason: inferred.restart_limit_reason,
     })
 }
 
@@ -982,6 +1093,108 @@ mod tests {
         assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
         assert_eq!(result["roots_configured"], true);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_restart_preserves_policy_but_does_not_resume_memory_only_restart() {
+        let (temp, _roots) = fixture();
+        let id = format!("restart-reconcile-{}", uuid::Uuid::new_v4());
+        let cwd = temp.path().join("volume/repo");
+        let mut session = config::new_session(&cwd, Some(&id), false).unwrap();
+        session.process_id = std::process::id();
+        config::save_session(&session).await.unwrap();
+        let mut lifecycle =
+            SessionLifecycle::starting(session.started_at, Some("src/repo".to_owned()));
+        lifecycle.status = LifecycleStatus::Active;
+        lifecycle.restart_policy = "on-failure".to_owned();
+        lifecycle.restart_count = 2;
+        config::save_session_lifecycle(&id, &lifecycle)
+            .await
+            .unwrap();
+
+        reconcile_stale_sessions().await.unwrap();
+
+        let reconciled = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(reconciled.status, LifecycleStatus::Crashed);
+        assert_eq!(reconciled.restart_policy, "on-failure");
+        assert_eq!(reconciled.restart_count, 2);
+        assert!(reconciled.next_restart_at.is_none());
+        assert_eq!(
+            reconciled.restart_limit_reason.as_deref(),
+            Some(RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART)
+        );
+        cleanup(&id).await;
+    }
+
+    #[tokio::test]
+    async fn detached_permission_control_mutates_live_session_without_restart() {
+        let (temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("permission-control-{}", uuid::Uuid::new_v4());
+        let info = supervisor.start("src/repo", Some(&id)).await.unwrap();
+        let original_pid = config::read_session_metadata(&id).await.unwrap().process_id;
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        let canonical_extra = std::fs::canonicalize(&extra).unwrap();
+
+        let allowed = dispatch_request(
+            ControlRequest::PermissionAllow {
+                session_id: id.clone(),
+                path: extra,
+            },
+            &supervisor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowed["process_id"], original_pid);
+        let roots = allowed["permitted_directories"].as_array().unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|value| value.as_str() == canonical_extra.to_str())
+        );
+
+        let yolo = dispatch_request(
+            ControlRequest::PermissionMode {
+                session_id: id.clone(),
+                yolo: true,
+            },
+            &supervisor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(yolo["permission_mode"], "yolo");
+        assert_eq!(yolo["process_id"], original_pid);
+
+        let revoke_cwd = dispatch_request(
+            ControlRequest::PermissionRevoke {
+                session_id: id.clone(),
+                path: info.cwd.clone(),
+            },
+            &supervisor,
+        )
+        .await;
+        assert!(
+            revoke_cwd
+                .unwrap_err()
+                .to_string()
+                .contains("cannot revoke the session cwd")
+        );
+
+        let ask = dispatch_request(
+            ControlRequest::PermissionMode {
+                session_id: id.clone(),
+                yolo: false,
+            },
+            &supervisor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ask["permission_mode"], "ask");
+        assert_eq!(ask["process_id"], original_pid);
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
     }
 
     #[tokio::test]

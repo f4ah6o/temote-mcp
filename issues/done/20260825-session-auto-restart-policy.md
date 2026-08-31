@@ -40,3 +40,8 @@ on-failure
 - supervisor restart restores policy without bypassing the rate limit
 - one crashing/restarting session does not affect another session
 - default policy remains `never`
+
+
+## Completed — 2026-09-01
+
+Implemented explicit `never` / `on-failure` policy with `never` as the default. Unexpected runtime failures use bounded exponential backoff and stop after five attempts; graceful stop cancels pending restart. Lifecycle metadata records restart count, most recent restart time, pending restart time, and terminal limit reason. Restart state is isolated per session. Captured start credentials remain memory-only: after the supervisor process itself restarts, a pending credential-bearing automatic restart is not resumed implicitly and the durable crashed state explains that an explicit `session restart` is required. Targeted restart tests and the full all-features suite pass.

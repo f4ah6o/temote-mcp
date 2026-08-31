@@ -134,18 +134,18 @@ If future requirements allow the same `session_id` to be active on multiple host
 
 ## Acceptance criteria
 
-- [ ] documentation explicitly states that `temote-mcp up` direct ingress is single-host per public endpoint
-- [ ] documentation explicitly states that sharing one Cloudflare Tunnel direct-ingress configuration across multiple Temote hosts is unsupported
-- [ ] supported multi-host guidance points to `temote-mcp gateway-agent` + Worker/Durable Objects gateway
-- [ ] a stable non-secret host ID is available in runtime diagnostics
-- [ ] `temote-mcp up` startup diagnostics show the host ID and direct-ingress topology
-- [ ] `doctor --profile cloudflare` shows enough non-secret ingress identity information to compare two hosts safely
-- [ ] no raw tunnel token is logged or returned
-- [ ] local PID files, supervisor sockets, and session metadata remain host-local
-- [ ] existing single-host `temote-mcp up` behavior remains compatible
-- [ ] gateway-agent generation/lease routing remains unchanged
-- [ ] tests cover host identity parsing/defaulting and diagnostic output where practical
-- [ ] README / operational documentation is updated in English and Japanese
+- [x] documentation explicitly states that `temote-mcp up` direct ingress is single-host per public endpoint
+- [x] documentation explicitly states that sharing one Cloudflare Tunnel direct-ingress configuration across multiple Temote hosts is unsupported
+- [x] supported multi-host guidance points to `temote-mcp gateway-agent` + Worker/Durable Objects gateway
+- [x] a stable non-secret host ID is available in runtime diagnostics
+- [x] `temote-mcp up` startup diagnostics show the host ID and direct-ingress topology
+- [x] `doctor --profile cloudflare` shows enough non-secret ingress identity information to compare two hosts safely
+- [x] no raw tunnel token is logged or returned
+- [x] local PID files, supervisor sockets, and session metadata remain host-local
+- [x] existing single-host `temote-mcp up` behavior remains compatible
+- [x] gateway-agent generation/lease routing remains unchanged
+- [x] tests cover host identity parsing/defaulting and diagnostic output where practical
+- [x] README / operational documentation is updated in English and Japanese
 
 ## Required tests
 
@@ -159,3 +159,8 @@ If future requirements allow the same `session_id` to be active on multiple host
 ## Follow-up consideration
 
 A later HA design could allow two physical hosts to serve equivalent workloads, but that requires explicit Temote-level placement, fencing, generation ownership, and retry semantics. It should be designed above the session supervisor layer rather than inferred from Cloudflare Tunnel replica behavior.
+
+
+## Completion evidence — 2026-09-01
+
+Added non-secret host identity through `TEMOTE_MCP_HOST_ID`, with validated OS-hostname fallback. Host ID is reported by supervisor/session diagnostics; `temote-mcp up` identifies direct ingress as `topology=single-host`; `doctor --profile cloudflare` reports host ID, public endpoint, and optional non-secret Tunnel ID without reading or returning the raw Tunnel token. Direct-ingress state remains host-local and gateway generation/lease routing is unchanged. README and managed-session operational docs now state that one direct public endpoint maps to one Temote host, that shared Cloudflare Tunnel replicas are unsupported for sessionful direct ingress, and that multi-host single-endpoint deployments must use `gateway-agent` + Worker/Durable Objects. Host-ID validation/fallback tests and the existing Cloudflare/gateway regression suite pass.

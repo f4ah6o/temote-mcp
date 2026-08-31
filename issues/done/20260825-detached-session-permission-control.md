@@ -53,3 +53,8 @@ temote-mcp session permission <id> yolo
 - remote MCP cannot invoke the local-only control path
 - console disconnect does not change permissions
 - supervisor restart preserves the resulting permission state
+
+
+## Completed — 2026-09-01
+
+Implemented `temote-mcp session permission <id> status|ask|yolo|allow|revoke` over the owner-only local supervisor socket. Mutations operate on the live runtime without restart, preserve canonical/symlink containment, reject cwd revoke, keep remote MCP unable to create yolo sessions, and persist permitted roots for explicit restart of the same session/cwd. Targeted permission tests and the full all-features test suite pass.

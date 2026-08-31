@@ -69,3 +69,8 @@ Follow-up configuration-migration evidence:
 - both platforms: rustfmt, all-target check, no-default-features check, Clippy, full tests, and CLI session E2E passed
 - Linux: sandbox helper build, live sandbox acceptance, dependency boundary, packaged crate manifest, and install-from-packaged-source passed
 - macOS: packaged crate manifest and dependency boundary passed
+
+
+## Tracking-only status — 2026-09-01
+
+Repository-local migration logic and safety tests are complete. The sole unchecked item is a destructive live-host acceptance proving that an actual legacy `serve + cloudflared` pair can be stopped after process-name verification; it remains open rather than simulating or fabricating live evidence.

@@ -7,6 +7,7 @@ mod config;
 mod doctor;
 #[cfg(feature = "network")]
 mod gateway;
+mod host_identity;
 #[cfg(feature = "network")]
 mod http;
 #[cfg(feature = "network")]
@@ -94,6 +95,13 @@ async fn main() -> Result<()> {
             cli::SessionCommand::Restart { session_id } => {
                 session_control::restart(session_id).await
             }
+            cli::SessionCommand::RestartPolicy { session_id, policy } => {
+                session_control::restart_policy(session_id, policy).await
+            }
+            cli::SessionCommand::Permission {
+                session_id,
+                command,
+            } => session_control::permission(session_id, command).await,
             cli::SessionCommand::Console => session_control::run_console().await,
         },
         cli::Command::Mcp => mcp::serve().await,
