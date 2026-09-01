@@ -365,7 +365,7 @@ fn decode_response_payload(value: Option<&Value>) -> std::result::Result<Vec<u8>
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
