@@ -1414,7 +1414,17 @@ mod tests {
                                 })
                                 .await
                                 .expect("injected crash did not persist crashed lifecycle");
-                                supervisor.reap_finished().await;
+                                tokio::time::timeout(Duration::from_secs(1), async {
+                                    loop {
+                                        supervisor.reap_finished().await;
+                                        if !supervisor.is_managed_for_test(id).await {
+                                            break;
+                                        }
+                                        tokio::task::yield_now().await;
+                                    }
+                                })
+                                .await
+                                .expect("crashed session handle was not reaped");
                                 model[index] = ModelState::Crashed;
                             }
                         }

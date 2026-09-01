@@ -403,6 +403,11 @@ impl SessionSupervisor {
         handle.crash_for_test().await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn is_managed_for_test(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
+    }
+
     pub async fn reap_finished(&self) {
         let finished = {
             let sessions = self.sessions.lock().await;
