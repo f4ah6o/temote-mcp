@@ -170,3 +170,12 @@ local SQLite direct-read はprototype実測で通常CLI pathより速くなく�
 - FFIはTemote本体へ直接ロードせずsidecarへ隔離。Desktop IPC hang時は親からtimeout/kill/restart可能。
 - fallbackは1 reference = 1 `op read`ではなく、referenceをenvironmentとして1回の `op run`へ渡し、Rust helperが解決値をJSON encodeするbatch pathにした。
 - gateway 46/46 pass、full Rust suite 341/341 pass、sidecar ABI decoder 1/1 pass。`cargo package` verification pass。packaged crateからのinstallで `temote-mcp` / `temote-linux-sandbox` / `temote-onepassword-sdk` の3 binariesを確認。
+
+## Phase 4: shared unofficial Rust SDK consumer (2026-09-02)
+
+- Temote固有sidecarの自前 `dlopen` / `dlsym` / C ABI / SDK compatibility metadata実装を削除し、crates.io `onepassword-sdk-unofficial 0.3.0` を利用する薄いsidecarへ置換した。
+- kill可能なsibling process境界、session-scoped persistent process、account別persistent `Client`、30秒timeout、request/response bounds、CLI batch fallbackは維持した。
+- transport/platform差分とDesktopSessionExpired retryは共有SDKへ集約され、TemoteはSDK protocol/ABIを直接保持しない。
+- macOSだけだったTemote固有transport制約を外し、共有SDKが実装するmacOS/Linux Desktop transportをそのまま利用する。Windows等の未対応platformでは従来どおりCLI batch fallbackへ移行する。
+- `temote-onepassword-sdk --emit-env-json` はCLI fallback helperとして維持し、release artifactのbinary layoutを変更しない。
+- refactor後の直接sidecar live probeは現在のDesktop authorization状態で12秒以内に応答せず、probe側からkillして終了した。secret値は出力していない。共有SDK自体のlive成功proofは`opz-rs/onepassword-sdk-unofficial`側で保持し、Temote側ではtimeout/kill可能なprocess isolationを維持する。

@@ -406,7 +406,7 @@ fn validate_references(references: &[String]) -> Result<()> {
 }
 
 fn safe_sdk_error(error: &str) -> &'static str {
-    if error.contains("Denied authorization") {
+    if error.contains("Denied authorization") || error.contains("authorization was denied") {
         "1Password SDK desktop authorization was denied"
     } else if error.contains("DesktopSessionExpired") || error.contains("desktop session expired") {
         "1Password SDK desktop session expired"

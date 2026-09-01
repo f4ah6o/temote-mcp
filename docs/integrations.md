@@ -31,7 +31,7 @@ This path keeps the official 1Password authentication, encryption, synchronizati
 
 ### Persistent Desktop SDK secret resolution
 
-`onepassword_secret_resolve` resolves up to 100 `op://` secret references. On macOS, Temote starts a small sibling sidecar that loads the official 1Password Desktop SDK IPC library and keeps an SDK client alive across requests. The SDK FFI is isolated from the main Temote process so a stuck Desktop IPC call can be timed out by killing and recreating the sidecar. If SDK initialization or resolution fails, Temote falls back to one batched official `op run` invocation rather than issuing one CLI process per reference.
+`onepassword_secret_resolve` resolves up to 100 `op://` secret references. Temote starts a small sibling sidecar that uses `onepassword-sdk-unofficial` and keeps an SDK client alive across requests. The SDK transport remains isolated from the main Temote process so a stuck Desktop IPC call can be timed out by killing and recreating the sidecar. The shared Rust SDK currently provides the desktop transport on macOS and Linux; unsupported or failed SDK initialization/resolution falls back to one batched official `op run` invocation rather than issuing one CLI process per reference.
 
 The request requires the 1Password account name or UUID used by Desktop SDK authentication. Enable **Settings > Developer > Integrate with the 1Password SDKs > Integrate with other apps** in the desktop app. CLI sign-in state is independent from Desktop SDK authorization. Returned strings are secret-bearing and are never included in approval/activity summaries. No password, account key, decrypted database, or plaintext secret is persisted by Temote.
 
