@@ -1,12 +1,20 @@
+#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(target_os = "macos")]
+use serde_json::json;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
 const MAX_CLIENTS: usize = 16;
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +101,8 @@ fn run() -> Result<()> {
 struct SdkClients {
     #[cfg(target_os = "macos")]
     library: SdkLibrary,
+    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "macos")]
     clients: HashMap<String, u64>,
 }
 

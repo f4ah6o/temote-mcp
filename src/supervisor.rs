@@ -891,6 +891,30 @@ mod tests {
             .await
             .unwrap();
         supervisor.crash_for_test(&id).await.unwrap();
+        let mut scheduled = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                supervisor.reap_finished().await;
+                let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+                if lifecycle.status == config::LifecycleStatus::Crashed
+                    && lifecycle.restart_count == 1
+                    && lifecycle.next_restart_at.is_some()
+                {
+                    break lifecycle;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("crashed session did not schedule an automatic restart");
+
+        // The production policy intentionally waits at least one second before restarting.
+        // Make the scheduled attempt due now so this test verifies the restart transition
+        // without depending on wall-clock backoff while the full suite is under load.
+        scheduled.next_restart_at = Some(config::unix_time());
+        config::save_session_lifecycle(&id, &scheduled)
+            .await
+            .unwrap();
+
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
                 supervisor.reap_finished().await;
@@ -901,11 +925,11 @@ mod tests {
                 {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("crashed session was not automatically restarted");
+        .expect("scheduled automatic restart did not become active");
 
         supervisor.stop(&id).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
