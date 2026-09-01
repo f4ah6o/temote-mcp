@@ -87,12 +87,12 @@ VaultItems: cache hit
 
 ## Phase 2: request coalescing
 
-- [ ] session-scoped bridge を導入し、同一 `(account, vault)` の近接 read を micro-batch する。
-- [x] 同一 explicit batch 内の item query を resolved item ID で deduplicate する。cross-call coalescing は未着手。
-- [ ] caller ごとに結果を正しく fan-out する。
-- [ ] one caller cancellation が shared read を壊さないようにする。
-- [ ] coalescing window と max batch size を bounded にする。
-- [ ] secret plaintext を durable cache に保存しない。
+- [x] session-scoped bridge を導入し、同一 `(account, vault)` の近接 read を micro-batch する。
+- [x] 同一 explicit batch と cross-call micro-batch の item query を resolved item ID で deduplicate する。
+- [x] caller ごとに結果を正しく fan-out する。
+- [x] one caller cancellation が shared read を壊さないようにする。
+- [x] coalescing window と max batch size を bounded にする。
+- [x] secret plaintext を durable cache に保存しない。
 
 ## Phase 3: optional local fast-read
 
@@ -139,6 +139,18 @@ VaultItems: cache hit
 - `[A, A, B]` request が2 item resultになることをlive確認。
 - new unit tests 6/6 pass。gateway tests 46/46 pass。Clippy / no-default-features check pass。
 - full Rust suite は `cargo test -- --test-threads=1` で332/332 pass。通常の並列 `cargo test` では既存 `supervisor::tests::on_failure_policy_restarts_crash_and_graceful_stop_does_not_restart` が4秒timeoutで断続的にfailし、同test単独実行はpass。今回のfeature差分には同testの変更を含めない。
+
+
+## Phase 2 implementation result (2026-09-01)
+
+- MCP process 内に session + `(account, vault)` keyed bridge を追加。scope bridge は最大64、各scope pending queueは128、micro-batch windowは15 msにboundした。
+- 一つのmicro-batchでは最大100 queryまで受け、`op item list` を1回共有してcaller別にresolveする。曖昧title/missing queryはそのcallerだけをfailさせる。
+- 成功callerのresolved IDをunion/deduplicateして `op item get -` を1回実行し、返却itemをIDでcallerごとの元順序へfan-outする。
+- oneshot receiverがdropされたcallerへの送信失敗は無視し、shared batchと他callerの応答を継続する。
+- fetched secret plaintextはbatch処理中のmemoryにだけ存在し、durable cache/session metadata/activity/approval summaryへ保存しない。
+- unit tests: 11/11 pass。micro-batch collection、overflow defer、session scope分離、ambiguity isolation、ID fan-out、caller cancellation、batch-size PBTを含む。
+- fake `op` を使うloopback HTTP process-boundary E2Eで、同時2 callerが `item list` 1回 + `item get` 1回へcoalesceされ、各callerへ正しいIDが返ることを確認。
+- current `gateway-agent` poll loop はhost RPCを直列dispatchするため、gateway-routed callsでは同時callが同一processへ到達せずcross-call coalescingの効果は出ない。global gateway dispatch concurrencyはtool ordering/approval semanticsへ影響するため、このfeatureでは変更しない。explicit `items` batchはtransportに依存せず有効。
 
 ## 設計判断
 

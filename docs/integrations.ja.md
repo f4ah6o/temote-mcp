@@ -25,7 +25,7 @@ Temote MCP は、一部の local MCP server と secret injection workflow を br
 
 `onepassword_item_get` は general 1Password item を公式 `op` CLI 経由で読み、複数 item を1回の upstream `op item get -` にまとめます。`items` には正確な item ID または title を指定します。同名 title の曖昧性を避けるには `vault`、複数 account がある host では必要に応じて `account` を指定します。
 
-bridge はまず公式 CLI で item overview を解決し、同じ item ID の重複を除去してから batch fetch します。返却 JSON には secret value が含まれ得るため、read-only operation ですが通常 session では local approval を要求します。approval/activity には件数と scope 設定有無だけを出し、item title や取得値は記録しません。
+bridge はまず公式 CLI で item overview を解決し、同じ item ID の重複を除去してから batch fetch します。同一 session・同一 `(account, vault)` scope の同時 read は bounded な 15 ms micro-batch window でまとめ、最大100 itemまで1組の list/get を共有します。結果は resolved item ID で caller ごとに fan-out し、1 caller の cancel や曖昧 query が他 caller を壊さないようにします。secret plaintext を durable cache には保存しません。返却 JSON には secret value が含まれ得るため、read-only operation ですが通常 session では local approval を要求します。approval/activity には件数と scope 設定有無だけを出し、item title や取得値は記録しません。
 
 この経路は公式 1Password の authentication / encryption / synchronization / cache semantics を維持し、local 1Password database を書き換えません。将来 direct local-DB read を追加する場合も explicit opt-in の read-only optimization とし、mutation は公式 1Password 経路に限定します。
 

@@ -616,7 +616,7 @@ async fn call_tool(
             {
                 anyhow::bail!("user denied 1Password item read")
             }
-            match onepassword_cli::item_get(&session, &request).await {
+            match onepassword_cli::item_get_coalesced(&session, &request).await {
                 Ok(items) => {
                     approvals::activity(
                         &session.id,
