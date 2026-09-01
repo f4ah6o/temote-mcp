@@ -91,6 +91,8 @@ Use the official child MCP bridge discover-first:
 
 Do not invent child tool names or schemas. Keep secret values out of summaries and user-visible diagnostic text unless the user explicitly supplied and requested those exact values.
 
+For general item reads, prefer `onepassword_item_get`. Put all items needed for one step into a single `items` array instead of issuing separate reads; the bridge resolves exact IDs/titles, deduplicates them, and batches the official `op` fetch. Use `vault` or `account` only when needed to resolve scope. The returned payload may contain secrets, so do not echo it into diagnostics or approval summaries.
+
 For service-account workflows, use `onepassword_service_account_status` before assuming a token exists. `onepassword_service_account_run` accepts `op://...` references and checked-in env templates; do not replace secret references with plaintext.
 
 ## kintone bridge

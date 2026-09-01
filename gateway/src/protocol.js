@@ -227,6 +227,21 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "onepassword_item_get",
+    "Batch-read 1Password items",
+    "Read up to 100 1Password items by exact ID or title through the official op CLI. Temote resolves the requested items and fetches them in one batch; returned JSON may contain secret values. Normal sessions require local approval.",
+    { ...readOnly, openWorldHint: true },
+    schema(
+      {
+        ...sessionProperty,
+        items: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 },
+        vault: { type: "string" },
+        account: { type: "string" },
+      },
+      ["session_id", "items"],
+    ),
+  ),
+  tool(
     "onepassword_service_account_status",
     "Check 1Password service account",
     "Check whether the selected host session has a service-account token and whether 1Password CLI accepts it. The token is never returned.",

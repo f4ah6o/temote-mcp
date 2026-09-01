@@ -492,6 +492,42 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "account": {
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "vault": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "items"
+        ],
+        "type": "object"
+      },
+      "name": "onepassword_item_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
           "session_id": {
             "type": "string"
           }

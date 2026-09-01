@@ -14,7 +14,8 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    approvals, child_env, config, onepassword_mcp, sandbox, session_control::SessionBackend,
+    approvals, child_env, config, onepassword_cli, onepassword_mcp, sandbox,
+    session_control::SessionBackend,
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -395,6 +396,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"onepassword_mcp_discover","title":"Discover 1Password MCP","description":"List resources and tool schemas exposed by the official local 1Password Environments MCP server. Start with this tool before using 1Password MCP tools.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"onepassword_mcp_read_resource","title":"Read a 1Password MCP resource","description":"Read a documentation resource exposed by the official local 1Password Environments MCP server.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"uri":{"type":"string"}},"required":["session_id","uri"],"additionalProperties":false}},
         {"name":"onepassword_mcp_call","title":"Call a 1Password MCP tool","description":"Call a tool exposed by the official local 1Password Environments MCP server. Non-read-only child tools require temote-mcp approval unless the session is in yolo mode. Raw secrets remain governed by 1Password's MCP server contract.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}},"required":["session_id","tool_name","arguments"],"additionalProperties":false}},
+        {"name":"onepassword_item_get","title":"Batch-read 1Password items","description":"Read up to 100 1Password items by exact ID or title through the official op CLI. Temote resolves the requested items and fetches them in one batch; returned JSON may contain secret values. Normal sessions require local approval.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"items":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":100},"vault":{"type":"string"},"account":{"type":"string"}},"required":["session_id","items"],"additionalProperties":false}},
         {"name":"onepassword_service_account_status","title":"Check 1Password service account","description":"Check whether this temote-mcp session was started with a 1Password service-account token and whether 1Password CLI accepts it. The token is never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"onepassword_service_account_run","title":"Run with 1Password service-account secrets","description":"Run a host command through `op run` using the service-account token held only by the temote-mcp start process. 1Password CLI output masking remains enabled and OP_SERVICE_ACCOUNT_TOKEN is removed from the target command environment. Normal sessions require local approval; yolo sessions do not.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"env_files":{"type":"array","items":{"type":"string"}},"environment":{"type":"object","additionalProperties":{"type":"string"},"description":"Environment variable names mapped to op:// secret references. Plaintext values are rejected."}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"kintone_mcp_status","title":"Check kintone MCP","description":"Check whether the selected temote-mcp session has the official kintone MCP server executable and required authentication configuration. Credential values are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
@@ -582,6 +584,53 @@ async fn call_tool(
                 .context("missing tool_name")?;
             let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
             onepassword_mcp::call_tool(&session, tool_name, arguments).await
+        }
+        "onepassword_item_get" => {
+            let items = required_string_array(&args, "items")?;
+            let vault = args
+                .get("vault")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("vault must be a string")
+                })
+                .transpose()?;
+            let account = args
+                .get("account")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("account must be a string")
+                })
+                .transpose()?;
+            let request = onepassword_cli::ItemGetRequest::new(items, vault, account)?;
+            if !approvals::request(
+                &session.id,
+                "onepassword_item_get",
+                request.approval_summary(),
+                session.cwd.clone(),
+            )
+            .await?
+            {
+                anyhow::bail!("user denied 1Password item read")
+            }
+            match onepassword_cli::item_get(&session, &request).await {
+                Ok(items) => {
+                    approvals::activity(
+                        &session.id,
+                        format!("Read {} 1Password item(s)", items.len()),
+                        None,
+                    )
+                    .await;
+                    text_result(serde_json::to_string_pretty(&items)?)
+                }
+                Err(error) => {
+                    approvals::activity(&session.id, "1Password item read failed", None).await;
+                    Err(error)
+                }
+            }
         }
         "onepassword_service_account_status" => {
             let result = approvals::onepassword_service_account_status(&session.id).await?;
@@ -2674,7 +2723,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 28);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()

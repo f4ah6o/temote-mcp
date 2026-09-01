@@ -2,6 +2,8 @@ use tokio::process::Command;
 
 pub const SENSITIVE_ENV_NAMES: &[&str] = &[
     "OP_SERVICE_ACCOUNT_TOKEN",
+    "OP_CONNECT_HOST",
+    "OP_CONNECT_TOKEN",
     "OPENAI_ADMIN_KEY",
     "CONTROL_PLANE_API_KEY",
     "OPENAI_API_KEY",

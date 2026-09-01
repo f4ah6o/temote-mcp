@@ -22,6 +22,7 @@ mod line_protocol;
 mod local_oauth;
 mod mcp;
 mod named_roots;
+mod onepassword_cli;
 mod onepassword_mcp;
 #[cfg(feature = "network")]
 mod openai_tunnel;

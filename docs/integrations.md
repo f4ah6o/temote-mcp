@@ -21,6 +21,14 @@ Use the bridge in this order:
 
 Normal sessions approval-gate child tools that are not marked read-only. Argument values are not persisted in approval summaries.
 
+### Batched item reads with the official CLI
+
+`onepassword_item_get` reads general 1Password items through the official `op` CLI and batches multiple requested items into one upstream `op item get -` call. Supply exact item IDs or exact titles; use `vault` to disambiguate repeated titles and `account` when the host has multiple 1Password accounts.
+
+The bridge first resolves item overviews with the official CLI, removes duplicate resolved item IDs, and then performs one batch fetch. The returned JSON can contain secret values. Normal sessions therefore require local approval even though the operation is read-only. Approval/activity text reports only counts and whether a scope was configured; item titles and returned values are not logged.
+
+This path keeps the official 1Password authentication, encryption, synchronization, and cache semantics. It does not write the local 1Password database. Direct local-database reads, if added later, remain an explicit opt-in read-only optimization; mutations continue to use official 1Password paths.
+
 ### 1Password service-account mode
 
 Start the session with a service-account token:
