@@ -31,7 +31,7 @@ bridge はまず公式 CLI で item overview を解決し、同じ item ID の�
 
 ### Desktop SDK persistent secret resolve
 
-`onepassword_secret_resolve` は最大100件の `op://` secret reference を解決します。macOS では sibling sidecar が 1Password Desktop 同梱の公式 SDK IPC library をロードし、SDK client をrequest間で再利用します。Desktop IPC が停止してもTemote本体を巻き込まないようFFIはsidecarへ隔離し、timeout時はsidecarをkill/recreateします。SDK初期化またはresolveに失敗した場合は、referenceごとのCLI起動ではなく1回の公式 `op run` batchへfallbackします。
+`onepassword_secret_resolve` は最大100件の `op://` secret reference を解決します。sibling sidecar は `onepassword-sdk-unofficial` を利用し、SDK client をrequest間で再利用します。Desktop IPC が停止してもTemote本体を巻き込まないようSDK transportはsidecarへ隔離し、timeout時はsidecarをkill/recreateします。共有Rust SDKのDesktop transportは現在macOS/Linuxに対応し、未対応platformやSDK初期化・resolve失敗時はreferenceごとのCLI起動ではなく1回の公式 `op run` batchへfallbackします。
 
 Desktop SDK認証に使う1Password account名またはUUIDを `account` に指定します。1Password Desktop の **Settings > Developer > Integrate with the 1Password SDKs > Integrate with other apps** を有効にしてください。CLIのsign-in状態とDesktop SDK authorizationは別です。返却文字列はsecret-bearingですが、approval/activity summaryには含めません。Temoteはaccount password、account key、復号済みDB、plaintext secretを永続化しません。
 
