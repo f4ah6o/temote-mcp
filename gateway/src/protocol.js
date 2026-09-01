@@ -242,6 +242,20 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "onepassword_secret_resolve",
+    "Resolve 1Password secrets",
+    "Resolve up to 100 op:// secret references. On macOS, Temote reuses a persistent 1Password Desktop SDK sidecar when authorized and falls back to one batched official op CLI path when the SDK is unavailable. Returned strings are secrets; normal sessions require local approval.",
+    { ...readOnly, openWorldHint: true },
+    schema(
+      {
+        ...sessionProperty,
+        account: { type: "string" },
+        references: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 },
+      },
+      ["session_id", "account", "references"],
+    ),
+  ),
+  tool(
     "onepassword_service_account_status",
     "Check 1Password service account",
     "Check whether the selected host session has a service-account token and whether 1Password CLI accepts it. The token is never returned.",

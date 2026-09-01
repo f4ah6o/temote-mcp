@@ -1,11 +1,12 @@
 # Linux sandbox and crates.io packaging
 
-Temote owns its Linux sandbox boundary directly. The published `temote-mcp` Cargo package contains two binaries:
+Temote owns its Linux sandbox boundary directly. The published `temote-mcp` Cargo package contains three binaries:
 
 - `temote-mcp`
 - `temote-linux-sandbox`
+- `temote-onepassword-sdk`
 
-`cargo install temote-mcp` installs both binaries from the same package. There are no runtime or build dependencies on `codex-*` or `unofficial-codex-*` crates.
+`cargo install temote-mcp` installs all three binaries from the same package. There are no runtime or build dependencies on `codex-*` or `unofficial-codex-*` crates.
 
 ## Security model
 
@@ -45,4 +46,4 @@ The Apache-2.0 text is included as `LICENSE-APACHE`, and the corresponding attri
 
 Linux CI installs bubblewrap and runs the live sandbox tests. The acceptance covers writable cwd and explicit roots, `/tmp`, denied writes outside permitted roots, ordinary Git metadata protection, real `git add`/`git commit`, linked worktrees, restricted networking, `no_new_privs`, malformed policy/helper misuse, and Git pointer rejection.
 
-Packaging CI also runs `cargo package`, inspects the generated `.crate` for forbidden Git/Codex dependencies and required helper sources, installs from the extracted package into a temporary Cargo root, and verifies that both binaries are present. Runtime dependency metadata is checked so `codex-*` and `unofficial-codex-*` cannot silently re-enter the published graph.
+Packaging CI also runs `cargo package`, inspects the generated `.crate` for forbidden Git/Codex dependencies and required helper sources, installs from the extracted package into a temporary Cargo root, and verifies that all three binaries are present. Runtime dependency metadata is checked so `codex-*` and `unofficial-codex-*` cannot silently re-enter the published graph.

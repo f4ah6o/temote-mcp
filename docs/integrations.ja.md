@@ -27,7 +27,13 @@ Temote MCP は、一部の local MCP server と secret injection workflow を br
 
 bridge はまず公式 CLI で item overview を解決し、同じ item ID の重複を除去してから batch fetch します。同一 session・同一 `(account, vault)` scope の同時 read は bounded な 15 ms micro-batch window でまとめ、最大100 itemまで1組の list/get を共有します。結果は resolved item ID で caller ごとに fan-out し、1 caller の cancel や曖昧 query が他 caller を壊さないようにします。secret plaintext を durable cache には保存しません。返却 JSON には secret value が含まれ得るため、read-only operation ですが通常 session では local approval を要求します。approval/activity には件数と scope 設定有無だけを出し、item title や取得値は記録しません。
 
-この経路は公式 1Password の authentication / encryption / synchronization / cache semantics を維持し、local 1Password database を書き換えません。将来 direct local-DB read を追加する場合も explicit opt-in の read-only optimization とし、mutation は公式 1Password 経路に限定します。
+この経路は公式 1Password の authentication / encryption / synchronization / cache semantics を維持し、local 1Password database を書き換えません。
+
+### Desktop SDK persistent secret resolve
+
+`onepassword_secret_resolve` は最大100件の `op://` secret reference を解決します。macOS では sibling sidecar が 1Password Desktop 同梱の公式 SDK IPC library をロードし、SDK client をrequest間で再利用します。Desktop IPC が停止してもTemote本体を巻き込まないようFFIはsidecarへ隔離し、timeout時はsidecarをkill/recreateします。SDK初期化またはresolveに失敗した場合は、referenceごとのCLI起動ではなく1回の公式 `op run` batchへfallbackします。
+
+Desktop SDK認証に使う1Password account名またはUUIDを `account` に指定します。1Password Desktop の **Settings > Developer > Integrate with the 1Password SDKs > Integrate with other apps** を有効にしてください。CLIのsign-in状態とDesktop SDK authorizationは別です。返却文字列はsecret-bearingですが、approval/activity summaryには含めません。Temoteはaccount password、account key、復号済みDB、plaintext secretを永続化しません。
 
 ### 1Password service-account mode
 

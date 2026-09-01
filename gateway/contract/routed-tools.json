@@ -528,6 +528,40 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "account": {
+            "type": "string"
+          },
+          "references": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "account",
+          "references"
+        ],
+        "type": "object"
+      },
+      "name": "onepassword_secret_resolve"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
           "session_id": {
             "type": "string"
           }

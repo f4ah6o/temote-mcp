@@ -27,7 +27,13 @@ Normal sessions approval-gate child tools that are not marked read-only. Argumen
 
 The bridge first resolves item overviews with the official CLI, removes duplicate resolved item IDs, and then performs one batch fetch. Concurrent reads in the same session and `(account, vault)` scope are held for a bounded 15 ms micro-batch window and share one list/get pair up to the 100-item limit. Results are fanned back out by resolved item ID; a canceled or invalid caller does not cancel or poison unrelated callers. No secret plaintext is stored in a durable cache. The returned JSON can contain secret values. Normal sessions therefore require local approval even though the operation is read-only. Approval/activity text reports only counts and whether a scope was configured; item titles and returned values are not logged.
 
-This path keeps the official 1Password authentication, encryption, synchronization, and cache semantics. It does not write the local 1Password database. Direct local-database reads, if added later, remain an explicit opt-in read-only optimization; mutations continue to use official 1Password paths.
+This path keeps the official 1Password authentication, encryption, synchronization, and cache semantics. It does not write the local 1Password database.
+
+### Persistent Desktop SDK secret resolution
+
+`onepassword_secret_resolve` resolves up to 100 `op://` secret references. On macOS, Temote starts a small sibling sidecar that loads the official 1Password Desktop SDK IPC library and keeps an SDK client alive across requests. The SDK FFI is isolated from the main Temote process so a stuck Desktop IPC call can be timed out by killing and recreating the sidecar. If SDK initialization or resolution fails, Temote falls back to one batched official `op run` invocation rather than issuing one CLI process per reference.
+
+The request requires the 1Password account name or UUID used by Desktop SDK authentication. Enable **Settings > Developer > Integrate with the 1Password SDKs > Integrate with other apps** in the desktop app. CLI sign-in state is independent from Desktop SDK authorization. Returned strings are secret-bearing and are never included in approval/activity summaries. No password, account key, decrypted database, or plaintext secret is persisted by Temote.
 
 ### 1Password service-account mode
 

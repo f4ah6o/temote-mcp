@@ -94,15 +94,18 @@ VaultItems: cache hit
 - [x] coalescing window と max batch size を bounded にする。
 - [x] secret plaintext を durable cache に保存しない。
 
-## Phase 3: optional local fast-read
+## Phase 3: official Desktop SDK persistent fast-read
 
-- [ ] macOS 1Password local DB schema compatibility boundary を定義する。
-- [ ] read-only open を fail-closed で保証する。
-- [ ] schema/version mismatch は公式 CLI path へ fallback する。
-- [ ] credential/key handling を threat model 化する。
-- [ ] 公式 Desktop integration より弱い password persistence を default にしない。
-- [ ] explicit opt-in のみ許可する。
-- [ ] local DB write API を実装しない regression test を置く。
+- [x] direct local SQLite resolver prototypeを実測し、通常CLI pathより速くないため不採用にした。
+- [x] 公式1Password SDKがDesktop同梱 `libop_sdk_ipc_client` C ABIを利用することを確認した。
+- [x] FFIをTemote本体から分離した sibling sidecar を追加した。
+- [x] accountごとのSDK clientをsidecar内でpersistent reuseする。
+- [x] sidecar response/request sizeをboundし、30秒timeout時にchildをkill可能にした。
+- [x] `SecretsResolveAll` で最大100 `op://` referencesをbatch resolveする。
+- [x] SDK failure時は1回の公式 `op run` batchへfallbackし、referenceごとのprocess起動を避ける。
+- [x] password/account key/local DB decryptを実装・永続化しない。
+- [x] direct SQLite write/read fast pathをproductionへ入れない。
+- [x] gateway contract / docs / packaging / full gatesを完了する。
 
 ## Security invariants
 
@@ -111,7 +114,7 @@ VaultItems: cache hit
 - activity は item count / success/failure 程度だけを表示し、item title、field value、password、token を表示しない。
 - normal session でも host 1Password CLI の既存 authorization / Desktop authentication semantics を弱めない。
 - child process environment から Temote が保持する他 integration credentials を不要に継承させない。
-- direct DB fast path は read-only FD / SQLite mode=ro 相当を必須にする。
+- production fast path は公式 Desktop SDK IPC に限定し、direct local DB access は実装しない。
 - mutation は official 1Password API/CLI/SDK path に限定する。
 
 ## Acceptance criteria
@@ -123,7 +126,7 @@ VaultItems: cache hit
 - [x] secret-bearing output が approval/activity/debug summary に混入しない。
 - [x] existing `onepassword_mcp_*` / service-account behavior を壊さない。
 - [x] `cargo fmt --all -- --check`
-- [ ] `cargo test`
+- [x] `cargo test`
 - [x] `cargo clippy --all-targets -- -D warnings`
 - [x] `cargo check --no-default-features --all-targets`
 - [x] `(cd gateway && npm test)`
@@ -156,4 +159,14 @@ VaultItems: cache hit
 
 最初に official CLI batch path を採用する。実機で約 3x の改善が確認でき、1Password の既存認証・暗号化・sync semantics をそのまま利用できるため、リスクに対する効果が最も大きい。
 
-local SQLite direct-read は性能上の上限を引き上げられるが、credential handling と schema compatibility の security/maintenance cost が高い。そのため Phase 1/2 の測定後に opt-in fast path として判断する。
+local SQLite direct-read はprototype実測で通常CLI pathより速くなく、credential handling と schema compatibility の security/maintenance costも高いため不採用とした。Phase 3は公式 Desktop SDK IPC のpersistent clientへ切り替えた。
+
+## Phase 3 implementation result (2026-09-01)
+
+- local SQLite exact-ID resolverは10件で **7.02 s**、通常の `op list + get` は **6.32 s** だったためproduction採用を撤回。
+- 公式Go SDKの実装からDesktop SDK IPC ABI (`op_sdk_ipc_send_message` / `op_sdk_ipc_free_response`) を確認。Temoteでは同ABIをRust sidecarから利用し、外部Node/Go/Python runtime dependencyを追加しない。
+- 1Password Desktopの **Integrate with other apps** が有効なhostで公式SDK初期化を再確認。`op whoami` は未sign-inでもDesktop SDK client初期化は成功し、CLI sign-inとSDK authorizationが独立していることを確認。
+- Rust sidecar live probe: 初回request **3.97 s**、同一persistent clientの2回目 **271 ms**。secret値を表示せず、存在しないreferenceを用いてIPC/client reuseのみ計測。
+- FFIはTemote本体へ直接ロードせずsidecarへ隔離。Desktop IPC hang時は親からtimeout/kill/restart可能。
+- fallbackは1 reference = 1 `op read`ではなく、referenceをenvironmentとして1回の `op run`へ渡し、Rust helperが解決値をJSON encodeするbatch pathにした。
+- gateway 46/46 pass、full Rust suite 341/341 pass、sidecar ABI decoder 1/1 pass。`cargo package` verification pass。packaged crateからのinstallで `temote-mcp` / `temote-linux-sandbox` / `temote-onepassword-sdk` の3 binariesを確認。

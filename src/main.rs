@@ -24,6 +24,7 @@ mod mcp;
 mod named_roots;
 mod onepassword_cli;
 mod onepassword_mcp;
+mod onepassword_sdk;
 #[cfg(feature = "network")]
 mod openai_tunnel;
 mod platform_paths;

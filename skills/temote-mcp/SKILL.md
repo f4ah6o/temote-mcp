@@ -93,6 +93,8 @@ Do not invent child tool names or schemas. Keep secret values out of summaries a
 
 For general item reads, prefer `onepassword_item_get`. Put all items needed for one step into a single `items` array instead of issuing separate reads; the bridge resolves exact IDs/titles, deduplicates them, and batches the official `op` fetch. Concurrent calls in the same session and `(account, vault)` scope are also micro-batched and fanned out by resolved item ID, but explicit batching is still preferable because not every transport delivers calls concurrently. Use `vault` or `account` only when needed to resolve scope. The returned payload may contain secrets, so do not echo it into diagnostics or approval summaries.
 
+For `op://` field resolution on macOS, prefer `onepassword_secret_resolve` when an account name/UUID is known. Batch all references needed for one step. Temote reuses an official 1Password Desktop SDK client in an isolated sidecar and falls back to one batched official CLI invocation if SDK authorization is unavailable. Treat the returned string array as secrets and never echo it into logs or summaries. Desktop SDK authorization is separate from `op` CLI sign-in.
+
 For service-account workflows, use `onepassword_service_account_status` before assuming a token exists. `onepassword_service_account_run` accepts `op://...` references and checked-in env templates; do not replace secret references with plaintext.
 
 ## kintone bridge

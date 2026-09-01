@@ -153,6 +153,8 @@ jobs:
               members = set(archive.getnames())
           if f"{package_root}/src/bin/temote-linux-sandbox.rs" not in members:
               raise SystemExit("temote-linux-sandbox source is missing from the crate")
+          if f"{package_root}/src/bin/temote-onepassword-sdk.rs" not in members:
+              raise SystemExit("temote-onepassword-sdk source is missing from the crate")
           if f"{package_root}/docs/linux-sandbox.md" not in members:
               raise SystemExit("Linux sandbox provenance documentation is missing from the crate")
           if f"{package_root}/THIRD_PARTY_NOTICES.md" not in members:
@@ -209,6 +211,7 @@ jobs:
           cargo install --path "$package_root" --root "$install_root" --locked --force
           test -x "$install_root/bin/temote-mcp"
           test -x "$install_root/bin/temote-linux-sandbox"
+          test -x "$install_root/bin/temote-onepassword-sdk"
           "$install_root/bin/temote-mcp" --version
 
       - name: Verify macOS dependency boundary
