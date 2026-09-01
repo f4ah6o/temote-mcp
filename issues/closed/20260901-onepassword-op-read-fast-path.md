@@ -1,9 +1,9 @@
 # 1Password `op` read path を batch / coalescing / optional local fast-read で高速化する
 
-Status: open
+Status: closed
 Model: gpt-5.6-sol
 Created: 2026-09-01
-Updated: 2026-09-01
+Updated: 2026-09-02
 Branch: main
 
 ## 概要
@@ -179,3 +179,7 @@ local SQLite direct-read はprototype実測で通常CLI pathより速くなく�
 - macOSだけだったTemote固有transport制約を外し、共有SDKが実装するmacOS/Linux Desktop transportをそのまま利用する。Windows等の未対応platformでは従来どおりCLI batch fallbackへ移行する。
 - `temote-onepassword-sdk --emit-env-json` はCLI fallback helperとして維持し、release artifactのbinary layoutを変更しない。
 - refactor後の直接sidecar live probeは現在のDesktop authorization状態で12秒以内に応答せず、probe側からkillして終了した。secret値は出力していない。共有SDK自体のlive成功proofは`opz-rs/onepassword-sdk-unofficial`側で保持し、Temote側ではtimeout/kill可能なprocess isolationを維持する。
+
+## Completion
+
+Phase 1–4を完了し、official CLI batch/coalescing、isolated persistent Desktop SDK fast path、共有 `onepassword-sdk-unofficial` consumer化までmainへ統合したためcloseする。
