@@ -86,6 +86,14 @@ starting -> active -> stopping -> stopped
 
 A graceful explicit stop becomes `stopped`. Unexpected termination becomes `crashed`. On local supervisor startup, stale sockets are removed and metadata that claimed a live runtime but has no live socket is reconciled to `crashed`.
 
+## Supervisor binary handoff
+
+After installing a replacement Temote binary, run `temote-mcp upgrade --dry-run` and then `temote-mcp upgrade`. The target executable must report the same local control protocol, lifecycle schema, and restore-plan schema as the running supervisor; incompatible generations are rejected before any active runtime is stopped.
+
+The implementation uses coordinated restart/restore, not live in-process task transfer. The old supervisor fences lifecycle mutations, validates named-root/cwd resolution and memory-only restart context, and quiesces all active runtimes. Quiesce fails closed when an integration call or approval is in flight. The owner-only restore plan contains session identity, path/permission/restart metadata, and restart-context key names only—never credential values. After graceful drain, the process `exec`s `temote-mcp supervisor --restore-plan ...` with the same PID. The replacement recreates only the planned active sessions and verifies metadata plus every session-socket probe before deleting the plan.
+
+Direct `serve/up` ingress remains a separate process; it can keep running when the control protocol is compatible. Protocol/lifecycle-schema-changing handoffs are deliberately rejected rather than guessing an ingress restart. If `exec` itself fails, the old supervisor attempts to recreate drained sessions from its in-memory restart specifications and clears the fence. If replacement startup/restore fails after `exec`, the non-secret restore plan remains for diagnosis/recovery. After supervisor and session health checks pass, `upgrade` transactionally refreshes the binary-owned Codex plugin and reports the required restart of an already-running Codex client. A pre-handoff-protocol supervisor needs one manual restart to bootstrap this path.
+
 Restart policy defaults to `never`. `temote-mcp session restart-policy <id> on-failure` enables automatic restart only after unexpected runtime failure; graceful stop never restarts. Automatic restart uses bounded exponential delays of 1, 2, 4, 8, and 16 seconds and then settles in `crashed` after five attempts. Lifecycle state records `restart_count`, `last_restart_at`, `next_restart_at`, and `restart_limit_reason`. The original captured start environment is retained only in supervisor memory and is never persisted; after the supervisor process itself restarts, pending credential-bearing automatic restart is intentionally not resumed and the session remains `crashed` with an explanatory reason until an explicit `session restart`.
 
 ## HTTP managed sessions

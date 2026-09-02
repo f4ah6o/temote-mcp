@@ -109,6 +109,12 @@ Use `kintone_cli_status` and then `kintone_cli_run` when cli-kintone covers a ga
 
 Do not guess tenant credentials or expose them. In normal sessions, forwarded kintone MCP calls and all cli-kintone runs are approval-gated.
 
+## Supervisor upgrades
+
+`temote-mcp up` owns HTTP/ingress, not the session supervisor. When the user explicitly asks to apply an already-installed Temote binary to the running supervisor and local command execution is available, use `temote-mcp upgrade --dry-run` first and inspect the plan before `temote-mcp upgrade`. Do not substitute re-running `temote-mcp up` for a supervisor handoff.
+
+If dry-run reports incompatible protocol/schema, missing restart context, or an in-flight operation, stop there and report the blocker. Do not persist or reconstruct plaintext credentials to force the transition. A supervisor that predates the handoff protocol requires one manual supervisor restart before later compatible releases can use `upgrade`.
+
 ## Failure handling
 
 When a tool fails:

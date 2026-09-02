@@ -86,6 +86,14 @@ starting -> active -> stopping -> stopped
 
 明示的な graceful stop は `stopped`、予期しない終了は `crashed` です。local supervisor の起動時には stale socket を処理し、live runtime を示す metadata に対して socket が死んでいれば `crashed` に reconcile します。
 
+## supervisor binary handoff
+
+Temote binary を更新した後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` を使います。target executable が running supervisor と同じ local control protocol / lifecycle schema / restore-plan schema を申告する場合だけ続行し、非互換 generation は active runtime を停止する前に拒否します。
+
+実装は live な in-process task transfer ではなく coordinated restart/restore です。旧 supervisor は lifecycle mutation を fence し、named-root/cwd resolution と memory-only restart context を検証して全 active runtime を quiesce します。integration call または approval が in-flight なら fail closed で中止します。owner-only restore plan に含めるのは session identity、path/permission/restart metadata、restart-context のキー名だけで、credential value は保存しません。graceful drain 後、同じ PID のまま `temote-mcp supervisor --restore-plan ...` を `exec` し、replacement は planned active session だけを復元して metadata と全 session socket probe を確認してから plan を削除します。
+
+direct `serve/up` ingress は別 process のままで、control protocol が compatible なら稼働継続できます。protocol/lifecycle schema をまたぐ handoff は ingress restart を推測せず拒否します。`exec` 自体が失敗した場合、旧 supervisor は memory 上の restart specification から drained session の再作成を試みて fence を解除します。`exec` 後の replacement startup/restore failure では non-secret restore plan を診断・復旧用に残します。supervisor/session health check 成功後、`upgrade` は binary-owned Codex Plugin を transactionally refresh し、既に起動中の Codex client の再起動が必要であることを報告します。handoff protocol 導入前の supervisor からは最初の1回だけ手動 restart が必要です。
+
 restart policy の既定値は安全側の `never` です。`temote-mcp session restart-policy <id> on-failure` で、予期しない runtime failure に限って automatic restart を有効化できます。graceful stop は再起動しません。automatic restart は 1, 2, 4, 8, 16 秒の bounded exponential delay を使い、5回で limit に達して `crashed` に確定します。lifecycle state には `restart_count` / `last_restart_at` / `next_restart_at` / `restart_limit_reason` を保存します。start 時に capture した environment は supervisor memory のみに保持して永続化しません。そのため supervisor process 自体が再起動した後は pending な credential-bearing automatic restart を暗黙再開せず、理由を残して `crashed` のままにし、明示的な `session restart` を要求します。
 
 ## HTTP managed session

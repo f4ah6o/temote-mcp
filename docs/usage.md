@@ -17,6 +17,8 @@ temote-mcp session info my-project
 
 Use `temote-mcp session console` when local approval input is required. Closing that console or sending stdin EOF detaches it without stopping the runtime. While no console is attached, approval-required operations fail closed.
 
+After replacing the installed binary, run `temote-mcp upgrade --dry-run` and then `temote-mcp upgrade` for a compatible same-PID supervisor handoff with coordinated session restart/restore. No credential values are persisted; missing restart context or an in-flight operation aborts the transition, and every planned session is verified before success. A supervisor from before the handoff protocol needs one manual restart first.
+
 `session list` includes durable `starting`, `active`, `stopping`, `stopped`, and `crashed` states. `session info` includes the working directory, permitted roots, permission mode, timestamps, exit reason, and last error. A dead or ambiguous socket is never silently treated as active. Manual restart is available with `temote-mcp session restart <id>`; automatic restart is not enabled.
 
 For compatibility, `cd ~/src/my-project && temote-mcp start my-project` asks the running local supervisor to start the current directory. `temote-mcp start my-project --yolo` remains the deliberately unrestricted local-only form.

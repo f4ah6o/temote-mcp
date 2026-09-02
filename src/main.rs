@@ -86,7 +86,17 @@ async fn main() -> Result<()> {
         cli::Command::Start { session_id, yolo } => {
             session_control::start_legacy(session_id, yolo).await
         }
-        cli::Command::Supervisor => session_control::run_supervisor().await,
+        cli::Command::Supervisor {
+            restore_plan,
+            capabilities,
+        } => {
+            if capabilities {
+                session_control::print_supervisor_capabilities()
+            } else {
+                session_control::run_supervisor(restore_plan).await
+            }
+        }
+        cli::Command::Upgrade { dry_run, force } => session_control::upgrade(dry_run, force).await,
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { session_id, path } => {
                 session_control::start_named(session_id, path).await

@@ -17,6 +17,8 @@ temote-mcp session info my-project
 
 local approval input が必要な場合は `temote-mcp session console` を使います。この console を閉じる、または stdin EOF になっても runtime は停止せず、console だけが detach します。console 不在中の approval-required operation は fail closed します。
 
+installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` で compatible な same-PID supervisor handoff と coordinated session restart/restore を行えます。credential value は永続化せず、restart context 不足または in-flight operation があれば中止し、planned session を全て確認してから成功を返します。handoff protocol 導入前の supervisor からは最初に手動 restart が1回必要です。
+
 `session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` を確認できます。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。
 
 互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。これは起動中の local supervisor に current directory の session 作成を依頼します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。

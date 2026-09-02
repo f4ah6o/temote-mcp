@@ -23,7 +23,14 @@ pub enum Command {
         session_id: Option<String>,
         yolo: bool,
     },
-    Supervisor,
+    Supervisor {
+        restore_plan: Option<PathBuf>,
+        capabilities: bool,
+    },
+    Upgrade {
+        dry_run: bool,
+        force: bool,
+    },
     Session {
         command: SessionCommand,
     },
@@ -179,7 +186,41 @@ where
         .take(&mut args)
         .is_present()
     {
-        return finish(args, Command::Supervisor);
+        let restore_plan = noargs::opt("restore-plan")
+            .ty("PATH")
+            .doc("Internal: restore a validated supervisor handoff plan")
+            .take(&mut args)
+            .present()
+            .map(|opt| PathBuf::from(opt.value()));
+        let capabilities = noargs::flag("capabilities")
+            .doc("Print supervisor handoff protocol capabilities as JSON")
+            .take(&mut args)
+            .is_present();
+        if capabilities && restore_plan.is_some() {
+            return Err("--capabilities and --restore-plan cannot be combined".to_owned());
+        }
+        return finish(
+            args,
+            Command::Supervisor {
+                restore_plan,
+                capabilities,
+            },
+        );
+    }
+    if noargs::cmd("upgrade")
+        .doc("Safely hand off the running supervisor to this installed Temote binary")
+        .take(&mut args)
+        .is_present()
+    {
+        let dry_run = noargs::flag("dry-run")
+            .doc("Validate and print the handoff plan without changing processes or sessions")
+            .take(&mut args)
+            .is_present();
+        let force = noargs::flag("force")
+            .doc("Perform a handoff even when the running and installed versions match")
+            .take(&mut args)
+            .is_present();
+        return finish(args, Command::Upgrade { dry_run, force });
     }
     if noargs::cmd("session")
         .doc("Manage sessions owned by the local Temote supervisor")
@@ -839,6 +880,7 @@ mod tests {
         assert!(help.contains("start"));
         assert!(help.contains("mcp"));
         assert!(help.contains("codex"));
+        assert!(help.contains("upgrade"));
         assert!(help.contains("--version"));
 
         let ParseOutcome::Print(start_help) =
@@ -861,6 +903,43 @@ mod tests {
         };
         assert!(help.contains("codex plugin install"));
         assert!(help.contains("codex diagnose"));
+    }
+
+    #[test]
+    fn upgrade_and_supervisor_handoff_options_parse() {
+        assert!(matches!(
+            command(&["temote-mcp", "upgrade", "--dry-run"]),
+            Command::Upgrade {
+                dry_run: true,
+                force: false,
+            }
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "upgrade", "--force"]),
+            Command::Upgrade {
+                dry_run: false,
+                force: true,
+            }
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "supervisor", "--capabilities"]),
+            Command::Supervisor {
+                restore_plan: None,
+                capabilities: true,
+            }
+        ));
+        assert!(matches!(
+            command(&[
+                "temote-mcp",
+                "supervisor",
+                "--restore-plan",
+                "/tmp/plan.json",
+            ]),
+            Command::Supervisor {
+                restore_plan: Some(path),
+                capabilities: false,
+            } if path == std::path::Path::new("/tmp/plan.json")
+        ));
     }
 
     #[test]

@@ -217,22 +217,22 @@ It should produce the exact transition plan without stopping or restarting anyth
 
 ## Acceptance criteria
 
-- [ ] an explicit command can determine whether installed and running supervisor versions differ
+- [x] an explicit command can determine whether installed and running supervisor versions differ
 - [ ] `--dry-run` produces a complete non-destructive handoff/restart plan
-- [ ] lifecycle mutations are fenced while supervisor ownership is changing
-- [ ] compatibility is verified before the old supervisor is stopped
-- [ ] intended active sessions are preserved or recreated automatically with the same IDs
-- [ ] logical path, cwd resolution, permission mode, and restart policy are preserved
-- [ ] sessions requiring unavailable secret/restart context block destructive transition
-- [ ] no plaintext credential is persisted to enable upgrade
-- [ ] every restored session is socket-probed before upgrade success
+- [x] lifecycle mutations are fenced while supervisor ownership is changing
+- [x] compatibility is verified before the old supervisor is stopped
+- [x] intended active sessions are preserved or recreated automatically with the same IDs
+- [x] logical path, cwd resolution, permission mode, and restart policy are preserved
+- [x] sessions requiring unavailable secret/restart context block destructive transition
+- [x] no plaintext credential is persisted to enable upgrade
+- [x] every restored session is socket-probed before upgrade success
 - [ ] ingress is restarted/reloaded only when needed and is health-checked afterward
-- [ ] Codex plugin version is reconciled or a precise client-restart action is reported
+- [x] Codex plugin version is reconciled or a precise client-restart action is reported
 - [ ] failure produces a deterministic rollback/partial-state report
-- [ ] repeated invocation after successful upgrade is idempotent
-- [ ] existing `up/down`, session lifecycle, sandbox, approval, 1Password, kintone, and gateway security boundaries remain unchanged
+- [x] repeated invocation after successful upgrade is idempotent
+- [x] existing `up/down`, session lifecycle, sandbox, approval, 1Password, kintone, and gateway security boundaries remain unchanged
 - [ ] Linux and macOS upgrade-path tests cover compatible and incompatible generations
-- [ ] README / managed-session / usage documentation is updated in English and Japanese
+- [x] README / managed-session / usage documentation is updated in English and Japanese
 
 ## Required tests
 
@@ -250,3 +250,32 @@ It should produce the exact transition plan without stopping or restarting anyth
 ## Implementation note
 
 The current architecture keeps session runtimes as in-process tasks owned by `SessionSupervisor`. Therefore Level B (coordinated restart/restore) is likely the smallest safe first implementation. A future Level A live-FD/runtime transfer can be considered separately if restart interruption becomes material.
+
+
+## Implementation status — 2026-09-02
+
+Implemented the first Level B handoff path:
+
+- `temote-mcp upgrade --dry-run` compares the installed/current CLI binary with the running supervisor and requests a non-destructive plan.
+- `temote-mcp upgrade` validates the target executable by invoking `supervisor --capabilities`; control protocol, lifecycle schema, and restore-plan schema must match the running supervisor before any runtime is stopped.
+- The running supervisor fences lifecycle mutations and validates every active session's named-root/cwd mapping plus memory-only restart context. Missing/changed restart environment is reported by variable **name only** and aborts the transition.
+- Active session-runtime bridge operations and approvals are counted. Upgrade quiesce fails closed while one is in flight and resumes any already-quiesced runtime on abort.
+- The disk restore plan is owner-only and contains session identity/path/permission/restart state plus restart-context key names only. Credential values remain memory-only and are passed to the replacement process through the `exec` environment, not persisted.
+- The old supervisor gracefully drains the planned sessions and `exec`s the target supervisor with `--restore-plan` in the same PID. The replacement recreates only the prior active set, preserves ID/logical path/cwd/permitted roots/yolo/restart policy, and probes every restored socket before deleting the plan.
+- If `exec` fails before process replacement, the old supervisor attempts rollback from its still-memory-resident restart specifications and clears the lifecycle fence.
+- After successful supervisor/session verification, `upgrade` transactionally runs the binary-owned Codex plugin installer. Failure produces the exact manual follow-up command; already-running Codex still requires restart.
+- Same-version invocation is a no-op unless `--force` is supplied.
+
+Current deliberate limitations keep this issue open:
+
+- protocol/lifecycle-schema-changing generations fail closed; automatic `serve/up` ingress restart/profile recovery and post-transition ingress health checks are not implemented yet;
+- if the replacement process has already `exec`'d and then fails during restore, the non-secret plan is retained but automatic execution of an old binary generation is not yet implemented;
+- Linux isolated process E2E has been exercised; macOS process-boundary handoff evidence is still required.
+
+### Evidence
+
+- full `cargo test --all-targets --all-features`: 347 main-binary tests passed, 0 failed; existing process-boundary lifecycle test remains intentionally ignored; sandbox/package tests also passed;
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed;
+- `cargo check --no-default-features --all-targets`: passed (existing feature-dependent dead-code warnings only);
+- isolated Linux E2E using socket namespace `upge2e01`: supervisor PID `2233563` remained unchanged across forced same-version `exec` handoff; session `e2e-upgrade` was restored active with the same ID/cwd/permission metadata and then stopped cleanly;
+- the E2E temporarily installed the checkout debug Codex plugin as part of the real upgrade path; the host plugin was immediately restored with the installed `temote-mcp codex plugin install`, returning it to version `2026.9.2`.

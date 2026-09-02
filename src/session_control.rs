@@ -1,5 +1,6 @@
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read as _, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,12 +18,15 @@ use crate::approvals::{
 use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::host_identity;
 use crate::named_roots::NamedRoots;
-use crate::supervisor::SessionSupervisor;
+use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
 const CONTROL_PROTOCOL_VERSION: u64 = 1;
+const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
+const UPGRADE_PLAN_SCHEMA_VERSION: u64 = 1;
+const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +84,16 @@ enum ControlRequest {
     PermissionRevoke {
         session_id: String,
         path: PathBuf,
+    },
+    Upgrade {
+        executable: PathBuf,
+        target_version: String,
+        #[serde(default)]
+        environment: CapturedStartEnvironment,
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        force: bool,
     },
     AttachConsole,
 }
@@ -201,7 +215,7 @@ struct ControlResponse {
     error: Option<String>,
 }
 
-pub async fn run_supervisor() -> Result<()> {
+pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
     let path = config::supervisor_socket_path()?;
     prepare_supervisor_socket(&path).await?;
     let parent = path.parent().context("supervisor socket has no parent")?;
@@ -212,12 +226,33 @@ pub async fn run_supervisor() -> Result<()> {
 
     let roots = NamedRoots::from_env()?;
     let (supervisor, approvals) = SessionSupervisor::new(roots);
-    let (console_registration, console_registrations) = mpsc::channel(8);
-    let approval_broker = tokio::spawn(run_approval_broker(approvals, console_registrations));
 
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+
+    if let Some(restore_plan_path) = restore_plan_path.as_deref() {
+        let plan = read_upgrade_plan(restore_plan_path)?;
+        validate_restore_plan(&plan)?;
+        let available_environment = CapturedStartEnvironment::capture();
+        if let Err(error) = supervisor
+            .restore_upgrade_plan(&plan, &available_environment)
+            .await
+        {
+            let _ = tokio::fs::remove_file(&path).await;
+            let _ = supervisor.shutdown().await;
+            return Err(error).context("failed to restore sessions after supervisor upgrade");
+        }
+        remove_upgrade_plan(restore_plan_path)?;
+        eprintln!(
+            "Temote supervisor handoff restored {} session(s) on version {}",
+            plan.sessions.len(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    let (console_registration, console_registrations) = mpsc::channel(8);
+    let approval_broker = tokio::spawn(run_approval_broker(approvals, console_registrations));
 
     eprintln!("Temote session supervisor: {}", path.display());
     eprintln!("Use `temote-mcp session console` to attach the approval console.");
@@ -460,18 +495,41 @@ async fn handle_control_connection(
     let request: ControlRequest =
         serde_json::from_str(line.trim()).context("invalid control request")?;
 
-    if matches!(request, ControlRequest::AttachConsole) {
-        return handle_console_attachment(stream, console_registration).await;
+    match request {
+        ControlRequest::AttachConsole => {
+            handle_console_attachment(stream, console_registration).await
+        }
+        ControlRequest::Upgrade {
+            executable,
+            target_version,
+            environment,
+            dry_run,
+            force,
+        } => {
+            handle_upgrade_request(
+                stream,
+                supervisor,
+                executable,
+                target_version,
+                environment,
+                dry_run,
+                force,
+            )
+            .await
+        }
+        request => {
+            let result = dispatch_request(request, &supervisor).await;
+            let response = match result {
+                Ok(result) => json!({"ok": true, "result": result, "error": Value::Null}),
+                Err(error) => {
+                    json!({"ok": false, "result": Value::Null, "error": format!("{error:#}")})
+                }
+            };
+            stream.write_all(&encode_line(&response)?).await?;
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
     }
-
-    let result = dispatch_request(request, &supervisor).await;
-    let response = match result {
-        Ok(result) => json!({"ok": true, "result": result, "error": Value::Null}),
-        Err(error) => json!({"ok": false, "result": Value::Null, "error": format!("{error:#}")}),
-    };
-    stream.write_all(&encode_line(&response)?).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
 }
 
 async fn dispatch_request(
@@ -483,7 +541,11 @@ async fn dispatch_request(
         ControlRequest::Ping => Ok(json!({
             "status": "active",
             "host_id": host_identity::resolve()?,
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
             "control_protocol": CONTROL_PROTOCOL_VERSION,
+            "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
+            "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
             "roots_configured": supervisor.roots_configured(),
         })),
         ControlRequest::Approval {
@@ -566,8 +628,440 @@ async fn dispatch_request(
             supervisor.revoke_directory(&session_id, path).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::Upgrade { .. } => unreachable!("handled before dispatch"),
         ControlRequest::AttachConsole => unreachable!("handled before dispatch"),
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SupervisorCapabilities {
+    version: String,
+    control_protocol: u64,
+    lifecycle_schema: u64,
+    upgrade_plan_schema: u64,
+}
+
+pub fn print_supervisor_capabilities() -> Result<()> {
+    let capabilities = SupervisorCapabilities {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        control_protocol: CONTROL_PROTOCOL_VERSION,
+        lifecycle_schema: LIFECYCLE_SCHEMA_VERSION,
+        upgrade_plan_schema: UPGRADE_PLAN_SCHEMA_VERSION,
+    };
+    println!("{}", serde_json::to_string(&capabilities)?);
+    Ok(())
+}
+
+fn validate_upgrade_executable(
+    path: &Path,
+    claimed_version: &str,
+) -> Result<(PathBuf, SupervisorCapabilities)> {
+    let path = std::fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve upgrade executable {}", path.display()))?;
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("cannot inspect upgrade executable {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "upgrade executable is not a regular file: {}",
+        path.display()
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode & 0o111 != 0,
+        "upgrade executable is not executable: {}",
+        path.display()
+    );
+
+    let output = std::process::Command::new(&path)
+        .args(["supervisor", "--capabilities"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect upgrade capabilities from {}",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        output.status.success(),
+        "upgrade executable did not report supervisor capabilities successfully"
+    );
+    anyhow::ensure!(
+        output.stdout.len() <= 64 * 1024,
+        "upgrade capability response is too large"
+    );
+    let capabilities: SupervisorCapabilities = serde_json::from_slice(&output.stdout)
+        .context("invalid supervisor capability response from upgrade executable")?;
+    anyhow::ensure!(
+        capabilities.version == claimed_version,
+        "upgrade executable version changed during preflight: expected {claimed_version}, found {}",
+        capabilities.version
+    );
+    anyhow::ensure!(
+        capabilities.control_protocol == CONTROL_PROTOCOL_VERSION,
+        "supervisor control protocol {} is incompatible with running protocol {}",
+        capabilities.control_protocol,
+        CONTROL_PROTOCOL_VERSION
+    );
+    anyhow::ensure!(
+        capabilities.lifecycle_schema == LIFECYCLE_SCHEMA_VERSION,
+        "lifecycle schema {} is incompatible with running schema {}",
+        capabilities.lifecycle_schema,
+        LIFECYCLE_SCHEMA_VERSION
+    );
+    anyhow::ensure!(
+        capabilities.upgrade_plan_schema == UPGRADE_PLAN_SCHEMA_VERSION,
+        "upgrade plan schema {} is incompatible with running schema {}",
+        capabilities.upgrade_plan_schema,
+        UPGRADE_PLAN_SCHEMA_VERSION
+    );
+    Ok((path, capabilities))
+}
+
+async fn write_control_error(stream: &mut UnixStream, error: &anyhow::Error) -> Result<()> {
+    let response = json!({
+        "ok": false,
+        "result": Value::Null,
+        "error": format!("{error:#}"),
+    });
+    stream.write_all(&encode_line(&response)?).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+async fn handle_upgrade_request(
+    mut stream: UnixStream,
+    supervisor: Arc<SessionSupervisor>,
+    executable: PathBuf,
+    target_version: String,
+    environment: CapturedStartEnvironment,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    let preflight: Result<(PathBuf, SupervisorUpgradePlan)> = async {
+        environment.validate()?;
+        let (executable, capabilities) = validate_upgrade_executable(&executable, &target_version)?;
+        let plan = supervisor
+            .build_upgrade_plan(
+                &target_version,
+                capabilities.control_protocol,
+                capabilities.lifecycle_schema,
+                &environment,
+                !dry_run,
+                force,
+            )
+            .await?;
+        Ok((executable, plan))
+    }
+    .await;
+    let (executable, plan) = match preflight {
+        Ok(value) => value,
+        Err(error) => {
+            write_control_error(&mut stream, &error).await?;
+            return Ok(());
+        }
+    };
+
+    if dry_run || !plan.handoff_required {
+        let response = json!({"ok": true, "result": plan, "error": Value::Null});
+        stream.write_all(&encode_line(&response)?).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
+    let plan_path = match write_upgrade_plan(&plan) {
+        Ok(path) => path,
+        Err(error) => {
+            supervisor.clear_upgrade_fence();
+            write_control_error(&mut stream, &error).await?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = supervisor.quiesce_for_upgrade(&plan).await {
+        let _ = remove_upgrade_plan(&plan_path);
+        write_control_error(&mut stream, &error).await?;
+        return Ok(());
+    }
+    let response = json!({
+        "ok": true,
+        "result": {
+            "plan": plan,
+            "handoff": "accepted"
+        },
+        "error": Value::Null
+    });
+    if let Err(error) = stream.write_all(&encode_line(&response)?).await {
+        let rollback = supervisor.rollback_upgrade(&plan).await;
+        let _ = remove_upgrade_plan(&plan_path);
+        return match rollback {
+            Ok(()) => Err(error)
+                .context("failed to acknowledge supervisor upgrade; quiesce was rolled back"),
+            Err(rollback) => Err(anyhow::anyhow!(
+                "failed to acknowledge supervisor upgrade: {error}; rollback also failed: {rollback:#}"
+            )),
+        };
+    }
+    let _ = stream.shutdown().await;
+
+    if let Err(error) = supervisor.drain_for_upgrade(&plan).await {
+        let rollback = supervisor.rollback_upgrade(&plan).await;
+        let _ = remove_upgrade_plan(&plan_path);
+        return match rollback {
+            Ok(()) => Err(error).context("supervisor upgrade drain failed; sessions were restored"),
+            Err(rollback) => Err(anyhow::anyhow!(
+                "supervisor upgrade drain failed: {error:#}; rollback also failed: {rollback:#}"
+            )),
+        };
+    }
+
+    let mut command = std::process::Command::new(&executable);
+    command
+        .arg("supervisor")
+        .arg("--restore-plan")
+        .arg(&plan_path);
+    environment.apply_to_command(&mut command);
+    let exec_error = command.exec();
+
+    let rollback = supervisor.rollback_upgrade(&plan).await;
+    let _ = remove_upgrade_plan(&plan_path);
+    match rollback {
+        Ok(()) => {
+            Err(exec_error).context("failed to exec upgraded supervisor; sessions were restored")
+        }
+        Err(rollback) => Err(anyhow::anyhow!(
+            "failed to exec upgraded supervisor: {exec_error}; rollback also failed: {rollback:#}"
+        )),
+    }
+}
+
+fn upgrade_plan_directory() -> Result<PathBuf> {
+    Ok(config::state_dir()?.join("upgrade"))
+}
+
+fn write_upgrade_plan(plan: &SupervisorUpgradePlan) -> Result<PathBuf> {
+    let directory = upgrade_plan_directory()?;
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "failed to create upgrade plan directory {}",
+            directory.display()
+        )
+    })?;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let path = directory.join(format!("restore-{}.json", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(plan)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_UPGRADE_PLAN_BYTES,
+        "supervisor upgrade plan exceeds {MAX_UPGRADE_PLAN_BYTES} bytes"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("failed to create upgrade plan {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+fn validate_upgrade_plan_path(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("upgrade plan has no parent directory")?;
+    let expected = upgrade_plan_directory()?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("cannot resolve upgrade plan directory {}", parent.display()))?;
+    let expected = std::fs::canonicalize(&expected).with_context(|| {
+        format!(
+            "cannot resolve expected upgrade plan directory {}",
+            expected.display()
+        )
+    })?;
+    anyhow::ensure!(
+        parent == expected,
+        "restore plan must be inside {}",
+        expected.display()
+    );
+    anyhow::ensure!(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("restore-") && name.ends_with(".json")),
+        "invalid supervisor restore plan file name"
+    );
+    Ok(())
+}
+
+fn read_upgrade_plan(path: &Path) -> Result<SupervisorUpgradePlan> {
+    validate_upgrade_plan_path(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("cannot open supervisor restore plan {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "supervisor restore plan must be a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_UPGRADE_PLAN_BYTES as u64,
+        "supervisor restore plan exceeds {MAX_UPGRADE_PLAN_BYTES} bytes"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode & 0o077 == 0,
+        "supervisor restore plan must be owner-only (mode {mode:04o})"
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_UPGRADE_PLAN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_UPGRADE_PLAN_BYTES,
+        "supervisor restore plan exceeds {MAX_UPGRADE_PLAN_BYTES} bytes"
+    );
+    serde_json::from_slice(&bytes).context("invalid supervisor restore plan")
+}
+
+fn validate_restore_plan(plan: &SupervisorUpgradePlan) -> Result<()> {
+    anyhow::ensure!(
+        plan.plan_schema == UPGRADE_PLAN_SCHEMA_VERSION,
+        "unsupported supervisor restore plan schema"
+    );
+    anyhow::ensure!(
+        plan.control_protocol == CONTROL_PROTOCOL_VERSION,
+        "restore plan control protocol is incompatible"
+    );
+    anyhow::ensure!(
+        plan.lifecycle_schema == LIFECYCLE_SCHEMA_VERSION,
+        "restore plan lifecycle schema is incompatible"
+    );
+    anyhow::ensure!(
+        plan.target_version == env!("CARGO_PKG_VERSION"),
+        "restore plan target version does not match this binary"
+    );
+    Ok(())
+}
+
+fn remove_upgrade_plan(path: &Path) -> Result<()> {
+    validate_upgrade_plan_path(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove restore plan {}", path.display()))
+        }
+    }
+}
+
+pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
+    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+    let target_version = env!("CARGO_PKG_VERSION").to_owned();
+    let ping = request(ControlRequest::Ping).await?;
+    let source_version = ping
+        .get("version")
+        .and_then(Value::as_str)
+        .context("running supervisor did not report its version; bootstrap by restarting it once with a handoff-capable Temote release")?;
+    let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
+    anyhow::ensure!(
+        ping.get("control_protocol").and_then(Value::as_u64) == Some(CONTROL_PROTOCOL_VERSION),
+        "running supervisor control protocol is incompatible; manual supervisor restart is required"
+    );
+
+    let result = request(ControlRequest::Upgrade {
+        executable,
+        target_version: target_version.clone(),
+        environment: CapturedStartEnvironment::capture(),
+        dry_run,
+        force,
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "running supervisor {source_version} does not support safe handoff or rejected the upgrade; bootstrap with one manual supervisor restart if this is the first handoff-capable release"
+        )
+    })?;
+
+    if dry_run {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let plan_value = result
+        .get("plan")
+        .cloned()
+        .unwrap_or_else(|| result.clone());
+    let plan: SupervisorUpgradePlan = serde_json::from_value(plan_value)?;
+    if !plan.handoff_required {
+        println!("supervisor already runs Temote {target_version}; no handoff required");
+    } else {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "supervisor handoff did not become healthy within the bounded verification window; source version={source_version} pid={source_pid}, target version={target_version}"
+                );
+            }
+            match request(ControlRequest::Ping).await {
+                Ok(status)
+                    if status.get("version").and_then(Value::as_str)
+                        == Some(target_version.as_str())
+                        && status.get("pid").and_then(Value::as_u64) == Some(source_pid) =>
+                {
+                    let mut healthy = true;
+                    for session in &plan.sessions {
+                        match request(ControlRequest::Info {
+                            session_id: session.session_id.clone(),
+                        })
+                        .await
+                        {
+                            Ok(view)
+                                if view.get("status").and_then(Value::as_str) == Some("active") => {
+                            }
+                            _ => {
+                                healthy = false;
+                                break;
+                            }
+                        }
+                    }
+                    if healthy {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        println!(
+            "supervisor handoff complete: {source_version} -> {target_version}; restored {} session(s); pid={source_pid}",
+            plan.sessions.len()
+        );
+    }
+
+    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+    match std::process::Command::new(&executable)
+        .args(["codex", "plugin", "install"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if !text.trim().is_empty() {
+                println!("{}", text.trim());
+            }
+        }
+        Ok(output) => {
+            eprintln!(
+                "Codex plugin reconciliation failed (exit {}); run `temote-mcp codex plugin install` manually. An already-running Codex session must be restarted after plugin replacement.\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "Codex plugin reconciliation could not start: {error}; run `temote-mcp codex plugin install` manually. An already-running Codex session must be restarted after plugin replacement."
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn restart_session(
@@ -1090,9 +1584,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["status"], "active");
+        assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(result["pid"], std::process::id());
         assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
+        assert_eq!(result["upgrade_plan_schema"], UPGRADE_PLAN_SCHEMA_VERSION);
         assert_eq!(result["roots_configured"], true);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_executable_gate_rejects_incompatible_protocol_without_running_handoff() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("fake-temote");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\necho '{\"version\":\"test-version\",\"control_protocol\":999,\"lifecycle_schema\":1,\"upgrade_plan_schema\":1}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = validate_upgrade_executable(&executable, "test-version").unwrap_err();
+        assert!(error.to_string().contains("control protocol"), "{error:#}");
     }
 
     #[tokio::test]

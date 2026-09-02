@@ -54,6 +54,15 @@ temote-mcp up --profile cloudflare
 # temote-mcp up --profile openai
 ```
 
+installed binary を置き換えた後は、session ownership への適用を明示的に行います。
+
+```sh
+temote-mcp upgrade --dry-run
+temote-mcp upgrade
+```
+
+`upgrade` は target supervisor/control/lifecycle schema を停止前に検証し、lifecycle mutation を fence します。integration / approval operation が in-flight なら中止し、credential-bearing session は実行元 environment から memory-only の restart context を再現できる場合だけ続行します。owner-only restore plan に保存するのは restart-context のキー名までで、credential value は保存しません。active runtime を graceful drain した後、同じ PID のまま新 supervisor を `exec` し、handoff 前に active だった session を同じ ID / permission / restart policy で復元して全 socket を probe します。compatible direct ingress は稼働継続でき、protocol/schema 非互換は fail closed です。その後 binary-owned Codex Plugin を reconcile しますが、既に起動中の Codex client は再起動が必要です。この handoff protocol より古い supervisor からの初回移行だけは手動 restart が1回必要です。
+
 Direct `temote-mcp up` ingress は **public endpoint ごとに single-host** が契約です。`TEMOTE_MCP_HOST_ID=ubuntu1` のような stable かつ non-secret な host ID を設定すると、startup / `doctor` / supervisor / session diagnostics で host ownership を明示できます。未設定時は OS hostname に fallback します。同じ Cloudflare Tunnel token / hostname を複数 Temote host で direct-ingress replica として同時利用する構成は非対応です。Cloudflare の replica routing は Temote の session ownership を認識せず、session state は host-local のままだからです。1つの public endpoint から複数 host を扱う場合は、[multi-host Cloudflare gateway](docs/gateway.ja.md) の `temote-mcp gateway-agent` + Worker/Durable Objects gateway を使用します。
 
 認証済み MCP client からは次の順で利用します。

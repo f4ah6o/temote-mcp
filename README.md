@@ -55,6 +55,15 @@ temote-mcp up --profile cloudflare
 # temote-mcp up --profile openai
 ```
 
+After replacing the installed binary, apply it to session ownership explicitly:
+
+```sh
+temote-mcp upgrade --dry-run
+temote-mcp upgrade
+```
+
+`upgrade` validates the target supervisor/control/lifecycle schemas before stopping anything, fences lifecycle mutations, aborts when an integration/approval operation is in flight, and requires the invoking environment to reproduce each credential-bearing session's memory-only restart context. Its owner-only restore plan stores restart-context key names but never credential values. Active runtimes are gracefully drained, the new supervisor is `exec`'d with the same PID, the intended active sessions are recreated with their prior IDs/permissions/restart policy, and every restored socket is probed before success. Compatible direct ingress can remain running; incompatible protocol/schema changes fail closed. The binary-owned Codex plugin is reconciled afterward, but an already-running Codex client must be restarted. A supervisor from before this handoff protocol needs one manual restart to bootstrap the first transition.
+
 Direct `temote-mcp up` ingress is **single-host per public endpoint**. Set `TEMOTE_MCP_HOST_ID=ubuntu1` (or another stable non-secret identifier) to make host ownership explicit in startup, `doctor`, supervisor, and session diagnostics; when unset, Temote falls back to the OS hostname. Do not run the same Cloudflare Tunnel token/hostname concurrently on multiple Temote hosts as direct-ingress replicas: Cloudflare routing is not Temote-session-aware, while session state remains host-local. For one public endpoint spanning multiple hosts, use `temote-mcp gateway-agent` with the Worker/Durable Objects gateway described in [multi-host Cloudflare gateway](docs/gateway.md).
 
 An authenticated MCP client can then use:

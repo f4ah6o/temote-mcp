@@ -3,6 +3,7 @@ use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -118,6 +119,41 @@ impl CapturedStartEnvironment {
 
     pub(crate) fn values(&self) -> &BTreeMap<String, String> {
         &self.values
+    }
+
+    pub(crate) fn restart_context_keys(&self) -> Vec<String> {
+        self.values.keys().cloned().collect()
+    }
+
+    pub(crate) fn restart_context_mismatches(&self, available: &Self) -> Vec<String> {
+        self.values
+            .iter()
+            .filter(|(name, value)| available.values.get(*name) != Some(*value))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    pub(crate) fn select_restart_context(&self, keys: &[String]) -> Result<Self> {
+        let values = keys
+            .iter()
+            .map(|name| {
+                let value = self
+                    .values
+                    .get(name)
+                    .with_context(|| format!("restart context is missing {name}"))?;
+                Ok((name.clone(), value.clone()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let selected = Self { values };
+        selected.validate()?;
+        Ok(selected)
+    }
+
+    pub(crate) fn apply_to_command(&self, command: &mut std::process::Command) {
+        for name in CAPTURED_START_ENV_NAMES {
+            command.env_remove(name);
+        }
+        command.envs(&self.values);
     }
 
     #[cfg(test)]
@@ -521,6 +557,10 @@ enum RuntimeCommand {
     Snapshot {
         response: oneshot::Sender<Session>,
     },
+    SetUpgradeQuiesced {
+        value: bool,
+        response: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     CrashForTest,
     Shutdown,
@@ -591,6 +631,18 @@ impl RuntimeHandle {
         receiver
             .await
             .context("session runtime stopped before snapshot")
+    }
+
+    pub(crate) async fn set_upgrade_quiesced(&self, value: bool) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::SetUpgradeQuiesced { value, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before changing upgrade quiesce state")??;
+        Ok(())
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -886,6 +938,23 @@ async fn receive_session_message(
     let _ = queue_incoming_session_message(&sender, stream, message, permit);
 }
 
+struct ActiveOperationGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl ActiveOperationGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
+    }
+}
+
+impl Drop for ActiveOperationGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 async fn run_runtime(
     listener: UnixListener,
     session: &mut Session,
@@ -899,6 +968,8 @@ async fn run_runtime(
     let (incoming_sender, mut incoming_receiver) = mpsc::channel(MAX_PENDING_SESSION_READS);
     let read_slots = Arc::new(Semaphore::new(MAX_PENDING_SESSION_READS));
     let approval_slots = Arc::new(Semaphore::new(MAX_PENDING_APPROVALS));
+    let active_operations = Arc::new(AtomicUsize::new(0));
+    let mut upgrade_quiesced = false;
     loop {
         tokio::select! {
             connection = listener.accept() => {
@@ -919,6 +990,37 @@ async fn run_runtime(
             incoming = incoming_receiver.recv() => {
                 let Some(IncomingSessionMessage { mut stream, message, _permit }) = incoming else { continue };
                 drop(_permit);
+                if upgrade_quiesced && !matches!(&message, Message::Probe | Message::Activity { .. }) {
+                    match &message {
+                        Message::Approval { .. } => {
+                            let _ = stream.write_all(b"deny\n").await;
+                        }
+                        Message::OnePasswordServiceAccount { .. } => {
+                            let bytes = encode_session_result(
+                                Err(anyhow::anyhow!("session is quiesced for supervisor upgrade")),
+                                "1Password service-account response",
+                            );
+                            let _ = stream.write_all(&bytes).await;
+                        }
+                        Message::KintoneMcp { .. } => {
+                            let bytes = encode_session_result(
+                                Err(anyhow::anyhow!("session is quiesced for supervisor upgrade")),
+                                "kintone MCP response",
+                            );
+                            let _ = stream.write_all(&bytes).await;
+                        }
+                        Message::KintoneCli { .. } => {
+                            let bytes = encode_session_result(
+                                Err(anyhow::anyhow!("session is quiesced for supervisor upgrade")),
+                                "cli-kintone response",
+                            );
+                            let _ = stream.write_all(&bytes).await;
+                        }
+                        Message::Probe | Message::Activity { .. } => unreachable!(),
+                    }
+                    let _ = stream.shutdown().await;
+                    continue;
+                }
                 match message {
                     Message::Probe => {
                         if let Err(error) = stream.write_all(b"active\n").await {
@@ -931,7 +1033,9 @@ async fn run_runtime(
                     Message::OnePasswordServiceAccount { request } => {
                         let session = session.clone();
                         let token = service_account_token.map(str::to_owned);
+                        let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
+                            let _operation = operation;
                             let response = handle_service_account_request(&session, token.as_deref(), request).await;
                             let bytes = encode_session_result(response, "1Password service-account response");
                             let _ = stream.write_all(&bytes).await;
@@ -941,7 +1045,9 @@ async fn run_runtime(
                     Message::KintoneMcp { request } => {
                         let session = session.clone();
                         let bridge = Arc::clone(&kintone_bridge);
+                        let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
+                            let _operation = operation;
                             let response = handle_kintone_mcp_request(&session, bridge, request).await;
                             let bytes = encode_session_result(response, "kintone MCP response");
                             let _ = stream.write_all(&bytes).await;
@@ -951,7 +1057,9 @@ async fn run_runtime(
                     Message::KintoneCli { request } => {
                         let session = session.clone();
                         let bridge = Arc::clone(&kintone_cli_bridge);
+                        let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
+                            let _operation = operation;
                             let response = handle_kintone_cli_request(&session, bridge, request).await;
                             let bytes = encode_session_result(response, "cli-kintone response");
                             let _ = stream.write_all(&bytes).await;
@@ -994,7 +1102,9 @@ async fn run_runtime(
                             continue;
                         }
                         let mut runtime_alive = approval_lifetime.subscribe();
+                        let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
+                            let _operation = operation;
                             let _permit = permit;
                             let allowed = tokio::select! {
                                 response = receiver => response.unwrap_or(false),
@@ -1048,6 +1158,19 @@ async fn run_runtime(
                     }
                     RuntimeCommand::Snapshot { response } => {
                         let _ = response.send(session.clone());
+                    }
+                    RuntimeCommand::SetUpgradeQuiesced { value, response } => {
+                        let result = if value && active_operations.load(Ordering::Acquire) != 0 {
+                            Err(anyhow::anyhow!(
+                                "session {} has {} in-flight operation(s)",
+                                session.id,
+                                active_operations.load(Ordering::Acquire)
+                            ))
+                        } else {
+                            upgrade_quiesced = value;
+                            Ok(())
+                        };
+                        let _ = response.send(result);
                     }
                     #[cfg(test)]
                     RuntimeCommand::CrashForTest => {
@@ -1405,6 +1528,34 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[test]
+    fn restart_context_comparison_reports_keys_without_values() {
+        let captured = CapturedStartEnvironment::from_values(BTreeMap::from([
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("KINTONE_PASSWORD".to_owned(), "secret-a".to_owned()),
+        ]))
+        .unwrap();
+        let available = CapturedStartEnvironment::from_values(BTreeMap::from([
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("KINTONE_PASSWORD".to_owned(), "secret-b".to_owned()),
+            ("HOME".to_owned(), "/tmp/home".to_owned()),
+        ]))
+        .unwrap();
+        let mismatches = captured.restart_context_mismatches(&available);
+        assert_eq!(mismatches, ["KINTONE_PASSWORD"]);
+        assert_eq!(
+            captured.restart_context_keys(),
+            ["KINTONE_PASSWORD", "PATH"]
+        );
+        let selected = available
+            .select_restart_context(&["PATH".to_owned()])
+            .unwrap();
+        assert_eq!(selected.restart_context_keys(), ["PATH"]);
+        let rendered = format!("{mismatches:?}");
+        assert!(!rendered.contains("secret-a"));
+        assert!(!rendered.contains("secret-b"));
     }
 
     #[test]
