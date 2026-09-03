@@ -33,6 +33,7 @@ const MAX_SERVICE_ACCOUNT_ENV_VARS: usize = 64;
 const MAX_SERVICE_ACCOUNT_ENV_NAME_BYTES: usize = 128;
 const MAX_SERVICE_ACCOUNT_ENV_REF_BYTES: usize = 4096;
 const MAX_SERVICE_ACCOUNT_ALLOWED_LOCATORS: usize = 128;
+const REDACTED_TRUNCATED_SECRET_OUTPUT: &str = "[REDACTED_TRUNCATED_SECRET_OUTPUT]";
 const MAX_ACTIVITY_TITLE_BYTES: usize = 512;
 const MAX_ACTIVITY_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
@@ -204,6 +205,7 @@ enum ServiceAccountRequest {
         command: Vec<String>,
         env_files: Vec<PathBuf>,
         environment: BTreeMap<String, String>,
+        #[serde(default)]
         allowed_locators: Vec<String>,
     },
 }
@@ -279,6 +281,14 @@ fn encode_session_result(result: Result<Value>, label: &str) -> Vec<u8> {
         }))
         .expect("bounded session error response must fit"),
     }
+}
+
+pub(crate) fn ensure_approval_detail_fits(detail: &str) -> Result<()> {
+    anyhow::ensure!(
+        detail.len() <= MAX_APPROVAL_DETAIL_BYTES,
+        "approval detail exceeds {MAX_APPROVAL_DETAIL_BYTES} bytes; exact nested resolver locator scope cannot be displayed safely"
+    );
+    Ok(())
 }
 
 pub async fn request(
@@ -1419,22 +1429,45 @@ async fn service_account_run_with_op(
         None => Vec::new(),
     };
     let output = output.context("failed to run command through 1Password service account")?;
+    Ok(redact_service_account_output(
+        output,
+        token,
+        capability_token.as_deref(),
+        &resolved_secrets,
+    ))
+}
+
+fn redact_service_account_output(
+    output: sandbox::Output,
+    token: &str,
+    capability_token: Option<&str>,
+    resolved_secrets: &[String],
+) -> Value {
+    if output.truncated && !resolved_secrets.is_empty() {
+        return json!({
+            "exit_code": output.status,
+            "stdout": REDACTED_TRUNCATED_SECRET_OUTPUT,
+            "stderr": REDACTED_TRUNCATED_SECRET_OUTPUT,
+            "truncated": true,
+        });
+    }
+
     let mut stdout = redact_token(&output.stdout, token);
     let mut stderr = redact_token(&output.stderr, token);
-    if let Some(capability_token) = capability_token.as_deref() {
+    if let Some(capability_token) = capability_token {
         stdout = redact_value(&stdout, capability_token, "[REDACTED_RESOLVER_CAPABILITY]");
         stderr = redact_value(&stderr, capability_token, "[REDACTED_RESOLVER_CAPABILITY]");
     }
-    for secret in &resolved_secrets {
+    for secret in resolved_secrets {
         stdout = redact_value(&stdout, secret, "[REDACTED_SECRET]");
         stderr = redact_value(&stderr, secret, "[REDACTED_SECRET]");
     }
-    Ok(json!({
+    json!({
         "exit_code": output.status,
         "stdout": stdout,
         "stderr": stderr,
         "truncated": output.truncated,
-    }))
+    })
 }
 
 async fn service_account_read_secret_with_op(
@@ -1843,6 +1876,78 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("generated response exceeds"))
         );
+    }
+
+    #[test]
+    fn legacy_service_account_run_request_defaults_nested_locator_scope() {
+        let request: ServiceAccountRequest = serde_json::from_value(json!({
+            "operation": "run",
+            "cwd": "/tmp",
+            "command": ["true"],
+            "env_files": [],
+            "environment": {}
+        }))
+        .unwrap();
+        match request {
+            ServiceAccountRequest::Run {
+                allowed_locators, ..
+            } => {
+                assert!(allowed_locators.is_empty());
+            }
+            ServiceAccountRequest::Status => panic!("expected run request"),
+        }
+    }
+
+    #[test]
+    fn truncated_output_after_secret_resolution_is_fully_redacted() {
+        let secret = "resolved-secret-sensitive-value".to_owned();
+        let prefix = &secret[..8];
+        let stdout = format!(
+            "{}{}",
+            "x".repeat(sandbox::MAX_COMMAND_OUTPUT_BYTES - prefix.len()),
+            prefix
+        );
+        assert_eq!(stdout.len(), sandbox::MAX_COMMAND_OUTPUT_BYTES);
+        assert!(stdout.ends_with(prefix));
+
+        let result = redact_service_account_output(
+            sandbox::Output {
+                status: 0,
+                stdout,
+                stderr: String::new(),
+                truncated: true,
+            },
+            "service-account-token",
+            Some("resolver-capability-token"),
+            std::slice::from_ref(&secret),
+        );
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert_eq!(result["stdout"], REDACTED_TRUNCATED_SECRET_OUTPUT);
+        assert_eq!(result["stderr"], REDACTED_TRUNCATED_SECRET_OUTPUT);
+        assert_eq!(result["truncated"], true);
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("resolved-secret"));
+        assert!(!rendered.contains(prefix));
+        assert!(!rendered.contains("service-account-token"));
+        assert!(!rendered.contains("resolver-capability-token"));
+    }
+
+    #[test]
+    fn truncated_output_without_resolved_nested_secret_keeps_existing_capture_semantics() {
+        let result = redact_service_account_output(
+            sandbox::Output {
+                status: 7,
+                stdout: "ordinary-truncated-output".to_owned(),
+                stderr: "ordinary-error".to_owned(),
+                truncated: true,
+            },
+            "service-account-token",
+            None,
+            &[],
+        );
+        assert_eq!(result["stdout"], "ordinary-truncated-output");
+        assert_eq!(result["stderr"], "ordinary-error");
+        assert_eq!(result["truncated"], true);
     }
 
     #[tokio::test]

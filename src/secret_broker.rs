@@ -1,35 +1,50 @@
+#[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(target_os = "linux")]
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(target_os = "linux")]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, oneshot};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
+#[cfg(target_os = "linux")]
+use tokio::task::JoinSet;
+#[cfg(target_os = "linux")]
 use uuid::Uuid;
 
 pub const SOCKET_ENV: &str = "TEMOTE_MCP_SECRET_RESOLVER_SOCKET";
 pub const TOKEN_ENV: &str = "TEMOTE_MCP_SECRET_RESOLVER_TOKEN";
 
+#[cfg(target_os = "linux")]
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const MAX_LOCATOR_BYTES: usize = 4096;
+#[cfg(target_os = "linux")]
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type ResolveFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 pub type Resolver = Arc<dyn Fn(String) -> ResolveFuture + Send + Sync>;
 
+#[cfg(target_os = "linux")]
 #[derive(Deserialize)]
 struct ResolveRequest {
     token: String,
     locator: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct ResolveResponse<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +165,7 @@ pub fn validate_locator(locator: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_policy(allowed_locators: &[String]) -> Result<BTreeSet<String>> {
     anyhow::ensure!(
         !allowed_locators.is_empty(),
@@ -330,6 +346,7 @@ async fn write_response(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;

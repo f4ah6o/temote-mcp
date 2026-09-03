@@ -718,25 +718,12 @@ async fn call_tool(
                 &environment,
                 &allowed_locators,
             )?;
-            let detail = format!(
-                "argv: {}\nenv files: {}\nsecret env names: {}\nnested resolver locators: {}",
-                render_command(&command),
-                if env_files.is_empty() {
-                    "(none)".to_owned()
-                } else {
-                    env_files
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                },
-                if environment.is_empty() {
-                    "(none)".to_owned()
-                } else {
-                    environment.keys().cloned().collect::<Vec<_>>().join(", ")
-                },
-                allowed_locators.len()
-            );
+            let detail = service_account_approval_detail(
+                &command,
+                &env_files,
+                &environment,
+                &allowed_locators,
+            )?;
             if !approvals::request(
                 &session.id,
                 "onepassword_service_account_run",
@@ -1991,6 +1978,46 @@ fn safe_kintone_cli_summary(arguments: &[String], stdout_path: Option<&Path>) ->
     )
 }
 
+fn service_account_approval_detail(
+    command: &[String],
+    env_files: &[PathBuf],
+    environment: &std::collections::BTreeMap<String, String>,
+    allowed_locators: &[String],
+) -> Result<String> {
+    let locator_scope = if allowed_locators.is_empty() {
+        "(none)".to_owned()
+    } else {
+        allowed_locators
+            .iter()
+            .map(|locator| format!("- {locator}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let detail = format!(
+        "argv: {}\nenv files: {}\nsecret env names: {}\nnested resolver locators:\n{}",
+        render_command(command),
+        if env_files.is_empty() {
+            "(none)".to_owned()
+        } else {
+            env_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        if environment.is_empty() {
+            "(none)".to_owned()
+        } else {
+            environment.keys().cloned().collect::<Vec<_>>().join(", ")
+        },
+        locator_scope
+    );
+    if !allowed_locators.is_empty() {
+        approvals::ensure_approval_detail_fits(&detail)?;
+    }
+    Ok(detail)
+}
+
 fn render_command(command: &[String]) -> String {
     command
         .iter()
@@ -2067,6 +2094,80 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn service_account_approval_detail_lists_exact_nested_locator_scope() {
+        let env = std::collections::BTreeMap::from([(
+            "API_TOKEN".to_owned(),
+            "op://vault/env-item/password".to_owned(),
+        )]);
+        let single = service_account_approval_detail(
+            &["tool".to_owned()],
+            &[],
+            &env,
+            &["op://vault/item-a/password".to_owned()],
+        )
+        .unwrap();
+        assert!(single.contains("nested resolver locators:\n- op://vault/item-a/password"));
+        assert!(!single.contains("op://vault/env-item/password"));
+
+        let multiple = service_account_approval_detail(
+            &["tool".to_owned()],
+            &[],
+            &env,
+            &[
+                "op://vault/item-a/password".to_owned(),
+                "op://vault/item-b/client_secret".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(multiple.contains("- op://vault/item-a/password"));
+        assert!(multiple.contains("- op://vault/item-b/client_secret"));
+        assert!(!multiple.contains("resolved-secret-sensitive-value"));
+        assert!(!multiple.contains("service-account-token"));
+    }
+
+    #[test]
+    fn service_account_approval_detail_distinguishes_equal_sized_locator_sets() {
+        let left = service_account_approval_detail(
+            &["tool".to_owned()],
+            &[],
+            &std::collections::BTreeMap::new(),
+            &[
+                "op://vault/item-a/password".to_owned(),
+                "op://vault/item-b/password".to_owned(),
+            ],
+        )
+        .unwrap();
+        let right = service_account_approval_detail(
+            &["tool".to_owned()],
+            &[],
+            &std::collections::BTreeMap::new(),
+            &[
+                "op://vault/item-a/password".to_owned(),
+                "op://high-value-vault/admin/root-token".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_ne!(left, right);
+        assert!(left.contains("op://vault/item-b/password"));
+        assert!(right.contains("op://high-value-vault/admin/root-token"));
+    }
+
+    #[test]
+    fn service_account_approval_detail_rejects_unrenderable_nested_scope() {
+        let locators = (0..32)
+            .map(|index| format!("op://vault/item-{index}/{}", "x".repeat(3000)))
+            .collect::<Vec<_>>();
+        let error = service_account_approval_detail(
+            &["tool".to_owned()],
+            &[],
+            &std::collections::BTreeMap::new(),
+            &locators,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be displayed safely"));
+    }
 
     #[tokio::test]
     async fn bounded_stdio_reader_discards_oversized_line_and_recovers() {
