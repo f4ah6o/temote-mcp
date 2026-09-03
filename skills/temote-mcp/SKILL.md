@@ -95,7 +95,7 @@ For general item reads, prefer `onepassword_item_get`. Put all items needed for 
 
 For `op://` field resolution on macOS, prefer `onepassword_secret_resolve` when an account name/UUID is known. Batch all references needed for one step. Temote reuses an official 1Password Desktop SDK client in an isolated sidecar and falls back to one batched official CLI invocation if SDK authorization is unavailable. Treat the returned string array as secrets and never echo it into logs or summaries. Desktop SDK authorization is separate from `op` CLI sign-in.
 
-For service-account workflows, use `onepassword_service_account_status` before assuming a token exists. `onepassword_service_account_run` accepts `op://...` references and checked-in env templates; do not replace secret references with plaintext.
+For service-account workflows, use `onepassword_service_account_status` before assuming a token exists. `onepassword_service_account_run` accepts `op://...` references and checked-in env templates; do not replace secret references with plaintext. Prefer `environment` / `env_files` when secrets are known before startup. If a Linux child must resolve reviewed secrets later through its own `SecretReader`, pass only the required exact references in `allowed_locators`; this enables the per-invocation Temote resolver without exposing `OP_SERVICE_ACCOUNT_TOKEN`. Do not request a broad locator set, and do not implement plaintext or interactive fallback when the resolver fails.
 
 ## kintone bridge
 

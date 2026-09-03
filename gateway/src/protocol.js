@@ -265,7 +265,7 @@ export const PUBLIC_TOOLS = [
   tool(
     "onepassword_service_account_run",
     "Run with 1Password service-account secrets",
-    "Run a host command through op run using the service-account token held by the selected temote-mcp start process. 1Password CLI output masking remains enabled; normal sessions require host approval.",
+    "Run a host command through op run using the service-account token held by the selected temote-mcp start process. Optional allowed_locators enables exact per-invocation nested resolution on Linux without forwarding the service-account token; normal sessions require host approval.",
     networkMutation,
     schema(
       {
@@ -274,6 +274,11 @@ export const PUBLIC_TOOLS = [
         cwd: { type: "string" },
         env_files: { type: "array", items: { type: "string" } },
         environment: { type: "object", additionalProperties: { type: "string" } },
+        allowed_locators: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 128,
+        },
       },
       ["session_id", "command"],
     ),

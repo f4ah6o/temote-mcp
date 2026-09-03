@@ -583,6 +583,13 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "allowed_locators": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 128,
+            "type": "array"
+          },
           "command": {
             "items": {
               "type": "string"

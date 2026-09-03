@@ -1,6 +1,9 @@
 # Nested 1Password secret resolution without exposing the service-account token
 
 Date: 2026-09-03
+Status: closed
+Updated: 2026-09-03
+Branch: feat/nested-onepassword-secret-resolution
 
 ## Background
 
@@ -232,19 +235,19 @@ The original reproduction is a useful integration test shape:
 
 ## Acceptance criteria
 
-- [ ] a Temote-launched child can resolve an explicitly authorized `op://` locator after startup
-- [ ] `OP_SERVICE_ACCOUNT_TOKEN` remains absent from the child environment
-- [ ] the child cannot read the raw Service Account token through the capability
-- [ ] unapproved locators fail closed before `op read`
-- [ ] capability scope is per invocation/session and becomes unusable after cleanup
-- [ ] resolved values are not persisted in worktree/runtime/lifecycle files
-- [ ] secret values and raw tokens are absent from logs and error messages
-- [ ] concurrent invocations cannot use each other's resolver capability
-- [ ] normal `onepassword_service_account_run` behavior remains backward-compatible
-- [ ] existing approval/yolo semantics remain unchanged
-- [ ] Linux tests cover success, denied locator, dead capability, concurrent isolation, and child-token absence
-- [ ] macOS uses an equivalent secure local capability or explicitly fails closed until supported
-- [ ] documentation explains when to use direct environment substitution versus nested resolution
+- [x] a Temote-launched child can resolve an explicitly authorized `op://` locator after startup
+- [x] `OP_SERVICE_ACCOUNT_TOKEN` remains absent from the child environment
+- [x] the child cannot read the raw Service Account token through the capability
+- [x] unapproved locators fail closed before `op read`
+- [x] capability scope is per invocation/session and becomes unusable after cleanup
+- [x] resolved values are not persisted in worktree/runtime/lifecycle files
+- [x] secret values and raw tokens are absent from logs and error messages
+- [x] concurrent invocations cannot use each other's resolver capability
+- [x] normal `onepassword_service_account_run` behavior remains backward-compatible
+- [x] existing approval/yolo semantics remain unchanged
+- [x] Linux tests cover success, denied locator, dead capability, concurrent isolation, and child-token absence
+- [x] macOS uses an equivalent secure local capability or explicitly fails closed until supported
+- [x] documentation explains when to use direct environment substitution versus nested resolution
 
 ## Required tests
 
@@ -262,3 +265,29 @@ The original reproduction is a useful integration test shape:
 ## Implementation note
 
 The current behavior of stripping `OP_SERVICE_ACCOUNT_TOKEN` from the target is a security feature and should remain the default. This issue should add a narrower secret-resolution capability rather than weakening that boundary.
+
+
+## Implementation result
+
+- `onepassword_service_account_run` に optional `allowed_locators` を追加し、既存の `environment` / `env_files` path を変更せず nested resolution を opt-in にした。
+- Linux では invocation ごとに owner-only directory + Unix-domain socket を作成し、random capability token と exact locator allowlist で broker access を制限する。peer UID も検証する。
+- child に渡すのは `TEMOTE_MCP_SECRET_RESOLVER_SOCKET` / `TEMOTE_MCP_SECRET_RESOLVER_TOKEN` のみで、`OP_SERVICE_ACCOUNT_TOKEN` は引き続き `/usr/bin/env -u` で除去する。
+- allowlist 外・malformed locator は `op read` 前に拒否し、broker backend error は secret/token を含まない generic error に変換する。
+- broker 経由で取得された値と capability token は command の captured stdout/stderr から redaction し、broker close 時に socket/directory を削除する。
+- concurrent broker の capability cross-use と close 後 reuse を fail-closed にするテストを追加した。
+- process-boundary test では Temote 起動 child が raw Service Account token なしで startup 後に broker へ接続し、allowed secret を取得できることを確認した。child が取得値を stdout へ出しても `[REDACTED_SECRET]` になる。
+- macOS など Linux 以外は `allowed_locators` 使用時に明示的に fail closed とし、従来の non-nested service-account execution は維持する。
+- Rust MCP schema / gateway routed-tool contract / English/Japanese docs / Temote Agent Skill を同期した。
+
+## Verification
+
+- `cargo fmt --all -- --check`: pass
+- `cargo test`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo check --no-default-features --all-targets`: pass（既存 feature-off dead-code warnings のみ）
+- `(cd gateway && npm test)`: 46/46 pass
+- `git diff --check`: pass
+
+## Completion
+
+上記 security boundary、nested resolution、cleanup、gateway parity、documentation、Linux process-boundary regression tests を実装・検証したため close する。

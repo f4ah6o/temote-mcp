@@ -399,7 +399,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"onepassword_item_get","title":"Batch-read 1Password items","description":"Read up to 100 1Password items by exact ID or title through the official op CLI. Temote resolves the requested items and fetches them in one batch; returned JSON may contain secret values. Normal sessions require local approval.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"items":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":100},"vault":{"type":"string"},"account":{"type":"string"}},"required":["session_id","items"],"additionalProperties":false}},
         {"name":"onepassword_secret_resolve","title":"Resolve 1Password secrets","description":"Resolve up to 100 op:// secret references. On macOS, Temote reuses a persistent 1Password Desktop SDK sidecar when authorized and falls back to one batched official op CLI path when the SDK is unavailable. Returned strings are secrets; normal sessions require local approval.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"account":{"type":"string"},"references":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":100}},"required":["session_id","account","references"],"additionalProperties":false}},
         {"name":"onepassword_service_account_status","title":"Check 1Password service account","description":"Check whether this temote-mcp session was started with a 1Password service-account token and whether 1Password CLI accepts it. The token is never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"onepassword_service_account_run","title":"Run with 1Password service-account secrets","description":"Run a host command through `op run` using the service-account token held only by the temote-mcp start process. 1Password CLI output masking remains enabled and OP_SERVICE_ACCOUNT_TOKEN is removed from the target command environment. Normal sessions require local approval; yolo sessions do not.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"env_files":{"type":"array","items":{"type":"string"}},"environment":{"type":"object","additionalProperties":{"type":"string"},"description":"Environment variable names mapped to op:// secret references. Plaintext values are rejected."}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"onepassword_service_account_run","title":"Run with 1Password service-account secrets","description":"Run a host command through `op run` using the service-account token held only by the temote-mcp start process. OP_SERVICE_ACCOUNT_TOKEN is removed from the target command environment. Optional allowed_locators enables a per-invocation Linux secret resolver for exact op:// references without forwarding the service-account token. Normal sessions require local approval; yolo sessions do not.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"env_files":{"type":"array","items":{"type":"string"}},"environment":{"type":"object","additionalProperties":{"type":"string"},"description":"Environment variable names mapped to op:// secret references. Plaintext values are rejected."},"allowed_locators":{"type":"array","items":{"type":"string"},"maxItems":128,"description":"Exact op:// references the launched process may resolve after startup through the per-invocation Temote secret resolver. Linux only; omitted keeps existing behavior."}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"kintone_mcp_status","title":"Check kintone MCP","description":"Check whether the selected temote-mcp session has the official kintone MCP server executable and required authentication configuration. Credential values are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"kintone_mcp_discover","title":"Discover kintone MCP","description":"List tool schemas exposed by the official kintone MCP server using credentials retained only by the selected temote-mcp start process.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"kintone_mcp_call","title":"Call a kintone MCP tool","description":"Call a tool exposed by the official kintone MCP server. All child tool calls are host-approval-gated in normal temote-mcp sessions because the upstream server does not currently annotate read-only versus mutating tools.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"tool_name":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}},"required":["session_id","tool_name","arguments"],"additionalProperties":false}},
@@ -707,9 +707,19 @@ async fn call_tool(
                 })
                 .transpose()?
                 .unwrap_or_default();
-            approvals::validate_service_account_run_input(&command, &env_files, &environment)?;
+            let allowed_locators = args
+                .get("allowed_locators")
+                .map(|_| required_string_array(&args, "allowed_locators"))
+                .transpose()?
+                .unwrap_or_default();
+            approvals::validate_service_account_run_input(
+                &command,
+                &env_files,
+                &environment,
+                &allowed_locators,
+            )?;
             let detail = format!(
-                "argv: {}\nenv files: {}\nsecret env names: {}",
+                "argv: {}\nenv files: {}\nsecret env names: {}\nnested resolver locators: {}",
                 render_command(&command),
                 if env_files.is_empty() {
                     "(none)".to_owned()
@@ -724,7 +734,8 @@ async fn call_tool(
                     "(none)".to_owned()
                 } else {
                     environment.keys().cloned().collect::<Vec<_>>().join(", ")
-                }
+                },
+                allowed_locators.len()
             );
             if !approvals::request(
                 &session.id,
@@ -742,6 +753,7 @@ async fn call_tool(
                 command,
                 env_files,
                 environment,
+                allowed_locators,
             )
             .await?;
             text_result(serde_json::to_string_pretty(&result)?)

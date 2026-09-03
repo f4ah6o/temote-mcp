@@ -48,7 +48,17 @@ The session process holds the token in memory; it is not written to session JSON
 - `onepassword_service_account_status` checks token presence and `op whoami` without returning the token.
 - `onepassword_service_account_run` runs a command through `op run`.
 
-Provide secret values as `op://...` references through `environment`, or use checked-in env templates through `env_files`. Plaintext secret values in `environment` are rejected. 1Password CLI output masking remains enabled and the target command does not directly inherit `OP_SERVICE_ACCOUNT_TOKEN`.
+Provide secret values as `op://...` references through `environment`, or use checked-in env templates through `env_files`. Plaintext secret values in `environment` are rejected. Use this direct substitution path when all required secrets are known before the command starts. 1Password CLI output masking remains enabled and the target command does not directly inherit `OP_SERVICE_ACCOUNT_TOKEN`.
+
+For an application that must resolve additional reviewed references after startup, pass the exact references in `allowed_locators`. On Linux, Temote creates a per-invocation Unix-domain-socket broker, injects only `TEMOTE_MCP_SECRET_RESOLVER_SOCKET` and `TEMOTE_MCP_SECRET_RESOLVER_TOKEN`, and performs each allowed `op read` inside the supervisor boundary. The capability token is random, restricted to that invocation and exact locator set, and is destroyed with the broker when the command exits. The raw service-account token is still removed from the target environment. On macOS, requesting `allowed_locators` currently fails closed; ordinary non-nested service-account execution is unchanged.
+
+The broker uses one JSON line per connection:
+
+```json
+{"token":"<TEMOTE_MCP_SECRET_RESOLVER_TOKEN>","locator":"op://vault/item/field"}
+```
+
+A successful response is `{"value":"..."}`; failures are `{"error":"..."}`. Clients should treat broker connection, authorization, locator, and resolution errors as hard failures and must not fall back to plaintext files or interactive credentials. Keep this protocol behind the application's `SecretReader` abstraction rather than coupling business logic to Temote. Temote removes the socket after the command and redacts the capability token and any values returned by the broker if the child later writes them to captured stdout/stderr. No resolved value or service-account token is persisted by the broker.
 
 Normal sessions still require host approval. `--yolo` removes that Temote MCP approval boundary.
 

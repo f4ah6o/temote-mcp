@@ -31,6 +31,7 @@ mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
+mod secret_broker;
 mod session_control;
 mod supervisor;
 #[cfg(test)]
