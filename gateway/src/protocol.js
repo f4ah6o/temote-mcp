@@ -258,14 +258,14 @@ export const PUBLIC_TOOLS = [
   tool(
     "onepassword_service_account_status",
     "Check 1Password service account",
-    "Check whether the selected host session has a service-account token and whether 1Password CLI accepts it. The token is never returned.",
+    "Check whether the selected host session has a service-account token and whether a process-isolated 1Password CLI accepts it. The token is never returned.",
     { ...readOnly, openWorldHint: true },
     schema(sessionProperty, ["session_id"]),
   ),
   tool(
     "onepassword_service_account_run",
     "Run with 1Password service-account secrets",
-    "Run a host command through op run using the service-account token held by the selected temote-mcp start process. 1Password CLI output masking remains enabled; normal sessions require host approval.",
+    "Resolve reviewed op:// inputs before target startup using the selected process-inspection-protected Temote service account, then launch the target without the raw token. Linux raw-token CLI calls require a protected setgid 1Password CLI installation, and Linux service-account targets run with a private PID namespace/private /proc. Optional allowed_locators exposes only pre-resolved exact references through a process-tree-bound per-invocation Linux broker; normal sessions require host approval.",
     networkMutation,
     schema(
       {
@@ -274,6 +274,11 @@ export const PUBLIC_TOOLS = [
         cwd: { type: "string" },
         env_files: { type: "array", items: { type: "string" } },
         environment: { type: "object", additionalProperties: { type: "string" } },
+        allowed_locators: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 128,
+        },
       },
       ["session_id", "command"],
     ),

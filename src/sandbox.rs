@@ -18,6 +18,25 @@ mod policy;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
 
+pub fn protect_current_process_if_service_account_token_present() -> Result<()> {
+    if std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_some() {
+        protect_current_process_from_peer_inspection()?;
+    }
+    Ok(())
+}
+
+pub fn protect_current_process_from_peer_inspection() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to disable peer process inspection");
+        }
+    }
+    Ok(())
+}
+
 pub struct Output {
     pub status: i32,
     pub stdout: String,
@@ -370,6 +389,111 @@ pub async fn run_unrestricted_with_env(
         .await
 }
 
+pub async fn run_unrestricted_with_env_and_spawn_hook<F>(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
+    run_unrestricted_with_env_mode_and_spawn_hook(
+        command,
+        cwd,
+        stdin,
+        environment,
+        remove_environment,
+        false,
+        on_spawn,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+pub async fn run_unrestricted_with_env_and_spawn_hook_private_pid<F>(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    let bwrap = trusted_service_account_bwrap()?;
+    let mut wrapped = vec![
+        bwrap.to_string_lossy().into_owned(),
+        "--bind".to_owned(),
+        "/".to_owned(),
+        "/".to_owned(),
+        "--dev-bind".to_owned(),
+        "/dev".to_owned(),
+        "/dev".to_owned(),
+        "--proc".to_owned(),
+        "/proc".to_owned(),
+        "--unshare-pid".to_owned(),
+        "--die-with-parent".to_owned(),
+        "--new-session".to_owned(),
+        "--chdir".to_owned(),
+        cwd.to_string_lossy().into_owned(),
+        "--".to_owned(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    run_unrestricted_with_env_mode_and_spawn_hook(
+        &wrapped,
+        &cwd,
+        stdin,
+        environment,
+        remove_environment,
+        false,
+        on_spawn,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_service_account_bwrap() -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    for candidate in [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")] {
+        let Ok(path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("failed to inspect bubblewrap at {}", path.display()))?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o111 == 0
+            || metadata.mode() & 0o022 != 0
+        {
+            continue;
+        }
+        let mut trusted = true;
+        for ancestor in path.ancestors().skip(1) {
+            let metadata = std::fs::metadata(ancestor).with_context(|| {
+                format!("failed to inspect bubblewrap parent {}", ancestor.display())
+            })?;
+            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                trusted = false;
+                break;
+            }
+        }
+        if trusted {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!(
+        "service-account target isolation requires a root-owned, non-writable /usr/bin/bwrap"
+    )
+}
+
 pub async fn run_unrestricted_with_only_env(
     command: &[String],
     cwd: &Path,
@@ -387,6 +511,30 @@ async fn run_unrestricted_with_env_mode(
     remove_environment: &[&str],
     clear_environment: bool,
 ) -> Result<Output> {
+    run_unrestricted_with_env_mode_and_spawn_hook(
+        command,
+        cwd,
+        stdin,
+        environment,
+        remove_environment,
+        clear_environment,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn run_unrestricted_with_env_mode_and_spawn_hook<F>(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+    clear_environment: bool,
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -410,9 +558,17 @@ async fn run_unrestricted_with_env_mode(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = process
+    let mut child = process
         .spawn()
         .context("failed to start unsandboxed command")?;
+    let pid = child
+        .id()
+        .context("unsandboxed child PID is unavailable after spawn")?;
+    if let Err(error) = on_spawn(pid) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
     wait_with_limited_output(child, stdin).await
 }
 
@@ -940,6 +1096,208 @@ mod linux_tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+        Ok(())
+    }
+
+    fn proc_environ_contains(pid: u32, marker: &[u8]) -> Result<bool> {
+        match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(bytes) => Ok(bytes.windows(marker.len()).any(|window| window == marker)),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[test]
+    fn service_account_startup_environment_is_process_inspection_protected() -> Result<()> {
+        const ROLE: &str = "TEMOTE_TEST_STARTUP_ENV_PROTECTION_ROLE";
+        const MARKER: &str = "fabricated-startup-token-7f2c";
+        const TEST_NAME: &str = "sandbox::linux_tests::service_account_startup_environment_is_process_inspection_protected";
+
+        if std::env::var(ROLE).as_deref() == Ok("fixture") {
+            assert_eq!(
+                std::env::var("OP_SERVICE_ACCOUNT_TOKEN").as_deref(),
+                Ok(MARKER)
+            );
+            protect_current_process_if_service_account_token_present()?;
+            let supervisor_pid = std::process::id();
+            let output = std::process::Command::new("/bin/cat")
+                .arg(format!("/proc/{supervisor_pid}/environ"))
+                .output()?;
+            assert!(
+                !output.status.success()
+                    || !output
+                        .stdout
+                        .windows(MARKER.len())
+                        .any(|window| window == MARKER.as_bytes()),
+                "target child recovered the supervisor startup token"
+            );
+            return Ok(());
+        }
+
+        let current_exe = std::env::current_exe()?;
+        let output = std::process::Command::new(current_exe)
+            .env("OP_SERVICE_ACCOUNT_TOKEN", MARKER)
+            .env(ROLE, "fixture")
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "startup environment protection fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_processes_cannot_inspect_sensitive_supervisor_or_cli() -> Result<()> {
+        const ROLE: &str = "TEMOTE_TEST_CROSS_SUPERVISOR_ROLE";
+        const PID_FILE_ENV: &str = "TEMOTE_TEST_CROSS_SUPERVISOR_PID_FILE";
+        const SUPERVISOR_PID_ENV: &str = "TEMOTE_TEST_CROSS_SUPERVISOR_B_PID";
+        const SENSITIVE_PID_ENV: &str = "TEMOTE_TEST_CROSS_SUPERVISOR_SENSITIVE_PID";
+        const MARKER: &str = "fabricated-cross-supervisor-token-91ab";
+        const TEST_NAME: &str = "sandbox::linux_tests::independent_processes_cannot_inspect_sensitive_supervisor_or_cli";
+
+        match std::env::var(ROLE).as_deref() {
+            Ok("supervisor-b") => {
+                protect_current_process_if_service_account_token_present()?;
+                let pid_file = std::env::var(PID_FILE_ENV)?;
+                let mut child = std::process::Command::new("/bin/sleep")
+                    .arg("2")
+                    .env("OP_SERVICE_ACCOUNT_TOKEN", MARKER)
+                    .spawn()?;
+                std::fs::write(&pid_file, child.id().to_string())?;
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+            Ok("supervisor-a") => {
+                let supervisor_pid = std::env::var(SUPERVISOR_PID_ENV)?.parse::<u32>()?;
+                let sensitive_pid = std::env::var(SENSITIVE_PID_ENV)?.parse::<u32>()?;
+                let command = command(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        &format!(
+                            r#"
+set -eu
+if [ -e /proc/{supervisor_pid}/environ ]; then
+  exit 91
+fi
+if [ -e /proc/{sensitive_pid}/environ ]; then
+  exit 92
+fi
+for path in /proc/[0-9]*/environ; do
+  if grep -a -F -q '{MARKER}' "$path" 2>/dev/null; then
+    exit 93
+  fi
+done
+"#
+                        ),
+                    ],
+                );
+                let output = run_unrestricted_with_env_and_spawn_hook_private_pid(
+                    &command,
+                    Path::new("/tmp"),
+                    None,
+                    &HashMap::new(),
+                    &[],
+                    |_| Ok(()),
+                )
+                .await?;
+                anyhow::ensure!(
+                    output.status == 0,
+                    "supervisor A target observed host credential process: {}",
+                    output.stderr
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let root = tempfile::tempdir()?;
+        let pid_file = root.path().join("sensitive.pid");
+        let current_exe = std::env::current_exe()?;
+        let mut supervisor_b = std::process::Command::new(&current_exe)
+            .env("OP_SERVICE_ACCOUNT_TOKEN", MARKER)
+            .env(ROLE, "supervisor-b")
+            .env(PID_FILE_ENV, &pid_file)
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .spawn()?;
+        let supervisor_b_pid = supervisor_b.id();
+
+        for _ in 0..200 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        anyhow::ensure!(
+            pid_file.exists(),
+            "supervisor B never started sensitive CLI fixture"
+        );
+        let sensitive_pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+        anyhow::ensure!(
+            proc_environ_contains(sensitive_pid, MARKER.as_bytes())?,
+            "fixture did not expose the sibling credential environment on the host"
+        );
+
+        let supervisor_a = std::process::Command::new(&current_exe)
+            .env(ROLE, "supervisor-a")
+            .env(SUPERVISOR_PID_ENV, supervisor_b_pid.to_string())
+            .env(SENSITIVE_PID_ENV, sensitive_pid.to_string())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .output()?;
+        anyhow::ensure!(
+            supervisor_a.status.success(),
+            "supervisor A isolation fixture failed: {}",
+            String::from_utf8_lossy(&supervisor_a.stderr)
+        );
+        let status = supervisor_b.wait()?;
+        anyhow::ensure!(status.success(), "supervisor B fixture failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_account_private_pid_namespace_hides_host_peer_environments() -> Result<()> {
+        const MARKER: &str = "fabricated-host-peer-token-c8f4";
+
+        let mut peer = std::process::Command::new("/bin/sleep")
+            .arg("2")
+            .env("OP_SERVICE_ACCOUNT_TOKEN", MARKER)
+            .spawn()?;
+        let peer_pid = peer.id();
+        let command = command(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    r#"
+set -eu
+if [ -e /proc/{peer_pid}/environ ]; then
+  exit 91
+fi
+for path in /proc/[0-9]*/environ; do
+  if grep -a -F -q '{MARKER}' "$path" 2>/dev/null; then
+    exit 92
+  fi
+done
+"#
+                ),
+            ],
+        );
+        let output = run_unrestricted_with_env_and_spawn_hook_private_pid(
+            &command,
+            Path::new("/tmp"),
+            None,
+            &HashMap::new(),
+            &[],
+            |_| Ok(()),
+        )
+        .await?;
+        let _ = peer.kill();
+        let _ = peer.wait();
+        assert_eq!(output.status, 0, "{}", output.stderr);
         Ok(())
     }
 

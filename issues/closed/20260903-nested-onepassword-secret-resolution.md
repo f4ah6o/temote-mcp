@@ -1,6 +1,9 @@
 # Nested 1Password secret resolution without exposing the service-account token
 
 Date: 2026-09-03
+Status: closed
+Updated: 2026-09-03
+Branch: feat/nested-onepassword-secret-resolution
 
 ## Background
 
@@ -232,19 +235,19 @@ The original reproduction is a useful integration test shape:
 
 ## Acceptance criteria
 
-- [ ] a Temote-launched child can resolve an explicitly authorized `op://` locator after startup
-- [ ] `OP_SERVICE_ACCOUNT_TOKEN` remains absent from the child environment
-- [ ] the child cannot read the raw Service Account token through the capability
-- [ ] unapproved locators fail closed before `op read`
-- [ ] capability scope is per invocation/session and becomes unusable after cleanup
-- [ ] resolved values are not persisted in worktree/runtime/lifecycle files
-- [ ] secret values and raw tokens are absent from logs and error messages
-- [ ] concurrent invocations cannot use each other's resolver capability
-- [ ] normal `onepassword_service_account_run` behavior remains backward-compatible
-- [ ] existing approval/yolo semantics remain unchanged
-- [ ] Linux tests cover success, denied locator, dead capability, concurrent isolation, and child-token absence
-- [ ] macOS uses an equivalent secure local capability or explicitly fails closed until supported
-- [ ] documentation explains when to use direct environment substitution versus nested resolution
+- [x] a Temote-launched child can resolve an explicitly authorized `op://` locator after startup
+- [x] `OP_SERVICE_ACCOUNT_TOKEN` remains absent from the child environment
+- [x] the child cannot read the raw Service Account token through the capability
+- [x] unapproved locators fail closed before `op read`
+- [x] capability scope is per invocation/session and becomes unusable after cleanup
+- [x] resolved values are not persisted in worktree/runtime/lifecycle files
+- [x] secret values and raw tokens are absent from logs and error messages
+- [x] concurrent invocations cannot use each other's resolver capability
+- [x] normal `onepassword_service_account_run` behavior remains backward-compatible
+- [x] existing approval/yolo semantics remain unchanged
+- [x] Linux tests cover success, denied locator, dead capability, concurrent isolation, and child-token absence
+- [x] macOS uses an equivalent secure local capability or explicitly fails closed until supported
+- [x] documentation explains when to use direct environment substitution versus nested resolution
 
 ## Required tests
 
@@ -262,3 +265,31 @@ The original reproduction is a useful integration test shape:
 ## Implementation note
 
 The current behavior of stripping `OP_SERVICE_ACCOUNT_TOKEN` from the target is a security feature and should remain the default. This issue should add a narrower secret-resolution capability rather than weakening that boundary.
+
+
+## Implementation result
+
+- `onepassword_service_account_run` に optional `allowed_locators` を追加し、既存の `environment` / `env_files` path を変更せず nested resolution を opt-in にした。
+- service-account token を持つ `op run` / `op read` は **untrusted target 起動前に完了**させる。direct environment substitution は supervisor memory に capture し、nested `allowed_locators` は exact locator-to-value map として事前解決する。Linux supervisor は startup token を検出すると command parse 前に `PR_SET_DUMPABLE=0` を適用し、upgrade / re-exec 時は raw token を startup environment に再注入せず mode 000 の sealed anonymous FD で引き継ぐ。raw-token CLI は root-owned / non-writable / setgid で、setgid group が Temote user から利用不能な `op` executable の場合だけ許可し、`fs.suid_dumpable=1` は fail closed にする。さらに service-account target は private PID namespace + private `/proc` で起動する。これにより process-local lock を credential boundary とせず、独立 supervisor 間でも target から raw token-bearing host process を観測できない OS-level boundary にした。
+- Linux では invocation ごとに owner-only directory + Unix-domain socket を作成する。broker は事前解決済み map だけを返し、target 起動後に 1Password API / `op read` を呼ばない。
+- broker authorization は random capability token + peer UID に加え、`SO_PEERCRED` PID が bind 済み target root PID またはその descendant であることを `/proc/<pid>/stat` の parent chain / start time で検証する。same-UID の別 invocation が token/socket を知っていても process identity 外なら deny する。
+- broker connection concurrency は invocation ごとに bounded とし、shutdown 時には active connection task を deterministic に cancel する。target 起動後の resolver/API call 自体を廃止したため、unbounded `op read` / resolver timeout surface も除去した。
+- locator validation は control character に加えて bidi override/isolate、zero-width 等の operator-visible identity を壊す Unicode format character を reject する。通常の日本語 locator は許可する。
+- capability token が存在する invocation では、resolved secret がまだ使われていなくても captured output が truncation された場合は stdout/stderr を fail-closed に全面抑止する。direct/nested の解決済み secret と raw token も output から redaction する。`env_files` は value に `op://` を含む assignment だけを secret-bearing として登録し、曖昧な assignment syntax は fail closed にするため、`MODE=production` や `RETRY=1` のような非secret値を誤って全面 redaction しない。
+- process-boundary regression は fabricated token を実際の `temote-mcp` startup environment に入れ、actual binary の `/proc/<pid>/environ` から取得できないことを確認する。さらに独立 supervisor/process fixture を使い、target A から protected supervisor B と exec-time credential boundary を持つ token-bearing helper の environment を取得できないことを host integration で確認する。正しい broker token/socket を知る process-tree 外の same-UID process も deny される。
+- process-local RW lock を削除したため、long-running service-account target 実行中でも別の status / pre-resolution operation を実行できる。
+- macOS など Linux 以外は `allowed_locators` 使用時に明示的に fail closed とし、従来の non-nested service-account execution は維持する。
+- Rust MCP schema / gateway routed-tool contract / English/Japanese docs / Temote Agent Skill を同期した。
+
+## Verification
+
+- `cargo fmt --all -- --check`: pass
+- `cargo test`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo check --no-default-features --all-targets`: pass（既存 feature-off dead-code warnings のみ）
+- `(cd gateway && npm test)`: 46/46 pass
+- `git diff --check`: pass
+
+## Completion
+
+上記 security boundary、nested resolution、cleanup、gateway parity、documentation、Linux process-boundary regression tests を実装・検証したため close する。

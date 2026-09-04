@@ -31,6 +31,7 @@ mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
+mod secret_broker;
 mod session_control;
 mod supervisor;
 #[cfg(test)]
@@ -52,6 +53,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    approvals::bootstrap_service_account_process_boundary()?;
     let cli = match cli::parse_env() {
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Ok(cli::ParseOutcome::Print(output)) => {

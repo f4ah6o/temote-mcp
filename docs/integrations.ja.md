@@ -46,9 +46,19 @@ OP_SERVICE_ACCOUNT_TOKEN='<service-account-token>' temote-mcp start my-project
 session process が token を memory に保持し、session JSON へ書かず、MCP tool から返しません。
 
 - `onepassword_service_account_status`: token の有無と `op whoami` を token 値を返さず確認
-- `onepassword_service_account_run`: `op run` 経由で command 実行
+- `onepassword_service_account_run`: reviewed な `op://` input を 1Password で事前解決してから target command を実行
 
-secret は `environment` に `op://...` reference として渡すか、`env_files` で checked-in template を指定します。`environment` の plaintext secret は拒否します。1Password CLI の output masking は維持され、target command は `OP_SERVICE_ACCOUNT_TOKEN` を直接継承しません。
+secret は `environment` に `op://...` reference として渡すか、`env_files` で checked-in template を指定します。`environment` の plaintext secret は拒否します。env file では value に `op://` reference を含む assignment だけを secret-bearing variable として redaction scope に登録し、対応外の assignment syntax は fail closed にします。command 開始前に必要な secret が確定している場合は、この直接 substitution を使います。Temote は token-bearing な `op run` substitution を supervisor memory 上で先に完了し、その CLI process の終了後に `OP_SERVICE_ACCOUNT_TOKEN` を持たない target を直接起動します。解決済み secret は target の captured output から redaction します。
+
+起動後に application 自身が追加の reviewed reference を解決する必要がある場合は、exact reference を `allowed_locators` に渡します。Linux では Temote が全 allowed locator を target 起動前に解決し、その exact locator-to-value map だけを invocation ごとの Unix domain socket broker に保持します。したがって token-bearing な `op read` process は untrusted target が存在する前に終了します。Service Account credential を持つ supervisor は request 処理前に peer process inspection を無効化し、supervisor upgrade / re-exec では raw token を新しい startup environment に戻さず、mode 000 の sealed anonymous FD で引き継ぎます。raw-token CLI の実行は kernel-enforced な process-inspection boundary を持つ `op` executable に限定し、root-owned・group/other 非writable・setgid・setgid group が Temote user から利用不能であること、および Linux `fs.suid_dumpable` が 0 または 2 であることを確認します。さらに service-account target は private PID namespace + private `/proc` 内で起動するため、自 supervisor / 別 supervisor の host process や token-bearing CLI を観測できません。child に渡すのは `TEMOTE_MCP_SECRET_RESOLVER_SOCKET` と `TEMOTE_MCP_SECRET_RESOLVER_TOKEN` だけで、broker はさらに接続 PID が bound target process またはその descendant であることを検証するため、same-UID の別 process が盗んだ capability を再利用できません。target 起動後に broker が追加の 1Password read を行うことはなく、command 終了時に破棄されます。long-running target は無関係な service-account status / resolution を block しません。macOS では現在 `allowed_locators` 指定時は fail closed とし、従来の non-nested service-account 実行は変更しません。
+
+broker は connection ごとに 1 JSON line を受け取ります。
+
+```json
+{"token":"<TEMOTE_MCP_SECRET_RESOLVER_TOKEN>","locator":"op://vault/item/field"}
+```
+
+成功 response は `{"value":"..."}`、失敗は `{"error":"..."}` です。client は broker connection / authorization / locator / resolution error を hard failure として扱い、plaintext file や interactive credential へ fallback してはいけません。business logic を Temote に直接依存させず、application の `SecretReader` abstraction の背後に protocol を閉じ込めてください。Temote は command 終了時に socket を削除し、child が broker capability token や broker から得た値を captured stdout/stderr へ出力しても redaction します。broker は resolved value や service-account token を永続化しません。
 
 通常 session では host approval が必要です。`--yolo` はこの Temote MCP approval boundary を外します。
 

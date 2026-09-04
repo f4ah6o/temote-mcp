@@ -818,8 +818,10 @@ async fn handle_upgrade_request(
         .arg("supervisor")
         .arg("--restore-plan")
         .arg(&plan_path);
-    environment.apply_to_command(&mut command);
+    let _exec_credential_handoff = environment.apply_to_command(&mut command)?;
     let exec_error = command.exec();
+    #[cfg(target_os = "linux")]
+    drop(_exec_credential_handoff);
 
     let rollback = supervisor.rollback_upgrade(&plan).await;
     let _ = remove_upgrade_plan(&plan_path);
