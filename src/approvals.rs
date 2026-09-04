@@ -1,5 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -44,11 +50,9 @@ const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_CAPTURED_START_ENV_TOTAL_BYTES: usize = 56 * 1024;
+const SERVICE_ACCOUNT_TOKEN_FD_ENV: &str = "TEMOTE_MCP_OP_SERVICE_ACCOUNT_TOKEN_FD";
+static INHERITED_SERVICE_ACCOUNT_TOKEN: OnceLock<String> = OnceLock::new();
 
-fn service_account_process_boundary() -> &'static RwLock<()> {
-    static BOUNDARY: OnceLock<RwLock<()>> = OnceLock::new();
-    BOUNDARY.get_or_init(|| RwLock::new(()))
-}
 const CAPTURED_START_ENV_NAMES: &[&str] = &[
     "OP_SERVICE_ACCOUNT_TOKEN",
     "KINTONE_BASE_URL",
@@ -72,6 +76,131 @@ const CAPTURED_START_ENV_NAMES: &[&str] = &[
     "LC_ALL",
 ];
 
+pub fn bootstrap_service_account_process_boundary() -> Result<()> {
+    let startup_token_present = std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_some();
+    let inherited_fd = std::env::var_os(SERVICE_ACCOUNT_TOKEN_FD_ENV);
+    if startup_token_present || inherited_fd.is_some() {
+        sandbox::protect_current_process_from_peer_inspection()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(raw_fd) = inherited_fd {
+        anyhow::ensure!(
+            !startup_token_present,
+            "service-account credential handoff is ambiguous"
+        );
+        let token = read_service_account_token_handoff(&raw_fd)?;
+        INHERITED_SERVICE_ACCOUNT_TOKEN.set(token).map_err(|_| {
+            anyhow::anyhow!("service-account credential handoff was already initialized")
+        })?;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if inherited_fd.is_some() {
+        anyhow::bail!("service-account credential FD handoff is unsupported on this platform");
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_service_account_token_handoff(raw_fd: &std::ffi::OsStr) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let raw_fd = raw_fd
+        .to_str()
+        .context("service-account credential FD is not valid UTF-8")?;
+    let fd = raw_fd
+        .parse::<libc::c_int>()
+        .context("service-account credential FD is invalid")?;
+    anyhow::ensure!(fd >= 3, "service-account credential FD is invalid");
+
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .context("failed to inspect service-account credential FD")?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.mode() & 0o777 == 0,
+        "service-account credential FD is not a protected anonymous file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_CAPTURED_START_ENV_VALUE_BYTES as u64,
+        "service-account credential exceeds {MAX_CAPTURED_START_ENV_VALUE_BYTES} bytes"
+    );
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    anyhow::ensure!(seals >= 0, "service-account credential FD is not sealable");
+    let required_seals =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    anyhow::ensure!(
+        seals & required_seals == required_seals,
+        "service-account credential FD is not fully sealed"
+    );
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut token = String::new();
+    file.take((MAX_CAPTURED_START_ENV_VALUE_BYTES + 1) as u64)
+        .read_to_string(&mut token)
+        .context("failed to read service-account credential handoff")?;
+    anyhow::ensure!(
+        !token.is_empty() && token.len() <= MAX_CAPTURED_START_ENV_VALUE_BYTES,
+        "service-account credential handoff is empty or oversized"
+    );
+    Ok(token)
+}
+
+#[cfg(target_os = "linux")]
+fn create_service_account_token_handoff(token: &str) -> Result<File> {
+    use std::ffi::CString;
+
+    anyhow::ensure!(
+        !token.is_empty() && token.len() <= MAX_CAPTURED_START_ENV_VALUE_BYTES,
+        "service-account credential is empty or oversized"
+    );
+    let name = CString::new("temote-service-account-token")?;
+    let mut fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create service-account credential handoff");
+    }
+    if fd < 3 {
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+        let duplicate_error = if duplicated < 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        unsafe {
+            libc::close(fd);
+        }
+        if let Some(error) = duplicate_error {
+            return Err(error).context("failed to reserve service-account credential FD");
+        }
+        fd = duplicated;
+    }
+
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(token.as_bytes())?;
+    file.flush()?;
+    file.seek(SeekFrom::Start(0))?;
+    let chmod = unsafe { libc::fchmod(file.as_raw_fd(), 0) };
+    if chmod != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to protect service-account credential handoff permissions");
+    }
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    let sealed = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    if sealed != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to seal service-account credential handoff");
+    }
+    Ok(file)
+}
+
+pub(crate) struct ExecCredentialHandoff {
+    #[cfg(target_os = "linux")]
+    _service_account_token: Option<File>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct CapturedStartEnvironment {
     #[serde(default)]
@@ -92,8 +221,15 @@ impl CapturedStartEnvironment {
         let values = CAPTURED_START_ENV_NAMES
             .iter()
             .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
+                let value = if *name == "OP_SERVICE_ACCOUNT_TOKEN" {
+                    INHERITED_SERVICE_ACCOUNT_TOKEN
+                        .get()
+                        .cloned()
+                        .or_else(|| std::env::var(name).ok())
+                } else {
+                    std::env::var(name).ok()
+                };
+                value
                     .filter(|value| !value.is_empty())
                     .map(|value| ((*name).to_owned(), value))
             })
@@ -156,11 +292,39 @@ impl CapturedStartEnvironment {
         Ok(selected)
     }
 
-    pub(crate) fn apply_to_command(&self, command: &mut std::process::Command) {
+    pub(crate) fn apply_to_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<ExecCredentialHandoff> {
         for name in CAPTURED_START_ENV_NAMES {
             command.env_remove(name);
         }
-        command.envs(&self.values);
+        command.env_remove(SERVICE_ACCOUNT_TOKEN_FD_ENV);
+
+        #[cfg(target_os = "linux")]
+        let mut service_account_token = None;
+        for (name, value) in &self.values {
+            if name == "OP_SERVICE_ACCOUNT_TOKEN" {
+                #[cfg(target_os = "linux")]
+                {
+                    let handoff = create_service_account_token_handoff(value)?;
+                    command.env(
+                        SERVICE_ACCOUNT_TOKEN_FD_ENV,
+                        handoff.as_raw_fd().to_string(),
+                    );
+                    service_account_token = Some(handoff);
+                }
+                #[cfg(not(target_os = "linux"))]
+                command.env(name, value);
+            } else {
+                command.env(name, value);
+            }
+        }
+
+        Ok(ExecCredentialHandoff {
+            #[cfg(target_os = "linux")]
+            _service_account_token: service_account_token,
+        })
     }
 
     #[cfg(test)]
@@ -1278,7 +1442,121 @@ async fn handle_service_account_request(
 }
 
 async fn service_account_status(session: &Session, token: &str) -> Result<Value> {
-    service_account_status_with_op(session, token, "op").await
+    let op_executable = service_account_cli_executable()?;
+    service_account_status_with_op(session, token, &op_executable.to_string_lossy()).await
+}
+
+fn service_account_cli_executable() -> Result<PathBuf> {
+    let path = resolve_executable_from_path("op")?;
+    validate_service_account_cli_process_boundary(&path)?;
+    Ok(path)
+}
+
+fn resolve_executable_from_path(name: &str) -> Result<PathBuf> {
+    let path = Path::new(name);
+    if path.components().count() > 1 {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve executable {name}"));
+    }
+    let search_path = std::env::var_os("PATH").context("PATH is not configured")?;
+    for directory in std::env::split_paths(&search_path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return std::fs::canonicalize(&candidate)
+                .with_context(|| format!("failed to resolve executable {}", candidate.display()));
+        }
+    }
+    anyhow::bail!("1Password CLI executable was not found on PATH")
+}
+
+#[cfg(target_os = "linux")]
+fn validate_service_account_cli_process_boundary(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect 1Password CLI at {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "1Password CLI must be a regular file");
+    validate_service_account_cli_metadata(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        &supplementary_groups()?,
+        linux_suid_dumpable()?,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_service_account_cli_process_boundary(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_service_account_cli_metadata(
+    owner_uid: u32,
+    owner_gid: u32,
+    mode: u32,
+    effective_uid: u32,
+    effective_gid: u32,
+    supplementary_groups: &[u32],
+    suid_dumpable: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        effective_uid != 0,
+        "service-account execution as root is not supported"
+    );
+    anyhow::ensure!(owner_uid == 0, "1Password CLI must be owned by root");
+    anyhow::ensure!(
+        mode & 0o2000 != 0,
+        "1Password CLI must have the setgid bit enabled"
+    );
+    anyhow::ensure!(
+        mode & 0o001 != 0,
+        "1Password CLI must be executable by the Temote user"
+    );
+    anyhow::ensure!(
+        mode & 0o022 == 0,
+        "1Password CLI must not be writable by its group or other users"
+    );
+    anyhow::ensure!(
+        owner_gid != effective_gid && !supplementary_groups.contains(&owner_gid),
+        "1Password CLI setgid group must not be available to the Temote user"
+    );
+    anyhow::ensure!(
+        matches!(suid_dumpable, 0 | 2),
+        "Linux fs.suid_dumpable must be 0 or 2 for service-account execution"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn supplementary_groups() -> Result<Vec<u32>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect supplementary groups");
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    if count > 0 {
+        let read = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect supplementary groups");
+        }
+        groups.truncate(read as usize);
+    }
+    Ok(groups.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_suid_dumpable() -> Result<u32> {
+    let value = std::fs::read_to_string("/proc/sys/fs/suid_dumpable")
+        .context("failed to read Linux fs.suid_dumpable policy")?;
+    value
+        .trim()
+        .parse::<u32>()
+        .context("Linux fs.suid_dumpable policy is invalid")
 }
 
 async fn service_account_status_with_op(
@@ -1286,7 +1564,6 @@ async fn service_account_status_with_op(
     token: &str,
     op_executable: &str,
 ) -> Result<Value> {
-    let _token_process_guard = service_account_process_boundary().write().await;
     let command = vec![
         op_executable.to_owned(),
         "whoami".to_owned(),
@@ -1341,6 +1618,7 @@ async fn service_account_run(
     environment_refs: BTreeMap<String, String>,
     allowed_locators: Vec<String>,
 ) -> Result<Value> {
+    let op_executable = service_account_cli_executable()?;
     service_account_run_with_op(
         session,
         token,
@@ -1351,7 +1629,7 @@ async fn service_account_run(
             environment_refs,
             allowed_locators,
         },
-        "op",
+        &op_executable.to_string_lossy(),
     )
     .await
 }
@@ -1383,14 +1661,10 @@ async fn service_account_run_with_op(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Raw-token CLI processes are globally serialized against every active
-    // service-account target. This closes the cross-invocation sibling-process
-    // exposure in addition to keeping each invocation's own target separated.
-    let (mut target_environment, mut resolved_secrets, resolved_locators) = {
-        let _token_process_guard = service_account_process_boundary().write().await;
-        let secret_environment_names =
-            service_account_secret_environment_names(&env_files, &environment_refs)?;
-        let (target_environment, resolved_secrets) = service_account_resolve_environment_with_op(
+    let secret_environment_names =
+        service_account_secret_environment_names(&env_files, &environment_refs)?;
+    let (mut target_environment, mut resolved_secrets) =
+        service_account_resolve_environment_with_op(
             token,
             &cwd,
             &env_files,
@@ -1400,20 +1674,17 @@ async fn service_account_run_with_op(
         )
         .await?;
 
-        // Nested locators are pre-resolved before target spawn. The broker is an
-        // in-memory capability over this exact map, never an `op read` proxy.
-        let mut resolved_locators = BTreeMap::new();
-        for locator in allowed_locators {
-            if resolved_locators.contains_key(&locator) {
-                continue;
-            }
-            let value =
-                service_account_read_secret_with_op(session, token, &locator, op_executable)
-                    .await?;
-            resolved_locators.insert(locator, value);
+    // Nested locators are pre-resolved before target spawn. The broker is an
+    // in-memory capability over this exact map, never an `op read` proxy.
+    let mut resolved_locators = BTreeMap::new();
+    for locator in allowed_locators {
+        if resolved_locators.contains_key(&locator) {
+            continue;
         }
-        (target_environment, resolved_secrets, resolved_locators)
-    };
+        let value =
+            service_account_read_secret_with_op(session, token, &locator, op_executable).await?;
+        resolved_locators.insert(locator, value);
+    }
 
     let broker = if resolved_locators.is_empty() {
         None
@@ -1435,9 +1706,24 @@ async fn service_account_run_with_op(
     }
     target_environment.remove("OP_SERVICE_ACCOUNT_TOKEN");
 
-    // While any service-account target is alive, status checks and other
-    // invocations' pre-resolution paths cannot launch token-bearing `op`.
-    let _target_process_guard = service_account_process_boundary().read().await;
+    #[cfg(target_os = "linux")]
+    let output = sandbox::run_unrestricted_with_env_and_spawn_hook_private_pid(
+        &command,
+        &cwd,
+        None,
+        &target_environment,
+        &[
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            secret_broker::SOCKET_ENV,
+            secret_broker::TOKEN_ENV,
+        ],
+        |pid| match &broker {
+            Some(broker) => broker.bind_target_pid(pid),
+            None => Ok(()),
+        },
+    )
+    .await;
+    #[cfg(not(target_os = "linux"))]
     let output = sandbox::run_unrestricted_with_env_and_spawn_hook(
         &command,
         &cwd,
@@ -1566,11 +1852,19 @@ fn service_account_secret_environment_names(
                 continue;
             }
             let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-            let Some((name, _)) = line.split_once('=') else {
-                continue;
-            };
+            let (name, value) = line.split_once('=').with_context(|| {
+                format!(
+                    "unsupported 1Password env-file syntax in {}",
+                    path.display()
+                )
+            })?;
             let name = name.trim();
-            if valid_environment_name(name) {
+            anyhow::ensure!(
+                valid_environment_name(name),
+                "invalid 1Password env-file variable name in {}",
+                path.display()
+            );
+            if value.contains("op://") {
                 names.insert(name.to_owned());
             }
         }
@@ -1851,6 +2145,69 @@ mod tests {
             process_id: 0,
             yolo: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_account_cli_metadata_requires_kernel_credential_transition() {
+        assert!(
+            validate_service_account_cli_metadata(0, 1002, 0o102755, 1000, 1000, &[4, 24, 100], 2)
+                .is_ok()
+        );
+        for invalid in [
+            validate_service_account_cli_metadata(1000, 1002, 0o102755, 1000, 1000, &[], 2),
+            validate_service_account_cli_metadata(0, 1002, 0o100755, 1000, 1000, &[], 2),
+            validate_service_account_cli_metadata(0, 1002, 0o102644, 1000, 1000, &[], 2),
+            validate_service_account_cli_metadata(0, 1002, 0o102775, 1000, 1000, &[], 2),
+            validate_service_account_cli_metadata(0, 1000, 0o102755, 1000, 1000, &[], 2),
+            validate_service_account_cli_metadata(0, 1002, 0o102755, 1000, 1000, &[1002], 2),
+            validate_service_account_cli_metadata(0, 1002, 0o102755, 0, 0, &[], 2),
+            validate_service_account_cli_metadata(0, 1002, 0o102755, 1000, 1000, &[], 1),
+            validate_service_account_cli_metadata(0, 1002, 0o102755, 1000, 1000, &[], 3),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_exec_handoff_never_places_raw_service_account_token_in_environment() {
+        use std::ffi::OsStr;
+
+        let environment = CapturedStartEnvironment::from_values(BTreeMap::from([
+            (
+                "OP_SERVICE_ACCOUNT_TOKEN".to_owned(),
+                "fabricated-upgrade-token-42".to_owned(),
+            ),
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ]))
+        .unwrap();
+        let mut command = std::process::Command::new("/bin/true");
+        command.env("OP_SERVICE_ACCOUNT_TOKEN", "ambient-token");
+        let handoff = environment.apply_to_command(&mut command).unwrap();
+        let envs = command.get_envs().collect::<Vec<_>>();
+
+        let raw_token = envs
+            .iter()
+            .find(|(name, _)| *name == OsStr::new("OP_SERVICE_ACCOUNT_TOKEN"))
+            .map(|(_, value)| *value);
+        assert_eq!(raw_token, Some(None));
+
+        let fd_value = envs
+            .iter()
+            .find(|(name, _)| *name == OsStr::new(SERVICE_ACCOUNT_TOKEN_FD_ENV))
+            .and_then(|(_, value)| *value)
+            .expect("credential handoff FD must be present")
+            .to_string_lossy()
+            .parse::<libc::c_int>()
+            .unwrap();
+        assert!(fd_value >= 3);
+        let seals = unsafe { libc::fcntl(fd_value, libc::F_GET_SEALS) };
+        let required_seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(seals & required_seals, required_seals);
+
+        drop(handoff);
     }
 
     #[test]
@@ -2318,11 +2675,87 @@ esac
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn token_bearing_cli_is_blocked_while_service_account_target_is_active() {
+    async fn mixed_env_file_redacts_only_resolved_secret_values() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let env_file = root.path().join("mixed.env");
+        std::fs::write(
+            &env_file,
+            "MODE=production\nRETRY=1\nPASSWORD=op://vault/item/password\n",
+        )
+        .unwrap();
+        let fake_op = root.path().join("op");
+        std::fs::write(
+            &fake_op,
+            r#"#!/bin/sh
+set -eu
+operation="$1"
+shift
+case "$operation" in
+  run)
+    while [ "$1" != "--" ]; do shift; done
+    shift
+    export MODE='production'
+    export RETRY='1'
+    export PASSWORD='resolved-password'
+    exec "$@"
+    ;;
+  *) exit 8 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_op, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = test_session(root.path());
+        let result = service_account_run_with_op(
+            &session,
+            "service-account-token-must-not-leak",
+            ServiceAccountRunSpec {
+                cwd: session.cwd.clone(),
+                command: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    r#"printf '%s\n%s\n%s\n' "$MODE" "$RETRY" "$PASSWORD""#.to_owned(),
+                ],
+                env_files: vec![env_file],
+                environment_refs: BTreeMap::new(),
+                allowed_locators: Vec::new(),
+            },
+            fake_op.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["exit_code"], 0, "{}", result["stderr"]);
+        assert_eq!(result["stdout"], "production\n1\n[REDACTED_SECRET]\n");
+    }
+
+    #[test]
+    fn ambiguous_env_file_syntax_fails_closed_before_redaction_scope_is_built() {
+        let root = tempfile::tempdir().unwrap();
+        let env_file = root.path().join("ambiguous.env");
+        std::fs::write(
+            &env_file,
+            "PASSWORD=op://vault/item/password\ncontinued-without-assignment\n",
+        )
+        .unwrap();
+        let error =
+            service_account_secret_environment_names(&[env_file], &BTreeMap::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported 1Password env-file syntax")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn service_account_status_runs_while_long_lived_target_is_active() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
         let active = root.path().join("target-active");
+        let observed = root.path().join("status-during-active");
         let fake_op = root.path().join("op");
         let script = format!(
             r#"#!/bin/sh
@@ -2337,14 +2770,15 @@ case "$operation" in
     ;;
   whoami)
     if [ -e '{}' ]; then
-      exit 91
+      touch '{}'
     fi
     printf '%s' '{{"account_uuid":"a","account_url":"u","user_uuid":"x"}}'
     ;;
   *) exit 8 ;;
 esac
 "#,
-            active.display()
+            active.display(),
+            observed.display()
         );
         std::fs::write(&fake_op, script).unwrap();
         std::fs::set_permissions(&fake_op, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2385,6 +2819,10 @@ esac
         assert_eq!(run.unwrap()["exit_code"], 0);
         let status = status.unwrap();
         assert_eq!(status["authenticated"], true);
+        assert!(
+            observed.exists(),
+            "status call waited for target completion"
+        );
         assert!(!active.exists());
     }
 

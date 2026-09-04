@@ -53,6 +53,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    approvals::bootstrap_service_account_process_boundary()?;
     let cli = match cli::parse_env() {
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Ok(cli::ParseOutcome::Print(output)) => {
