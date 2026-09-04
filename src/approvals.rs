@@ -1618,6 +1618,10 @@ async fn service_account_run(
     environment_refs: BTreeMap<String, String>,
     allowed_locators: Vec<String>,
 ) -> Result<Value> {
+    // Validate caller-controlled input before resolving or inspecting the host
+    // 1Password CLI. Invalid requests must fail deterministically even on hosts
+    // where `op` is absent or its process boundary is not acceptable.
+    validate_service_account_run_input(&command, &env_files, &environment_refs, &allowed_locators)?;
     let op_executable = service_account_cli_executable()?;
     service_account_run_with_op(
         session,
