@@ -265,7 +265,7 @@ export const PUBLIC_TOOLS = [
   tool(
     "onepassword_service_account_run",
     "Run with 1Password service-account secrets",
-    "Run a host command through op run using the service-account token held by the selected temote-mcp start process. Optional allowed_locators enables exact per-invocation nested resolution on Linux without forwarding the service-account token; normal sessions require host approval.",
+    "Resolve reviewed op:// inputs before target startup using the selected temote-mcp service account, then launch the target without the raw token. Optional allowed_locators exposes only pre-resolved exact references through a process-tree-bound per-invocation Linux broker; normal sessions require host approval.",
     networkMutation,
     schema(
       {

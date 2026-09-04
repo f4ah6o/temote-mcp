@@ -1,23 +1,25 @@
-#[cfg(target_os = "linux")]
-use std::collections::BTreeSet;
-use std::future::Future;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+
+use anyhow::Result;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
-use anyhow::Result;
 #[cfg(target_os = "linux")]
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(target_os = "linux")]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, oneshot};
-use tokio::task::JoinHandle;
+#[cfg(target_os = "linux")]
+use tokio::sync::{Semaphore, watch};
 #[cfg(target_os = "linux")]
 use tokio::task::JoinSet;
 #[cfg(target_os = "linux")]
@@ -33,9 +35,10 @@ const MAX_LOCATOR_BYTES: usize = 4096;
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub type ResolveFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
-pub type Resolver = Arc<dyn Fn(String) -> ResolveFuture + Send + Sync>;
+#[cfg(target_os = "linux")]
+const MAX_IN_FLIGHT_CONNECTIONS: usize = 16;
+#[cfg(target_os = "linux")]
+const MAX_PROCESS_ANCESTORS: usize = 256;
 
 #[cfg(target_os = "linux")]
 #[derive(Deserialize)]
@@ -53,20 +56,36 @@ struct ResolveResponse<'a> {
     error: Option<&'a str>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct ProcessStat {
+    parent_pid: u32,
+    start_time: u64,
+}
+
 pub struct SecretBroker {
     socket_path: PathBuf,
     directory: PathBuf,
     capability_token: String,
-    secrets: Arc<Mutex<Vec<String>>>,
+    secrets: Vec<String>,
     shutdown: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<Result<()>>>,
+    #[cfg(target_os = "linux")]
+    target: watch::Sender<Option<ProcessIdentity>>,
 }
 
 impl SecretBroker {
-    pub async fn start(allowed_locators: &[String], resolver: Resolver) -> Result<Self> {
+    pub async fn start(resolved_locators: BTreeMap<String, String>) -> Result<Self> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (allowed_locators, resolver);
+            let _ = resolved_locators;
             anyhow::bail!(
                 "nested 1Password secret resolution is currently supported only on Linux"
             );
@@ -74,7 +93,7 @@ impl SecretBroker {
 
         #[cfg(target_os = "linux")]
         {
-            let allowed = validate_policy(allowed_locators)?;
+            let resolved = validate_policy(resolved_locators)?;
             let directory = create_capability_directory()?;
             let socket_path = directory.join("resolver.sock");
             let listener = UnixListener::bind(&socket_path).with_context(|| {
@@ -85,20 +104,24 @@ impl SecretBroker {
             })?;
             set_mode(&socket_path, 0o600)?;
             let capability_token = Uuid::new_v4().simple().to_string();
-            let secrets = Arc::new(Mutex::new(Vec::new()));
-            let task_secrets = Arc::clone(&secrets);
+            let mut secrets = Vec::new();
+            for value in resolved.values() {
+                if !value.is_empty() && !secrets.iter().any(|known| known == value) {
+                    secrets.push(value.clone());
+                }
+            }
             let task_socket = socket_path.clone();
             let task_directory = directory.clone();
             let task_token = capability_token.clone();
+            let (target, target_rx) = watch::channel(None);
             let (shutdown, shutdown_rx) = oneshot::channel();
             let join = tokio::spawn(async move {
                 run_broker(
                     listener,
                     shutdown_rx,
-                    allowed,
-                    task_token,
-                    resolver,
-                    task_secrets,
+                    Arc::new(resolved),
+                    Arc::new(task_token),
+                    target_rx,
                 )
                 .await;
                 let _ = tokio::fs::remove_file(&task_socket).await;
@@ -112,6 +135,7 @@ impl SecretBroker {
                 secrets,
                 shutdown: Some(shutdown),
                 join: Some(join),
+                target,
             })
         }
     }
@@ -124,6 +148,28 @@ impl SecretBroker {
         &self.capability_token
     }
 
+    pub fn bind_target_pid(&self, pid: u32) -> Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            anyhow::bail!(
+                "nested 1Password secret resolution is currently supported only on Linux"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let stat = read_process_stat(pid)?;
+            self.target
+                .send(Some(ProcessIdentity {
+                    pid,
+                    start_time: stat.start_time,
+                }))
+                .context("nested secret resolver closed before target binding")?;
+            Ok(())
+        }
+    }
+
     pub async fn close(mut self) -> Vec<String> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -131,7 +177,7 @@ impl SecretBroker {
         if let Some(join) = self.join.take() {
             let _ = join.await;
         }
-        self.secrets.lock().await.clone()
+        self.secrets.clone()
     }
 }
 
@@ -159,25 +205,46 @@ pub fn validate_locator(locator: &str) -> Result<()> {
         "nested secret resolver locator is incomplete"
     );
     anyhow::ensure!(
-        locator.trim() == locator && !locator.chars().any(|character| character.is_control()),
-        "nested secret resolver locator contains invalid whitespace or control characters"
+        locator.trim() == locator
+            && !locator.chars().any(char::is_control)
+            && !locator.chars().any(is_visual_format_character),
+        "nested secret resolver locator contains invalid whitespace, control, or Unicode format characters"
     );
     Ok(())
 }
 
+fn is_visual_format_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x00ad
+            | 0x061c
+            | 0x180e
+            | 0xfeff
+            | 0xe0001
+            | 0xfff9..=0xfffb
+            | 0x200b..=0x200f
+            | 0x202a..=0x202e
+            | 0x2060..=0x206f
+            | 0xe0020..=0xe007f
+    )
+}
+
 #[cfg(target_os = "linux")]
-fn validate_policy(allowed_locators: &[String]) -> Result<BTreeSet<String>> {
+fn validate_policy(
+    resolved_locators: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
     anyhow::ensure!(
-        !allowed_locators.is_empty(),
+        !resolved_locators.is_empty(),
         "nested secret resolver requires at least one allowed locator"
     );
-    allowed_locators
-        .iter()
-        .try_fold(BTreeSet::new(), |mut allowed, locator| {
-            validate_locator(locator)?;
-            allowed.insert(locator.clone());
-            Result::<_>::Ok(allowed)
-        })
+    for (locator, value) in &resolved_locators {
+        validate_locator(locator)?;
+        anyhow::ensure!(
+            value.len() <= MAX_SECRET_BYTES,
+            "resolved secret exceeds size limit"
+        );
+    }
+    Ok(resolved_locators)
 }
 
 #[cfg(target_os = "linux")]
@@ -217,25 +284,27 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 async fn run_broker(
     listener: UnixListener,
     mut shutdown: oneshot::Receiver<()>,
-    allowed: BTreeSet<String>,
-    capability_token: String,
-    resolver: Resolver,
-    secrets: Arc<Mutex<Vec<String>>>,
+    resolved: Arc<BTreeMap<String, String>>,
+    capability_token: Arc<String>,
+    target: watch::Receiver<Option<ProcessIdentity>>,
 ) {
-    let allowed = Arc::new(allowed);
-    let capability_token = Arc::new(capability_token);
+    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_CONNECTIONS));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { break };
-                let allowed = Arc::clone(&allowed);
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let resolved = Arc::clone(&resolved);
                 let capability_token = Arc::clone(&capability_token);
-                let resolver = Arc::clone(&resolver);
-                let secrets = Arc::clone(&secrets);
+                let target = target.clone();
                 connections.spawn(async move {
-                    let _ = handle_connection(stream, &allowed, &capability_token, resolver, secrets).await;
+                    let _permit = permit;
+                    let _ = handle_connection(stream, &resolved, &capability_token, target).await;
                 });
             }
             joined = connections.join_next(), if !connections.is_empty() => {
@@ -250,21 +319,26 @@ async fn run_broker(
 #[cfg(target_os = "linux")]
 async fn handle_connection(
     stream: UnixStream,
-    allowed: &BTreeSet<String>,
+    resolved: &BTreeMap<String, String>,
     capability_token: &str,
-    resolver: Resolver,
-    secrets: Arc<Mutex<Vec<String>>>,
+    mut target: watch::Receiver<Option<ProcessIdentity>>,
 ) -> Result<()> {
     let peer = stream
         .peer_cred()
         .context("failed to authenticate nested secret resolver peer")?;
     let current_uid = unsafe { libc::geteuid() };
-    anyhow::ensure!(
-        peer.uid() == current_uid,
-        "nested secret resolver peer is owned by a different user"
-    );
+    let peer_pid = peer
+        .pid()
+        .context("nested secret resolver peer PID is unavailable")? as u32;
+    let target = wait_for_target_identity(&mut target).await?;
+    let process_authorized = peer.uid() == current_uid && process_is_descendant(peer_pid, target)?;
 
     let (reader, mut writer) = stream.into_split();
+    if !process_authorized {
+        write_error(&mut writer, "unauthorized process").await?;
+        return Ok(());
+    }
+
     let mut line = String::new();
     let read = tokio::time::timeout(REQUEST_TIMEOUT, async {
         BufReader::new(reader)
@@ -290,36 +364,77 @@ async fn handle_connection(
         write_error(&mut writer, "unauthorized capability").await?;
         return Ok(());
     }
-    if validate_locator(&request.locator).is_err() || !allowed.contains(&request.locator) {
+    if validate_locator(&request.locator).is_err() {
         write_error(&mut writer, "locator is not authorized").await?;
         return Ok(());
     }
-
-    let value = match resolver(request.locator).await {
-        Ok(value) if value.len() <= MAX_SECRET_BYTES => value,
-        Ok(_) => {
-            write_error(&mut writer, "resolved secret exceeds size limit").await?;
-            return Ok(());
-        }
-        Err(_) => {
-            write_error(&mut writer, "1Password secret resolution failed").await?;
-            return Ok(());
-        }
+    let Some(value) = resolved.get(&request.locator) else {
+        write_error(&mut writer, "locator is not authorized").await?;
+        return Ok(());
     };
-    {
-        let mut known = secrets.lock().await;
-        if !value.is_empty() && !known.iter().any(|secret| secret == &value) {
-            known.push(value.clone());
-        }
-    }
     write_response(
         &mut writer,
         &ResolveResponse {
-            value: Some(&value),
+            value: Some(value),
             error: None,
         },
     )
     .await
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_target_identity(
+    target: &mut watch::Receiver<Option<ProcessIdentity>>,
+) -> Result<ProcessIdentity> {
+    if let Some(identity) = *target.borrow() {
+        return Ok(identity);
+    }
+    let value = tokio::time::timeout(REQUEST_TIMEOUT, target.wait_for(Option::is_some))
+        .await
+        .context("nested secret resolver target binding timed out")?
+        .context("nested secret resolver closed before target binding")?;
+    value.context("nested secret resolver target binding is unavailable")
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_descendant(peer_pid: u32, root: ProcessIdentity) -> Result<bool> {
+    let mut current = peer_pid;
+    for _ in 0..MAX_PROCESS_ANCESTORS {
+        let stat = match read_process_stat(current) {
+            Ok(stat) => stat,
+            Err(_) => return Ok(false),
+        };
+        if current == root.pid {
+            return Ok(stat.start_time == root.start_time);
+        }
+        if stat.parent_pid == 0 || stat.parent_pid == current {
+            return Ok(false);
+        }
+        current = stat.parent_pid;
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_stat(pid: u32) -> Result<ProcessStat> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to inspect process identity for PID {pid}"))?;
+    let close = stat
+        .rfind(')')
+        .context("process stat is missing command terminator")?;
+    let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
+    anyhow::ensure!(fields.len() > 19, "process stat is incomplete");
+    let parent_pid = fields[1]
+        .parse::<u32>()
+        .context("process stat has invalid parent PID")?;
+    let start_time = fields[19]
+        .parse::<u64>()
+        .context("process stat has invalid start time")?;
+    Ok(ProcessStat {
+        parent_pid,
+        start_time,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -360,25 +475,16 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use serde_json::Value;
 
     use super::*;
 
-    fn resolver(
-        counter: Arc<AtomicUsize>,
-        expected: &'static str,
-        value: &'static str,
-    ) -> Resolver {
-        Arc::new(move |locator| {
-            let counter = Arc::clone(&counter);
-            Box::pin(async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                anyhow::ensure!(locator == expected, "unexpected locator");
-                Ok(value.to_owned())
-            })
-        })
+    async fn broker(locator: &str, value: &str) -> SecretBroker {
+        let broker = SecretBroker::start(BTreeMap::from([(locator.to_owned(), value.to_owned())]))
+            .await
+            .unwrap();
+        broker.bind_target_pid(std::process::id()).unwrap();
+        broker
     }
 
     async fn request(socket: &Path, token: &str, locator: &str) -> Result<Value> {
@@ -395,34 +501,21 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_locator_resolves_and_is_captured_for_output_redaction() {
-        let calls = Arc::new(AtomicUsize::new(0));
         let locator = "op://vault/item/field";
-        let broker = SecretBroker::start(
-            &[locator.to_owned()],
-            resolver(Arc::clone(&calls), locator, "resolved-secret"),
-        )
-        .await
-        .unwrap();
+        let broker = broker(locator, "resolved-secret").await;
         let response = request(broker.socket_path(), broker.capability_token(), locator)
             .await
             .unwrap();
         assert_eq!(response["value"], "resolved-secret");
         assert!(response["error"].is_null());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
         let secrets = broker.close().await;
         assert_eq!(secrets, ["resolved-secret"]);
     }
 
     #[tokio::test]
-    async fn denied_and_malformed_locators_do_not_reach_resolver() {
-        let calls = Arc::new(AtomicUsize::new(0));
+    async fn denied_and_malformed_locators_fail_closed() {
         let allowed = "op://vault/item/allowed";
-        let broker = SecretBroker::start(
-            &[allowed.to_owned()],
-            resolver(Arc::clone(&calls), allowed, "secret"),
-        )
-        .await
-        .unwrap();
+        let broker = broker(allowed, "secret").await;
         for locator in ["op://vault/item/denied", "plaintext", "op://bad\nlocator"] {
             let response = request(broker.socket_path(), broker.capability_token(), locator)
                 .await
@@ -430,32 +523,18 @@ mod tests {
             assert!(response["value"].is_null());
             assert!(response["error"].is_string());
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
         broker.close().await;
     }
 
     #[tokio::test]
     async fn capabilities_are_isolated_and_dead_after_close() {
         let locator = "op://vault/item/field";
-        let calls_a = Arc::new(AtomicUsize::new(0));
-        let calls_b = Arc::new(AtomicUsize::new(0));
-        let broker_a = SecretBroker::start(
-            &[locator.to_owned()],
-            resolver(Arc::clone(&calls_a), locator, "secret-a"),
-        )
-        .await
-        .unwrap();
-        let broker_b = SecretBroker::start(
-            &[locator.to_owned()],
-            resolver(Arc::clone(&calls_b), locator, "secret-b"),
-        )
-        .await
-        .unwrap();
+        let broker_a = broker(locator, "secret-a").await;
+        let broker_b = broker(locator, "secret-b").await;
         let response = request(broker_b.socket_path(), broker_a.capability_token(), locator)
             .await
             .unwrap();
         assert!(response["value"].is_null());
-        assert_eq!(calls_b.load(Ordering::SeqCst), 0);
 
         let dead_socket = broker_a.socket_path().to_path_buf();
         let dead_token = broker_a.capability_token().to_owned();
@@ -464,14 +543,50 @@ mod tests {
         broker_b.close().await;
     }
 
+    #[tokio::test]
+    async fn correct_token_is_denied_outside_bound_process_tree() {
+        use std::process::Stdio;
+
+        let locator = "op://vault/item/field";
+        let broker = SecretBroker::start(BTreeMap::from([(
+            locator.to_owned(),
+            "resolved-secret".to_owned(),
+        )]))
+        .await
+        .unwrap();
+        let mut target = tokio::process::Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let target_pid = target.id().unwrap();
+        broker.bind_target_pid(target_pid).unwrap();
+
+        let response = request(broker.socket_path(), broker.capability_token(), locator)
+            .await
+            .unwrap();
+        assert!(response["value"].is_null());
+        assert_eq!(response["error"], "unauthorized process");
+
+        let _ = target.kill().await;
+        let _ = target.wait().await;
+        broker.close().await;
+    }
+
     #[test]
-    fn locator_validation_is_exact_and_fail_closed() {
-        assert!(validate_locator("op://vault/item/field").is_ok());
+    fn locator_validation_is_exact_and_operator_safe() {
+        assert!(validate_locator("op://vault/日本語 item/field").is_ok());
         for invalid in [
             "",
             "op://",
             " op://vault/item/field",
             "op://vault/item/field\n",
+            "op://vault/item/\u{202e}field",
+            "op://vault/item/\u{2066}field",
+            "op://vault/item/\u{2067}field",
+            "op://vault/item/\u{200b}field",
         ] {
             assert!(validate_locator(invalid).is_err(), "accepted {invalid:?}");
         }
@@ -491,11 +606,13 @@ mod non_linux_tests {
 
     #[tokio::test]
     async fn nested_resolution_fails_closed_until_platform_support_exists() {
-        let resolver: Resolver = Arc::new(|_| Box::pin(async { Ok("secret".to_owned()) }));
-        let error = SecretBroker::start(&["op://vault/item/field".to_owned()], resolver)
-            .await
-            .err()
-            .expect("non-Linux nested resolution fails closed");
+        let error = SecretBroker::start(BTreeMap::from([(
+            "op://vault/item/field".to_owned(),
+            "secret".to_owned(),
+        )]))
+        .await
+        .err()
+        .expect("non-Linux nested resolution fails closed");
         assert!(error.to_string().contains("supported only on Linux"));
     }
 }

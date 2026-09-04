@@ -370,6 +370,29 @@ pub async fn run_unrestricted_with_env(
         .await
 }
 
+pub async fn run_unrestricted_with_env_and_spawn_hook<F>(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
+    run_unrestricted_with_env_mode_and_spawn_hook(
+        command,
+        cwd,
+        stdin,
+        environment,
+        remove_environment,
+        false,
+        on_spawn,
+    )
+    .await
+}
+
 pub async fn run_unrestricted_with_only_env(
     command: &[String],
     cwd: &Path,
@@ -387,6 +410,30 @@ async fn run_unrestricted_with_env_mode(
     remove_environment: &[&str],
     clear_environment: bool,
 ) -> Result<Output> {
+    run_unrestricted_with_env_mode_and_spawn_hook(
+        command,
+        cwd,
+        stdin,
+        environment,
+        remove_environment,
+        clear_environment,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn run_unrestricted_with_env_mode_and_spawn_hook<F>(
+    command: &[String],
+    cwd: &Path,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+    clear_environment: bool,
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -410,9 +457,17 @@ async fn run_unrestricted_with_env_mode(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = process
+    let mut child = process
         .spawn()
         .context("failed to start unsandboxed command")?;
+    let pid = child
+        .id()
+        .context("unsandboxed child PID is unavailable after spawn")?;
+    if let Err(error) = on_spawn(pid) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
     wait_with_limited_output(child, stdin).await
 }
 
