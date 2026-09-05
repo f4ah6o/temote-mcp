@@ -1,11 +1,11 @@
 # TEMOTE-04: session metadata蓄積でsession_listを壊さないbounded discoveryとretention
 
-- Status: Open
+- Status: Done
 - Date: 2026-09-05 (Asia/Tokyo)
 - Priority: P1
 - Baseline: `4ae3847cf64ec52a1f7b7e8b7bf7b28af88236dd` (`main`)
 - Depends on: なし
-- Related: [TEMOTE-01](20260905-01-session-job-discovery.md)
+- Related: [TEMOTE-01](../open/20260905-01-session-job-discovery.md)
 
 ## 事象
 
@@ -155,3 +155,37 @@ gateway contractに変更が入る場合はsnapshot/parity testも更新する�
 完了記録にはretention policy、before/afterのmetadata件数、MCP/CLI両方の大規模fixture結果を残す。
 
 実機の既存session metadataを手作業で削除して「直った」としない。まずコード側でactive discoveryをhistory蓄積から独立させ、その後安全なretentionを実装する。
+
+## 完了記録
+
+2026-09-05 に実装・検証完了。
+
+- active discovery は running supervisor の owned session IDs を先に取得する active-first 方式へ変更した。history の量や filesystem iteration 順では active session を落とさない。
+- historical discovery は directory scan 最大16K entries、JSON candidate 最大4096、control list 最大256 entries / 56 KiB に bound し、`stopped_at desc` → `started_at desc` → `session_id asc` の安定順序で返す。
+- MCP `session_list` は supervisor の `ControlRequest::List` を利用し、supervisor unavailable 時だけ read-only filesystem fallback を使う。fallback は lifecycle を書き換えず、socket を確認できない live claim は `unknown` とする。
+- terminal retention は最近512件の safely confirmed stopped/crashed metadata pair を保持し、それより古い pair だけを prune する。startup と60秒周期 maintenance で実行する。
+- live socket、probe error、active/starting/stopping、malformed/orphan、invalid ID、upgrade restore plan protected metadata は自動削除しない。prune 直前にも ownership / restore plan / metadata / lifecycle / timestamp / socket liveness を再確認する。
+- `doctor` に path や raw parse error を出さない session metadata diagnostics を追加した。
+- usage docs（英日）へ active-first discovery、bounded history、terminal retention 512、安全側の非削除条件を追記した。
+
+大規模 fixture 結果:
+
+- 4200個の non-JSON metadata があっても active session discovery は成功。
+- 4200 terminal history pair + active 3 sessions でも active 3件を先頭で返す。
+- 700 terminal pair は retention 後 `.json = 512` / `.state = 512` へ収束。
+- CLI `session list` と MCP `session_list` の active 集合 parity は一致。
+- retention E2E は 9 passed / 0 failed。
+
+実ユーザーの session metadata directory は手作業で削除していない。再開時点の installed runtime では `session_list` が既存実装の `session metadata directory exceeds 4096 entries` を再現したため、修正版 binary への更新後に retention maintenance で自然収束させる。
+
+最終検証:
+
+- `cargo fmt --all -- --check`: PASS
+- `cargo test`: PASS
+- `cargo clippy --all-targets -- -D warnings`: PASS
+- `cargo check --no-default-features --all-targets`: PASS（既存 dead-code warning のみ）
+- `git diff --check`: PASS
+- gateway contract/schema は変更なし。full test 内の gateway tests と `routed_gateway_contract_matches_checked_in_snapshot` が PASS しているため、追加 gateway E2E は不要と判断。
+
+途中で `supervisor::tests::one_runtime_failure_does_not_stop_other_session` が full parallel run で1回だけ失敗したが、同テスト単体は直後に PASS、続く full `cargo test` も PASS した。今回変更との再現性は確認されなかった。
+

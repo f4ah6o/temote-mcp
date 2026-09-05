@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read as _, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -21,6 +22,12 @@ use crate::named_roots::NamedRoots;
 use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_SESSION_LIST_ENTRIES: usize = 256;
+const MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED: usize = 16 * 1024;
+const MAX_SESSION_HISTORY_CANDIDATES: usize = 4096;
+const MAX_SESSION_CONTROL_LIST_BYTES: usize = 56 * 1024;
+const TERMINAL_SESSION_RETENTION: usize = 512;
+const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
 const CONTROL_PROTOCOL_VERSION: u64 = 1;
@@ -122,6 +129,30 @@ pub struct SessionView {
     pub last_restart_at: Option<u64>,
     pub next_restart_at: Option<u64>,
     pub restart_limit_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct SessionMetadataDiagnostics {
+    pub total_entries: usize,
+    pub json_entries: usize,
+    pub state_entries: usize,
+    pub other_entries: usize,
+    pub retained_terminal_count: usize,
+    pub safely_prunable_count: usize,
+    pub invalid_orphan_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalMetadataCandidate {
+    id: String,
+    started_at: u64,
+    stopped_at: u64,
+}
+
+#[derive(Debug)]
+struct RetentionPlan {
+    diagnostics: SessionMetadataDiagnostics,
+    prune_candidates: Vec<TerminalMetadataCandidate>,
 }
 
 #[derive(Clone)]
@@ -283,6 +314,10 @@ pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    if let Err(error) = maintain_session_metadata(&supervisor).await {
+        eprintln!("session metadata retention maintenance skipped: {error:#}");
+    }
+
     let (console_registration, console_registrations) = mpsc::channel(8);
     let approval_broker = tokio::spawn(run_approval_broker(approvals, console_registrations));
 
@@ -294,6 +329,9 @@ pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
     tokio::pin!(ctrl_c);
     let mut maintenance = tokio::time::interval(Duration::from_millis(250));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut retention_maintenance = tokio::time::interval(RETENTION_MAINTENANCE_INTERVAL);
+    retention_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retention_maintenance.tick().await;
     let serve_result: Result<()> = loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -312,6 +350,11 @@ pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
             }
             _ = maintenance.tick() => {
                 supervisor.reap_finished().await;
+            }
+            _ = retention_maintenance.tick() => {
+                if let Err(error) = maintain_session_metadata(&supervisor).await {
+                    eprintln!("session metadata retention maintenance skipped: {error:#}");
+                }
             }
             signal = &mut ctrl_c => {
                 match signal {
@@ -621,7 +664,7 @@ async fn dispatch_request(
                 inspect_session(&info.session_id).await?,
             )?)
         }
-        ControlRequest::List => Ok(serde_json::to_value(list_session_views().await?)?),
+        ControlRequest::List => Ok(serde_json::to_value(list_session_views(supervisor).await?)?),
         ControlRequest::Info { session_id } => {
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
@@ -1719,15 +1762,97 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
     })
 }
 
-async fn list_session_views() -> Result<Vec<SessionView>> {
+async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<SessionView>> {
+    let owned_ids = supervisor.owned_session_ids().await;
+    let owned = owned_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut sessions = Vec::new();
+
+    for id in owned_ids {
+        let session = inspect_session_read_only(&id)
+            .await
+            .with_context(|| format!("failed to inspect supervisor-owned session {id}"))?;
+        push_control_session_view(&mut sessions, session, true)?;
+    }
+
+    let history_ids = bounded_history_session_ids(&owned).await?;
+    let mut history = Vec::new();
+    for id in history_ids {
+        if let Ok(session) = inspect_session_read_only(&id).await {
+            history.push(session);
+        }
+    }
+    sort_history_views(&mut history);
+    for session in history {
+        if !push_control_session_view(&mut sessions, session, false)? {
+            break;
+        }
+    }
+    Ok(sessions)
+}
+
+pub(crate) async fn request_session_views() -> Result<Vec<SessionView>> {
+    let result = request(ControlRequest::List).await?;
+    serde_json::from_value(result).context("invalid supervisor session list response")
+}
+
+pub(crate) async fn session_views_for_mcp() -> Result<Vec<SessionView>> {
+    if supervisor_is_available().await? {
+        request_session_views().await
+    } else {
+        filesystem_session_views_read_only().await
+    }
+}
+
+async fn supervisor_is_available() -> Result<bool> {
+    let path = config::supervisor_socket_path()?;
+    match UnixStream::connect(path).await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error).context("failed to inspect supervisor availability"),
+    }
+}
+
+async fn filesystem_session_views_read_only() -> Result<Vec<SessionView>> {
+    let ids = bounded_history_session_ids(&HashSet::new()).await?;
+    let mut sessions = Vec::new();
+    for id in ids {
+        if let Ok(session) = inspect_session_read_only(&id).await {
+            sessions.push(session);
+        }
+    }
+    sort_history_views(&mut sessions);
+    let mut bounded = Vec::new();
+    for session in sessions {
+        if !push_control_session_view(&mut bounded, session, false)? {
+            break;
+        }
+    }
+    Ok(bounded)
+}
+
+async fn bounded_history_session_ids(excluded: &HashSet<String>) -> Result<Vec<String>> {
     let directory = config::sessions_dir()?;
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("failed to read session metadata directory"),
     };
-    let mut sessions = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
+    let mut scanned = 0usize;
+    let mut ids = BTreeSet::new();
+    while scanned < MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED {
+        let Some(entry) = entries.next_entry().await? else {
+            break;
+        };
+        scanned += 1;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
@@ -1735,15 +1860,329 @@ async fn list_session_views() -> Result<Vec<SessionView>> {
         let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        if config::validate_session_id(id).is_err() {
+        if excluded.contains(id) || config::validate_session_id(id).is_err() {
             continue;
         }
-        if let Ok(session) = inspect_session(id).await {
-            sessions.push(session);
+        ids.insert(id.to_owned());
+        if ids.len() > MAX_SESSION_HISTORY_CANDIDATES {
+            let last = ids.iter().next_back().cloned();
+            if let Some(last) = last {
+                ids.remove(&last);
+            }
         }
     }
-    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    Ok(sessions)
+    Ok(ids.into_iter().collect())
+}
+
+fn sort_history_views(sessions: &mut [SessionView]) {
+    sessions.sort_by(|left, right| {
+        right
+            .stopped_at
+            .unwrap_or_default()
+            .cmp(&left.stopped_at.unwrap_or_default())
+            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+}
+
+fn push_control_session_view(
+    sessions: &mut Vec<SessionView>,
+    session: SessionView,
+    required: bool,
+) -> Result<bool> {
+    if sessions.len() >= MAX_SESSION_LIST_ENTRIES {
+        anyhow::ensure!(
+            !required,
+            "active session list exceeds {MAX_SESSION_LIST_ENTRIES} entries"
+        );
+        return Ok(false);
+    }
+    sessions.push(session);
+    let fits = serde_json::to_vec(sessions)?.len() <= MAX_SESSION_CONTROL_LIST_BYTES;
+    if fits {
+        return Ok(true);
+    }
+    sessions.pop();
+    anyhow::ensure!(
+        !required,
+        "active session list exceeds {MAX_SESSION_CONTROL_LIST_BYTES} bytes"
+    );
+    Ok(false)
+}
+
+pub(crate) async fn inspect_session_read_only(id: &str) -> Result<SessionView> {
+    config::validate_session_id(id)?;
+    let session = config::read_session_metadata(id).await?;
+    let lifecycle = config::read_session_lifecycle(id).await?;
+    let liveness = config::session_is_active(id).await;
+    let inferred = lifecycle.unwrap_or_else(|| {
+        let mut state = SessionLifecycle::starting(session.started_at, None);
+        state.status = if session.process_id == 0 {
+            LifecycleStatus::Stopped
+        } else {
+            LifecycleStatus::Active
+        };
+        state
+    });
+    let claims_live_runtime = matches!(
+        inferred.status,
+        LifecycleStatus::Starting | LifecycleStatus::Active | LifecycleStatus::Stopping
+    );
+    let (status, last_error) = match liveness {
+        Ok(true) => {
+            let status = match inferred.status {
+                LifecycleStatus::Starting => "starting",
+                LifecycleStatus::Stopping => "stopping",
+                _ => "active",
+            };
+            (status.to_owned(), inferred.last_error.clone())
+        }
+        Ok(false) if claims_live_runtime => (
+            "unknown".to_owned(),
+            Some(
+                inferred
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "session socket is not active".to_owned()),
+            ),
+        ),
+        Ok(false) => (
+            status_name(inferred.status).to_owned(),
+            inferred.last_error.clone(),
+        ),
+        Err(_) => (
+            "unknown".to_owned(),
+            Some("session liveness could not be determined safely".to_owned()),
+        ),
+    };
+    let pid = matches!(status.as_str(), "starting" | "active" | "stopping")
+        .then_some(session.process_id)
+        .filter(|pid| *pid != 0);
+    Ok(SessionView {
+        host_id: host_identity::resolve()?,
+        id: session.id.clone(),
+        session_id: session.id,
+        status,
+        pid,
+        process_id: session.process_id,
+        cwd: session.cwd,
+        permitted_directories: session.permitted_directories,
+        started_at: inferred.started_at,
+        stopped_at: inferred.stopped_at,
+        exit_reason: inferred.exit_reason,
+        last_error,
+        permission_mode: if session.yolo { "yolo" } else { "ask" }.to_owned(),
+        yolo: session.yolo,
+        logical_path: inferred.logical_path,
+        restart_policy: inferred.restart_policy,
+        restart_count: inferred.restart_count,
+        last_restart_at: inferred.last_restart_at,
+        next_restart_at: inferred.next_restart_at,
+        restart_limit_reason: inferred.restart_limit_reason,
+    })
+}
+
+pub(crate) async fn session_metadata_diagnostics() -> Result<SessionMetadataDiagnostics> {
+    let plan = build_retention_plan(&HashSet::new()).await?;
+    Ok(plan.diagnostics)
+}
+
+async fn maintain_session_metadata(
+    supervisor: &SessionSupervisor,
+) -> Result<SessionMetadataDiagnostics> {
+    let owned = supervisor
+        .owned_session_ids()
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let plan = build_retention_plan(&owned).await?;
+    for candidate in &plan.prune_candidates {
+        if retention_candidate_still_safe(supervisor, candidate).await? {
+            prune_terminal_metadata_pair(&candidate.id).await?;
+        }
+    }
+    Ok(plan.diagnostics)
+}
+
+async fn build_retention_plan(owned: &HashSet<String>) -> Result<RetentionPlan> {
+    let protected = protected_upgrade_session_ids()?;
+    let directory = config::sessions_dir()?;
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RetentionPlan {
+                diagnostics: SessionMetadataDiagnostics::default(),
+                prune_candidates: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error).context("failed to read session metadata directory"),
+    };
+    let mut diagnostics = SessionMetadataDiagnostics::default();
+    let mut pairs: HashMap<String, (bool, bool)> = HashMap::new();
+    while let Some(entry) = entries.next_entry().await? {
+        diagnostics.total_entries = diagnostics.total_entries.saturating_add(1);
+        let path = entry.path();
+        let extension = path.extension().and_then(|value| value.to_str());
+        let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+            diagnostics.other_entries = diagnostics.other_entries.saturating_add(1);
+            continue;
+        };
+        match extension {
+            Some("json") => {
+                diagnostics.json_entries = diagnostics.json_entries.saturating_add(1);
+                pairs.entry(id.to_owned()).or_default().0 = true;
+            }
+            Some("state") => {
+                diagnostics.state_entries = diagnostics.state_entries.saturating_add(1);
+                pairs.entry(id.to_owned()).or_default().1 = true;
+            }
+            _ => diagnostics.other_entries = diagnostics.other_entries.saturating_add(1),
+        }
+    }
+
+    let mut terminal = Vec::new();
+    for (id, (has_json, has_state)) in pairs {
+        if !has_json || !has_state || config::validate_session_id(&id).is_err() {
+            diagnostics.invalid_orphan_count = diagnostics.invalid_orphan_count.saturating_add(1);
+            continue;
+        }
+        let session = match config::read_session_metadata(&id).await {
+            Ok(session) if session.id == id => session,
+            _ => {
+                diagnostics.invalid_orphan_count =
+                    diagnostics.invalid_orphan_count.saturating_add(1);
+                continue;
+            }
+        };
+        let lifecycle = match config::read_session_lifecycle(&id).await {
+            Ok(Some(lifecycle)) => lifecycle,
+            _ => {
+                diagnostics.invalid_orphan_count =
+                    diagnostics.invalid_orphan_count.saturating_add(1);
+                continue;
+            }
+        };
+        if !matches!(
+            lifecycle.status,
+            LifecycleStatus::Stopped | LifecycleStatus::Crashed
+        ) {
+            continue;
+        }
+        let Some(stopped_at) = lifecycle.stopped_at else {
+            diagnostics.invalid_orphan_count = diagnostics.invalid_orphan_count.saturating_add(1);
+            continue;
+        };
+        if owned.contains(&id) || protected.contains(&id) {
+            diagnostics.retained_terminal_count =
+                diagnostics.retained_terminal_count.saturating_add(1);
+            continue;
+        }
+        match config::session_is_active(&id).await {
+            Ok(false) => terminal.push(TerminalMetadataCandidate {
+                id,
+                started_at: lifecycle.started_at.max(session.started_at),
+                stopped_at,
+            }),
+            Ok(true) | Err(_) => {
+                diagnostics.retained_terminal_count =
+                    diagnostics.retained_terminal_count.saturating_add(1);
+            }
+        }
+    }
+    terminal.sort_by(|left, right| {
+        right
+            .stopped_at
+            .cmp(&left.stopped_at)
+            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let split = terminal.len().min(TERMINAL_SESSION_RETENTION);
+    diagnostics.retained_terminal_count = diagnostics.retained_terminal_count.saturating_add(split);
+    let prune_candidates = terminal.split_off(split);
+    diagnostics.safely_prunable_count = prune_candidates.len();
+    Ok(RetentionPlan {
+        diagnostics,
+        prune_candidates,
+    })
+}
+
+fn protected_upgrade_session_ids() -> Result<HashSet<String>> {
+    let directory = upgrade_plan_directory()?;
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error).context("failed to inspect supervisor restore plans"),
+    };
+    let mut protected = HashSet::new();
+    for entry in entries {
+        let entry = entry.context("failed to inspect supervisor restore plan entry")?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("restore-")
+            || !name.ends_with(".json")
+            || name.ends_with(".failure.json")
+        {
+            continue;
+        }
+        let plan = read_upgrade_plan(&path)
+            .context("a supervisor restore plan could not be read safely")?;
+        for session in plan.sessions {
+            config::validate_session_id(&session.session_id)?;
+            protected.insert(session.session_id);
+        }
+    }
+    Ok(protected)
+}
+
+async fn retention_candidate_still_safe(
+    supervisor: &SessionSupervisor,
+    candidate: &TerminalMetadataCandidate,
+) -> Result<bool> {
+    if supervisor
+        .owned_session_ids()
+        .await
+        .iter()
+        .any(|id| id == &candidate.id)
+    {
+        return Ok(false);
+    }
+    if protected_upgrade_session_ids()?.contains(&candidate.id) {
+        return Ok(false);
+    }
+    let session = match config::read_session_metadata(&candidate.id).await {
+        Ok(session) if session.id == candidate.id => session,
+        _ => return Ok(false),
+    };
+    let lifecycle = match config::read_session_lifecycle(&candidate.id).await {
+        Ok(Some(lifecycle)) => lifecycle,
+        _ => return Ok(false),
+    };
+    if !matches!(
+        lifecycle.status,
+        LifecycleStatus::Stopped | LifecycleStatus::Crashed
+    ) || lifecycle.stopped_at != Some(candidate.stopped_at)
+        || lifecycle.started_at.max(session.started_at) != candidate.started_at
+    {
+        return Ok(false);
+    }
+    match config::session_is_active(&candidate.id).await {
+        Ok(false) => Ok(true),
+        Ok(true) | Err(_) => Ok(false),
+    }
+}
+
+async fn prune_terminal_metadata_pair(id: &str) -> Result<()> {
+    let state = config::session_lifecycle_path(id)?;
+    let metadata = config::session_path(id)?;
+    tokio::fs::remove_file(&state)
+        .await
+        .with_context(|| format!("failed to prune terminal lifecycle for {id}"))?;
+    tokio::fs::remove_file(&metadata)
+        .await
+        .with_context(|| format!("failed to prune terminal metadata for {id}"))?;
+    Ok(())
 }
 
 fn status_name(status: LifecycleStatus) -> &'static str {

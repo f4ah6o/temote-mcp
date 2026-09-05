@@ -21,6 +21,8 @@ installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp 
 
 `session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` を確認できます。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。
 
+session discovery は active-first です。running supervisor が所有する session を bounded な historical metadata より先に返すため、履歴が蓄積しても active session が `session list` / MCP `session_list` から押し出されません。historical な stopped / crashed entry は list budget 内で deterministic な recent-first 順に返します。supervisor startup と periodic maintenance では、安全に terminal と確認できた metadata pair のうち最近512件を保持し、それより古い confirmed stopped / crashed pair だけを prune します。live、曖昧、malformed / orphan、supervisor upgrade restore plan で保護されている metadata は retention で自動削除しません。read-only listing と MCP fallback は cleanup を行いません。
+
 互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。これは起動中の local supervisor に current directory の session 作成を依頼します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。
 
 相対 path は session の working directory を基準に解決されます。

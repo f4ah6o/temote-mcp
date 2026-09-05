@@ -38,7 +38,6 @@ const MAX_MCP_RESPONSE_BYTES: usize = 52 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_DIRECTORY_LIST_BYTES: usize = 1024 * 1024;
-const MAX_SESSION_METADATA_ENTRIES_SCANNED: usize = 4096;
 const MAX_SESSION_LIST_ENTRIES: usize = 256;
 const MAX_SESSION_LIST_BYTES: usize = 4 * 1024 * 1024;
 const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -845,63 +844,35 @@ async fn call_tool(
 }
 
 async fn session_list() -> Result<Value> {
-    let directory = config::sessions_dir()?;
-    let mut entries = match tokio::fs::read_dir(&directory).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return text_result("[]".to_owned());
-        }
-        Err(error) => return Err(error).context("failed to read session metadata"),
-    };
+    let views = crate::session_control::session_views_for_mcp().await?;
     let mut sessions = Vec::new();
-    let mut scanned_entries = 0usize;
     let mut session_bytes = 0usize;
-    while let Some(entry) = entries.next_entry().await? {
-        scanned_entries =
-            next_session_scan_count(scanned_entries, MAX_SESSION_METADATA_ENTRIES_SCANNED)?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if config::validate_session_id(id).is_err() {
-            continue;
-        }
-        if let Some(session) = session_list_entry(id).await {
-            push_session_list_entry(
-                &mut sessions,
-                &mut session_bytes,
-                session,
-                MAX_SESSION_LIST_ENTRIES,
-                MAX_SESSION_LIST_BYTES,
-            )?;
-        }
+    for session in views {
+        push_session_list_entry(
+            &mut sessions,
+            &mut session_bytes,
+            json!({
+                "session_id": session.session_id,
+                "cwd": session.cwd,
+                "started_at": session.started_at,
+                "stopped_at": session.stopped_at,
+                "status": session.status,
+                "pid": session.pid,
+                "exit_reason": session.exit_reason,
+                "last_error": session.last_error,
+                "permission_mode": session.permission_mode,
+                "yolo": session.yolo,
+            }),
+            MAX_SESSION_LIST_ENTRIES,
+            MAX_SESSION_LIST_BYTES,
+        )?;
     }
-    sessions.sort_by_key(|session| {
-        session["session_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned()
-    });
     let rendered = serde_json::to_string_pretty(&sessions)?;
     anyhow::ensure!(
         rendered.len() <= MAX_SESSION_LIST_BYTES,
         "session list exceeds {MAX_SESSION_LIST_BYTES} bytes"
     );
     text_result(rendered)
-}
-
-fn next_session_scan_count(current: usize, max_entries: usize) -> Result<usize> {
-    let next = current
-        .checked_add(1)
-        .context("session metadata entry count overflow")?;
-    anyhow::ensure!(
-        next <= max_entries,
-        "session metadata directory exceeds {max_entries} entries"
-    );
-    Ok(next)
 }
 
 fn push_session_list_entry(
@@ -926,22 +897,6 @@ fn push_session_list_entry(
     sessions.push(session);
     *rendered_bytes = next;
     Ok(())
-}
-
-async fn session_list_entry(id: &str) -> Option<Value> {
-    let session = crate::session_control::inspect_session(id).await.ok()?;
-    Some(json!({
-        "session_id": session.session_id,
-        "cwd": session.cwd,
-        "started_at": session.started_at,
-        "stopped_at": session.stopped_at,
-        "status": session.status,
-        "pid": session.pid,
-        "exit_reason": session.exit_reason,
-        "last_error": session.last_error,
-        "permission_mode": session.permission_mode,
-        "yolo": session.yolo,
-    }))
 }
 
 async fn report_result<T>(session_id: &str, title: String, result: &Result<T>) {
@@ -2344,27 +2299,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_session_scan_count_matches_reference_model() -> noprop::TestResult {
-        test_support::run(0x5345_5353_5343_414e, 512, |ctx| {
-            let max_entries = noprop::sample_usize_in(ctx, 0..=16);
-            let current = noprop::sample_usize_in(ctx, 0..=max_entries.saturating_add(2));
-            let result = next_session_scan_count(current, max_entries);
-            let expected = current
-                .checked_add(1)
-                .is_some_and(|next| next <= max_entries);
-            assert_eq!(
-                result.is_ok(),
-                expected,
-                "current={current} max_entries={max_entries}"
-            );
-            if expected {
-                assert_eq!(result.unwrap(), current + 1);
-            }
-            Ok(())
-        })
-    }
-
-    #[test]
     fn generated_session_list_budget_matches_reference_model() -> noprop::TestResult {
         test_support::run(0x5345_5353_4c49_5354, 512, |ctx| {
             let max_entries = noprop::sample_usize_in(ctx, 0..=8);
@@ -2928,12 +2862,12 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
 
-        let listed = session_list_entry(&id)
+        let listed = crate::session_control::inspect_session_read_only(&id)
             .await
             .expect("ambiguous session should be surfaced");
         server.await.unwrap();
-        assert_eq!(listed["session_id"], id);
-        assert_eq!(listed["status"], "unknown");
+        assert_eq!(listed.session_id, id);
+        assert_eq!(listed.status, "unknown");
 
         tokio::fs::remove_file(config::session_path(&id).unwrap())
             .await

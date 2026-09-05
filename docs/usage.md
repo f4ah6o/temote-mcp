@@ -21,6 +21,8 @@ After replacing the installed binary, run `temote-mcp upgrade --dry-run` and the
 
 `session list` includes durable `starting`, `active`, `stopping`, `stopped`, and `crashed` states. `session info` includes the working directory, permitted roots, permission mode, timestamps, exit reason, and last error. A dead or ambiguous socket is never silently treated as active. Manual restart is available with `temote-mcp session restart <id>`; automatic restart is not enabled.
 
+Session discovery is active-first: sessions owned by the running supervisor are returned before bounded historical metadata, so accumulated history cannot evict active sessions from `session list` / MCP `session_list`. Historical stopped/crashed entries are returned in a deterministic recent-first order within the list budget. Supervisor startup and periodic maintenance retain the 512 most recent safely confirmed terminal metadata pairs and prune only older confirmed stopped/crashed pairs. Live, ambiguous, malformed/orphaned, and supervisor-upgrade restore-plan-protected metadata is never automatically removed by retention; read-only listing and MCP fallback do not perform cleanup.
+
 For compatibility, `cd ~/src/my-project && temote-mcp start my-project` asks the running local supervisor to start the current directory. `temote-mcp start my-project --yolo` remains the deliberately unrestricted local-only form.
 
 Relative paths resolve from the session working directory.

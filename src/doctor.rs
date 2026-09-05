@@ -246,6 +246,27 @@ pub async fn run(options: Options) -> Result<()> {
         ));
     }
 
+    match crate::session_control::session_metadata_diagnostics().await {
+        Ok(diagnostics) => report.add(Check::pass(
+            "session metadata",
+            format!(
+                "entries={} json={} state={} other={} retained_terminal={} safely_prunable={} invalid_orphan={}",
+                diagnostics.total_entries,
+                diagnostics.json_entries,
+                diagnostics.state_entries,
+                diagnostics.other_entries,
+                diagnostics.retained_terminal_count,
+                diagnostics.safely_prunable_count,
+                diagnostics.invalid_orphan_count
+            ),
+        )),
+        Err(_) => report.add(Check::fail(
+            "session metadata",
+            "session metadata diagnostics could not be completed safely",
+            "Inspect session metadata health before relying on retention maintenance.",
+        )),
+    }
+
     report.finish()
 }
 

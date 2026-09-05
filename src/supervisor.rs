@@ -131,6 +131,20 @@ impl SessionSupervisor {
         self.upgrade_fenced.store(false, Ordering::Release);
     }
 
+    pub async fn owned_session_ids(&self) -> Vec<String> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        let mut ids = self
+            .sessions
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     #[cfg(test)]
     pub async fn start(
         &self,
