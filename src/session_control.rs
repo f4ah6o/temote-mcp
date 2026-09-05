@@ -769,23 +769,11 @@ async fn handle_upgrade_request(
     dry_run: bool,
     force: bool,
 ) -> Result<()> {
-    let preflight: Result<(PathBuf, SupervisorUpgradePlan)> = async {
+    let executable_preflight = (|| -> Result<(PathBuf, SupervisorCapabilities)> {
         environment.validate()?;
-        let (executable, capabilities) = validate_upgrade_executable(&executable, &target_version)?;
-        let plan = supervisor
-            .build_upgrade_plan(
-                &target_version,
-                capabilities.control_protocol,
-                capabilities.lifecycle_schema,
-                &environment,
-                !dry_run,
-                force,
-            )
-            .await?;
-        Ok((executable, plan))
-    }
-    .await;
-    let (executable, plan) = match preflight {
+        validate_upgrade_executable(&executable, &target_version)
+    })();
+    let (executable, capabilities) = match executable_preflight {
         Ok(value) => value,
         Err(error) => {
             write_control_error(&mut stream, &error).await?;
@@ -793,7 +781,52 @@ async fn handle_upgrade_request(
         }
     };
 
-    if dry_run || !plan.handoff_required {
+    if dry_run {
+        let preview = supervisor
+            .preview_upgrade_plan(
+                &target_version,
+                capabilities.control_protocol,
+                capabilities.lifecycle_schema,
+                &environment,
+                force,
+            )
+            .await;
+        let preview = match preview {
+            Ok(preview) => preview,
+            Err(error) => {
+                write_control_error(&mut stream, &error).await?;
+                return Ok(());
+            }
+        };
+        let response = json!({"ok": true, "result": preview, "error": Value::Null});
+        stream.write_all(&encode_line(&response)?).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
+    let preflight: Result<SupervisorUpgradePlan> = async {
+        let plan = supervisor
+            .build_upgrade_plan(
+                &target_version,
+                capabilities.control_protocol,
+                capabilities.lifecycle_schema,
+                &environment,
+                true,
+                force,
+            )
+            .await?;
+        Ok(plan)
+    }
+    .await;
+    let plan = match preflight {
+        Ok(value) => value,
+        Err(error) => {
+            write_control_error(&mut stream, &error).await?;
+            return Ok(());
+        }
+    };
+
+    if !plan.handoff_required {
         let response = json!({"ok": true, "result": plan, "error": Value::Null});
         stream.write_all(&encode_line(&response)?).await?;
         let _ = stream.shutdown().await;

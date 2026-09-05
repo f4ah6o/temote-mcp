@@ -40,6 +40,25 @@ pub struct SupervisorUpgradePlan {
     pub sessions: Vec<UpgradeSessionPlan>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpgradeSessionBlocker {
+    pub session_id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupervisorUpgradePreview {
+    pub plan: SupervisorUpgradePlan,
+    pub blocked_sessions: Vec<UpgradeSessionBlocker>,
+}
+
+#[derive(Clone, Copy)]
+struct UpgradePlanOptions {
+    fence: bool,
+    force: bool,
+    collect_blockers: bool,
+}
+
 #[derive(Clone)]
 struct RestartSpec {
     cwd: PathBuf,
@@ -452,6 +471,52 @@ impl SessionSupervisor {
         fence: bool,
         force: bool,
     ) -> Result<SupervisorUpgradePlan> {
+        let preview = self
+            .prepare_upgrade_plan(
+                target_version,
+                control_protocol,
+                lifecycle_schema,
+                available_environment,
+                UpgradePlanOptions {
+                    fence,
+                    force,
+                    collect_blockers: false,
+                },
+            )
+            .await?;
+        Ok(preview.plan)
+    }
+
+    pub async fn preview_upgrade_plan(
+        &self,
+        target_version: &str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &approvals::CapturedStartEnvironment,
+        force: bool,
+    ) -> Result<SupervisorUpgradePreview> {
+        self.prepare_upgrade_plan(
+            target_version,
+            control_protocol,
+            lifecycle_schema,
+            available_environment,
+            UpgradePlanOptions {
+                fence: false,
+                force,
+                collect_blockers: true,
+            },
+        )
+        .await
+    }
+
+    async fn prepare_upgrade_plan(
+        &self,
+        target_version: &str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &approvals::CapturedStartEnvironment,
+        options: UpgradePlanOptions,
+    ) -> Result<SupervisorUpgradePreview> {
         let _transition = self.transitions.lock().await;
         anyhow::ensure!(
             !self.upgrade_fenced.load(Ordering::Acquire),
@@ -460,8 +525,9 @@ impl SessionSupervisor {
         self.reap_finished().await;
 
         let source_version = env!("CARGO_PKG_VERSION").to_owned();
-        let handoff_required = force || source_version != target_version;
+        let handoff_required = options.force || source_version != target_version;
         let mut plans = Vec::new();
+        let mut blocked_sessions = Vec::new();
         if handoff_required {
             let ids = {
                 let sessions = self.sessions.lock().await;
@@ -470,72 +536,90 @@ impl SessionSupervisor {
                 ids
             };
             for id in ids {
-                let snapshot = {
-                    let sessions = self.sessions.lock().await;
-                    let handle = sessions.get(&id).with_context(|| {
-                        format!("session {id} disappeared during upgrade preflight")
-                    })?;
-                    handle.snapshot().await?
-                };
-                let spec = self
-                    .restart_specs
-                    .lock()
-                    .await
-                    .get(&id)
-                    .cloned()
-                    .with_context(|| format!("session {id} has no in-memory restart context"))?;
-                if let Some(logical_path) = spec.logical_path.as_deref() {
-                    let resolved = self.roots.resolve(logical_path)?;
+                let attempt: Result<UpgradeSessionPlan> = async {
+                    let snapshot = {
+                        let sessions = self.sessions.lock().await;
+                        let handle = sessions.get(&id).with_context(|| {
+                            format!("session {id} disappeared during upgrade preflight")
+                        })?;
+                        handle.snapshot().await?
+                    };
+                    let spec = self
+                        .restart_specs
+                        .lock()
+                        .await
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| {
+                            format!("session {id} has no in-memory restart context")
+                        })?;
+                    if let Some(logical_path) = spec.logical_path.as_deref() {
+                        let resolved = self.roots.resolve(logical_path)?;
+                        anyhow::ensure!(
+                            resolved == snapshot.cwd,
+                            "session {id} named root no longer resolves to its current cwd"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            config::canonical_directory(&spec.cwd)? == snapshot.cwd,
+                            "session {id} local cwd no longer resolves to its current cwd"
+                        );
+                    }
+                    let mismatches = spec
+                        .environment
+                        .restart_context_mismatches(available_environment);
                     anyhow::ensure!(
-                        resolved == snapshot.cwd,
-                        "session {id} named root no longer resolves to its current cwd"
+                        mismatches.is_empty(),
+                        "session {id} restart context is unavailable or changed for keys: {}",
+                        mismatches.join(", ")
                     );
-                } else {
+                    let lifecycle = config::read_session_lifecycle(&id)
+                        .await?
+                        .with_context(|| format!("session {id} has no lifecycle metadata"))?;
                     anyhow::ensure!(
-                        config::canonical_directory(&spec.cwd)? == snapshot.cwd,
-                        "session {id} local cwd no longer resolves to its current cwd"
+                        lifecycle.status == config::LifecycleStatus::Active,
+                        "session {id} is not in active lifecycle state during upgrade preflight"
                     );
+                    Ok(UpgradeSessionPlan {
+                        session_id: id.clone(),
+                        cwd: snapshot.cwd,
+                        permitted_directories: snapshot.permitted_directories,
+                        yolo: snapshot.yolo,
+                        logical_path: spec.logical_path,
+                        restart_policy: lifecycle.restart_policy,
+                        public: self.public_sessions.lock().await.contains(&id),
+                        restart_context_keys: spec.environment.restart_context_keys(),
+                    })
                 }
-                let mismatches = spec
-                    .environment
-                    .restart_context_mismatches(available_environment);
-                anyhow::ensure!(
-                    mismatches.is_empty(),
-                    "session {id} restart context is unavailable or changed for keys: {}",
-                    mismatches.join(", ")
-                );
-                let lifecycle = config::read_session_lifecycle(&id)
-                    .await?
-                    .with_context(|| format!("session {id} has no lifecycle metadata"))?;
-                anyhow::ensure!(
-                    lifecycle.status == config::LifecycleStatus::Active,
-                    "session {id} is not in active lifecycle state during upgrade preflight"
-                );
-                plans.push(UpgradeSessionPlan {
-                    session_id: id.clone(),
-                    cwd: snapshot.cwd,
-                    permitted_directories: snapshot.permitted_directories,
-                    yolo: snapshot.yolo,
-                    logical_path: spec.logical_path,
-                    restart_policy: lifecycle.restart_policy,
-                    public: self.public_sessions.lock().await.contains(&id),
-                    restart_context_keys: spec.environment.restart_context_keys(),
-                });
+                .await;
+                match attempt {
+                    Ok(plan) => plans.push(plan),
+                    Err(error) if options.collect_blockers => {
+                        blocked_sessions.push(UpgradeSessionBlocker {
+                            session_id: id,
+                            reason: format!("{error:#}"),
+                        })
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
-        if fence && handoff_required {
+        if options.fence && handoff_required && blocked_sessions.is_empty() {
             self.upgrade_fenced.store(true, Ordering::Release);
         }
-        Ok(SupervisorUpgradePlan {
-            plan_schema: 1,
-            source_version,
-            target_version: target_version.to_owned(),
-            control_protocol,
-            lifecycle_schema,
-            supervisor_pid: std::process::id(),
-            created_at: config::unix_time(),
-            handoff_required,
-            sessions: plans,
+        Ok(SupervisorUpgradePreview {
+            plan: SupervisorUpgradePlan {
+                plan_schema: 1,
+                source_version,
+                target_version: target_version.to_owned(),
+                control_protocol,
+                lifecycle_schema,
+                supervisor_pid: std::process::id(),
+                created_at: config::unix_time(),
+                handoff_required,
+                sessions: plans,
+            },
+            blocked_sessions,
         })
     }
 
@@ -1422,6 +1506,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgrade_preview_collects_blockers_without_mutation_or_secret_values() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let ready_id = format!("upgrade-preview-ready-{}", uuid::Uuid::new_v4());
+        let blocked_id = format!("upgrade-preview-blocked-{}", uuid::Uuid::new_v4());
+        let ready_environment =
+            approvals::CapturedStartEnvironment::from_values(BTreeMap::from([(
+                "PATH".to_owned(),
+                "/usr/bin:/bin".to_owned(),
+            )]))
+            .unwrap();
+        let blocked_environment = approvals::CapturedStartEnvironment::from_values(BTreeMap::from(
+            [("KINTONE_PASSWORD".to_owned(), "original-secret".to_owned())],
+        ))
+        .unwrap();
+        let available_environment =
+            approvals::CapturedStartEnvironment::from_values(BTreeMap::from([
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                ("KINTONE_PASSWORD".to_owned(), "different-secret".to_owned()),
+            ]))
+            .unwrap();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&ready_id), ready_environment)
+            .await
+            .unwrap();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&blocked_id), blocked_environment)
+            .await
+            .unwrap();
+
+        let preview = supervisor
+            .preview_upgrade_plan(
+                env!("CARGO_PKG_VERSION"),
+                1,
+                1,
+                &available_environment,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(preview.plan.handoff_required);
+        assert_eq!(preview.plan.sessions.len(), 1);
+        assert_eq!(preview.plan.sessions[0].session_id, ready_id);
+        assert_eq!(preview.blocked_sessions.len(), 1);
+        assert_eq!(preview.blocked_sessions[0].session_id, blocked_id);
+        assert!(
+            preview.blocked_sessions[0]
+                .reason
+                .contains("KINTONE_PASSWORD")
+        );
+        let serialized = serde_json::to_string(&preview).unwrap();
+        assert!(!serialized.contains("original-secret"));
+        assert!(!serialized.contains("different-secret"));
+        assert!(config::session_is_active(&ready_id).await.unwrap());
+        assert!(config::session_is_active(&blocked_id).await.unwrap());
+
+        let error = supervisor
+            .build_upgrade_plan(
+                env!("CARGO_PKG_VERSION"),
+                1,
+                1,
+                &available_environment,
+                true,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("KINTONE_PASSWORD"));
+        assert!(config::session_is_active(&ready_id).await.unwrap());
+        assert!(config::session_is_active(&blocked_id).await.unwrap());
+
+        // Neither preview nor failed destructive preflight may leave mutation fenced.
+        supervisor.stop(&ready_id).await.unwrap();
+        supervisor.stop(&blocked_id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&ready_id).await;
+        cleanup_session(&blocked_id).await;
+    }
+
+    #[tokio::test]
     async fn upgrade_preflight_rejects_changed_restart_context_without_exposing_values() {
         let (_temp, roots) = fixture();
         let (supervisor, _approvals) = SessionSupervisor::new(roots);
@@ -1440,6 +1604,18 @@ mod tests {
             .start_with_environment("src/repo-a", Some(&id), original)
             .await
             .unwrap();
+
+        let preview = supervisor
+            .preview_upgrade_plan(env!("CARGO_PKG_VERSION"), 1, 1, &changed, true)
+            .await
+            .unwrap();
+        assert!(preview.plan.sessions.is_empty());
+        assert_eq!(preview.blocked_sessions.len(), 1);
+        let blocker = &preview.blocked_sessions[0];
+        assert_eq!(blocker.session_id, id);
+        assert!(blocker.reason.contains("KINTONE_PASSWORD"));
+        assert!(!blocker.reason.contains("original-secret"));
+        assert!(!blocker.reason.contains("different-secret"));
 
         let error = supervisor
             .build_upgrade_plan(env!("CARGO_PKG_VERSION"), 1, 1, &changed, true, true)

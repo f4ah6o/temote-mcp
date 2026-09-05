@@ -218,7 +218,7 @@ It should produce the exact transition plan without stopping or restarting anyth
 ## Acceptance criteria
 
 - [x] an explicit command can determine whether installed and running supervisor versions differ
-- [ ] `--dry-run` produces a complete non-destructive handoff/restart plan
+- [x] `--dry-run` produces a complete non-destructive handoff/restart plan
 - [x] lifecycle mutations are fenced while supervisor ownership is changing
 - [x] compatibility is verified before the old supervisor is stopped
 - [x] intended active sessions are preserved or recreated automatically with the same IDs
@@ -264,6 +264,10 @@ Implemented the first Level B handoff path:
 - The old supervisor gracefully drains the planned sessions and `exec`s the target supervisor with `--restore-plan` in the same PID. The replacement recreates only the prior active set, preserves ID/logical path/cwd/permitted roots/yolo/restart policy, and probes every restored socket before deleting the plan.
 - If `exec` fails before process replacement, the old supervisor attempts rollback from its still-memory-resident restart specifications and clears the lifecycle fence.
 - If the replacement process fails while restoring sessions after `exec`, it removes its control socket, shuts down any replacement-owned sessions, classifies the final planned/restored/unrestored set, and writes an owner-only bounded `restore-*.failure.json` report next to the retained non-secret restore plan. The original `upgrade` caller watches for that report and returns the concrete rollback state and restore cause instead of only timing out on health verification. Failure reports contain session IDs and diagnostic text only; captured restart-environment values are redacted before persistence, and restart-context keys and values are not persisted.
+- `upgrade --dry-run` now uses a non-mutating preview path. Re-creatable sessions remain in the normal handoff plan while sessions blocked by missing or changed restart context are returned separately in `blocked_sessions`, including only diagnostic reason text and restart-context key names.
+- Dry-run blockers do not stop sessions or leave the lifecycle fence set. The destructive path continues to fail closed on the same blocker before writing a restore plan or draining any session.
+- Dry-run serialization is covered against captured credential values: restart-context key names remain visible for diagnosis, while the old and caller-provided secret values are absent.
+- Executable/protocol/lifecycle compatibility validation remains shared with the destructive path, so an incompatible target still fails closed before either preview or handoff.
 - After successful supervisor/session verification, `upgrade` transactionally runs the binary-owned Codex plugin installer. Failure produces the exact manual follow-up command; already-running Codex still requires restart.
 - Same-version invocation is a no-op unless `--force` is supplied.
 
@@ -275,7 +279,8 @@ Current deliberate limitations keep this issue open:
 
 ### Evidence
 
-- full `cargo test --all-targets --all-features` under an isolated macOS `HOME`: 362 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
+- full `cargo test --all-targets --all-features` under isolated macOS `HOME` / `XDG_STATE_HOME`: 363 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
+- dry-run regression coverage verifies mixed ready/blocked sessions, blocker visibility, credential-value non-disclosure, no session mutation, no lifecycle-fence residue, and destructive fail-closed behavior for the same restart-context mismatch;
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed;
 - `cargo check --no-default-features --all-targets`: passed (existing feature-dependent dead-code warnings only);
 - isolated Linux E2E using socket namespace `upge2e01`: supervisor PID `2233563` remained unchanged across forced same-version `exec` handoff; session `e2e-upgrade` was restored active with the same ID/cwd/permission metadata and then stopped cleanly;
