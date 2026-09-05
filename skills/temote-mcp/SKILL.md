@@ -111,9 +111,13 @@ Do not guess tenant credentials or expose them. In normal sessions, forwarded ki
 
 ## Supervisor upgrades
 
-`temote-mcp up` owns HTTP/ingress, not the session supervisor. When the user explicitly asks to apply an already-installed Temote binary to the running supervisor and local command execution is available, use `temote-mcp upgrade --dry-run` first and inspect the plan before `temote-mcp upgrade`. Do not substitute re-running `temote-mcp up` for a supervisor handoff.
+`temote-mcp up` owns HTTP/ingress, not the session supervisor. When the user explicitly asks to apply an already-installed Temote binary to the running supervisor and local command execution is available, use `temote-mcp upgrade --dry-run` first and inspect the complete plan before `temote-mcp upgrade`. Do not substitute re-running `temote-mcp up` for a supervisor handoff.
 
-If dry-run reports incompatible protocol/schema, missing restart context, or an in-flight operation, stop there and report the blocker. Do not persist or reconstruct plaintext credentials to force the transition. A supervisor that predates the handoff protocol requires one manual supervisor restart before later compatible releases can use `upgrade`.
+The dry-run is the source of truth for the transition. Check supervisor compatibility, `blocked_sessions`, in-flight-operation blockers, and direct-ingress actions. It may also report an ingress blocker when the current ingress cannot be reconstructed safely, for example because required restart context was interactive-only. Do not proceed with the destructive upgrade while any blocker remains.
+
+A successful upgrade performs a same-PID supervisor handoff, restores and probes the intended active-session set, and reports deterministic partial-state details if restore fails. When direct ingress is active, it is left untouched only when already healthy on the target binary; otherwise Temote restarts it from its durable non-secret recipe and requires `/healthz` to recover before reporting success. After the supervisor/session transition succeeds, Temote also reconciles the binary-owned Codex plugin transactionally; report any exact manual follow-up or client-restart requirement returned by the command rather than assuming a running client has reloaded the plugin.
+
+Do not persist or reconstruct plaintext credentials to force a transition. A supervisor that predates the handoff protocol requires one manual supervisor restart before later compatible releases can use `upgrade`.
 
 ## Failure handling
 
