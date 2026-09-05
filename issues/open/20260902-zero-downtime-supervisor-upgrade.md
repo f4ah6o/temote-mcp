@@ -228,7 +228,7 @@ It should produce the exact transition plan without stopping or restarting anyth
 - [x] every restored session is socket-probed before upgrade success
 - [ ] ingress is restarted/reloaded only when needed and is health-checked afterward
 - [x] Codex plugin version is reconciled or a precise client-restart action is reported
-- [ ] failure produces a deterministic rollback/partial-state report
+- [x] failure produces a deterministic rollback/partial-state report
 - [x] repeated invocation after successful upgrade is idempotent
 - [x] existing `up/down`, session lifecycle, sandbox, approval, 1Password, kintone, and gateway security boundaries remain unchanged
 - [ ] Linux and macOS upgrade-path tests cover compatible and incompatible generations
@@ -263,19 +263,22 @@ Implemented the first Level B handoff path:
 - The disk restore plan is owner-only and contains session identity/path/permission/restart state plus restart-context key names only. Credential values remain memory-only and are passed to the replacement process through the `exec` environment, not persisted.
 - The old supervisor gracefully drains the planned sessions and `exec`s the target supervisor with `--restore-plan` in the same PID. The replacement recreates only the prior active set, preserves ID/logical path/cwd/permitted roots/yolo/restart policy, and probes every restored socket before deleting the plan.
 - If `exec` fails before process replacement, the old supervisor attempts rollback from its still-memory-resident restart specifications and clears the lifecycle fence.
+- If the replacement process fails while restoring sessions after `exec`, it removes its control socket, shuts down any replacement-owned sessions, classifies the final planned/restored/unrestored set, and writes an owner-only bounded `restore-*.failure.json` report next to the retained non-secret restore plan. The original `upgrade` caller watches for that report and returns the concrete rollback state and restore cause instead of only timing out on health verification. Failure reports contain session IDs and diagnostic text only; captured restart-environment values are redacted before persistence, and restart-context keys and values are not persisted.
 - After successful supervisor/session verification, `upgrade` transactionally runs the binary-owned Codex plugin installer. Failure produces the exact manual follow-up command; already-running Codex still requires restart.
 - Same-version invocation is a no-op unless `--force` is supplied.
 
 Current deliberate limitations keep this issue open:
 
 - protocol/lifecycle-schema-changing generations fail closed; automatic `serve/up` ingress restart/profile recovery and post-transition ingress health checks are not implemented yet;
-- if the replacement process has already `exec`'d and then fails during restore, the non-secret plan is retained but automatic execution of an old binary generation is not yet implemented;
-- Linux isolated process E2E has been exercised; macOS process-boundary handoff evidence is still required.
+- if the replacement process has already `exec`'d and then fails during restore, deterministic partial-state reporting and replacement-session shutdown are implemented, but automatic execution of an old binary generation is not yet implemented;
+- a portable ignored process-boundary compatible-generation E2E now exists and has passed on macOS; a dedicated Linux/macOS matrix covering both compatible and incompatible generations remains open.
 
 ### Evidence
 
-- full `cargo test --all-targets --all-features`: 347 main-binary tests passed, 0 failed; existing process-boundary lifecycle test remains intentionally ignored; sandbox/package tests also passed;
+- full `cargo test --all-targets --all-features` under an isolated macOS `HOME`: 352 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed;
 - `cargo check --no-default-features --all-targets`: passed (existing feature-dependent dead-code warnings only);
 - isolated Linux E2E using socket namespace `upge2e01`: supervisor PID `2233563` remained unchanged across forced same-version `exec` handoff; session `e2e-upgrade` was restored active with the same ID/cwd/permission metadata and then stopped cleanly;
+- explicit macOS process E2E `supervisor_upgrade_handoff_preserves_active_session_and_pid`: passed; forced same-version handoff preserved the supervisor PID and restored the session as active with the same cwd, `ask` permission mode, and `on-failure` restart policy. The test isolates both `HOME` and `XDG_STATE_HOME` so Codex plugin reconciliation cannot modify the developer's real home state;
+- failure-report tests cover owner-only permissions, bounded reads, out-of-tree path rejection, symlink rejection via `O_NOFOLLOW`, secret-value redaction/non-persistence, partial restore classification as `incomplete`, and successful process handoff verifies that no `.failure.json` is created;
 - the E2E temporarily installed the checkout debug Codex plugin as part of the real upgrade path; the host plugin was immediately restored with the installed `temote-mcp codex plugin install`, returning it to version `2026.9.2`.

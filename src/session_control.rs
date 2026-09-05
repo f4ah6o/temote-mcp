@@ -27,6 +27,8 @@ const CONTROL_PROTOCOL_VERSION: u64 = 1;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 const UPGRADE_PLAN_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
+const UPGRADE_FAILURE_REPORT_SCHEMA_VERSION: u64 = 1;
+const MAX_UPGRADE_FAILURE_REPORT_BYTES: usize = 64 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -215,6 +217,18 @@ struct ControlResponse {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct UpgradeFailureReport {
+    report_schema: u64,
+    source_version: String,
+    target_version: String,
+    planned_sessions: Vec<String>,
+    restored_sessions: Vec<String>,
+    unrestored_sessions: Vec<String>,
+    rollback: String,
+    error: String,
+}
+
 pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
     let path = config::supervisor_socket_path()?;
     prepare_supervisor_socket(&path).await?;
@@ -239,9 +253,27 @@ pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
             .restore_upgrade_plan(&plan, &available_environment)
             .await
         {
+            let restore_error =
+                redact_captured_environment_values(&format!("{error:#}"), &available_environment);
             let _ = tokio::fs::remove_file(&path).await;
-            let _ = supervisor.shutdown().await;
-            return Err(error).context("failed to restore sessions after supervisor upgrade");
+            let shutdown = supervisor.shutdown().await;
+            let shutdown_error = shutdown.as_ref().err().map(|error| format!("{error:#}"));
+            let report =
+                collect_upgrade_failure_report(&plan, &restore_error, shutdown_error.as_deref())
+                    .await;
+            if let Err(report_error) = write_upgrade_failure_report(restore_plan_path, &report) {
+                return Err(anyhow::anyhow!(
+                    "failed to restore sessions after supervisor upgrade: {restore_error}; additionally failed to persist deterministic failure report: {report_error:#}"
+                ));
+            }
+            if let Err(shutdown_error) = shutdown {
+                return Err(anyhow::anyhow!(
+                    "failed to restore sessions after supervisor upgrade: {restore_error}; replacement rollback was incomplete: {shutdown_error:#}"
+                ));
+            }
+            return Err(anyhow::anyhow!(
+                "failed to restore sessions after supervisor upgrade: {restore_error}; replacement sessions were stopped and a failure report was preserved"
+            ));
         }
         remove_upgrade_plan(restore_plan_path)?;
         eprintln!(
@@ -785,7 +817,8 @@ async fn handle_upgrade_request(
         "ok": true,
         "result": {
             "plan": plan,
-            "handoff": "accepted"
+            "handoff": "accepted",
+            "restore_plan_path": plan_path
         },
         "error": Value::Null
     });
@@ -887,7 +920,11 @@ fn validate_upgrade_plan_path(path: &Path) -> Result<()> {
     anyhow::ensure!(
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("restore-") && name.ends_with(".json")),
+            .is_some_and(|name| {
+                name.starts_with("restore-")
+                    && name.ends_with(".json")
+                    && !name.ends_with(".failure.json")
+            }),
         "invalid supervisor restore plan file name"
     );
     Ok(())
@@ -944,6 +981,192 @@ fn validate_restore_plan(plan: &SupervisorUpgradePlan) -> Result<()> {
     Ok(())
 }
 
+fn upgrade_failure_report_path(restore_plan_path: &Path) -> Result<PathBuf> {
+    validate_upgrade_plan_path(restore_plan_path)?;
+    let file_name = restore_plan_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("restore plan file name is not valid UTF-8")?;
+    let base = file_name
+        .strip_suffix(".json")
+        .context("restore plan file name has no .json suffix")?;
+    Ok(restore_plan_path.with_file_name(format!("{base}.failure.json")))
+}
+
+fn validate_upgrade_failure_report_path(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("upgrade failure report has no parent directory")?;
+    let expected = upgrade_plan_directory()?;
+    let parent = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "cannot resolve upgrade failure report directory {}",
+            parent.display()
+        )
+    })?;
+    let expected = std::fs::canonicalize(&expected).with_context(|| {
+        format!(
+            "cannot resolve expected upgrade plan directory {}",
+            expected.display()
+        )
+    })?;
+    anyhow::ensure!(
+        parent == expected,
+        "upgrade failure report must be inside {}",
+        expected.display()
+    );
+    anyhow::ensure!(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("restore-") && name.ends_with(".failure.json")),
+        "invalid supervisor upgrade failure report file name"
+    );
+    Ok(())
+}
+
+fn write_upgrade_failure_report(
+    restore_plan_path: &Path,
+    report: &UpgradeFailureReport,
+) -> Result<PathBuf> {
+    let path = upgrade_failure_report_path(restore_plan_path)?;
+    validate_upgrade_failure_report_path(&path)?;
+    let bytes = serde_json::to_vec_pretty(report)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_UPGRADE_FAILURE_REPORT_BYTES,
+        "supervisor upgrade failure report exceeds {MAX_UPGRADE_FAILURE_REPORT_BYTES} bytes"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("failed to create upgrade failure report {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+fn read_upgrade_failure_report(restore_plan_path: &Path) -> Result<Option<UpgradeFailureReport>> {
+    let path = upgrade_failure_report_path(restore_plan_path)?;
+    validate_upgrade_failure_report_path(&path)?;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open upgrade failure report {}", path.display()));
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "supervisor upgrade failure report must be a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_UPGRADE_FAILURE_REPORT_BYTES as u64,
+        "supervisor upgrade failure report exceeds {MAX_UPGRADE_FAILURE_REPORT_BYTES} bytes"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode & 0o077 == 0,
+        "supervisor upgrade failure report must be owner-only (mode {mode:04o})"
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_UPGRADE_FAILURE_REPORT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_UPGRADE_FAILURE_REPORT_BYTES,
+        "supervisor upgrade failure report exceeds {MAX_UPGRADE_FAILURE_REPORT_BYTES} bytes"
+    );
+    let report: UpgradeFailureReport =
+        serde_json::from_slice(&bytes).context("invalid supervisor upgrade failure report")?;
+    anyhow::ensure!(
+        report.report_schema == UPGRADE_FAILURE_REPORT_SCHEMA_VERSION,
+        "unsupported supervisor upgrade failure report schema"
+    );
+    Ok(Some(report))
+}
+
+fn redact_captured_environment_values(
+    text: &str,
+    environment: &CapturedStartEnvironment,
+) -> String {
+    let mut redacted = text.to_owned();
+    for (name, value) in environment.values() {
+        if !value.is_empty() && redacted.contains(value) {
+            redacted = redacted.replace(value, &format!("<redacted:{name}>"));
+        }
+    }
+    redacted
+}
+
+async fn collect_upgrade_failure_report(
+    plan: &SupervisorUpgradePlan,
+    restore_error: &str,
+    shutdown_error: Option<&str>,
+) -> UpgradeFailureReport {
+    let planned_sessions = plan
+        .sessions
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect::<Vec<_>>();
+    let mut restored_sessions = Vec::new();
+    let mut unrestored_sessions = Vec::new();
+    let mut probe_errors = Vec::new();
+    for session_id in &planned_sessions {
+        match config::session_is_active(session_id).await {
+            Ok(true) => restored_sessions.push(session_id.clone()),
+            Ok(false) => unrestored_sessions.push(session_id.clone()),
+            Err(error) => {
+                unrestored_sessions.push(session_id.clone());
+                probe_errors.push(format!("{session_id}: {error:#}"));
+            }
+        }
+    }
+
+    let rollback = if shutdown_error.is_none() && restored_sessions.is_empty() {
+        "replacement_sessions_stopped"
+    } else {
+        "incomplete"
+    };
+    let mut error = restore_error.to_owned();
+    if let Some(shutdown_error) = shutdown_error {
+        error.push_str("; replacement shutdown failed: ");
+        error.push_str(shutdown_error);
+    }
+    if !probe_errors.is_empty() {
+        error.push_str("; post-rollback liveness probe errors: ");
+        error.push_str(&probe_errors.join(", "));
+    }
+    UpgradeFailureReport {
+        report_schema: UPGRADE_FAILURE_REPORT_SCHEMA_VERSION,
+        source_version: plan.source_version.clone(),
+        target_version: plan.target_version.clone(),
+        planned_sessions,
+        restored_sessions,
+        unrestored_sessions,
+        rollback: rollback.to_owned(),
+        error,
+    }
+}
+
+fn format_upgrade_failure_report(report: &UpgradeFailureReport) -> String {
+    format!(
+        "supervisor handoff failed after exec\nsource: {}\ntarget: {}\nrollback: {}\nrestored: [{}]\nunrestored: [{}]\ncause: {}",
+        report.source_version,
+        report.target_version,
+        report.rollback,
+        report.restored_sessions.join(", "),
+        report.unrestored_sessions.join(", "),
+        report.error
+    )
+}
+
 fn remove_upgrade_plan(path: &Path) -> Result<()> {
     validate_upgrade_plan_path(path)?;
     match std::fs::remove_file(path) {
@@ -993,11 +1216,25 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         .cloned()
         .unwrap_or_else(|| result.clone());
     let plan: SupervisorUpgradePlan = serde_json::from_value(plan_value)?;
+    let restore_plan_path = result
+        .get("restore_plan_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
     if !plan.handoff_required {
         println!("supervisor already runs Temote {target_version}; no handoff required");
     } else {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
+            if let Some(restore_plan_path) = restore_plan_path.as_deref()
+                && let Some(report) = read_upgrade_failure_report(restore_plan_path)?
+            {
+                anyhow::ensure!(
+                    report.source_version == source_version
+                        && report.target_version == target_version,
+                    "supervisor upgrade failure report identity does not match the requested handoff"
+                );
+                anyhow::bail!(format_upgrade_failure_report(&report));
+            }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(
                     "supervisor handoff did not become healthy within the bounded verification window; source version={source_version} pid={source_pid}, target version={target_version}"
@@ -1610,6 +1847,144 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = validate_upgrade_executable(&executable, "test-version").unwrap_err();
         assert!(error.to_string().contains("control protocol"), "{error:#}");
+    }
+
+    #[test]
+    fn upgrade_failure_report_redacts_captured_environment_values() {
+        let secret = "credential-sentinel-must-not-persist";
+        let environment = CapturedStartEnvironment::from_values(BTreeMap::from([(
+            "KINTONE_PASSWORD".to_owned(),
+            secret.to_owned(),
+        )]))
+        .unwrap();
+        let error = format!("injected child failure included {secret}");
+        let redacted = redact_captured_environment_values(&error, &environment);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("<redacted:KINTONE_PASSWORD>"));
+    }
+
+    fn failure_report_fixture(secret: &str) -> (SupervisorUpgradePlan, UpgradeFailureReport) {
+        let session_id = format!("upgrade-failure-{}", uuid::Uuid::new_v4());
+        let plan = SupervisorUpgradePlan {
+            plan_schema: UPGRADE_PLAN_SCHEMA_VERSION,
+            source_version: "source-version".to_owned(),
+            target_version: env!("CARGO_PKG_VERSION").to_owned(),
+            control_protocol: CONTROL_PROTOCOL_VERSION,
+            lifecycle_schema: LIFECYCLE_SCHEMA_VERSION,
+            supervisor_pid: std::process::id(),
+            created_at: config::unix_time(),
+            handoff_required: true,
+            sessions: vec![crate::supervisor::UpgradeSessionPlan {
+                session_id: session_id.clone(),
+                cwd: std::env::current_dir().unwrap(),
+                permitted_directories: vec![std::env::current_dir().unwrap()],
+                yolo: false,
+                logical_path: None,
+                restart_policy: "never".to_owned(),
+                public: false,
+                restart_context_keys: vec!["KINTONE_PASSWORD".to_owned()],
+            }],
+        };
+        let report = UpgradeFailureReport {
+            report_schema: UPGRADE_FAILURE_REPORT_SCHEMA_VERSION,
+            source_version: plan.source_version.clone(),
+            target_version: plan.target_version.clone(),
+            planned_sessions: vec![session_id.clone()],
+            restored_sessions: Vec::new(),
+            unrestored_sessions: vec![session_id],
+            rollback: "replacement_sessions_stopped".to_owned(),
+            error: "injected restore failure".to_owned(),
+        };
+        assert!(!serde_json::to_string(&report).unwrap().contains(secret));
+        (plan, report)
+    }
+
+    #[test]
+    fn upgrade_failure_report_is_owner_only_bounded_and_secret_free() {
+        let secret = "credential-sentinel-must-not-persist";
+        let (plan, report) = failure_report_fixture(secret);
+        let plan_path = write_upgrade_plan(&plan).unwrap();
+        let report_path = write_upgrade_failure_report(&plan_path, &report).unwrap();
+        let mode = std::fs::metadata(&report_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode & 0o077, 0);
+        let bytes = std::fs::read(&report_path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        assert_eq!(
+            read_upgrade_failure_report(&plan_path).unwrap(),
+            Some(report)
+        );
+
+        std::fs::remove_file(&report_path).unwrap();
+        remove_upgrade_plan(&plan_path).unwrap();
+    }
+
+    #[test]
+    fn upgrade_failure_report_rejects_outside_paths_symlinks_and_oversize() {
+        use std::os::unix::fs::symlink;
+
+        let (_plan, report) = failure_report_fixture("not-written");
+        let outside = tempfile::tempdir().unwrap();
+        let outside_report = outside.path().join("restore-outside.failure.json");
+        assert!(validate_upgrade_failure_report_path(&outside_report).is_err());
+
+        let directory = upgrade_plan_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plan_path = directory.join(format!("restore-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&plan_path, b"{}").unwrap();
+        std::fs::set_permissions(&plan_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let report_path = upgrade_failure_report_path(&plan_path).unwrap();
+        let target = outside.path().join("target.json");
+        std::fs::write(&target, serde_json::to_vec(&report).unwrap()).unwrap();
+        symlink(&target, &report_path).unwrap();
+        let symlink_error = read_upgrade_failure_report(&plan_path).unwrap_err();
+        assert!(
+            format!("{symlink_error:#}").contains("cannot open upgrade failure report"),
+            "{symlink_error:#}"
+        );
+        std::fs::remove_file(&report_path).unwrap();
+
+        std::fs::write(
+            &report_path,
+            vec![b'x'; MAX_UPGRADE_FAILURE_REPORT_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::set_permissions(&report_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let oversized = read_upgrade_failure_report(&plan_path).unwrap_err();
+        assert!(format!("{oversized:#}").contains("exceeds"));
+        std::fs::remove_file(&report_path).unwrap();
+        std::fs::remove_file(&plan_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_report_classifies_partial_restore_as_incomplete() {
+        let (mut plan, _report) = failure_report_fixture("not-written");
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let active_id = format!("upgrade-partial-{}", uuid::Uuid::new_v4());
+        supervisor
+            .start("src/repo", Some(&active_id))
+            .await
+            .unwrap();
+        plan.sessions[0].session_id = active_id.clone();
+        let missing_id = format!("upgrade-missing-{}", uuid::Uuid::new_v4());
+        let mut missing = plan.sessions[0].clone();
+        missing.session_id = missing_id.clone();
+        plan.sessions.push(missing);
+
+        let report = collect_upgrade_failure_report(&plan, "injected failure", None).await;
+        assert_eq!(report.rollback, "incomplete");
+        assert_eq!(report.restored_sessions, vec![active_id.clone()]);
+        assert_eq!(report.unrestored_sessions, vec![missing_id.clone()]);
+        assert!(format_upgrade_failure_report(&report).contains("rollback: incomplete"));
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&active_id).await;
+        cleanup(&missing_id).await;
     }
 
     #[tokio::test]

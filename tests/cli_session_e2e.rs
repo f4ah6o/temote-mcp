@@ -71,6 +71,7 @@ impl McpClient {
         command
             .arg("mcp")
             .env("XDG_STATE_HOME", state_home)
+            .env("HOME", state_home)
             .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -206,6 +207,7 @@ fn spawn_supervisor(binary: &Path, project: &Path, state_home: &Path) -> ChildGu
     command
         .arg("supervisor")
         .env("XDG_STATE_HOME", state_home)
+        .env("HOME", state_home)
         .env("TEMOTE_MCP_ROOTS", roots_env(project))
         .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
         .stdin(Stdio::null())
@@ -219,6 +221,7 @@ fn run_cli(binary: &Path, args: &[&str], cwd: &Path, state_home: &Path) -> Outpu
         .args(args)
         .current_dir(cwd)
         .env("XDG_STATE_HOME", state_home)
+        .env("HOME", state_home)
         .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
         .stdin(Stdio::null())
         .output()
@@ -248,6 +251,105 @@ fn wait_for_supervisor(binary: &Path, cwd: &Path, state_home: &Path) {
         );
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn upgrade_failure_reports(state_home: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let directory = state_home
+        .join("Library")
+        .join("Application Support")
+        .join("temote-mcp")
+        .join("upgrade");
+    #[cfg(not(target_os = "macos"))]
+    let directory = state_home.join("temote-mcp").join("upgrade");
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.to_string_lossy().ends_with(".failure.json"))
+        .collect()
+}
+
+#[test]
+#[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
+fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let project = TempDir::new().expect("failed to create E2E project directory");
+    let state = TempDir::new().expect("failed to create isolated state directory");
+    initialize_git_repository(project.path());
+    let canonical_project =
+        fs::canonicalize(project.path()).expect("failed to canonicalize project");
+    let session_id = format!("upgrade-e2e-{}", std::process::id());
+
+    let mut supervisor = spawn_supervisor(&binary, project.path(), state.path());
+    let supervisor_pid = supervisor.child.id();
+    wait_for_supervisor(&binary, project.path(), state.path());
+
+    let start = run_cli(
+        &binary,
+        &["session", "start", "--path", "src", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&start, "session start before upgrade");
+    let policy = run_cli(
+        &binary,
+        &["session", "restart-policy", &session_id, "on-failure"],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&policy, "restart policy before upgrade");
+
+    let upgrade = run_cli(
+        &binary,
+        &["upgrade", "--force"],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&upgrade, "forced same-version supervisor upgrade");
+    assert!(
+        String::from_utf8_lossy(&upgrade.stdout).contains("supervisor handoff complete"),
+        "upgrade did not report handoff completion: stdout={} stderr={}",
+        String::from_utf8_lossy(&upgrade.stdout),
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert_eq!(supervisor.child.id(), supervisor_pid);
+    assert!(
+        supervisor.child.try_wait().unwrap().is_none(),
+        "supervisor exited during same-PID exec handoff"
+    );
+
+    let info = run_cli(
+        &binary,
+        &["session", "info", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&info, "session info after upgrade");
+    let info: Value = serde_json::from_slice(&info.stdout).expect("invalid session info JSON");
+    assert_eq!(info["status"], "active");
+    assert_eq!(info["permission_mode"], "ask");
+    assert_eq!(info["restart_policy"], "on-failure");
+    assert_eq!(
+        PathBuf::from(info["cwd"].as_str().expect("session cwd missing")),
+        canonical_project
+    );
+    assert!(
+        upgrade_failure_reports(state.path()).is_empty(),
+        "successful supervisor handoff must not create an upgrade failure report"
+    );
+
+    let stop = run_cli(
+        &binary,
+        &["session", "stop", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&stop, "session stop after upgrade");
+    supervisor.interrupt();
+    let status = supervisor.wait_for_exit(SHUTDOWN_TIMEOUT);
+    assert!(status.success(), "supervisor exited with {status}");
 }
 
 #[test]
