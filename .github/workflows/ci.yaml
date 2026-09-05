@@ -29,7 +29,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-15
+          - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -82,9 +82,13 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features --locked
 
-      - name: CLI session E2E
+      - name: Supervisor upgrade path E2E
         timeout-minutes: 5
-        run: cargo test --test cli_session_e2e --all-features --locked -- --ignored --nocapture
+        run: cargo test --test cli_session_e2e --all-features --locked supervisor_upgrade_ -- --ignored --nocapture --test-threads=1
+
+      - name: CLI session lifecycle E2E
+        timeout-minutes: 5
+        run: cargo test --test cli_session_e2e --all-features --locked supervisor_session_lifecycle_survives_console_eof_and_records_crash -- --ignored --nocapture
 
       - name: Verify Linux dependency boundary
         if: runner.os == 'Linux'

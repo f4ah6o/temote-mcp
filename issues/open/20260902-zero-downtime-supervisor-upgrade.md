@@ -231,7 +231,7 @@ It should produce the exact transition plan without stopping or restarting anyth
 - [x] failure produces a deterministic rollback/partial-state report
 - [x] repeated invocation after successful upgrade is idempotent
 - [x] existing `up/down`, session lifecycle, sandbox, approval, 1Password, kintone, and gateway security boundaries remain unchanged
-- [ ] Linux and macOS upgrade-path tests cover compatible and incompatible generations
+- [x] Linux and macOS upgrade-path tests cover compatible and incompatible generations
 - [x] README / managed-session / usage documentation is updated in English and Japanese
 
 ## Required tests
@@ -274,20 +274,22 @@ Implemented the first Level B handoff path:
 - After successful supervisor/session verification, `upgrade` transactionally runs the binary-owned Codex plugin installer. Failure produces the exact manual follow-up command; already-running Codex still requires restart.
 - Same-version invocation is a no-op unless `--force` is supplied.
 
-Current deliberate limitations keep this issue open:
+Deliberate limitations retained after the acceptance criteria are satisfied:
 
 - protocol/lifecycle-schema-changing generations fail closed;
 - if the replacement process has already `exec`'d and then fails during restore, deterministic partial-state reporting and replacement-session shutdown are implemented, but automatic execution of an old binary generation is not yet implemented;
-- a portable ignored process-boundary compatible-generation E2E now exists and has passed on macOS; a dedicated Linux/macOS matrix covering both compatible and incompatible generations remains open.
+- the portable process-boundary upgrade E2Es intentionally validate Level B compatible handoff and fail-closed incompatible-generation rejection rather than attempting an incompatible live migration.
 
 ### Evidence
 
-- full `cargo test --all-targets --all-features` under isolated macOS `HOME` / `XDG_STATE_HOME`: 369 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
+- full `cargo test --all-targets --all-features` under isolated macOS `HOME` / `XDG_STATE_HOME`: 369 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 3 process-boundary E2Es remain intentionally ignored in the ordinary suite;
+- CI `rust` matrix explicitly runs on `ubuntu-latest` and `macos-latest`; the `Supervisor upgrade path E2E` step runs both `supervisor_upgrade_handoff_preserves_active_session_and_pid` and `supervisor_upgrade_rejects_incompatible_generation_before_handoff` via the `supervisor_upgrade_` filter with `--ignored --nocapture --test-threads=1`;
 - dry-run regression coverage verifies mixed ready/blocked sessions, blocker visibility, credential-value non-disclosure, no session mutation, no lifecycle-fence residue, and destructive fail-closed behavior for the same restart-context mismatch;
 - ingress regression coverage verifies owner-only bounded state, symlink/public-mode/oversize rejection, restart-needed classification, loopback health probing with HTTP-200 enforcement, and fail-closed OpenAI interactive-only restart recipes without secret persistence;
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed;
 - `cargo check --no-default-features --all-targets`: passed (existing feature-dependent dead-code warnings only);
 - isolated Linux E2E using socket namespace `upge2e01`: supervisor PID `2233563` remained unchanged across forced same-version `exec` handoff; session `e2e-upgrade` was restored active with the same ID/cwd/permission metadata and then stopped cleanly;
 - explicit macOS process E2E `supervisor_upgrade_handoff_preserves_active_session_and_pid`: passed; forced same-version handoff preserved the supervisor PID and restored the session as active with the same cwd, `ask` permission mode, and `on-failure` restart policy. The test isolates both `HOME` and `XDG_STATE_HOME` so Codex plugin reconciliation cannot modify the developer's real home state;
+- explicit macOS process E2E `supervisor_upgrade_rejects_incompatible_generation_before_handoff`: passed; a fake old-generation control socket answered the initial `Ping` with control protocol `999`, the current CLI failed closed with the compatibility error before sending any second control request, and no upgrade failure artifact was created;
 - failure-report tests cover owner-only permissions, bounded reads, out-of-tree path rejection, symlink rejection via `O_NOFOLLOW`, secret-value redaction/non-persistence, partial restore classification as `incomplete`, and successful process handoff verifies that no `.failure.json` is created;
 - the E2E temporarily installed the checkout debug Codex plugin as part of the real upgrade path; the host plugin was immediately restored with the installed `temote-mcp codex plugin install`, returning it to version `2026.9.2`.

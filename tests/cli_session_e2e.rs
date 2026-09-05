@@ -271,6 +271,113 @@ fn upgrade_failure_reports(state_home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
+fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let project = TempDir::new().expect("failed to create E2E project directory");
+    let state = TempDir::new().expect("failed to create isolated state directory");
+    initialize_git_repository(project.path());
+
+    let namespace = format!("bad{:x}", std::process::id());
+    assert!(namespace.len() <= 12, "test socket namespace is too long");
+    let uid = unsafe { libc::geteuid() };
+    let socket_dir = PathBuf::from("/tmp").join(format!("tmcp-{uid}-{namespace}"));
+    fs::create_dir_all(&socket_dir).expect("failed to create fake supervisor socket directory");
+    let socket_path = socket_dir.join("supervisor.sock");
+    let _ = fs::remove_file(&socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("failed to bind fake old-generation supervisor socket");
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("failed to accept upgrade compatibility probe");
+        let mut line = String::new();
+        BufReader::new(
+            stream
+                .try_clone()
+                .expect("failed to clone fake supervisor stream"),
+        )
+        .read_line(&mut line)
+        .expect("failed to read upgrade compatibility probe");
+        let request: Value = serde_json::from_str(line.trim())
+            .expect("upgrade compatibility probe was not valid JSON");
+        assert_eq!(request["command"], "ping");
+
+        let response = json!({
+            "ok": true,
+            "result": {
+                "status": "active",
+                "host_id": "old-generation-host",
+                "version": "old-generation",
+                "pid": 4242,
+                "control_protocol": 999,
+                "lifecycle_schema": 1,
+                "upgrade_plan_schema": 1,
+                "roots_configured": true
+            },
+            "error": Value::Null
+        });
+        writeln!(stream, "{response}").expect("failed to write fake supervisor response");
+        stream
+            .flush()
+            .expect("failed to flush fake supervisor response");
+        drop(stream);
+
+        listener
+            .set_nonblocking(true)
+            .expect("failed to make fake supervisor listener nonblocking");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => panic!("upgrade sent a control request after incompatible Ping"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => {
+                    panic!("failed while checking for unexpected control request: {error}")
+                }
+            }
+        }
+    });
+
+    let output = Command::new(&binary)
+        .args(["upgrade", "--force"])
+        .current_dir(project.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("HOME", state.path())
+        .env("TEMOTE_MCP_SOCKET_NAMESPACE", &namespace)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run incompatible-generation upgrade probe");
+    assert!(
+        !output.status.success(),
+        "incompatible generation unexpectedly upgraded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "running supervisor control protocol is incompatible; manual supervisor restart is required"
+        ),
+        "upgrade did not report the compatibility gate: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .join()
+        .expect("fake old-generation supervisor thread panicked");
+    assert!(
+        upgrade_failure_reports(state.path()).is_empty(),
+        "compatibility rejection must not create upgrade failure artifacts"
+    );
+
+    fs::remove_file(&socket_path).expect("failed to remove fake supervisor socket");
+    fs::remove_dir(&socket_dir).expect("failed to remove fake supervisor socket directory");
+}
+
 #[test]
 #[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
 fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
