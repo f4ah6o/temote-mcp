@@ -226,7 +226,7 @@ It should produce the exact transition plan without stopping or restarting anyth
 - [x] sessions requiring unavailable secret/restart context block destructive transition
 - [x] no plaintext credential is persisted to enable upgrade
 - [x] every restored session is socket-probed before upgrade success
-- [ ] ingress is restarted/reloaded only when needed and is health-checked afterward
+- [x] ingress is restarted/reloaded only when needed and is health-checked afterward
 - [x] Codex plugin version is reconciled or a precise client-restart action is reported
 - [x] failure produces a deterministic rollback/partial-state report
 - [x] repeated invocation after successful upgrade is idempotent
@@ -268,19 +268,23 @@ Implemented the first Level B handoff path:
 - Dry-run blockers do not stop sessions or leave the lifecycle fence set. The destructive path continues to fail closed on the same blocker before writing a restore plan or draining any session.
 - Dry-run serialization is covered against captured credential values: restart-context key names remain visible for diagnosis, while the old and caller-provided secret values are absent.
 - Executable/protocol/lifecycle compatibility validation remains shared with the destructive path, so an incompatible target still fails closed before either preview or handoff.
+- `temote-mcp up` now writes an owner-only bounded `up.state.json` beside `up.pid` with schema/ownership, PID, binary version, profile, host ID, local address, validated public origin, non-secret tunnel-token file reference, OpenAI tunnel ID/client override, and restart-context key names only. The runtime directory is protected as `0700`; API keys, tunnel tokens, OAuth credentials, and captured secret values are never persisted.
+- Upgrade preflight inspects the live direct-ingress owner and probes local `/healthz`. A healthy ingress already on the target binary is left untouched. A version mismatch or failed health probe produces a controlled restart action; missing legacy state or an OpenAI ingress whose runtime credential existed only as interactive input is reported as a blocker before supervisor handoff.
+- After supervisor/session verification, a required ingress restart stops the verified `temote-mcp up` owner and its direct children, starts the target binary from the durable non-secret recipe, and waits within a bounded window until the replacement state reports the target version and `/healthz` returns HTTP 200. `--dry-run` includes this ingress action plus the post-success plugin reconciliation action without mutating ingress state.
 - After successful supervisor/session verification, `upgrade` transactionally runs the binary-owned Codex plugin installer. Failure produces the exact manual follow-up command; already-running Codex still requires restart.
 - Same-version invocation is a no-op unless `--force` is supplied.
 
 Current deliberate limitations keep this issue open:
 
-- protocol/lifecycle-schema-changing generations fail closed; automatic `serve/up` ingress restart/profile recovery and post-transition ingress health checks are not implemented yet;
+- protocol/lifecycle-schema-changing generations fail closed;
 - if the replacement process has already `exec`'d and then fails during restore, deterministic partial-state reporting and replacement-session shutdown are implemented, but automatic execution of an old binary generation is not yet implemented;
 - a portable ignored process-boundary compatible-generation E2E now exists and has passed on macOS; a dedicated Linux/macOS matrix covering both compatible and incompatible generations remains open.
 
 ### Evidence
 
-- full `cargo test --all-targets --all-features` under isolated macOS `HOME` / `XDG_STATE_HOME`: 363 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
+- full `cargo test --all-targets --all-features` under isolated macOS `HOME` / `XDG_STATE_HOME`: 369 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
 - dry-run regression coverage verifies mixed ready/blocked sessions, blocker visibility, credential-value non-disclosure, no session mutation, no lifecycle-fence residue, and destructive fail-closed behavior for the same restart-context mismatch;
+- ingress regression coverage verifies owner-only bounded state, symlink/public-mode/oversize rejection, restart-needed classification, loopback health probing with HTTP-200 enforcement, and fail-closed OpenAI interactive-only restart recipes without secret persistence;
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed;
 - `cargo check --no-default-features --all-targets`: passed (existing feature-dependent dead-code warnings only);
 - isolated Linux E2E using socket namespace `upge2e01`: supervisor PID `2233563` remained unchanged across forced same-version `exec` handoff; session `e2e-upgrade` was restored active with the same ID/cwd/permission metadata and then stopped cleanly;

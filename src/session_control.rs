@@ -1225,8 +1225,15 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         "running supervisor control protocol is incompatible; manual supervisor restart is required"
     );
 
+    #[cfg(all(feature = "network", unix))]
+    let ingress_upgrade = crate::lifecycle::prepare_direct_ingress_upgrade(&target_version).await?;
+    #[cfg(all(feature = "network", unix))]
+    if !dry_run && let Some(blocker) = ingress_upgrade.blocker() {
+        anyhow::bail!("direct ingress upgrade blocked before supervisor handoff: {blocker}");
+    }
+
     let result = request(ControlRequest::Upgrade {
-        executable,
+        executable: executable.clone(),
         target_version: target_version.clone(),
         environment: CapturedStartEnvironment::capture(),
         dry_run,
@@ -1240,6 +1247,15 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     })?;
 
     if dry_run {
+        #[cfg(all(feature = "network", unix))]
+        let result = serde_json::json!({
+            "supervisor": result,
+            "ingress": ingress_upgrade.plan(),
+            "plugin": {
+                "action": "reconcile_after_success",
+                "client_restart_required_if_replaced": true
+            }
+        });
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -1307,6 +1323,25 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
             "supervisor handoff complete: {source_version} -> {target_version}; restored {} session(s); pid={source_pid}",
             plan.sessions.len()
         );
+    }
+
+    #[cfg(all(feature = "network", unix))]
+    {
+        let ingress_result =
+            crate::lifecycle::apply_direct_ingress_upgrade(ingress_upgrade, &executable).await?;
+        match ingress_result.action.as_str() {
+            "restarted" => println!(
+                "direct ingress restart complete: profile={} health={}",
+                ingress_result.profile.as_deref().unwrap_or("unknown"),
+                ingress_result.health
+            ),
+            "untouched" => println!(
+                "direct ingress left running: profile={} health={}",
+                ingress_result.profile.as_deref().unwrap_or("unknown"),
+                ingress_result.health
+            ),
+            _ => {}
+        }
     }
 
     let executable = std::fs::canonicalize(std::env::current_exe()?)?;
