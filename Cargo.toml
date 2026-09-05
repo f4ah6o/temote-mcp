@@ -1,6 +1,6 @@
 [package]
 name = "temote-mcp"
-version = "2026.8.0"
+version = "2026.9.4"
 edition = "2024"
 license = "MIT AND Apache-2.0"
 description = "A sandboxed local-machine MCP server with out-of-band approvals"
