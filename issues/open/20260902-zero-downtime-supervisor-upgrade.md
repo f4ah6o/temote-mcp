@@ -275,7 +275,7 @@ Current deliberate limitations keep this issue open:
 
 ### Evidence
 
-- full `cargo test --all-targets --all-features` under an isolated macOS `HOME`: 352 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
+- full `cargo test --all-targets --all-features` under an isolated macOS `HOME`: 362 main-binary tests passed, 0 failed; 33 sandbox tests and all auxiliary test binaries passed; 2 process-boundary E2Es remain intentionally ignored in the ordinary suite;
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed;
 - `cargo check --no-default-features --all-targets`: passed (existing feature-dependent dead-code warnings only);
 - isolated Linux E2E using socket namespace `upge2e01`: supervisor PID `2233563` remained unchanged across forced same-version `exec` handoff; session `e2e-upgrade` was restored active with the same ID/cwd/permission metadata and then stopped cleanly;
