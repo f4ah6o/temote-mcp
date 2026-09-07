@@ -1,6 +1,6 @@
 # TEMOTE-01: 会話をまたいで実行中ジョブを再発見するjob_list
 
-- Status: Open
+- Status: Done
 - Date: 2026-09-05 (Asia/Tokyo)
 - Priority: P1
 - Baseline: `8d5538314a8eb42ed5538d8b4c99c2514011df61` (`main`)
@@ -77,3 +77,14 @@ git diff --check
 変更ファイル・新toolの例・テスト結果を完了記録に残す。
 ジョブの永続化、終了済みプロセスの再実行、supervisor upgrade、release/installはこのissueに含めない。
 稼働中のtemoteを再起動して検証せず、テスト用のsession/一時ディレクトリを使う。
+
+## 完了記録
+
+2026-09-08 に実装・検証完了。
+
+- `src/mcp.rs` に `job_list({session_id, limit?})` と current-session 限定 snapshot を追加した。status は `running` / `completed` / `failed` / `unknown`、running-first + job_id 辞書順、default 50 / max 128、`truncated` は limit 適用前件数から算出する。
+- command / argv / stdout / stderr / environment / raw error は一覧へ出さず、completed result も consume しない。空一覧は execution history を意味しない。
+- gateway schema/contract/routing と英日 usage docs を同期した。
+- acceptance: session isolation、completion 非消費、secret sentinel redaction、ordering/truncation、unknown status、limit/unknown-field、empty-history semantics が PASS。
+
+最終検証: generated gateway contract PASS、`cargo fmt --all -- --check` PASS、`cargo test` PASS（main 400 tests）、`cargo clippy --all-targets -- -D warnings` PASS、`cargo check --no-default-features --all-targets` PASS、gateway `npm test` 48/48 PASS、`git diff --check` PASS。live Temote runtime の restart/upgrade は実施していない。

@@ -112,7 +112,7 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 27);
+  assert.equal(names.length, 31);
   for (const forbidden of ["without_sandbox", "session_start", "session_stop"]) {
     assert.equal(names.includes(forbidden), false, forbidden);
   }
@@ -135,6 +135,21 @@ test("gateway contract parity detects schema, forbidden-tool, and protocol drift
     () => assertGatewayContractParity(PUBLIC_TOOLS, { modernProtocolVersion: "future" }),
     assert.AssertionError,
   );
+});
+
+test("job discovery, checkpoints, and handoff remain session-scoped in the gateway contract", () => {
+  const names = ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff"];
+  for (const name of names) {
+    const routed = PUBLIC_TOOLS.find((candidate) => candidate.name === name);
+    assert.ok(routed, name);
+    assert.equal(routed.inputSchema.additionalProperties, false, name);
+    assert.equal(routed.inputSchema.required.includes("session_id"), true, name);
+    assert.equal(routed.annotations.openWorldHint, false, name);
+  }
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "job_list").annotations.readOnlyHint, true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "checkpoint_load").annotations.readOnlyHint, true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "work_handoff").annotations.readOnlyHint, true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "checkpoint_save").annotations.readOnlyHint, false);
 });
 
 test("gateway identity comes only from deployment version metadata", () => {
@@ -1044,7 +1059,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 27);
+  assert.equal(rpc.result.tools.length, 31);
   assert.equal(rpc.result.tools.some((tool) => tool.name === "without_sandbox"), false);
 });
 
@@ -1088,6 +1103,59 @@ test("the MCP endpoint selects a Session Durable Object only by session_id", asy
   assert.equal((await response.json()).result.content[0].text, "routed");
 });
 
+
+test("new work-state tools route by session_id and reject missing session_id", async () => {
+  const routed = [];
+  const sessionStub = {
+    fetch: async (_url, init) => {
+      const request = JSON.parse(init.body).request;
+      routed.push(request.params.name);
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: "routed" }] },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  };
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: () => sessionStub,
+    },
+  };
+  const argumentsByTool = {
+    job_list: { session_id: "mac-main", limit: 1 },
+    checkpoint_save: {
+      session_id: "mac-main",
+      expected_revision: 0,
+      checkpoint: {
+        title: "reported",
+        base_commit: null,
+        steps: [],
+        checks: [],
+        next_step_id: null,
+      },
+    },
+    checkpoint_load: {
+      session_id: "mac-main",
+      checkpoint_id: "00000000-0000-4000-8000-000000000001",
+    },
+    work_handoff: { session_id: "mac-main" },
+  };
+  for (const [name, toolArguments] of Object.entries(argumentsByTool)) {
+    const response = await worker.fetch(legacyToolCallRequest(name, toolArguments), env);
+    assert.equal(response.status, 200, name);
+    assert.equal((await response.json()).result.content[0].text, "routed", name);
+
+    const missing = { ...toolArguments };
+    delete missing.session_id;
+    const rejected = await worker.fetch(legacyToolCallRequest(name, missing), env);
+    assert.equal(rejected.status, 200, name);
+    assert.equal((await rejected.json()).error.code, -32602, name);
+  }
+  assert.deepEqual(routed, ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff"]);
+});
 
 test("session_list performs bounded final online checks and preserves registry order", async () => {
   const sessions = Array.from({ length: 40 }, (_, index) => ({

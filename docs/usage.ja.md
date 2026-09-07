@@ -78,7 +78,19 @@ migration は legacy state file を安全に検証し、signal 前に live PID �
 
 最初から background 実行する場合は `start_command` を使います。`poll_job` で完了を確認し、`stop_job` で停止できます。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。1 session あたり同時に8 jobまで実行できます。
 
+`job_list({session_id, limit?})` は current session が所有する in-memory job の redacted snapshot を返します。返すのは `job_id` と `running` / `completed` / `failed` / `unknown` だけで、running を先頭に並べ、上限超過は `truncated` で示します。command text、argv、stdout/stderr、raw error は返さず、list しても completed result は消費しません。`retention="in_memory"` なので、空のlistを「過去に何も実行していない証拠」とは扱わないでください。restartやcache expiry以前の履歴ではありません。
+
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
+
+## work checkpoint / handoff
+
+`checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。revision conflict時は新しい申告を上書きせず失敗します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。
+
+checkpointのstatus/check resultは常に `source="client_reported"` です。`verified` もreported checkとcommitの整合性を検査するだけで、command成功からTemoteが自動的にverificationを認定することはありません。title/descriptionへcredential、token、private command outputなどのsecretを書かないでください。approval/activity summaryにはtoolとstep/check件数だけを出し、自由文のcheckpoint本文は転載しません。
+
+`work_handoff({session_id, checkpoint_id?})` はread-onlyです。ID省略時は同scopeのbounded checkpoint候補を自動選択せず一覧化します。ID指定時はそのcheckpoint、current-session jobのredactedな `source="live_snapshot"`、`freshness="not_revalidated"`、固定のresume hintを返します。checkpoint本文をcommandとして実行せず、作業のreplay、Git実行、artifact検証もしません。
+
+安全なresume flowは `session_info` → `work_handoff` → checkpointを選択 → `work_handoff(checkpoint_id=...)` → running jobを再実行前にinspect/poll → Git state・artifact・checkを別のread-only手段で再検証 → 次のoperationを決める、です。
 
 ## file / image
 

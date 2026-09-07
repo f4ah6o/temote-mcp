@@ -5,7 +5,7 @@
 - Priority: P1
 - Baseline: `4ae3847cf64ec52a1f7b7e8b7bf7b28af88236dd` (`main`)
 - Depends on: なし
-- Related: [TEMOTE-01](../open/20260905-01-session-job-discovery.md)
+- Related: [TEMOTE-01](20260905-01-session-job-discovery.md)
 
 ## 事象
 

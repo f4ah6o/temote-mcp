@@ -78,7 +78,19 @@ The legacy inline `/permission ...` terminal command UI is not the owner of deta
 
 Use `start_command` when work should be backgrounded immediately, then `poll_job` until completion or `stop_job` to cancel it. Jobs belong to their session, have a two-hour lifetime limit, and are cancelled when the session stops. A session can have up to eight active sandbox jobs.
 
+`job_list({session_id, limit?})` returns a redacted snapshot of the current session's in-memory jobs. It reports only `job_id` and `running` / `completed` / `failed` / `unknown`, with running jobs first and a `truncated` flag. It never returns command text, argv, stdout/stderr, or raw errors, and listing does not consume a completed result. `retention="in_memory"` is explicit: an empty list is not proof that no work ran before restart or cache expiry.
+
 The combined stdout/stderr retained for a command is capped at 1 MiB and reports when output was truncated.
+
+## Work checkpoints and handoff
+
+`checkpoint_save` stores a bounded client-reported checkpoint in Temote's private state, scoped to the session's current canonical working directory. New checkpoints omit `checkpoint_id` and use `expected_revision=0`; updates supply the existing UUID and current revision. A conflicting revision fails rather than overwriting a newer report. Normal sessions require local approval; yolo keeps the existing auto-approval semantics. `checkpoint_load` can read the record only from the same canonical working-directory scope, including from another session for that same worktree.
+
+Checkpoint status and check results are always labeled `source="client_reported"`. Even a `verified` report is only consistency-checked against its reported checks and commit; Temote does not infer verification from command success. Do not put credentials, tokens, private command output, or other secrets in checkpoint title/description fields. Approval/activity summaries include only the tool and step/check counts, not free-form checkpoint text.
+
+`work_handoff({session_id, checkpoint_id?})` is read-only. Without an ID it lists bounded same-scope checkpoint candidates without choosing one. With an ID it returns that checkpoint, a redacted `source="live_snapshot"` view of current-session jobs, `freshness="not_revalidated"`, and fixed resume hints. It does not execute checkpoint text, replay work, run Git, or validate artifacts.
+
+A safe resume flow is: `session_info` → `work_handoff` → choose a checkpoint → `work_handoff(checkpoint_id=...)` → inspect/poll any running jobs before repeating work → separately revalidate Git state, artifacts, and checks → choose the next operation.
 
 ## Files and images
 

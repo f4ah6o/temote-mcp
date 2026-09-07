@@ -1,6 +1,6 @@
 # TEMOTE-02: 作業の申告状態を保存する、scope付きcheckpoint
 
-- Status: Open
+- Status: Done
 - Date: 2026-09-05 (Asia/Tokyo)
 - Priority: P1
 - Baseline: `8d5538314a8eb42ed5538d8b4c99c2514011df61` (`main`)
@@ -105,3 +105,15 @@ git diff --check
 
 保存→競合→再読込の具体例とtest結果を記録する。新規DB/ネットワーク依存は追加しない。
 利用中のserver upgrade、secretの永続化、Gitの自動commit/push、検証コマンドの自動実行は対象外。
+
+## 完了記録
+
+2026-09-08 に実装・検証完了。
+
+- `src/checkpoints.rs` を追加し、`checkpoint_save` / `checkpoint_load` を `state_dir()/work-checkpoints/<UUID>.json` に保存する scope 付き `client_reported` checkpoint として実装した。
+- UUID lock + `flock(LOCK_NB)`、revision CAS、`O_NOFOLLOW`、0700 directory / 0600 file、64 KiB bound、same-directory atomic temp/write/flush/sync/rename、scope 隔離、schema/commit/reference validation を実装した。
+- normal session は保存前に approval を要求し、approval/activity detail は step/check 件数だけを扱う。approval denial は disk 不変。atomic write の rename 前 failure でも旧 JSON を保持し temporary file を清掃する。
+- `list_for_scope` は record content を最大128件だけ読み、filename順を固定して `truncated` / `incomplete` を返す。directory enumeration 自体も4096 entriesで fail-closed に bound した。
+- checkpoint acceptance 17件 PASS。BUSY/CONFLICT区別、same-revision concurrent writer、wrong-scope generic not-found、symlink/oversize/invalid schema、verified consistency、128件 truncation、approval redaction、approval denial、atomic rollback、directory bound を確認した。
+
+最終検証: generated gateway contract PASS、`cargo fmt --all -- --check` PASS、`cargo test` PASS（main 400 tests）、`cargo clippy --all-targets -- -D warnings` PASS、`cargo check --no-default-features --all-targets` PASS（既存 feature-gating dead-code warnings のみ）、gateway `npm test` 48/48 PASS、`git diff --check` PASS。実ユーザーの checkpoint state は acceptance test で使用していない。

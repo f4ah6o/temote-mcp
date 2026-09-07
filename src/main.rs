@@ -1,6 +1,7 @@
 #[cfg(feature = "network")]
 mod access;
 mod approvals;
+mod checkpoints;
 mod child_env;
 mod cli;
 mod config;
@@ -36,6 +37,7 @@ mod session_control;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
+mod work_handoff;
 
 use temote_mcp::sandbox;
 

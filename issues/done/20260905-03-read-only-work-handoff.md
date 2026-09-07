@@ -1,6 +1,6 @@
 # TEMOTE-03: 保存した作業状態と現在のjobをまとめるreadonly handoff
 
-- Status: Open
+- Status: Done
 - Date: 2026-09-05 (Asia/Tokyo)
 - Priority: P2
 - Baseline: `8d5538314a8eb42ed5538d8b4c99c2514011df61` (`main`)
@@ -85,3 +85,15 @@ git diff --check
 テスト用sessionで「job開始→checkpoint保存→新しいclient相当からhandoff取得→既存jobをpoll」を確認する。
 稼働中のサービスの置換はしない。release/install、永続job runner、会話全文保存、失敗した処理の自動再送は対象外。
 本issueと依存2件が完了した時点でも、checkpointは監査証明や再実行の許可証ではないことをdocsに残す。
+
+## 完了記録
+
+2026-09-08 に実装・検証完了。
+
+- `src/work_handoff.rs` と `work_handoff({session_id, checkpoint_id?})` を追加した。未指定時は同scope候補を列挙するだけで checkpoint を自動選択しない。
+- checkpoint は `source=client_reported`、current-session job は `source=live_snapshot`、`freshness=not_revalidated` として明示し、固定順の resume hints だけを返す。
+- checkpoint の自由文を command として解釈・実行せず、Git/成果物の再検証、network、approval変更、file write、work replay は行わない。response は1 MiBに bound した。
+- acceptance では候補非自動選択、verified申告 + live failed job のsource分離、restart後non-replay、worktree scope、read-only、instruction text非実行、invalid request、response bound を確認した。
+- gateway schema/contract/routing と英日 usage docs を同期した。
+
+最終検証: generated gateway contract PASS、`cargo fmt --all -- --check` PASS、`cargo test` PASS（main 400 tests）、`cargo clippy --all-targets -- -D warnings` PASS、`cargo check --no-default-features --all-targets` PASS、gateway `npm test` 48/48 PASS、`git diff --check` PASS。live Temote runtime の置換・restart・upgrade は実施していない。

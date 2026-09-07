@@ -50,6 +50,92 @@ function schema(properties, required = []) {
   return value;
 }
 
+function clientCheckpointSchema() {
+  return {
+    type: "object",
+    properties: {
+      title: { type: "string", maxLength: 256 },
+      base_commit: {
+        anyOf: [
+          { type: "string", pattern: "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$" },
+          { type: "null" },
+        ],
+      },
+      steps: {
+        type: "array",
+        maxItems: 64,
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+            description: { type: "string", maxLength: 256 },
+            reported_status: {
+              type: "string",
+              enum: ["pending", "in_progress", "implemented", "verified", "blocked"],
+            },
+          },
+          required: ["id", "description", "reported_status"],
+          additionalProperties: false,
+        },
+      },
+      checks: {
+        type: "array",
+        maxItems: 64,
+        items: {
+          type: "object",
+          properties: {
+            step_id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+            name: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+            reported_result: { type: "string", enum: ["pass", "fail", "not_run"] },
+            commit: {
+              anyOf: [
+                { type: "string", pattern: "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$" },
+                { type: "null" },
+              ],
+            },
+          },
+          required: ["step_id", "name", "reported_result", "commit"],
+          additionalProperties: false,
+        },
+      },
+      next_step_id: {
+        anyOf: [
+          { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+          { type: "null" },
+        ],
+      },
+    },
+    required: ["title", "base_commit", "steps", "checks", "next_step_id"],
+    additionalProperties: false,
+  };
+}
+
+function checkpointSaveSchema() {
+  return schema(
+    {
+      ...sessionProperty,
+      checkpoint_id: { type: "string" },
+      expected_revision: { type: "integer", minimum: 0 },
+      checkpoint: clientCheckpointSchema(),
+    },
+    ["session_id", "expected_revision", "checkpoint"],
+  );
+}
+
+function checkpointLoadSchema() {
+  return schema(
+    { ...sessionProperty, checkpoint_id: { type: "string" } },
+    ["session_id", "checkpoint_id"],
+  );
+}
+
+function workHandoffSchema() {
+  return schema(
+    { ...sessionProperty, checkpoint_id: { type: "string" } },
+    ["session_id"],
+  );
+}
+
 function tool(name, title, description, annotations, inputSchema) {
   return { name, title, description, annotations, inputSchema };
 }
@@ -190,6 +276,37 @@ export const PUBLIC_TOOLS = [
     "Poll a background command on the selected host.",
     { ...readOnly, idempotentHint: false },
     schema({ ...sessionProperty, job_id: { type: "string" } }, ["session_id", "job_id"]),
+  ),
+  tool(
+    "job_list",
+    "List current-session sandbox jobs",
+    "Return a bounded redacted snapshot of in-memory jobs owned by the selected session.",
+    readOnly,
+    schema(
+      { ...sessionProperty, limit: { type: "integer", minimum: 1, maximum: 128, default: 50 } },
+      ["session_id"],
+    ),
+  ),
+  tool(
+    "checkpoint_save",
+    "Save a scoped work checkpoint",
+    "Persist a bounded client-reported work checkpoint scoped to the current canonical working directory.",
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    checkpointSaveSchema(),
+  ),
+  tool(
+    "checkpoint_load",
+    "Load a scoped work checkpoint",
+    "Read one client-reported checkpoint belonging to the current canonical working directory.",
+    readOnly,
+    checkpointLoadSchema(),
+  ),
+  tool(
+    "work_handoff",
+    "Read a work handoff snapshot",
+    "Project scoped client-reported checkpoint state with a redacted live snapshot of current-session jobs.",
+    readOnly,
+    workHandoffSchema(),
   ),
   tool(
     "stop_job",

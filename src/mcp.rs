@@ -14,8 +14,8 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    approvals, child_env, config, onepassword_cli, onepassword_mcp, onepassword_sdk, sandbox,
-    session_control::SessionBackend,
+    approvals, checkpoints, child_env, config, onepassword_cli, onepassword_mcp, onepassword_sdk,
+    sandbox, session_control::SessionBackend, work_handoff,
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,6 +77,18 @@ impl Drop for JobSlot {
 struct JobState {
     jobs: HashMap<Uuid, Job>,
     active_by_session: HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct JobSummary {
+    pub job_id: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct JobListSnapshot {
+    pub jobs: Vec<JobSummary>,
+    pub truncated: bool,
 }
 
 fn jobs() -> &'static Mutex<JobState> {
@@ -373,6 +385,78 @@ fn modernize_result(method: &str, mut result: Value) -> Value {
     result
 }
 
+fn client_checkpoint_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": {"type":"string","maxLength":256},
+            "base_commit": {"anyOf":[{"type":"string","pattern":"^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"},{"type":"null"}]},
+            "steps": {
+                "type":"array","maxItems":64,
+                "items": {
+                    "type":"object",
+                    "properties": {
+                        "id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+                        "description":{"type":"string","maxLength":256},
+                        "reported_status":{"type":"string","enum":["pending","in_progress","implemented","verified","blocked"]}
+                    },
+                    "required":["id","description","reported_status"],
+                    "additionalProperties":false
+                }
+            },
+            "checks": {
+                "type":"array","maxItems":64,
+                "items": {
+                    "type":"object",
+                    "properties": {
+                        "step_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+                        "name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},
+                        "reported_result":{"type":"string","enum":["pass","fail","not_run"]},
+                        "commit":{"anyOf":[{"type":"string","pattern":"^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"},{"type":"null"}]}
+                    },
+                    "required":["step_id","name","reported_result","commit"],
+                    "additionalProperties":false
+                }
+            },
+            "next_step_id":{"anyOf":[{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},{"type":"null"}]}
+        },
+        "required":["title","base_commit","steps","checks","next_step_id"],
+        "additionalProperties":false
+    })
+}
+
+fn checkpoint_save_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "session_id":{"type":"string"},
+            "checkpoint_id":{"type":"string"},
+            "expected_revision":{"type":"integer","minimum":0},
+            "checkpoint":client_checkpoint_schema()
+        },
+        "required":["session_id","expected_revision","checkpoint"],
+        "additionalProperties":false
+    })
+}
+
+fn checkpoint_load_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"session_id":{"type":"string"},"checkpoint_id":{"type":"string"}},
+        "required":["session_id","checkpoint_id"],
+        "additionalProperties":false
+    })
+}
+
+fn work_handoff_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"session_id":{"type":"string"},"checkpoint_id":{"type":"string"}},
+        "required":["session_id"],
+        "additionalProperties":false
+    })
+}
+
 fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -391,6 +475,10 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Normal sessions run in the temote-mcp sandbox with network disabled; yolo sessions run directly on the host with the local user's filesystem, environment, process, and network permissions. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Normal sessions use the temote-mcp sandbox with network disabled; yolo sessions run directly on the host with the local user's permissions.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"checkpoint_save","title":"Save a scoped work checkpoint","description":"Persist a bounded client-reported work checkpoint scoped to the current canonical working directory. Normal sessions require local approval.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":checkpoint_save_input_schema()},
+        {"name":"checkpoint_load","title":"Load a scoped work checkpoint","description":"Read one client-reported checkpoint only when it belongs to the current canonical working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_load_input_schema()},
+        {"name":"work_handoff","title":"Read a work handoff snapshot","description":"Project scoped client-reported checkpoint state together with a redacted live snapshot of current-session jobs. This tool does not execute or revalidate reported work.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":work_handoff_input_schema()},
         {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"onepassword_mcp_discover","title":"Discover 1Password MCP","description":"List resources and tool schemas exposed by the official local 1Password Environments MCP server. Start with this tool before using 1Password MCP tools.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"onepassword_mcp_read_resource","title":"Read a 1Password MCP resource","description":"Read a documentation resource exposed by the official local 1Password Environments MCP server.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"uri":{"type":"string"}},"required":["session_id","uri"],"additionalProperties":false}},
@@ -564,6 +652,40 @@ async fn call_tool(
         "execute" => execute(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
+        "job_list" => job_list(&args, &session),
+        "checkpoint_save" => {
+            let request = checkpoints::parse_save_request(&args)?;
+            anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+            let approval_detail = checkpoints::approval_detail(&request.checkpoint);
+            let approved = approvals::request(
+                &session.id,
+                "checkpoint_save",
+                approval_detail,
+                session.cwd.clone(),
+            )
+            .await?;
+            let store = checkpoints::Store::default_store()?;
+            let (saved, activity_detail) =
+                save_checkpoint_after_approval(&session, request, &store, approved)?;
+            approvals::activity(
+                &session.id,
+                "Saved client-reported checkpoint",
+                Some(activity_detail),
+            )
+            .await;
+            text_result(serde_json::to_string_pretty(&saved)?)
+        }
+        "checkpoint_load" => {
+            let request = checkpoints::parse_load_request(&args)?;
+            anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+            let loaded = checkpoints::load(&session, request.checkpoint_id)?;
+            approvals::activity(&session.id, "Loaded client-reported checkpoint", None).await;
+            text_result(serde_json::to_string_pretty(&loaded)?)
+        }
+        "work_handoff" => {
+            let request = work_handoff::parse_request(&args)?;
+            text_result(work_handoff::render(&session, request)?)
+        }
         "stop_job" => stop_job(&args, &session).await,
         "onepassword_mcp_discover" => {
             let result = onepassword_mcp::discover(&session).await?;
@@ -1745,6 +1867,41 @@ fn inspect_job(job_id: Uuid, session_id: &str) -> Result<JobPollSnapshot> {
     }
 }
 
+pub(crate) fn snapshot_jobs_for_session(session_id: &str, limit: usize) -> JobListSnapshot {
+    let state = jobs().lock().unwrap();
+    let mut summaries = state
+        .jobs
+        .iter()
+        .filter(|(_, job)| job.session_id == session_id)
+        .map(|(job_id, job)| {
+            let completion = job.completion.lock().unwrap();
+            let status = match completion.result.as_ref() {
+                Some(CachedJobResult::Success(_)) => "completed",
+                Some(CachedJobResult::Error(_)) => "failed",
+                None if job.handle.is_finished() => "unknown",
+                None => "running",
+            };
+            JobSummary {
+                job_id: job_id.to_string(),
+                status: status.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        let left_rank = usize::from(left.status != "running");
+        let right_rank = usize::from(right.status != "running");
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.job_id.cmp(&right.job_id))
+    });
+    let truncated = summaries.len() > limit;
+    summaries.truncate(limit);
+    JobListSnapshot {
+        jobs: summaries,
+        truncated,
+    }
+}
+
 fn take_job_for_session(job_id: Uuid, session_id: &str) -> Result<Job> {
     let mut state = jobs().lock().unwrap();
     let job = state.jobs.get(&job_id).context("unknown job_id")?;
@@ -1753,6 +1910,54 @@ fn take_job_for_session(job_id: Uuid, session_id: &str) -> Result<Job> {
         "job does not belong to this session"
     );
     state.jobs.remove(&job_id).context("unknown job_id")
+}
+
+fn save_checkpoint_after_approval(
+    session: &config::Session,
+    request: checkpoints::SaveRequest,
+    store: &checkpoints::Store,
+    approved: bool,
+) -> Result<(checkpoints::CheckpointEnvelope, String)> {
+    anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+    if !approved {
+        anyhow::bail!("user denied checkpoint save")
+    }
+    let activity_detail = checkpoints::activity_detail(&request.checkpoint);
+    let saved = store.save(
+        session,
+        request.checkpoint_id,
+        request.expected_revision,
+        request.checkpoint,
+    )?;
+    Ok((saved, activity_detail))
+}
+
+fn job_list(args: &Value, session: &config::Session) -> Result<Value> {
+    let object = args
+        .as_object()
+        .context("job_list arguments must be an object")?;
+    anyhow::ensure!(
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "session_id" | "limit")),
+        "job_list accepts only session_id and limit"
+    );
+    let limit = match object.get("limit") {
+        Some(value) => {
+            let limit = value
+                .as_u64()
+                .context("job_list limit must be an integer")?;
+            anyhow::ensure!((1..=128).contains(&limit), "job_list limit must be 1..=128");
+            limit as usize
+        }
+        None => 50,
+    };
+    let snapshot = snapshot_jobs_for_session(&session.id, limit);
+    text_result(serde_json::to_string_pretty(&json!({
+        "jobs": snapshot.jobs,
+        "truncated": snapshot.truncated,
+        "retention": "in_memory"
+    }))?)
 }
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
@@ -2806,7 +3011,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 33);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -3350,6 +3555,287 @@ mod tests {
             });
             Ok(())
         })
+    }
+
+    #[test]
+    fn checkpoint_save_denial_keeps_disk_unchanged() {
+        let cwd = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store_path = state.path().join("checkpoints");
+        let store = checkpoints::Store::new(store_path.clone());
+        let session = config::Session {
+            id: format!("checkpoint-denied-{}", Uuid::new_v4()),
+            cwd: config::canonical_directory(cwd.path()).unwrap(),
+            permitted_directories: vec![config::canonical_directory(cwd.path()).unwrap()],
+            started_at: 1,
+            process_id: 2,
+            yolo: false,
+        };
+        let marker = "denied-secret-sentinel";
+        let request = checkpoints::parse_save_request(&json!({
+            "session_id": session.id,
+            "expected_revision": 0,
+            "checkpoint": {
+                "title": marker,
+                "base_commit": null,
+                "steps": [{
+                    "id": "step",
+                    "description": marker,
+                    "reported_status": "pending"
+                }],
+                "checks": [],
+                "next_step_id": "step"
+            }
+        }))
+        .unwrap();
+        let safe_detail = checkpoints::approval_detail(&request.checkpoint);
+        assert!(!safe_detail.contains(marker));
+        let error = save_checkpoint_after_approval(&session, request, &store, false).unwrap_err();
+        assert!(error.to_string().contains("user denied checkpoint save"));
+        assert!(
+            !store_path.exists(),
+            "denied save created checkpoint storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_list_is_session_scoped() {
+        let owner = format!("job-list-owner-{}", Uuid::new_v4());
+        let other = format!("job-list-other-{}", Uuid::new_v4());
+        let owner_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let marker_command = "command-sentinel-must-not-leak";
+        let marker_output = "output-sentinel-must-not-leak";
+        let owner_completion = Arc::new(Mutex::new(JobCompletion {
+            result: Some(CachedJobResult::Success(marker_output.to_owned())),
+            completed_at: Some(Instant::now()),
+        }));
+        let other_completion = Arc::new(Mutex::new(JobCompletion::default()));
+        jobs().lock().unwrap().jobs.insert(
+            owner_id,
+            Job {
+                session_id: owner.clone(),
+                command: marker_command.to_owned(),
+                handle: tokio::spawn(async {}),
+                completion: owner_completion,
+            },
+        );
+        jobs().lock().unwrap().jobs.insert(
+            other_id,
+            Job {
+                session_id: other,
+                command: "other-secret-command".to_owned(),
+                handle: tokio::spawn(async { std::future::pending::<()>().await }),
+                completion: other_completion,
+            },
+        );
+
+        let snapshot = snapshot_jobs_for_session(&owner, 50);
+        assert_eq!(snapshot.jobs.len(), 1);
+        assert_eq!(snapshot.jobs[0].job_id, owner_id.to_string());
+        assert_eq!(snapshot.jobs[0].status, "completed");
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains(marker_command));
+        assert!(!rendered.contains(marker_output));
+        assert!(!rendered.contains("other-secret-command"));
+
+        if let Some(job) = remove_job(owner_id) {
+            job.handle.abort();
+        }
+        if let Some(job) = remove_job(other_id) {
+            job.handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn job_list_redacts_command_and_output() {
+        let session_id = format!("job-list-redact-{}", Uuid::new_v4());
+        let success_id = Uuid::new_v4();
+        let failure_id = Uuid::new_v4();
+        let command_sentinel = "command-secret-sentinel";
+        let success_sentinel = "success-secret-sentinel";
+        let failure_sentinel = "failure-secret-sentinel";
+        for (job_id, result, command) in [
+            (
+                success_id,
+                CachedJobResult::Success(success_sentinel.to_owned()),
+                command_sentinel,
+            ),
+            (
+                failure_id,
+                CachedJobResult::Error(failure_sentinel.to_owned()),
+                "failure-command-secret-sentinel",
+            ),
+        ] {
+            let completion = Arc::new(Mutex::new(JobCompletion {
+                result: Some(result),
+                completed_at: Some(Instant::now()),
+            }));
+            jobs().lock().unwrap().jobs.insert(
+                job_id,
+                Job {
+                    session_id: session_id.clone(),
+                    command: command.to_owned(),
+                    handle: tokio::spawn(async {}),
+                    completion,
+                },
+            );
+        }
+        let rendered = serde_json::to_string(&snapshot_jobs_for_session(&session_id, 50)).unwrap();
+        for sentinel in [
+            command_sentinel,
+            success_sentinel,
+            failure_sentinel,
+            "failure-command-secret-sentinel",
+        ] {
+            assert!(!rendered.contains(sentinel), "leaked {sentinel}");
+        }
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("failed"));
+        for job_id in [success_id, failure_id] {
+            if let Some(job) = remove_job(job_id) {
+                job.handle.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn job_list_does_not_consume_completion() {
+        let session_id = format!("job-list-repeat-{}", Uuid::new_v4());
+        let job_id = Uuid::new_v4();
+        let completion = Arc::new(Mutex::new(JobCompletion {
+            result: Some(CachedJobResult::Success("still-cached".to_owned())),
+            completed_at: Some(Instant::now()),
+        }));
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id: session_id.clone(),
+                command: "hidden".to_owned(),
+                handle: tokio::spawn(async {}),
+                completion,
+            },
+        );
+
+        let first = snapshot_jobs_for_session(&session_id, 50);
+        let second = snapshot_jobs_for_session(&session_id, 50);
+        assert_eq!(first, second);
+        assert!(matches!(
+            inspect_job(job_id, &session_id).unwrap(),
+            JobPollSnapshot::Completed(CachedJobResult::Success(_))
+        ));
+        if let Some(job) = remove_job(job_id) {
+            job.handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn job_list_orders_running_first_and_reports_truncation() {
+        let session_id = format!("job-list-order-{}", Uuid::new_v4());
+        let ids = [
+            Uuid::from_u128(4),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            Uuid::from_u128(1),
+        ];
+        for (index, job_id) in ids.iter().copied().enumerate() {
+            let running = index < 2;
+            let completion = Arc::new(Mutex::new(if running {
+                JobCompletion::default()
+            } else {
+                JobCompletion {
+                    result: Some(CachedJobResult::Success("hidden".to_owned())),
+                    completed_at: Some(Instant::now()),
+                }
+            }));
+            let handle = if running {
+                tokio::spawn(async { std::future::pending::<()>().await })
+            } else {
+                tokio::spawn(async {})
+            };
+            jobs().lock().unwrap().jobs.insert(
+                job_id,
+                Job {
+                    session_id: session_id.clone(),
+                    command: "hidden".to_owned(),
+                    handle,
+                    completion,
+                },
+            );
+        }
+        let snapshot = snapshot_jobs_for_session(&session_id, 2);
+        assert!(snapshot.truncated);
+        assert_eq!(
+            snapshot
+                .jobs
+                .iter()
+                .map(|job| job.job_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Uuid::from_u128(2).to_string(),
+                Uuid::from_u128(4).to_string()
+            ]
+        );
+        assert!(snapshot.jobs.iter().all(|job| job.status == "running"));
+        for job_id in ids {
+            if let Some(job) = remove_job(job_id) {
+                job.handle.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn job_list_reports_unknown_for_finished_handle_without_result() {
+        let session_id = format!("job-list-unknown-{}", Uuid::new_v4());
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async {});
+        tokio::task::yield_now().await;
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id: session_id.clone(),
+                command: "hidden".to_owned(),
+                handle,
+                completion: Arc::new(Mutex::new(JobCompletion::default())),
+            },
+        );
+        let snapshot = snapshot_jobs_for_session(&session_id, 50);
+        assert_eq!(snapshot.jobs[0].status, "unknown");
+        if let Some(job) = remove_job(job_id) {
+            job.handle.abort();
+        }
+    }
+
+    #[test]
+    fn job_list_orders_running_first_and_validates_limit_and_fields() {
+        let cwd = std::env::current_dir().unwrap();
+        let session = config::Session {
+            id: format!("job-list-args-{}", Uuid::new_v4()),
+            cwd,
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        assert!(job_list(&json!({"session_id":session.id,"limit":1}), &session).is_ok());
+        assert!(job_list(&json!({"session_id":session.id,"limit":128}), &session).is_ok());
+        assert!(job_list(&json!({"session_id":session.id,"limit":0}), &session).is_err());
+        assert!(job_list(&json!({"session_id":session.id,"limit":129}), &session).is_err());
+        assert!(
+            job_list(
+                &json!({"session_id":session.id,"limit":50,"unknown":true}),
+                &session
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn job_list_empty_is_not_execution_history() {
+        let session_id = format!("job-list-empty-{}", Uuid::new_v4());
+        let snapshot = snapshot_jobs_for_session(&session_id, 50);
+        assert!(snapshot.jobs.is_empty());
+        assert!(!snapshot.truncated);
     }
 
     #[cfg(unix)]

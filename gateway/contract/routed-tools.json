@@ -383,6 +383,219 @@
     },
     {
       "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 50,
+            "maximum": 128,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "job_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint": {
+            "additionalProperties": false,
+            "properties": {
+              "base_commit": {
+                "anyOf": [
+                  {
+                    "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "checks": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "commit": {
+                      "anyOf": [
+                        {
+                          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$",
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "name": {
+                      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                      "type": "string"
+                    },
+                    "reported_result": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "not_run"
+                      ],
+                      "type": "string"
+                    },
+                    "step_id": {
+                      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "step_id",
+                    "name",
+                    "reported_result",
+                    "commit"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "next_step_id": {
+                "anyOf": [
+                  {
+                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "steps": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                      "type": "string"
+                    },
+                    "reported_status": {
+                      "enum": [
+                        "pending",
+                        "in_progress",
+                        "implemented",
+                        "verified",
+                        "blocked"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "description",
+                    "reported_status"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 64,
+                "type": "array"
+              }
+            },
+            "required": [
+              "title",
+              "base_commit",
+              "steps",
+              "checks",
+              "next_step_id"
+            ],
+            "type": "object"
+          },
+          "checkpoint_id": {
+            "type": "string"
+          },
+          "expected_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "expected_revision",
+          "checkpoint"
+        ],
+        "type": "object"
+      },
+      "name": "checkpoint_save"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "checkpoint_id"
+        ],
+        "type": "object"
+      },
+      "name": "checkpoint_load"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "work_handoff"
+    },
+    {
+      "annotations": {
         "destructiveHint": true,
         "idempotentHint": false,
         "openWorldHint": false,
