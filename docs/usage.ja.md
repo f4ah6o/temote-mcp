@@ -84,13 +84,27 @@ stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated と
 
 ## work checkpoint / handoff
 
-`checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。revision conflict時は新しい申告を上書きせず失敗します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。
+`checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。すべてのsaveで opaque UUID `operation_id` が必須です。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。同じlogical mutationを同一`operation_id`かつ同一canonical requestで再送すると、checkpoint/revisionを増やさず以前のcommit結果を返します。同じoperation IDを異なるrequestで再利用すると `OPERATION_CONFLICT`、通常のstale revisionは `CHECKPOINT_CONFLICT` になります。operation receiptはcheckpointと同じatomic write境界で永続化し、bounded historyとして保持します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。
 
 checkpointのstatus/check resultは常に `source="client_reported"` です。`verified` もreported checkとcommitの整合性を検査するだけで、command成功からTemoteが自動的にverificationを認定することはありません。title/descriptionへcredential、token、private command outputなどのsecretを書かないでください。approval/activity summaryにはtoolとstep/check件数だけを出し、自由文のcheckpoint本文は転載しません。
 
 `work_handoff({session_id, checkpoint_id?})` はread-onlyです。ID省略時は同scopeのbounded checkpoint候補を自動選択せず一覧化します。ID指定時はそのcheckpoint、current-session jobのredactedな `source="live_snapshot"`、`freshness="not_revalidated"`、固定のresume hintを返します。checkpoint本文をcommandとして実行せず、作業のreplay、Git実行、artifact検証もしません。
 
 安全なresume flowは `session_info` → `work_handoff` → checkpointを選択 → `work_handoff(checkpoint_id=...)` → running jobを再実行前にinspect/poll → Git state・artifact・checkを別のread-only手段で再検証 → 次のoperationを決める、です。
+
+## bounded multi-file patch
+
+`apply_patch({session_id, patch})` は Codex-style の `*** Begin Patch` 形式で add / update / move / delete を扱います。patch本文をshellで実行せず、Rust側で直接parseします。最初のwriteより前に全source/destinationを検査し、absolute/traversal pathとsymlink escapeを拒否し、patch/file sizeとoperation数をboundedにし、yoloでもsession root外へ出さない契約です。通常sessionはpreflight済みpatch全体に対してlocal approvalを1回だけ要求します。approval/activity metadataへpatch本文は保存せず、operation件数だけを出します。
+
+multi-file全体をtransactional atomicとは扱いません。途中I/O errorが発生した場合は `partial_failure` と machine-readableな `committed` listを返し、errorまでに完了したadd/update/move/deleteを正確に示します。malformed patchまたはpreflight failure時は1 fileもwriteしません。
+
+## friction / learning candidate / recall
+
+Temoteはowner-onlyかつboundedなfriction event storeへ、event/session ID、canonical scope、enum kind/source/outcome、restrictedなoperation/tool identifier、optional UUID linkだけを保存します。command argv、stdout/stderr、file content、prompt、approval本文、environment value、credential、transcriptは保存しません。現在のautomatic emitterはcommand/Git failureと `apply_patch` のambiguous partial mutationです。`recall_feedback(outcome="no_hit")` はqueryやrecall resultを保存せず、明示的な `client_reported` knowledge-gap signalだけを追加できます。
+
+`friction_summary({session_id})` はread-onlyで、kind別countとcap済みcontributionを含むexplainable scoreを返します。正常sessionはtool call数が多いだけではcandidateにならず、同kindのrepeated failureはbounded、recall miss単独はscore 0です。`learning_candidate_list({session_id})` はsummaryからreview用candidateをderived viewとして返しますが、authoritative learningへ自動publishせず、checkpoint本文、transcript、command outputもcandidateへコピーしません。
+
+authoritative learningはrepo-managed Markdownです。`recall({session_id, query, knowledge_root?, limit?})` はrelative `learnings/` をdefault rootとし、明示した別rootもsession root内だけ許可します。毎requestでdeterministic local indexを再構築し、network、embedding API、vector DBは不要です。各Markdown learningには `title`、`date` (`YYYY-MM-DD`)、1個以上のbounded `tags`、`domain`、`verification` と、`## Problem` / `## Resolution` / `## Reusable lesson` sectionが必要です。recall resultはhitごとのmatched/missing termとscoreを返します。learningのpublish/editは既存の `write_file` + Git trust/approval flowを使います。
 
 ## file / image
 

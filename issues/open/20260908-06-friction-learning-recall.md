@@ -507,3 +507,32 @@ Temote execution plane
 ```
 
 将来 TeamAI 等を併用する場合も、Temote の friction/recall primitive は protocol/API boundary を通して利用でき、agent config management を Temote core に取り込まなくてよい構造を維持する。
+
+## 2026-09-08 implementation status
+
+TEMOTE-06 の core implementation と最終検証は完了したが、Status は Open のままとする。
+
+完了している範囲:
+
+- bounded / owner-only / secret-free friction event store。
+- `observed` と `client_reported` の source distinction。
+- bounded で explainable な friction score と derived learning candidate。
+- repo-managed Markdown から再構築する deterministic local recall index。
+- matched/missing recall terms と `recall_feedback` の no-hit signal。
+- command/Git failure と ambiguous `apply_patch` の自動 friction 記録。
+- gateway parity、docs、privacy/retention tests。
+
+未完了の範囲:
+
+- `src/approvals.rs` の approval-denial automatic friction capture。
+- `src/work_handoff.rs` の automatic recall injection。
+
+上記2点の編集は OpenAI safety により明示的に block されたため、別の編集経路で迂回していない。したがって「主要な execution friction」と「明示 recall」は利用できるが、approval denial の runtime 自動記録と handoff/resume 時の自動 recall は未完了として扱う。
+
+最終検証:
+
+- `cargo fmt --all -- --check`: PASS
+- `cargo clippy --all-targets -- -D warnings`: PASS
+- `cargo test --all-targets`: 469 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `(cd gateway && npm test)`: 48 passed / 0 failed
+- `git diff --check`: PASS

@@ -280,3 +280,23 @@ start session
 - ambiguous side effect を勝手に failed/safe-to-retry と分類しない原則がcontract/tests/docsに固定される。
 - `apply_patch` が全対象preflight後にのみmutationし、Temoteのsandbox/approval/root boundaryを維持する。
 - browser orchestration / worker chats / unrestricted shell / full transcript recorderをTemote coreへ導入していない。
+
+## 2026-09-08 implementation verification
+
+TEMOTE-05 の core implementation は実装済みで、今回の最終検証は次の結果になった。
+
+- `cargo fmt --all -- --check`: PASS
+- `cargo clippy --all-targets -- -D warnings`: PASS
+- `cargo test --all-targets`: 469 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `(cd gateway && npm test)`: 48 passed / 0 failed
+- `git diff --check`: PASS
+
+実装と確認済みの contract は、caller-supplied `operation_id`、exact retry、`OPERATION_CONFLICT`、bounded durable receipt history、add/update/move/delete の Rust-native `apply_patch`、全対象 preflight、root/symlink/traversal protection、normal session の一回 approval、patch body 非保存、partial apply の machine-readable committed operations、gateway parity、英日 docs である。
+
+ただし、issue 本文 Phase D の「必須の受け入れテスト」全件はまだ満たしていないため、Status は Open のままとする。未実装の deterministic failure-boundary coverage は以下。
+
+- checkpoint の durable commit 前 crash と commit 後 response loss を fault gate で直接検証するテスト。
+- `apply_patch` の partial I/O failure を再現し、exact committed operations を検証するテスト（対応する fault-injection seam を含む）。
+- 新しい client/chat から existing running job を発見する dedicated E2E テスト。
+
+このため本 issue は `issues/done` へは移動しない。実装の主経路は完成しているが、上記の acceptance coverage を追加してから close する。

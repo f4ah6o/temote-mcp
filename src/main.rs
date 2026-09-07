@@ -1,11 +1,15 @@
+#![recursion_limit = "256"]
+
 #[cfg(feature = "network")]
 mod access;
+mod apply_patch;
 mod approvals;
 mod checkpoints;
 mod child_env;
 mod cli;
 mod config;
 mod doctor;
+mod friction;
 #[cfg(feature = "network")]
 mod gateway;
 mod host_identity;
@@ -32,6 +36,7 @@ mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
+mod recall;
 mod secret_broker;
 mod session_control;
 mod supervisor;

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,13 @@ const MAX_STEPS: usize = 64;
 const MAX_CHECKS: usize = 64;
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_IDENTIFIER_BYTES: usize = 64;
+const MAX_OPERATION_HISTORY: usize = 128;
+const CHECKPOINT_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x5a, 0x1a, 0x7e, 0x0e, 0x34, 0xd4, 0x4c, 0x3d, 0x9f, 0x18, 0x96, 0x6d, 0xa1, 0xa5, 0x9e, 0x51,
+]);
+const REQUEST_FINGERPRINT_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x7f, 0x15, 0x50, 0x69, 0xe1, 0xa7, 0x4e, 0x77, 0xb2, 0x08, 0xe0, 0x66, 0xa3, 0x0f, 0x3a, 0x47,
+]);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -75,6 +83,15 @@ pub(crate) struct OriginSession {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct OperationReceipt {
+    pub operation_id: Uuid,
+    pub request_fingerprint: Uuid,
+    pub result_revision: u64,
+    pub origin_session: OriginSession,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointEnvelope {
     pub schema_version: u64,
     pub checkpoint_id: Uuid,
@@ -82,6 +99,10 @@ pub(crate) struct CheckpointEnvelope {
     pub scope_cwd: PathBuf,
     pub origin_session: OriginSession,
     pub source: String,
+    #[serde(default)]
+    pub operation_id: Option<Uuid>,
+    #[serde(default)]
+    pub operations: Vec<OperationReceipt>,
     pub checkpoint: ClientCheckpoint,
 }
 
@@ -89,6 +110,7 @@ pub(crate) struct CheckpointEnvelope {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SaveRequest {
     pub session_id: String,
+    pub operation_id: Uuid,
     pub checkpoint_id: Option<Uuid>,
     pub expected_revision: u64,
     pub checkpoint: ClientCheckpoint,
@@ -141,9 +163,27 @@ impl Store {
         Ok(Self::new(config::state_dir()?.join("work-checkpoints")))
     }
 
+    #[cfg(test)]
     pub(crate) fn save(
         &self,
         session: &config::Session,
+        checkpoint_id: Option<Uuid>,
+        expected_revision: u64,
+        checkpoint: ClientCheckpoint,
+    ) -> Result<CheckpointEnvelope> {
+        self.save_idempotent(
+            session,
+            Uuid::new_v4(),
+            checkpoint_id,
+            expected_revision,
+            checkpoint,
+        )
+    }
+
+    pub(crate) fn save_idempotent(
+        &self,
+        session: &config::Session,
+        operation_id: Uuid,
         checkpoint_id: Option<Uuid>,
         expected_revision: u64,
         checkpoint: ClientCheckpoint,
@@ -153,23 +193,47 @@ impl Store {
         self.ensure_directory()?;
 
         let is_new = checkpoint_id.is_none();
-        let checkpoint_id = checkpoint_id.unwrap_or_else(Uuid::new_v4);
+        let checkpoint_id =
+            checkpoint_id.unwrap_or_else(|| checkpoint_id_for_operation(session, operation_id));
+        let fingerprint =
+            request_fingerprint(checkpoint_id, is_new, expected_revision, &checkpoint)?;
         let _lock = self.acquire_lock(checkpoint_id)?;
         let path = self.record_path(checkpoint_id);
 
-        let current = if is_new {
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => anyhow::bail!("checkpoint UUID collision; retry the save"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error).context("cannot inspect checkpoint record"),
-            }
-        } else {
-            Some(self.read_record(checkpoint_id)?)
+        let current = match std::fs::symlink_metadata(&path) {
+            Ok(_) => Some(self.read_record(checkpoint_id)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("cannot inspect checkpoint record"),
         };
 
-        let revision = match current {
+        if let Some(current) = current.as_ref() {
+            ensure_scope_matches(current, session)?;
+            if let Some((index, receipt)) = current
+                .operations
+                .iter()
+                .enumerate()
+                .find(|(_, receipt)| receipt.operation_id == operation_id)
+            {
+                anyhow::ensure!(
+                    receipt.request_fingerprint == fingerprint,
+                    "OPERATION_CONFLICT: operation_id was already committed with a different request"
+                );
+                let mut replay = current.clone();
+                replay.revision = receipt.result_revision;
+                replay.origin_session = receipt.origin_session.clone();
+                replay.operation_id = Some(operation_id);
+                replay.operations.truncate(index + 1);
+                replay.checkpoint = checkpoint;
+                return Ok(replay);
+            }
+            anyhow::ensure!(
+                !is_new,
+                "OPERATION_CONFLICT: operation_id maps to an existing checkpoint but no matching operation record is available"
+            );
+        }
+
+        let revision = match current.as_ref() {
             Some(current) => {
-                ensure_scope_matches(&current, session)?;
                 anyhow::ensure!(
                     current.revision == expected_revision,
                     "CHECKPOINT_CONFLICT: expected revision {expected_revision}, current revision {}",
@@ -189,18 +253,36 @@ impl Store {
             }
         };
 
+        let origin_session = OriginSession {
+            id: session.id.clone(),
+            started_at: session.started_at,
+            process_id: session.process_id,
+        };
+        let mut operations = current
+            .as_ref()
+            .map(|current| current.operations.clone())
+            .unwrap_or_default();
+        operations.push(OperationReceipt {
+            operation_id,
+            request_fingerprint: fingerprint,
+            result_revision: revision,
+            origin_session: origin_session.clone(),
+        });
+        if operations.len() > MAX_OPERATION_HISTORY {
+            let excess = operations.len() - MAX_OPERATION_HISTORY;
+            operations.drain(..excess);
+        }
+
         reject_symlink_target(&path)?;
         let envelope = CheckpointEnvelope {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id,
             revision,
             scope_cwd: session.cwd.clone(),
-            origin_session: OriginSession {
-                id: session.id.clone(),
-                started_at: session.started_at,
-                process_id: session.process_id,
-            },
+            origin_session,
             source: "client_reported".to_owned(),
+            operation_id: Some(operation_id),
+            operations,
             checkpoint,
         };
         self.atomic_write(&path, &envelope)?;
@@ -434,6 +516,34 @@ impl Store {
     }
 }
 
+fn checkpoint_id_for_operation(session: &config::Session, operation_id: Uuid) -> Uuid {
+    let mut bytes = session.cwd.as_os_str().as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(operation_id.as_bytes());
+    Uuid::new_v5(&CHECKPOINT_ID_NAMESPACE, &bytes)
+}
+
+fn request_fingerprint(
+    checkpoint_id: Uuid,
+    is_new: bool,
+    expected_revision: u64,
+    checkpoint: &ClientCheckpoint,
+) -> Result<Uuid> {
+    #[derive(Serialize)]
+    struct CanonicalRequest<'a> {
+        checkpoint_id: Option<Uuid>,
+        expected_revision: u64,
+        checkpoint: &'a ClientCheckpoint,
+    }
+    let canonical = CanonicalRequest {
+        checkpoint_id: (!is_new).then_some(checkpoint_id),
+        expected_revision,
+        checkpoint,
+    };
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(Uuid::new_v5(&REQUEST_FINGERPRINT_NAMESPACE, &bytes))
+}
+
 struct FileLock {
     file: File,
 }
@@ -471,6 +581,10 @@ pub(crate) fn parse_save_request(value: &serde_json::Value) -> Result<SaveReques
     let object = value
         .as_object()
         .context("checkpoint_save arguments must be an object")?;
+    anyhow::ensure!(
+        object.get("operation_id").is_some(),
+        "checkpoint_save requires operation_id"
+    );
     if let Some(checkpoint_id) = object.get("checkpoint_id") {
         anyhow::ensure!(
             checkpoint_id.is_string(),
@@ -669,6 +783,37 @@ fn validate_envelope(envelope: &CheckpointEnvelope, expected_id: Uuid) -> Result
         canonical_scope == envelope.scope_cwd,
         "checkpoint scope is not canonical"
     );
+    anyhow::ensure!(
+        envelope.operations.len() <= MAX_OPERATION_HISTORY,
+        "checkpoint operation history exceeds limit"
+    );
+    let mut operation_ids = HashSet::new();
+    for receipt in &envelope.operations {
+        anyhow::ensure!(
+            operation_ids.insert(receipt.operation_id),
+            "duplicate checkpoint operation_id"
+        );
+        anyhow::ensure!(
+            receipt.result_revision > 0 && receipt.result_revision <= envelope.revision,
+            "invalid checkpoint operation revision"
+        );
+        config::validate_session_id(&receipt.origin_session.id)?;
+    }
+    if let Some(last) = envelope.operations.last() {
+        anyhow::ensure!(
+            envelope.operation_id == Some(last.operation_id),
+            "checkpoint operation identity mismatch"
+        );
+        anyhow::ensure!(
+            last.result_revision == envelope.revision,
+            "checkpoint latest operation revision mismatch"
+        );
+    } else {
+        anyhow::ensure!(
+            envelope.operation_id.is_none(),
+            "checkpoint operation history is missing"
+        );
+    }
     validate_checkpoint(&envelope.checkpoint)
 }
 
@@ -958,6 +1103,81 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_create_response_loss_exact_retry_returns_original_result() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::new(store_root.path().join("checkpoints"));
+        let session = session(root.path(), "retry");
+        let operation_id = Uuid::new_v4();
+        let first = store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("same"))
+            .unwrap();
+        let retry = store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("same"))
+            .unwrap();
+        assert_eq!(retry.checkpoint_id, first.checkpoint_id);
+        assert_eq!(retry.revision, 1);
+        assert_eq!(retry.operation_id, Some(operation_id));
+        let listed = store.list_for_scope(&session).unwrap();
+        assert_eq!(listed.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_operation_id_conflict_rejects_different_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::new(store_root.path().join("checkpoints"));
+        let session = session(root.path(), "retry-conflict");
+        let operation_id = Uuid::new_v4();
+        store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("first"))
+            .unwrap();
+        let error = store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("different"))
+            .unwrap_err();
+        assert!(error.to_string().contains("OPERATION_CONFLICT"));
+    }
+
+    #[test]
+    fn checkpoint_update_exact_retry_does_not_create_second_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::new(store_root.path().join("checkpoints"));
+        let session = session(root.path(), "retry-update");
+        let created = store
+            .save_idempotent(&session, Uuid::new_v4(), None, 0, checkpoint("first"))
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let updated = store
+            .save_idempotent(
+                &session,
+                operation_id,
+                Some(created.checkpoint_id),
+                created.revision,
+                checkpoint("second"),
+            )
+            .unwrap();
+        let retry = store
+            .save_idempotent(
+                &session,
+                operation_id,
+                Some(created.checkpoint_id),
+                created.revision,
+                checkpoint("second"),
+            )
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(retry.revision, 2);
+        assert_eq!(
+            store
+                .load(&session, created.checkpoint_id)
+                .unwrap()
+                .revision,
+            2
+        );
+    }
+
+    #[test]
     fn checkpoint_verified_requires_passing_checks_at_base_commit() {
         let mut value = checkpoint("verified");
         value.steps[0].reported_status = ReportedStatus::Verified;
@@ -985,6 +1205,7 @@ mod tests {
     fn checkpoint_request_requires_nullable_fields_to_be_present() {
         let value = serde_json::json!({
             "session_id": "test",
+            "operation_id": Uuid::new_v4(),
             "expected_revision": 0,
             "checkpoint": {
                 "title": "missing-base",
@@ -997,6 +1218,7 @@ mod tests {
 
         let value = serde_json::json!({
             "session_id": "test",
+            "operation_id": Uuid::new_v4(),
             "expected_revision": 0,
             "checkpoint": {
                 "title": "missing-commit",
@@ -1010,6 +1232,7 @@ mod tests {
 
         let value = serde_json::json!({
             "session_id": "test",
+            "operation_id": Uuid::new_v4(),
             "checkpoint_id": null,
             "expected_revision": 0,
             "checkpoint": {
@@ -1027,6 +1250,7 @@ mod tests {
     fn checkpoint_request_rejects_unknown_fields() {
         let value = serde_json::json!({
             "session_id": "test",
+            "operation_id": Uuid::new_v4(),
             "expected_revision": 0,
             "checkpoint": checkpoint("ok"),
             "extra": true

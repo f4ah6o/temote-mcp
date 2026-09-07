@@ -112,7 +112,7 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 31);
+  assert.equal(names.length, 36);
   for (const forbidden of ["without_sandbox", "session_start", "session_stop"]) {
     assert.equal(names.includes(forbidden), false, forbidden);
   }
@@ -138,7 +138,7 @@ test("gateway contract parity detects schema, forbidden-tool, and protocol drift
 });
 
 test("job discovery, checkpoints, and handoff remain session-scoped in the gateway contract", () => {
-  const names = ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff"];
+  const names = ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff", "apply_patch", "friction_summary", "learning_candidate_list", "recall", "recall_feedback"];
   for (const name of names) {
     const routed = PUBLIC_TOOLS.find((candidate) => candidate.name === name);
     assert.ok(routed, name);
@@ -1059,7 +1059,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 31);
+  assert.equal(rpc.result.tools.length, 36);
   assert.equal(rpc.result.tools.some((tool) => tool.name === "without_sandbox"), false);
 });
 

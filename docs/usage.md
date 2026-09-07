@@ -84,13 +84,27 @@ The combined stdout/stderr retained for a command is capped at 1 MiB and reports
 
 ## Work checkpoints and handoff
 
-`checkpoint_save` stores a bounded client-reported checkpoint in Temote's private state, scoped to the session's current canonical working directory. New checkpoints omit `checkpoint_id` and use `expected_revision=0`; updates supply the existing UUID and current revision. A conflicting revision fails rather than overwriting a newer report. Normal sessions require local approval; yolo keeps the existing auto-approval semantics. `checkpoint_load` can read the record only from the same canonical working-directory scope, including from another session for that same worktree.
+`checkpoint_save` stores a bounded client-reported checkpoint in Temote's private state, scoped to the session's current canonical working directory. Every save requires an opaque UUID `operation_id`. New checkpoints omit `checkpoint_id` and use `expected_revision=0`; updates supply the existing UUID and current revision. Retrying the same logical mutation with the same `operation_id` and identical canonical request returns the previously committed result without creating another checkpoint or revision. Reusing an operation ID with a different request fails with `OPERATION_CONFLICT`; an ordinary stale revision still fails with `CHECKPOINT_CONFLICT`. Operation receipts are persisted atomically with the checkpoint and retained in a bounded history. Normal sessions require local approval; yolo keeps the existing auto-approval semantics. `checkpoint_load` can read the record only from the same canonical working-directory scope, including from another session for that same worktree.
 
 Checkpoint status and check results are always labeled `source="client_reported"`. Even a `verified` report is only consistency-checked against its reported checks and commit; Temote does not infer verification from command success. Do not put credentials, tokens, private command output, or other secrets in checkpoint title/description fields. Approval/activity summaries include only the tool and step/check counts, not free-form checkpoint text.
 
 `work_handoff({session_id, checkpoint_id?})` is read-only. Without an ID it lists bounded same-scope checkpoint candidates without choosing one. With an ID it returns that checkpoint, a redacted `source="live_snapshot"` view of current-session jobs, `freshness="not_revalidated"`, and fixed resume hints. It does not execute checkpoint text, replay work, run Git, or validate artifacts.
 
 A safe resume flow is: `session_info` → `work_handoff` → choose a checkpoint → `work_handoff(checkpoint_id=...)` → inspect/poll any running jobs before repeating work → separately revalidate Git state, artifacts, and checks → choose the next operation.
+
+## Bounded multi-file patches
+
+`apply_patch({session_id, patch})` accepts the Codex-style `*** Begin Patch` format with add, update, move, and delete operations. Temote parses the patch in Rust rather than executing the patch body through a shell. Before the first write it validates every source and destination, rejects absolute/traversal paths and symlink escapes, bounds patch/file sizes and operation count, and requires all paths to remain inside the session roots even in yolo mode. Normal sessions receive one local approval for the whole preflighted patch. Approval/activity metadata contains only operation counts, never the patch body.
+
+Multi-file application is not advertised as transactionally atomic across independent files. If an I/O error occurs after one or more operations were committed, the result is `partial_failure` with a machine-readable `committed` list describing exactly which add/update/move/delete steps completed before the error. A malformed patch or any preflight failure writes nothing.
+
+## Friction, learning candidates, and recall
+
+Temote keeps a bounded owner-only friction event store containing only structured execution metadata: event/session IDs, canonical scope, enum kind/source/outcome, restricted operation/tool identifiers, and optional UUID links. It does not persist command argv, stdout/stderr, file contents, prompts, approval bodies, environment values, credentials, or transcripts. Current automatic emitters cover command/Git failures and ambiguous partial `apply_patch` mutations; `recall_feedback(outcome="no_hit")` can add an explicitly `client_reported` knowledge-gap signal without persisting the query or recall results.
+
+`friction_summary({session_id})` is read-only and returns an explainable bounded score with per-kind counts and capped contributions. A clean session produces no candidate merely because it used many tools, repeated same-kind failures are capped, and a recall miss alone scores zero. `learning_candidate_list({session_id})` derives review-only candidates from that summary; it never publishes authoritative knowledge automatically and never copies checkpoint text, transcripts, or command output into a candidate.
+
+Authoritative learnings are repo-managed Markdown. `recall({session_id, query, knowledge_root?, limit?})` defaults to the relative `learnings/` directory (or another explicitly supplied relative root inside the session roots), rebuilds a deterministic local index on every request, and requires no network, embedding API, or vector database. Each Markdown learning must have `title`, `date` (`YYYY-MM-DD`), one or more bounded `tags`, `domain`, `verification`, plus `## Problem`, `## Resolution`, and `## Reusable lesson` sections. Recall returns the matched/missing terms and score for each hit. Publishing or editing a learning continues to use the existing `write_file` and Git trust/approval flow.
 
 ## Files and images
 

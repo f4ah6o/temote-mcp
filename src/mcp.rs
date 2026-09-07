@@ -14,8 +14,9 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    approvals, checkpoints, child_env, config, onepassword_cli, onepassword_mcp, onepassword_sdk,
-    sandbox, session_control::SessionBackend, work_handoff,
+    apply_patch, approvals, checkpoints, child_env, config, friction, onepassword_cli,
+    onepassword_mcp, onepassword_sdk, recall, sandbox, session_control::SessionBackend,
+    work_handoff,
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -430,11 +431,12 @@ fn checkpoint_save_input_schema() -> Value {
         "type":"object",
         "properties":{
             "session_id":{"type":"string"},
+            "operation_id":{"type":"string","format":"uuid"},
             "checkpoint_id":{"type":"string"},
             "expected_revision":{"type":"integer","minimum":0},
             "checkpoint":client_checkpoint_schema()
         },
-        "required":["session_id","expected_revision","checkpoint"],
+        "required":["session_id","operation_id","expected_revision","checkpoint"],
         "additionalProperties":false
     })
 }
@@ -467,6 +469,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 regular file using the selected session permission mode. Existing special-file targets are rejected. Normal sessions are restricted to permitted roots and use the temote-mcp sandbox; yolo sessions may write anywhere the local user can.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
+        {"name":"apply_patch","title":"Apply a bounded multi-file patch","description":"Parse a Codex-style *** Begin Patch patch, preflight every source and destination inside the session roots, request approval once for normal sessions, then apply add/update/move/delete operations without invoking a shell parser. Partial I/O failure reports the exact committed operations.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"patch":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","patch"],"additionalProperties":false}},
         {"name":"git_add","title":"Stage files with Git","description":"Stage existing files or directories in the session repository with git add. Only the specified paths are staged; Git hooks and network access are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"cwd":{"type":"string"}},"required":["session_id","paths"],"additionalProperties":false}},
         {"name":"git_commit","title":"Create a local Git commit","description":"Create a local commit from the current Git index. This does not push, hooks and signing are disabled, and network access is unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":16384},"cwd":{"type":"string"}},"required":["session_id","message"],"additionalProperties":false}},
         {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
@@ -476,9 +479,13 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Normal sessions use the temote-mcp sandbox with network disabled; yolo sessions run directly on the host with the local user's permissions.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"checkpoint_save","title":"Save a scoped work checkpoint","description":"Persist a bounded client-reported work checkpoint scoped to the current canonical working directory. Normal sessions require local approval.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":checkpoint_save_input_schema()},
+        {"name":"checkpoint_save","title":"Save a scoped work checkpoint","description":"Persist a bounded client-reported work checkpoint scoped to the current canonical working directory. A mandatory operation_id makes exact retries idempotent. Normal sessions require local approval.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_save_input_schema()},
         {"name":"checkpoint_load","title":"Load a scoped work checkpoint","description":"Read one client-reported checkpoint only when it belongs to the current canonical working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_load_input_schema()},
         {"name":"work_handoff","title":"Read a work handoff snapshot","description":"Project scoped client-reported checkpoint state together with a redacted live snapshot of current-session jobs. This tool does not execute or revalidate reported work.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":work_handoff_input_schema()},
+        {"name":"friction_summary","title":"Summarize execution friction","description":"Return a bounded, explainable score derived only from secret-free execution metadata observed for the current session and scope. Command argv, output, file contents, prompts, and approval bodies are not stored in the friction event stream.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"learning_candidate_list","title":"List derived learning candidates","description":"Derive review-only learning candidates from bounded friction events. Candidates never become authoritative learning automatically and contain no transcript or command output.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"recall","title":"Recall repo-managed learnings","description":"Rebuild a deterministic local index from bounded Markdown files under a configured knowledge root inside the session roots and return explainable matches. No network or embedding service is used.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"query":{"type":"string","minLength":1,"maxLength":2048},"knowledge_root":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20,"default":5}},"required":["session_id","query"],"additionalProperties":false}},
+        {"name":"recall_feedback","title":"Record a recall knowledge-gap signal","description":"Persist only a client-reported no-hit signal, with an optional opaque retry-group UUID. Query text and recall results are not persisted. A no-hit signal alone never creates a learning candidate. Normal sessions require local approval.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"outcome":{"type":"string","enum":["no_hit"]},"retry_group":{"type":"string","format":"uuid"}},"required":["session_id","outcome"],"additionalProperties":false}},
         {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"onepassword_mcp_discover","title":"Discover 1Password MCP","description":"List resources and tool schemas exposed by the official local 1Password Environments MCP server. Start with this tool before using 1Password MCP tools.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"onepassword_mcp_read_resource","title":"Read a 1Password MCP resource","description":"Read a documentation resource exposed by the official local 1Password Environments MCP server.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"uri":{"type":"string"}},"required":["session_id","uri"],"additionalProperties":false}},
@@ -644,6 +651,11 @@ async fn call_tool(
             text_result(result?)
         }
         "write_file" => write_file(&args, &session).await,
+        "apply_patch" => {
+            let request = apply_patch::parse_request(&args)?;
+            let outcome = apply_patch::apply(&session, request).await?;
+            text_result(serde_json::to_string_pretty(&outcome)?)
+        }
         "git_add" => git_add(&args, &session).await,
         "git_commit" => git_commit(&args, &session).await,
         "git_fetch" => git_fetch(&args, &session).await,
@@ -685,6 +697,52 @@ async fn call_tool(
         "work_handoff" => {
             let request = work_handoff::parse_request(&args)?;
             text_result(work_handoff::render(&session, request)?)
+        }
+        "friction_summary" => {
+            let store = friction::Store::default_store()?;
+            let summary = store.summary(&session)?;
+            text_result(serde_json::to_string_pretty(&summary)?)
+        }
+        "learning_candidate_list" => {
+            let store = friction::Store::default_store()?;
+            let candidates = store.candidates(&session)?;
+            text_result(serde_json::to_string_pretty(&candidates)?)
+        }
+        "recall" => {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .context("missing query")?;
+            let knowledge_root = args.get("knowledge_root").and_then(Value::as_str);
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
+            let response = recall::search(&session, query, knowledge_root, limit)?;
+            text_result(serde_json::to_string_pretty(&response)?)
+        }
+        "recall_feedback" => {
+            anyhow::ensure!(
+                args.get("outcome").and_then(Value::as_str) == Some("no_hit"),
+                "recall_feedback outcome must be no_hit"
+            );
+            let retry_group = args
+                .get("retry_group")
+                .and_then(Value::as_str)
+                .map(Uuid::parse_str)
+                .transpose()
+                .context("retry_group must be a UUID")?;
+            let approved = if session.yolo {
+                true
+            } else {
+                approvals::request(
+                    &session.id,
+                    "recall_feedback",
+                    "signal: no_hit; query/content: not persisted".to_owned(),
+                    session.cwd.clone(),
+                )
+                .await?
+            };
+            anyhow::ensure!(approved, "user denied recall feedback persistence");
+            let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
+            text_result(serde_json::to_string_pretty(&event)?)
         }
         "stop_job" => stop_job(&args, &session).await,
         "onepassword_mcp_discover" => {
@@ -1486,7 +1544,7 @@ async fn run_approved_git_command(
     )
     .await;
     let result = output.and_then(render_output);
-    report_command_finished(session.id.clone(), &rendered_command, &result).await;
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
     text_result(result?)
 }
 
@@ -1599,7 +1657,7 @@ async fn run_git_and_report(
         .await
     };
     let result = output.and_then(render_output);
-    report_command_finished(session.id.clone(), &rendered_command, &result).await;
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
     text_result(result?)
 }
 
@@ -1670,7 +1728,7 @@ async fn spawn_sandboxed_command(
         }
         drop(slot);
         reap_jobs();
-        report_command_finished(session_id, &task_command, &result).await;
+        report_command_finished(session_id, "execute", &task_command, &result).await;
     });
     Ok((rendered_command, handle, completion))
 }
@@ -1923,8 +1981,9 @@ fn save_checkpoint_after_approval(
         anyhow::bail!("user denied checkpoint save")
     }
     let activity_detail = checkpoints::activity_detail(&request.checkpoint);
-    let saved = store.save(
+    let saved = store.save_idempotent(
         session,
+        request.operation_id,
         request.checkpoint_id,
         request.expected_revision,
         request.checkpoint,
@@ -2073,7 +2132,7 @@ async fn run_and_report(
         sandbox::run(&command, &cwd, roots, None).await
     };
     let result = output.and_then(render_output);
-    report_command_finished(session_id, &rendered_command, &result).await;
+    report_command_finished(session_id, "execute", &rendered_command, &result).await;
     text_result(result?)
 }
 
@@ -2186,11 +2245,31 @@ fn render_command(command: &[String]) -> String {
         .join(" ")
 }
 
-async fn report_command_finished(session_id: String, command: &str, result: &Result<String>) {
+async fn report_command_finished(
+    session_id: String,
+    operation_class: &str,
+    command: &str,
+    result: &Result<String>,
+) {
     let detail = match result {
         Ok(text) => command_summary(text),
         Err(error) => Some(format!("└ Error: {error:#}")),
     };
+    if result.is_err() {
+        let kind = if operation_class == "git" {
+            friction::FrictionKind::GitOperationFailed
+        } else {
+            friction::FrictionKind::ExecuteFailed
+        };
+        friction::record_observed_for_session_id(
+            &session_id,
+            kind,
+            Some(operation_class),
+            None,
+            friction::EventOutcome::Failed,
+        )
+        .await;
+    }
     approvals::activity(&session_id, format!("Ran {command}"), detail).await;
 }
 
@@ -3011,7 +3090,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 33);
+        assert_eq!(tools.len(), 38);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -3574,6 +3653,7 @@ mod tests {
         let marker = "denied-secret-sentinel";
         let request = checkpoints::parse_save_request(&json!({
             "session_id": session.id,
+            "operation_id": Uuid::new_v4(),
             "expected_revision": 0,
             "checkpoint": {
                 "title": marker,

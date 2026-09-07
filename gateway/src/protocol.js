@@ -114,11 +114,12 @@ function checkpointSaveSchema() {
   return schema(
     {
       ...sessionProperty,
+      operation_id: { type: "string", format: "uuid" },
       checkpoint_id: { type: "string" },
       expected_revision: { type: "integer", minimum: 0 },
       checkpoint: clientCheckpointSchema(),
     },
-    ["session_id", "expected_revision", "checkpoint"],
+    ["session_id", "operation_id", "expected_revision", "checkpoint"],
   );
 }
 
@@ -184,6 +185,16 @@ export const PUBLIC_TOOLS = [
     schema(
       { ...sessionProperty, path: { type: "string" }, content: { type: "string" } },
       ["session_id", "path", "content"],
+    ),
+  ),
+  tool(
+    "apply_patch",
+    "Apply a bounded multi-file patch",
+    "Parse a Codex-style *** Begin Patch patch, preflight every source and destination inside the session roots, request approval once for normal sessions, then apply add/update/move/delete operations without invoking a shell parser. Partial I/O failure reports the exact committed operations.",
+    mutation,
+    schema(
+      { ...sessionProperty, patch: { type: "string", minLength: 1, maxLength: 1048576 } },
+      ["session_id", "patch"],
     ),
   ),
   tool(
@@ -291,7 +302,7 @@ export const PUBLIC_TOOLS = [
     "checkpoint_save",
     "Save a scoped work checkpoint",
     "Persist a bounded client-reported work checkpoint scoped to the current canonical working directory.",
-    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     checkpointSaveSchema(),
   ),
   tool(
@@ -307,6 +318,49 @@ export const PUBLIC_TOOLS = [
     "Project scoped client-reported checkpoint state with a redacted live snapshot of current-session jobs.",
     readOnly,
     workHandoffSchema(),
+  ),
+  tool(
+    "friction_summary",
+    "Summarize execution friction",
+    "Return a bounded, explainable score derived only from secret-free execution metadata observed for the current session and scope. Command argv, output, file contents, prompts, and approval bodies are not stored in the friction event stream.",
+    readOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "learning_candidate_list",
+    "List derived learning candidates",
+    "Derive review-only learning candidates from bounded friction events. Candidates never become authoritative learning automatically and contain no transcript or command output.",
+    readOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "recall",
+    "Recall repo-managed learnings",
+    "Rebuild a deterministic local index from bounded Markdown files under a configured knowledge root inside the session roots and return explainable matches. No network or embedding service is used.",
+    readOnly,
+    schema(
+      {
+        ...sessionProperty,
+        query: { type: "string", minLength: 1, maxLength: 2048 },
+        knowledge_root: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 20, default: 5 },
+      },
+      ["session_id", "query"],
+    ),
+  ),
+  tool(
+    "recall_feedback",
+    "Record a recall knowledge-gap signal",
+    "Persist only a client-reported no-hit signal, with an optional opaque retry-group UUID. Query text and recall results are not persisted. A no-hit signal alone never creates a learning candidate. Normal sessions require local approval.",
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    schema(
+      {
+        ...sessionProperty,
+        outcome: { type: "string", enum: ["no_hit"] },
+        retry_group: { type: "string", format: "uuid" },
+      },
+      ["session_id", "outcome"],
+    ),
   ),
   tool(
     "stop_job",
