@@ -3,11 +3,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{checkpoints, config, mcp};
+use crate::{checkpoints, config, mcp, recall};
 
 const HANDOFF_VERSION: u64 = 1;
 const MAX_HANDOFF_BYTES: usize = 1024 * 1024;
 const MAX_HANDOFF_JOBS: usize = 128;
+const MAX_HANDOFF_RECALL_HITS: usize = 5;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +37,69 @@ pub(crate) fn render(session: &config::Session, request: WorkHandoffRequest) -> 
     let store = checkpoints::Store::default_store()?;
     let jobs = mcp::snapshot_jobs_for_session(&session.id, MAX_HANDOFF_JOBS);
     render_with_sources(session, request, &store, jobs)
+}
+
+fn automatic_recall(
+    session: &config::Session,
+    checkpoint: Option<&checkpoints::CheckpointEnvelope>,
+) -> (Value, bool) {
+    let Some(checkpoint) = checkpoint else {
+        return (
+            json!({
+                "status": "not_run",
+                "reason": "checkpoint_not_selected"
+            }),
+            false,
+        );
+    };
+
+    let mut query = checkpoint.checkpoint.title.trim().to_owned();
+    if let Some(next_step_id) = checkpoint.checkpoint.next_step_id.as_deref()
+        && let Some(step) = checkpoint
+            .checkpoint
+            .steps
+            .iter()
+            .find(|step| step.id == next_step_id)
+    {
+        let description = step.description.trim();
+        if !description.is_empty() {
+            if !query.is_empty() {
+                query.push(' ');
+            }
+            query.push_str(description);
+        }
+    }
+    if query.is_empty() {
+        return (
+            json!({
+                "status": "not_run",
+                "reason": "checkpoint_has_no_searchable_text"
+            }),
+            false,
+        );
+    }
+
+    match recall::search(session, &query, None, MAX_HANDOFF_RECALL_HITS) {
+        Ok(response) => {
+            let has_hits = !response.hits.is_empty();
+            (
+                json!({
+                    "status": "searched",
+                    "query_source": "checkpoint_title_and_next_step",
+                    "response": response
+                }),
+                has_hits,
+            )
+        }
+        Err(_) => (
+            json!({
+                "status": "unavailable",
+                "query_source": "checkpoint_title_and_next_step",
+                "reason": "automatic_recall_failed"
+            }),
+            false,
+        ),
+    }
 }
 
 fn render_with_sources(
@@ -67,6 +131,7 @@ fn render_with_sources(
             }
         };
 
+    let (automatic_recall, has_recall_hits) = automatic_recall(session, checkpoint.as_ref());
     let has_running_job = jobs.jobs.iter().any(|job| job.status == "running");
     let mut resume_hints = Vec::new();
     if checkpoint.is_none() && !available.is_empty() {
@@ -84,6 +149,9 @@ fn render_with_sources(
     {
         resume_hints.push("review_reported_next_step");
     }
+    if has_recall_hits {
+        resume_hints.push("review_recalled_learnings");
+    }
 
     let response = json!({
         "handoff_version": HANDOFF_VERSION,
@@ -95,6 +163,7 @@ fn render_with_sources(
             "observation": "current_session"
         },
         "checkpoint": checkpoint,
+        "automatic_recall": automatic_recall,
         "available_checkpoints": available,
         "available_checkpoints_truncated": available_truncated,
         "available_checkpoints_incomplete": available_incomplete,
@@ -165,6 +234,12 @@ mod tests {
         }
     }
 
+    fn learning(title: &str, tags: &str, body: &str) -> String {
+        format!(
+            "---\ntitle: \"{title}\"\ndate: 2026-09-08\ntags: [{tags}]\ndomain: technical\nverification: verified\n---\n\n## Problem\n{body}\n\n## Resolution\nResolved deterministically.\n\n## Reusable lesson\nReuse this bounded learning.\n"
+        )
+    }
+
     #[test]
     fn handoff_lists_checkpoints_without_selecting_one() {
         let root = tempfile::tempdir().unwrap();
@@ -189,6 +264,11 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_str(&rendered).unwrap();
         assert!(value["checkpoint"].is_null());
+        assert_eq!(value["automatic_recall"]["status"], "not_run");
+        assert_eq!(
+            value["automatic_recall"]["reason"],
+            "checkpoint_not_selected"
+        );
         assert_eq!(value["available_checkpoints"].as_array().unwrap().len(), 2);
         assert_eq!(value["resume_hints"], json!(["choose_checkpoint"]));
         assert_eq!(value["freshness"], "not_revalidated");
@@ -236,6 +316,60 @@ mod tests {
                 "revalidate_repository_and_checks",
                 "review_reported_next_step"
             ])
+        );
+    }
+
+    #[test]
+    fn handoff_selected_checkpoint_injects_local_recall_hits() {
+        let root = tempfile::tempdir().unwrap();
+        let learnings = root.path().join("learnings");
+        std::fs::create_dir(&learnings).unwrap();
+        std::fs::write(
+            learnings.join("steam-tls.md"),
+            learning(
+                "Steam TLS certificate validation",
+                "steam, tls, wine",
+                "GnuTLS-backed validation is required for Steam certificate handling.",
+            ),
+        )
+        .unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "handoff-recall");
+        let store = Store::new(store_root.path().join("checkpoints"));
+        let saved = store
+            .save(
+                &session,
+                None,
+                0,
+                checkpoint("Steam TLS resume", "verify certificate validation"),
+            )
+            .unwrap();
+        let rendered = render_with_sources(
+            &session,
+            WorkHandoffRequest {
+                session_id: session.id.clone(),
+                checkpoint_id: Some(saved.checkpoint_id),
+            },
+            &store,
+            empty_jobs(),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["automatic_recall"]["status"], "searched");
+        assert_eq!(
+            value["automatic_recall"]["query_source"],
+            "checkpoint_title_and_next_step"
+        );
+        assert_eq!(
+            value["automatic_recall"]["response"]["hits"][0]["title"],
+            "Steam TLS certificate validation"
+        );
+        assert!(
+            value["resume_hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint == "review_recalled_learnings")
         );
     }
 

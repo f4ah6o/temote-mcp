@@ -88,7 +88,7 @@ stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated と
 
 checkpointのstatus/check resultは常に `source="client_reported"` です。`verified` もreported checkとcommitの整合性を検査するだけで、command成功からTemoteが自動的にverificationを認定することはありません。title/descriptionへcredential、token、private command outputなどのsecretを書かないでください。approval/activity summaryにはtoolとstep/check件数だけを出し、自由文のcheckpoint本文は転載しません。
 
-`work_handoff({session_id, checkpoint_id?})` はread-onlyです。ID省略時は同scopeのbounded checkpoint候補を自動選択せず一覧化します。ID指定時はそのcheckpoint、current-session jobのredactedな `source="live_snapshot"`、`freshness="not_revalidated"`、固定のresume hintを返します。checkpoint本文をcommandとして実行せず、作業のreplay、Git実行、artifact検証もしません。
+`work_handoff({session_id, checkpoint_id?})` はread-onlyです。ID省略時は同scopeのbounded checkpoint候補を自動選択せず一覧化します。ID指定時はそのcheckpoint、current-session jobのredactedな `source="live_snapshot"`、`freshness="not_revalidated"`、resume hintに加えて、checkpoint titleとclient-reported next-step descriptionからローカルで構築したbest-effortの `automatic_recall` を返します。automatic recallはrepo-managedな `learnings/` indexだけを使い、network不要で、hitがある場合だけ `review_recalled_learnings` を追加します。checkpoint本文をcommandとして実行せず、作業のreplay、Git実行、artifact検証もしません。
 
 安全なresume flowは `session_info` → `work_handoff` → checkpointを選択 → `work_handoff(checkpoint_id=...)` → running jobを再実行前にinspect/poll → Git state・artifact・checkを別のread-only手段で再検証 → 次のoperationを決める、です。
 
@@ -100,7 +100,7 @@ multi-file全体をtransactional atomicとは扱いません。途中I/O error�
 
 ## friction / learning candidate / recall
 
-Temoteはowner-onlyかつboundedなfriction event storeへ、event/session ID、canonical scope、enum kind/source/outcome、restrictedなoperation/tool identifier、optional UUID linkだけを保存します。command argv、stdout/stderr、file content、prompt、approval本文、environment value、credential、transcriptは保存しません。現在のautomatic emitterはcommand/Git failureと `apply_patch` のambiguous partial mutationです。`recall_feedback(outcome="no_hit")` はqueryやrecall resultを保存せず、明示的な `client_reported` knowledge-gap signalだけを追加できます。
+Temoteはowner-onlyかつboundedなfriction event storeへ、event/session ID、canonical scope、enum kind/source/outcome、restrictedなoperation/tool identifier、optional UUID linkだけを保存します。command argv、stdout/stderr、file content、prompt、approval本文、environment value、credential、transcriptは保存しません。現在のautomatic emitterはcommand/Git failure、`apply_patch` のambiguous partial mutation、normal sessionで実際に返されたnegative approval responseです。runtime shutdownでpending promptが閉じただけのケースはuser denialとして誤記録しません。`recall_feedback(outcome="no_hit")` はqueryやrecall resultを保存せず、明示的な `client_reported` knowledge-gap signalだけを追加できます。
 
 `friction_summary({session_id})` はread-onlyで、kind別countとcap済みcontributionを含むexplainable scoreを返します。正常sessionはtool call数が多いだけではcandidateにならず、同kindのrepeated failureはbounded、recall miss単独はscore 0です。`learning_candidate_list({session_id})` はsummaryからreview用candidateをderived viewとして返しますが、authoritative learningへ自動publishせず、checkpoint本文、transcript、command outputもcandidateへコピーしません。
 

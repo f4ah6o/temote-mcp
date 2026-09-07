@@ -315,7 +315,7 @@ export const PUBLIC_TOOLS = [
   tool(
     "work_handoff",
     "Read a work handoff snapshot",
-    "Project scoped client-reported checkpoint state with a redacted live snapshot of current-session jobs.",
+    "Project scoped client-reported checkpoint state with a redacted live snapshot of current-session jobs and best-effort local learning recall for a selected checkpoint.",
     readOnly,
     workHandoffSchema(),
   ),

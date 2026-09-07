@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{self, Session};
-use crate::{kintone_cli, kintone_mcp, sandbox, secret_broker};
+use crate::{friction, kintone_cli, kintone_mcp, sandbox, secret_broker};
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APPROVAL_RESPONSE_BYTES: usize = 64;
@@ -1271,6 +1271,8 @@ async fn run_runtime(
                                 continue;
                             }
                         };
+                        let friction_operation = request.operation.clone();
+                        let friction_session = session.clone();
                         let (response, receiver) = oneshot::channel();
                         let prompt = ApprovalPrompt {
                             session_id: session.id.clone(),
@@ -1289,10 +1291,24 @@ async fn run_runtime(
                         tokio::spawn(async move {
                             let _operation = operation;
                             let _permit = permit;
-                            let allowed = tokio::select! {
-                                response = receiver => response.unwrap_or(false),
-                                _ = runtime_alive.changed() => false,
+                            let (allowed, record_denial) = tokio::select! {
+                                response = receiver => {
+                                    let allowed = response.unwrap_or(false);
+                                    (allowed, !allowed)
+                                },
+                                _ = runtime_alive.changed() => (false, false),
                             };
+                            if record_denial {
+                                friction::record_observed(
+                                    &friction_session,
+                                    friction::FrictionKind::ApprovalDenied,
+                                    Some("approval"),
+                                    Some(&friction_operation),
+                                    friction::EventOutcome::Denied,
+                                    None,
+                                    None,
+                                );
+                            }
                             let _ = stream
                                 .write_all(if allowed { b"allow\n" } else { b"deny\n" })
                                 .await;

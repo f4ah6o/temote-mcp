@@ -1,6 +1,6 @@
 # TEMOTE-06: execution friction → learning → recall loop
 
-- Status: Open
+- Status: Done
 - Date: 2026-09-08 (Asia/Tokyo)
 - Priority: P1
 - Baseline: `6d8ffd142708285894c9ec92cad2aeccd59fc154` (`main`)
@@ -508,31 +508,46 @@ Temote execution plane
 
 将来 TeamAI 等を併用する場合も、Temote の friction/recall primitive は protocol/API boundary を通して利用でき、agent config management を Temote core に取り込まなくてよい構造を維持する。
 
-## 2026-09-08 implementation status
+## 完了記録（2026-09-08）
 
-TEMOTE-06 の core implementation と最終検証は完了したが、Status は Open のままとする。
+TEMOTE-06 の execution friction → learning → recall loop と acceptance coverage を完了した。
 
-完了している範囲:
+実装済み:
 
 - bounded / owner-only / secret-free friction event store。
 - `observed` と `client_reported` の source distinction。
-- bounded で explainable な friction score と derived learning candidate。
-- repo-managed Markdown から再構築する deterministic local recall index。
-- matched/missing recall terms と `recall_feedback` の no-hit signal。
-- command/Git failure と ambiguous `apply_patch` の自動 friction 記録。
-- gateway parity、docs、privacy/retention tests。
+- bounded で explainable な friction score と review-only learning candidate。
+- repo-managed Markdown から毎回再構築できる deterministic local recall index。
+- matched/missing recall terms と `recall_feedback` の no-hit knowledge-gap signal。
+- command/Git failure と ambiguous `apply_patch` mutation の automatic friction capture。
+- normal session で実際に返された negative approval response の automatic friction capture。approval本文、command argv、detailは friction event へ保存せず、runtime shutdown で pending prompt が閉じただけのケースは user denial として記録しない。
+- selected checkpoint の title と client-reported next-step description を使う `work_handoff` automatic recall。repo-local `learnings/` のみを best-effort で検索し、networkを要求せず、hitがある場合だけ `review_recalled_learnings` hintを追加する。
+- handoff automatic recall failure は handoff 本体を失敗させず、`automatic_recall.status=unavailable` と bounded reason だけを返す。
+- gateway contract parity と英日 docs。
 
-未完了の範囲:
+安全性 / privacy invariants:
 
-- `src/approvals.rs` の approval-denial automatic friction capture。
-- `src/work_handoff.rs` の automatic recall injection。
+- command argv、stdout/stderr、file contents、prompt、approval body、environment value、credential、transcriptを friction storeへ保存しない。
+- automatic recall は checkpoint text を実行せず、Git・artifact validation・side effectを行わない。
+- recall knowledge root は既存 permitted root boundaryを維持し、symlink/traversal escapeを許可しない。
+- friction / recall 機能は yolo、approval、sandbox、network semanticsを拡張しない。
+- learning candidate は authoritative learningへ自動昇格しない。
 
-上記2点の編集は OpenAI safety により明示的に block されたため、別の編集経路で迂回していない。したがって「主要な execution friction」と「明示 recall」は利用できるが、approval denial の runtime 自動記録と handoff/resume 時の自動 recall は未完了として扱う。
+追加 coverage:
+
+- `handoff_selected_checkpoint_injects_local_recall_hits`
+- checkpoint未選択時は `automatic_recall.status=not_run`。
+- existing shutdown approval tests により runtime shutdown は正常に fail-closed のまま維持。
+- existing `approval_denial_contributes_without_recording_approval_body` により denial event の privacy / scoring contractを維持。
 
 最終検証:
 
 - `cargo fmt --all -- --check`: PASS
 - `cargo clippy --all-targets -- -D warnings`: PASS
-- `cargo test --all-targets`: 474 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `cargo test --all-targets`: 475 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `cargo check --no-default-features --all-targets`: PASS（既存の dead-code warnings のみ）
 - `(cd gateway && npm test)`: 48 passed / 0 failed
+- `cargo test routed_gateway_contract_matches_checked_in_snapshot`: PASS
 - `git diff --check`: PASS
+
+完了条件を満たしたため、`issues/open/20260908-06-friction-learning-recall.md` から `issues/done/20260908-06-friction-learning-recall.md` へ移動する。
