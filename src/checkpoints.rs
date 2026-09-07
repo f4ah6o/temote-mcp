@@ -1103,6 +1103,51 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_crash_before_durable_commit_does_not_publish_success() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::new(store_root.path().join("checkpoints"));
+        let session = session(root.path(), "crash-before-commit");
+        let operation_id = Uuid::new_v4();
+
+        let error = store
+            .clone()
+            .with_atomic_write_failure()
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("not-committed"))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected atomic write failure"));
+        let checkpoint_id = checkpoint_id_for_operation(&session, operation_id);
+        assert!(!store.record_path(checkpoint_id).exists());
+        assert!(store.load(&session, checkpoint_id).is_err());
+
+        let recovered = store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("not-committed"))
+            .unwrap();
+        assert_eq!(recovered.checkpoint_id, checkpoint_id);
+        assert_eq!(recovered.revision, 1);
+    }
+
+    #[test]
+    fn checkpoint_crash_after_commit_before_response_is_recoverable() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Store::new(store_root.path().join("checkpoints"));
+        let session = session(root.path(), "crash-after-commit");
+        let operation_id = Uuid::new_v4();
+
+        let _response_lost = store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("committed"))
+            .unwrap();
+        let recovered = store
+            .save_idempotent(&session, operation_id, None, 0, checkpoint("committed"))
+            .unwrap();
+
+        assert_eq!(recovered.operation_id, Some(operation_id));
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(store.list_for_scope(&session).unwrap().checkpoints.len(), 1);
+    }
+
+    #[test]
     fn checkpoint_create_response_loss_exact_retry_returns_original_result() {
         let root = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();

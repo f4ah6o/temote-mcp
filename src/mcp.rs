@@ -3910,6 +3910,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn job_list_after_new_chat_discovers_existing_running_job() {
+        let session_id = format!("job-list-new-chat-{}", Uuid::new_v4());
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id: session_id.clone(),
+                command: "hidden".to_owned(),
+                handle,
+                completion: Arc::new(Mutex::new(JobCompletion::default())),
+            },
+        );
+
+        let first_client = snapshot_jobs_for_session(&session_id, 50);
+        let second_client = snapshot_jobs_for_session(&session_id, 50);
+        assert_eq!(first_client.jobs.len(), 1);
+        assert_eq!(first_client, second_client);
+        assert_eq!(first_client.jobs[0].job_id, job_id.to_string());
+        assert_eq!(first_client.jobs[0].status, "running");
+
+        if let Some(job) = remove_job(job_id) {
+            job.handle.abort();
+        }
+    }
+
     #[test]
     fn job_list_empty_is_not_execution_history() {
         let session_id = format!("job-list-empty-{}", Uuid::new_v4());

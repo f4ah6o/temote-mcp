@@ -533,6 +533,6 @@ TEMOTE-06 の core implementation と最終検証は完了したが、Status は
 
 - `cargo fmt --all -- --check`: PASS
 - `cargo clippy --all-targets -- -D warnings`: PASS
-- `cargo test --all-targets`: 469 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `cargo test --all-targets`: 474 passed / 0 failed / 3 ignored（既存の process-boundary tests）
 - `(cd gateway && npm test)`: 48 passed / 0 failed
 - `git diff --check`: PASS

@@ -728,6 +728,26 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_does_not_widen_session_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        symlink(outside.path(), root.path().join("outside")).unwrap();
+
+        let session = session(root.path(), false);
+        let parsed = parse_patch(
+            "*** Begin Patch\n*** Update File: outside/secret.txt\n@@\n-secret\n+changed\n*** End Patch",
+        )
+        .unwrap();
+
+        assert!(preflight(&session, &parsed).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret\n"
+        );
+    }
+
+    #[test]
     fn apply_patch_malformed_multi_file_patch_writes_nothing() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.txt"), "before\n").unwrap();
@@ -740,6 +760,41 @@ mod tests {
             "before\n"
         );
         assert!(!root.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn apply_patch_partial_io_failure_reports_exact_commit_state() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.txt");
+        let blocked_parent = root.path().join("blocked");
+        std::fs::write(&blocked_parent, "not a directory\n").unwrap();
+        let second = blocked_parent.join("second.txt");
+        let session = session(root.path(), true);
+        let operations = vec![
+            PreparedOperation::Add {
+                path: first.clone(),
+                content: "first\n".to_owned(),
+            },
+            PreparedOperation::Add {
+                path: second.clone(),
+                content: "second\n".to_owned(),
+            },
+        ];
+
+        let outcome = apply_prepared_after_approval(&session, operations, true)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, "partial_failure");
+        assert_eq!(outcome.committed, vec![commit_record("add", &first, None)]);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to write"))
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first\n");
+        assert!(!second.exists());
     }
 
     #[tokio::test]
@@ -764,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_approval_detail_never_contains_patch_content() {
+    fn apply_patch_secret_content_is_not_copied_into_audit_metadata() {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path(), true);
         let marker = "secret-content-sentinel";

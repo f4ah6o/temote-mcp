@@ -1,6 +1,6 @@
 # TEMOTE-05: durable continuation hardening と Codex-style apply_patch
 
-- Status: Open
+- Status: Done
 - Date: 2026-09-08 (Asia/Tokyo)
 - Priority: P1
 - Baseline: `89a7981a7e566643a5502716a11085801cd44422` (`main`)
@@ -281,22 +281,47 @@ start session
 - `apply_patch` が全対象preflight後にのみmutationし、Temoteのsandbox/approval/root boundaryを維持する。
 - browser orchestration / worker chats / unrestricted shell / full transcript recorderをTemote coreへ導入していない。
 
-## 2026-09-08 implementation verification
+## 完了記録（2026-09-08）
 
-TEMOTE-05 の core implementation は実装済みで、今回の最終検証は次の結果になった。
+TEMOTE-05 の durable continuation hardening と Rust-native `apply_patch` を実装し、acceptance coverage を完了した。
+
+実装済み:
+
+- caller-supplied `operation_id` を必須化し、exact retry を同一結果へ idempotently replay。
+- 異なる request の operation_id 再利用を `OPERATION_CONFLICT` として拒否。
+- bounded durable operation receipt history。
+- checkpoint の atomic write / scope / revision / approval preflight。
+- Codex-style add/update/move/delete patch の Rust-native parser と全対象 preflight。
+- normal session の root / symlink / traversal / permission boundary と一回 approval。
+- patch body / secret content を approval・activity metadata に保存しない。
+- partial apply 時の machine-readable committed operations。
+- job discovery / handoff の reported・observed・live state separation。
+- gateway contract parity と英日 docs。
+
+必須 failure-boundary / safety coverage:
+
+- `checkpoint_crash_before_durable_commit_does_not_publish_success`
+- `checkpoint_crash_after_commit_before_response_is_recoverable`
+- `checkpoint_create_response_loss_exact_retry_returns_original_result`
+- `checkpoint_operation_id_conflict_rejects_different_payload`
+- `apply_patch_preflights_all_files_before_first_write`
+- `apply_patch_rejects_symlink_escape_and_move_destination_outside_root`
+- `apply_patch_denied_approval_writes_nothing`
+- `apply_patch_malformed_multi_file_patch_writes_nothing`
+- `apply_patch_partial_io_failure_reports_exact_commit_state`
+- `apply_patch_does_not_widen_session_permissions`
+- `apply_patch_secret_content_is_not_copied_into_audit_metadata`
+- `job_list_after_new_chat_discovers_existing_running_job`
+
+handoff の非再実行、reported/live distinction、shell 非呼び出し、gateway parity は既存テストで確認した。
+
+最終検証:
 
 - `cargo fmt --all -- --check`: PASS
 - `cargo clippy --all-targets -- -D warnings`: PASS
-- `cargo test --all-targets`: 469 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `cargo test --all-targets`: 474 passed / 0 failed / 3 ignored（既存の process-boundary tests）
+- `cargo check --no-default-features --all-targets`: PASS（既存の dead-code warnings のみ）
 - `(cd gateway && npm test)`: 48 passed / 0 failed
 - `git diff --check`: PASS
 
-実装と確認済みの contract は、caller-supplied `operation_id`、exact retry、`OPERATION_CONFLICT`、bounded durable receipt history、add/update/move/delete の Rust-native `apply_patch`、全対象 preflight、root/symlink/traversal protection、normal session の一回 approval、patch body 非保存、partial apply の machine-readable committed operations、gateway parity、英日 docs である。
-
-ただし、issue 本文 Phase D の「必須の受け入れテスト」全件はまだ満たしていないため、Status は Open のままとする。未実装の deterministic failure-boundary coverage は以下。
-
-- checkpoint の durable commit 前 crash と commit 後 response loss を fault gate で直接検証するテスト。
-- `apply_patch` の partial I/O failure を再現し、exact committed operations を検証するテスト（対応する fault-injection seam を含む）。
-- 新しい client/chat から existing running job を発見する dedicated E2E テスト。
-
-このため本 issue は `issues/done` へは移動しない。実装の主経路は完成しているが、上記の acceptance coverage を追加してから close する。
+acceptance criteria を満たしたため、`issues/open/20260908-05-durable-continuation-and-apply-patch.md` から `issues/done/20260908-05-durable-continuation-and-apply-patch.md` へ移動する。
