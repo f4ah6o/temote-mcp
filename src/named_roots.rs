@@ -116,6 +116,10 @@ impl NamedRoots {
     pub fn is_empty(&self) -> bool {
         self.roots.is_empty()
     }
+
+    pub fn names(&self) -> Vec<String> {
+        self.roots.keys().cloned().collect()
+    }
 }
 
 fn parse_json_roots(value: &str) -> Result<BTreeMap<String, String>> {

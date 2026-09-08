@@ -19,7 +19,7 @@
         "properties": {},
         "type": "object"
       },
-      "name": "session_list"
+      "name": "host_list"
     },
     {
       "annotations": {
@@ -31,6 +31,124 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "type": "object"
+      },
+      "name": "host_info"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "session_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id",
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "session_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_stop"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_restart"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -52,6 +170,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "path": {
             "type": "string"
           },
@@ -77,6 +198,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "path": {
             "type": "string"
           },
@@ -102,6 +226,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "path": {
             "type": "string"
           },
@@ -130,6 +257,9 @@
           "content": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "path": {
             "type": "string"
           },
@@ -156,6 +286,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "patch": {
             "maxLength": 1048576,
             "minLength": 1,
@@ -184,6 +317,9 @@
         "additionalProperties": false,
         "properties": {
           "cwd": {
+            "type": "string"
+          },
+          "host_id": {
             "type": "string"
           },
           "paths": {
@@ -219,6 +355,9 @@
           "cwd": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "message": {
             "maxLength": 16384,
             "minLength": 1,
@@ -249,6 +388,9 @@
           "cwd": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "remote": {
             "default": "origin",
             "type": "string"
@@ -277,6 +419,9 @@
           "cwd": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -299,6 +444,9 @@
         "additionalProperties": false,
         "properties": {
           "cwd": {
+            "type": "string"
+          },
+          "host_id": {
             "type": "string"
           },
           "remote": {
@@ -339,6 +487,9 @@
           "cwd": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -371,6 +522,9 @@
           "cwd": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -393,6 +547,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "job_id": {
             "type": "string"
           },
@@ -418,6 +575,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "limit": {
             "default": 50,
             "maximum": 128,
@@ -559,6 +719,9 @@
             "minimum": 0,
             "type": "integer"
           },
+          "host_id": {
+            "type": "string"
+          },
           "operation_id": {
             "format": "uuid",
             "type": "string"
@@ -590,6 +753,9 @@
           "checkpoint_id": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -615,6 +781,9 @@
           "checkpoint_id": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -636,6 +805,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -657,6 +829,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -678,6 +853,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "knowledge_root": {
             "type": "string"
           },
@@ -714,6 +892,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "outcome": {
             "enum": [
               "no_hit"
@@ -746,6 +927,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "job_id": {
             "type": "string"
           },
@@ -771,6 +955,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -792,6 +979,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           },
@@ -821,6 +1011,9 @@
             "additionalProperties": true,
             "type": "object"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           },
@@ -848,6 +1041,9 @@
         "additionalProperties": false,
         "properties": {
           "account": {
+            "type": "string"
+          },
+          "host_id": {
             "type": "string"
           },
           "items": {
@@ -886,6 +1082,9 @@
           "account": {
             "type": "string"
           },
+          "host_id": {
+            "type": "string"
+          },
           "references": {
             "items": {
               "type": "string"
@@ -917,6 +1116,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -967,6 +1169,9 @@
             },
             "type": "object"
           },
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -989,6 +1194,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -1010,6 +1218,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -1034,6 +1245,9 @@
           "arguments": {
             "additionalProperties": true,
             "type": "object"
+          },
+          "host_id": {
+            "type": "string"
           },
           "session_id": {
             "type": "string"
@@ -1061,6 +1275,9 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "host_id": {
+            "type": "string"
+          },
           "session_id": {
             "type": "string"
           }
@@ -1090,6 +1307,9 @@
             "type": "array"
           },
           "cwd": {
+            "type": "string"
+          },
+          "host_id": {
             "type": "string"
           },
           "session_id": {

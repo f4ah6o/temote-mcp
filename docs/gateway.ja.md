@@ -2,74 +2,137 @@
 
 [English](gateway.md)
 
-任意機能の `gateway/` Worker は1つの MCP endpoint を公開し、`session_id` ごとに Mac、Linux、Windows/WSL2 host へ call を振り分けます。host agent は outbound HTTPS long poll を使うため、endpoint ごとの inbound port や Tunnel は不要です。
+任意機能の `gateway/` Worker は、複数の Temote host を1つの MCP endpoint の背後に federation します。macOS、Linux、Windows 11 上の WSL2 で、それぞれ1つの supervisor と1つの host-level gateway agent を動かし、MCP client は host と session を選択できます。マシンごとに MCP server entry を追加する必要はありません。
 
-## 構成
+native Windows 実行は後続 milestone です。現時点の Windows 11 federation は WSL2 内で Temote を動かします。
 
-- `GatewaySession`: `session_id` ごとの Durable Object。generation、request queue、pending response、host lease を保持
-- `GatewayRegistry`: `session_list` 用の active lease を集約
-- Worker `/mcp`: Cloudflare Access assertion を検証し、MCP initialize/tool list に応答し、call を対象 `GatewaySession` へ転送
-- `/v1/hosts/*`: `temote-mcp gateway-agent` が使う bearer-token-protected protocol
+## Architecture
 
-host reconnect 時は generation を増やし、古い generation や process `instance_id` からの request/response を拒否します。非 idempotent operation があるため timeout 後の tool call は自動 replay しません。
+- `GatewaySession` Durable Object を request/response queue として使います。host mode は `host:<host_id>`、legacy per-session mode は従来どおり `session_id` を key にします。
+- `GatewayRegistry` は federated host lease と legacy per-session lease を別々に bounded state として保持します。
+- Worker `/mcp` は MCP client を認証し、host-aware tool を公開して routing します。
+- `/v1/hosts/*` は `temote-mcp gateway-agent` が outbound long poll で使う protocol です。
+- session lifecycle、named-root 解決、sandbox、approval の最終 authority は各 host の local supervisor です。gateway には named root の absolute path を送信しません。
 
-## MCP protocol compatibility
+host reconnect ごとに generation を進めます。古い generation または古い process `instance_id` からの request/response は拒否します。routed operation には非 idempotent なものがあるため、timeout や disconnect 後の自動 replay は行いません。
 
-gateway は MCP `2026-07-28` と既存の 2025 系 handshake の両方に対応します。modern request は dispatch 前に request ごとの `_meta` と標準 HTTP routing header を検証します。modern の `server/discover`、`tools/list`、tool result には 2026 仕様で必要な result metadata を付け、legacy の `initialize` は従来どおり維持します。
+## Host identity と認証
 
-routed tool schema と protocol version は Rust 生成の contract snapshot に対して Rust/Node の両テストで照合します。`serverInfo.version` は Temote CLI の CalVer ではなく、`GATEWAY_DEPLOYMENT` version-metadata binding が供給する Cloudflare deployment revision です。手動同期する source fallback をなくし、Worker の deploy ごとに identity が変わります。
+`host_id` は `mac-main`、`linux-main`、`win-main` のような安定した non-secret routing identity です。credential ではありません。
 
-## deploy
+federated host mode では、Worker secret `HOST_TOKENS_JSON` に host ごとの bearer token map を保存します。例:
+
+```json
+{"mac-main":"<random-token-a>","linux-main":"<random-token-b>","win-main":"<random-token-c>"}
+```
+
+各 local host には自分専用の token だけを `TEMOTE_MCP_GATEWAY_HOST_TOKEN` で渡します。agent は `X-Temote-Host-Id` も送信し、Worker は `HOST_TOKENS_JSON` からその `host_id` に対応する credential を選びます。別 host の token を使って別の `host_id` を名乗る要求は拒否し、request body の `host_id` も header と一致しなければなりません。
+
+`HOST_TOKEN` は一時的に残す legacy `gateway-agent --session-id` compatibility path 専用です。Cloudflare Access service-token credential は、どちらの Temote host token とも別 credential です。
+
+## Deploy
 
 1. `gateway/wrangler.toml` に non-secret の `ACCESS_TEAM_DOMAIN`、`ACCESS_AUDIENCE`、`ACCESS_ALLOWED_EMAILS` を設定します。
-2. 十分に強い host token を Worker secret `HOST_TOKEN` として保存します。
-3. test と dry-run 後に deploy します。
+2. host ごとの token map を保存します。
 
 ```sh
 cd gateway
+npx wrangler secret put HOST_TOKENS_JSON
+```
+
+3. migration 中に旧 per-session agent も稼働させる場合は、既存の `HOST_TOKEN` Worker secret も保持します。
+4. test と dry-run 後に deploy します。
+
+```sh
 npm test
 npx wrangler deploy --dry-run
 npx wrangler deploy
 ```
 
-4. custom domain を割り当て、self-hosted Cloudflare Access application で保護し、利用する MCP client 向けに Managed OAuth を有効化します。Access 配下の custom hostname だけを公開するため `workers_dev = false` を維持します。
-5. host agent は Access service-token policy で許可します。Access service token と `HOST_TOKEN` は別 credential です。
+5. custom domain を self-hosted Cloudflare Access application で保護し、利用する MCP client 向けに Managed OAuth を有効化します。`workers_dev = false` を維持します。
+6. host agent は Access service-token policy で許可します。Access service token と Temote host bearer token は独立した credential です。
 
-公開 URL は `https://<gateway-host>/mcp` です。
+公開 MCP URL は `https://<gateway-host>/mcp` です。
 
-## endpoint agent
+## 各 Temote host の設定
 
-先に local session を起動します。
+supervisor を動かすマシンごとに named root を設定します。gateway に広告するのは root 名だけで、physical path は host 内に残ります。
 
-```sh
-temote-mcp start mac-main
-```
-
-その session terminal で `gateway_connect` を承認し、agent を起動します。
+macOS 例:
 
 ```sh
+export TEMOTE_MCP_ROOTS='{"src":"/Volumes/devstorage/Developer","work":"/Users/me/work"}'
+export TEMOTE_MCP_GATEWAY_HOST_ID=mac-main
 export TEMOTE_MCP_GATEWAY_URL=https://<gateway-host>
-export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<worker HOST_TOKEN>'
+export TEMOTE_MCP_GATEWAY_HOST_TOKEN='<mac-main に割り当てた token>'
 export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID='<Access service-token ID>'
 export TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET='<Access service-token secret>'
-temote-mcp gateway-agent --session-id mac-main
+
+temote-mcp supervisor
+temote-mcp gateway-agent --host-id mac-main
 ```
 
-native Windows transport/sandbox が入るまでは WSL2 を使います。
+Linux も同じ構成で Linux path を使います。Windows 11 では WSL2 内で supervisor と agent を動かし、`/mnt/d/Developer` のような WSL path を named root にします。
 
 ```sh
-temote-mcp start windows-wsl2-main
-temote-mcp gateway-agent --session-id windows-wsl2-main --platform wsl2
+export TEMOTE_MCP_ROOTS='{"src":"/mnt/d/Developer"}'
+temote-mcp supervisor
+temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
-`--platform auto` は macOS、Linux、WSL2 を判別します。session ID は routing key であり credential ではありません。
+`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は federation readiness を表示します。supervisor compatibility と named-root 数を確認しますが、root path や token 値は表示しません。
 
-## 運用
+## MCP workflow
 
-- poll ごとに90秒 lease を更新し、最大20秒 work を待機
-- gateway dispatch は endpoint response を最大35秒待機
-- host disconnect / lease expiry 時は pending call を失敗させ、自動 replay しない
-- call 中の Worker replacement は retryable gateway error になり得るが、endpoint operation 自体は自動再実行しない
-- `session_list` は Registry lease を使い、最終 online check は per-session Durable Object でも行う
+gateway は host discovery と host-aware lifecycle routing を追加します。
 
-local Worker 開発では `gateway/.dev.vars.example` を `gateway/.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、endpoint environment file は commit しないでください。
+```text
+host_list()
+host_info(host_id="linux-main")
+session_list(host_id="linux-main")
+session_start(host_id="linux-main", path="src/project-a", session_id="project-a")
+session_info(host_id="linux-main", session_id="project-a")
+```
+
+`session_start` が受け付ける path は named-root-relative logical path だけです。host-side public supervisor が作成するのは常に通常の sandboxed session で、remote client から `--yolo` を要求することはできません。
+
+同じ human-friendly `session_id` を複数 host で使えます。
+
+```text
+mac-main / srmj
+linux-main / srmj
+```
+
+routing を確定させる場合は `host_id` を明示します。backward compatibility のため、`host_id` を省略した既存 `session_id` は、現在 discover 可能な owner がちょうど1つの場合だけ解決します。2 host が同じ ID を持つ場合や、leased host の問い合わせに失敗して ownership を安全に確定できない場合は、勝手に host を選ばず fail closed します。
+
+`session_stop` と `session_restart` は、その host の public supervisor が所有する active managed session だけに作用します。別途 local CLI で起動した yolo session は local-only のままで、public session-bound tool は yolo target の unrestricted semantics を引き継がず拒否します。
+
+## Lease と failure behavior
+
+- poll ごとに90秒の host lease を更新し、最大20秒 work を待機します。
+- gateway dispatch は endpoint response を最大35秒待ちます。
+- `host_list` は registry entry だけで判断せず、対応する host Durable Object が active lease を返した host だけを表示します。
+- reconnect は旧 generation を置き換え、古い agent instance を fence します。
+- disconnect、lease expiry、timeout、Worker replacement のいずれでも、ambiguous な mutating tool call を自動 replay しません。
+- unqualified な aggregate session discovery は、leased host の一部を問い合わせできない場合 fail closed します。
+- sandbox と approval policy は実行 host で常に適用されます。
+
+## Per-session agent からの migration
+
+既存 command は migration 用に一時的に残します。
+
+```sh
+temote-mcp gateway-agent --session-id old-session
+```
+
+この mode は従来の `HOST_TOKEN` と、`session_id` を直接 key にした Durable Object を使います。新規構成では supervisor ごとに1つの `--host-id` agent を使ってください。
+
+host mode は現行 supervisor control protocol を必要とします。この変更では control protocol を更新しているため、host-level gateway agent を起動する前に Temote supervisor を upgrade/restart してください。mixed version は lifecycle safety field を黙って落とさず、明示的に失敗します。
+
+migration 中は legacy session agent と host-level agent を同時に利用できます。unqualified session routing は両方を確認し、collision があれば fail closed します。
+
+## Development
+
+local Worker 開発では `gateway/.dev.vars.example` を `gateway/.dev.vars` にコピーします。`.dev.vars`、Worker secret、Access service-token secret、host bearer token、endpoint environment file は commit しないでください。
+
+routed tool schema と MCP protocol version は Rust 生成の contract snapshot に対して Rust/Node の両テストで照合します。`serverInfo.version` は Temote CLI CalVer ではなく、`GATEWAY_DEPLOYMENT` version-metadata binding が供給する Cloudflare deployment revision です。

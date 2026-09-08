@@ -1,3 +1,6 @@
 # Copy to .dev.vars for local development. Never commit real values.
-HOST_TOKEN=replace-with-random-host-token
+# Host mode: JSON map of stable host IDs to independent high-entropy bearer tokens.
+HOST_TOKENS_JSON={"mac-main":"replace-mac-token","linux-main":"replace-linux-token"}
+# Legacy compatibility only: gateway-agent --session-id.
+HOST_TOKEN=replace-with-random-legacy-host-token
 CLIENT_TOKEN=replace-with-random-local-client-token

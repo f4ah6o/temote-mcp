@@ -7,6 +7,7 @@ export const SUPPORTED_LEGACY_PROTOCOL_VERSIONS = new Set([
 ]);
 
 const SESSION_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}$/;
+const HOST_ID_PATTERN = /^(?=.{1,128}$)(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$/;
 
 const readOnly = {
   readOnlyHint: true,
@@ -33,10 +34,17 @@ const networkMutation = {
   openWorldHint: true,
 };
 
+const hostProperty = {
+  host_id: {
+    type: "string",
+    description: "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+  },
+};
 const sessionProperty = {
+  ...hostProperty,
   session_id: {
     type: "string",
-    description: "Target host session ID. Mac and Windows/WSL2 use different IDs.",
+    description: "Target host-local session ID. The same session ID may exist on multiple hosts.",
   },
 };
 
@@ -143,11 +151,49 @@ function tool(name, title, description, annotations, inputSchema) {
 
 export const PUBLIC_TOOLS = [
   tool(
-    "session_list",
-    "List gateway sessions",
-    "List active Mac, Linux, and Windows/WSL2 sessions registered with the gateway.",
+    "host_list",
+    "List federated Temote hosts",
+    "List currently leased host-level gateway agents with non-secret platform, capability, generation, protocol, and named-root metadata.",
     readOnly,
     schema({}),
+  ),
+  tool(
+    "host_info",
+    "Inspect a federated Temote host",
+    "Show one currently leased host and its non-secret federation metadata.",
+    readOnly,
+    schema(hostProperty, ["host_id"]),
+  ),
+  tool(
+    "session_list",
+    "List gateway sessions",
+    "List sessions with explicit host attribution. Optionally filter by host_id.",
+    readOnly,
+    schema(hostProperty),
+  ),
+  tool(
+    "session_start",
+    "Start a managed session on a federated host",
+    "Start a normal sandboxed session below a named root on the selected host. Remote yolo creation is unavailable.",
+    mutation,
+    schema(
+      { ...hostProperty, path: { type: "string" }, session_id: { type: "string" } },
+      ["host_id", "path"],
+    ),
+  ),
+  tool(
+    "session_stop",
+    "Stop a managed session on a federated host",
+    "Stop a session owned by the selected host's public lifecycle supervisor. Local CLI/yolo sessions cannot be stopped remotely.",
+    mutation,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "session_restart",
+    "Restart a managed session on a federated host",
+    "Restart an active session owned by the selected host's public lifecycle supervisor. Local CLI/yolo sessions cannot be restarted remotely.",
+    mutation,
+    schema(sessionProperty, ["session_id"]),
   ),
   tool(
     "session_info",
@@ -518,6 +564,15 @@ export function validateSessionId(value) {
   return typeof value === "string" && SESSION_ID_PATTERN.test(value);
 }
 
+export function validateHostId(value) {
+  return typeof value === "string" && HOST_ID_PATTERN.test(value);
+}
+
+export function hostIdFromRpc(request) {
+  const value = request?.params?.arguments?.host_id;
+  return validateHostId(value) ? value : null;
+}
+
 export function sessionIdFromRpc(request) {
   const value = request?.params?.arguments?.session_id;
   return validateSessionId(value) ? value : null;
@@ -579,7 +634,7 @@ export function discoverResult(version) {
     supportedVersions: [MODERN_PROTOCOL_VERSION],
     capabilities: { tools: { listChanged: false } },
     instructions:
-      "This is one MCP gateway for multiple endpoint sessions. Use session_list, then pass the selected session_id to every other tool.",
+      "This is one MCP gateway for multiple federated Temote hosts. Use host_list and session_list, then pass host_id with session_id. An unqualified session_id is accepted only when ownership is unambiguous.",
     ttlMs: 0,
     cacheScope: "private",
     _meta: { "io.modelcontextprotocol/serverInfo": serverInfo(version) },
