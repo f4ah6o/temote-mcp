@@ -204,6 +204,11 @@ async function handleToolCall(rpc, env) {
     }
     const hosts = await readOnlineHosts(env);
     if (!hosts.ok) return mcpJson(rpcError(id, -32001, hosts.error));
+    if (hosts.unavailable.length > 0) {
+      return mcpJson(rpcError(id, -32006, "host_discovery_unavailable", {
+        unavailable_hosts: hosts.unavailable,
+      }));
+    }
     return toolTextResponse(rpc, env, hosts.value);
   }
 
@@ -214,6 +219,9 @@ async function handleToolCall(rpc, env) {
     }
     const hosts = await readOnlineHosts(env);
     if (!hosts.ok) return mcpJson(rpcError(id, -32001, hosts.error));
+    if (hosts.unavailable.includes(hostId)) {
+      return mcpJson(rpcError(id, -32006, "host_status_unavailable", { host_id: hostId }));
+    }
     const host = hosts.value.find((candidate) => candidate.host_id === hostId);
     if (!host) return mcpJson(rpcError(id, -32004, "host_offline", { host_id: hostId }));
     return toolTextResponse(rpc, env, host);
@@ -344,13 +352,15 @@ async function readRegistryCollection(env, action, maxEntries) {
 async function readOnlineHosts(env) {
   const hosts = await readRegistryCollection(env, "hosts", MAX_REGISTRY_HOSTS);
   if (!hosts.ok) return hosts;
-  return { ok: true, value: await filterOnlineRegistryHosts(hosts.value, env) };
+  const filtered = await filterOnlineRegistryHosts(hosts.value, env);
+  return { ok: true, value: filtered.online, unavailable: filtered.unavailable };
 }
 
 async function readOnlineLegacySessions(env) {
   const sessions = await readRegistryCollection(env, "list", MAX_REGISTRY_SESSIONS);
   if (!sessions.ok) return sessions;
-  return { ok: true, value: await filterOnlineRegistrySessions(sessions.value, env) };
+  const filtered = await filterOnlineRegistrySessions(sessions.value, env);
+  return { ok: true, value: filtered.online, unavailable: filtered.unavailable };
 }
 
 function parseSessionListPayload(payload, hostId) {
@@ -404,6 +414,9 @@ async function listGatewaySessions(env, hostId) {
   const hosts = await readOnlineHosts(env);
   if (!hosts.ok) return hosts;
   if (hostId) {
+    if (hosts.unavailable.includes(hostId)) {
+      return { ok: false, code: -32006, error: "host_status_unavailable", data: { host_id: hostId } };
+    }
     const host = hosts.value.find((candidate) => candidate.host_id === hostId);
     if (!host) return { ok: false, code: -32004, error: "host_offline", data: { host_id: hostId } };
     const result = await sessionsFromHost(env, host);
@@ -411,8 +424,24 @@ async function listGatewaySessions(env, hostId) {
     return { ok: true, value: result.sessions };
   }
 
+  if (hosts.unavailable.length > 0) {
+    return {
+      ok: false,
+      code: -32006,
+      error: "host session discovery incomplete",
+      data: { unavailable_hosts: hosts.unavailable },
+    };
+  }
   const legacy = await readOnlineLegacySessions(env);
   if (!legacy.ok) return legacy;
+  if (legacy.unavailable.length > 0) {
+    return {
+      ok: false,
+      code: -32006,
+      error: "legacy session discovery incomplete",
+      data: { unavailable_sessions: legacy.unavailable },
+    };
+  }
   const hostResults = await collectHostSessions(env, hosts.value);
   const unavailable = hostResults.filter((result) => !result.ok).map((result) => result.host_id);
   if (unavailable.length > 0) {
@@ -440,6 +469,22 @@ async function resolveUnqualifiedSession(env, sessionId) {
   ]);
   if (!hosts.ok) return hosts;
   if (!legacy.ok) return legacy;
+  if (hosts.unavailable.length > 0) {
+    return {
+      ok: false,
+      code: -32006,
+      error: "session_ownership_unavailable",
+      data: { session_id: sessionId, unavailable_hosts: hosts.unavailable },
+    };
+  }
+  if (legacy.unavailable.includes(sessionId)) {
+    return {
+      ok: false,
+      code: -32006,
+      error: "session_ownership_unavailable",
+      data: { session_id: sessionId, unavailable_legacy_sessions: [sessionId] },
+    };
+  }
 
   const hostResults = await collectHostSessions(env, hosts.value);
   const unavailable = hostResults.filter((result) => !result.ok).map((result) => result.host_id);
@@ -596,7 +641,14 @@ export class GatewaySession {
     this.queue.length = 0;
     this.replaceWaitingPoll("generation_replaced");
     await this.state.storage.put({ generation, host });
-    await this.upsertRegistry(host);
+    const registry = await this.upsertRegistry(host);
+    if (!registry.ok) {
+      await this.clearHost(host, "registry_registration_failed");
+      return jsonResponse({
+        error: registry.error,
+        ...(registry.status ? { gateway_status: registry.status } : {}),
+      }, registry.status ?? 503);
+    }
     return jsonResponse({
       ...route,
       generation,
@@ -616,7 +668,14 @@ export class GatewaySession {
     host.last_seen = now;
     host.expires_at = now + HOST_LEASE_MS;
     await this.state.storage.put("host", host);
-    await this.upsertRegistry(host);
+    const registry = await this.upsertRegistry(host);
+    if (!registry.ok) {
+      await this.clearHost(host, "registry_renewal_failed");
+      return jsonResponse({
+        error: registry.error,
+        ...(registry.status ? { gateway_status: registry.status } : {}),
+      }, registry.status ?? 503);
+    }
 
     const queued = this.takeQueuedRequest(host.generation);
     if (queued) return jsonResponse(queued);
@@ -658,7 +717,14 @@ export class GatewaySession {
     host.last_seen = now;
     host.expires_at = now + HOST_LEASE_MS;
     await this.state.storage.put("host", host);
-    await this.upsertRegistry(host);
+    const registry = await this.upsertRegistry(host);
+    if (!registry.ok) {
+      await this.clearHost(host, "registry_renewal_failed");
+      return jsonResponse({
+        error: registry.error,
+        ...(registry.status ? { gateway_status: registry.status } : {}),
+      }, registry.status ?? 503);
+    }
     return new Response(null, { status: 204 });
   }
 
@@ -783,15 +849,30 @@ export class GatewaySession {
   }
 
   async upsertRegistry(host) {
+    let response;
     try {
-      await registryStub(this.env).fetch("https://registry.internal/upsert", {
+      response = await registryStub(this.env).fetch("https://registry.internal/upsert", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(host),
       });
     } catch (error) {
       console.error("registry upsert failed", error);
+      return { ok: false, status: 503, error: "registry_unavailable" };
     }
+    if (response.ok) return { ok: true };
+
+    const failure = await safeBoundedJson(
+      response,
+      MAX_INTERNAL_ERROR_RESPONSE_BYTES,
+      "registry upsert error",
+    );
+    const error = typeof failure?.error === "string" && /^[a-z0-9_]{1,64}$/.test(failure.error)
+      ? failure.error
+      : "registry_update_failed";
+    const status = response.status >= 400 && response.status <= 599 ? response.status : 503;
+    console.error("registry upsert failed", { status, error });
+    return { ok: false, status, error };
   }
 
   async removeRegistry(host) {
@@ -1035,24 +1116,28 @@ export async function filterOnlineRegistryHosts(
   concurrency = MAX_SESSION_STATUS_CHECK_CONCURRENCY,
 ) {
   const online = [];
+  const unavailable = [];
   const limit = Math.max(1, Math.min(MAX_SESSION_STATUS_CHECK_CONCURRENCY, concurrency));
   for (let offset = 0; offset < hosts.length; offset += limit) {
     const batch = hosts.slice(offset, offset + limit);
     const checked = await Promise.all(batch.map(async (host) => {
       const hostId = host?.host_id;
-      if (!validateHostId(hostId)) return null;
+      if (!validateHostId(hostId)) return { state: "unavailable", id: "invalid_registry_host" };
       try {
         const response = await hostStub(env, hostId).fetch("https://host.internal/status");
-        return response.ok ? host : null;
+        if (response.ok) return { state: "online", value: host };
+        if (response.status === 404) return { state: "offline" };
+        return { state: "unavailable", id: hostId };
       } catch {
-        return null;
+        return { state: "unavailable", id: hostId };
       }
     }));
-    for (const host of checked) {
-      if (host) online.push(host);
+    for (const result of checked) {
+      if (result.state === "online") online.push(result.value);
+      if (result.state === "unavailable") unavailable.push(result.id);
     }
   }
-  return online;
+  return { online, unavailable };
 }
 
 export async function filterOnlineRegistrySessions(
@@ -1061,24 +1146,28 @@ export async function filterOnlineRegistrySessions(
   concurrency = MAX_SESSION_STATUS_CHECK_CONCURRENCY,
 ) {
   const online = [];
+  const unavailable = [];
   const limit = Math.max(1, Math.min(MAX_SESSION_STATUS_CHECK_CONCURRENCY, concurrency));
   for (let offset = 0; offset < sessions.length; offset += limit) {
     const batch = sessions.slice(offset, offset + limit);
     const checked = await Promise.all(batch.map(async (session) => {
       const sessionId = session?.session_id;
-      if (!validateSessionId(sessionId)) return null;
+      if (!validateSessionId(sessionId)) return { state: "unavailable", id: "invalid_registry_session" };
       try {
         const response = await sessionStub(env, sessionId).fetch("https://session.internal/status");
-        return response.ok ? session : null;
+        if (response.ok) return { state: "online", value: session };
+        if (response.status === 404) return { state: "offline" };
+        return { state: "unavailable", id: sessionId };
       } catch {
-        return null;
+        return { state: "unavailable", id: sessionId };
       }
     }));
-    for (const session of checked) {
-      if (session) online.push(session);
+    for (const result of checked) {
+      if (result.state === "online") online.push(result.value);
+      if (result.state === "unavailable") unavailable.push(result.id);
     }
   }
-  return online;
+  return { online, unavailable };
 }
 
 function sessionStub(env, sessionId) {

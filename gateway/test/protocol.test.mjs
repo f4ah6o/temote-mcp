@@ -560,6 +560,96 @@ test("host-level reconnect fences the stale agent generation", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("registry upsert failure makes connect fail closed and leaves no active route", async () => {
+  const storage = new MemoryStorage();
+  const actions = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      actions.push(action);
+      if (action === "upsert") {
+        return new Response(JSON.stringify({ error: "registry_full" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(null, { status: 204 });
+    },
+  };
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry } },
+  );
+
+  const response = await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  }));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "registry_full", gateway_status: 503 });
+  assert.equal(await storage.get("host"), undefined);
+  assert.equal(await storage.get("generation"), 1);
+  assert.deepEqual(actions, ["upsert", "remove"]);
+  assert.equal((await session.fetch(new Request("https://session.internal/status"))).status, 404);
+
+  const dispatch = await session.fetch(post("dispatch", {
+    request: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "session_info", arguments: { session_id: "same" } } },
+  }));
+  assert.equal(dispatch.status, 503);
+  assert.equal((await dispatch.json()).error, "host_offline");
+});
+
+test("registry renewal failure disconnects the generation before it can remain discoverable", async () => {
+  const storage = new MemoryStorage();
+  let upserts = 0;
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      if (action === "upsert") {
+        upserts += 1;
+        if (upserts > 1) {
+          return new Response(JSON.stringify({ error: "registry_full" }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          });
+        }
+      }
+      return new Response(null, { status: 204 });
+    },
+  };
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry } },
+  );
+  const connected = await body(await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  })));
+  assert.equal(connected.generation, 1);
+
+  const renewed = await session.fetch(post("poll", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    generation: 1,
+  }));
+  assert.equal(renewed.status, 503);
+  assert.deepEqual(await renewed.json(), { error: "registry_full", gateway_status: 503 });
+  assert.equal(await storage.get("host"), undefined);
+  assert.equal((await session.fetch(new Request("https://session.internal/status"))).status, 404);
+});
+
 test("host_list returns only hosts with a currently valid Durable Object lease", async () => {
   const now = Date.now();
   const registry = {
@@ -688,6 +778,136 @@ test("same session_id on two hosts is addressable explicitly and ambiguous when 
   );
   assert.equal((await explicit.json()).result.content[0].text, "host:linux-main");
   assert.deepEqual(actualCalls, [["host:linux-main", "session_info"]]);
+});
+
+test("unavailable federated host status fails unqualified ownership while explicit host routing stays isolated", async () => {
+  const now = Date.now();
+  const hosts = [
+    { host_id: "mac-main", generation: 1, expires_at: now + 60_000 },
+    { host_id: "linux-main", generation: 1, expires_at: now + 60_000 },
+  ];
+  const routed = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      return new Response(JSON.stringify(action === "hosts" ? hosts : []), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: async (url, init) => {
+          const path = new URL(url).pathname;
+          if (path === "/status") {
+            if (name === "host:mac-main") throw new Error("transient status failure");
+            return new Response(null, { status: 204 });
+          }
+          const request = JSON.parse(init.body).request;
+          if (request.params.name === "session_list") {
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: { content: [{ type: "text", text: JSON.stringify([{ session_id: "same" }]) }] },
+            }), { headers: { "content-type": "application/json" } });
+          }
+          routed.push([name, request.params.name]);
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { content: [{ type: "text", text: name }] },
+          }), { headers: { "content-type": "application/json" } });
+        },
+      }),
+    },
+  };
+
+  const unresolved = await worker.fetch(legacyToolCallRequest("session_info", { session_id: "same" }), env);
+  const unresolvedPayload = await unresolved.json();
+  assert.equal(unresolvedPayload.error.code, -32006);
+  assert.equal(unresolvedPayload.error.message, "session_ownership_unavailable");
+  assert.deepEqual(unresolvedPayload.error.data.unavailable_hosts, ["mac-main"]);
+  assert.deepEqual(routed, []);
+
+  const incompleteList = await worker.fetch(legacyToolCallRequest("session_list"), env);
+  const incompletePayload = await incompleteList.json();
+  assert.equal(incompletePayload.error.code, -32006);
+  assert.equal(incompletePayload.error.message, "host session discovery incomplete");
+
+  const scopedList = await worker.fetch(legacyToolCallRequest("session_list", { host_id: "linux-main" }), env);
+  const scopedSessions = JSON.parse((await scopedList.json()).result.content[0].text);
+  assert.deepEqual(scopedSessions.map((session) => [session.host_id, session.session_id]), [["linux-main", "same"]]);
+
+  const explicit = await worker.fetch(
+    legacyToolCallRequest("session_info", { host_id: "linux-main", session_id: "same" }),
+    env,
+  );
+  assert.equal((await explicit.json()).result.content[0].text, "host:linux-main");
+  assert.deepEqual(routed, [["host:linux-main", "session_info"]]);
+});
+
+test("unavailable legacy status blocks read and mutating unqualified routing without poisoning explicit host routing", async () => {
+  const now = Date.now();
+  const host = { host_id: "linux-main", generation: 1, expires_at: now + 60_000 };
+  const legacy = { session_id: "same", generation: 1, expires_at: now + 60_000 };
+  const routed = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      const values = action === "hosts" ? [host] : action === "list" ? [legacy] : [];
+      return new Response(JSON.stringify(values), { headers: { "content-type": "application/json" } });
+    },
+  };
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: async (url, init) => {
+          const path = new URL(url).pathname;
+          if (path === "/status") {
+            if (name === "same") throw new Error("legacy status unavailable");
+            return new Response(null, { status: 204 });
+          }
+          const request = JSON.parse(init.body).request;
+          if (request.params.name === "session_list") {
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: { content: [{ type: "text", text: JSON.stringify([{ session_id: "same" }]) }] },
+            }), { headers: { "content-type": "application/json" } });
+          }
+          routed.push([name, request.params.name]);
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { content: [{ type: "text", text: name }] },
+          }), { headers: { "content-type": "application/json" } });
+        },
+      }),
+    },
+  };
+
+  for (const tool of ["session_info", "session_stop"]) {
+    const response = await worker.fetch(legacyToolCallRequest(tool, { session_id: "same" }), env);
+    const payload = await response.json();
+    assert.equal(payload.error.code, -32006, tool);
+    assert.equal(payload.error.message, "session_ownership_unavailable", tool);
+    assert.deepEqual(payload.error.data.unavailable_legacy_sessions, ["same"], tool);
+  }
+  assert.deepEqual(routed, []);
+
+  const explicit = await worker.fetch(
+    legacyToolCallRequest("session_stop", { host_id: "linux-main", session_id: "same" }),
+    env,
+  );
+  assert.equal((await explicit.json()).result.content[0].text, "host:linux-main");
+  assert.deepEqual(routed, [["host:linux-main", "session_stop"]]);
 });
 
 test("tools/call routing reads only params.arguments.session_id", () => {
@@ -1415,10 +1635,13 @@ test("session_list performs bounded final online checks and preserves registry o
   let activeChecks = 0;
   let maxActiveChecks = 0;
   const registryStub = {
-    fetch: async () => new Response(JSON.stringify(sessions), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      return new Response(JSON.stringify(action === "list" ? sessions : []), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
   };
   const sessionNamespace = {
     idFromName: (name) => name,

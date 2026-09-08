@@ -113,6 +113,13 @@ struct HostConnectRequest<'a> {
     named_roots: &'a [String],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostSupervisorMetadata {
+    runtime_version: String,
+    control_protocol: u64,
+    named_roots: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct HostConnectResponse {
     host_id: String,
@@ -155,6 +162,7 @@ struct HostResponseRequest<'a> {
 enum GenerationExit {
     Replaced,
     Disconnected,
+    SupervisorChanged,
 }
 
 pub async fn run_agent(options: AgentOptions) -> Result<()> {
@@ -297,47 +305,43 @@ async fn run_host_agent(
     validate_federated_platform(platform)?;
     let host_id = host_identity::validate(host_id)?;
     let sessions = session_control::SessionBackend::local_control().await?;
-    let initial_status = sessions.status().await?;
-    let named_roots = status_named_roots(&initial_status)?;
-    let runtime_version = initial_status
-        .get("version")
-        .and_then(Value::as_str)
-        .context("local supervisor did not report runtime version")?
-        .to_owned();
-    let control_protocol = initial_status
-        .get("control_protocol")
-        .and_then(Value::as_u64)
-        .context("local supervisor did not report control protocol")?;
-    anyhow::ensure!(
-        control_protocol == session_control::CONTROL_PROTOCOL_VERSION,
-        "local supervisor control protocol changed while starting gateway agent"
-    );
 
     eprintln!(
-        "temote-mcp federated gateway agent\nhost_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}\nnamed_roots: {}",
-        host_id,
-        platform,
-        instance_id,
-        gateway.base_url,
-        if named_roots.is_empty() {
-            "(none)".to_owned()
-        } else {
-            named_roots.join(",")
-        }
+        "temote-mcp federated gateway agent\nhost_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
+        host_id, platform, instance_id, gateway.base_url,
     );
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     loop {
+        let metadata = tokio::select! {
+            result = sessions.status() => result
+                .context("local supervisor is unavailable")
+                .and_then(|status| host_supervisor_metadata(&status)),
+            signal = &mut ctrl_c => {
+                signal.context("failed to receive Ctrl-C")?;
+                eprintln!("Stopping gateway agent for host {host_id}");
+                return Ok(());
+            }
+        };
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!("gateway host metadata refresh failed: {error:#}");
+                if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
         let connected = tokio::select! {
             result = connect_host(
                 gateway,
                 &host_id,
                 instance_id,
                 platform,
-                &runtime_version,
-                control_protocol,
-                &named_roots,
+                &metadata,
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
@@ -357,8 +361,15 @@ async fn run_host_agent(
             }
         };
         eprintln!(
-            "gateway connected: mode=host host_id={} generation={} lease_seconds={}",
-            connection.host_id, connection.generation, connection.lease_seconds
+            "gateway connected: mode=host host_id={} generation={} lease_seconds={} named_roots={}",
+            connection.host_id,
+            connection.generation,
+            connection.lease_seconds,
+            if metadata.named_roots.is_empty() {
+                "(none)".to_owned()
+            } else {
+                metadata.named_roots.join(",")
+            }
         );
 
         let outcome = tokio::select! {
@@ -368,6 +379,7 @@ async fn run_host_agent(
                 &host_id,
                 instance_id,
                 connection.generation,
+                &metadata,
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
@@ -396,6 +408,9 @@ fn log_generation_outcome(outcome: Result<GenerationExit>, generation: u64) {
         }
         Ok(GenerationExit::Disconnected) => {
             eprintln!("gateway disconnected; reconnecting");
+        }
+        Ok(GenerationExit::SupervisorChanged) => {
+            eprintln!("local supervisor metadata changed; reconnecting gateway host generation");
         }
         Err(error) => {
             eprintln!("gateway generation ended: {error:#}");
@@ -453,22 +468,16 @@ async fn connect_host(
     host_id: &str,
     instance_id: &str,
     platform: &str,
-    runtime_version: &str,
-    control_protocol: u64,
-    named_roots: &[String],
+    metadata: &HostSupervisorMetadata,
 ) -> Result<HostConnectResponse> {
     let response = gateway
         .request(Method::POST, "/v1/hosts/connect", Some(host_id))
-        .json(&HostConnectRequest {
+        .json(&host_connect_request(
             host_id,
             instance_id,
             platform,
-            agent_protocol: HOST_AGENT_PROTOCOL_VERSION,
-            runtime_version,
-            control_protocol,
-            capabilities: HOST_CAPABILITIES,
-            named_roots,
-        })
+            metadata,
+        ))
         .send()
         .await
         .context("gateway host connect request failed")?;
@@ -542,16 +551,27 @@ async fn run_host_generation(
     host_id: &str,
     instance_id: &str,
     generation: u64,
+    connected_metadata: &HostSupervisorMetadata,
 ) -> Result<GenerationExit> {
     loop {
-        let status = sessions
-            .status()
-            .await
-            .context("local supervisor is unavailable")?;
-        anyhow::ensure!(
-            status.get("status").and_then(Value::as_str) == Some("active"),
-            "local supervisor is not active"
-        );
+        let status = match sessions.status().await {
+            Ok(status) => status,
+            Err(error) => {
+                disconnect_host(gateway, host_id, instance_id, generation).await;
+                return Err(error).context("local supervisor is unavailable");
+            }
+        };
+        let current_metadata = match host_supervisor_metadata(&status) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                disconnect_host(gateway, host_id, instance_id, generation).await;
+                return Err(error);
+            }
+        };
+        if &current_metadata != connected_metadata {
+            disconnect_host(gateway, host_id, instance_id, generation).await;
+            return Ok(GenerationExit::SupervisorChanged);
+        }
 
         let poll_started = Instant::now();
         let response = gateway
@@ -685,6 +705,49 @@ async fn disconnect_host(
         .await;
     if let Err(error) = result {
         eprintln!("gateway host disconnect failed: {error}");
+    }
+}
+
+fn host_supervisor_metadata(status: &Value) -> Result<HostSupervisorMetadata> {
+    anyhow::ensure!(
+        status.get("status").and_then(Value::as_str) == Some("active"),
+        "local supervisor is not active"
+    );
+    let runtime_version = status
+        .get("version")
+        .and_then(Value::as_str)
+        .context("local supervisor did not report runtime version")?
+        .to_owned();
+    let control_protocol = status
+        .get("control_protocol")
+        .and_then(Value::as_u64)
+        .context("local supervisor did not report control protocol")?;
+    anyhow::ensure!(
+        control_protocol == session_control::CONTROL_PROTOCOL_VERSION,
+        "local supervisor control protocol is incompatible"
+    );
+    Ok(HostSupervisorMetadata {
+        runtime_version,
+        control_protocol,
+        named_roots: status_named_roots(status)?,
+    })
+}
+
+fn host_connect_request<'a>(
+    host_id: &'a str,
+    instance_id: &'a str,
+    platform: &'a str,
+    metadata: &'a HostSupervisorMetadata,
+) -> HostConnectRequest<'a> {
+    HostConnectRequest {
+        host_id,
+        instance_id,
+        platform,
+        agent_protocol: HOST_AGENT_PROTOCOL_VERSION,
+        runtime_version: &metadata.runtime_version,
+        control_protocol: metadata.control_protocol,
+        capabilities: HOST_CAPABILITIES,
+        named_roots: &metadata.named_roots,
     }
 }
 
@@ -981,6 +1044,53 @@ mod tests {
         }
         assert!(validate_federated_platform("windows").is_err());
         assert!(validate_federated_platform("unknown").is_err());
+    }
+
+    #[test]
+    fn refreshed_supervisor_metadata_changes_host_connect_payload_and_rejects_incompatible_protocol()
+     {
+        let before = host_supervisor_metadata(&json!({
+            "status": "active",
+            "version": "2026.9.0",
+            "control_protocol": session_control::CONTROL_PROTOCOL_VERSION,
+            "named_roots": ["src"]
+        }))
+        .unwrap();
+        let after = host_supervisor_metadata(&json!({
+            "status": "active",
+            "version": "2026.9.1",
+            "control_protocol": session_control::CONTROL_PROTOCOL_VERSION,
+            "named_roots": ["src", "work"]
+        }))
+        .unwrap();
+        assert_ne!(before, after);
+
+        let before_payload = serde_json::to_value(host_connect_request(
+            "mac-main",
+            "instance-a",
+            "macos",
+            &before,
+        ))
+        .unwrap();
+        let after_payload = serde_json::to_value(host_connect_request(
+            "mac-main",
+            "instance-a",
+            "macos",
+            &after,
+        ))
+        .unwrap();
+        assert_eq!(before_payload["runtime_version"], "2026.9.0");
+        assert_eq!(before_payload["named_roots"], json!(["src"]));
+        assert_eq!(after_payload["runtime_version"], "2026.9.1");
+        assert_eq!(after_payload["named_roots"], json!(["src", "work"]));
+
+        let incompatible = json!({
+            "status": "active",
+            "version": "2026.10.0",
+            "control_protocol": session_control::CONTROL_PROTOCOL_VERSION + 1,
+            "named_roots": ["src"]
+        });
+        assert!(host_supervisor_metadata(&incompatible).is_err());
     }
 
     #[test]
