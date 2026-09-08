@@ -1523,7 +1523,7 @@ async fn handle_console_attachment(
     let mut reader = BufReader::new(reader);
 
     while let Some(prompt) = receiver.recv().await {
-        let event = json!({
+        let mut event = json!({
             "type": "approval",
             "session_id": prompt.session_id,
             "id": prompt.request.id,
@@ -1531,6 +1531,9 @@ async fn handle_console_attachment(
             "operation": prompt.request.operation,
             "detail": prompt.request.detail,
         });
+        if !prompt.request.metadata.is_empty() {
+            event["metadata"] = serde_json::to_value(&prompt.request.metadata)?;
+        }
         if let Err(error) = writer.write_all(&encode_line(&event)?).await {
             prompt.respond(false);
             return Err(error).context("approval console disconnected while writing prompt");
@@ -2673,6 +2676,7 @@ mod tests {
             operation: "Authorize OAuth client".to_owned(),
             detail: "proxy approval".to_owned(),
             cwd: std::env::current_dir().unwrap(),
+            metadata: std::collections::BTreeMap::new(),
         };
         let supervisor_for_request = Arc::clone(&supervisor);
         let allowed = tokio::spawn(async move {
@@ -2704,6 +2708,7 @@ mod tests {
                     operation: "Authorize OAuth client".to_owned(),
                     detail: "console disconnected".to_owned(),
                     cwd: std::env::current_dir().unwrap(),
+                    metadata: std::collections::BTreeMap::new(),
                 },
             },
             &supervisor,

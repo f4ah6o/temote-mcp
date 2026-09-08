@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -678,19 +678,15 @@ async fn call_tool(
         "read_file" => read_file_tool(&args, &session).await,
         "evidence_read" => evidence_read_tool(&args, &session),
         "codex_status" => {
-            authorize_codex_operation(&session, "codex_status", "model and effort metadata")
-                .await?;
+            let (detail, metadata) = codex_status_approval();
+            authorize_codex_operation(&session, "codex_status", detail, metadata).await?;
             text_result(serde_json::to_string_pretty(
                 &codex_app_server::status(&session).await?,
             )?)
         }
         "codex_task_start" => {
-            authorize_codex_operation(
-                &session,
-                "codex_task_start",
-                "start scoped Codex task; prompt and arguments omitted",
-            )
-            .await?;
+            let (detail, metadata) = codex_task_start_approval(&args);
+            authorize_codex_operation(&session, "codex_task_start", detail, metadata).await?;
             text_result(serde_json::to_string_pretty(
                 &codex_app_server::task_start(&args, &session).await?,
             )?)
@@ -699,12 +695,8 @@ async fn call_tool(
             &codex_app_server::task_get(&args, &session).await?,
         )?),
         "codex_task_control" => {
-            authorize_codex_operation(
-                &session,
-                "codex_task_control",
-                "control scoped Codex task; input and arguments omitted",
-            )
-            .await?;
+            let (detail, metadata) = codex_task_control_approval(&args);
+            authorize_codex_operation(&session, "codex_task_control", detail, metadata).await?;
             text_result(serde_json::to_string_pretty(
                 &codex_app_server::task_control(&args, &session).await?,
             )?)
@@ -1166,15 +1158,111 @@ fn display_path<'a>(path: &'a Path, session_cwd: &Path) -> std::borrow::Cow<'a, 
 async fn authorize_codex_operation(
     session: &config::Session,
     action: &str,
-    summary: &str,
+    detail: String,
+    metadata: BTreeMap<String, String>,
 ) -> Result<()> {
     if session.yolo {
         return Ok(());
     }
-    let approved =
-        approvals::request(&session.id, action, summary.to_owned(), session.cwd.clone()).await?;
+    let approved = approvals::request_with_metadata(
+        &session.id,
+        action,
+        detail,
+        session.cwd.clone(),
+        metadata,
+    )
+    .await?;
     anyhow::ensure!(approved, "user denied Codex operation");
     Ok(())
+}
+
+fn codex_status_approval() -> (String, BTreeMap<String, String>) {
+    (
+        "Codex delegation request\naccess: read-only\nscope: current session\nresult: model and effort compatibility metadata".to_owned(),
+        codex_approval_metadata("codex_status", "status", false, "session_scope"),
+    )
+}
+
+fn codex_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
+    let operation_id = safe_codex_argument(args, "operation_id");
+    let model = safe_codex_argument(args, "model");
+    let effort = safe_codex_argument(args, "effort");
+    let mut metadata =
+        codex_approval_metadata("codex_task_start", "task_start", true, "session_scope");
+    metadata.insert("operation_id".to_owned(), operation_id.clone());
+    metadata.insert("model".to_owned(), model.clone());
+    metadata.insert("effort".to_owned(), effort.clone());
+    metadata.insert("task_input".to_owned(), "omitted".to_owned());
+    (
+        format!(
+            "Codex delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\neffort: {effort}\noperation_id: {operation_id}\ntask input: omitted"
+        ),
+        metadata,
+    )
+}
+
+fn codex_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
+    let task_id = safe_codex_argument(args, "task_id");
+    let operation_id = safe_codex_argument(args, "operation_id");
+    let action = safe_codex_argument(args, "action");
+    let mut metadata = codex_approval_metadata(
+        "codex_task_control",
+        "task_control",
+        true,
+        &format!("task:{task_id}"),
+    );
+    metadata.insert("task_id".to_owned(), task_id.clone());
+    metadata.insert("operation_id".to_owned(), operation_id.clone());
+    metadata.insert("action".to_owned(), action.clone());
+    metadata.insert("control_input".to_owned(), "omitted".to_owned());
+    (
+        format!(
+            "Codex delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
+        ),
+        metadata,
+    )
+}
+
+fn codex_approval_metadata(
+    tool: &str,
+    operation_type: &str,
+    mutation: bool,
+    target: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("provenance".to_owned(), "codex_delegation".to_owned()),
+        ("source".to_owned(), "codex_delegation".to_owned()),
+        ("tool".to_owned(), tool.to_owned()),
+        ("operation_type".to_owned(), operation_type.to_owned()),
+        ("target".to_owned(), target.to_owned()),
+        ("mutation".to_owned(), mutation.to_string()),
+        ("read_only".to_owned(), (!mutation).to_string()),
+        ("scope".to_owned(), "session_cwd".to_owned()),
+    ])
+}
+
+fn safe_codex_argument(args: &Value, key: &str) -> String {
+    let Some(value) = args.get(key).and_then(Value::as_str) else {
+        return "(not provided)".to_owned();
+    };
+    let mut rendered = String::new();
+    for character in value.chars() {
+        let part = if character.is_control() {
+            if character.is_ascii() {
+                format!("\\x{:02x}", character as u32)
+            } else {
+                format!("\\u{{{:x}}}", character as u32)
+            }
+        } else {
+            character.to_string()
+        };
+        if rendered.len().saturating_add(part.len()) > 256 {
+            rendered.push('…');
+            break;
+        }
+        rendered.push_str(&part);
+    }
+    rendered
 }
 
 fn text_result(text: String) -> Result<Value> {
@@ -2402,15 +2490,17 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
         }
         JobPollSnapshot::Running(stored_policy) => {
             let policy = override_policy.unwrap_or(stored_policy);
-            text_result(
+            let response = if policy == OutputPolicy::default() {
+                json!({"status":"running","job_id":job_id})
+            } else {
                 json!({
                     "status":"running",
                     "job_id":job_id,
                     "status_only": policy.status_only,
                     "output_limit_bytes": policy.output_limit_bytes
                 })
-                .to_string(),
-            )
+            };
+            text_result(response.to_string())
         }
         JobPollSnapshot::FinishedWithoutResult => {
             anyhow::bail!("background command task finished without a cached result")
@@ -2732,6 +2822,52 @@ mod tests {
             text: text.into(),
             evidence: None,
         }
+    }
+
+    #[test]
+    fn codex_approval_details_are_actionable_without_task_input() {
+        let task_marker = "prompt-secret-marker";
+        let (start_detail, start_metadata) = codex_task_start_approval(&json!({
+            "operation_id": "0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+            "task": task_marker,
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        }));
+        assert!(start_detail.contains("operation: start task"));
+        assert!(start_detail.contains("model: gpt-5.6-luna"));
+        assert!(start_detail.contains("effort: max"));
+        assert!(start_detail.contains("task input: omitted"));
+        assert!(!start_detail.contains(task_marker));
+        assert_eq!(start_metadata["provenance"], "codex_delegation");
+        assert_eq!(start_metadata["tool"], "codex_task_start");
+        assert_eq!(start_metadata["mutation"], "true");
+        assert_eq!(start_metadata["task_input"], "omitted");
+        assert!(
+            !serde_json::to_string(&start_metadata)
+                .unwrap()
+                .contains(task_marker)
+        );
+
+        let (control_detail, control_metadata) = codex_task_control_approval(&json!({
+            "task_id": "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb",
+            "operation_id": "0199cccc-cccc-7ccc-8ccc-cccccccccccc",
+            "action": "steer",
+            "input": task_marker
+        }));
+        assert!(control_detail.contains("action: steer"));
+        assert!(control_detail.contains("target: task 0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"));
+        assert!(control_detail.contains("control input: omitted"));
+        assert!(!control_detail.contains(task_marker));
+        assert_eq!(control_metadata["operation_type"], "task_control");
+        assert_eq!(
+            control_metadata["task_id"],
+            "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(control_metadata["control_input"], "omitted");
+
+        let (_, status_metadata) = codex_status_approval();
+        assert_eq!(status_metadata["read_only"], "true");
+        assert_eq!(status_metadata["mutation"], "false");
     }
 
     #[test]
@@ -4586,6 +4722,78 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first["content"][0]["text"], "cached-result");
+        remove_job(job_id);
+    }
+
+    #[tokio::test]
+    async fn default_running_job_poll_preserves_legacy_response_shape() {
+        let session_id = format!("test-job-running-default-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: session_id.clone(),
+            cwd: std::env::current_dir().unwrap(),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id,
+                command: "test".to_owned(),
+                handle,
+                completion: Arc::new(Mutex::new(JobCompletion::default())),
+                output_policy: OutputPolicy::default(),
+            },
+        );
+
+        let result = poll_job(&json!({"job_id": job_id.to_string()}), &session)
+            .await
+            .unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            json!({"status":"running","job_id":job_id}).to_string()
+        );
+        remove_job(job_id);
+    }
+
+    #[tokio::test]
+    async fn explicit_running_job_poll_policy_is_opt_in() {
+        let session_id = format!("test-job-running-extended-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: session_id.clone(),
+            cwd: std::env::current_dir().unwrap(),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id,
+                command: "test".to_owned(),
+                handle,
+                completion: Arc::new(Mutex::new(JobCompletion::default())),
+                output_policy: OutputPolicy::default(),
+            },
+        );
+
+        let result = poll_job(
+            &json!({"job_id": job_id.to_string(), "status_only": true}),
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["status_only"], true);
+        assert!(value.get("output_limit_bytes").is_some());
         remove_job(job_id);
     }
 

@@ -341,6 +341,8 @@ pub struct Request {
     pub operation: String,
     pub detail: String,
     pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -466,11 +468,22 @@ pub async fn request(
     detail: String,
     cwd: PathBuf,
 ) -> Result<bool> {
+    request_with_metadata(session_id, operation, detail, cwd, BTreeMap::new()).await
+}
+
+pub async fn request_with_metadata(
+    session_id: &str,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+) -> Result<bool> {
     let request = Request {
         id: Uuid::new_v4(),
         operation: operation.to_owned(),
         detail,
         cwd,
+        metadata,
     };
     let message = encode_session_json_line(&Message::Approval { request })?;
     let path = config::socket_path(session_id)?;
@@ -719,6 +732,7 @@ pub async fn request_supervisor_approval(
         operation: operation.to_owned(),
         detail,
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        metadata: BTreeMap::new(),
     };
     request_approval(sender, "oauth", request).await
 }
@@ -2380,6 +2394,38 @@ mod tests {
     }
 
     #[test]
+    fn approval_metadata_is_optional_for_legacy_wire_requests() {
+        let request = Request {
+            id: Uuid::from_u128(1),
+            operation: "legacy".to_owned(),
+            detail: "safe detail".to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            metadata: BTreeMap::new(),
+        };
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serialized,
+            json!({
+                "id": "00000000-0000-0000-0000-000000000001",
+                "operation": "legacy",
+                "detail": "safe detail",
+                "cwd": "/tmp"
+            })
+        );
+        let decoded: Request = serde_json::from_value(serialized).unwrap();
+        assert!(decoded.metadata.is_empty());
+
+        let request = Request {
+            metadata: BTreeMap::from([("provenance".to_owned(), "codex_delegation".to_owned())]),
+            ..request
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["metadata"]["provenance"],
+            "codex_delegation"
+        );
+    }
+
+    #[test]
     fn oversized_session_result_degrades_to_bounded_error_response() {
         let bytes = encode_session_result(
             Ok(json!({"payload": "x".repeat(MAX_SESSION_MESSAGE_BYTES)})),
@@ -3043,6 +3089,7 @@ esac
                 operation: "disconnect-test".to_owned(),
                 detail: "client closes before allow response".to_owned(),
                 cwd: root.path().to_path_buf(),
+                metadata: BTreeMap::new(),
             },
         };
         let mut approval = UnixStream::connect(&path).await.unwrap();
@@ -3328,6 +3375,7 @@ esac
                             operation: operation.clone(),
                             detail: String::new(),
                             cwd: PathBuf::from("."),
+                            metadata: BTreeMap::new(),
                         },
                         response,
                     };

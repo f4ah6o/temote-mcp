@@ -145,7 +145,7 @@ pub(crate) fn read(
     let desired_end = offset_bytes
         .saturating_add(max_bytes)
         .min(record.content.len());
-    let end = previous_char_boundary(&record.content, desired_end, offset_bytes);
+    let end = next_char_boundary(&record.content, desired_end);
     let content = record.content[offset_bytes..end].to_owned();
     let truncated = end < record.content.len();
     Ok(EvidenceChunk {
@@ -171,9 +171,9 @@ pub(crate) fn remove_session(session_id: &str) {
     }
 }
 
-fn previous_char_boundary(text: &str, mut end: usize, floor: usize) -> usize {
-    while end > floor && !text.is_char_boundary(end) {
-        end -= 1;
+fn next_char_boundary(text: &str, mut end: usize) -> usize {
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
     }
     end
 }
@@ -221,8 +221,9 @@ mod tests {
         assert!(read("other", root.path(), id, 0, 2).is_err());
         assert!(read("owner", other.path(), id, 0, 2).is_err());
         let first = read("owner", root.path(), id, 0, 2).unwrap();
-        assert_eq!(first.content, "a");
-        assert_eq!(first.next_offset_bytes, Some(1));
+        assert_eq!(first.content, "aβ");
+        assert_eq!(first.returned_bytes, 3);
+        assert_eq!(first.next_offset_bytes, Some(3));
         let second = read(
             "owner",
             root.path(),
@@ -231,8 +232,44 @@ mod tests {
             3,
         )
         .unwrap();
-        assert_eq!(second.content, "βc");
+        assert_eq!(second.content, "cde");
         assert!(read("owner", root.path(), id, 2, 2).is_err());
+    }
+
+    #[test]
+    fn tiny_utf8_pages_always_advance_and_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "aé水🦀z";
+        let reference = store("tiny-pages", root.path(), text.to_owned())
+            .unwrap()
+            .unwrap();
+        let id = Uuid::parse_str(&reference.evidence_id).unwrap();
+
+        let mut offset = 0;
+        let mut pages = String::new();
+        while offset < text.len() {
+            let page = read("tiny-pages", root.path(), id, offset, 1).unwrap();
+            assert_eq!(page.offset_bytes, offset);
+            assert!(page.returned_bytes > 0);
+            pages.push_str(&page.content);
+            if page.truncated {
+                let next = page
+                    .next_offset_bytes
+                    .expect("truncated page must return a continuation offset");
+                assert!(next > offset);
+                offset = next;
+            } else {
+                assert_eq!(offset + page.returned_bytes, text.len());
+                assert_eq!(page.next_offset_bytes, None);
+                offset = text.len();
+            }
+        }
+
+        assert_eq!(pages, text);
+        let eof = read("tiny-pages", root.path(), id, offset, 1).unwrap();
+        assert!(eof.content.is_empty());
+        assert!(!eof.truncated);
+        assert_eq!(eof.next_offset_bytes, None);
     }
 
     #[test]

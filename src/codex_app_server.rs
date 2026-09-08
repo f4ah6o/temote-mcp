@@ -119,6 +119,10 @@ impl TaskStatus {
             Self::Unknown => "unknown",
         }
     }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Interrupted | Self::Failed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -183,6 +187,16 @@ struct TaskStore {
     directory: PathBuf,
 }
 
+enum StartAcceptance {
+    Existing(TaskRecord),
+    Accepted(TaskRecord),
+}
+
+enum ControlAcceptance {
+    Replay(Value),
+    Accepted(Box<TaskRecord>),
+}
+
 fn store_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -238,6 +252,7 @@ impl TaskStore {
         Ok(record)
     }
 
+    #[cfg(test)]
     fn save(&self, record: &TaskRecord) -> Result<()> {
         let _guard = store_lock().lock().unwrap();
         self.save_locked(record)
@@ -287,6 +302,100 @@ impl TaskStore {
         record.updated_at = config::unix_time();
         self.save_locked(&record)?;
         Ok(record)
+    }
+
+    fn accept_start(
+        &self,
+        session: &config::Session,
+        record: TaskRecord,
+    ) -> Result<StartAcceptance> {
+        let _guard = store_lock().lock().unwrap();
+        match self.read_record(record.task_id) {
+            Ok(existing) => {
+                ensure_task_owner(&existing, session)?;
+                Ok(StartAcceptance::Existing(existing))
+            }
+            Err(error) if is_not_found(&error) => {
+                self.save_locked(&record)?;
+                Ok(StartAcceptance::Accepted(record))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn accept_control(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        operation_id: Uuid,
+        request_fingerprint: Uuid,
+        action: &str,
+    ) -> Result<ControlAcceptance> {
+        let _guard = store_lock().lock().unwrap();
+        let mut record = self.load_locked(session, task_id)?;
+        if let Some(receipt) = record
+            .operations
+            .iter()
+            .find(|receipt| receipt.operation_id == operation_id)
+        {
+            anyhow::ensure!(
+                receipt.request_fingerprint == request_fingerprint,
+                "OPERATION_CONFLICT: operation_id was already accepted with a different request"
+            );
+            if receipt.phase == OperationPhase::Accepted {
+                let mut outcome = receipt.outcome.clone();
+                outcome.status = TaskStatus::ReconciliationRequired;
+                return Ok(ControlAcceptance::Replay(operation_view(task_id, &outcome)));
+            }
+            return Ok(ControlAcceptance::Replay(operation_view(
+                task_id,
+                &receipt.outcome,
+            )));
+        }
+
+        if action == "resume" {
+            anyhow::ensure!(
+                matches!(
+                    record.status,
+                    TaskStatus::Unknown | TaskStatus::ReconciliationRequired
+                ),
+                "Codex task does not require resume reconciliation"
+            );
+        } else {
+            anyhow::ensure!(
+                matches!(
+                    record.status,
+                    TaskStatus::Running | TaskStatus::WaitingApproval
+                ),
+                "Codex task is not active and cannot be controlled"
+            );
+        }
+        anyhow::ensure!(
+            record.thread_id.is_some(),
+            "Codex task requires reconciliation before control"
+        );
+        if action != "resume" {
+            anyhow::ensure!(
+                record.turn_id.is_some(),
+                "Codex task requires reconciliation before control"
+            );
+        }
+
+        record.revision = record.revision.saturating_add(1);
+        let accepted_outcome = record.outcome();
+        record.operations.push(OperationReceipt {
+            operation_id,
+            request_fingerprint,
+            action: action.to_owned(),
+            phase: OperationPhase::Accepted,
+            outcome: accepted_outcome,
+        });
+        if record.operations.len() > MAX_OPERATION_HISTORY {
+            let excess = record.operations.len() - MAX_OPERATION_HISTORY;
+            record.operations.drain(..excess);
+        }
+        self.save_locked(&record)?;
+        Ok(ControlAcceptance::Accepted(Box::new(record)))
     }
 
     fn read_record(&self, task_id: Uuid) -> Result<TaskRecord> {
@@ -441,6 +550,7 @@ fn is_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(test)]
 fn is_missing_task(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -1090,11 +1200,19 @@ async fn handle_server_request(
             let allowed = if session.yolo {
                 true
             } else {
-                approvals::request(
+                let (detail, metadata) = child_approval(
+                    "command execution",
+                    "commandExecution",
+                    "command_execution",
+                    task_id,
+                    &params,
+                );
+                approvals::request_with_metadata(
                     &session.id,
                     "Codex command approval",
-                    format!("Codex task {task_id} requested command execution"),
+                    detail,
                     session.cwd.clone(),
+                    metadata,
                 )
                 .await
                 .unwrap_or(false)
@@ -1114,11 +1232,14 @@ async fn handle_server_request(
             let allowed = if session.yolo {
                 true
             } else {
-                approvals::request(
+                let (detail, metadata) =
+                    child_approval("file change", "fileChange", "file_change", task_id, &params);
+                approvals::request_with_metadata(
                     &session.id,
                     "Codex file-change approval",
-                    format!("Codex task {task_id} requested file changes"),
+                    detail,
                     session.cwd.clone(),
+                    metadata,
                 )
                 .await
                 .unwrap_or(false)
@@ -1130,6 +1251,130 @@ async fn handle_server_request(
             -32601,
             format!("unsupported Codex app-server request method: {method}"),
         )),
+    }
+}
+
+fn child_approval(
+    operation: &str,
+    method: &str,
+    operation_type: &str,
+    task_id: Uuid,
+    params: &Value,
+) -> (String, BTreeMap<String, String>) {
+    let thread_id = safe_approval_identifier(params, "threadId");
+    let turn_id = safe_approval_identifier(params, "turnId");
+    let item_id = safe_approval_identifier(params, "itemId");
+    let mut metadata = BTreeMap::from([
+        ("provenance".to_owned(), "codex_app_server".to_owned()),
+        ("source".to_owned(), "codex_delegation".to_owned()),
+        ("tool".to_owned(), format!("item/{method}/requestApproval")),
+        ("operation_type".to_owned(), operation_type.to_owned()),
+        ("target".to_owned(), format!("task:{task_id}")),
+        ("task_id".to_owned(), task_id.to_string()),
+        ("mutation".to_owned(), "true".to_owned()),
+        ("read_only".to_owned(), "false".to_owned()),
+        ("scope".to_owned(), "session_cwd".to_owned()),
+        ("thread_id".to_owned(), thread_id.clone()),
+        ("turn_id".to_owned(), turn_id.clone()),
+        ("item_id".to_owned(), item_id.clone()),
+    ]);
+    let specifics = if operation_type == "command_execution" {
+        let summary = command_approval_summary(params);
+        metadata.insert("command".to_owned(), "argument_values_omitted".to_owned());
+        metadata.insert("command_summary".to_owned(), summary.clone());
+        format!("command: {summary}")
+    } else {
+        let count = params
+            .get("changes")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        metadata.insert("change_count".to_owned(), count.to_string());
+        metadata.insert("change_details".to_owned(), "omitted".to_owned());
+        format!("file changes: {count} change(s); paths and patch details omitted")
+    };
+    (
+        format!(
+            "Codex delegated task approval\noperation: {operation}\nmutation: true\ntarget: task {task_id}\nscope: session working directory\nthread_id: {thread_id}\nturn_id: {turn_id}\nitem_id: {item_id}\n{specifics}"
+        ),
+        metadata,
+    )
+}
+
+fn safe_approval_identifier(params: &Value, key: &str) -> String {
+    let Some(value) = params.get(key).and_then(Value::as_str) else {
+        return "(not provided)".to_owned();
+    };
+    let mut rendered = String::new();
+    for character in value.chars() {
+        let part = if character.is_control() {
+            if character.is_ascii() {
+                format!("\\x{:02x}", character as u32)
+            } else {
+                format!("\\u{{{:x}}}", character as u32)
+            }
+        } else {
+            character.to_string()
+        };
+        if rendered.len().saturating_add(part.len()) > MAX_ARGUMENT_BYTES {
+            rendered.push('…');
+            break;
+        }
+        rendered.push_str(&part);
+    }
+    rendered
+}
+
+fn command_approval_summary(params: &Value) -> String {
+    let Some(command) = params.get("command").and_then(Value::as_array) else {
+        return "provided; argument values omitted".to_owned();
+    };
+    let executable = command
+        .first()
+        .and_then(Value::as_str)
+        .map(safe_command_component)
+        .unwrap_or_else(|| "(not provided)".to_owned());
+    let mut options = command
+        .iter()
+        .skip(1)
+        .filter_map(Value::as_str)
+        .filter(|value| value.starts_with('-'))
+        .map(|value| {
+            let name = value
+                .split_once('=')
+                .map_or(value, |(name, _)| name)
+                .to_owned();
+            safe_command_component(&name)
+        })
+        .collect::<Vec<_>>();
+    options.sort();
+    options.dedup();
+    format!(
+        "executable {executable}; {} argument(s); option names: {}",
+        command.len().saturating_sub(1),
+        if options.is_empty() {
+            "(none)".to_owned()
+        } else {
+            options.join(", ")
+        }
+    )
+}
+
+fn safe_command_component(value: &str) -> String {
+    let mut rendered = String::new();
+    for character in value.chars() {
+        if character.is_control() || character.is_whitespace() {
+            break;
+        }
+        if rendered.len() >= MAX_ARGUMENT_BYTES {
+            rendered.push('…');
+            break;
+        }
+        rendered.push(character);
+    }
+    if rendered.is_empty() {
+        "(not provided)".to_owned()
+    } else {
+        rendered
     }
 }
 
@@ -1287,12 +1532,6 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
     }))?;
     let store = TaskStore::default_store()?;
 
-    match store.load(session, task_id) {
-        Ok(existing) => return replay_operation(&existing, operation_id, request_fingerprint),
-        Err(error) if is_missing_task(&error) => {}
-        Err(error) => return Err(error),
-    }
-
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
@@ -1318,7 +1557,12 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
         phase: OperationPhase::Accepted,
         outcome: record.outcome(),
     });
-    store.save(&record)?;
+    let mut record = match store.accept_start(session, record)? {
+        StartAcceptance::Existing(existing) => {
+            return replay_operation(&existing, operation_id, request_fingerprint);
+        }
+        StartAcceptance::Accepted(record) => record,
+    };
 
     let (client, _) = match spawn_initialized_client(session, Some(task_id)).await {
         Ok(client) => client,
@@ -1724,72 +1968,22 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
     }
 
     let store = TaskStore::default_store()?;
-    let mut record = store.load(session, task_id)?;
     let request_fingerprint = fingerprint(&json!({
         "kind": "control",
         "task_id": task_id,
         "action": action,
         "input": input,
     }))?;
-    if let Some(receipt) = record
-        .operations
-        .iter()
-        .find(|receipt| receipt.operation_id == operation_id)
-    {
-        anyhow::ensure!(
-            receipt.request_fingerprint == request_fingerprint,
-            "OPERATION_CONFLICT: operation_id was already accepted with a different request"
-        );
-        if receipt.phase == OperationPhase::Accepted {
-            let mut outcome = receipt.outcome.clone();
-            outcome.status = TaskStatus::ReconciliationRequired;
-            return Ok(operation_view(task_id, &outcome));
-        }
-        return Ok(operation_view(task_id, &receipt.outcome));
-    }
-    if action == "resume" {
-        anyhow::ensure!(
-            matches!(
-                record.status,
-                TaskStatus::Unknown | TaskStatus::ReconciliationRequired
-            ),
-            "Codex task does not require resume reconciliation"
-        );
-    } else {
-        anyhow::ensure!(
-            matches!(
-                record.status,
-                TaskStatus::Running | TaskStatus::WaitingApproval
-            ),
-            "Codex task is not active and cannot be controlled"
-        );
-    }
+    let mut record =
+        match store.accept_control(session, task_id, operation_id, request_fingerprint, action)? {
+            ControlAcceptance::Replay(result) => return Ok(result),
+            ControlAcceptance::Accepted(record) => *record,
+        };
     let thread_id = record
         .thread_id
         .clone()
         .context("Codex task requires reconciliation before control")?;
     let turn_id = record.turn_id.clone();
-    if action != "resume" {
-        anyhow::ensure!(
-            turn_id.is_some(),
-            "Codex task requires reconciliation before control"
-        );
-    }
-
-    record.revision = record.revision.saturating_add(1);
-    let accepted_outcome = record.outcome();
-    record.operations.push(OperationReceipt {
-        operation_id,
-        request_fingerprint,
-        action: action.to_owned(),
-        phase: OperationPhase::Accepted,
-        outcome: accepted_outcome,
-    });
-    if record.operations.len() > MAX_OPERATION_HISTORY {
-        let excess = record.operations.len() - MAX_OPERATION_HISTORY;
-        record.operations.drain(..excess);
-    }
-    store.save(&record)?;
 
     let client = match ensure_runtime(session, &record).await {
         Ok(client) => client,
@@ -1869,7 +2063,7 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
             if resumed.usage.is_some() {
                 record.usage = resumed.usage.clone();
             }
-        } else {
+        } else if !record.status.is_terminal() {
             record.generation = record.generation.saturating_add(1);
             record.status = if action == "interrupt" {
                 TaskStatus::Interrupted
@@ -1917,6 +2111,7 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier, mpsc};
 
     fn session(root: &Path, id: &str, yolo: bool) -> config::Session {
         let cwd = config::canonical_directory(root).unwrap();
@@ -2066,6 +2261,313 @@ for raw in sys.stdin:
         let replay = replay_operation(&record, operation_id, fp).unwrap();
         assert_eq!(replay["status"], "reconciliation_required");
         assert!(replay_operation(&record, operation_id, Uuid::new_v4()).is_err());
+    }
+
+    #[test]
+    fn concurrent_start_acceptance_has_one_durable_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "concurrent-start", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let operation_id = Uuid::new_v4();
+        let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+        let request_fingerprint = fingerprint(&json!({"task":"same"})).unwrap();
+        let now = config::unix_time();
+        let record = TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(&owner),
+            scope_cwd: owner.cwd.clone(),
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "max".to_owned(),
+            status: TaskStatus::Accepted,
+            revision: 1,
+            generation: 0,
+            thread_id: None,
+            turn_id: None,
+            usage: None,
+            created_at: now,
+            updated_at: now,
+            operations: vec![OperationReceipt {
+                operation_id,
+                request_fingerprint,
+                action: "start".to_owned(),
+                phase: OperationPhase::Accepted,
+                outcome: OperationOutcome {
+                    status: TaskStatus::Accepted,
+                    revision: 1,
+                    generation: 0,
+                    thread_id: None,
+                    turn_id: None,
+                },
+            }],
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for candidate in [record.clone(), record] {
+                let store = store.clone();
+                let owner = owner.clone();
+                let barrier = Arc::clone(&barrier);
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let accepted = matches!(
+                        store.accept_start(&owner, candidate).unwrap(),
+                        StartAcceptance::Accepted(_)
+                    );
+                    sender.send(accepted).unwrap();
+                });
+            }
+            barrier.wait();
+        });
+        drop(sender);
+
+        let results: Vec<_> = receiver.iter().collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.iter().filter(|accepted| **accepted).count(), 1);
+        let persisted = store.load(&owner, task_id).unwrap();
+        assert_eq!(persisted.operations.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_control_acceptance_is_idempotent_for_duplicate_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "concurrent-control", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let request_fingerprint = fingerprint(&json!({"action":"interrupt"})).unwrap();
+        let now = config::unix_time();
+        let record = TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(&owner),
+            scope_cwd: owner.cwd.clone(),
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "max".to_owned(),
+            status: TaskStatus::Running,
+            revision: 1,
+            generation: 1,
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+            usage: None,
+            created_at: now,
+            updated_at: now,
+            operations: Vec::new(),
+        };
+        store.save(&record).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let store = store.clone();
+                let owner = owner.clone();
+                let barrier = Arc::clone(&barrier);
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let accepted = matches!(
+                        store
+                            .accept_control(
+                                &owner,
+                                task_id,
+                                operation_id,
+                                request_fingerprint,
+                                "interrupt",
+                            )
+                            .unwrap(),
+                        ControlAcceptance::Accepted(_)
+                    );
+                    sender.send(accepted).unwrap();
+                });
+            }
+            barrier.wait();
+        });
+        drop(sender);
+
+        let results: Vec<_> = receiver.iter().collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.iter().filter(|accepted| **accepted).count(), 1);
+        let persisted = store.load(&owner, task_id).unwrap();
+        assert_eq!(persisted.operations.len(), 1);
+        assert_eq!(persisted.operations[0].operation_id, operation_id);
+    }
+
+    #[test]
+    fn concurrent_completion_and_control_acceptance_never_resurrects_task() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "completion-control", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let request_fingerprint = fingerprint(&json!({"action":"interrupt"})).unwrap();
+        let now = config::unix_time();
+        let record = TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(&owner),
+            scope_cwd: owner.cwd.clone(),
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "max".to_owned(),
+            status: TaskStatus::Running,
+            revision: 1,
+            generation: 1,
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+            usage: None,
+            created_at: now,
+            updated_at: now,
+            operations: Vec::new(),
+        };
+        store.save(&record).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let completion_store = store.clone();
+            let completion_owner = owner.clone();
+            let completion_barrier = Arc::clone(&barrier);
+            let completion_sender = sender.clone();
+            scope.spawn(move || {
+                completion_barrier.wait();
+                let completed = completion_store
+                    .update(&completion_owner, task_id, |record| {
+                        record.status = TaskStatus::Completed;
+                        record.revision = record.revision.saturating_add(1);
+                        Ok(())
+                    })
+                    .is_ok();
+                completion_sender.send(("completion", completed)).unwrap();
+            });
+
+            let control_store = store.clone();
+            let control_owner = owner.clone();
+            let control_barrier = Arc::clone(&barrier);
+            let control_sender = sender.clone();
+            scope.spawn(move || {
+                control_barrier.wait();
+                let accepted = match control_store.accept_control(
+                    &control_owner,
+                    task_id,
+                    operation_id,
+                    request_fingerprint,
+                    "interrupt",
+                ) {
+                    Ok(ControlAcceptance::Accepted(_)) => true,
+                    Ok(ControlAcceptance::Replay(_)) | Err(_) => false,
+                };
+                control_sender.send(("control", accepted)).unwrap();
+            });
+            barrier.wait();
+        });
+        drop(sender);
+
+        let outcomes: Vec<_> = receiver.iter().collect();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .any(|(operation, success)| *operation == "completion" && *success)
+        );
+        let control_accepted = outcomes
+            .iter()
+            .find(|(operation, _)| *operation == "control")
+            .map(|(_, accepted)| *accepted)
+            .unwrap();
+        let persisted = store.load(&owner, task_id).unwrap();
+        assert_eq!(persisted.status, TaskStatus::Completed);
+        assert_eq!(persisted.operations.len(), usize::from(control_accepted));
+    }
+
+    #[test]
+    fn control_acceptance_rejects_terminal_tasks_without_recording_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "terminal-control", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let record = TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(&owner),
+            scope_cwd: owner.cwd.clone(),
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "max".to_owned(),
+            status: TaskStatus::Completed,
+            revision: 3,
+            generation: 1,
+            thread_id: Some("thread-1".to_owned()),
+            turn_id: Some("turn-1".to_owned()),
+            usage: None,
+            created_at: config::unix_time(),
+            updated_at: config::unix_time(),
+            operations: Vec::new(),
+        };
+        store.save(&record).unwrap();
+
+        let error = match store.accept_control(
+            &owner,
+            task_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "interrupt",
+        ) {
+            Ok(_) => panic!("terminal task unexpectedly accepted control"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not active"));
+        assert!(store.load(&owner, task_id).unwrap().operations.is_empty());
+    }
+
+    #[test]
+    fn child_approval_detail_identifies_safe_action_without_raw_arguments() {
+        let task_id = Uuid::from_u128(1);
+        let marker = "secret-command-argument";
+        let (command_detail, command_metadata) = child_approval(
+            "command execution",
+            "commandExecution",
+            "command_execution",
+            task_id,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "command": ["cargo", "test", marker, "--package=private"]
+            }),
+        );
+        assert!(command_detail.contains("operation: command execution"));
+        assert!(command_detail.contains("executable cargo"));
+        assert!(command_detail.contains("option names: --package"));
+        assert!(!command_detail.contains(marker));
+        assert_eq!(command_metadata["provenance"], "codex_app_server");
+        assert_eq!(
+            command_metadata["tool"],
+            "item/commandExecution/requestApproval"
+        );
+        assert_eq!(command_metadata["command"], "argument_values_omitted");
+
+        let (file_detail, file_metadata) = child_approval(
+            "file change",
+            "fileChange",
+            "file_change",
+            task_id,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-2",
+                "changes": [{"path": marker, "diff": "private patch"}]
+            }),
+        );
+        assert!(file_detail.contains("file changes: 1 change(s)"));
+        assert!(file_detail.contains("paths and patch details omitted"));
+        assert!(!file_detail.contains(marker));
+        assert_eq!(file_metadata["change_count"], "1");
+        assert_eq!(file_metadata["change_details"], "omitted");
     }
 
     #[test]
