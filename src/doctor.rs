@@ -151,6 +151,7 @@ pub async fn run(options: Options) -> Result<()> {
     let mut report = Report::new();
     let host_id = host_identity::resolve()?;
     report.add(Check::pass("host identity", format!("host_id={host_id}")));
+    check_federation_readiness(&mut report).await;
     check_platform(&mut report);
     #[cfg(target_os = "macos")]
     report.add(Check::pass("sandbox backend", "native macOS Seatbelt"));
@@ -268,6 +269,89 @@ pub async fn run(options: Options) -> Result<()> {
     }
 
     report.finish()
+}
+
+async fn check_federation_readiness(report: &mut Report) {
+    let Ok(configured_host_id) = std::env::var("TEMOTE_MCP_GATEWAY_HOST_ID") else {
+        return;
+    };
+    let configured_host_id = match host_identity::validate(&configured_host_id) {
+        Ok(value) => value,
+        Err(error) => {
+            report.add(Check::fail(
+                "federation readiness",
+                format!("invalid TEMOTE_MCP_GATEWAY_HOST_ID: {error}"),
+                "Configure a stable diagnostic-safe host ID before starting gateway-agent in host mode.",
+            ));
+            return;
+        }
+    };
+    let gateway_url = std::env::var("TEMOTE_MCP_GATEWAY_URL").unwrap_or_default();
+    let host_token_present =
+        std::env::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").is_ok_and(|value| !value.trim().is_empty());
+    let access_client_id_present = std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID")
+        .is_ok_and(|value| !value.trim().is_empty());
+    let access_client_secret_present = std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET")
+        .is_ok_and(|value| !value.trim().is_empty());
+    if gateway_url.trim().is_empty()
+        || !host_token_present
+        || access_client_id_present != access_client_secret_present
+    {
+        report.add(Check::fail(
+            "federation readiness",
+            format!(
+                "host_id={configured_host_id}, gateway_url={}, host_token={}, access_service_token={}",
+                if gateway_url.trim().is_empty() {
+                    "missing"
+                } else {
+                    "configured"
+                },
+                if host_token_present {
+                    "configured"
+                } else {
+                    "missing"
+                },
+                if access_client_id_present == access_client_secret_present {
+                    if access_client_id_present { "configured" } else { "not configured" }
+                } else {
+                    "incomplete"
+                }
+            ),
+            "Set TEMOTE_MCP_GATEWAY_URL and TEMOTE_MCP_GATEWAY_HOST_TOKEN; provide both Access service-token fields together when Access protects host-agent traffic.",
+        ));
+        return;
+    }
+
+    match crate::session_control::SessionBackend::local_control().await {
+        Ok(sessions) => match sessions.status().await {
+            Ok(status) => {
+                let roots = status
+                    .get("named_roots")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                let protocol = status
+                    .get("control_protocol")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                report.add(Check::pass(
+                    "federation readiness",
+                    format!(
+                        "host_id={configured_host_id}, supervisor=active, control_protocol={protocol}, named_roots={roots}, gateway_url=configured, host_token=configured"
+                    ),
+                ));
+            }
+            Err(error) => report.add(Check::fail(
+                "federation readiness",
+                format!("host_id={configured_host_id}, supervisor status failed: {error}"),
+                "Restart the Temote supervisor with the current binary before starting the host-level gateway agent.",
+            )),
+        },
+        Err(error) => report.add(Check::fail(
+            "federation readiness",
+            format!("host_id={configured_host_id}, supervisor unavailable: {error}"),
+            "Start or upgrade the Temote supervisor before starting the host-level gateway agent.",
+        )),
+    }
 }
 
 fn check_platform(report: &mut Report) {

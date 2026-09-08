@@ -115,6 +115,10 @@ impl SessionSupervisor {
         !self.roots.is_empty()
     }
 
+    pub fn named_root_names(&self) -> Vec<String> {
+        self.roots.names()
+    }
+
     pub fn approval_sender(&self) -> ApprovalSender {
         self.approval_sender.clone()
     }

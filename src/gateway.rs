@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{approvals, config, mcp};
+use crate::{approvals, config, host_identity, mcp, session_control};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GATEWAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -19,6 +19,8 @@ const MAX_GATEWAY_ERROR_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_ERROR_DISPLAY_CHARS: usize = 4096;
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HOST_AGENT_PROTOCOL_VERSION: u64 = 1;
+const HOST_CAPABILITIES: &[&str] = &["session_lifecycle", "session_tools", "named_roots"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -60,7 +62,8 @@ impl Platform {
 
 pub struct AgentOptions {
     pub gateway_url: String,
-    pub session_id: String,
+    pub session_id: Option<String>,
+    pub host_id: Option<String>,
     pub host_token: String,
     pub access_client_id: Option<String>,
     pub access_client_secret: Option<String>,
@@ -78,22 +81,48 @@ struct GatewayClient {
 }
 
 #[derive(Serialize)]
-struct ConnectRequest<'a> {
+struct LegacyConnectRequest<'a> {
     session_id: &'a str,
     instance_id: &'a str,
     platform: &'a str,
 }
 
 #[derive(Deserialize)]
-struct ConnectResponse {
+struct LegacyConnectResponse {
     session_id: String,
     generation: u64,
     lease_seconds: u64,
 }
 
 #[derive(Serialize)]
-struct GenerationRequest<'a> {
+struct LegacyGenerationRequest<'a> {
     session_id: &'a str,
+    instance_id: &'a str,
+    generation: u64,
+}
+
+#[derive(Serialize)]
+struct HostConnectRequest<'a> {
+    host_id: &'a str,
+    instance_id: &'a str,
+    platform: &'a str,
+    agent_protocol: u64,
+    runtime_version: &'a str,
+    control_protocol: u64,
+    capabilities: &'a [&'static str],
+    named_roots: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct HostConnectResponse {
+    host_id: String,
+    generation: u64,
+    lease_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct HostGenerationRequest<'a> {
+    host_id: &'a str,
     instance_id: &'a str,
     generation: u64,
 }
@@ -105,8 +134,17 @@ struct PollEnvelope {
 }
 
 #[derive(Serialize)]
-struct ResponseRequest<'a> {
+struct LegacyResponseRequest<'a> {
     session_id: &'a str,
+    instance_id: &'a str,
+    generation: u64,
+    request_id: &'a str,
+    response: &'a Value,
+}
+
+#[derive(Serialize)]
+struct HostResponseRequest<'a> {
+    host_id: &'a str,
     instance_id: &'a str,
     generation: u64,
     request_id: &'a str,
@@ -120,7 +158,10 @@ enum GenerationExit {
 }
 
 pub async fn run_agent(options: AgentOptions) -> Result<()> {
-    config::validate_session_id(&options.session_id)?;
+    anyhow::ensure!(
+        options.session_id.is_some() ^ options.host_id.is_some(),
+        "gateway agent requires exactly one of session_id or host_id"
+    );
     anyhow::ensure!(
         !options.host_token.trim().is_empty(),
         "gateway host token must not be empty"
@@ -130,19 +171,7 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
         options.access_client_secret.as_deref(),
     )?;
 
-    let session = config::load_session(&options.session_id).await?;
     let base_url = normalize_gateway_url(&options.gateway_url)?;
-    let platform = options.platform.resolve();
-    let instance_id = Uuid::new_v4().to_string();
-    let approved = approvals::request(
-        &session.id,
-        "gateway_connect",
-        format!("gateway={base_url} platform={platform} instance_id={instance_id}"),
-        session.cwd.clone(),
-    )
-    .await?;
-    anyhow::ensure!(approved, "gateway connection was denied at the endpoint");
-
     let gateway = GatewayClient {
         client: Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -158,9 +187,49 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
     } else {
         options.reconnect_delay
     };
+    let platform = options.platform.resolve();
+    let instance_id = Uuid::new_v4().to_string();
+
+    if let Some(host_id) = options.host_id {
+        return run_host_agent(&gateway, &host_id, &instance_id, platform, reconnect_delay).await;
+    }
+
+    run_legacy_agent(
+        &gateway,
+        options
+            .session_id
+            .as_deref()
+            .expect("validated session mode"),
+        &instance_id,
+        platform,
+        reconnect_delay,
+    )
+    .await
+}
+
+async fn run_legacy_agent(
+    gateway: &GatewayClient,
+    session_id: &str,
+    instance_id: &str,
+    platform: &str,
+    reconnect_delay: Duration,
+) -> Result<()> {
+    config::validate_session_id(session_id)?;
+    let session = config::load_session(session_id).await?;
+    let approved = approvals::request(
+        &session.id,
+        "gateway_connect",
+        format!(
+            "gateway={} platform={platform} instance_id={instance_id}",
+            gateway.base_url
+        ),
+        session.cwd.clone(),
+    )
+    .await?;
+    anyhow::ensure!(approved, "gateway connection was denied at the endpoint");
 
     eprintln!(
-        "temote-mcp gateway agent approved\nsession_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
+        "temote-mcp legacy gateway agent approved\nsession_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}",
         session.id, platform, instance_id, gateway.base_url
     );
 
@@ -168,7 +237,7 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
     tokio::pin!(ctrl_c);
     loop {
         let connected = tokio::select! {
-            result = connect(&gateway, &session.id, &instance_id, platform) => result,
+            result = connect_legacy(gateway, &session.id, instance_id, platform) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
                 eprintln!("Stopping gateway agent for session {}", session.id);
@@ -187,23 +256,23 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
             }
         };
         eprintln!(
-            "gateway connected: session_id={} generation={} lease_seconds={}",
+            "gateway connected: mode=legacy-session session_id={} generation={} lease_seconds={}",
             connection.session_id, connection.generation, connection.lease_seconds
         );
 
         let outcome = tokio::select! {
-            result = run_generation(
-                &gateway,
+            result = run_legacy_generation(
+                gateway,
                 &session.id,
-                &instance_id,
+                instance_id,
                 connection.generation,
             ) => result,
             signal = &mut ctrl_c => {
                 signal.context("failed to receive Ctrl-C")?;
-                disconnect(
-                    &gateway,
+                disconnect_legacy(
+                    gateway,
                     &session.id,
-                    &instance_id,
+                    instance_id,
                     connection.generation,
                 ).await;
                 eprintln!("Stopping gateway agent for session {}", session.id);
@@ -211,22 +280,125 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
             }
         };
 
-        match outcome {
-            Ok(GenerationExit::Replaced) => {
-                eprintln!(
-                    "gateway generation {} was replaced; reconnecting",
-                    connection.generation
-                );
-            }
-            Ok(GenerationExit::Disconnected) => {
-                eprintln!("gateway disconnected; reconnecting");
-            }
-            Err(error) => {
-                eprintln!("gateway generation ended: {error:#}");
-            }
-        }
+        log_generation_outcome(outcome, connection.generation);
         if wait_or_stop(reconnect_delay, &mut ctrl_c, &session.id).await? {
             return Ok(());
+        }
+    }
+}
+
+async fn run_host_agent(
+    gateway: &GatewayClient,
+    host_id: &str,
+    instance_id: &str,
+    platform: &str,
+    reconnect_delay: Duration,
+) -> Result<()> {
+    validate_federated_platform(platform)?;
+    let host_id = host_identity::validate(host_id)?;
+    let sessions = session_control::SessionBackend::local_control().await?;
+    let initial_status = sessions.status().await?;
+    let named_roots = status_named_roots(&initial_status)?;
+    let runtime_version = initial_status
+        .get("version")
+        .and_then(Value::as_str)
+        .context("local supervisor did not report runtime version")?
+        .to_owned();
+    let control_protocol = initial_status
+        .get("control_protocol")
+        .and_then(Value::as_u64)
+        .context("local supervisor did not report control protocol")?;
+    anyhow::ensure!(
+        control_protocol == session_control::CONTROL_PROTOCOL_VERSION,
+        "local supervisor control protocol changed while starting gateway agent"
+    );
+
+    eprintln!(
+        "temote-mcp federated gateway agent\nhost_id: {}\nplatform: {}\ninstance_id: {}\ngateway: {}\nnamed_roots: {}",
+        host_id,
+        platform,
+        instance_id,
+        gateway.base_url,
+        if named_roots.is_empty() {
+            "(none)".to_owned()
+        } else {
+            named_roots.join(",")
+        }
+    );
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        let connected = tokio::select! {
+            result = connect_host(
+                gateway,
+                &host_id,
+                instance_id,
+                platform,
+                &runtime_version,
+                control_protocol,
+                &named_roots,
+            ) => result,
+            signal = &mut ctrl_c => {
+                signal.context("failed to receive Ctrl-C")?;
+                eprintln!("Stopping gateway agent for host {host_id}");
+                return Ok(());
+            }
+        };
+
+        let connection = match connected {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("gateway host connect failed: {error:#}");
+                if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        eprintln!(
+            "gateway connected: mode=host host_id={} generation={} lease_seconds={}",
+            connection.host_id, connection.generation, connection.lease_seconds
+        );
+
+        let outcome = tokio::select! {
+            result = run_host_generation(
+                gateway,
+                &sessions,
+                &host_id,
+                instance_id,
+                connection.generation,
+            ) => result,
+            signal = &mut ctrl_c => {
+                signal.context("failed to receive Ctrl-C")?;
+                disconnect_host(
+                    gateway,
+                    &host_id,
+                    instance_id,
+                    connection.generation,
+                ).await;
+                eprintln!("Stopping gateway agent for host {host_id}");
+                return Ok(());
+            }
+        };
+
+        log_generation_outcome(outcome, connection.generation);
+        if wait_or_stop(reconnect_delay, &mut ctrl_c, &host_id).await? {
+            return Ok(());
+        }
+    }
+}
+
+fn log_generation_outcome(outcome: Result<GenerationExit>, generation: u64) {
+    match outcome {
+        Ok(GenerationExit::Replaced) => {
+            eprintln!("gateway generation {generation} was replaced; reconnecting");
+        }
+        Ok(GenerationExit::Disconnected) => {
+            eprintln!("gateway disconnected; reconnecting");
+        }
+        Err(error) => {
+            eprintln!("gateway generation ended: {error:#}");
         }
     }
 }
@@ -234,7 +406,7 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
 async fn wait_or_stop<F>(
     delay: Duration,
     ctrl_c: &mut std::pin::Pin<&mut F>,
-    session_id: &str,
+    route_label: &str,
 ) -> Result<bool>
 where
     F: std::future::Future<Output = std::io::Result<()>>,
@@ -243,21 +415,21 @@ where
         _ = tokio::time::sleep(delay) => Ok(false),
         signal = ctrl_c => {
             signal.context("failed to receive Ctrl-C")?;
-            eprintln!("Stopping gateway agent for session {session_id}");
+            eprintln!("Stopping gateway agent for {route_label}");
             Ok(true)
         }
     }
 }
 
-async fn connect(
+async fn connect_legacy(
     gateway: &GatewayClient,
     session_id: &str,
     instance_id: &str,
     platform: &str,
-) -> Result<ConnectResponse> {
+) -> Result<LegacyConnectResponse> {
     let response = gateway
-        .request(Method::POST, "/v1/hosts/connect")
-        .json(&ConnectRequest {
+        .request(Method::POST, "/v1/hosts/connect", None)
+        .json(&LegacyConnectRequest {
             session_id,
             instance_id,
             platform,
@@ -267,7 +439,7 @@ async fn connect(
         .context("gateway connect request failed")?;
     let response = require_success(response, "gateway connect").await?;
     let bytes = read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway connect").await?;
-    let body: ConnectResponse =
+    let body: LegacyConnectResponse =
         serde_json::from_slice(&bytes).context("gateway connect returned invalid JSON")?;
     anyhow::ensure!(
         body.session_id == session_id,
@@ -276,7 +448,43 @@ async fn connect(
     Ok(body)
 }
 
-async fn run_generation(
+async fn connect_host(
+    gateway: &GatewayClient,
+    host_id: &str,
+    instance_id: &str,
+    platform: &str,
+    runtime_version: &str,
+    control_protocol: u64,
+    named_roots: &[String],
+) -> Result<HostConnectResponse> {
+    let response = gateway
+        .request(Method::POST, "/v1/hosts/connect", Some(host_id))
+        .json(&HostConnectRequest {
+            host_id,
+            instance_id,
+            platform,
+            agent_protocol: HOST_AGENT_PROTOCOL_VERSION,
+            runtime_version,
+            control_protocol,
+            capabilities: HOST_CAPABILITIES,
+            named_roots,
+        })
+        .send()
+        .await
+        .context("gateway host connect request failed")?;
+    let response = require_success(response, "gateway host connect").await?;
+    let bytes =
+        read_bounded_body(response, MAX_GATEWAY_RESPONSE_BYTES, "gateway host connect").await?;
+    let body: HostConnectResponse =
+        serde_json::from_slice(&bytes).context("gateway host connect returned invalid JSON")?;
+    anyhow::ensure!(
+        body.host_id == host_id,
+        "gateway returned a different host_id"
+    );
+    Ok(body)
+}
+
+async fn run_legacy_generation(
     gateway: &GatewayClient,
     session_id: &str,
     instance_id: &str,
@@ -284,14 +492,14 @@ async fn run_generation(
 ) -> Result<GenerationExit> {
     loop {
         if !config::session_is_active(session_id).await? {
-            disconnect(gateway, session_id, instance_id, generation).await;
+            disconnect_legacy(gateway, session_id, instance_id, generation).await;
             return Ok(GenerationExit::Disconnected);
         }
 
         let poll_started = Instant::now();
         let response = gateway
-            .request(Method::POST, "/v1/hosts/poll")
-            .json(&GenerationRequest {
+            .request(Method::POST, "/v1/hosts/poll", None)
+            .json(&LegacyGenerationRequest {
                 session_id,
                 instance_id,
                 generation,
@@ -300,26 +508,18 @@ async fn run_generation(
             .await
             .context("gateway poll request failed")?;
 
-        if response.status() == StatusCode::NO_CONTENT {
-            let delay = empty_poll_delay(poll_started.elapsed());
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
+        let Some(envelope) = poll_envelope(response, poll_started).await? else {
             continue;
-        }
-        if response.status() == StatusCode::CONFLICT {
+        };
+        if envelope.1 {
             return Ok(GenerationExit::Replaced);
         }
-        let response = require_success(response, "gateway poll").await?;
-        let bytes =
-            read_bounded_body(response, MAX_GATEWAY_POLL_RESPONSE_BYTES, "gateway poll").await?;
-        let envelope: PollEnvelope =
-            serde_json::from_slice(&bytes).context("gateway poll returned invalid JSON")?;
+        let envelope = envelope.0.context("gateway poll returned no envelope")?;
         let rpc_response = dispatch_response(&envelope.request).await;
 
         let response = gateway
-            .request(Method::POST, "/v1/hosts/respond")
-            .json(&ResponseRequest {
+            .request(Method::POST, "/v1/hosts/respond", None)
+            .json(&LegacyResponseRequest {
                 session_id,
                 instance_id,
                 generation,
@@ -334,6 +534,87 @@ async fn run_generation(
         }
         require_success(response, "gateway response upload").await?;
     }
+}
+
+async fn run_host_generation(
+    gateway: &GatewayClient,
+    sessions: &session_control::SessionBackend,
+    host_id: &str,
+    instance_id: &str,
+    generation: u64,
+) -> Result<GenerationExit> {
+    loop {
+        let status = sessions
+            .status()
+            .await
+            .context("local supervisor is unavailable")?;
+        anyhow::ensure!(
+            status.get("status").and_then(Value::as_str) == Some("active"),
+            "local supervisor is not active"
+        );
+
+        let poll_started = Instant::now();
+        let response = gateway
+            .request(Method::POST, "/v1/hosts/poll", Some(host_id))
+            .json(&HostGenerationRequest {
+                host_id,
+                instance_id,
+                generation,
+            })
+            .send()
+            .await
+            .context("gateway host poll request failed")?;
+
+        let Some(envelope) = poll_envelope(response, poll_started).await? else {
+            continue;
+        };
+        if envelope.1 {
+            return Ok(GenerationExit::Replaced);
+        }
+        let envelope = envelope
+            .0
+            .context("gateway host poll returned no envelope")?;
+        let rpc_response = dispatch_host_response(&envelope.request, sessions).await;
+
+        let response = gateway
+            .request(Method::POST, "/v1/hosts/respond", Some(host_id))
+            .json(&HostResponseRequest {
+                host_id,
+                instance_id,
+                generation,
+                request_id: &envelope.request_id,
+                response: &rpc_response,
+            })
+            .send()
+            .await
+            .context("gateway host response upload failed")?;
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(GenerationExit::Replaced);
+        }
+        require_success(response, "gateway host response upload").await?;
+    }
+}
+
+async fn poll_envelope(
+    response: Response,
+    poll_started: Instant,
+) -> Result<Option<(Option<PollEnvelope>, bool)>> {
+    if response.status() == StatusCode::NO_CONTENT {
+        let delay = empty_poll_delay(poll_started.elapsed());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        return Ok(None);
+    }
+    if response.status() == StatusCode::CONFLICT {
+        return Ok(Some((None, true)));
+    }
+    let response = require_success(response, "gateway poll").await?;
+    let bytes =
+        read_bounded_body(response, MAX_GATEWAY_POLL_RESPONSE_BYTES, "gateway poll").await?;
+    let envelope: PollEnvelope =
+        serde_json::from_slice(&bytes).context("gateway poll returned invalid JSON")?;
+    Ok(Some((Some(envelope), false)))
 }
 
 fn empty_poll_delay(elapsed: Duration) -> Duration {
@@ -352,10 +633,30 @@ async fn dispatch_response(request: &Value) -> Value {
     }
 }
 
-async fn disconnect(gateway: &GatewayClient, session_id: &str, instance_id: &str, generation: u64) {
+async fn dispatch_host_response(
+    request: &Value,
+    sessions: &session_control::SessionBackend,
+) -> Value {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    match mcp::dispatch_public(request, Some(sessions)).await {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(error) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32000, "message": format!("{error:#}")}
+        }),
+    }
+}
+
+async fn disconnect_legacy(
+    gateway: &GatewayClient,
+    session_id: &str,
+    instance_id: &str,
+    generation: u64,
+) {
     let result = gateway
-        .request(Method::POST, "/v1/hosts/disconnect")
-        .json(&GenerationRequest {
+        .request(Method::POST, "/v1/hosts/disconnect", None)
+        .json(&LegacyGenerationRequest {
             session_id,
             instance_id,
             generation,
@@ -367,12 +668,51 @@ async fn disconnect(gateway: &GatewayClient, session_id: &str, instance_id: &str
     }
 }
 
+async fn disconnect_host(
+    gateway: &GatewayClient,
+    host_id: &str,
+    instance_id: &str,
+    generation: u64,
+) {
+    let result = gateway
+        .request(Method::POST, "/v1/hosts/disconnect", Some(host_id))
+        .json(&HostGenerationRequest {
+            host_id,
+            instance_id,
+            generation,
+        })
+        .send()
+        .await;
+    if let Err(error) = result {
+        eprintln!("gateway host disconnect failed: {error}");
+    }
+}
+
+fn status_named_roots(status: &Value) -> Result<Vec<String>> {
+    let values = status
+        .get("named_roots")
+        .and_then(Value::as_array)
+        .context("local supervisor did not report named roots")?;
+    let mut roots = Vec::with_capacity(values.len());
+    for value in values {
+        let root = value
+            .as_str()
+            .context("local supervisor returned an invalid named root")?;
+        crate::named_roots::validate_root_name(root)?;
+        roots.push(root.to_owned());
+    }
+    Ok(roots)
+}
+
 impl GatewayClient {
-    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+    fn request(&self, method: Method, path: &str, host_id: Option<&str>) -> RequestBuilder {
         let mut request = self
             .client
             .request(method, format!("{}{}", self.base_url, path))
             .bearer_auth(&self.host_token);
+        if let Some(host_id) = host_id {
+            request = request.header("X-Temote-Host-Id", host_id);
+        }
         if let (Some(client_id), Some(client_secret)) = (
             self.access_client_id.as_deref(),
             self.access_client_secret.as_deref(),
@@ -476,6 +816,14 @@ fn validate_access_service_token(
         }
         _ => anyhow::bail!("Cloudflare Access client ID and secret must be provided together"),
     }
+}
+
+fn validate_federated_platform(platform: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(platform, "macos" | "linux" | "wsl2"),
+        "native Windows federation is not supported yet; run Temote inside WSL2"
+    );
+    Ok(())
 }
 
 fn detected_platform() -> &'static str {
@@ -624,6 +972,25 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn federated_platforms_are_limited_to_current_support_boundary() {
+        for platform in ["macos", "linux", "wsl2"] {
+            assert!(validate_federated_platform(platform).is_ok(), "{platform}");
+        }
+        assert!(validate_federated_platform("windows").is_err());
+        assert!(validate_federated_platform("unknown").is_err());
+    }
+
+    #[test]
+    fn status_root_names_reject_paths_and_accept_names() {
+        assert_eq!(
+            status_named_roots(&json!({"named_roots": ["src", "work-tree"]})).unwrap(),
+            ["src", "work-tree"]
+        );
+        assert!(status_named_roots(&json!({"named_roots": ["/tmp"]})).is_err());
+        assert!(status_named_roots(&json!({})).is_err());
     }
 
     #[tokio::test]
