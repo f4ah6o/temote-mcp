@@ -554,23 +554,17 @@ async fn run_host_generation(
     connected_metadata: &HostSupervisorMetadata,
 ) -> Result<GenerationExit> {
     loop {
-        let status = match sessions.status().await {
-            Ok(status) => status,
-            Err(error) => {
-                disconnect_host(gateway, host_id, instance_id, generation).await;
-                return Err(error).context("local supervisor is unavailable");
-            }
-        };
-        let current_metadata = match host_supervisor_metadata(&status) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                disconnect_host(gateway, host_id, instance_id, generation).await;
-                return Err(error);
-            }
-        };
-        if &current_metadata != connected_metadata {
-            disconnect_host(gateway, host_id, instance_id, generation).await;
-            return Ok(GenerationExit::SupervisorChanged);
+        if let Some(exit) = verify_host_generation_metadata(
+            gateway,
+            sessions,
+            host_id,
+            instance_id,
+            generation,
+            connected_metadata,
+        )
+        .await?
+        {
+            return Ok(exit);
         }
 
         let poll_started = Instant::now();
@@ -594,6 +588,22 @@ async fn run_host_generation(
         let envelope = envelope
             .0
             .context("gateway host poll returned no envelope")?;
+
+        // The supervisor can stop or change while the long poll is waiting. Revalidate
+        // before dispatch so a dequeued request is never executed by a stale host generation.
+        if let Some(exit) = verify_host_generation_metadata(
+            gateway,
+            sessions,
+            host_id,
+            instance_id,
+            generation,
+            connected_metadata,
+        )
+        .await?
+        {
+            return Ok(exit);
+        }
+
         let rpc_response = dispatch_host_response(&envelope.request, sessions).await;
 
         let response = gateway
@@ -613,6 +623,42 @@ async fn run_host_generation(
         }
         require_success(response, "gateway host response upload").await?;
     }
+}
+
+async fn verify_host_generation_metadata(
+    gateway: &GatewayClient,
+    sessions: &session_control::SessionBackend,
+    host_id: &str,
+    instance_id: &str,
+    generation: u64,
+    connected_metadata: &HostSupervisorMetadata,
+) -> Result<Option<GenerationExit>> {
+    let status = match sessions.status().await {
+        Ok(status) => status,
+        Err(error) => {
+            disconnect_host(gateway, host_id, instance_id, generation).await;
+            return Err(error).context("local supervisor is unavailable");
+        }
+    };
+    let changed = match supervisor_metadata_changed(&status, connected_metadata) {
+        Ok(changed) => changed,
+        Err(error) => {
+            disconnect_host(gateway, host_id, instance_id, generation).await;
+            return Err(error);
+        }
+    };
+    if changed {
+        disconnect_host(gateway, host_id, instance_id, generation).await;
+        return Ok(Some(GenerationExit::SupervisorChanged));
+    }
+    Ok(None)
+}
+
+fn supervisor_metadata_changed(
+    status: &Value,
+    connected_metadata: &HostSupervisorMetadata,
+) -> Result<bool> {
+    Ok(host_supervisor_metadata(status)? != *connected_metadata)
 }
 
 async fn poll_envelope(
@@ -1049,21 +1095,23 @@ mod tests {
     #[test]
     fn refreshed_supervisor_metadata_changes_host_connect_payload_and_rejects_incompatible_protocol()
      {
-        let before = host_supervisor_metadata(&json!({
+        let before_status = json!({
             "status": "active",
             "version": "2026.9.0",
             "control_protocol": session_control::CONTROL_PROTOCOL_VERSION,
             "named_roots": ["src"]
-        }))
-        .unwrap();
-        let after = host_supervisor_metadata(&json!({
+        });
+        let after_status = json!({
             "status": "active",
             "version": "2026.9.1",
             "control_protocol": session_control::CONTROL_PROTOCOL_VERSION,
             "named_roots": ["src", "work"]
-        }))
-        .unwrap();
+        });
+        let before = host_supervisor_metadata(&before_status).unwrap();
+        let after = host_supervisor_metadata(&after_status).unwrap();
         assert_ne!(before, after);
+        assert!(!supervisor_metadata_changed(&before_status, &before).unwrap());
+        assert!(supervisor_metadata_changed(&after_status, &before).unwrap());
 
         let before_payload = serde_json::to_value(host_connect_request(
             "mac-main",
@@ -1091,6 +1139,7 @@ mod tests {
             "named_roots": ["src"]
         });
         assert!(host_supervisor_metadata(&incompatible).is_err());
+        assert!(supervisor_metadata_changed(&incompatible, &before).is_err());
     }
 
     #[test]
