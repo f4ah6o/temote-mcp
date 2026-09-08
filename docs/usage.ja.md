@@ -82,6 +82,14 @@ migration は legacy state file を安全に検証し、signal 前に live PID �
 
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 
+### Experimental Codex task
+
+opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_control` は、local `codex app-server --stdio` に接続し、名前付きの status/task 操作だけを扱います。app-server の handshake は `0.153.4` として検証します。task は完全な session instance と canonical working directory に所有されるため、別 session、別 process generation、別 scope から resume できません。
+
+`codex_task_start` と `codex_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。Temote は child turn の start/control より先に accepted receipt を永続化します。crash で副作用の成否が不明な場合は盲目的に replay せず `reconciliation_required` を返します。通常 session では local approval が必要です。prompt、control input、transcript、command output は task metadata や approval/activity summary に保存しません。`codex_task_get` の詳細 thread data は、opaque な `evidence_id` で取得する bounded・期限付き・session/scope限定の evidence だけです。
+
+生成される turn には Codex の `workspaceWrite`、session の canonical directory を writable root、network disabled を指定します。これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な app-server adapter です。app-server process 自体は inference service と直接通信するため、Codex build と sandbox behavior を検証できない場合はこの surface を無効または opt-in のままにしてください。generic JSON-RPC、remote shell、automatic approval は公開しません。
+
 ## work checkpoint / handoff
 
 `checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。すべてのsaveで opaque UUID `operation_id` が必須です。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。同じlogical mutationを同一`operation_id`かつ同一canonical requestで再送すると、checkpoint/revisionを増やさず以前のcommit結果を返します。同じoperation IDを異なるrequestで再利用すると `OPERATION_CONFLICT`、通常のstale revisionは `CHECKPOINT_CONFLICT` になります。operation receiptはcheckpointと同じatomic write境界で永続化し、bounded historyとして保持します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。

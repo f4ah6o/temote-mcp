@@ -13,6 +13,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+#[path = "codex_delegation.rs"]
+mod delegation;
+
 const PLUGIN_NAME: &str = "temote-mcp";
 const MARKETPLACE: &str = "debug";
 const BINARY_HINT: &str = ".temote-mcp-bin";
@@ -31,6 +34,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         [status, flag] if status == "status" && flag == "--json" => status_current(true),
         [diagnose] if diagnose == "diagnose" => diagnose_current(false),
         [diagnose, flag] if diagnose == "diagnose" && flag == "--json" => diagnose_current(true),
+        [delegate, rest @ ..] if delegate == "delegate" => delegation::run_cli(rest),
         _ => Err(format!(
             "unsupported Codex command: {}\n\n{}",
             args.join(" "),
@@ -46,6 +50,7 @@ Usage:\n\
   temote-mcp codex plugin uninstall\n\
   temote-mcp codex status [--json]\n\
   temote-mcp codex diagnose [--json]\n\n\
+  temote-mcp codex delegate --model <MODEL> --reasoning-effort <EFFORT> --prompt <PROMPT>\n\n\
 The installed plugin is a thin local router. It pins the exact temote-mcp binary\n\
 that performed the install and does not own session lifecycle, sandbox, approval,\n\
 OAuth, or ingress policy.\n"

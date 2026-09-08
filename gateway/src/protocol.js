@@ -27,6 +27,8 @@ const idempotentMutation = {
   idempotentHint: true,
   openWorldHint: false,
 };
+const networkReadOnly = { ...readOnly, openWorldHint: true };
+const idempotentNetworkMutation = { ...idempotentMutation, openWorldHint: true };
 const networkMutation = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -205,9 +207,87 @@ export const PUBLIC_TOOLS = [
   tool(
     "read_file",
     "Read a local file",
-    "Read a UTF-8 file from the selected host session.",
+    "Read a UTF-8 file from the selected host session, optionally as a bounded line/byte range.",
     readOnly,
-    schema({ ...sessionProperty, path: { type: "string" } }, ["session_id", "path"]),
+    schema(
+      {
+        ...sessionProperty,
+        path: { type: "string" },
+        start_line: { type: "integer", minimum: 1 },
+        end_line: { type: "integer", minimum: 1 },
+        offset_bytes: { type: "integer", minimum: 0 },
+        max_bytes: { type: "integer", minimum: 4, maximum: 8388608 },
+      },
+      ["session_id", "path"],
+    ),
+  ),
+  tool(
+    "evidence_read",
+    "Read scoped Temote evidence",
+    "Read a bounded chunk from an opaque expiring evidence record owned by the selected session and scope.",
+    readOnly,
+    schema(
+      {
+        ...sessionProperty,
+        evidence_id: { type: "string", format: "uuid" },
+        offset_bytes: { type: "integer", minimum: 0, default: 0 },
+        max_bytes: { type: "integer", minimum: 1, maximum: 65536, default: 16384 },
+      },
+      ["session_id", "evidence_id"],
+    ),
+  ),
+  tool(
+    "codex_status",
+    "Check Codex app-server compatibility",
+    "Check the locally installed Codex app-server and return bounded compatibility metadata.",
+    networkReadOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "codex_task_start",
+    "Start a scoped Codex task",
+    "Start an idempotent scoped Codex app-server task with durable pre-side-effect acceptance.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        operation_id: { type: "string", format: "uuid" },
+        task: { type: "string", minLength: 1, maxLength: 1048576 },
+        model: { type: "string", minLength: 1, maxLength: 256 },
+        effort: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      ["session_id", "operation_id", "task", "model", "effort"],
+    ),
+  ),
+  tool(
+    "codex_task_get",
+    "Read a scoped Codex task",
+    "Read and reconcile a retained Codex task owned by the selected full session instance and scope.",
+    networkReadOnly,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", format: "uuid" },
+        after_revision: { type: "integer", minimum: 0 },
+      },
+      ["session_id", "task_id"],
+    ),
+  ),
+  tool(
+    "codex_task_control",
+    "Control a scoped Codex task",
+    "Idempotently steer or interrupt the retained active turn of a scoped Codex task.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", format: "uuid" },
+        operation_id: { type: "string", format: "uuid" },
+        action: { type: "string", enum: ["steer", "resume", "interrupt"] },
+        input: { type: "string", minLength: 1, maxLength: 1048576 },
+      },
+      ["session_id", "task_id", "operation_id", "action"],
+    ),
   ),
   tool(
     "get_image",
@@ -309,6 +389,8 @@ export const PUBLIC_TOOLS = [
         ...sessionProperty,
         command: { type: "array", items: { type: "string" }, minItems: 1 },
         cwd: { type: "string" },
+        output_limit_bytes: { type: "integer", minimum: 256, maximum: 1048576 },
+        status_only: { type: "boolean", default: false },
       },
       ["session_id", "command"],
     ),
@@ -323,6 +405,8 @@ export const PUBLIC_TOOLS = [
         ...sessionProperty,
         command: { type: "array", items: { type: "string" }, minItems: 1 },
         cwd: { type: "string" },
+        output_limit_bytes: { type: "integer", minimum: 256, maximum: 1048576 },
+        status_only: { type: "boolean", default: false },
       },
       ["session_id", "command"],
     ),
@@ -332,7 +416,15 @@ export const PUBLIC_TOOLS = [
     "Poll a sandbox job",
     "Poll a background command on the selected host.",
     { ...readOnly, idempotentHint: false },
-    schema({ ...sessionProperty, job_id: { type: "string" } }, ["session_id", "job_id"]),
+    schema(
+      {
+        ...sessionProperty,
+        job_id: { type: "string" },
+        output_limit_bytes: { type: "integer", minimum: 256, maximum: 1048576 },
+        status_only: { type: "boolean" },
+      },
+      ["session_id", "job_id"],
+    ),
   ),
   tool(
     "job_list",

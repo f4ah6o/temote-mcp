@@ -82,6 +82,14 @@ Use `start_command` when work should be backgrounded immediately, then `poll_job
 
 The combined stdout/stderr retained for a command is capped at 1 MiB and reports when output was truncated.
 
+### Experimental Codex tasks
+
+The opt-in `codex_status`, `codex_task_start`, `codex_task_get`, and `codex_task_control` tools connect to a local `codex app-server --stdio` and accept only the named status/task operations. The app-server handshake is version-checked (`0.153.4`). A task is owned by the complete session instance and its canonical working directory, so it cannot be resumed from another session, process generation, or scope.
+
+`codex_task_start` and `codex_task_control` require an opaque `operation_id`; control actions are typed `steer`, `resume`, and `interrupt`. Temote persists an accepted receipt before starting or controlling the child turn; an uncertain crash returns `reconciliation_required` instead of replaying a side effect. Normal sessions require local approval. Prompts, control input, transcripts, and command output are not placed in task metadata or approval/activity summaries. `codex_task_get` exposes only bounded, expiring, session-and-scope-bound evidence through an opaque `evidence_id`.
+
+Generated turns are requested with Codex `workspaceWrite`, the session's canonical directory as the writable root, and network access disabled. This is an experimental app-server adapter, not the same OS-level boundary as Temote's direct `execute` sandbox: the app-server process itself communicates with the inference service outside that direct command sandbox. It exposes no generic JSON-RPC, remote shell, or automatic approval path. If the installed Codex build or its sandbox behavior cannot be validated, keep these surfaces disabled/opt-in.
+
 ## Work checkpoints and handoff
 
 `checkpoint_save` stores a bounded client-reported checkpoint in Temote's private state, scoped to the session's current canonical working directory. Every save requires an opaque UUID `operation_id`. New checkpoints omit `checkpoint_id` and use `expected_revision=0`; updates supply the existing UUID and current revision. Retrying the same logical mutation with the same `operation_id` and identical canonical request returns the previously committed result without creating another checkpoint or revision. Reusing an operation ID with a different request fails with `OPERATION_CONFLICT`; an ordinary stale revision still fails with `CHECKPOINT_CONFLICT`. Operation receipts are persisted atomically with the checkpoint and retained in a bounded history. Normal sessions require local approval; yolo keeps the existing auto-approval semantics. `checkpoint_load` can read the record only from the same canonical working-directory scope, including from another session for that same worktree.

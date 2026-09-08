@@ -170,14 +170,31 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "end_line": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "host_id": {
             "type": "string"
+          },
+          "max_bytes": {
+            "maximum": 8388608,
+            "minimum": 4,
+            "type": "integer"
+          },
+          "offset_bytes": {
+            "minimum": 0,
+            "type": "integer"
           },
           "path": {
             "type": "string"
           },
           "session_id": {
             "type": "string"
+          },
+          "start_line": {
+            "minimum": 1,
+            "type": "integer"
           }
         },
         "required": [
@@ -187,6 +204,198 @@
         "type": "object"
       },
       "name": "read_file"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 16384,
+            "maximum": 65536,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset_bytes": {
+            "default": 0,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "evidence_id"
+        ],
+        "type": "object"
+      },
+      "name": "evidence_read"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "codex_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "effort": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "task",
+          "model",
+          "effort"
+        ],
+        "type": "object"
+      },
+      "name": "codex_task_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "codex_task_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "steer",
+              "resume",
+              "interrupt"
+            ],
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id",
+          "operation_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "codex_task_control"
     },
     {
       "annotations": {
@@ -490,8 +699,17 @@
           "host_id": {
             "type": "string"
           },
+          "output_limit_bytes": {
+            "maximum": 1048576,
+            "minimum": 256,
+            "type": "integer"
+          },
           "session_id": {
             "type": "string"
+          },
+          "status_only": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [
@@ -525,8 +743,17 @@
           "host_id": {
             "type": "string"
           },
+          "output_limit_bytes": {
+            "maximum": 1048576,
+            "minimum": 256,
+            "type": "integer"
+          },
           "session_id": {
             "type": "string"
+          },
+          "status_only": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [
@@ -553,8 +780,16 @@
           "job_id": {
             "type": "string"
           },
+          "output_limit_bytes": {
+            "maximum": 1048576,
+            "minimum": 256,
+            "type": "integer"
+          },
           "session_id": {
             "type": "string"
+          },
+          "status_only": {
+            "type": "boolean"
           }
         },
         "required": [

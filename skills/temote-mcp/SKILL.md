@@ -56,6 +56,10 @@ If `execute` returns a `job_id`, the work is still running. Poll it with `poll_j
 
 Do not tell the user that work is complete while a required job is still running. Do not ask the user to wait instead of polling a job that can be completed in the current turn.
 
+### Experimental Codex tasks
+
+When the experimental `codex_status`, `codex_task_start`, `codex_task_get`, or `codex_task_control` tools are available, call `codex_status` first and treat its version/model/effort result as compatibility metadata, not as proof that a task will succeed. Start and control require a fresh UUID `operation_id`; preserve it for an exact retry and never retry an uncertain side effect with a new ID. Use `codex_task_get` to reconcile `reconciliation_required`, `unknown`, approval waits, and process restarts before deciding whether to control a task. Control is limited to typed `steer`, `resume`, and `interrupt` actions. These tools expose named operations only—do not attempt to tunnel arbitrary app-server JSON-RPC or a remote shell. Prompts, transcripts, and raw child output are not a substitute for the bounded evidence reference returned by the task API. The app-server adapter is experimental and its generated-turn sandbox is not equivalent to Temote's direct command sandbox; do not claim normal `execute` guarantees for it without host-specific validation.
+
 ## Git
 
 Use ordinary `execute` for read-only Git inspection. Use Temote MCP's dedicated tools for Git metadata writes and remote synchronization:
