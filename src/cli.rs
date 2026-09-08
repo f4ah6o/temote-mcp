@@ -62,7 +62,8 @@ pub enum Command {
     #[cfg(feature = "network")]
     GatewayAgent {
         gateway_url: String,
-        session_id: String,
+        session_id: Option<String>,
+        host_id: Option<String>,
         host_token: String,
         access_client_id: Option<String>,
         access_client_secret: Option<String>,
@@ -675,18 +676,29 @@ fn parse_gateway_agent(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         "Cloudflare Worker origin, without a path",
         "https://gateway.example.com",
     )?;
-    let session_id = required_string_opt(
+    let session_id = string_opt_env(
         args,
         "session-id",
         None,
-        "Active temote-mcp session to publish through the gateway",
-        "my-session",
+        "Legacy mode: active temote-mcp session to publish through the gateway",
     )?;
+    let host_id = string_opt_env(
+        args,
+        "host-id",
+        Some("TEMOTE_MCP_GATEWAY_HOST_ID"),
+        "Federation mode: stable non-secret host ID representing the local supervisor",
+    )?;
+    if session_id.is_some() == host_id.is_some() {
+        return Err(noargs::Error::other(
+            args,
+            "gateway-agent requires exactly one of --host-id or --session-id",
+        ));
+    }
     let host_token = required_string_opt(
         args,
         "host-token",
         Some("TEMOTE_MCP_GATEWAY_HOST_TOKEN"),
-        "Shared host credential stored as the Worker's HOST_TOKEN secret",
+        "Host credential; host mode binds it through HOST_TOKENS_JSON, legacy session mode uses HOST_TOKEN",
         "<secret>",
     )?;
     let access_client_id = string_opt_env(
@@ -716,6 +728,7 @@ fn parse_gateway_agent(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
     Ok(Command::GatewayAgent {
         gateway_url,
         session_id,
+        host_id,
         host_token,
         access_client_id,
         access_client_secret,
@@ -1051,8 +1064,8 @@ mod tests {
             "gateway-agent",
             "--gateway-url",
             "https://example.test",
-            "--session-id",
-            "s",
+            "--host-id",
+            "linux-main",
             "--host-token",
             "secret",
             "--platform",
@@ -1061,14 +1074,53 @@ mod tests {
             "7",
         ]) {
             Command::GatewayAgent {
+                host_id,
+                session_id,
                 platform,
                 reconnect_delay_seconds,
                 ..
             } => {
+                assert_eq!(host_id.as_deref(), Some("linux-main"));
+                assert_eq!(session_id, None);
                 assert_eq!(platform, gateway::Platform::Linux);
                 assert_eq!(reconnect_delay_seconds, 7);
             }
             _ => panic!("expected gateway-agent"),
         }
+        match command(&[
+            "temote-mcp",
+            "gateway-agent",
+            "--gateway-url",
+            "https://example.test",
+            "--session-id",
+            "legacy-session",
+            "--host-token",
+            "secret",
+        ]) {
+            Command::GatewayAgent {
+                host_id,
+                session_id,
+                ..
+            } => {
+                assert_eq!(host_id, None);
+                assert_eq!(session_id.as_deref(), Some("legacy-session"));
+            }
+            _ => panic!("expected legacy gateway-agent"),
+        }
+        assert!(
+            parse(argv(&[
+                "temote-mcp",
+                "gateway-agent",
+                "--gateway-url",
+                "https://example.test",
+                "--host-id",
+                "linux-main",
+                "--session-id",
+                "legacy-session",
+                "--host-token",
+                "secret",
+            ]))
+            .is_err()
+        );
     }
 }

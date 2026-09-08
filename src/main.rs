@@ -212,6 +212,7 @@ async fn main() -> Result<()> {
         cli::Command::GatewayAgent {
             gateway_url,
             session_id,
+            host_id,
             host_token,
             access_client_id,
             access_client_secret,
@@ -221,6 +222,7 @@ async fn main() -> Result<()> {
             gateway::run_agent(gateway::AgentOptions {
                 gateway_url,
                 session_id,
+                host_id,
                 host_token,
                 access_client_id,
                 access_client_secret,

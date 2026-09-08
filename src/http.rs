@@ -1186,6 +1186,19 @@ mod tests {
                 .to_string_lossy()
         );
 
+        let restarted =
+            call_public_tool(&runtime, "session_restart", json!({"session_id": first_id})).await;
+        let restarted: Value = serde_json::from_str(tool_text(&restarted)).unwrap();
+        assert_eq!(restarted["status"], "active");
+        assert_eq!(restarted["yolo"], false);
+        let reread = call_public_tool(
+            &runtime,
+            "read_file",
+            json!({"session_id": first_id, "path": "note.txt"}),
+        )
+        .await;
+        assert_eq!(tool_text(&reread), "hello managed session\n");
+
         let root_id = format!("http-root-{}", uuid::Uuid::new_v4());
         let root_session = call_public_tool(
             &runtime,
@@ -1292,6 +1305,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_session_tools_cannot_operate_local_yolo_runtime() {
+        let runtime = runtime();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("note.txt"), "local only\n").unwrap();
+        let id = format!("yolo-local-{}", uuid::Uuid::new_v4());
+        let (sender, _approvals) = crate::approvals::approval_channel();
+        let handle = crate::approvals::spawn_runtime(cwd.path(), Some(&id), true, sender)
+            .await
+            .unwrap();
+
+        let response = call_public_tool(
+            &runtime,
+            "read_file",
+            json!({"session_id": id, "path": "note.txt"}),
+        )
+        .await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("yolo sessions are unavailable on the public MCP endpoint")
+        );
+        assert!(crate::config::session_is_active(&id).await.unwrap());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn public_session_stop_cannot_stop_unmanaged_cli_runtime() {
         let runtime = runtime();
         let cwd = tempfile::tempdir().unwrap();
@@ -1323,6 +1363,15 @@ mod tests {
         let response = call_public_tool(&runtime, "session_stop", json!({"session_id": id})).await;
         assert!(
             response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not created through the public HTTP supervisor")
+        );
+        assert!(crate::config::session_is_active(&id).await.unwrap());
+        let restart =
+            call_public_tool(&runtime, "session_restart", json!({"session_id": id})).await;
+        assert!(
+            restart["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("not created through the public HTTP supervisor")

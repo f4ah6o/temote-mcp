@@ -19,7 +19,11 @@ Temote MCP is a Rust MCP server for operating local machines through explicit se
 
 Do not weaken these without an explicit issue describing the security model change:
 
-- `session_list` is the only public tool that does not require `session_id`.
+- Session-bound execution, filesystem, Git, job, checkpoint, handoff, and work-state tools require `session_id`. Federated discovery/lifecycle tools are documented exceptions: `host_list`, `host_info`, host-aware `session_list`, and `session_start` may be sessionless only for host discovery or lifecycle scope.
+- Remote `session_start` is host-scoped and limited to named-root-relative normal sandbox sessions; it must not create `--yolo` sessions.
+- Unqualified session routing must fail closed whenever ownership is ambiguous or cannot be determined because any relevant leased host/session status is unavailable. Explicit `host_id` routing must remain isolated from unrelated host discovery failures.
+- `host_id` is a non-secret routing identity, not a credential; authenticated host identity must stay bound to configured credentials and generation state.
+- Public tools must not inherit unrestricted local `--yolo` semantics merely because a local host/session uses yolo mode.
 - Normal-session filesystem access must remain inside permitted roots, including symlink resolution and command `cwd`.
 - Normal `execute` / `start_command` run in the sandbox with network disabled.
 - Ordinary sandboxed commands must not gain write access to Git metadata. Use the dedicated Git tools for index/commit/remote operations.

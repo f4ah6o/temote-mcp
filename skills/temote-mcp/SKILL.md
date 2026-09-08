@@ -11,16 +11,18 @@ metadata:
 
 Temote MCP exposes a user's local machine through explicit sessions. Treat the selected session as the source of truth for its working directory, permission mode, filesystem roots, and host process state.
 
-## Select or create the session first
+## Select the host and session first
 
-1. If the user explicitly names a session ID, use that exact ID.
-2. Otherwise call `session_list` first.
-3. Match the target project to an existing session `cwd`. If one clearly matches, use it.
-4. If no session matches and `session_start` is available, start one with the host's logical named-root path such as `src/project`. Do not invent an absolute host path, do not pass a yolo option, and do not retry an unknown root by weakening path constraints.
-5. Call `session_info` after selecting or creating the session, before ordinary tools.
-6. Do not silently switch to a different session midway through a task.
+1. If `host_list` is available, treat the connection as a federated gateway. If the user explicitly names a host, use that exact `host_id`; otherwise call `host_list` before choosing among multiple machines.
+2. If the user explicitly names a session ID, preserve that exact ID. Use `session_list(host_id=...)` when a host is selected.
+3. Match the target project to an existing session `cwd`. If one clearly matches on the selected host, use it. The same `session_id` may exist on different hosts.
+4. If no session matches and `session_start` is available, start one with explicit `host_id` when supported and a logical named-root path such as `src/project`. Do not invent an absolute host path, do not pass a yolo option, and do not retry an unknown root by weakening path constraints.
+5. Call `session_info` with explicit `host_id` when supported after selecting or creating the session, before ordinary tools. Continue passing that `host_id` with session-scoped calls.
+6. Do not silently switch to a different host or session midway through a task.
 
-The normal remote workflow is `session_list` → `session_start` when needed → `session_info` → ordinary tools. `session_stop` may stop only sessions owned by the current `serve` supervisor; never use it to try to terminate a separately started CLI session.
+On a federated gateway, prefer `host_list` → `session_list(host_id=...)` → `session_start(host_id=...)` when needed → `session_info(host_id=..., session_id=...)` → ordinary tools. An unqualified `session_id` is a compatibility path only; if ownership is ambiguous, do not guess. `session_stop` and `session_restart` may act only on sessions owned by the selected host's public supervisor; never use them to try to control a separately started CLI/yolo session.
+
+On a direct single-host Temote endpoint without `host_list`, keep using the existing session-only workflow.
 
 Do not ask the user to repeat a session ID or logical path that Temote MCP can discover or that the current task already supplies.
 

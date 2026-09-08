@@ -2,15 +2,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, federatedHostToken, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
 import {
   LEGACY_PROTOCOL_VERSION,
   MODERN_PROTOCOL_VERSION,
   PUBLIC_TOOLS,
   SUPPORTED_LEGACY_PROTOCOL_VERSIONS,
   gatewayVersion,
+  hostIdFromRpc,
   negotiateProtocolVersion,
   sessionIdFromRpc,
+  validateHostId,
   validateSessionId,
 } from "../src/protocol.js";
 
@@ -112,10 +114,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 36);
-  for (const forbidden of ["without_sandbox", "session_start", "session_stop"]) {
-    assert.equal(names.includes(forbidden), false, forbidden);
+  assert.equal(names.length, 41);
+  for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
+    assert.equal(names.includes(required), true, required);
   }
+  assert.equal(names.includes("without_sandbox"), false);
 });
 
 test("gateway contract parity detects schema, forbidden-tool, and protocol drift", () => {
@@ -444,6 +447,467 @@ test("session IDs are safe Durable Object routing keys", () => {
   for (const value of ["", ".", "..", "../escape", "contains spaces", "x".repeat(65)]) {
     assert.equal(validateSessionId(value), false, value);
   }
+});
+
+
+test("host IDs are bounded non-secret routing identities", () => {
+  for (const value of ["mac-main", "linux_1.example", "x".repeat(128)]) {
+    assert.equal(validateHostId(value), true, value.slice(0, 16));
+  }
+  for (const value of ["", "---", "host name", "host/main", "x".repeat(129)]) {
+    assert.equal(validateHostId(value), false, value.slice(0, 16));
+  }
+  assert.equal(hostIdFromRpc({ params: { arguments: { host_id: "linux-main" } } }), "linux-main");
+  assert.equal(hostIdFromRpc({ host_id: "wrong-place" }), null);
+});
+
+test("federated host credentials are bound to host_id instead of trusting the routing name", () => {
+  const env = { HOST_TOKENS_JSON: JSON.stringify({ "mac-main": "mac-secret", "linux-main": "linux-secret" }) };
+  assert.equal(federatedHostToken(env, "mac-main"), "mac-secret");
+  assert.equal(federatedHostToken(env, "linux-main"), "linux-secret");
+  assert.equal(federatedHostToken(env, "missing"), null);
+  assert.equal(federatedHostToken({ HOST_TOKENS_JSON: "not-json" }, "mac-main"), null);
+});
+
+test("federated host API rejects token impersonation and host-id/body mismatch", async () => {
+  const selected = [];
+  const namespace = {
+    idFromName: (name) => {
+      selected.push(name);
+      return name;
+    },
+    get: () => ({ fetch: async () => new Response(null, { status: 204 }) }),
+  };
+  const connectBody = (host_id) => ({
+    host_id,
+    instance_id: "instance-a",
+    platform: "linux",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle"],
+    named_roots: ["src"],
+  });
+  const request = (headerHost, bearer, bodyHost) => new Request("https://gateway.example.test/v1/hosts/connect", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      "x-temote-host-id": headerHost,
+    },
+    body: JSON.stringify(connectBody(bodyHost)),
+  });
+  const env = {
+    HOST_TOKENS_JSON: JSON.stringify({ "mac-main": "mac-secret", "linux-main": "linux-secret" }),
+    GATEWAY_SESSIONS: namespace,
+  };
+
+  assert.equal((await worker.fetch(request("mac-main", "linux-secret", "mac-main"), env)).status, 401);
+  assert.equal((await worker.fetch(request("mac-main", "mac-secret", "linux-main"), env)).status, 403);
+  assert.equal((await worker.fetch(request("mac-main", "mac-secret", "mac-main"), env)).status, 204);
+  assert.deepEqual(selected, ["host:mac-main"]);
+});
+
+
+test("host-level registration fails clearly on incompatible supervisor control protocol", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const response = await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-old",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.8.0",
+    control_protocol: 1,
+    capabilities: ["session_lifecycle"],
+    named_roots: ["src"],
+  }));
+  assert.equal(response.status, 409);
+  assert.deepEqual(await response.json(), {
+    error: "protocol_incompatible",
+    supported_control_protocol: 2,
+  });
+});
+
+test("host-level reconnect fences the stale agent generation", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const connect = (instance_id) => session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id,
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src", "work"],
+  }));
+  const first = await body(await connect("instance-a"));
+  const second = await body(await connect("instance-b"));
+  assert.equal(first.host_id, "mac-main");
+  assert.equal(first.generation, 1);
+  assert.equal(second.generation, 2);
+  const stale = await session.fetch(post("poll", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    generation: 1,
+  }));
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).error, "stale_generation");
+});
+
+test("registry upsert failure makes connect fail closed and leaves no active route", async () => {
+  const storage = new MemoryStorage();
+  const actions = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      actions.push(action);
+      if (action === "upsert") {
+        return new Response(JSON.stringify({ error: "registry_full" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(null, { status: 204 });
+    },
+  };
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry } },
+  );
+
+  const response = await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  }));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "registry_full", gateway_status: 503 });
+  assert.equal(await storage.get("host"), undefined);
+  assert.equal(await storage.get("generation"), 1);
+  assert.deepEqual(actions, ["upsert", "remove"]);
+  assert.equal((await session.fetch(new Request("https://session.internal/status"))).status, 404);
+
+  const dispatch = await session.fetch(post("dispatch", {
+    request: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "session_info", arguments: { session_id: "same" } } },
+  }));
+  assert.equal(dispatch.status, 503);
+  assert.equal((await dispatch.json()).error, "host_offline");
+});
+
+test("registry renewal failure disconnects the generation before it can remain discoverable", async () => {
+  const storage = new MemoryStorage();
+  let upserts = 0;
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      if (action === "upsert") {
+        upserts += 1;
+        if (upserts > 1) {
+          return new Response(JSON.stringify({ error: "registry_full" }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          });
+        }
+      }
+      return new Response(null, { status: 204 });
+    },
+  };
+  const session = new GatewaySession(
+    { storage },
+    { GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry } },
+  );
+  const connected = await body(await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  })));
+  assert.equal(connected.generation, 1);
+
+  const renewed = await session.fetch(post("poll", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    generation: 1,
+  }));
+  assert.equal(renewed.status, 503);
+  assert.deepEqual(await renewed.json(), { error: "registry_full", gateway_status: 503 });
+  assert.equal(await storage.get("host"), undefined);
+  assert.equal((await session.fetch(new Request("https://session.internal/status"))).status, 404);
+});
+
+test("host_list returns only hosts with a currently valid Durable Object lease", async () => {
+  const now = Date.now();
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      const value = action === "hosts" ? [
+        { host_id: "mac-main", generation: 2, expires_at: now + 60_000 },
+        { host_id: "linux-main", generation: 4, expires_at: now + 60_000 },
+      ] : [];
+      return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+    },
+  };
+  const response = await worker.fetch(legacyToolCallRequest("host_list"), {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: async () => new Response(null, { status: name === "host:mac-main" ? 204 : 404 }),
+      }),
+    },
+  });
+  const payload = await response.json();
+  const hosts = JSON.parse(payload.result.content[0].text);
+  assert.deepEqual(hosts.map((host) => host.host_id), ["mac-main"]);
+});
+
+test("remote session_start is host-selected, strips routing metadata, and cannot request yolo", async () => {
+  const selected = [];
+  let routed;
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => {
+        selected.push(name);
+        return name;
+      },
+      get: () => ({
+        fetch: async (_url, init) => {
+          routed = JSON.parse(init.body).request;
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: routed.id,
+            result: { content: [{ type: "text", text: "started" }] },
+          }), { headers: { "content-type": "application/json" } });
+        },
+      }),
+    },
+  };
+  const started = await worker.fetch(legacyToolCallRequest("session_start", {
+    host_id: "linux-main",
+    path: "src/project-a",
+    session_id: "project-a",
+  }), env);
+  assert.equal((await started.json()).result.content[0].text, "started");
+  assert.deepEqual(selected, ["host:linux-main"]);
+  assert.deepEqual(routed.params.arguments, { path: "src/project-a", session_id: "project-a" });
+
+  const rejected = await worker.fetch(legacyToolCallRequest("session_start", {
+    host_id: "linux-main",
+    path: "src/project-a",
+    session_id: "project-a",
+    yolo: true,
+  }), env);
+  assert.equal((await rejected.json()).error.code, -32602);
+  assert.deepEqual(selected, ["host:linux-main"]);
+});
+
+test("same session_id on two hosts is addressable explicitly and ambiguous when unqualified", async () => {
+  const now = Date.now();
+  const hosts = ["mac-main", "linux-main"].map((host_id) => ({
+    host_id,
+    generation: 1,
+    expires_at: now + 60_000,
+  }));
+  const actualCalls = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      return new Response(JSON.stringify(action === "hosts" ? hosts : []), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  const hostStub = (routeName) => ({
+    fetch: async (url, init) => {
+      if (new URL(url).pathname === "/status") return new Response(null, { status: 204 });
+      const request = JSON.parse(init.body).request;
+      if (request.params.name === "session_list") {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: { content: [{ type: "text", text: JSON.stringify([{ session_id: "same" }]) }] },
+        }), { headers: { "content-type": "application/json" } });
+      }
+      actualCalls.push([routeName, request.params.name]);
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: { content: [{ type: "text", text: routeName }] },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: (name) => hostStub(name),
+    },
+  };
+
+  const ambiguous = await worker.fetch(
+    legacyToolCallRequest("session_info", { session_id: "same" }),
+    env,
+  );
+  const ambiguousPayload = await ambiguous.json();
+  assert.equal(ambiguousPayload.error.code, -32005);
+  assert.equal(ambiguousPayload.error.message, "ambiguous_session_identity");
+  assert.deepEqual(ambiguousPayload.error.data.hosts, ["mac-main", "linux-main"]);
+  assert.deepEqual(actualCalls, []);
+
+  const explicit = await worker.fetch(
+    legacyToolCallRequest("session_info", { host_id: "linux-main", session_id: "same" }),
+    env,
+  );
+  assert.equal((await explicit.json()).result.content[0].text, "host:linux-main");
+  assert.deepEqual(actualCalls, [["host:linux-main", "session_info"]]);
+});
+
+test("unavailable federated host status fails unqualified ownership while explicit host routing stays isolated", async () => {
+  const now = Date.now();
+  const hosts = [
+    { host_id: "mac-main", generation: 1, expires_at: now + 60_000 },
+    { host_id: "linux-main", generation: 1, expires_at: now + 60_000 },
+  ];
+  const routed = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      return new Response(JSON.stringify(action === "hosts" ? hosts : []), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: async (url, init) => {
+          const path = new URL(url).pathname;
+          if (path === "/status") {
+            if (name === "host:mac-main") throw new Error("transient status failure");
+            return new Response(null, { status: 204 });
+          }
+          const request = JSON.parse(init.body).request;
+          if (request.params.name === "session_list") {
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: { content: [{ type: "text", text: JSON.stringify([{ session_id: "same" }]) }] },
+            }), { headers: { "content-type": "application/json" } });
+          }
+          routed.push([name, request.params.name]);
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { content: [{ type: "text", text: name }] },
+          }), { headers: { "content-type": "application/json" } });
+        },
+      }),
+    },
+  };
+
+  const unresolved = await worker.fetch(legacyToolCallRequest("session_info", { session_id: "same" }), env);
+  const unresolvedPayload = await unresolved.json();
+  assert.equal(unresolvedPayload.error.code, -32006);
+  assert.equal(unresolvedPayload.error.message, "session_ownership_unavailable");
+  assert.deepEqual(unresolvedPayload.error.data.unavailable_hosts, ["mac-main"]);
+  assert.deepEqual(routed, []);
+
+  const incompleteList = await worker.fetch(legacyToolCallRequest("session_list"), env);
+  const incompletePayload = await incompleteList.json();
+  assert.equal(incompletePayload.error.code, -32006);
+  assert.equal(incompletePayload.error.message, "host session discovery incomplete");
+
+  const scopedList = await worker.fetch(legacyToolCallRequest("session_list", { host_id: "linux-main" }), env);
+  const scopedSessions = JSON.parse((await scopedList.json()).result.content[0].text);
+  assert.deepEqual(scopedSessions.map((session) => [session.host_id, session.session_id]), [["linux-main", "same"]]);
+
+  const explicit = await worker.fetch(
+    legacyToolCallRequest("session_info", { host_id: "linux-main", session_id: "same" }),
+    env,
+  );
+  assert.equal((await explicit.json()).result.content[0].text, "host:linux-main");
+  assert.deepEqual(routed, [["host:linux-main", "session_info"]]);
+});
+
+test("unavailable legacy status blocks read and mutating unqualified routing without poisoning explicit host routing", async () => {
+  const now = Date.now();
+  const host = { host_id: "linux-main", generation: 1, expires_at: now + 60_000 };
+  const legacy = { session_id: "same", generation: 1, expires_at: now + 60_000 };
+  const routed = [];
+  const registry = {
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      const values = action === "hosts" ? [host] : action === "list" ? [legacy] : [];
+      return new Response(JSON.stringify(values), { headers: { "content-type": "application/json" } });
+    },
+  };
+  const env = {
+    CLIENT_TOKEN: "client-token",
+    GATEWAY_REGISTRY: { idFromName: (name) => name, get: () => registry },
+    GATEWAY_SESSIONS: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: async (url, init) => {
+          const path = new URL(url).pathname;
+          if (path === "/status") {
+            if (name === "same") throw new Error("legacy status unavailable");
+            return new Response(null, { status: 204 });
+          }
+          const request = JSON.parse(init.body).request;
+          if (request.params.name === "session_list") {
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: { content: [{ type: "text", text: JSON.stringify([{ session_id: "same" }]) }] },
+            }), { headers: { "content-type": "application/json" } });
+          }
+          routed.push([name, request.params.name]);
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { content: [{ type: "text", text: name }] },
+          }), { headers: { "content-type": "application/json" } });
+        },
+      }),
+    },
+  };
+
+  for (const tool of ["session_info", "session_stop"]) {
+    const response = await worker.fetch(legacyToolCallRequest(tool, { session_id: "same" }), env);
+    const payload = await response.json();
+    assert.equal(payload.error.code, -32006, tool);
+    assert.equal(payload.error.message, "session_ownership_unavailable", tool);
+    assert.deepEqual(payload.error.data.unavailable_legacy_sessions, ["same"], tool);
+  }
+  assert.deepEqual(routed, []);
+
+  const explicit = await worker.fetch(
+    legacyToolCallRequest("session_stop", { host_id: "linux-main", session_id: "same" }),
+    env,
+  );
+  assert.equal((await explicit.json()).result.content[0].text, "host:linux-main");
+  assert.deepEqual(routed, [["host:linux-main", "session_stop"]]);
 });
 
 test("tools/call routing reads only params.arguments.session_id", () => {
@@ -1059,34 +1523,29 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 36);
+  assert.equal(rpc.result.tools.length, 41);
+  for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
+    assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
+  }
   assert.equal(rpc.result.tools.some((tool) => tool.name === "without_sandbox"), false);
 });
 
-test("the MCP endpoint selects a Session Durable Object only by session_id", async () => {
+test("the MCP endpoint routes explicit host_id to the host Durable Object and strips routing metadata", async () => {
   const selected = [];
-  const sessionStub = {
+  let routedRequest;
+  const hostStub = {
     fetch: async (_url, init) => {
-      const request = JSON.parse(init.body).request;
+      routedRequest = JSON.parse(init.body).request;
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
-        id: request.id,
+        id: routedRequest.id,
         result: { content: [{ type: "text", text: "routed" }] },
       }), { headers: { "content-type": "application/json" } });
     },
   };
-  const request = new Request("https://gateway.example.test/mcp", {
-    method: "POST",
-    headers: {
-      authorization: "Bearer client-token",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "session_info", arguments: { session_id: "mac-main" } },
-    }),
+  const request = legacyToolCallRequest("session_info", {
+    host_id: "mac-main",
+    session_id: "project-a",
   });
   const response = await worker.fetch(request, {
     CLIENT_TOKEN: "client-token",
@@ -1095,21 +1554,24 @@ test("the MCP endpoint selects a Session Durable Object only by session_id", asy
         selected.push(name);
         return name;
       },
-      get: () => sessionStub,
+      get: () => hostStub,
     },
   });
 
-  assert.deepEqual(selected, ["mac-main"]);
+  assert.deepEqual(selected, ["host:mac-main"]);
+  assert.equal(routedRequest.params.arguments.host_id, undefined);
+  assert.equal(routedRequest.params.arguments.session_id, "project-a");
   assert.equal((await response.json()).result.content[0].text, "routed");
 });
 
-
-test("new work-state tools route by session_id and reject missing session_id", async () => {
+test("session-scoped work-state tools route by explicit host_id and reject missing session_id", async () => {
   const routed = [];
-  const sessionStub = {
+  const selected = [];
+  const hostStub = {
     fetch: async (_url, init) => {
       const request = JSON.parse(init.body).request;
       routed.push(request.params.name);
+      assert.equal(request.params.arguments.host_id, undefined);
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
         id: request.id,
@@ -1120,14 +1582,19 @@ test("new work-state tools route by session_id and reject missing session_id", a
   const env = {
     CLIENT_TOKEN: "client-token",
     GATEWAY_SESSIONS: {
-      idFromName: (name) => name,
-      get: () => sessionStub,
+      idFromName: (name) => {
+        selected.push(name);
+        return name;
+      },
+      get: () => hostStub,
     },
   };
   const argumentsByTool = {
-    job_list: { session_id: "mac-main", limit: 1 },
+    job_list: { host_id: "mac-main", session_id: "project-a", limit: 1 },
     checkpoint_save: {
-      session_id: "mac-main",
+      host_id: "mac-main",
+      session_id: "project-a",
+      operation_id: "00000000-0000-4000-8000-000000000001",
       expected_revision: 0,
       checkpoint: {
         title: "reported",
@@ -1138,10 +1605,11 @@ test("new work-state tools route by session_id and reject missing session_id", a
       },
     },
     checkpoint_load: {
-      session_id: "mac-main",
+      host_id: "mac-main",
+      session_id: "project-a",
       checkpoint_id: "00000000-0000-4000-8000-000000000001",
     },
-    work_handoff: { session_id: "mac-main" },
+    work_handoff: { host_id: "mac-main", session_id: "project-a" },
   };
   for (const [name, toolArguments] of Object.entries(argumentsByTool)) {
     const response = await worker.fetch(legacyToolCallRequest(name, toolArguments), env);
@@ -1155,6 +1623,7 @@ test("new work-state tools route by session_id and reject missing session_id", a
     assert.equal((await rejected.json()).error.code, -32602, name);
   }
   assert.deepEqual(routed, ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff"]);
+  assert.deepEqual(selected, ["host:mac-main", "host:mac-main", "host:mac-main", "host:mac-main"]);
 });
 
 test("session_list performs bounded final online checks and preserves registry order", async () => {
@@ -1166,10 +1635,13 @@ test("session_list performs bounded final online checks and preserves registry o
   let activeChecks = 0;
   let maxActiveChecks = 0;
   const registryStub = {
-    fetch: async () => new Response(JSON.stringify(sessions), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    }),
+    fetch: async (url) => {
+      const action = new URL(url).pathname.slice(1);
+      return new Response(JSON.stringify(action === "list" ? sessions : []), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
   };
   const sessionNamespace = {
     idFromName: (name) => name,
@@ -1259,7 +1731,7 @@ test("internal registry responses are bounded before JSON parsing", async () => 
   assert.match(payload.error.message, /registry returned invalid JSON/);
 });
 
-test("internal dispatch responses are bounded on success and error paths", async () => {
+test("internal host dispatch responses are bounded on success and error paths", async () => {
   const oversizedSuccess = {
     fetch: async () => new Response("{}", {
       status: 200,
@@ -1278,7 +1750,7 @@ test("internal dispatch responses are bounded on success and error paths", async
   });
 
   const successResponse = await worker.fetch(
-    legacyToolCallRequest("session_info", { session_id: "mac-main" }),
+    legacyToolCallRequest("session_info", { host_id: "mac-main", session_id: "project-a" }),
     env(oversizedSuccess),
   );
   const successPayload = await successResponse.json();
@@ -1295,13 +1767,14 @@ test("internal dispatch responses are bounded on success and error paths", async
     }),
   };
   const failureResponse = await worker.fetch(
-    legacyToolCallRequest("session_info", { session_id: "mac-main" }),
+    legacyToolCallRequest("session_info", { host_id: "mac-main", session_id: "project-a" }),
     env(oversizedFailure),
   );
   const failurePayload = await failureResponse.json();
   assert.equal(failurePayload.error.code, -32001);
   assert.equal(failurePayload.error.message, "host request failed");
   assert.equal(failurePayload.error.data.gateway_status, 503);
+  assert.equal(failurePayload.error.data.host_id, "mac-main");
 });
 
 test("modern server/discover advertises the 2026 protocol", async () => {
@@ -1380,10 +1853,11 @@ test("modern tools/list requires Mcp-Method and returns cacheable result fields"
   assert.equal(Array.isArray(result.tools), true);
 });
 
-test("modern routed tool responses are normalized to the 2026 result shape", async () => {
+test("modern host-routed tool responses are normalized to the 2026 result shape", async () => {
   const sessionStub = {
     fetch: async (_url, init) => {
       const request = JSON.parse(init.body).request;
+      assert.equal(request.params.arguments.host_id, undefined);
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
         id: request.id,
@@ -1406,7 +1880,7 @@ test("modern routed tool responses are normalized to the 2026 result shape", asy
       method: "tools/call",
       params: {
         name: "session_info",
-        arguments: { session_id: "mac-main" },
+        arguments: { host_id: "mac-main", session_id: "project-a" },
         _meta: {
           "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
           "io.modelcontextprotocol/clientCapabilities": {},

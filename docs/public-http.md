@@ -191,6 +191,6 @@ For the Tailscale profile, an unauthenticated `/mcp` request returns `401` with 
 
 ## Remote tool and managed-session boundary
 
-With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start` and `session_stop`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` is limited to sessions marked HTTP-owned by the lifecycle supervisor; local CLI/yolo sessions cannot be stopped remotely.
+With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start`, `session_stop`, and `session_restart`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` and `session_restart` are limited to sessions marked HTTP-owned by the lifecycle supervisor. Public session-bound tools reject separately started yolo sessions instead of inheriting their unrestricted local semantics.
 
 Remote profiles do not expose `without_sandbox`. Normal sessions keep filesystem containment and a network-disabled sandbox, while host/network-sensitive operations still require local approval. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.

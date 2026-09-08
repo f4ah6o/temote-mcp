@@ -189,6 +189,6 @@ Tailscale profile の未認証 `/mcp` は `401` と Bearer `WWW-Authenticate` ch
 
 ## Remote tool / managed session の境界
 
-`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` は現在の `serve` process が所有する session に限定されます。
+`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` / `session_restart` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` / `session_restart` は lifecycle supervisor が public-owned として保持する session に限定されます。public session-bound tool は別途起動した yolo session を拒否し、unrestricted な local semantics を remote access に引き継ぎません。
 
 remote profile に `without_sandbox` は出ません。通常 session は filesystem containment と network-disabled sandbox を維持し、host/network-sensitive operation は引き続き local approval が必要です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。

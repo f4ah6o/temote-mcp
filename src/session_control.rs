@@ -30,7 +30,7 @@ const TERMINAL_SESSION_RETENTION: usize = 512;
 const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
-const CONTROL_PROTOCOL_VERSION: u64 = 1;
+pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 const UPGRADE_PLAN_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
@@ -74,6 +74,8 @@ enum ControlRequest {
         session_id: String,
         #[serde(default)]
         environment: CapturedStartEnvironment,
+        #[serde(default)]
+        public: bool,
     },
     RestartPolicy {
         session_id: String,
@@ -182,16 +184,28 @@ impl SessionBackend {
         Ok(Self::LocalControl)
     }
 
-    pub async fn roots_configured(&self) -> Result<bool> {
+    pub async fn status(&self) -> Result<Value> {
         match self {
             #[cfg(test)]
-            Self::InProcess(supervisor) => Ok(supervisor.roots_configured()),
-            Self::LocalControl => Ok(request(ControlRequest::Ping)
-                .await?
-                .get("roots_configured")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)),
+            Self::InProcess(supervisor) => Ok(json!({
+                "status": "active",
+                "host_id": host_identity::resolve()?,
+                "version": env!("CARGO_PKG_VERSION"),
+                "control_protocol": CONTROL_PROTOCOL_VERSION,
+                "roots_configured": supervisor.roots_configured(),
+                "named_roots": supervisor.named_root_names(),
+            })),
+            Self::LocalControl => request(ControlRequest::Ping).await,
         }
+    }
+
+    pub async fn roots_configured(&self) -> Result<bool> {
+        Ok(self
+            .status()
+            .await?
+            .get("roots_configured")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     pub async fn start(&self, path: &str, session_id: Option<&str>) -> Result<Value> {
@@ -236,6 +250,30 @@ impl SessionBackend {
                 })
                 .await?;
                 Ok(())
+            }
+        }
+    }
+
+    pub async fn restart(&self, session_id: &str) -> Result<Value> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                restart_session(
+                    supervisor,
+                    session_id,
+                    CapturedStartEnvironment::default(),
+                    true,
+                )
+                .await?;
+                Ok(serde_json::to_value(inspect_session(session_id).await?)?)
+            }
+            Self::LocalControl => {
+                request(ControlRequest::Restart {
+                    session_id: session_id.to_owned(),
+                    environment: CapturedStartEnvironment::default(),
+                    public: true,
+                })
+                .await
             }
         }
     }
@@ -441,6 +479,7 @@ pub async fn restart(session_id: String) -> Result<()> {
     let result = request(ControlRequest::Restart {
         session_id,
         environment: CapturedStartEnvironment::capture(),
+        public: false,
     })
     .await?;
     print_json(&result)
@@ -622,6 +661,7 @@ async fn dispatch_request(
             "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
             "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
             "roots_configured": supervisor.roots_configured(),
+            "named_roots": supervisor.named_root_names(),
         })),
         ControlRequest::Approval {
             session_id,
@@ -679,9 +719,10 @@ async fn dispatch_request(
         ControlRequest::Restart {
             session_id,
             environment,
+            public,
         } => {
             environment.validate()?;
-            restart_session(supervisor, &session_id, environment).await?;
+            restart_session(supervisor, &session_id, environment, public).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::RestartPolicy { session_id, policy } => {
@@ -1418,25 +1459,46 @@ async fn restart_session(
     supervisor: &Arc<SessionSupervisor>,
     session_id: &str,
     environment: CapturedStartEnvironment,
+    public: bool,
 ) -> Result<()> {
     config::validate_session_id(session_id)?;
     supervisor.reap_finished().await;
     let session = config::read_session_metadata(session_id).await?;
     let lifecycle = config::read_session_lifecycle(session_id).await?;
-    if config::session_is_active(session_id).await? {
-        supervisor.stop(session_id).await?;
-    }
-    if let Some(path) = lifecycle
-        .as_ref()
-        .and_then(|state| state.logical_path.as_deref())
-    {
+    if public {
+        anyhow::ensure!(
+            config::session_is_active(session_id).await?,
+            "public session_restart requires an active managed session"
+        );
+        let path = lifecycle
+            .as_ref()
+            .and_then(|state| state.logical_path.as_deref())
+            .context("public managed session has no named-root path")?;
+        supervisor.stop_public(session_id).await?;
         supervisor
-            .start_with_environment(path, Some(session_id), environment)
+            .start_public_with_environment(path, Some(session_id), environment)
             .await?;
     } else {
-        supervisor
-            .start_local_with_environment(&session.cwd, Some(session_id), session.yolo, environment)
-            .await?;
+        if config::session_is_active(session_id).await? {
+            supervisor.stop(session_id).await?;
+        }
+        if let Some(path) = lifecycle
+            .as_ref()
+            .and_then(|state| state.logical_path.as_deref())
+        {
+            supervisor
+                .start_with_environment(path, Some(session_id), environment)
+                .await?;
+        } else {
+            supervisor
+                .start_local_with_environment(
+                    &session.cwd,
+                    Some(session_id),
+                    session.yolo,
+                    environment,
+                )
+                .await?;
+        }
     }
     Ok(())
 }
@@ -2833,6 +2895,7 @@ mod tests {
                                 &supervisor,
                                 id,
                                 CapturedStartEnvironment::default(),
+                                false,
                             )
                             .await;
                             assert_eq!(

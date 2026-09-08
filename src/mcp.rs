@@ -464,6 +464,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB from the local machine. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
@@ -511,7 +512,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         tools.as_array_mut().unwrap().retain(|tool| {
             !matches!(
                 tool["name"].as_str(),
-                Some("session_start" | "session_stop")
+                Some("session_start" | "session_stop" | "session_restart")
             )
         });
     }
@@ -580,6 +581,27 @@ async fn call_tool(
         let info = sessions.start(path, session_id).await?;
         return text_result(serde_json::to_string_pretty(&info)?);
     }
+    if name == "session_restart" {
+        anyhow::ensure!(
+            public,
+            "session_restart is available only from temote-mcp serve"
+        );
+        let sessions = sessions.context("session supervisor is unavailable")?;
+        let object = args
+            .as_object()
+            .context("session_restart arguments must be an object")?;
+        anyhow::ensure!(
+            object.keys().all(|key| key == "session_id"),
+            "session_restart accepts only session_id"
+        );
+        let session_id = object
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("missing session_id")?;
+        config::validate_session_id(session_id)?;
+        let info = sessions.restart(session_id).await?;
+        return text_result(serde_json::to_string_pretty(&info)?);
+    }
     if name == "session_stop" {
         anyhow::ensure!(
             public,
@@ -616,6 +638,10 @@ async fn call_tool(
         return text_result(serde_json::to_string_pretty(&view)?);
     }
     let session = config::load_session(&session_id).await?;
+    anyhow::ensure!(
+        !public || !session.yolo,
+        "yolo sessions are unavailable on the public MCP endpoint"
+    );
     match name {
         "get_image" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
@@ -3054,7 +3080,48 @@ mod tests {
     }
 
     fn routed_gateway_contract() -> Value {
-        let mut routed_tools = tools(true, false);
+        let mut routed_tools = tools(true, true).as_array().unwrap().to_owned();
+        let host_property = json!({"type": "string"});
+        for tool in &mut routed_tools {
+            let name = tool["name"].as_str().unwrap_or_default().to_owned();
+            if name == "session_list" {
+                tool["inputSchema"] = json!({
+                    "type": "object",
+                    "properties": {"host_id": host_property.clone()},
+                    "additionalProperties": false
+                });
+                continue;
+            }
+            if let Some(properties) = tool
+                .pointer_mut("/inputSchema/properties")
+                .and_then(Value::as_object_mut)
+            {
+                properties.insert("host_id".to_owned(), host_property.clone());
+            }
+            if name == "session_start" {
+                tool["inputSchema"]["required"] = json!(["host_id", "path"]);
+            }
+        }
+        routed_tools.insert(0, json!({
+            "name": "host_info",
+            "title": "Inspect a federated Temote host",
+            "description": "Show one currently leased federated host.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"host_id": host_property.clone()},
+                "required": ["host_id"],
+                "additionalProperties": false
+            }
+        }));
+        routed_tools.insert(0, json!({
+            "name": "host_list",
+            "title": "List federated Temote hosts",
+            "description": "List currently leased federated hosts.",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }));
+        let mut routed_tools = Value::Array(routed_tools);
         strip_gateway_contract_prose(&mut routed_tools);
         json!({
             "latestLegacyProtocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
@@ -3090,7 +3157,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 38);
+        assert_eq!(tools.len(), 39);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -3105,6 +3172,7 @@ mod tests {
         }));
         assert!(tools.iter().any(|tool| tool["name"] == "session_start"));
         assert!(tools.iter().any(|tool| tool["name"] == "session_stop"));
+        assert!(tools.iter().any(|tool| tool["name"] == "session_restart"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_add"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_commit"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_fetch"));
