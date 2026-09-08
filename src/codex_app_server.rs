@@ -533,33 +533,78 @@ impl TaskStore {
                 continue;
             }
             if record.owner == current.owner && record.scope_cwd == current.scope_cwd {
-                scoped.push((
-                    record.updated_at,
-                    id,
-                    entry.path(),
-                    terminal && !runtime_backed,
-                ));
+                scoped.push(id);
             }
         }
-        let current_is_persisted = scoped.iter().any(|(_, id, _, _)| *id == current.task_id);
+        let current_is_persisted = scoped.contains(&current.task_id);
         let projected = scoped.len() + usize::from(!current_is_persisted);
         if projected > MAX_TASKS_PER_SCOPE {
-            let excess = projected - MAX_TASKS_PER_SCOPE;
-            let mut candidates = scoped
-                .iter()
-                .filter(|(_, id, _, terminal)| *id != current.task_id && *terminal)
-                .collect::<Vec<_>>();
-            candidates.sort_by_key(|(updated, id, _, _)| (*updated, *id));
-            anyhow::ensure!(
-                candidates.len() >= excess,
-                "Codex task scope has reached its limit with active tasks; refusing to accept another task"
+            anyhow::bail!(
+                "Codex task scope has reached its retention limit; refusing to accept another task"
             );
-            for (_, _, path, _) in candidates.into_iter().take(excess) {
-                std::fs::remove_file(path)
-                    .with_context(|| "cannot prune terminal Codex task".to_owned())?;
-            }
         }
         Ok(())
+    }
+
+    fn finalize_owner(&self, owner: &SessionInstance) -> Result<usize> {
+        let _guard = store_lock().lock().unwrap();
+        let metadata = match std::fs::symlink_metadata(&self.directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error).context("cannot inspect Codex task store"),
+        };
+        validate_store_directory(&self.directory, &metadata)?;
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error).context("cannot list Codex task store"),
+        };
+        let now = config::unix_time();
+        let mut count = 0usize;
+        let mut finalized = 0usize;
+        for entry in entries {
+            count += 1;
+            anyhow::ensure!(
+                count <= MAX_TASK_DIRECTORY_ENTRIES,
+                "Codex task store contains more than {MAX_TASK_DIRECTORY_ENTRIES} entries"
+            );
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            let mut record = match self.read_record(id) {
+                Ok(record) => record,
+                Err(error) if is_not_found(&error) => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot inspect Codex task {id} during cleanup"));
+                }
+            };
+            if record.owner != owner.clone() || record.status.is_terminal() {
+                continue;
+            }
+
+            record.status = TaskStatus::Interrupted;
+            record.revision = record.revision.saturating_add(1);
+            record.updated_at = now;
+            let outcome = record.outcome();
+            for receipt in &mut record.operations {
+                if receipt.phase == OperationPhase::Accepted {
+                    receipt.phase = OperationPhase::Applied;
+                }
+                receipt.outcome = outcome.clone();
+            }
+            self.save_locked(&record)?;
+            finalized += 1;
+        }
+        Ok(finalized)
     }
 }
 
@@ -933,14 +978,13 @@ async fn active_session_exists(session_id: &str) -> bool {
     config::session_is_active(session_id).await.unwrap_or(true)
 }
 
-pub(crate) async fn remove_session(session: &config::Session) {
-    let owner = SessionInstance::from_session(session);
+async fn shutdown_session_runtimes(owner: &SessionInstance) {
     let clients = {
         let _guard = store_lock().lock().unwrap();
         let state = runtimes().lock().unwrap();
         state
             .values()
-            .filter_map(|runtime| (runtime.owner == owner).then_some(runtime.client.clone()))
+            .filter_map(|runtime| (runtime.owner == *owner).then_some(runtime.client.clone()))
             .collect::<Vec<_>>()
     };
     for client in clients {
@@ -951,10 +995,41 @@ pub(crate) async fn remove_session(session: &config::Session) {
         runtimes()
             .lock()
             .unwrap()
-            .retain(|_, runtime| runtime.owner != owner);
+            .retain(|_, runtime| runtime.owner != *owner);
     }
+}
+
+async fn remove_session_evidence(owner: &SessionInstance) {
     if !active_session_exists(&owner.id).await {
         evidence::remove_session(&owner.id);
+    }
+}
+
+async fn finalize_session_tasks(owner: &SessionInstance, store: &TaskStore) -> Result<()> {
+    let result = store
+        .finalize_owner(owner)
+        .context("failed to finalize Codex tasks for ended session instance")
+        .map(|_| ());
+    remove_session_evidence(owner).await;
+    result
+}
+
+#[cfg(test)]
+async fn remove_session_with_store(session: &config::Session, store: &TaskStore) -> Result<()> {
+    let owner = SessionInstance::from_session(session);
+    shutdown_session_runtimes(&owner).await;
+    finalize_session_tasks(&owner, store).await
+}
+
+pub(crate) async fn remove_session(session: &config::Session) -> Result<()> {
+    let owner = SessionInstance::from_session(session);
+    shutdown_session_runtimes(&owner).await;
+    match TaskStore::default_store() {
+        Ok(store) => finalize_session_tasks(&owner, &store).await,
+        Err(error) => {
+            remove_session_evidence(&owner).await;
+            Err(error).context("cannot open Codex task store for session cleanup")
+        }
     }
 }
 
@@ -2618,7 +2693,7 @@ for raw in sys.stdin:
             },
         );
 
-        remove_session(&old).await;
+        remove_session(&old).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), old_stopped_receiver)
             .await
             .unwrap()
@@ -2626,7 +2701,262 @@ for raw in sys.stdin:
         assert!(runtime_for(&old, old_task).is_none());
         assert!(runtime_for(&replacement, replacement_task).is_some());
 
-        remove_session(&replacement).await;
+        remove_session(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_session_finalizes_running_record_and_preserves_start_idempotency() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "finalize-running", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let operation_id = Uuid::new_v4();
+        let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "finalize on session stop",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let request_fingerprint = fingerprint(&json!({
+            "kind": "start",
+            "task_id": task_id,
+            "task": "finalize on session stop",
+            "model": "gpt-5.6-luna",
+            "effort": "max",
+        }))
+        .unwrap();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            2,
+            Some("thread"),
+            Some("turn"),
+        );
+        record.operations.push(start_receipt(
+            operation_id,
+            request_fingerprint,
+            OperationPhase::Applied,
+            record.outcome(),
+        ));
+        store.save(&record).unwrap();
+
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (stopped, stopped_receiver) = oneshot::channel();
+        let actor = tokio::spawn(async move {
+            if matches!(receiver.recv().await, Some(ClientCommand::Shutdown)) {
+                let _ = stopped.send(());
+            }
+        });
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: RpcClient {
+                    tx: commands,
+                    actor: Arc::new(Mutex::new(Some(actor))),
+                },
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                started_at: Instant::now(),
+            },
+        );
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(runtime_for(&owner, task_id).is_none());
+        let finalized = store.load(&owner, task_id).unwrap();
+        assert_eq!(finalized.status, TaskStatus::Interrupted);
+        assert_eq!(finalized.operations[0].phase, OperationPhase::Applied);
+        assert_eq!(
+            finalized.operations[0].outcome.status,
+            TaskStatus::Interrupted
+        );
+
+        let replay = task_start_with_store_and_binary(
+            &args,
+            &owner,
+            &store,
+            &root.path().join("never-spawned"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "interrupted");
+        assert!(runtime_for(&owner, task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_session_finalizes_nonterminal_orphan_records_and_accepted_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "finalize-orphans", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let statuses = [
+            TaskStatus::Accepted,
+            TaskStatus::WaitingApproval,
+            TaskStatus::RetryableFailed,
+            TaskStatus::ReconciliationRequired,
+            TaskStatus::Unknown,
+        ];
+        let mut operations = Vec::new();
+        for (index, status) in statuses.into_iter().enumerate() {
+            let task_id = Uuid::new_v4();
+            let operation_id = Uuid::new_v4();
+            let request_fingerprint = fingerprint(&json!({"index": index})).unwrap();
+            let mut record = task_record(&owner, task_id, status, 1, None, None);
+            record.operations.push(start_receipt(
+                operation_id,
+                request_fingerprint,
+                OperationPhase::Accepted,
+                record.outcome(),
+            ));
+            store.save(&record).unwrap();
+            operations.push((task_id, operation_id, request_fingerprint));
+        }
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+
+        for (task_id, operation_id, request_fingerprint) in operations {
+            let finalized = store.load(&owner, task_id).unwrap();
+            assert_eq!(finalized.status, TaskStatus::Interrupted);
+            assert_eq!(finalized.operations[0].phase, OperationPhase::Applied);
+            assert_eq!(
+                finalized.operations[0].outcome.status,
+                TaskStatus::Interrupted
+            );
+            let replay = replay_operation(&finalized, operation_id, request_fingerprint).unwrap();
+            assert_eq!(replay["status"], "interrupted");
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_task_expires_and_is_pruned_after_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "finalize-expiry", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+        let mut expired = store.load(&owner, task_id).unwrap();
+        expired.updated_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS + 1);
+        store.save(&expired).unwrap();
+        store
+            .save(&task_record(
+                &owner,
+                Uuid::new_v4(),
+                TaskStatus::Accepted,
+                1,
+                None,
+                None,
+            ))
+            .unwrap();
+        assert!(store.load(&owner, task_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn finalized_task_remains_fenced_from_replacement_session_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "finalize-fence", true);
+        let mut replacement = owner.clone();
+        replacement.started_at += 1;
+        replacement.process_id += 1;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+        assert_eq!(
+            store.load(&owner, task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        assert!(store.load(&replacement, task_id).is_err());
+        assert!(
+            store
+                .update(&replacement, task_id, |record| {
+                    record.status = TaskStatus::Completed;
+                    Ok(())
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_session_finalization_leaves_only_prunable_terminal_records() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let mut records = Vec::new();
+        for index in 0..8 {
+            let mut owner = session(root.path(), "repeated-finalize", true);
+            owner.started_at += index;
+            owner.process_id += index as u32;
+            let task_id = Uuid::new_v4();
+            store
+                .save(&task_record(
+                    &owner,
+                    task_id,
+                    TaskStatus::Running,
+                    1,
+                    Some("thread"),
+                    Some("turn"),
+                ))
+                .unwrap();
+            remove_session_with_store(&owner, &store).await.unwrap();
+            assert_eq!(
+                store.load(&owner, task_id).unwrap().status,
+                TaskStatus::Interrupted
+            );
+            records.push((owner, task_id));
+        }
+
+        let expired_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS + 1);
+        for (owner, task_id) in &records {
+            let mut record = store.load(owner, *task_id).unwrap();
+            record.updated_at = expired_at;
+            std::fs::write(
+                store.path(*task_id),
+                serde_json::to_vec_pretty(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        let current = session(root.path(), "replacement-finalize", true);
+        store
+            .save(&task_record(
+                &current,
+                Uuid::new_v4(),
+                TaskStatus::Accepted,
+                1,
+                None,
+                None,
+            ))
+            .unwrap();
+        for (owner, task_id) in records {
+            assert!(store.load(&owner, task_id).is_err());
+        }
     }
 
     #[tokio::test]
@@ -2706,7 +3036,7 @@ for raw in sys.stdin:
         .await
         .unwrap();
         assert_eq!(result["status"], "running");
-        remove_session(&session).await;
+        remove_session(&session).await.unwrap();
     }
 
     #[test]
@@ -2997,7 +3327,7 @@ for raw in sys.stdin:
         }
         let candidate = task_record(&owner, Uuid::new_v4(), TaskStatus::Accepted, 1, None, None);
         let error = store.save(&candidate).unwrap_err();
-        assert!(error.to_string().contains("active tasks"));
+        assert!(error.to_string().contains("retention limit"));
         for task_id in ids {
             assert_eq!(
                 store.load(&owner, task_id).unwrap().status,
@@ -3015,7 +3345,7 @@ for raw in sys.stdin:
     }
 
     #[test]
-    fn task_store_prunes_only_terminal_and_expired_records() {
+    fn task_store_retains_fresh_terminal_and_prunes_expired_records() {
         let root = tempfile::tempdir().unwrap();
         let store_root = tempfile::tempdir().unwrap();
         let owner = session(root.path(), "terminal-capacity", true);
@@ -3053,12 +3383,9 @@ for raw in sys.stdin:
                 Some("thread"),
                 Some("turn"),
             ))
-            .unwrap();
-        assert!(store.load(&owner, terminal_id).is_err());
-        assert_eq!(
-            store.load(&owner, candidate_id).unwrap().status,
-            TaskStatus::Running
-        );
+            .unwrap_err();
+        assert!(store.load(&owner, terminal_id).is_ok());
+        assert!(store.load(&owner, candidate_id).is_err());
 
         let expired_store_root = tempfile::tempdir().unwrap();
         let expired_store = TaskStore::new(expired_store_root.path().join("tasks"));
@@ -3085,6 +3412,79 @@ for raw in sys.stdin:
             ))
             .unwrap();
         assert!(expired_store.load(&owner, expired_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_terminal_start_replays_after_capacity_pressure() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "retained-start", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let operation_id = Uuid::new_v4();
+        let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "replay retained task",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let request_fingerprint = fingerprint(&json!({
+            "kind": "start",
+            "task_id": task_id,
+            "task": "replay retained task",
+            "model": "gpt-5.6-luna",
+            "effort": "max",
+        }))
+        .unwrap();
+        let mut original = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Completed,
+            2,
+            Some("thread"),
+            Some("turn"),
+        );
+        original.operations.push(start_receipt(
+            operation_id,
+            request_fingerprint,
+            OperationPhase::Applied,
+            original.outcome(),
+        ));
+        store.save(&original).unwrap();
+        for _ in 0..MAX_TASKS_PER_SCOPE - 1 {
+            store
+                .save(&task_record(
+                    &owner,
+                    Uuid::new_v4(),
+                    TaskStatus::Running,
+                    1,
+                    Some("thread"),
+                    Some("turn"),
+                ))
+                .unwrap();
+        }
+
+        let missing_binary = root.path().join("never-spawned");
+        let new_args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "must be rejected at capacity",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let capacity_error =
+            task_start_with_store_and_binary(&new_args, &owner, &store, &missing_binary)
+                .await
+                .unwrap_err();
+        assert!(capacity_error.to_string().contains("retention limit"));
+
+        let replay = task_start_with_store_and_binary(&args, &owner, &store, &missing_binary)
+            .await
+            .unwrap();
+        assert_eq!(replay["task_id"], task_id.to_string());
+        assert_eq!(replay["status"], "completed");
+        let persisted = store.load(&owner, task_id).unwrap();
+        assert_eq!(persisted.status, TaskStatus::Completed);
+        assert_eq!(persisted.operations[0].phase, OperationPhase::Applied);
     }
 
     #[tokio::test]
@@ -3139,14 +3539,14 @@ for raw in sys.stdin:
         }
         let candidate = task_record(&owner, Uuid::new_v4(), TaskStatus::Running, 1, None, None);
         let error = store.save(&candidate).unwrap_err();
-        assert!(error.to_string().contains("active tasks"));
+        assert!(error.to_string().contains("retention limit"));
         assert_eq!(
             store.load(&owner, runtime_task_id).unwrap().status,
             TaskStatus::Completed
         );
         assert!(runtime_for(&owner, runtime_task_id).is_some());
 
-        remove_session(&owner).await;
+        remove_session(&owner).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), stopped_receiver)
             .await
             .unwrap()
@@ -3282,7 +3682,7 @@ for raw in sys.stdin:
         assert_eq!(result["status"], "completed");
         assert!(result["revision"].as_u64().unwrap() > 7);
         assert_ne!(result["status"], "not_modified");
-        remove_session(&owner).await;
+        remove_session(&owner).await.unwrap();
         session_handle.shutdown().await.unwrap();
     }
 
@@ -3319,7 +3719,7 @@ for raw in sys.stdin:
             .unwrap();
         assert_eq!(second["status"], "running");
         assert!(second["thread_id"].as_str().is_some());
-        remove_session(&owner).await;
+        remove_session(&owner).await.unwrap();
     }
 
     #[tokio::test]
@@ -3354,7 +3754,7 @@ for raw in sys.stdin:
         .await
         .unwrap();
         assert_eq!(retry["status"], "running");
-        remove_session(&owner).await;
+        remove_session(&owner).await.unwrap();
 
         let deterministic_id = Uuid::new_v4();
         let deterministic_args = json!({

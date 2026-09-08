@@ -639,9 +639,7 @@ async fn call_tool(
             .get("session_id")
             .and_then(Value::as_str)
             .context("missing session_id")?;
-        let session = config::read_session_metadata(session_id).await?;
         sessions.stop(session_id).await?;
-        codex_app_server::remove_session(&session).await;
         return text_result(serde_json::to_string_pretty(&json!({
             "session_id": session_id,
             "status": "stopped"

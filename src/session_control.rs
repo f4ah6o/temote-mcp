@@ -268,7 +268,6 @@ impl SessionBackend {
                 Ok(serde_json::to_value(inspect_session(session_id).await?)?)
             }
             Self::LocalControl => {
-                let session = config::read_session_metadata(session_id).await?;
                 let lifecycle = config::read_session_lifecycle(session_id)
                     .await?
                     .context("public managed session has no lifecycle metadata")?;
@@ -281,7 +280,6 @@ impl SessionBackend {
                     public: true,
                 })
                 .await?;
-                crate::codex_app_server::remove_session(&session).await;
                 request(ControlRequest::Start {
                     path: path.to_owned(),
                     session_id: session_id.to_owned(),
@@ -1490,14 +1488,14 @@ async fn restart_session(
             .and_then(|state| state.logical_path.as_deref())
             .context("public managed session has no named-root path")?;
         supervisor.stop_public(session_id).await?;
-        crate::codex_app_server::remove_session(&session).await;
         supervisor
             .start_public_with_environment(path, Some(session_id), environment)
             .await?;
     } else {
         if config::session_is_active(session_id).await? {
             supervisor.stop(session_id).await?;
-            crate::codex_app_server::remove_session(&session).await;
+        } else {
+            crate::codex_app_server::remove_session(&session).await?;
         }
         if let Some(path) = lifecycle
             .as_ref()

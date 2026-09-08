@@ -434,7 +434,16 @@ impl SessionSupervisor {
                     continue;
                 }
             };
-            crate::codex_app_server::remove_session(&old_session).await;
+            if let Err(error) = crate::codex_app_server::remove_session(&old_session).await {
+                eprintln!("automatic restart cleanup for session {id} failed: {error:#}");
+                if let Err(save_error) = self
+                    .schedule_restart(&id, &format!("automatic restart cleanup failed: {error:#}"))
+                    .await
+                {
+                    eprintln!("failed to schedule another restart for {id}: {save_error:#}");
+                }
+                continue;
+            }
             if let Err(error) = self
                 .start_resolved(
                     spec.cwd.clone(),
@@ -479,6 +488,8 @@ impl SessionSupervisor {
             }
             if self.restart_specs.lock().await.remove(session_id).is_some() {
                 self.public_sessions.lock().await.remove(session_id);
+                let session = config::read_session_metadata(session_id).await?;
+                let cleanup_result = crate::codex_app_server::remove_session(&session).await;
                 if let Some(mut lifecycle) = config::read_session_lifecycle(session_id).await? {
                     lifecycle.status = config::LifecycleStatus::Stopped;
                     lifecycle.stopped_at = Some(config::unix_time());
@@ -488,13 +499,20 @@ impl SessionSupervisor {
                     lifecycle.last_error = None;
                     config::save_session_lifecycle(session_id, &lifecycle).await?;
                 }
-                return Ok(());
+                return cleanup_result;
             }
             anyhow::bail!("session {session_id} is not managed by this supervisor process");
         };
         self.restart_specs.lock().await.remove(session_id);
         self.public_sessions.lock().await.remove(session_id);
-        handle.shutdown().await
+        let session = config::read_session_metadata(session_id).await;
+        let shutdown_result = handle.shutdown().await;
+        let cleanup_result = match session {
+            Ok(session) => crate::codex_app_server::remove_session(&session).await,
+            Err(error) => Err(error).context("cannot read session metadata for Codex cleanup"),
+        };
+        shutdown_result.with_context(|| format!("failed to stop session {session_id}"))?;
+        cleanup_result
     }
 
     pub async fn build_upgrade_plan(
@@ -718,9 +736,11 @@ impl SessionSupervisor {
                 );
             };
             let shutdown_result = handle.shutdown().await;
-            crate::codex_app_server::remove_session(&session).await;
+            let cleanup_result = crate::codex_app_server::remove_session(&session).await;
             shutdown_result
                 .with_context(|| format!("failed to drain session {}", planned.session_id))?;
+            cleanup_result
+                .with_context(|| format!("failed to clean up session {}", planned.session_id))?;
         }
         Ok(())
     }
@@ -775,10 +795,66 @@ impl SessionSupervisor {
         }
     }
 
+    async fn cleanup_restored_sessions(&self, session_ids: Vec<String>) -> Result<()> {
+        let mut first_error = None;
+        for id in session_ids.into_iter().rev() {
+            self.restart_specs.lock().await.remove(&id);
+            self.public_sessions.lock().await.remove(&id);
+            let session = config::read_session_metadata(&id).await;
+            let shutdown_result = match self.sessions.lock().await.remove(&id) {
+                Some(handle) => handle.shutdown().await,
+                None => Ok(()),
+            };
+            if let Err(error) = shutdown_result
+                && first_error.is_none()
+            {
+                first_error =
+                    Some(error.context(format!("failed to stop partially restored session {id}")));
+            }
+            let cleanup_result = match session {
+                Ok(session) => crate::codex_app_server::remove_session(&session).await,
+                Err(error) => {
+                    Err(error).context("cannot read session metadata for restored-session cleanup")
+                }
+            };
+            if let Err(error) = cleanup_result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error).context("failed to clean up partially restored sessions")
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn restore_upgrade_plan(
         &self,
         plan: &SupervisorUpgradePlan,
         available_environment: &approvals::CapturedStartEnvironment,
+    ) -> Result<()> {
+        let mut restored = Vec::new();
+        let result = self
+            .restore_upgrade_plan_inner(plan, available_environment, &mut restored)
+            .await;
+        if let Err(error) = result {
+            if let Err(cleanup_error) = self.cleanup_restored_sessions(restored).await {
+                return Err(anyhow::anyhow!(
+                    "{error:#}; restore cleanup also failed: {cleanup_error:#}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn restore_upgrade_plan_inner(
+        &self,
+        plan: &SupervisorUpgradePlan,
+        available_environment: &approvals::CapturedStartEnvironment,
+        restored: &mut Vec<String>,
     ) -> Result<()> {
         anyhow::ensure!(
             plan.plan_schema == 1,
@@ -790,7 +866,6 @@ impl SessionSupervisor {
             plan.target_version,
             env!("CARGO_PKG_VERSION")
         );
-        let mut restored = Vec::new();
         for planned in &plan.sessions {
             let environment = available_environment
                 .select_restart_context(&planned.restart_context_keys)
@@ -830,11 +905,6 @@ impl SessionSupervisor {
             match result {
                 Ok(_) => restored.push(planned.session_id.clone()),
                 Err(error) => {
-                    for id in restored.into_iter().rev() {
-                        if let Some(handle) = self.sessions.lock().await.remove(&id) {
-                            let _ = handle.shutdown().await;
-                        }
-                    }
                     return Err(error).with_context(|| {
                         format!("failed to restore session {}", planned.session_id)
                     });
@@ -907,7 +977,21 @@ impl SessionSupervisor {
         for id in finished {
             let handle = self.sessions.lock().await.remove(&id);
             if let Some(handle) = handle {
-                match handle.wait().await {
+                let session = config::read_session_metadata(&id).await;
+                let wait_result = handle.wait().await;
+                let cleanup_result = match session {
+                    Ok(session) => crate::codex_app_server::remove_session(&session).await,
+                    Err(error) => {
+                        Err(error).context("cannot read session metadata for Codex cleanup")
+                    }
+                };
+                let cleanup_failed = if let Err(error) = cleanup_result {
+                    eprintln!("Codex task cleanup for ended session {id} failed: {error:#}");
+                    true
+                } else {
+                    false
+                };
+                match wait_result {
                     Ok(()) => {
                         self.restart_specs.lock().await.remove(&id);
                         self.public_sessions.lock().await.remove(&id);
@@ -921,7 +1005,14 @@ impl SessionSupervisor {
                             .is_some_and(|state| state.restart_policy == "on-failure");
                         if should_restart && self.restart_specs.lock().await.contains_key(&id) {
                             if let Err(schedule_error) = self
-                                .schedule_restart(&id, "unexpected runtime failure")
+                                .schedule_restart(
+                                    &id,
+                                    if cleanup_failed {
+                                        "Codex task cleanup failed after unexpected runtime failure"
+                                    } else {
+                                        "unexpected runtime failure"
+                                    },
+                                )
                                 .await
                             {
                                 eprintln!(
@@ -950,13 +1041,21 @@ impl SessionSupervisor {
         self.public_sessions.lock().await.clear();
         let mut first_error = None;
         for (session_id, handle) in handles {
-            if let Err(error) = handle.shutdown().await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
+            let session = config::read_session_metadata(&session_id).await;
+            if let Err(error) = handle.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
-            let _ = session_id;
+            let cleanup_result = match session {
+                Ok(session) => crate::codex_app_server::remove_session(&session).await,
+                Err(error) => Err(error).context("cannot read session metadata for Codex cleanup"),
+            };
+            if let Err(error) = cleanup_result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
         if let Some(error) = first_error {
             return Err(error).context("failed to stop all managed sessions");
