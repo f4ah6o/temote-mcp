@@ -351,6 +351,8 @@ enum Message {
     Probe,
     Approval {
         request: Request,
+        #[serde(default)]
+        require_user: bool,
     },
     Activity {
         title: String,
@@ -478,6 +480,30 @@ pub async fn request_with_metadata(
     cwd: PathBuf,
     metadata: BTreeMap<String, String>,
 ) -> Result<bool> {
+    request_with_metadata_mode(session_id, operation, detail, cwd, metadata, false).await
+}
+
+/// Request an approval that must cross the user-approval boundary even when the
+/// Temote session itself is in yolo mode. Delegated child runtimes use this so
+/// Temote's local sandbox bypass does not silently authorize child mutations.
+pub async fn request_user_approval_with_metadata(
+    session_id: &str,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+) -> Result<bool> {
+    request_with_metadata_mode(session_id, operation, detail, cwd, metadata, true).await
+}
+
+async fn request_with_metadata_mode(
+    session_id: &str,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+    require_user: bool,
+) -> Result<bool> {
     let request = Request {
         id: Uuid::new_v4(),
         operation: operation.to_owned(),
@@ -485,7 +511,10 @@ pub async fn request_with_metadata(
         cwd,
         metadata,
     };
-    let message = encode_session_json_line(&Message::Approval { request })?;
+    let message = encode_session_json_line(&Message::Approval {
+        request,
+        require_user,
+    })?;
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
         .await
@@ -1263,7 +1292,10 @@ async fn run_runtime(
                             let _ = stream.shutdown().await;
                         });
                     }
-                    Message::Approval { request } if session.yolo => {
+                    Message::Approval {
+                        request,
+                        require_user: false,
+                    } if session.yolo => {
                         eprintln!(
                             "[session {}] [yolo] allowing {}: {}",
                             session.id,
@@ -1274,7 +1306,10 @@ async fn run_runtime(
                             eprintln!("[session {}] approval client disconnected before response: {error}", session.id);
                         }
                     }
-                    Message::Approval { request } => {
+                    Message::Approval {
+                        request,
+                        require_user: _,
+                    } => {
                         let permit = match Arc::clone(&approval_slots).try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
@@ -3091,6 +3126,7 @@ esac
                 cwd: root.path().to_path_buf(),
                 metadata: BTreeMap::new(),
             },
+            require_user: false,
         };
         let mut approval = UnixStream::connect(&path).await.unwrap();
         let mut bytes = serde_json::to_vec(&request).unwrap();
@@ -3103,6 +3139,57 @@ esac
         assert_eq!(snapshot.id, id);
         assert!(snapshot.yolo);
         assert!(config::session_is_active(&id).await.unwrap());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_user_approval_is_not_auto_allowed_for_yolo_session() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("yolo-child-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approval_channel();
+        let handle = spawn_runtime(root.path(), Some(&id), true, sender)
+            .await
+            .unwrap();
+        let request_id = id.clone();
+        let cwd = root.path().to_path_buf();
+        let pending = tokio::spawn(async move {
+            request_user_approval_with_metadata(
+                &request_id,
+                "Codex command approval",
+                "bounded child command".to_owned(),
+                cwd,
+                BTreeMap::from([("source".to_owned(), "codex_app_server".to_owned())]),
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .expect("yolo child approval must reach the user transport");
+        assert_eq!(prompt.request.operation, "Codex command approval");
+        assert_eq!(prompt.request.metadata["source"], "codex_app_server");
+        prompt.respond(false);
+        assert!(!pending.await.unwrap().unwrap());
+
+        let request_id = id.clone();
+        let cwd = root.path().to_path_buf();
+        let pending = tokio::spawn(async move {
+            request_user_approval_with_metadata(
+                &request_id,
+                "Codex file-change approval",
+                "bounded child file change".to_owned(),
+                cwd,
+                BTreeMap::from([("source".to_owned(), "codex_app_server".to_owned())]),
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .expect("yolo child file approval must reach the user transport");
+        assert_eq!(prompt.request.operation, "Codex file-change approval");
+        prompt.respond(false);
+        assert!(!pending.await.unwrap().unwrap());
         handle.shutdown().await.unwrap();
     }
 

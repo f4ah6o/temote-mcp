@@ -418,6 +418,23 @@ impl SessionSupervisor {
                 eprintln!("failed to persist restart attempt for {id}: {error:#}");
                 continue;
             }
+            let old_session = match config::read_session_metadata(&id).await {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("failed to inspect old session instance for {id}: {error:#}");
+                    if let Err(save_error) = self
+                        .schedule_restart(
+                            &id,
+                            &format!("old session instance inspection failed: {error:#}"),
+                        )
+                        .await
+                    {
+                        eprintln!("failed to schedule another restart for {id}: {save_error:#}");
+                    }
+                    continue;
+                }
+            };
+            crate::codex_app_server::remove_session(&old_session).await;
             if let Err(error) = self
                 .start_resolved(
                     spec.cwd.clone(),
@@ -685,6 +702,14 @@ impl SessionSupervisor {
             "supervisor upgrade is not fenced"
         );
         for planned in &plan.sessions {
+            let session = config::read_session_metadata(&planned.session_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "session {} disappeared before upgrade drain cleanup",
+                        planned.session_id
+                    )
+                })?;
             let handle = self.sessions.lock().await.remove(&planned.session_id);
             let Some(handle) = handle else {
                 anyhow::bail!(
@@ -692,9 +717,9 @@ impl SessionSupervisor {
                     planned.session_id
                 );
             };
-            handle
-                .shutdown()
-                .await
+            let shutdown_result = handle.shutdown().await;
+            crate::codex_app_server::remove_session(&session).await;
+            shutdown_result
                 .with_context(|| format!("failed to drain session {}", planned.session_id))?;
         }
         Ok(())

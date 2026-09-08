@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{approvals, config, evidence};
@@ -29,6 +30,7 @@ const MAX_TASK_RECORD_BYTES: usize = 64 * 1024;
 const MAX_TASK_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_TASKS_PER_SCOPE: usize = 128;
 const MAX_OPERATION_HISTORY: usize = 128;
+const CODEX_APPROVAL_POLICY: &str = "on-request";
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_RPC_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -99,6 +101,7 @@ enum TaskStatus {
     Accepted,
     Running,
     WaitingApproval,
+    RetryableFailed,
     Completed,
     Interrupted,
     Failed,
@@ -112,6 +115,7 @@ impl TaskStatus {
             Self::Accepted => "accepted",
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
+            Self::RetryableFailed => "retryable_failed",
             Self::Completed => "completed",
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
@@ -130,6 +134,7 @@ impl TaskStatus {
 enum OperationPhase {
     Accepted,
     Applied,
+    RetryableFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -151,6 +156,12 @@ struct OperationReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct OperationTombstone {
+    operation_id: Uuid,
+    request_fingerprint: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct TaskRecord {
     schema_version: u64,
     task_id: Uuid,
@@ -168,6 +179,8 @@ struct TaskRecord {
     created_at: u64,
     updated_at: u64,
     operations: Vec<OperationReceipt>,
+    #[serde(default)]
+    operation_tombstones: Vec<OperationTombstone>,
 }
 
 impl TaskRecord {
@@ -182,6 +195,18 @@ impl TaskRecord {
     }
 }
 
+fn update_operation_receipt(record: &mut TaskRecord, operation_id: Uuid, phase: OperationPhase) {
+    let outcome = record.outcome();
+    if let Some(receipt) = record
+        .operations
+        .iter_mut()
+        .find(|receipt| receipt.operation_id == operation_id)
+    {
+        receipt.phase = phase;
+        receipt.outcome = outcome;
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TaskStore {
     directory: PathBuf,
@@ -192,6 +217,7 @@ enum StartAcceptance {
     Accepted(TaskRecord),
 }
 
+#[derive(Debug)]
 enum ControlAcceptance {
     Replay(Value),
     Accepted(Box<TaskRecord>),
@@ -310,10 +336,38 @@ impl TaskStore {
         record: TaskRecord,
     ) -> Result<StartAcceptance> {
         let _guard = store_lock().lock().unwrap();
+        let candidate_receipt = record
+            .operations
+            .first()
+            .context("Codex start acceptance is missing its operation receipt")?;
         match self.read_record(record.task_id) {
-            Ok(existing) => {
+            Ok(mut existing) => {
                 ensure_task_owner(&existing, session)?;
-                Ok(StartAcceptance::Existing(existing))
+                let retryable = existing
+                    .operations
+                    .iter()
+                    .find(|receipt| receipt.operation_id == candidate_receipt.operation_id)
+                    .is_some_and(|receipt| {
+                        receipt.request_fingerprint == candidate_receipt.request_fingerprint
+                            && receipt.action == "start"
+                            && receipt.phase == OperationPhase::RetryableFailed
+                            && existing.status == TaskStatus::RetryableFailed
+                            && existing.thread_id.is_none()
+                    });
+                if retryable {
+                    existing.status = TaskStatus::Accepted;
+                    existing.revision = existing.revision.saturating_add(1);
+                    update_operation_receipt(
+                        &mut existing,
+                        candidate_receipt.operation_id,
+                        OperationPhase::Accepted,
+                    );
+                    existing.updated_at = config::unix_time();
+                    self.save_locked(&existing)?;
+                    Ok(StartAcceptance::Accepted(existing))
+                } else {
+                    Ok(StartAcceptance::Existing(existing))
+                }
             }
             Err(error) if is_not_found(&error) => {
                 self.save_locked(&record)?;
@@ -352,6 +406,19 @@ impl TaskStore {
                 &receipt.outcome,
             )));
         }
+        if let Some(tombstone) = record
+            .operation_tombstones
+            .iter()
+            .find(|tombstone| tombstone.operation_id == operation_id)
+        {
+            anyhow::ensure!(
+                tombstone.request_fingerprint == request_fingerprint,
+                "OPERATION_CONFLICT: operation_id was already accepted with a different request"
+            );
+            anyhow::bail!(
+                "OPERATION_REPLAY_COMPACTED: operation_id was accepted during task retention, but its detailed receipt was compacted; refusing to reapply the mutation"
+            );
+        }
 
         if action == "resume" {
             anyhow::ensure!(
@@ -383,6 +450,13 @@ impl TaskStore {
 
         record.revision = record.revision.saturating_add(1);
         let accepted_outcome = record.outcome();
+        if record.operations.len() >= MAX_OPERATION_HISTORY {
+            let receipt = record.operations.remove(0);
+            record.operation_tombstones.push(OperationTombstone {
+                operation_id: receipt.operation_id,
+                request_fingerprint: receipt.request_fingerprint,
+            });
+        }
         record.operations.push(OperationReceipt {
             operation_id,
             request_fingerprint,
@@ -390,10 +464,6 @@ impl TaskStore {
             phase: OperationPhase::Accepted,
             outcome: accepted_outcome,
         });
-        if record.operations.len() > MAX_OPERATION_HISTORY {
-            let excess = record.operations.len() - MAX_OPERATION_HISTORY;
-            record.operations.drain(..excess);
-        }
         self.save_locked(&record)?;
         Ok(ControlAcceptance::Accepted(Box::new(record)))
     }
@@ -455,21 +525,38 @@ impl TaskStore {
                 continue;
             };
             let expired = now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS;
-            if expired && id != current.task_id {
-                let _ = std::fs::remove_file(entry.path());
+            let runtime_backed = runtime_matches_record(&record);
+            let terminal = record.status.is_terminal();
+            if expired && terminal && !runtime_backed && id != current.task_id {
+                std::fs::remove_file(entry.path())
+                    .with_context(|| format!("cannot prune expired Codex task {id}"))?;
                 continue;
             }
             if record.owner == current.owner && record.scope_cwd == current.scope_cwd {
-                scoped.push((record.updated_at, id, entry.path()));
+                scoped.push((
+                    record.updated_at,
+                    id,
+                    entry.path(),
+                    terminal && !runtime_backed,
+                ));
             }
         }
-        if scoped.len() >= MAX_TASKS_PER_SCOPE {
-            scoped.sort_by_key(|(updated, id, _)| (*updated, *id));
-            let excess = scoped.len() + 1 - MAX_TASKS_PER_SCOPE;
-            for (_, id, path) in scoped.into_iter().take(excess) {
-                if id != current.task_id {
-                    let _ = std::fs::remove_file(path);
-                }
+        let current_is_persisted = scoped.iter().any(|(_, id, _, _)| *id == current.task_id);
+        let projected = scoped.len() + usize::from(!current_is_persisted);
+        if projected > MAX_TASKS_PER_SCOPE {
+            let excess = projected - MAX_TASKS_PER_SCOPE;
+            let mut candidates = scoped
+                .iter()
+                .filter(|(_, id, _, terminal)| *id != current.task_id && *terminal)
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(updated, id, _, _)| (*updated, *id));
+            anyhow::ensure!(
+                candidates.len() >= excess,
+                "Codex task scope has reached its limit with active tasks; refusing to accept another task"
+            );
+            for (_, _, path, _) in candidates.into_iter().take(excess) {
+                std::fs::remove_file(path)
+                    .with_context(|| "cannot prune terminal Codex task".to_owned())?;
             }
         }
         Ok(())
@@ -584,6 +671,17 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
         record.operations.len() <= MAX_OPERATION_HISTORY,
         "Codex task operation history exceeds limit"
     );
+    let mut operation_ids = record
+        .operations
+        .iter()
+        .map(|receipt| receipt.operation_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for tombstone in &record.operation_tombstones {
+        anyhow::ensure!(
+            operation_ids.insert(tombstone.operation_id),
+            "Codex task operation history contains a duplicate operation_id"
+        );
+    }
     if let Some(usage) = &record.usage {
         anyhow::ensure!(
             usage.len() <= TOKEN_USAGE_FIELDS.len()
@@ -672,6 +770,7 @@ fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
 #[derive(Clone)]
 struct RpcClient {
     tx: mpsc::Sender<ClientCommand>,
+    actor: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 enum ClientCommand {
@@ -719,6 +818,10 @@ impl RpcClient {
 
     async fn shutdown(&self) {
         let _ = self.tx.send(ClientCommand::Shutdown).await;
+        let actor = self.actor.lock().unwrap().take();
+        if let Some(actor) = actor {
+            let _ = actor.await;
+        }
     }
 }
 
@@ -736,64 +839,123 @@ fn runtimes() -> &'static Mutex<HashMap<Uuid, RuntimeHandle>> {
 }
 
 fn runtime_for(session: &config::Session, task_id: Uuid) -> Option<RuntimeHandle> {
-    let mut state = runtimes().lock().unwrap();
-    let now = Instant::now();
-    state.retain(|_, runtime| now.saturating_duration_since(runtime.started_at) < CHILD_LIFETIME);
-    let runtime = state.get(&task_id)?.clone();
+    let state = runtimes().lock().unwrap();
+    let runtime = state.get(&task_id)?;
+    if Instant::now().saturating_duration_since(runtime.started_at) >= CHILD_LIFETIME {
+        return None;
+    }
+    let runtime = runtime.clone();
     let scope = config::canonical_directory(&session.cwd).ok()?;
     (runtime.owner.matches(session) && runtime.scope == scope).then_some(runtime)
 }
 
+fn runtime_matches_record(record: &TaskRecord) -> bool {
+    runtimes()
+        .lock()
+        .unwrap()
+        .get(&record.task_id)
+        .is_some_and(|runtime| runtime.owner == record.owner && runtime.scope == record.scope_cwd)
+}
+
 fn insert_runtime(session: &config::Session, task_id: Uuid, client: RpcClient) -> Result<()> {
     let scope = config::canonical_directory(&session.cwd)?;
+    let owner = SessionInstance::from_session(session);
     let runtime = RuntimeHandle {
         client: client.clone(),
-        owner: SessionInstance::from_session(session),
+        owner: owner.clone(),
         scope,
         started_at: Instant::now(),
     };
-    runtimes().lock().unwrap().insert(task_id, runtime);
-    let session_id = session.id.clone();
+    {
+        let _guard = store_lock().lock().unwrap();
+        let mut state = runtimes().lock().unwrap();
+        anyhow::ensure!(
+            !state.contains_key(&task_id),
+            "Codex task runtime is already registered"
+        );
+        state.insert(task_id, runtime);
+    }
     tokio::spawn(async move {
         let session_stopped = tokio::select! {
             _ = tokio::time::sleep(CHILD_LIFETIME) => false,
-            _ = wait_for_session_stop(session_id.clone()) => true,
+            _ = wait_for_session_stop(owner.clone()) => true,
         };
-        let runtime = { runtimes().lock().unwrap().remove(&task_id) };
-        if let Some(runtime) = runtime {
-            runtime.client.shutdown().await;
+        let client = {
+            let _guard = store_lock().lock().unwrap();
+            runtimes()
+                .lock()
+                .unwrap()
+                .get(&task_id)
+                .filter(|runtime| runtime.owner == owner)
+                .map(|runtime| runtime.client.clone())
+        };
+        if let Some(client) = client {
+            client.shutdown().await;
         }
-        if session_stopped {
-            evidence::remove_session(&session_id);
+        {
+            let _guard = store_lock().lock().unwrap();
+            let mut state = runtimes().lock().unwrap();
+            if state
+                .get(&task_id)
+                .is_some_and(|runtime| runtime.owner == owner)
+            {
+                state.remove(&task_id);
+            }
+        }
+        if session_stopped && !active_session_exists(&owner.id).await {
+            evidence::remove_session(&owner.id);
         }
     });
     Ok(())
 }
 
-async fn wait_for_session_stop(session_id: String) {
+async fn wait_for_session_stop(owner: SessionInstance) {
     loop {
-        if let Ok(false) = config::session_is_active(&session_id).await {
+        let same_instance_active = match config::read_session_metadata(&owner.id).await {
+            Ok(session) if owner.matches(&session) => {
+                config::session_is_active(&owner.id).await.unwrap_or(false)
+            }
+            Ok(_) | Err(_) => false,
+        };
+        if !same_instance_active {
             return;
         }
         tokio::time::sleep(SESSION_STOP_POLL).await;
     }
 }
 
-pub(crate) async fn remove_session(session_id: &str) {
+async fn active_session_exists(session_id: &str) -> bool {
+    if config::read_session_metadata(session_id).await.is_err() {
+        // Unknown lifecycle state must not erase evidence that could belong to
+        // a replacement session.
+        return true;
+    }
+    config::session_is_active(session_id).await.unwrap_or(true)
+}
+
+pub(crate) async fn remove_session(session: &config::Session) {
+    let owner = SessionInstance::from_session(session);
     let clients = {
-        let mut state = runtimes().lock().unwrap();
-        let ids = state
-            .iter()
-            .filter_map(|(id, runtime)| (runtime.owner.id == session_id).then_some(*id))
-            .collect::<Vec<_>>();
-        ids.into_iter()
-            .filter_map(|id| state.remove(&id).map(|runtime| runtime.client))
+        let _guard = store_lock().lock().unwrap();
+        let state = runtimes().lock().unwrap();
+        state
+            .values()
+            .filter_map(|runtime| (runtime.owner == owner).then_some(runtime.client.clone()))
             .collect::<Vec<_>>()
     };
     for client in clients {
         client.shutdown().await;
     }
-    evidence::remove_session(session_id);
+    {
+        let _guard = store_lock().lock().unwrap();
+        runtimes()
+            .lock()
+            .unwrap()
+            .retain(|_, runtime| runtime.owner != owner);
+    }
+    if !active_session_exists(&owner.id).await {
+        evidence::remove_session(&owner.id);
+    }
 }
 
 async fn spawn_initialized_client(
@@ -891,8 +1053,11 @@ async fn spawn_client_with_binary(
         .take()
         .context("Codex app-server stdout unavailable")?;
     let (tx, rx) = mpsc::channel(64);
-    tokio::spawn(run_actor(child, stdin, stdout, session, task_id, rx));
-    Ok(RpcClient { tx })
+    let actor = tokio::spawn(run_actor(child, stdin, stdout, session, task_id, rx));
+    Ok(RpcClient {
+        tx,
+        actor: Arc::new(Mutex::new(Some(actor))),
+    })
 }
 
 fn filtered_codex_environment<I>(environment: I) -> Vec<(OsString, OsString)>
@@ -1103,6 +1268,7 @@ fn handle_notification(
         }
         if let Some(status) = status
             && record.status != status
+            && (!record.status.is_terminal() || status.is_terminal())
         {
             record.status = status;
             changed = true;
@@ -1197,26 +1363,22 @@ async fn handle_server_request(
             })?;
             validate_approval_task(session, task_id, &params)?;
             mark_waiting_approval(session, task_id, true);
-            let allowed = if session.yolo {
-                true
-            } else {
-                let (detail, metadata) = child_approval(
-                    "command execution",
-                    "commandExecution",
-                    "command_execution",
-                    task_id,
-                    &params,
-                );
-                approvals::request_with_metadata(
-                    &session.id,
-                    "Codex command approval",
-                    detail,
-                    session.cwd.clone(),
-                    metadata,
-                )
-                .await
-                .unwrap_or(false)
-            };
+            let (detail, metadata) = child_approval(
+                "command execution",
+                "commandExecution",
+                "command_execution",
+                task_id,
+                &params,
+            );
+            let allowed = approvals::request_user_approval_with_metadata(
+                &session.id,
+                "Codex command approval",
+                detail,
+                session.cwd.clone(),
+                metadata,
+            )
+            .await
+            .unwrap_or(false);
             mark_waiting_approval(session, task_id, false);
             Ok(json!({"decision": if allowed { "accept" } else { "decline" }}))
         }
@@ -1229,21 +1391,17 @@ async fn handle_server_request(
             })?;
             validate_approval_task(session, task_id, &params)?;
             mark_waiting_approval(session, task_id, true);
-            let allowed = if session.yolo {
-                true
-            } else {
-                let (detail, metadata) =
-                    child_approval("file change", "fileChange", "file_change", task_id, &params);
-                approvals::request_with_metadata(
-                    &session.id,
-                    "Codex file-change approval",
-                    detail,
-                    session.cwd.clone(),
-                    metadata,
-                )
-                .await
-                .unwrap_or(false)
-            };
+            let (detail, metadata) =
+                child_approval("file change", "fileChange", "file_change", task_id, &params);
+            let allowed = approvals::request_user_approval_with_metadata(
+                &session.id,
+                "Codex file-change approval",
+                detail,
+                session.cwd.clone(),
+                metadata,
+            )
+            .await
+            .unwrap_or(false);
             mark_waiting_approval(session, task_id, false);
             Ok(json!({"decision": if allowed { "accept" } else { "decline" }}))
         }
@@ -1429,6 +1587,9 @@ fn internal_server_error(error: anyhow::Error) -> (i64, String) {
 fn mark_waiting_approval(session: &config::Session, task_id: Uuid, waiting: bool) {
     if let Ok(store) = TaskStore::default_store() {
         let _ = store.update(session, task_id, |record| {
+            if record.status.is_terminal() {
+                return Ok(());
+            }
             record.status = if waiting {
                 TaskStatus::WaitingApproval
             } else if matches!(record.status, TaskStatus::WaitingApproval) {
@@ -1514,6 +1675,16 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
 }
 
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
+    let store = TaskStore::default_store()?;
+    task_start_with_store_and_binary(args, session, &store, Path::new("codex")).await
+}
+
+async fn task_start_with_store_and_binary(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+) -> Result<Value> {
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
     let model = required_string(args, "model")?;
@@ -1530,8 +1701,6 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
         "model": model,
         "effort": effort,
     }))?;
-    let store = TaskStore::default_store()?;
-
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
@@ -1549,6 +1718,7 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
         created_at: now,
         updated_at: now,
         operations: Vec::new(),
+        operation_tombstones: Vec::new(),
     };
     record.operations.push(OperationReceipt {
         operation_id,
@@ -1564,12 +1734,17 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
         StartAcceptance::Accepted(record) => record,
     };
 
-    let (client, _) = match spawn_initialized_client(session, Some(task_id)).await {
+    let (client, _) = match spawn_initialized_client_with_binary(session, Some(task_id), binary)
+        .await
+    {
         Ok(client) => client,
         Err(_) => {
             let record = store.update(session, task_id, |record| {
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
+                if !record.status.is_terminal() {
+                    record.status = TaskStatus::RetryableFailed;
+                    record.revision = record.revision.saturating_add(1);
+                    update_operation_receipt(record, operation_id, OperationPhase::RetryableFailed);
+                }
                 Ok(())
             })?;
             return Ok(task_view(&record, None));
@@ -1583,16 +1758,10 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
         Err(_) => {
             client.shutdown().await;
             let record = store.update(session, task_id, |record| {
-                record.status = TaskStatus::Failed;
-                record.revision = record.revision.saturating_add(1);
-                let outcome = record.outcome();
-                if let Some(receipt) = record
-                    .operations
-                    .iter_mut()
-                    .find(|receipt| receipt.operation_id == operation_id)
-                {
-                    receipt.phase = OperationPhase::Applied;
-                    receipt.outcome = outcome;
+                if !record.status.is_terminal() {
+                    record.status = TaskStatus::RetryableFailed;
+                    record.revision = record.revision.saturating_add(1);
+                    update_operation_receipt(record, operation_id, OperationPhase::RetryableFailed);
                 }
                 Ok(())
             })?;
@@ -1602,16 +1771,10 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
     if validate_model_request(&models, model, effort).is_err() {
         client.shutdown().await;
         let record = store.update(session, task_id, |record| {
-            record.status = TaskStatus::Failed;
-            record.revision = record.revision.saturating_add(1);
-            let outcome = record.outcome();
-            if let Some(receipt) = record
-                .operations
-                .iter_mut()
-                .find(|receipt| receipt.operation_id == operation_id)
-            {
-                receipt.phase = OperationPhase::Applied;
-                receipt.outcome = outcome;
+            if !record.status.is_terminal() {
+                record.status = TaskStatus::Failed;
+                record.revision = record.revision.saturating_add(1);
+                update_operation_receipt(record, operation_id, OperationPhase::Applied);
             }
             Ok(())
         })?;
@@ -1626,7 +1789,7 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
                 json!({
                     "cwd": cwd,
                     "model": model,
-                    "approvalPolicy": if session.yolo { "never" } else { "on-request" },
+                    "approvalPolicy": CODEX_APPROVAL_POLICY,
                     "approvalsReviewer": "user",
                     "sandbox": "workspaceWrite",
                     "runtimeWorkspaceRoots": [record.scope_cwd],
@@ -1657,7 +1820,7 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
                     "model": model,
                     "effort": effort,
                     "cwd": cwd,
-                    "approvalPolicy": if session.yolo { "never" } else { "on-request" },
+                    "approvalPolicy": CODEX_APPROVAL_POLICY,
                     "sandboxPolicy": {
                         "type": "workspaceWrite",
                         "writableRoots": [record.scope_cwd],
@@ -1693,11 +1856,7 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
             }
             record.generation = 1;
             record.revision = record.revision.saturating_add(1);
-            let outcome = record.outcome();
-            if let Some(receipt) = record.operations.last_mut() {
-                receipt.phase = OperationPhase::Applied;
-                receipt.outcome = outcome;
-            }
+            update_operation_receipt(record, operation_id, OperationPhase::Applied);
             Ok(())
         })?;
         Result::<()>::Ok(())
@@ -1707,23 +1866,44 @@ pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Resul
     if let Err(_error) = start_result {
         client.shutdown().await;
         let record = store.update(session, task_id, |record| {
-            record.status = TaskStatus::ReconciliationRequired;
-            record.revision = record.revision.saturating_add(1);
+            if !record.status.is_terminal() {
+                record.status = TaskStatus::ReconciliationRequired;
+                record.revision = record.revision.saturating_add(1);
+                update_operation_receipt(record, operation_id, OperationPhase::Accepted);
+            }
             Ok(())
         })?;
         return Ok(task_view(&record, None));
     }
 
-    insert_runtime(session, task_id, client)?;
+    if let Err(error) = insert_runtime(session, task_id, client.clone()) {
+        client.shutdown().await;
+        return Err(error);
+    }
     Ok(task_view(&record, None))
 }
 
 fn replay_operation(record: &TaskRecord, operation_id: Uuid, fingerprint: Uuid) -> Result<Value> {
-    let receipt = record
+    let Some(receipt) = record
         .operations
         .iter()
         .find(|receipt| receipt.operation_id == operation_id)
-        .context("OPERATION_CONFLICT: task exists without the requested operation receipt")?;
+    else {
+        if let Some(tombstone) = record
+            .operation_tombstones
+            .iter()
+            .find(|tombstone| tombstone.operation_id == operation_id)
+        {
+            anyhow::ensure!(
+                tombstone.request_fingerprint == fingerprint,
+                "OPERATION_CONFLICT: operation_id was already accepted with a different request"
+            );
+            anyhow::bail!(
+                "OPERATION_REPLAY_COMPACTED: operation_id was accepted during task retention, but its detailed receipt was compacted; refusing to reapply the mutation"
+            );
+        }
+        anyhow::bail!("OPERATION_CONFLICT: task exists without the requested operation receipt");
+    };
     anyhow::ensure!(
         receipt.request_fingerprint == fingerprint,
         "OPERATION_CONFLICT: operation_id was already accepted with a different request"
@@ -1737,34 +1917,46 @@ fn replay_operation(record: &TaskRecord, operation_id: Uuid, fingerprint: Uuid) 
 }
 
 pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<Value> {
+    let store = TaskStore::default_store()?;
+    task_get_with_store_and_binary(args, session, &store, Path::new("codex")).await
+}
+
+async fn task_get_with_store_and_binary(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+) -> Result<Value> {
     let task_id = required_uuid(args, "task_id")?;
     let after_revision = optional_u64(args, "after_revision")?;
-    let store = TaskStore::default_store()?;
     let mut record = store.load(session, task_id)?;
-    if after_revision == Some(record.revision) && record.status != TaskStatus::Accepted {
-        return Ok(json!({
-            "task_id": task_id,
-            "status": "not_modified",
-            "revision": record.revision,
-        }));
-    }
     if record.thread_id.is_none() {
         if record.status == TaskStatus::Accepted {
+            let start_operation_id = record
+                .operations
+                .iter()
+                .find(|receipt| receipt.action == "start")
+                .map(|receipt| receipt.operation_id);
             record = store.update(session, task_id, |record| {
                 record.status = TaskStatus::ReconciliationRequired;
                 record.revision = record.revision.saturating_add(1);
+                if let Some(operation_id) = start_operation_id {
+                    update_operation_receipt(record, operation_id, OperationPhase::Accepted);
+                }
                 Ok(())
             })?;
         }
         return Ok(task_view(&record, None));
     }
 
-    let client = match ensure_runtime(session, &record).await {
+    let client = match ensure_runtime_with_binary(session, &record, binary).await {
         Ok(client) => client,
         Err(_) => {
             record = store.update(session, task_id, |record| {
-                record.status = TaskStatus::Unknown;
-                record.revision = record.revision.saturating_add(1);
+                if !record.status.is_terminal() {
+                    record.status = TaskStatus::Unknown;
+                    record.revision = record.revision.saturating_add(1);
+                }
                 Ok(())
             })?;
             return Ok(task_view(&record, None));
@@ -1781,8 +1973,10 @@ pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<
         Ok(response) => response,
         Err(_) => {
             let record = store.update(session, task_id, |record| {
-                record.status = TaskStatus::Unknown;
-                record.revision = record.revision.saturating_add(1);
+                if !record.status.is_terminal() {
+                    record.status = TaskStatus::Unknown;
+                    record.revision = record.revision.saturating_add(1);
+                }
                 Ok(())
             })?;
             return Ok(task_view(&record, None));
@@ -1796,19 +1990,22 @@ pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<
         Ok(derived) => derived,
         Err(_) => {
             record = store.update(session, task_id, |record| {
-                record.status = TaskStatus::Unknown;
-                record.revision = record.revision.saturating_add(1);
+                if !record.status.is_terminal() {
+                    record.status = TaskStatus::Unknown;
+                    record.revision = record.revision.saturating_add(1);
+                }
                 Ok(())
             })?;
             return Ok(task_view(&record, evidence_ref.as_ref()));
         }
     };
-    let changed = record.status != derived.status
+    let reconciled_status = reconciled_task_status(record.status, derived.status);
+    let changed = record.status != reconciled_status
         || record.turn_id != derived.turn_id
         || (derived.usage.is_some() && record.usage != derived.usage);
     if changed || (record.generation == 0 && derived.turn_id.is_some()) {
         record = store.update(session, task_id, |record| {
-            record.status = derived.status;
+            record.status = reconciled_task_status(record.status, derived.status);
             if derived.turn_id.is_some() {
                 record.turn_id = derived.turn_id.clone();
                 if record.generation == 0 {
@@ -1839,6 +2036,14 @@ pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<
         }));
     }
     Ok(task_view(&record, evidence_ref.as_ref()))
+}
+
+fn reconciled_task_status(current: TaskStatus, derived: TaskStatus) -> TaskStatus {
+    if current.is_terminal() && !derived.is_terminal() {
+        current
+    } else {
+        derived
+    }
 }
 
 struct DerivedThreadState {
@@ -1919,10 +2124,19 @@ fn extract_usage_from_turn(turn: &Value) -> Option<BTreeMap<String, u64>> {
 }
 
 async fn ensure_runtime(session: &config::Session, record: &TaskRecord) -> Result<RpcClient> {
+    ensure_runtime_with_binary(session, record, Path::new("codex")).await
+}
+
+async fn ensure_runtime_with_binary(
+    session: &config::Session,
+    record: &TaskRecord,
+    binary: &Path,
+) -> Result<RpcClient> {
     if let Some(runtime) = runtime_for(session, record.task_id) {
         return Ok(runtime.client);
     }
-    let (client, _) = spawn_initialized_client(session, Some(record.task_id)).await?;
+    let (client, _) =
+        spawn_initialized_client_with_binary(session, Some(record.task_id), binary).await?;
     let thread_id = record
         .thread_id
         .as_deref()
@@ -1934,7 +2148,7 @@ async fn ensure_runtime(session: &config::Session, record: &TaskRecord) -> Resul
                 "threadId": thread_id,
                 "cwd": record.scope_cwd,
                 "model": record.model,
-                "approvalPolicy": if session.yolo { "never" } else { "on-request" },
+                "approvalPolicy": CODEX_APPROVAL_POLICY,
                 "approvalsReviewer": "user",
                 "sandbox": "workspaceWrite",
                 "runtimeWorkspaceRoots": [record.scope_cwd],
@@ -1946,7 +2160,10 @@ async fn ensure_runtime(session: &config::Session, record: &TaskRecord) -> Resul
         client.shutdown().await;
         return Err(error).context("Codex task could not resume its retained thread");
     }
-    insert_runtime(session, record.task_id, client.clone())?;
+    if let Err(error) = insert_runtime(session, record.task_id, client.clone()) {
+        client.shutdown().await;
+        return Err(error);
+    }
     Ok(client)
 }
 
@@ -1989,8 +2206,10 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
         Ok(client) => client,
         Err(_) => {
             let record = store.update(session, task_id, |record| {
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
+                if !record.status.is_terminal() {
+                    record.status = TaskStatus::ReconciliationRequired;
+                    record.revision = record.revision.saturating_add(1);
+                }
                 Ok(())
             })?;
             return Ok(task_view(&record, None));
@@ -2027,8 +2246,10 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
     };
     if result.is_err() {
         let record = store.update(session, task_id, |record| {
-            record.status = TaskStatus::ReconciliationRequired;
-            record.revision = record.revision.saturating_add(1);
+            if !record.status.is_terminal() {
+                record.status = TaskStatus::ReconciliationRequired;
+                record.revision = record.revision.saturating_add(1);
+            }
             Ok(())
         })?;
         return Ok(task_view(&record, None));
@@ -2043,8 +2264,10 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
             Ok(state) => Some(state),
             Err(_) => {
                 let record = store.update(session, task_id, |record| {
-                    record.status = TaskStatus::ReconciliationRequired;
-                    record.revision = record.revision.saturating_add(1);
+                    if !record.status.is_terminal() {
+                        record.status = TaskStatus::ReconciliationRequired;
+                        record.revision = record.revision.saturating_add(1);
+                    }
                     Ok(())
                 })?;
                 return Ok(task_view(&record, None));
@@ -2055,7 +2278,7 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
     };
     record = store.update(session, task_id, |record| {
         if let Some(resumed) = resumed.as_ref() {
-            record.status = resumed.status;
+            record.status = reconciled_task_status(record.status, resumed.status);
             if resumed.turn_id.is_some() {
                 record.turn_id = resumed.turn_id.clone();
                 record.generation = record.generation.max(1);
@@ -2141,10 +2364,23 @@ for raw in sys.stdin:
     if method == 'initialize':
         result = {'userAgent':'codex_cli_rs/0.153.4 (temote-mcp; test)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'macos'}
     elif method == 'model/list':
-        result = {'data':[{'model':'gpt-5.6-luna','id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'xhigh'}]}]}
+        if mode == 'model-fail':
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'model list unavailable'}}), flush=True)
+            continue
+        model = 'other-model' if mode == 'invalid-model' else 'gpt-5.6-luna'
+        result = {'data':[{'model':model,'id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'xhigh'}]}]}
     elif method == 'thread/start':
+        if mode == 'thread-uncertain':
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'thread start response lost'}}), flush=True)
+            continue
+        if mode == 'reject-never' and req.get('params',{}).get('approvalPolicy') == 'never':
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'never approval policy rejected'}}), flush=True)
+            continue
         result = {'thread':{'id':thread_id}}
     elif method == 'turn/start':
+        if mode == 'reject-never' and req.get('params',{}).get('approvalPolicy') == 'never':
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'never approval policy rejected'}}), flush=True)
+            continue
         if mode == 'approval':
             print(json.dumps({'id':'approval-1','method':'item/commandExecution/requestApproval','params':{'itemId':'item','startedAtMs':1,'threadId':thread_id,'turnId':turn_id}}), flush=True)
             approval = json.loads(sys.stdin.readline())
@@ -2153,6 +2389,9 @@ for raw in sys.stdin:
                 continue
         result = {'turn':{'id':turn_id}}
     elif method == 'thread/resume':
+        if mode == 'reject-never' and req.get('params',{}).get('approvalPolicy') == 'never':
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'never approval policy rejected'}}), flush=True)
+            continue
         result = {'thread':{'id':thread_id}}
     elif method == 'thread/read':
         result = {'thread':{'id':thread_id,'status':{'type':'idle'},'tokenUsage':{'inputTokens':4,'cachedInputTokens':1,'outputTokens':2,'reasoningOutputTokens':1,'totalTokens':6},'turns':[{'id':turn_id,'status':'completed','items':[{'type':'agentMessage','id':'m','text':'secret transcript marker'}]}]}}
@@ -2168,6 +2407,70 @@ for raw in sys.stdin:
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    fn task_record(
+        owner: &config::Session,
+        task_id: Uuid,
+        status: TaskStatus,
+        revision: u64,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> TaskRecord {
+        let now = config::unix_time();
+        TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(owner),
+            scope_cwd: owner.cwd.clone(),
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "max".to_owned(),
+            status,
+            revision,
+            generation: u64::from(thread_id.is_some()),
+            thread_id: thread_id.map(str::to_owned),
+            turn_id: turn_id.map(str::to_owned),
+            usage: None,
+            created_at: now,
+            updated_at: now,
+            operations: Vec::new(),
+            operation_tombstones: Vec::new(),
+        }
+    }
+
+    fn start_receipt(
+        operation_id: Uuid,
+        request_fingerprint: Uuid,
+        phase: OperationPhase,
+        outcome: OperationOutcome,
+    ) -> OperationReceipt {
+        OperationReceipt {
+            operation_id,
+            request_fingerprint,
+            action: "start".to_owned(),
+            phase,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn reconciliation_never_regresses_a_terminal_task() {
+        assert_eq!(
+            reconciled_task_status(TaskStatus::Completed, TaskStatus::Running),
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            reconciled_task_status(TaskStatus::Interrupted, TaskStatus::WaitingApproval),
+            TaskStatus::Interrupted
+        );
+        assert_eq!(
+            reconciled_task_status(TaskStatus::Failed, TaskStatus::Unknown),
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            reconciled_task_status(TaskStatus::Running, TaskStatus::Completed),
+            TaskStatus::Completed
+        );
     }
 
     #[test]
@@ -2207,6 +2510,7 @@ for raw in sys.stdin:
                     turn_id: None,
                 },
             }],
+            operation_tombstones: Vec::new(),
         };
         store.save(&record).unwrap();
         let bytes = std::fs::read(store.path(task_id)).unwrap();
@@ -2257,10 +2561,152 @@ for raw in sys.stdin:
                     turn_id: None,
                 },
             }],
+            operation_tombstones: Vec::new(),
         };
         let replay = replay_operation(&record, operation_id, fp).unwrap();
         assert_eq!(replay["status"], "reconciliation_required");
         assert!(replay_operation(&record, operation_id, Uuid::new_v4()).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_runtime_cleanup_is_instance_fenced_and_waits_for_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let old = session(root.path(), "runtime-owner", false);
+        let mut replacement = old.clone();
+        replacement.started_at += 1;
+        replacement.process_id += 1;
+        let old_task = Uuid::new_v4();
+        let replacement_task = Uuid::new_v4();
+
+        let (old_commands, mut old_receiver) = tokio::sync::mpsc::channel(1);
+        let (old_stopped, old_stopped_receiver) = oneshot::channel();
+        let old_actor = tokio::spawn(async move {
+            if matches!(old_receiver.recv().await, Some(ClientCommand::Shutdown)) {
+                let _ = old_stopped.send(());
+            }
+        });
+        let old_client = RpcClient {
+            tx: old_commands,
+            actor: Arc::new(Mutex::new(Some(old_actor))),
+        };
+
+        let (replacement_commands, mut replacement_receiver) = tokio::sync::mpsc::channel(1);
+        let replacement_actor = tokio::spawn(async move {
+            let _ = replacement_receiver.recv().await;
+        });
+        let replacement_client = RpcClient {
+            tx: replacement_commands,
+            actor: Arc::new(Mutex::new(Some(replacement_actor))),
+        };
+
+        runtimes().lock().unwrap().insert(
+            old_task,
+            RuntimeHandle {
+                client: old_client,
+                owner: SessionInstance::from_session(&old),
+                scope: old.cwd.clone(),
+                started_at: Instant::now(),
+            },
+        );
+        runtimes().lock().unwrap().insert(
+            replacement_task,
+            RuntimeHandle {
+                client: replacement_client,
+                owner: SessionInstance::from_session(&replacement),
+                scope: replacement.cwd.clone(),
+                started_at: Instant::now(),
+            },
+        );
+
+        remove_session(&old).await;
+        tokio::time::timeout(Duration::from_secs(1), old_stopped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(runtime_for(&old, old_task).is_none());
+        assert!(runtime_for(&replacement, replacement_task).is_some());
+
+        remove_session(&replacement).await;
+    }
+
+    #[tokio::test]
+    async fn managed_session_restart_removes_old_codex_runtime_before_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = config::canonical_directory(root.path()).unwrap();
+        let roots = crate::named_roots::NamedRoots::from_canonical_roots(
+            std::collections::BTreeMap::from([("src".to_owned(), canonical)]),
+        )
+        .unwrap();
+        let (supervisor, _approval_receiver) = crate::supervisor::SessionSupervisor::new(roots);
+        let id = format!("restart-runtime-{}", Uuid::new_v4());
+        supervisor
+            .start_public_with_environment(
+                "src",
+                Some(&id),
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        let old_session = config::read_session_metadata(&id).await.unwrap();
+        let task_id = Uuid::new_v4();
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (stopped, stopped_receiver) = oneshot::channel();
+        let actor = tokio::spawn(async move {
+            if matches!(receiver.recv().await, Some(ClientCommand::Shutdown)) {
+                let _ = stopped.send(());
+            }
+        });
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: RpcClient {
+                    tx: commands,
+                    actor: Arc::new(Mutex::new(Some(actor))),
+                },
+                owner: SessionInstance::from_session(&old_session),
+                scope: old_session.cwd.clone(),
+                started_at: Instant::now(),
+            },
+        );
+
+        let backend = crate::session_control::SessionBackend::in_process(Arc::clone(&supervisor));
+        backend.restart(&id).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(runtime_for(&old_session, task_id).is_none());
+        assert!(config::session_is_active(&id).await.unwrap());
+
+        supervisor.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_file(config::socket_path(&id).unwrap()).await;
+        let _ = tokio::fs::remove_file(config::session_path(&id).unwrap()).await;
+        let _ = tokio::fs::remove_file(config::session_lifecycle_path(&id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn yolo_task_keeps_codex_approval_policy_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "yolo-codex-policy", true);
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "run the bounded test",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let result = task_start_with_store_and_binary(
+            &args,
+            &session,
+            &store,
+            &fake_app_server(root.path(), "reject-never"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"], "running");
+        remove_session(&session).await;
     }
 
     #[test]
@@ -2301,6 +2747,7 @@ for raw in sys.stdin:
                     turn_id: None,
                 },
             }],
+            operation_tombstones: Vec::new(),
         };
         let barrier = Arc::new(Barrier::new(3));
         let (sender, receiver) = mpsc::channel();
@@ -2357,6 +2804,7 @@ for raw in sys.stdin:
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
+            operation_tombstones: Vec::new(),
         };
         store.save(&record).unwrap();
         let barrier = Arc::new(Barrier::new(3));
@@ -2423,6 +2871,7 @@ for raw in sys.stdin:
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
+            operation_tombstones: Vec::new(),
         };
         store.save(&record).unwrap();
         let barrier = Arc::new(Barrier::new(3));
@@ -2507,6 +2956,7 @@ for raw in sys.stdin:
             created_at: config::unix_time(),
             updated_at: config::unix_time(),
             operations: Vec::new(),
+            operation_tombstones: Vec::new(),
         };
         store.save(&record).unwrap();
 
@@ -2522,6 +2972,451 @@ for raw in sys.stdin:
         };
         assert!(error.to_string().contains("not active"));
         assert!(store.load(&owner, task_id).unwrap().operations.is_empty());
+    }
+
+    #[test]
+    fn task_store_refuses_capacity_when_all_scoped_tasks_are_active() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "active-capacity", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let mut ids = Vec::new();
+        for _ in 0..MAX_TASKS_PER_SCOPE {
+            let task_id = Uuid::new_v4();
+            ids.push(task_id);
+            store
+                .save(&task_record(
+                    &owner,
+                    task_id,
+                    TaskStatus::Running,
+                    1,
+                    Some("thread"),
+                    Some("turn"),
+                ))
+                .unwrap();
+        }
+        let candidate = task_record(&owner, Uuid::new_v4(), TaskStatus::Accepted, 1, None, None);
+        let error = store.save(&candidate).unwrap_err();
+        assert!(error.to_string().contains("active tasks"));
+        for task_id in ids {
+            assert_eq!(
+                store.load(&owner, task_id).unwrap().status,
+                TaskStatus::Running
+            );
+        }
+        let persisted_count = std::fs::read_dir(&store.directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .count();
+        assert_eq!(persisted_count, MAX_TASKS_PER_SCOPE);
+    }
+
+    #[test]
+    fn task_store_prunes_only_terminal_and_expired_records() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "terminal-capacity", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let terminal_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                terminal_id,
+                TaskStatus::Completed,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+        for _ in 0..MAX_TASKS_PER_SCOPE - 1 {
+            store
+                .save(&task_record(
+                    &owner,
+                    Uuid::new_v4(),
+                    TaskStatus::Running,
+                    1,
+                    Some("thread"),
+                    Some("turn"),
+                ))
+                .unwrap();
+        }
+        let candidate_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                candidate_id,
+                TaskStatus::Running,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+        assert!(store.load(&owner, terminal_id).is_err());
+        assert_eq!(
+            store.load(&owner, candidate_id).unwrap().status,
+            TaskStatus::Running
+        );
+
+        let expired_store_root = tempfile::tempdir().unwrap();
+        let expired_store = TaskStore::new(expired_store_root.path().join("tasks"));
+        let expired_id = Uuid::new_v4();
+        let mut expired = task_record(
+            &owner,
+            expired_id,
+            TaskStatus::Completed,
+            1,
+            Some("thread"),
+            Some("turn"),
+        );
+        expired.updated_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS + 1);
+        expired_store.save(&expired).unwrap();
+        let fresh_id = Uuid::new_v4();
+        expired_store
+            .save(&task_record(
+                &owner,
+                fresh_id,
+                TaskStatus::Running,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+        assert!(expired_store.load(&owner, expired_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn task_store_does_not_prune_terminal_runtime_backed_records() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "runtime-backed-prune", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let runtime_task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                runtime_task_id,
+                TaskStatus::Completed,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (stopped, stopped_receiver) = oneshot::channel();
+        let actor = tokio::spawn(async move {
+            if matches!(receiver.recv().await, Some(ClientCommand::Shutdown)) {
+                let _ = stopped.send(());
+            }
+        });
+        runtimes().lock().unwrap().insert(
+            runtime_task_id,
+            RuntimeHandle {
+                client: RpcClient {
+                    tx: commands,
+                    actor: Arc::new(Mutex::new(Some(actor))),
+                },
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                started_at: Instant::now(),
+            },
+        );
+
+        for _ in 0..MAX_TASKS_PER_SCOPE - 1 {
+            store
+                .save(&task_record(
+                    &owner,
+                    Uuid::new_v4(),
+                    TaskStatus::Running,
+                    1,
+                    Some("thread"),
+                    Some("turn"),
+                ))
+                .unwrap();
+        }
+        let candidate = task_record(&owner, Uuid::new_v4(), TaskStatus::Running, 1, None, None);
+        let error = store.save(&candidate).unwrap_err();
+        assert!(error.to_string().contains("active tasks"));
+        assert_eq!(
+            store.load(&owner, runtime_task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+        assert!(runtime_for(&owner, runtime_task_id).is_some());
+
+        remove_session(&owner).await;
+        tokio::time::timeout(Duration::from_secs(1), stopped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn compacted_operation_receipts_remain_idempotent_for_task_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "operation-retention", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            1,
+            Some("thread"),
+            Some("turn"),
+        );
+        let start_id = Uuid::new_v4();
+        let start_fingerprint = fingerprint(&json!({"kind":"start"})).unwrap();
+        record.operations.push(start_receipt(
+            start_id,
+            start_fingerprint,
+            OperationPhase::Applied,
+            record.outcome(),
+        ));
+        store.save(&record).unwrap();
+
+        let mut first_control = None;
+        for index in 0..(MAX_OPERATION_HISTORY + 8) {
+            let operation_id = Uuid::new_v4();
+            let request_fingerprint = fingerprint(&json!({"index":index})).unwrap();
+            if first_control.is_none() {
+                first_control = Some((operation_id, request_fingerprint));
+            }
+            let accepted = store
+                .accept_control(
+                    &owner,
+                    task_id,
+                    operation_id,
+                    request_fingerprint,
+                    "interrupt",
+                )
+                .unwrap();
+            assert!(matches!(accepted, ControlAcceptance::Accepted(_)));
+        }
+        let persisted = store.load(&owner, task_id).unwrap();
+        let (old_operation_id, old_fingerprint) = first_control.unwrap();
+        assert!(
+            persisted
+                .operation_tombstones
+                .iter()
+                .any(|tombstone| tombstone.operation_id == old_operation_id)
+        );
+        let exact_error = store
+            .accept_control(
+                &owner,
+                task_id,
+                old_operation_id,
+                old_fingerprint,
+                "interrupt",
+            )
+            .unwrap_err();
+        assert!(
+            exact_error
+                .to_string()
+                .contains("OPERATION_REPLAY_COMPACTED")
+        );
+        let conflict = store
+            .accept_control(
+                &owner,
+                task_id,
+                old_operation_id,
+                Uuid::new_v4(),
+                "interrupt",
+            )
+            .unwrap_err();
+        assert!(conflict.to_string().contains("OPERATION_CONFLICT"));
+        assert_eq!(
+            store
+                .load(&owner, task_id)
+                .unwrap()
+                .operation_tombstones
+                .len(),
+            persisted.operation_tombstones.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn task_get_reconciles_remote_completion_before_not_modified() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (approval_sender, _approval_receiver) = approvals::approval_channel();
+        let session_handle =
+            approvals::spawn_runtime(root.path(), Some("reconcile-get"), true, approval_sender)
+                .await
+                .unwrap();
+        let owner = config::read_session_metadata("reconcile-get")
+            .await
+            .unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+            Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"),
+        );
+        record.operations.push(start_receipt(
+            operation_id,
+            fingerprint(&json!({"kind":"reconcile"})).unwrap(),
+            OperationPhase::Applied,
+            record.outcome(),
+        ));
+        store.save(&record).unwrap();
+        let result = task_get_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "after_revision": 7
+            }),
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "reject-never"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"], "completed");
+        assert!(result["revision"].as_u64().unwrap() > 7);
+        assert_ne!(result["status"], "not_modified");
+        remove_session(&owner).await;
+        session_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_thread_startup_failure_can_retry_same_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "retryable-start", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "retry after startup",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let missing = root.path().join("does-not-exist");
+        let first = task_start_with_store_and_binary(&args, &owner, &store, &missing)
+            .await
+            .unwrap();
+        assert_eq!(first["status"], "retryable_failed");
+        assert_eq!(
+            store
+                .load(&owner, task_id_for_operation(&owner, operation_id).unwrap())
+                .unwrap()
+                .operations[0]
+                .phase,
+            OperationPhase::RetryableFailed
+        );
+
+        let binary = fake_app_server(root.path(), "ok");
+        let second = task_start_with_store_and_binary(&args, &owner, &store, &binary)
+            .await
+            .unwrap();
+        assert_eq!(second["status"], "running");
+        assert!(second["thread_id"].as_str().is_some());
+        remove_session(&owner).await;
+    }
+
+    #[tokio::test]
+    async fn pre_thread_model_failure_retries_but_invalid_model_is_deterministic() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "retryable-model", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+
+        let transient_id = Uuid::new_v4();
+        let transient_args = json!({
+            "operation_id": transient_id,
+            "task": "retry model list",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let first = task_start_with_store_and_binary(
+            &transient_args,
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "model-fail"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["status"], "retryable_failed");
+        let retry = task_start_with_store_and_binary(
+            &transient_args,
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "ok"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry["status"], "running");
+        remove_session(&owner).await;
+
+        let deterministic_id = Uuid::new_v4();
+        let deterministic_args = json!({
+            "operation_id": deterministic_id,
+            "task": "invalid model",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let failed = task_start_with_store_and_binary(
+            &deterministic_args,
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "invalid-model"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed["status"], "failed");
+        let replay = task_start_with_store_and_binary(
+            &deterministic_args,
+            &owner,
+            &store,
+            &root.path().join("never-spawned"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn uncertain_thread_start_failure_is_not_blindly_replayed() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "uncertain-thread", true);
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "uncertain thread",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let first = task_start_with_store_and_binary(
+            &args,
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "thread-uncertain"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["status"], "reconciliation_required");
+        let retry = task_start_with_store_and_binary(
+            &args,
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "ok"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry["status"], "reconciliation_required");
+        assert!(
+            runtime_for(&owner, task_id_for_operation(&owner, operation_id).unwrap()).is_none()
+        );
     }
 
     #[test]
