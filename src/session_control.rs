@@ -953,7 +953,7 @@ async fn handle_upgrade_request(
         "error": Value::Null
     });
     if let Err(error) = stream.write_all(&encode_line(&response)?).await {
-        let rollback = supervisor.rollback_upgrade(&plan).await;
+        let rollback = supervisor.rollback_upgrade(&plan, true).await;
         let _ = remove_upgrade_plan(&plan_path);
         return match rollback {
             Ok(()) => Err(error)
@@ -966,10 +966,11 @@ async fn handle_upgrade_request(
     let _ = stream.shutdown().await;
 
     if let Err(error) = supervisor.drain_for_upgrade(&plan).await {
-        let rollback = supervisor.rollback_upgrade(&plan).await;
+        let rollback = supervisor.rollback_upgrade(&plan, false).await;
         let _ = remove_upgrade_plan(&plan_path);
         return match rollback {
-            Ok(()) => Err(error).context("supervisor upgrade drain failed; sessions were restored"),
+            Ok(()) => Err(error)
+                .context("supervisor upgrade drain failed; replacement startup was blocked"),
             Err(rollback) => Err(anyhow::anyhow!(
                 "supervisor upgrade drain failed: {error:#}; rollback also failed: {rollback:#}"
             )),
@@ -986,7 +987,7 @@ async fn handle_upgrade_request(
     #[cfg(target_os = "linux")]
     drop(_exec_credential_handoff);
 
-    let rollback = supervisor.rollback_upgrade(&plan).await;
+    let rollback = supervisor.rollback_upgrade(&plan, true).await;
     let _ = remove_upgrade_plan(&plan_path);
     match rollback {
         Ok(()) => {

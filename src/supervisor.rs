@@ -744,7 +744,11 @@ impl SessionSupervisor {
         Ok(())
     }
 
-    pub async fn rollback_upgrade(&self, plan: &SupervisorUpgradePlan) -> Result<()> {
+    pub async fn rollback_upgrade(
+        &self,
+        plan: &SupervisorUpgradePlan,
+        restart_removed_sessions: bool,
+    ) -> Result<()> {
         let _transition = self.transitions.lock().await;
         let mut first_error = None;
         for planned in &plan.sessions {
@@ -755,6 +759,9 @@ impl SessionSupervisor {
                 if let Some(handle) = self.sessions.lock().await.get(&planned.session_id) {
                     let _ = handle.set_upgrade_quiesced(false).await;
                 }
+                continue;
+            }
+            if !restart_removed_sessions {
                 continue;
             }
             let spec = self

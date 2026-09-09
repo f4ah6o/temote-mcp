@@ -37,6 +37,7 @@ const MAX_RPC_LINE_BYTES: usize = 4 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const SESSION_STOP_POLL: Duration = Duration::from_secs(1);
+const SESSION_CODEX_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_USAGE_FIELDS: &[&str] = &[
     "input_tokens",
     "cached_input_tokens",
@@ -84,6 +85,7 @@ struct CodexLifecycleEntry {
     cleanup_complete: bool,
     in_flight: usize,
     cancellation: watch::Sender<bool>,
+    drain_notify: Arc<tokio::sync::Notify>,
 }
 
 impl CodexLifecycleEntry {
@@ -94,6 +96,7 @@ impl CodexLifecycleEntry {
             cleanup_complete: false,
             in_flight: 0,
             cancellation,
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -124,15 +127,20 @@ fn begin_session_instance_shutdown(owner: &SessionInstance) {
     }
 }
 
-fn finish_session_shutdown(owner: &SessionInstance) {
+fn finish_session_shutdown(owner: &SessionInstance) -> Result<()> {
     let mut registry = codex_lifecycle_registry().lock().unwrap();
-    let should_remove = registry.entries.get_mut(owner).is_some_and(|entry| {
-        entry.cleanup_complete = true;
-        entry.in_flight == 0
-    });
-    if should_remove {
-        registry.entries.remove(owner);
-    }
+    let Some(entry) = registry.entries.get_mut(owner) else {
+        return Ok(());
+    };
+    anyhow::ensure!(entry.closing, "Codex session instance is not closing");
+    anyhow::ensure!(
+        entry.in_flight == 0,
+        "Codex session shutdown finished with {} in-flight operation(s)",
+        entry.in_flight
+    );
+    entry.cleanup_complete = true;
+    registry.entries.remove(owner);
+    Ok(())
 }
 
 fn session_instance_is_closing(owner: &SessionInstance) -> bool {
@@ -151,15 +159,71 @@ struct CodexLifecyclePermit {
 
 impl Drop for CodexLifecyclePermit {
     fn drop(&mut self) {
-        let mut registry = codex_lifecycle_registry().lock().unwrap();
-        let should_remove = registry.entries.get_mut(&self.owner).is_some_and(|entry| {
+        let (drain_notify, should_remove) = {
+            let mut registry = codex_lifecycle_registry().lock().unwrap();
+            let Some(entry) = registry.entries.get_mut(&self.owner) else {
+                return;
+            };
             entry.in_flight = entry.in_flight.saturating_sub(1);
-            entry.cleanup_complete && entry.in_flight == 0
-        });
+            let drain_notify = (entry.in_flight == 0).then(|| Arc::clone(&entry.drain_notify));
+            let should_remove = entry.cleanup_complete && entry.in_flight == 0;
+            (drain_notify, should_remove)
+        };
+        if let Some(drain_notify) = drain_notify {
+            drain_notify.notify_waiters();
+        }
         if should_remove {
-            registry.entries.remove(&self.owner);
+            let mut registry = codex_lifecycle_registry().lock().unwrap();
+            if registry
+                .entries
+                .get(&self.owner)
+                .is_some_and(|entry| entry.cleanup_complete && entry.in_flight == 0)
+            {
+                registry.entries.remove(&self.owner);
+            }
         }
     }
+}
+
+async fn wait_for_session_inflight_drain(owner: &SessionInstance, timeout: Duration) -> Result<()> {
+    let drain = async {
+        loop {
+            let notified = {
+                let registry = codex_lifecycle_registry().lock().unwrap();
+                let Some(entry) = registry.entries.get(owner) else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                anyhow::ensure!(
+                    entry.closing,
+                    "cannot drain Codex operations for a session instance that is not closing"
+                );
+                if entry.in_flight == 0 {
+                    return Ok(());
+                }
+                Arc::clone(&entry.drain_notify).notified_owned()
+            };
+            notified.await;
+        }
+    };
+
+    tokio::time::timeout(timeout, drain)
+        .await
+        .with_context(|| {
+            format!(
+                "Codex session shutdown timed out waiting for in-flight operations to drain (session {})",
+                owner.id
+            )
+        })??;
+    Ok(())
+}
+
+pub(crate) fn ensure_session_replacement_allowed(session_id: &str) -> Result<()> {
+    let registry = codex_lifecycle_registry().lock().unwrap();
+    anyhow::ensure!(
+        !registry.entries.keys().any(|owner| owner.id == session_id),
+        "Codex session {session_id} is still draining its previous instance"
+    );
+    Ok(())
 }
 
 async fn ensure_current_active_instance(
@@ -1530,16 +1594,26 @@ async fn finalize_session_tasks(owner: &SessionInstance, store: &TaskStore) -> R
         .map(|_| ());
     remove_session_evidence(owner).await;
     if result.is_ok() {
-        finish_session_shutdown(owner);
+        finish_session_shutdown(owner)?;
     }
     result
 }
 
 #[cfg(test)]
 async fn remove_session_with_store(session: &config::Session, store: &TaskStore) -> Result<()> {
+    remove_session_with_store_with_timeout(session, store, SESSION_CODEX_DRAIN_TIMEOUT).await
+}
+
+#[cfg(test)]
+async fn remove_session_with_store_with_timeout(
+    session: &config::Session,
+    store: &TaskStore,
+    timeout: Duration,
+) -> Result<()> {
     let owner = SessionInstance::from_session(session);
     begin_session_instance_shutdown(&owner);
     shutdown_session_runtimes(&owner).await;
+    wait_for_session_inflight_drain(&owner, timeout).await?;
     finalize_session_tasks(&owner, store).await
 }
 
@@ -1547,6 +1621,7 @@ pub(crate) async fn remove_session(session: &config::Session) -> Result<()> {
     let owner = SessionInstance::from_session(session);
     begin_session_instance_shutdown(&owner);
     shutdown_session_runtimes(&owner).await;
+    wait_for_session_inflight_drain(&owner, SESSION_CODEX_DRAIN_TIMEOUT).await?;
     match TaskStore::default_store() {
         Ok(store) => finalize_session_tasks(&owner, &store).await,
         Err(error) => {
@@ -1584,9 +1659,7 @@ async fn spawn_initialized_client_with_binary_mode(
         None
     };
     let client = if fence {
-        let client = spawn_client_if_instance_live(session.clone(), task_id, binary, &owner)?;
-        drop(spawn_permit);
-        client
+        spawn_client_if_instance_live(session.clone(), task_id, binary, &owner)?
     } else {
         spawn_client_with_binary_unchecked(session.clone(), task_id, binary)?
     };
@@ -1615,9 +1688,13 @@ async fn spawn_initialized_client_with_binary_mode(
     }
     .await;
     match initialized {
-        Ok(initialized) => Ok((client, initialized)),
+        Ok(initialized) => {
+            drop(spawn_permit);
+            Ok((client, initialized))
+        }
         Err(error) => {
             client.shutdown().await;
+            drop(spawn_permit);
             Err(error)
         }
     }
@@ -2455,6 +2532,11 @@ async fn task_start_with_store_and_binary_inner(
         }
         StartAcceptance::Accepted(record) => record,
     };
+    let _operation_permit = if fence {
+        Some(ensure_current_active_instance(&owner, session).await?)
+    } else {
+        None
+    };
 
     let client_result =
         spawn_initialized_client_with_binary_mode(session, Some(task_id), binary, fence).await;
@@ -2935,6 +3017,7 @@ async fn ensure_runtime_with_binary(
     if let Some(runtime) = runtime_for(session, record.task_id) {
         return Ok(runtime.client);
     }
+    let _operation_permit = ensure_current_active_instance(&owner, session).await?;
     let (client, _) =
         spawn_initialized_client_with_binary(session, Some(record.task_id), binary).await?;
     let thread_id = record
@@ -3265,9 +3348,14 @@ for raw in sys.stdin:
         result = {'data':[{'model':'gpt-5.6-luna','id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'xhigh'}]}]}
     elif method == blocked_method:
         open(entered, 'w').close()
+        if method == 'turn/start':
+            open(turn_started, 'w').close()
         while not os.path.exists(release):
             time.sleep(0.005)
-        result = {'thread':{'id':thread_id}}
+        if method == 'turn/start':
+            result = {'turn':{'id':turn_id}}
+        else:
+            result = {'thread':{'id':thread_id}}
     elif method == 'thread/start':
         result = {'thread':{'id':thread_id}}
     elif method == 'thread/resume':
@@ -3333,6 +3421,54 @@ for raw in sys.stdin:
                             _ => json!({}),
                         };
                         let _ = reply.send(Ok(result));
+                    }
+                    ClientCommand::Notify { .. } => {}
+                    ClientCommand::Shutdown => break,
+                }
+            }
+        });
+        RpcClient {
+            tx: commands,
+            actor: Arc::new(Mutex::new(Some(actor))),
+        }
+    }
+
+    fn blocking_shutdown_client(entered: PathBuf, release: PathBuf) -> RpcClient {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(8);
+        let actor = tokio::spawn(async move {
+            'commands: while let Some(command) = receiver.recv().await {
+                match command {
+                    ClientCommand::Request { method, reply, .. } => {
+                        assert_eq!(method, "turn/start");
+                        std::fs::write(&entered, b"entered").unwrap();
+                        loop {
+                            if release.exists() {
+                                let _ = reply.send(Ok(json!({
+                                    "turn": {"id": "turn"}
+                                })));
+                                break;
+                            }
+                            match tokio::time::timeout(Duration::from_millis(5), receiver.recv())
+                                .await
+                            {
+                                Ok(Some(ClientCommand::Shutdown)) => {
+                                    while !release.exists() {
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
+                                    let _ = reply
+                                        .send(Err("fake Codex child shutdown released".to_owned()));
+                                    break 'commands;
+                                }
+                                Ok(Some(ClientCommand::Notify { .. })) => {}
+                                Ok(Some(ClientCommand::Request { reply, .. })) => {
+                                    let _ = reply.send(Err(
+                                        "fake Codex child accepts one request".to_owned()
+                                    ));
+                                }
+                                Ok(None) => break 'commands,
+                                Err(_) => {}
+                            }
+                        }
                     }
                     ClientCommand::Notify { .. } => {}
                     ClientCommand::Shutdown => break,
@@ -3563,6 +3699,361 @@ for raw in sys.stdin:
         assert!(runtime_for(&replacement, replacement_task).is_some());
 
         remove_session(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_waits_for_a_blocked_turn_start_request_to_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("drain-turn-start-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let entered = root.path().join("turn-start-entered");
+        let release = root.path().join("turn-start-release");
+        let client = blocking_shutdown_client(entered.clone(), release.clone());
+        let owner_instance = SessionInstance::from_session(&owner);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            let owner = owner.clone();
+            let owner_instance = owner_instance.clone();
+            async move {
+                request_for_instance(&client, &owner_instance, &owner, "turn/start", json!({}))
+                    .await
+            }
+        });
+
+        wait_for_marker(&entered).await;
+        handle.shutdown().await.unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let mut removal = tokio::spawn({
+            let owner = owner.clone();
+            async move { remove_session_with_store(&owner, &store).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut removal)
+                .await
+                .is_err(),
+            "session cleanup returned before the in-flight turn/start child shutdown"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut removal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!session_instance_is_closing(&owner_instance));
+        assert!(
+            runtimes()
+                .lock()
+                .unwrap()
+                .values()
+                .all(|runtime| { runtime.owner != owner_instance })
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_during_turn_start_waits_for_inflight_child_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("task-drain-turn-start-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let (binary, _entered, release, turn_started, _) =
+            barrier_fake_app_server(root.path(), "turn/start");
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "stop while turn start is pending",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let task_owner = owner.clone();
+        let task_store = store.clone();
+        let task_binary = binary.clone();
+        let operation = tokio::spawn(async move {
+            task_start_with_store_and_binary_fenced(&args, &task_owner, &task_store, &task_binary)
+                .await
+        });
+        wait_for_marker(&turn_started).await;
+
+        // Keep a real lifecycle permit until the task's cancellation path and
+        // terminal record update have completed. This makes the shutdown
+        // boundary deterministic while the fake child is still in turn/start.
+        let drain_gate =
+            ensure_current_active_instance(&SessionInstance::from_session(&owner), &owner)
+                .await
+                .unwrap();
+        handle.shutdown().await.unwrap();
+        let mut removal = tokio::spawn({
+            let owner = owner.clone();
+            let store = store.clone();
+            async move { remove_session_with_store(&owner, &store).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut removal)
+                .await
+                .is_err(),
+            "session cleanup returned while turn/start cancellation was draining"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["status"], "interrupted");
+        let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+        assert_eq!(
+            store.load(&owner, task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        assert!(runtime_for(&owner, task_id).is_none());
+
+        drop(drain_gate);
+        tokio::time::timeout(Duration::from_secs(5), &mut removal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_does_not_start_replacement_until_old_turn_drained() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("volume");
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        let roots =
+            crate::named_roots::NamedRoots::from_canonical_roots(std::collections::BTreeMap::from(
+                [("src".to_owned(), std::fs::canonicalize(&root).unwrap())],
+            ))
+            .unwrap();
+        let (supervisor, _approvals) = crate::supervisor::SessionSupervisor::new(roots);
+        let id = format!("drain-restart-{}", Uuid::new_v4());
+        supervisor.start("src/repo", Some(&id)).await.unwrap();
+        let old = config::read_session_metadata(&id).await.unwrap();
+
+        let entered = fixture.path().join("restart-turn-start-entered");
+        let release = fixture.path().join("restart-turn-start-release");
+        let client = blocking_shutdown_client(entered.clone(), release.clone());
+        let old_instance = SessionInstance::from_session(&old);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            let old = old.clone();
+            let old_instance = old_instance.clone();
+            async move {
+                request_for_instance(&client, &old_instance, &old, "turn/start", json!({})).await
+            }
+        });
+        wait_for_marker(&entered).await;
+
+        let stopping = {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            tokio::spawn(async move { supervisor.stop(&id).await })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!config::session_is_active(&id).await.unwrap());
+
+        let mut starting = {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            tokio::spawn(async move { supervisor.start("src/repo", Some(&id)).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut starting)
+                .await
+                .is_err(),
+            "replacement start completed while the old Codex operation was draining"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(5), &mut starting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let replacement_session = config::read_session_metadata(&id).await.unwrap();
+        assert_eq!(replacement.session_id, id);
+        assert_ne!(
+            SessionInstance::from_session(&replacement_session),
+            old_instance
+        );
+        assert!(config::session_is_active(&id).await.unwrap());
+
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("drain-timeout-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let entered = root.path().join("timeout-entered");
+        let release = root.path().join("timeout-release");
+        let client = blocking_shutdown_client(entered.clone(), release.clone());
+        let owner_instance = SessionInstance::from_session(&owner);
+        let operation = tokio::spawn({
+            let client = client.clone();
+            let owner = owner.clone();
+            let owner_instance = owner_instance.clone();
+            async move {
+                request_for_instance(&client, &owner_instance, &owner, "turn/start", json!({}))
+                    .await
+            }
+        });
+        wait_for_marker(&entered).await;
+        handle.shutdown().await.unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let error =
+            remove_session_with_store_with_timeout(&owner, &store, Duration::from_millis(50))
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for in-flight")
+        );
+        assert!(ensure_session_replacement_allowed(&id).is_err());
+
+        let (sender, _receiver) = approvals::approval_channel();
+        let replacement = approvals::spawn_runtime(root.path(), Some(&id), false, sender).await;
+        assert!(
+            replacement.is_err(),
+            "replacement started after drain timeout"
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        remove_session_with_store(&owner, &store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registered_runtime_and_inflight_drain_do_not_deadlock() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("drain-registered-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let entered = root.path().join("registered-entered");
+        let release = root.path().join("registered-release");
+        let client = blocking_shutdown_client(entered.clone(), release.clone());
+        let task_id = Uuid::new_v4();
+        let owner_instance = SessionInstance::from_session(&owner);
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: client.clone(),
+                owner: owner_instance.clone(),
+                scope: owner.cwd.clone(),
+                started_at: Instant::now(),
+            },
+        );
+        let operation = tokio::spawn({
+            let client = client.clone();
+            let owner = owner.clone();
+            let owner_instance = owner_instance.clone();
+            async move {
+                request_for_instance(&client, &owner_instance, &owner, "turn/start", json!({}))
+                    .await
+            }
+        });
+        wait_for_marker(&entered).await;
+        handle.shutdown().await.unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let mut removal = tokio::spawn({
+            let owner = owner.clone();
+            async move { remove_session_with_store(&owner, &store).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut removal)
+                .await
+                .is_err()
+        );
+
+        std::fs::write(&release, b"release").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut removal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(runtime_for(&owner, task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn child_approval_permit_drains_before_session_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("drain-approval-{}", Uuid::new_v4());
+        let (approval_sender, mut approval_receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime(root.path(), Some(&id), false, approval_sender)
+            .await
+            .unwrap();
+        let owner = config::read_session_metadata(&id).await.unwrap();
+        let (finished_sender, mut finished_receiver) = oneshot::channel();
+        let approval = tokio::spawn({
+            let owner = owner.clone();
+            async move {
+                let allowed = request_child_approval(
+                    &owner,
+                    "Codex command approval",
+                    "approval drain test".to_owned(),
+                    BTreeMap::new(),
+                )
+                .await;
+                let _ = finished_sender.send(());
+                allowed
+            }
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(1), approval_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(prompt);
+
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        remove_session_with_store(&owner, &store).await.unwrap();
+        assert!(
+            finished_receiver.try_recv().is_ok(),
+            "session cleanup returned while child approval permit was still held"
+        );
+        assert!(!approval.await.unwrap());
+
+        handle.shutdown().await.unwrap();
+        remove_session(&owner).await.unwrap();
     }
 
     #[tokio::test]

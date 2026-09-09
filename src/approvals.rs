@@ -1009,6 +1009,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     )));
     let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture_from(environment.values()));
     let id = config::session_id(session_id)?;
+    crate::codex_app_server::ensure_session_replacement_allowed(&id)?;
     let previous_session = config::read_session_metadata(&id).await.ok();
     let previous_lifecycle = config::read_session_lifecycle(&id).await.ok().flatten();
     config::remove_inactive_socket(&id).await?;
