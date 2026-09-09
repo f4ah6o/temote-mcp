@@ -345,6 +345,29 @@ pub struct Request {
     pub metadata: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ExpectedSessionInstance {
+    id: String,
+    started_at: u64,
+    process_id: u32,
+}
+
+impl ExpectedSessionInstance {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            started_at: session.started_at,
+            process_id: session.process_id,
+        }
+    }
+
+    fn matches(&self, session: &Session) -> bool {
+        self.id == session.id
+            && self.started_at == session.started_at
+            && self.process_id == session.process_id
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Message {
@@ -353,6 +376,8 @@ enum Message {
         request: Request,
         #[serde(default)]
         require_user: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session: Option<ExpectedSessionInstance>,
     },
     Activity {
         title: String,
@@ -480,12 +505,13 @@ pub async fn request_with_metadata(
     cwd: PathBuf,
     metadata: BTreeMap<String, String>,
 ) -> Result<bool> {
-    request_with_metadata_mode(session_id, operation, detail, cwd, metadata, false).await
+    request_with_metadata_mode(session_id, operation, detail, cwd, metadata, false, None).await
 }
 
 /// Request an approval that must cross the user-approval boundary even when the
 /// Temote session itself is in yolo mode. Delegated child runtimes use this so
 /// Temote's local sandbox bypass does not silently authorize child mutations.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn request_user_approval_with_metadata(
     session_id: &str,
     operation: &str,
@@ -493,7 +519,7 @@ pub async fn request_user_approval_with_metadata(
     cwd: PathBuf,
     metadata: BTreeMap<String, String>,
 ) -> Result<bool> {
-    request_with_metadata_mode(session_id, operation, detail, cwd, metadata, true).await
+    request_with_metadata_mode(session_id, operation, detail, cwd, metadata, true, None).await
 }
 
 async fn request_with_metadata_mode(
@@ -503,6 +529,7 @@ async fn request_with_metadata_mode(
     cwd: PathBuf,
     metadata: BTreeMap<String, String>,
     require_user: bool,
+    expected_session: Option<ExpectedSessionInstance>,
 ) -> Result<bool> {
     let request = Request {
         id: Uuid::new_v4(),
@@ -514,6 +541,7 @@ async fn request_with_metadata_mode(
     let message = encode_session_json_line(&Message::Approval {
         request,
         require_user,
+        expected_session,
     })?;
     let path = config::socket_path(session_id)?;
     let mut stream = UnixStream::connect(&path)
@@ -529,6 +557,25 @@ async fn request_with_metadata_mode(
         "deny" => Ok(false),
         value => anyhow::bail!("invalid response from session: {value:?}"),
     }
+}
+
+pub async fn request_user_approval_for_instance(
+    session: &Session,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+) -> Result<bool> {
+    request_with_metadata_mode(
+        &session.id,
+        operation,
+        detail,
+        cwd,
+        metadata,
+        true,
+        Some(ExpectedSessionInstance::from_session(session)),
+    )
+    .await
 }
 
 async fn read_session_response(
@@ -795,6 +842,7 @@ enum RuntimeCommand {
 pub struct RuntimeHandle {
     id: String,
     cwd: PathBuf,
+    session: Session,
     commands: mpsc::Sender<RuntimeCommand>,
     join: JoinHandle<Result<()>>,
 }
@@ -806,6 +854,10 @@ impl RuntimeHandle {
 
     pub fn is_finished(&self) -> bool {
         self.join.is_finished()
+    }
+
+    pub(crate) fn session_metadata(&self) -> Session {
+        self.session.clone()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -872,6 +924,7 @@ impl RuntimeHandle {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        crate::codex_app_server::begin_session_shutdown(&self.session);
         if config::read_session_lifecycle(&self.id)
             .await
             .ok()
@@ -911,6 +964,7 @@ impl RuntimeHandle {
     }
 
     pub async fn wait(self) -> Result<()> {
+        crate::codex_app_server::begin_session_shutdown(&self.session);
         self.join
             .await
             .context("session runtime task failed to join")??;
@@ -956,11 +1010,29 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     let kintone_cli_bridge = Arc::new(kintone_cli::Bridge::capture_from(environment.values()));
     let id = config::session_id(session_id)?;
     let previous_session = config::read_session_metadata(&id).await.ok();
+    let previous_lifecycle = config::read_session_lifecycle(&id).await.ok().flatten();
     config::remove_inactive_socket(&id).await?;
     let mut session = config::new_session(cwd, Some(&id), yolo)?;
-    if let Some(previous) = previous_session
-        && previous.cwd == session.cwd
+    let previous_started_at = previous_session
+        .as_ref()
+        .map(|previous| previous.started_at)
+        .into_iter()
+        .chain(
+            previous_lifecycle
+                .as_ref()
+                .map(|previous| previous.started_at),
+        )
+        .max();
+    // `started_at` is second-resolution, so advance it when a same-id
+    // replacement is created in the same second and process.
+    if let Some(started_at) =
+        previous_started_at.filter(|started_at| *started_at >= session.started_at)
     {
+        session.started_at = started_at
+            .checked_add(1)
+            .context("session instance generation exhausted")?;
+    }
+    if let Some(previous) = previous_session.filter(|previous| previous.cwd == session.cwd) {
         session.permitted_directories = previous.permitted_directories;
         if !session.permitted_directories.contains(&session.cwd) {
             session.permitted_directories.push(session.cwd.clone());
@@ -976,10 +1048,6 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         .with_context(|| format!("failed to listen at {}", path.display()))?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
     session.process_id = std::process::id();
-    let previous_lifecycle = config::read_session_lifecycle(&session.id)
-        .await
-        .ok()
-        .flatten();
     let mut lifecycle = config::SessionLifecycle::starting(session.started_at, logical_path);
     if let Some(previous) = previous_lifecycle {
         lifecycle.restart_policy = previous.restart_policy;
@@ -1021,6 +1089,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
 
     let id_for_handle = session.id.clone();
     let cwd_for_handle = session.cwd.clone();
+    let session_for_handle = session.clone();
     let fallback_session = session.clone();
     let final_path = path.clone();
     let (commands, command_receiver) = mpsc::channel(MAX_PENDING_RUNTIME_COMMANDS);
@@ -1045,6 +1114,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
                 Err(anyhow::anyhow!("session runtime task failed: {error}")),
             ),
         };
+        crate::codex_app_server::begin_session_shutdown(&session);
         session.process_id = 0;
         if let Err(error) = config::save_session(&session).await {
             eprintln!(
@@ -1088,6 +1158,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     Ok(RuntimeHandle {
         id: id_for_handle,
         cwd: cwd_for_handle,
+        session: session_for_handle,
         commands,
         join,
     })
@@ -1295,7 +1366,16 @@ async fn run_runtime(
                     Message::Approval {
                         request,
                         require_user: false,
+                        expected_session,
                     } if session.yolo => {
+                        if expected_session
+                            .as_ref()
+                            .is_some_and(|expected| !expected.matches(session))
+                        {
+                            let _ = stream.write_all(b"deny\n").await;
+                            let _ = stream.shutdown().await;
+                            continue;
+                        }
                         eprintln!(
                             "[session {}] [yolo] allowing {}: {}",
                             session.id,
@@ -1309,7 +1389,16 @@ async fn run_runtime(
                     Message::Approval {
                         request,
                         require_user: _,
+                        expected_session,
                     } => {
+                        if expected_session
+                            .as_ref()
+                            .is_some_and(|expected| !expected.matches(session))
+                        {
+                            let _ = stream.write_all(b"deny\n").await;
+                            let _ = stream.shutdown().await;
+                            continue;
+                        }
                         let permit = match Arc::clone(&approval_slots).try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
@@ -3127,6 +3216,7 @@ esac
                 metadata: BTreeMap::new(),
             },
             require_user: false,
+            expected_session: None,
         };
         let mut approval = UnixStream::connect(&path).await.unwrap();
         let mut bytes = serde_json::to_vec(&request).unwrap();

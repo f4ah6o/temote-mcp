@@ -1492,6 +1492,7 @@ async fn restart_session(
             .start_public_with_environment(path, Some(session_id), environment)
             .await?;
     } else {
+        crate::codex_app_server::begin_session_shutdown(&session);
         if config::session_is_active(session_id).await? {
             supervisor.stop(session_id).await?;
         } else {

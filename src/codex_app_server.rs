@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -72,11 +72,134 @@ const CODEX_CHILD_ENV_ALLOWLIST: &[&str] = &[
     "USER",
 ];
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 struct SessionInstance {
     id: String,
     started_at: u64,
     process_id: u32,
+}
+
+struct CodexLifecycleEntry {
+    closing: bool,
+    cleanup_complete: bool,
+    in_flight: usize,
+    cancellation: watch::Sender<bool>,
+}
+
+impl CodexLifecycleEntry {
+    fn new() -> Self {
+        let (cancellation, _) = watch::channel(false);
+        Self {
+            closing: false,
+            cleanup_complete: false,
+            in_flight: 0,
+            cancellation,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CodexLifecycleRegistry {
+    entries: HashMap<SessionInstance, CodexLifecycleEntry>,
+}
+
+fn codex_lifecycle_registry() -> &'static Mutex<CodexLifecycleRegistry> {
+    static REGISTRY: OnceLock<Mutex<CodexLifecycleRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(CodexLifecycleRegistry::default()))
+}
+
+pub(crate) fn begin_session_shutdown(session: &config::Session) {
+    begin_session_instance_shutdown(&SessionInstance::from_session(session));
+}
+
+fn begin_session_instance_shutdown(owner: &SessionInstance) {
+    let mut registry = codex_lifecycle_registry().lock().unwrap();
+    let entry = registry
+        .entries
+        .entry(owner.clone())
+        .or_insert_with(CodexLifecycleEntry::new);
+    if !entry.closing {
+        entry.closing = true;
+        let _ = entry.cancellation.send(true);
+    }
+}
+
+fn finish_session_shutdown(owner: &SessionInstance) {
+    let mut registry = codex_lifecycle_registry().lock().unwrap();
+    let should_remove = registry.entries.get_mut(owner).is_some_and(|entry| {
+        entry.cleanup_complete = true;
+        entry.in_flight == 0
+    });
+    if should_remove {
+        registry.entries.remove(owner);
+    }
+}
+
+fn session_instance_is_closing(owner: &SessionInstance) -> bool {
+    codex_lifecycle_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .get(owner)
+        .is_some_and(|entry| entry.closing)
+}
+
+struct CodexLifecyclePermit {
+    owner: SessionInstance,
+    cancellation: watch::Receiver<bool>,
+}
+
+impl Drop for CodexLifecyclePermit {
+    fn drop(&mut self) {
+        let mut registry = codex_lifecycle_registry().lock().unwrap();
+        let should_remove = registry.entries.get_mut(&self.owner).is_some_and(|entry| {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            entry.cleanup_complete && entry.in_flight == 0
+        });
+        if should_remove {
+            registry.entries.remove(&self.owner);
+        }
+    }
+}
+
+async fn ensure_current_active_instance(
+    owner: &SessionInstance,
+    session: &config::Session,
+) -> Result<CodexLifecyclePermit> {
+    anyhow::ensure!(
+        owner.matches(session),
+        "Codex operation session snapshot does not match its owner instance"
+    );
+    anyhow::ensure!(
+        !session_instance_is_closing(owner),
+        "Codex session instance is closing"
+    );
+    let current = config::read_session_metadata(&owner.id)
+        .await
+        .with_context(|| format!("cannot verify current Codex session instance {}", owner.id))?;
+    anyhow::ensure!(
+        owner.matches(&current),
+        "Codex session instance is no longer current"
+    );
+    anyhow::ensure!(
+        config::session_is_active(&owner.id).await?,
+        "Codex session instance is not active"
+    );
+
+    let mut registry = codex_lifecycle_registry().lock().unwrap();
+    let entry = registry
+        .entries
+        .entry(owner.clone())
+        .or_insert_with(CodexLifecycleEntry::new);
+    anyhow::ensure!(
+        !entry.closing,
+        "Codex session instance began closing while it was being verified"
+    );
+    entry.in_flight += 1;
+    Ok(CodexLifecyclePermit {
+        owner: owner.clone(),
+        cancellation: entry.cancellation.subscribe(),
+    })
 }
 
 impl SessionInstance {
@@ -330,12 +453,60 @@ impl TaskStore {
         Ok(record)
     }
 
+    fn update_if_instance_live<F>(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        owner: &SessionInstance,
+        f: F,
+    ) -> Result<TaskRecord>
+    where
+        F: FnOnce(&mut TaskRecord) -> Result<()>,
+    {
+        let _guard = store_lock().lock().unwrap();
+        let registry = codex_lifecycle_registry().lock().unwrap();
+        let entry = registry
+            .entries
+            .get(owner)
+            .context("Codex session instance lifecycle state is unavailable")?;
+        anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+        let mut record = self.load_locked(session, task_id)?;
+        f(&mut record)?;
+        record.updated_at = config::unix_time();
+        self.save_locked(&record)?;
+        Ok(record)
+    }
+
     fn accept_start(
         &self,
         session: &config::Session,
         record: TaskRecord,
     ) -> Result<StartAcceptance> {
         let _guard = store_lock().lock().unwrap();
+        self.accept_start_locked(session, record)
+    }
+
+    fn accept_start_if_instance_live(
+        &self,
+        session: &config::Session,
+        record: TaskRecord,
+        owner: &SessionInstance,
+    ) -> Result<StartAcceptance> {
+        let _guard = store_lock().lock().unwrap();
+        let registry = codex_lifecycle_registry().lock().unwrap();
+        let entry = registry
+            .entries
+            .get(owner)
+            .context("Codex session instance lifecycle state is unavailable")?;
+        anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+        self.accept_start_locked(session, record)
+    }
+
+    fn accept_start_locked(
+        &self,
+        session: &config::Session,
+        record: TaskRecord,
+    ) -> Result<StartAcceptance> {
         let candidate_receipt = record
             .operations
             .first()
@@ -377,6 +548,7 @@ impl TaskStore {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn accept_control(
         &self,
         session: &config::Session,
@@ -386,6 +558,36 @@ impl TaskStore {
         action: &str,
     ) -> Result<ControlAcceptance> {
         let _guard = store_lock().lock().unwrap();
+        self.accept_control_locked(session, task_id, operation_id, request_fingerprint, action)
+    }
+
+    fn accept_control_if_instance_live(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        operation_id: Uuid,
+        request_fingerprint: Uuid,
+        action: &str,
+        owner: &SessionInstance,
+    ) -> Result<ControlAcceptance> {
+        let _guard = store_lock().lock().unwrap();
+        let registry = codex_lifecycle_registry().lock().unwrap();
+        let entry = registry
+            .entries
+            .get(owner)
+            .context("Codex session instance lifecycle state is unavailable")?;
+        anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+        self.accept_control_locked(session, task_id, operation_id, request_fingerprint, action)
+    }
+
+    fn accept_control_locked(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        operation_id: Uuid,
+        request_fingerprint: Uuid,
+        action: &str,
+    ) -> Result<ControlAcceptance> {
         let mut record = self.load_locked(session, task_id)?;
         if let Some(receipt) = record
             .operations
@@ -800,6 +1002,162 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
     })
 }
 
+fn store_evidence_for_instance(
+    owner: &SessionInstance,
+    session: &config::Session,
+    response: &Value,
+) -> Option<evidence::EvidenceRef> {
+    let registry = codex_lifecycle_registry().lock().unwrap();
+    if registry
+        .entries
+        .get(owner)
+        .is_none_or(|entry| entry.closing)
+    {
+        return None;
+    }
+    evidence::store(
+        &session.id,
+        &session.cwd,
+        serde_json::to_string(response).ok()?,
+    )
+    .ok()
+    .flatten()
+}
+
+fn apply_thread_start_response(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    thread_id: &str,
+) -> Result<TaskRecord> {
+    store.update(session, task_id, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        anyhow::ensure!(record.thread_id.is_none(), "task thread was already bound");
+        record.thread_id = Some(thread_id.to_owned());
+        record.revision = record.revision.saturating_add(1);
+        Ok(())
+    })
+}
+
+fn apply_thread_start_response_for_instance(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    thread_id: &str,
+    owner: &SessionInstance,
+) -> Result<TaskRecord> {
+    store.update_if_instance_live(session, task_id, owner, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        anyhow::ensure!(record.thread_id.is_none(), "task thread was already bound");
+        record.thread_id = Some(thread_id.to_owned());
+        record.revision = record.revision.saturating_add(1);
+        Ok(())
+    })
+}
+
+fn apply_turn_start_response(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    thread_id: &str,
+    turn_id: &str,
+    operation_id: Uuid,
+) -> Result<TaskRecord> {
+    store.update(session, task_id, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            record.thread_id.as_deref() == Some(thread_id),
+            "turn/start returned for an unexpected task thread"
+        );
+        if let Some(existing) = record.turn_id.as_deref() {
+            anyhow::ensure!(
+                existing == turn_id,
+                "turn/start returned an unexpected turn id"
+            );
+        } else {
+            record.turn_id = Some(turn_id.to_owned());
+        }
+        if matches!(
+            record.status,
+            TaskStatus::Accepted | TaskStatus::Unknown | TaskStatus::ReconciliationRequired
+        ) {
+            record.status = TaskStatus::Running;
+        }
+        record.generation = 1;
+        record.revision = record.revision.saturating_add(1);
+        update_operation_receipt(record, operation_id, OperationPhase::Applied);
+        Ok(())
+    })
+}
+
+fn apply_turn_start_response_for_instance(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    thread_id: &str,
+    turn_id: &str,
+    operation_id: Uuid,
+    owner: &SessionInstance,
+) -> Result<TaskRecord> {
+    store.update_if_instance_live(session, task_id, owner, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            record.thread_id.as_deref() == Some(thread_id),
+            "turn/start returned for an unexpected task thread"
+        );
+        if let Some(existing) = record.turn_id.as_deref() {
+            anyhow::ensure!(
+                existing == turn_id,
+                "turn/start returned an unexpected turn id"
+            );
+        } else {
+            record.turn_id = Some(turn_id.to_owned());
+        }
+        if matches!(
+            record.status,
+            TaskStatus::Accepted | TaskStatus::Unknown | TaskStatus::ReconciliationRequired
+        ) {
+            record.status = TaskStatus::Running;
+        }
+        record.generation = 1;
+        record.revision = record.revision.saturating_add(1);
+        update_operation_receipt(record, operation_id, OperationPhase::Applied);
+        Ok(())
+    })
+}
+
+fn apply_control_failure(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    operation_id: Uuid,
+    shutting_down: bool,
+) -> Result<TaskRecord> {
+    store.update(session, task_id, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        record.status = if shutting_down {
+            TaskStatus::Interrupted
+        } else {
+            TaskStatus::ReconciliationRequired
+        };
+        record.revision = record.revision.saturating_add(1);
+        if shutting_down {
+            update_operation_receipt(record, operation_id, OperationPhase::Applied);
+        }
+        Ok(())
+    })
+}
+
 fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
     json!({
         "task_id": task_id,
@@ -837,6 +1195,33 @@ struct ServerResponse {
 }
 
 impl RpcClient {
+    fn try_request(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<oneshot::Receiver<std::result::Result<Value, String>>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .try_send(ClientCommand::Request {
+                method,
+                params,
+                reply: reply_tx,
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("Codex app-server actor queue unavailable: {error}")
+            })?;
+        Ok(reply_rx)
+    }
+
+    fn try_notify(&self, method: &'static str, params: Option<Value>) -> Result<()> {
+        self.tx
+            .try_send(ClientCommand::Notify { method, params })
+            .map_err(|error| {
+                anyhow::anyhow!("Codex app-server actor queue unavailable: {error}")
+            })?;
+        Ok(())
+    }
+
     async fn request(&self, method: &'static str, params: Value) -> Result<Value> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -870,6 +1255,110 @@ impl RpcClient {
     }
 }
 
+fn dispatch_request_for_instance(
+    client: &RpcClient,
+    owner: &SessionInstance,
+    method: &'static str,
+    params: Value,
+) -> Result<oneshot::Receiver<std::result::Result<Value, String>>> {
+    let registry = codex_lifecycle_registry().lock().unwrap();
+    let entry = registry
+        .entries
+        .get(owner)
+        .context("Codex session instance lifecycle state is unavailable")?;
+    anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+    client.try_request(method, params)
+}
+
+fn dispatch_notify_for_instance(
+    client: &RpcClient,
+    owner: &SessionInstance,
+    method: &'static str,
+    params: Option<Value>,
+) -> Result<()> {
+    let registry = codex_lifecycle_registry().lock().unwrap();
+    let entry = registry
+        .entries
+        .get(owner)
+        .context("Codex session instance lifecycle state is unavailable")?;
+    anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+    client.try_notify(method, params)
+}
+
+async fn wait_for_request_response(
+    reply_rx: oneshot::Receiver<std::result::Result<Value, String>>,
+    method: &'static str,
+) -> Result<Value> {
+    let result = tokio::time::timeout(RPC_TIMEOUT, reply_rx)
+        .await
+        .with_context(|| format!("Codex app-server request timed out: {method}"))?
+        .context("Codex app-server actor dropped request")?;
+    result.map_err(anyhow::Error::msg)
+}
+
+async fn request_for_instance(
+    client: &RpcClient,
+    owner: &SessionInstance,
+    session: &config::Session,
+    method: &'static str,
+    params: Value,
+) -> Result<Value> {
+    let permit = ensure_current_active_instance(owner, session).await?;
+    let reply_rx = dispatch_request_for_instance(client, owner, method, params)?;
+    let mut cancellation = permit.cancellation.clone();
+    tokio::select! {
+        result = wait_for_request_response(reply_rx, method) => result,
+        changed = cancellation.changed() => {
+            let _ = changed;
+            client.shutdown().await;
+            Err(anyhow::anyhow!("Codex session instance began closing during {method}"))
+        }
+    }
+}
+
+async fn notify_for_instance(
+    client: &RpcClient,
+    owner: &SessionInstance,
+    session: &config::Session,
+    method: &'static str,
+    params: Option<Value>,
+) -> Result<()> {
+    let permit = ensure_current_active_instance(owner, session).await?;
+    dispatch_notify_for_instance(client, owner, method, params)?;
+    drop(permit);
+    Ok(())
+}
+
+async fn request_codex(
+    client: &RpcClient,
+    owner: &SessionInstance,
+    session: &config::Session,
+    method: &'static str,
+    params: Value,
+    fence: bool,
+) -> Result<Value> {
+    if fence {
+        request_for_instance(client, owner, session, method, params).await
+    } else {
+        client.request(method, params).await
+    }
+}
+
+async fn notify_codex(
+    client: &RpcClient,
+    owner: &SessionInstance,
+    session: &config::Session,
+    method: &'static str,
+    params: Option<Value>,
+    fence: bool,
+) -> Result<()> {
+    if fence {
+        notify_for_instance(client, owner, session, method, params).await
+    } else {
+        client.notify(method, params).await
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeHandle {
     client: RpcClient,
@@ -884,6 +1373,15 @@ fn runtimes() -> &'static Mutex<HashMap<Uuid, RuntimeHandle>> {
 }
 
 fn runtime_for(session: &config::Session, task_id: Uuid) -> Option<RuntimeHandle> {
+    let owner = SessionInstance::from_session(session);
+    let lifecycle = codex_lifecycle_registry().lock().unwrap();
+    if lifecycle
+        .entries
+        .get(&owner)
+        .is_some_and(|entry| entry.closing)
+    {
+        return None;
+    }
     let state = runtimes().lock().unwrap();
     let runtime = state.get(&task_id)?;
     if Instant::now().saturating_duration_since(runtime.started_at) >= CHILD_LIFETIME {
@@ -902,9 +1400,20 @@ fn runtime_matches_record(record: &TaskRecord) -> bool {
         .is_some_and(|runtime| runtime.owner == record.owner && runtime.scope == record.scope_cwd)
 }
 
-fn insert_runtime(session: &config::Session, task_id: Uuid, client: RpcClient) -> Result<()> {
-    let scope = config::canonical_directory(&session.cwd)?;
+async fn insert_runtime(session: &config::Session, task_id: Uuid, client: RpcClient) -> Result<()> {
     let owner = SessionInstance::from_session(session);
+    let _permit = ensure_current_active_instance(&owner, session).await?;
+    insert_runtime_unchecked(session, task_id, client, &owner)
+}
+
+fn insert_runtime_unchecked(
+    session: &config::Session,
+    task_id: Uuid,
+    client: RpcClient,
+    owner: &SessionInstance,
+) -> Result<()> {
+    let owner = owner.clone();
+    let scope = config::canonical_directory(&session.cwd)?;
     let runtime = RuntimeHandle {
         client: client.clone(),
         owner: owner.clone(),
@@ -913,6 +1422,14 @@ fn insert_runtime(session: &config::Session, task_id: Uuid, client: RpcClient) -
     };
     {
         let _guard = store_lock().lock().unwrap();
+        let registry = codex_lifecycle_registry().lock().unwrap();
+        anyhow::ensure!(
+            registry
+                .entries
+                .get(&owner)
+                .is_none_or(|entry| !entry.closing),
+            "Codex session instance is closing"
+        );
         let mut state = runtimes().lock().unwrap();
         anyhow::ensure!(
             !state.contains_key(&task_id),
@@ -963,6 +1480,7 @@ async fn wait_for_session_stop(owner: SessionInstance) {
             Ok(_) | Err(_) => false,
         };
         if !same_instance_active {
+            begin_session_instance_shutdown(&owner);
             return;
         }
         tokio::time::sleep(SESSION_STOP_POLL).await;
@@ -1011,18 +1529,23 @@ async fn finalize_session_tasks(owner: &SessionInstance, store: &TaskStore) -> R
         .context("failed to finalize Codex tasks for ended session instance")
         .map(|_| ());
     remove_session_evidence(owner).await;
+    if result.is_ok() {
+        finish_session_shutdown(owner);
+    }
     result
 }
 
 #[cfg(test)]
 async fn remove_session_with_store(session: &config::Session, store: &TaskStore) -> Result<()> {
     let owner = SessionInstance::from_session(session);
+    begin_session_instance_shutdown(&owner);
     shutdown_session_runtimes(&owner).await;
     finalize_session_tasks(&owner, store).await
 }
 
 pub(crate) async fn remove_session(session: &config::Session) -> Result<()> {
     let owner = SessionInstance::from_session(session);
+    begin_session_instance_shutdown(&owner);
     shutdown_session_runtimes(&owner).await;
     match TaskStore::default_store() {
         Ok(store) => finalize_session_tasks(&owner, &store).await,
@@ -1045,24 +1568,49 @@ async fn spawn_initialized_client_with_binary(
     task_id: Option<Uuid>,
     binary: &Path,
 ) -> Result<(RpcClient, Value)> {
-    let client = spawn_client_with_binary(session.clone(), task_id, binary).await?;
+    spawn_initialized_client_with_binary_mode(session, task_id, binary, true).await
+}
+
+async fn spawn_initialized_client_with_binary_mode(
+    session: &config::Session,
+    task_id: Option<Uuid>,
+    binary: &Path,
+    fence: bool,
+) -> Result<(RpcClient, Value)> {
+    let owner = SessionInstance::from_session(session);
+    let spawn_permit = if fence {
+        Some(ensure_current_active_instance(&owner, session).await?)
+    } else {
+        None
+    };
+    let client = if fence {
+        let client = spawn_client_if_instance_live(session.clone(), task_id, binary, &owner)?;
+        drop(spawn_permit);
+        client
+    } else {
+        spawn_client_with_binary_unchecked(session.clone(), task_id, binary)?
+    };
     let initialized = async {
-        let initialized = client
-            .request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "temote-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "capabilities": {
-                        "experimentalApi": true
-                    }
-                }),
-            )
-            .await?;
+        let initialize_params = json!({
+            "clientInfo": {
+                "name": "temote-mcp",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
+            }
+        });
+        let initialized = request_codex(
+            &client,
+            &owner,
+            session,
+            "initialize",
+            initialize_params,
+            fence,
+        )
+        .await?;
         validate_initialize_response(&initialized)?;
-        client.notify("initialized", None).await?;
+        notify_codex(&client, &owner, session, "initialized", None, fence).await?;
         Result::<Value>::Ok(initialized)
     }
     .await;
@@ -1096,7 +1644,22 @@ fn validate_initialize_response(value: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn spawn_client_with_binary(
+fn spawn_client_if_instance_live(
+    session: config::Session,
+    task_id: Option<Uuid>,
+    binary: &Path,
+    owner: &SessionInstance,
+) -> Result<RpcClient> {
+    let registry = codex_lifecycle_registry().lock().unwrap();
+    let entry = registry
+        .entries
+        .get(owner)
+        .context("Codex session instance lifecycle state is unavailable")?;
+    anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+    spawn_client_with_binary_unchecked(session, task_id, binary)
+}
+
+fn spawn_client_with_binary_unchecked(
     session: config::Session,
     task_id: Option<Uuid>,
     binary: &Path,
@@ -1328,7 +1891,11 @@ fn handle_notification(
     let Ok(store) = TaskStore::default_store() else {
         return;
     };
-    let _ = store.update(session, task_id, |record| {
+    let owner = SessionInstance::from_session(session);
+    let _ = store.update_if_instance_live(session, task_id, &owner, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
         anyhow::ensure!(
             record.thread_id.as_deref() == Some(thread_id),
             "Codex notification does not match task thread"
@@ -1436,6 +2003,13 @@ async fn handle_server_request(
                     "approval request is unavailable outside a Codex task".to_owned(),
                 )
             })?;
+            let owner = SessionInstance::from_session(session);
+            if ensure_current_active_instance(&owner, session)
+                .await
+                .is_err()
+            {
+                return Ok(json!({"decision": "decline"}));
+            }
             validate_approval_task(session, task_id, &params)?;
             mark_waiting_approval(session, task_id, true);
             let (detail, metadata) = child_approval(
@@ -1445,15 +2019,8 @@ async fn handle_server_request(
                 task_id,
                 &params,
             );
-            let allowed = approvals::request_user_approval_with_metadata(
-                &session.id,
-                "Codex command approval",
-                detail,
-                session.cwd.clone(),
-                metadata,
-            )
-            .await
-            .unwrap_or(false);
+            let allowed =
+                request_child_approval(session, "Codex command approval", detail, metadata).await;
             mark_waiting_approval(session, task_id, false);
             Ok(json!({"decision": if allowed { "accept" } else { "decline" }}))
         }
@@ -1464,19 +2031,20 @@ async fn handle_server_request(
                     "approval request is unavailable outside a Codex task".to_owned(),
                 )
             })?;
+            let owner = SessionInstance::from_session(session);
+            if ensure_current_active_instance(&owner, session)
+                .await
+                .is_err()
+            {
+                return Ok(json!({"decision": "decline"}));
+            }
             validate_approval_task(session, task_id, &params)?;
             mark_waiting_approval(session, task_id, true);
             let (detail, metadata) =
                 child_approval("file change", "fileChange", "file_change", task_id, &params);
-            let allowed = approvals::request_user_approval_with_metadata(
-                &session.id,
-                "Codex file-change approval",
-                detail,
-                session.cwd.clone(),
-                metadata,
-            )
-            .await
-            .unwrap_or(false);
+            let allowed =
+                request_child_approval(session, "Codex file-change approval", detail, metadata)
+                    .await;
             mark_waiting_approval(session, task_id, false);
             Ok(json!({"decision": if allowed { "accept" } else { "decline" }}))
         }
@@ -1484,6 +2052,42 @@ async fn handle_server_request(
             -32601,
             format!("unsupported Codex app-server request method: {method}"),
         )),
+    }
+}
+
+async fn request_child_approval(
+    session: &config::Session,
+    operation: &str,
+    detail: String,
+    metadata: BTreeMap<String, String>,
+) -> bool {
+    let owner = SessionInstance::from_session(session);
+    let permit = match ensure_current_active_instance(&owner, session).await {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    let mut cancellation = permit.cancellation.clone();
+    tokio::select! {
+        result = async {
+            let allowed = approvals::request_user_approval_for_instance(
+                session,
+                operation,
+                detail,
+                session.cwd.clone(),
+                metadata,
+            )
+            .await
+            .unwrap_or(false);
+            if allowed {
+                ensure_current_active_instance(&owner, session).await.is_ok()
+            } else {
+                false
+            }
+        } => result,
+        changed = cancellation.changed() => {
+            let _ = changed;
+            false
+        }
     }
 }
 
@@ -1637,6 +2241,10 @@ fn bind_approval_turn(
         .context("approval request is missing turnId")?;
     store.update(session, task_id, |record| {
         anyhow::ensure!(
+            !record.status.is_terminal(),
+            "approval request arrived after the Codex task was finalized"
+        );
+        anyhow::ensure!(
             record.thread_id.as_deref() == Some(thread_id),
             "approval request does not match task thread"
         );
@@ -1702,10 +2310,16 @@ fn validate_model_request(models: &Value, model: &str, effort: &str) -> Result<(
 }
 
 pub(crate) async fn status(session: &config::Session) -> Result<Value> {
+    let owner = SessionInstance::from_session(session);
     let (client, initialized) = spawn_initialized_client(session, None).await?;
-    let models = match client
-        .request("model/list", json!({"includeHidden": true}))
-        .await
+    let models = match request_for_instance(
+        &client,
+        &owner,
+        session,
+        "model/list",
+        json!({"includeHidden": true}),
+    )
+    .await
     {
         Ok(models) => models,
         Err(error) => {
@@ -1751,15 +2365,37 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
 
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
-    task_start_with_store_and_binary(args, session, &store, Path::new("codex")).await
+    task_start_with_store_and_binary_inner(args, session, &store, Path::new("codex"), true).await
 }
 
+#[cfg(test)]
 async fn task_start_with_store_and_binary(
     args: &Value,
     session: &config::Session,
     store: &TaskStore,
     binary: &Path,
 ) -> Result<Value> {
+    task_start_with_store_and_binary_inner(args, session, store, binary, false).await
+}
+
+#[cfg(test)]
+async fn task_start_with_store_and_binary_fenced(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+) -> Result<Value> {
+    task_start_with_store_and_binary_inner(args, session, store, binary, true).await
+}
+
+async fn task_start_with_store_and_binary_inner(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+    fence: bool,
+) -> Result<Value> {
+    let owner = SessionInstance::from_session(session);
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
     let model = required_string(args, "model")?;
@@ -1802,41 +2438,84 @@ async fn task_start_with_store_and_binary(
         phase: OperationPhase::Accepted,
         outcome: record.outcome(),
     });
-    let mut record = match store.accept_start(session, record)? {
+    let acceptance_permit = if fence {
+        Some(ensure_current_active_instance(&owner, session).await?)
+    } else {
+        None
+    };
+    let acceptance = if fence {
+        store.accept_start_if_instance_live(session, record, &owner)?
+    } else {
+        store.accept_start(session, record)?
+    };
+    drop(acceptance_permit);
+    let mut record = match acceptance {
         StartAcceptance::Existing(existing) => {
             return replay_operation(&existing, operation_id, request_fingerprint);
         }
         StartAcceptance::Accepted(record) => record,
     };
 
-    let (client, _) = match spawn_initialized_client_with_binary(session, Some(task_id), binary)
-        .await
-    {
+    let client_result =
+        spawn_initialized_client_with_binary_mode(session, Some(task_id), binary, fence).await;
+    let (client, _) = match client_result {
         Ok(client) => client,
         Err(_) => {
+            let shutting_down = fence && session_instance_is_closing(&owner);
             let record = store.update(session, task_id, |record| {
                 if !record.status.is_terminal() {
-                    record.status = TaskStatus::RetryableFailed;
+                    record.status = if shutting_down {
+                        TaskStatus::Interrupted
+                    } else {
+                        TaskStatus::RetryableFailed
+                    };
                     record.revision = record.revision.saturating_add(1);
-                    update_operation_receipt(record, operation_id, OperationPhase::RetryableFailed);
+                    update_operation_receipt(
+                        record,
+                        operation_id,
+                        if shutting_down {
+                            OperationPhase::Applied
+                        } else {
+                            OperationPhase::RetryableFailed
+                        },
+                    );
                 }
                 Ok(())
             })?;
             return Ok(task_view(&record, None));
         }
     };
-    let models = match client
-        .request("model/list", json!({"includeHidden": true}))
-        .await
+    let models = match request_codex(
+        &client,
+        &owner,
+        session,
+        "model/list",
+        json!({"includeHidden": true}),
+        fence,
+    )
+    .await
     {
         Ok(models) => models,
         Err(_) => {
             client.shutdown().await;
+            let shutting_down = fence && session_instance_is_closing(&owner);
             let record = store.update(session, task_id, |record| {
                 if !record.status.is_terminal() {
-                    record.status = TaskStatus::RetryableFailed;
+                    record.status = if shutting_down {
+                        TaskStatus::Interrupted
+                    } else {
+                        TaskStatus::RetryableFailed
+                    };
                     record.revision = record.revision.saturating_add(1);
-                    update_operation_receipt(record, operation_id, OperationPhase::RetryableFailed);
+                    update_operation_receipt(
+                        record,
+                        operation_id,
+                        if shutting_down {
+                            OperationPhase::Applied
+                        } else {
+                            OperationPhase::RetryableFailed
+                        },
+                    );
                 }
                 Ok(())
             })?;
@@ -1845,9 +2524,14 @@ async fn task_start_with_store_and_binary(
     };
     if validate_model_request(&models, model, effort).is_err() {
         client.shutdown().await;
+        let shutting_down = fence && session_instance_is_closing(&owner);
         let record = store.update(session, task_id, |record| {
             if !record.status.is_terminal() {
-                record.status = TaskStatus::Failed;
+                record.status = if shutting_down {
+                    TaskStatus::Interrupted
+                } else {
+                    TaskStatus::Failed
+                };
                 record.revision = record.revision.saturating_add(1);
                 update_operation_receipt(record, operation_id, OperationPhase::Applied);
             }
@@ -1858,100 +2542,124 @@ async fn task_start_with_store_and_binary(
 
     let start_result = async {
         let cwd = record.scope_cwd.to_string_lossy().into_owned();
-        let thread = client
-            .request(
-                "thread/start",
-                json!({
-                    "cwd": cwd,
-                    "model": model,
-                    "approvalPolicy": CODEX_APPROVAL_POLICY,
-                    "approvalsReviewer": "user",
-                    "sandbox": "workspaceWrite",
-                    "runtimeWorkspaceRoots": [record.scope_cwd],
-                    "ephemeral": false,
-                    "threadSource": "temote-mcp",
-                }),
-            )
-            .await?;
+        let thread = request_codex(
+            &client,
+            &owner,
+            session,
+            "thread/start",
+            json!({
+                "cwd": cwd,
+                "model": model,
+                "approvalPolicy": CODEX_APPROVAL_POLICY,
+                "approvalsReviewer": "user",
+                "sandbox": "workspaceWrite",
+                "runtimeWorkspaceRoots": [record.scope_cwd],
+                "ephemeral": false,
+                "threadSource": "temote-mcp",
+            }),
+            fence,
+        )
+        .await?;
         let thread_id = thread
             .get("thread")
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
             .context("thread/start response is missing thread.id")?
             .to_owned();
-        record = store.update(session, task_id, |record| {
-            anyhow::ensure!(record.thread_id.is_none(), "task thread was already bound");
-            record.thread_id = Some(thread_id.clone());
-            record.revision = record.revision.saturating_add(1);
-            Ok(())
-        })?;
+        let thread_update_permit = if fence {
+            Some(ensure_current_active_instance(&owner, session).await?)
+        } else {
+            None
+        };
+        record = if fence {
+            apply_thread_start_response_for_instance(store, session, task_id, &thread_id, &owner)?
+        } else {
+            apply_thread_start_response(store, session, task_id, &thread_id)?
+        };
+        drop(thread_update_permit);
 
-        let turn = client
-            .request(
-                "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": task}],
-                    "model": model,
-                    "effort": effort,
-                    "cwd": cwd,
-                    "approvalPolicy": CODEX_APPROVAL_POLICY,
-                    "sandboxPolicy": {
-                        "type": "workspaceWrite",
-                        "writableRoots": [record.scope_cwd],
-                        "networkAccess": false,
-                    },
-                }),
-            )
-            .await?;
+        let turn = request_codex(
+            &client,
+            &owner,
+            session,
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": task}],
+                "model": model,
+                "effort": effort,
+                "cwd": cwd,
+                "approvalPolicy": CODEX_APPROVAL_POLICY,
+                "sandboxPolicy": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [record.scope_cwd],
+                    "networkAccess": false,
+                },
+            }),
+            fence,
+        )
+        .await?;
         let turn_id = turn
             .get("turn")
             .and_then(|turn| turn.get("id"))
             .and_then(Value::as_str)
             .context("turn/start response is missing turn.id")?
             .to_owned();
-        record = store.update(session, task_id, |record| {
-            anyhow::ensure!(
-                record.thread_id.as_deref() == Some(thread_id.as_str()),
-                "turn/start returned for an unexpected task thread"
-            );
-            if let Some(existing) = record.turn_id.as_deref() {
-                anyhow::ensure!(
-                    existing == turn_id,
-                    "turn/start returned an unexpected turn id"
-                );
-            } else {
-                record.turn_id = Some(turn_id.clone());
-            }
-            if matches!(
-                record.status,
-                TaskStatus::Accepted | TaskStatus::Unknown | TaskStatus::ReconciliationRequired
-            ) {
-                record.status = TaskStatus::Running;
-            }
-            record.generation = 1;
-            record.revision = record.revision.saturating_add(1);
-            update_operation_receipt(record, operation_id, OperationPhase::Applied);
-            Ok(())
-        })?;
+        let turn_update_permit = if fence {
+            Some(ensure_current_active_instance(&owner, session).await?)
+        } else {
+            None
+        };
+        record = if fence {
+            apply_turn_start_response_for_instance(
+                store,
+                session,
+                task_id,
+                &thread_id,
+                &turn_id,
+                operation_id,
+                &owner,
+            )?
+        } else {
+            apply_turn_start_response(store, session, task_id, &thread_id, &turn_id, operation_id)?
+        };
+        drop(turn_update_permit);
         Result::<()>::Ok(())
     }
     .await;
 
     if let Err(_error) = start_result {
         client.shutdown().await;
+        let shutting_down = fence && session_instance_is_closing(&owner);
         let record = store.update(session, task_id, |record| {
             if !record.status.is_terminal() {
-                record.status = TaskStatus::ReconciliationRequired;
+                record.status = if shutting_down {
+                    TaskStatus::Interrupted
+                } else {
+                    TaskStatus::ReconciliationRequired
+                };
                 record.revision = record.revision.saturating_add(1);
-                update_operation_receipt(record, operation_id, OperationPhase::Accepted);
+                update_operation_receipt(
+                    record,
+                    operation_id,
+                    if shutting_down {
+                        OperationPhase::Applied
+                    } else {
+                        OperationPhase::Accepted
+                    },
+                );
             }
             Ok(())
         })?;
         return Ok(task_view(&record, None));
     }
 
-    if let Err(error) = insert_runtime(session, task_id, client.clone()) {
+    let insert_result = if fence {
+        insert_runtime(session, task_id, client.clone()).await
+    } else {
+        insert_runtime_unchecked(session, task_id, client.clone(), &owner)
+    };
+    if let Err(error) = insert_result {
         client.shutdown().await;
         return Err(error);
     }
@@ -2004,7 +2712,10 @@ async fn task_get_with_store_and_binary(
 ) -> Result<Value> {
     let task_id = required_uuid(args, "task_id")?;
     let after_revision = optional_u64(args, "after_revision")?;
+    let owner = SessionInstance::from_session(session);
+    let load_permit = ensure_current_active_instance(&owner, session).await?;
     let mut record = store.load(session, task_id)?;
+    drop(load_permit);
     if record.thread_id.is_none() {
         if record.status == TaskStatus::Accepted {
             let start_operation_id = record
@@ -2012,7 +2723,11 @@ async fn task_get_with_store_and_binary(
                 .iter()
                 .find(|receipt| receipt.action == "start")
                 .map(|receipt| receipt.operation_id);
-            record = store.update(session, task_id, |record| {
+            let apply_permit = ensure_current_active_instance(&owner, session).await?;
+            record = store.update_if_instance_live(session, task_id, &owner, |record| {
+                if record.status.is_terminal() {
+                    return Ok(());
+                }
                 record.status = TaskStatus::ReconciliationRequired;
                 record.revision = record.revision.saturating_add(1);
                 if let Some(operation_id) = start_operation_id {
@@ -2020,6 +2735,7 @@ async fn task_get_with_store_and_binary(
                 }
                 Ok(())
             })?;
+            drop(apply_permit);
         }
         return Ok(task_view(&record, None));
     }
@@ -2027,50 +2743,57 @@ async fn task_get_with_store_and_binary(
     let client = match ensure_runtime_with_binary(session, &record, binary).await {
         Ok(client) => client,
         Err(_) => {
-            record = store.update(session, task_id, |record| {
+            let apply_permit = ensure_current_active_instance(&owner, session).await?;
+            record = store.update_if_instance_live(session, task_id, &owner, |record| {
                 if !record.status.is_terminal() {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
                 }
                 Ok(())
             })?;
+            drop(apply_permit);
             return Ok(task_view(&record, None));
         }
     };
     let thread_id = record.thread_id.clone().unwrap();
-    let response = client
-        .request(
-            "thread/read",
-            json!({"threadId": thread_id, "includeTurns": true}),
-        )
-        .await;
+    let response = request_for_instance(
+        &client,
+        &owner,
+        session,
+        "thread/read",
+        json!({"threadId": thread_id, "includeTurns": true}),
+    )
+    .await;
     let response = match response {
         Ok(response) => response,
         Err(_) => {
-            let record = store.update(session, task_id, |record| {
+            let apply_permit = ensure_current_active_instance(&owner, session).await?;
+            let record = store.update_if_instance_live(session, task_id, &owner, |record| {
                 if !record.status.is_terminal() {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
                 }
                 Ok(())
             })?;
+            drop(apply_permit);
             return Ok(task_view(&record, None));
         }
     };
-    let evidence_ref =
-        evidence::store(&session.id, &session.cwd, serde_json::to_string(&response)?)
-            .ok()
-            .flatten();
+    let evidence_permit = ensure_current_active_instance(&owner, session).await?;
+    let evidence_ref = store_evidence_for_instance(&owner, session, &response);
+    drop(evidence_permit);
     let derived = match derive_thread_state(&response, record.turn_id.as_deref()) {
         Ok(derived) => derived,
         Err(_) => {
-            record = store.update(session, task_id, |record| {
+            let apply_permit = ensure_current_active_instance(&owner, session).await?;
+            record = store.update_if_instance_live(session, task_id, &owner, |record| {
                 if !record.status.is_terminal() {
                     record.status = TaskStatus::Unknown;
                     record.revision = record.revision.saturating_add(1);
                 }
                 Ok(())
             })?;
+            drop(apply_permit);
             return Ok(task_view(&record, evidence_ref.as_ref()));
         }
     };
@@ -2079,7 +2802,11 @@ async fn task_get_with_store_and_binary(
         || record.turn_id != derived.turn_id
         || (derived.usage.is_some() && record.usage != derived.usage);
     if changed || (record.generation == 0 && derived.turn_id.is_some()) {
-        record = store.update(session, task_id, |record| {
+        let apply_permit = ensure_current_active_instance(&owner, session).await?;
+        record = store.update_if_instance_live(session, task_id, &owner, |record| {
+            if record.status.is_terminal() {
+                return Ok(());
+            }
             record.status = reconciled_task_status(record.status, derived.status);
             if derived.turn_id.is_some() {
                 record.turn_id = derived.turn_id.clone();
@@ -2102,6 +2829,7 @@ async fn task_get_with_store_and_binary(
             }
             Ok(())
         })?;
+        drop(apply_permit);
     }
     if after_revision == Some(record.revision) {
         return Ok(json!({
@@ -2198,15 +2926,12 @@ fn extract_usage_from_turn(turn: &Value) -> Option<BTreeMap<String, u64>> {
         .and_then(extract_usage)
 }
 
-async fn ensure_runtime(session: &config::Session, record: &TaskRecord) -> Result<RpcClient> {
-    ensure_runtime_with_binary(session, record, Path::new("codex")).await
-}
-
 async fn ensure_runtime_with_binary(
     session: &config::Session,
     record: &TaskRecord,
     binary: &Path,
 ) -> Result<RpcClient> {
+    let owner = SessionInstance::from_session(session);
     if let Some(runtime) = runtime_for(session, record.task_id) {
         return Ok(runtime.client);
     }
@@ -2216,26 +2941,28 @@ async fn ensure_runtime_with_binary(
         .thread_id
         .as_deref()
         .context("cannot resume Codex task without thread_id")?;
-    let resume = client
-        .request(
-            "thread/resume",
-            json!({
-                "threadId": thread_id,
-                "cwd": record.scope_cwd,
-                "model": record.model,
-                "approvalPolicy": CODEX_APPROVAL_POLICY,
-                "approvalsReviewer": "user",
-                "sandbox": "workspaceWrite",
-                "runtimeWorkspaceRoots": [record.scope_cwd],
-                "excludeTurns": true,
-            }),
-        )
-        .await;
+    let resume = request_for_instance(
+        &client,
+        &owner,
+        session,
+        "thread/resume",
+        json!({
+            "threadId": thread_id,
+            "cwd": record.scope_cwd,
+            "model": record.model,
+            "approvalPolicy": CODEX_APPROVAL_POLICY,
+            "approvalsReviewer": "user",
+            "sandbox": "workspaceWrite",
+            "runtimeWorkspaceRoots": [record.scope_cwd],
+            "excludeTurns": true,
+        }),
+    )
+    .await;
     if let Err(error) = resume {
         client.shutdown().await;
         return Err(error).context("Codex task could not resume its retained thread");
     }
-    if let Err(error) = insert_runtime(session, record.task_id, client.clone()) {
+    if let Err(error) = insert_runtime(session, record.task_id, client.clone()).await {
         client.shutdown().await;
         return Err(error);
     }
@@ -2243,6 +2970,16 @@ async fn ensure_runtime_with_binary(
 }
 
 pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Result<Value> {
+    let store = TaskStore::default_store()?;
+    task_control_with_store_and_binary(args, session, &store, Path::new("codex")).await
+}
+
+async fn task_control_with_store_and_binary(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+) -> Result<Value> {
     let task_id = required_uuid(args, "task_id")?;
     let operation_id = required_uuid(args, "operation_id")?;
     let action = required_string(args, "action")?;
@@ -2259,74 +2996,84 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
         _ => unreachable!(),
     }
 
-    let store = TaskStore::default_store()?;
     let request_fingerprint = fingerprint(&json!({
         "kind": "control",
         "task_id": task_id,
         "action": action,
         "input": input,
     }))?;
-    let mut record =
-        match store.accept_control(session, task_id, operation_id, request_fingerprint, action)? {
-            ControlAcceptance::Replay(result) => return Ok(result),
-            ControlAcceptance::Accepted(record) => *record,
-        };
+    let owner = SessionInstance::from_session(session);
+    let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
+    let mut record = match store.accept_control_if_instance_live(
+        session,
+        task_id,
+        operation_id,
+        request_fingerprint,
+        action,
+        &owner,
+    )? {
+        ControlAcceptance::Replay(result) => return Ok(result),
+        ControlAcceptance::Accepted(record) => *record,
+    };
+    drop(acceptance_permit);
     let thread_id = record
         .thread_id
         .clone()
         .context("Codex task requires reconciliation before control")?;
     let turn_id = record.turn_id.clone();
 
-    let client = match ensure_runtime(session, &record).await {
+    let client = match ensure_runtime_with_binary(session, &record, binary).await {
         Ok(client) => client,
         Err(_) => {
-            let record = store.update(session, task_id, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TaskStatus::ReconciliationRequired;
-                    record.revision = record.revision.saturating_add(1);
-                }
-                Ok(())
-            })?;
+            let shutting_down = session_instance_is_closing(&owner);
+            let record =
+                apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
             return Ok(task_view(&record, None));
         }
     };
     let result = match action {
         "steer" => {
-            client
-                .request(
-                    "turn/steer",
-                    json!({
+            request_for_instance(
+                &client,
+                &owner,
+                session,
+                "turn/steer",
+                json!({
                     "threadId": thread_id,
-                        "expectedTurnId": turn_id.as_deref().unwrap_or_default(),
-                        "input": [{"type": "text", "text": input.unwrap()}],
-                    }),
-                )
-                .await
-        }
-        "interrupt" => client
-            .request(
-                "turn/interrupt",
-                json!({"threadId": thread_id, "turnId": turn_id.as_deref().unwrap_or_default()}),
+                    "expectedTurnId": turn_id.as_deref().unwrap_or_default(),
+                    "input": [{"type": "text", "text": input.unwrap()}],
+                }),
             )
-            .await,
+            .await
+        }
+        "interrupt" => {
+            request_for_instance(
+                &client,
+                &owner,
+                session,
+                "turn/interrupt",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id.as_deref().unwrap_or_default()
+                }),
+            )
+            .await
+        }
         "resume" => {
-            client
-                .request(
-                    "thread/read",
-                    json!({"threadId": thread_id, "includeTurns": true}),
-                )
-                .await
+            request_for_instance(
+                &client,
+                &owner,
+                session,
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": true}),
+            )
+            .await
         }
         _ => unreachable!(),
     };
     if result.is_err() {
-        let record = store.update(session, task_id, |record| {
-            if !record.status.is_terminal() {
-                record.status = TaskStatus::ReconciliationRequired;
-                record.revision = record.revision.saturating_add(1);
-            }
-            Ok(())
-        })?;
+        let shutting_down = session_instance_is_closing(&owner);
+        let record = apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
         return Ok(task_view(&record, None));
     }
 
@@ -2338,20 +3085,20 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
         match derive_thread_state(response, record.turn_id.as_deref()) {
             Ok(state) => Some(state),
             Err(_) => {
-                let record = store.update(session, task_id, |record| {
-                    if !record.status.is_terminal() {
-                        record.status = TaskStatus::ReconciliationRequired;
-                        record.revision = record.revision.saturating_add(1);
-                    }
-                    Ok(())
-                })?;
+                let shutting_down = session_instance_is_closing(&owner);
+                let record =
+                    apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
                 return Ok(task_view(&record, None));
             }
         }
     } else {
         None
     };
-    record = store.update(session, task_id, |record| {
+    let apply_permit = ensure_current_active_instance(&owner, session).await?;
+    record = store.update_if_instance_live(session, task_id, &owner, |record| {
+        if record.status.is_terminal() {
+            return Ok(());
+        }
         if let Some(resumed) = resumed.as_ref() {
             record.status = reconciled_task_status(record.status, resumed.status);
             if resumed.turn_id.is_some() {
@@ -2381,6 +3128,7 @@ pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Res
         }
         Ok(())
     })?;
+    drop(apply_permit);
     Ok(task_view(&record, None))
 }
 
@@ -2482,6 +3230,119 @@ for raw in sys.stdin:
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    fn barrier_fake_app_server(
+        root: &Path,
+        blocked_method: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let label = blocked_method.replace('/', "-");
+        let path = root.join(format!("fake-app-server-barrier-{label}"));
+        let entered = root.join(format!("{label}-entered"));
+        let release = root.join(format!("{label}-release"));
+        let turn_started = root.join(format!("{label}-turn-started"));
+        let steer_sent = root.join(format!("{label}-steer-sent"));
+        let python_string =
+            |value: &Path| serde_json::to_string(&value.to_string_lossy().into_owned()).unwrap();
+        let script = r##"#!/usr/bin/env python3
+import json, os, sys, time
+blocked_method = __BLOCKED_METHOD__
+entered = __ENTERED__
+release = __RELEASE__
+turn_started = __TURN_STARTED__
+steer_sent = __STEER_SENT__
+thread_id = '0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa'
+turn_id = '0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb'
+for raw in sys.stdin:
+    req = json.loads(raw)
+    if req.get('method') == 'initialized':
+        continue
+    i = req.get('id')
+    method = req.get('method')
+    if method == 'initialize':
+        result = {'userAgent':'codex_cli_rs/0.153.4 (temote-mcp; test)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'macos'}
+    elif method == 'model/list':
+        result = {'data':[{'model':'gpt-5.6-luna','id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'xhigh'}]}]}
+    elif method == blocked_method:
+        open(entered, 'w').close()
+        while not os.path.exists(release):
+            time.sleep(0.005)
+        result = {'thread':{'id':thread_id}}
+    elif method == 'thread/start':
+        result = {'thread':{'id':thread_id}}
+    elif method == 'thread/resume':
+        result = {'thread':{'id':thread_id}}
+    elif method == 'turn/start':
+        open(turn_started, 'w').close()
+        result = {'turn':{'id':turn_id}}
+    elif method == 'turn/steer':
+        open(steer_sent, 'w').close()
+        result = {'turnId':turn_id}
+    elif method == 'turn/interrupt':
+        result = {}
+    elif method == 'thread/read':
+        result = {'thread':{'id':thread_id,'status':{'type':'idle'},'turns':[{'id':turn_id,'status':'completed'}]}}
+    else:
+        print(json.dumps({'id':i,'error':{'code':-32601,'message':'unsupported'}}), flush=True)
+        continue
+    print(json.dumps({'id':i,'result':result}), flush=True)
+"##
+        .replace("__BLOCKED_METHOD__", &serde_json::to_string(blocked_method).unwrap())
+        .replace("__ENTERED__", &python_string(&entered))
+        .replace("__RELEASE__", &python_string(&release))
+        .replace("__TURN_STARTED__", &python_string(&turn_started))
+        .replace("__STEER_SENT__", &python_string(&steer_sent));
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (path, entered, release, turn_started, steer_sent)
+    }
+
+    async fn active_test_session(
+        root: &Path,
+        id: &str,
+        yolo: bool,
+    ) -> (approvals::RuntimeHandle, config::Session) {
+        let (approval_sender, _approval_receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime(root, Some(id), yolo, approval_sender)
+            .await
+            .unwrap();
+        let session = config::read_session_metadata(id).await.unwrap();
+        (handle, session)
+    }
+
+    async fn wait_for_marker(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fake app-server did not reach its barrier");
+    }
+
+    fn recording_client(methods: Arc<Mutex<Vec<String>>>) -> RpcClient {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(8);
+        let actor = tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    ClientCommand::Request { method, reply, .. } => {
+                        methods.lock().unwrap().push(method.to_owned());
+                        let result = match method {
+                            "thread/start" => json!({"thread":{"id":"thread"}}),
+                            "turn/start" => json!({"turn":{"id":"turn"}}),
+                            _ => json!({}),
+                        };
+                        let _ = reply.send(Ok(result));
+                    }
+                    ClientCommand::Notify { .. } => {}
+                    ClientCommand::Shutdown => break,
+                }
+            }
+        });
+        RpcClient {
+            tx: commands,
+            actor: Arc::new(Mutex::new(Some(actor))),
+        }
     }
 
     fn task_record(
@@ -2702,6 +3563,284 @@ for raw in sys.stdin:
         assert!(runtime_for(&replacement, replacement_task).is_some());
 
         remove_session(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_during_thread_start_never_starts_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("shutdown-thread-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let (binary, entered, release, turn_started, _) =
+            barrier_fake_app_server(root.path(), "thread/start");
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "stop while thread start is pending",
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        });
+        let task_owner = owner.clone();
+        let task_store = store.clone();
+        let task_binary = binary.clone();
+        let operation = tokio::spawn(async move {
+            task_start_with_store_and_binary_fenced(&args, &task_owner, &task_store, &task_binary)
+                .await
+        });
+
+        wait_for_marker(&entered).await;
+        handle.shutdown().await.unwrap();
+        remove_session_with_store(&owner, &store).await.unwrap();
+        std::fs::write(&release, b"release").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result["status"], "interrupted");
+        assert!(!turn_started.exists(), "turn/start was sent after shutdown");
+        assert!(
+            runtime_for(&owner, task_id_for_operation(&owner, operation_id).unwrap()).is_none()
+        );
+        let record = store
+            .load(&owner, task_id_for_operation(&owner, operation_id).unwrap())
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Interrupted);
+        assert!(record.thread_id.is_none());
+        remove_session(&owner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_after_thread_start_before_turn_start() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("shutdown-between-rpcs-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let client = recording_client(Arc::clone(&methods));
+
+        let thread = request_for_instance(
+            &client,
+            &SessionInstance::from_session(&owner),
+            &owner,
+            "thread/start",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(thread["thread"]["id"], "thread");
+
+        let owner_instance = SessionInstance::from_session(&owner);
+        begin_session_instance_shutdown(&owner_instance);
+        let turn =
+            request_for_instance(&client, &owner_instance, &owner, "turn/start", json!({})).await;
+        assert!(turn.is_err());
+        assert_eq!(methods.lock().unwrap().as_slice(), ["thread/start"]);
+
+        client.shutdown().await;
+        handle.shutdown().await.unwrap();
+        remove_session(&owner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_during_task_control_never_sends_steer() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("shutdown-control-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                1,
+                Some("thread"),
+                Some("turn"),
+            ))
+            .unwrap();
+        let (binary, entered, release, turn_started, steer_sent) =
+            barrier_fake_app_server(root.path(), "thread/resume");
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "task_id": task_id,
+            "operation_id": operation_id,
+            "action": "steer",
+            "input": "must not be sent"
+        });
+        let task_owner = owner.clone();
+        let task_store = store.clone();
+        let task_binary = binary.clone();
+        let operation = tokio::spawn(async move {
+            task_control_with_store_and_binary(&args, &task_owner, &task_store, &task_binary).await
+        });
+
+        wait_for_marker(&entered).await;
+        handle.shutdown().await.unwrap();
+        remove_session_with_store(&owner, &store).await.unwrap();
+        std::fs::write(&release, b"release").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result["status"], "interrupted");
+        assert!(!turn_started.exists(), "turn/start was sent during control");
+        assert!(!steer_sent.exists(), "turn/steer was sent after shutdown");
+        assert!(runtime_for(&owner, task_id).is_none());
+        assert_eq!(
+            store.load(&owner, task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        remove_session(&owner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_instance_cannot_insert_runtime_after_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("shutdown-insert-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let client = recording_client(methods);
+
+        handle.shutdown().await.unwrap();
+        remove_session_with_store(&owner, &store).await.unwrap();
+        let error = insert_runtime(&owner, task_id, client.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no longer current")
+                || error.to_string().contains("not active")
+        );
+        assert!(runtime_for(&owner, task_id).is_none());
+        client.shutdown().await;
+        remove_session(&owner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_child_approval_does_not_reach_replacement_session() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("approval-replacement-{}", Uuid::new_v4());
+        let (old_handle, old) = active_test_session(root.path(), &id, true).await;
+        old_handle.shutdown().await.unwrap();
+        remove_session(&old).await.unwrap();
+
+        let (sender, mut receiver) = approvals::approval_channel();
+        let replacement_handle = approvals::spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let replacement = config::read_session_metadata(&id).await.unwrap();
+        assert_ne!(old.started_at, replacement.started_at);
+
+        let allowed = approvals::request_user_approval_for_instance(
+            &old,
+            "Codex command approval",
+            "old instance prompt".to_owned(),
+            old.cwd.clone(),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!allowed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        replacement_handle.shutdown().await.unwrap();
+        remove_session(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_session_still_works() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("replacement-works-{}", Uuid::new_v4());
+        let (old_handle, old) = active_test_session(root.path(), &id, true).await;
+        old_handle.shutdown().await.unwrap();
+        remove_session(&old).await.unwrap();
+
+        let (replacement_handle, replacement) = active_test_session(root.path(), &id, true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let binary = fake_app_server(root.path(), "ok");
+        let operation_id = Uuid::new_v4();
+        let result = task_start_with_store_and_binary_fenced(
+            &json!({
+                "operation_id": operation_id,
+                "task": "new replacement task",
+                "model": "gpt-5.6-luna",
+                "effort": "max"
+            }),
+            &replacement,
+            &store,
+            &binary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"], "running");
+        let task_id = task_id_for_operation(&replacement, operation_id).unwrap();
+        assert!(runtime_for(&replacement, task_id).is_some());
+
+        replacement_handle.shutdown().await.unwrap();
+        remove_session_with_store(&replacement, &store)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load(&replacement, task_id).unwrap().status,
+            TaskStatus::Interrupted
+        );
+        remove_session(&replacement).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_record_never_resurrected_by_late_response() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let id = format!("late-response-{}", Uuid::new_v4());
+        let (handle, owner) = active_test_session(root.path(), &id, true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        store
+            .save(&task_record(
+                &owner,
+                task_id,
+                TaskStatus::Accepted,
+                1,
+                None,
+                None,
+            ))
+            .unwrap();
+
+        handle.shutdown().await.unwrap();
+        remove_session_with_store(&owner, &store).await.unwrap();
+        let finalized = store.load(&owner, task_id).unwrap();
+        let late_thread =
+            apply_thread_start_response(&store, &owner, task_id, "late-thread").unwrap();
+        let late_turn = apply_turn_start_response(
+            &store,
+            &owner,
+            task_id,
+            "late-thread",
+            "late-turn",
+            Uuid::new_v4(),
+        )
+        .unwrap();
+
+        for late in [finalized, late_thread, late_turn] {
+            assert_eq!(late.status, TaskStatus::Interrupted);
+            assert_eq!(late.revision, 2);
+            assert!(late.thread_id.is_none());
+            assert!(late.turn_id.is_none());
+            assert_eq!(late.generation, 0);
+        }
+        remove_session(&owner).await.unwrap();
     }
 
     #[tokio::test]
@@ -3882,7 +5021,7 @@ for raw in sys.stdin:
         let binary = fake_app_server(root.path(), "ok");
         let task_id = Uuid::new_v4();
         let (client, initialized) =
-            spawn_initialized_client_with_binary(&session, Some(task_id), &binary)
+            spawn_initialized_client_with_binary_mode(&session, Some(task_id), &binary, false)
                 .await
                 .unwrap();
         assert_eq!(initialized["platformOs"], "macos");
@@ -3950,7 +5089,7 @@ for raw in sys.stdin:
         )
         .unwrap();
         std::fs::set_permissions(&incompatible, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = spawn_initialized_client_with_binary(&session, None, &incompatible)
+        let error = spawn_initialized_client_with_binary_mode(&session, None, &incompatible, false)
             .await
             .err()
             .unwrap();
@@ -3963,7 +5102,7 @@ for raw in sys.stdin:
         )
         .unwrap();
         std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = spawn_initialized_client_with_binary(&session, None, &oversized)
+        let error = spawn_initialized_client_with_binary_mode(&session, None, &oversized, false)
             .await
             .err()
             .unwrap();

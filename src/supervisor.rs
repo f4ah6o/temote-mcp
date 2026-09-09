@@ -478,6 +478,9 @@ impl SessionSupervisor {
         }
         let handle = {
             let mut sessions = self.sessions.lock().await;
+            if let Some(handle) = sessions.get(session_id) {
+                crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+            }
             sessions.remove(session_id)
         };
         let Some(handle) = handle else {
@@ -505,12 +508,9 @@ impl SessionSupervisor {
         };
         self.restart_specs.lock().await.remove(session_id);
         self.public_sessions.lock().await.remove(session_id);
-        let session = config::read_session_metadata(session_id).await;
+        let session = handle.session_metadata();
         let shutdown_result = handle.shutdown().await;
-        let cleanup_result = match session {
-            Ok(session) => crate::codex_app_server::remove_session(&session).await,
-            Err(error) => Err(error).context("cannot read session metadata for Codex cleanup"),
-        };
+        let cleanup_result = crate::codex_app_server::remove_session(&session).await;
         shutdown_result.with_context(|| format!("failed to stop session {session_id}"))?;
         cleanup_result
     }
@@ -720,21 +720,20 @@ impl SessionSupervisor {
             "supervisor upgrade is not fenced"
         );
         for planned in &plan.sessions {
-            let session = config::read_session_metadata(&planned.session_id)
-                .await
-                .with_context(|| {
+            let handle = {
+                let mut sessions = self.sessions.lock().await;
+                let handle = sessions.get(&planned.session_id).with_context(|| {
                     format!(
-                        "session {} disappeared before upgrade drain cleanup",
+                        "session {} disappeared before upgrade drain",
                         planned.session_id
                     )
                 })?;
-            let handle = self.sessions.lock().await.remove(&planned.session_id);
-            let Some(handle) = handle else {
-                anyhow::bail!(
-                    "session {} disappeared before upgrade drain",
-                    planned.session_id
-                );
+                crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                sessions
+                    .remove(&planned.session_id)
+                    .expect("session handle disappeared after it was inspected")
             };
+            let session = handle.session_metadata();
             let shutdown_result = handle.shutdown().await;
             let cleanup_result = crate::codex_app_server::remove_session(&session).await;
             shutdown_result
@@ -800,8 +799,15 @@ impl SessionSupervisor {
         for id in session_ids.into_iter().rev() {
             self.restart_specs.lock().await.remove(&id);
             self.public_sessions.lock().await.remove(&id);
-            let session = config::read_session_metadata(&id).await;
-            let shutdown_result = match self.sessions.lock().await.remove(&id) {
+            let handle = {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(handle) = sessions.get(&id) {
+                    crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                }
+                sessions.remove(&id)
+            };
+            let session = handle.as_ref().map(RuntimeHandle::session_metadata);
+            let shutdown_result = match handle {
                 Some(handle) => handle.shutdown().await,
                 None => Ok(()),
             };
@@ -812,10 +818,12 @@ impl SessionSupervisor {
                     Some(error.context(format!("failed to stop partially restored session {id}")));
             }
             let cleanup_result = match session {
-                Ok(session) => crate::codex_app_server::remove_session(&session).await,
-                Err(error) => {
-                    Err(error).context("cannot read session metadata for restored-session cleanup")
-                }
+                Some(session) => crate::codex_app_server::remove_session(&session).await,
+                None => match config::read_session_metadata(&id).await {
+                    Ok(session) => crate::codex_app_server::remove_session(&session).await,
+                    Err(error) => Err(error)
+                        .context("cannot read session metadata for restored-session cleanup"),
+                },
             };
             if let Err(error) = cleanup_result
                 && first_error.is_none()
@@ -975,16 +983,17 @@ impl SessionSupervisor {
                 .collect::<Vec<_>>()
         };
         for id in finished {
-            let handle = self.sessions.lock().await.remove(&id);
+            let handle = {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(handle) = sessions.get(&id) {
+                    crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                }
+                sessions.remove(&id)
+            };
             if let Some(handle) = handle {
-                let session = config::read_session_metadata(&id).await;
+                let session = handle.session_metadata();
                 let wait_result = handle.wait().await;
-                let cleanup_result = match session {
-                    Ok(session) => crate::codex_app_server::remove_session(&session).await,
-                    Err(error) => {
-                        Err(error).context("cannot read session metadata for Codex cleanup")
-                    }
-                };
+                let cleanup_result = crate::codex_app_server::remove_session(&session).await;
                 let cleanup_failed = if let Err(error) = cleanup_result {
                     eprintln!("Codex task cleanup for ended session {id} failed: {error:#}");
                     true
@@ -1037,20 +1046,20 @@ impl SessionSupervisor {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect::<Vec<_>>()
         };
+        for (_, handle) in &handles {
+            crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+        }
         self.restart_specs.lock().await.clear();
         self.public_sessions.lock().await.clear();
         let mut first_error = None;
-        for (session_id, handle) in handles {
-            let session = config::read_session_metadata(&session_id).await;
+        for (_, handle) in handles {
+            let session = handle.session_metadata();
             if let Err(error) = handle.shutdown().await
                 && first_error.is_none()
             {
                 first_error = Some(error);
             }
-            let cleanup_result = match session {
-                Ok(session) => crate::codex_app_server::remove_session(&session).await,
-                Err(error) => Err(error).context("cannot read session metadata for Codex cleanup"),
-            };
+            let cleanup_result = crate::codex_app_server::remove_session(&session).await;
             if let Err(error) = cleanup_result
                 && first_error.is_none()
             {
