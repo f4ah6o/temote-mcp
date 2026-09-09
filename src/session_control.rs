@@ -268,7 +268,20 @@ impl SessionBackend {
                 Ok(serde_json::to_value(inspect_session(session_id).await?)?)
             }
             Self::LocalControl => {
-                request(ControlRequest::Restart {
+                let lifecycle = config::read_session_lifecycle(session_id)
+                    .await?
+                    .context("public managed session has no lifecycle metadata")?;
+                let path = lifecycle
+                    .logical_path
+                    .as_deref()
+                    .context("public managed session has no named-root path")?;
+                request(ControlRequest::Stop {
+                    session_id: session_id.to_owned(),
+                    public: true,
+                })
+                .await?;
+                request(ControlRequest::Start {
+                    path: path.to_owned(),
                     session_id: session_id.to_owned(),
                     environment: CapturedStartEnvironment::default(),
                     public: true,
@@ -940,7 +953,7 @@ async fn handle_upgrade_request(
         "error": Value::Null
     });
     if let Err(error) = stream.write_all(&encode_line(&response)?).await {
-        let rollback = supervisor.rollback_upgrade(&plan).await;
+        let rollback = supervisor.rollback_upgrade(&plan, true).await;
         let _ = remove_upgrade_plan(&plan_path);
         return match rollback {
             Ok(()) => Err(error)
@@ -953,10 +966,11 @@ async fn handle_upgrade_request(
     let _ = stream.shutdown().await;
 
     if let Err(error) = supervisor.drain_for_upgrade(&plan).await {
-        let rollback = supervisor.rollback_upgrade(&plan).await;
+        let rollback = supervisor.rollback_upgrade(&plan, false).await;
         let _ = remove_upgrade_plan(&plan_path);
         return match rollback {
-            Ok(()) => Err(error).context("supervisor upgrade drain failed; sessions were restored"),
+            Ok(()) => Err(error)
+                .context("supervisor upgrade drain failed; replacement startup was blocked"),
             Err(rollback) => Err(anyhow::anyhow!(
                 "supervisor upgrade drain failed: {error:#}; rollback also failed: {rollback:#}"
             )),
@@ -973,7 +987,7 @@ async fn handle_upgrade_request(
     #[cfg(target_os = "linux")]
     drop(_exec_credential_handoff);
 
-    let rollback = supervisor.rollback_upgrade(&plan).await;
+    let rollback = supervisor.rollback_upgrade(&plan, true).await;
     let _ = remove_upgrade_plan(&plan_path);
     match rollback {
         Ok(()) => {
@@ -1479,8 +1493,11 @@ async fn restart_session(
             .start_public_with_environment(path, Some(session_id), environment)
             .await?;
     } else {
+        crate::codex_app_server::begin_session_shutdown(&session);
         if config::session_is_active(session_id).await? {
             supervisor.stop(session_id).await?;
+        } else {
+            crate::codex_app_server::remove_session(&session).await?;
         }
         if let Some(path) = lifecycle
             .as_ref()
@@ -1523,7 +1540,7 @@ async fn handle_console_attachment(
     let mut reader = BufReader::new(reader);
 
     while let Some(prompt) = receiver.recv().await {
-        let event = json!({
+        let mut event = json!({
             "type": "approval",
             "session_id": prompt.session_id,
             "id": prompt.request.id,
@@ -1531,6 +1548,9 @@ async fn handle_console_attachment(
             "operation": prompt.request.operation,
             "detail": prompt.request.detail,
         });
+        if !prompt.request.metadata.is_empty() {
+            event["metadata"] = serde_json::to_value(&prompt.request.metadata)?;
+        }
         if let Err(error) = writer.write_all(&encode_line(&event)?).await {
             prompt.respond(false);
             return Err(error).context("approval console disconnected while writing prompt");
@@ -2673,6 +2693,7 @@ mod tests {
             operation: "Authorize OAuth client".to_owned(),
             detail: "proxy approval".to_owned(),
             cwd: std::env::current_dir().unwrap(),
+            metadata: std::collections::BTreeMap::new(),
         };
         let supervisor_for_request = Arc::clone(&supervisor);
         let allowed = tokio::spawn(async move {
@@ -2704,6 +2725,7 @@ mod tests {
                     operation: "Authorize OAuth client".to_owned(),
                     detail: "console disconnected".to_owned(),
                     cwd: std::env::current_dir().unwrap(),
+                    metadata: std::collections::BTreeMap::new(),
                 },
             },
             &supervisor,

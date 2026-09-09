@@ -58,6 +58,27 @@ git diff --check
 
 The installed HTTP/ingress lifecycle commands are `temote-mcp up --profile cloudflare|tailscale|openai` and `temote-mcp down`. They require a separately running `temote-mcp supervisor`; `down` does not stop that lifecycle supervisor or its sessions. Omitting the profile remains equivalent to `cloudflare`. The `justfile` provides development-oriented Cloudflare wrappers through `just up/down`; Tailscale/OpenAI profile testing should invoke the checkout binary directly so Cloudflare-only environment checks are not applied. For OpenAI, `TUNNEL_CLIENT_BIN` can point at a checkout/test binary while production should use the supported `tunnel-client` distribution and a Restricted runtime key rather than an admin key.
 
+## Experimental Codex delegation and app-server
+
+The developer-only `temote-mcp codex delegate` command is a small dogfood/experimental bootstrap for a parent process that needs to run the installed Codex CLI non-interactively:
+
+```sh
+temote-mcp codex delegate \
+  --model <model> \
+  --reasoning-effort <effort> \
+  --prompt-file ./delegation-prompt.txt
+```
+
+It invokes the installed `codex exec` contract with an explicit model, `model_reasoning_effort` config override, JSONL events, an output schema, and an output-last-message file. Child stdin is `/dev/null`, and JSONL/stderr are retained as owner-only temporary artifacts outside the checkout by default. The parent-facing result contains only a bounded JSON report, process classification, requested model/effort, observed model/effort when an event actually supplies them, and bounded thread/usage evidence; it does not print raw JSONL or stderr. The default final-report limit is 4096 bytes.
+
+This bootstrap is developer infrastructure, not a generic remote shell. It does not widen filesystem roots, bypass approvals, or alter the direct `execute` network prohibition.
+
+The experimental MCP surfaces `codex_status`, `codex_task_start`, `codex_task_get`, and `codex_task_control` use the local `codex app-server --stdio` protocol. The initialize handshake must advertise the supported app-server version (`0.153.4`) and a Codex home. Task records are bound to the complete Temote session instance (`session_id`, start time, and process ID) plus the canonical session directory. Every mutation requires an opaque `operation_id`; its accepted receipt is persisted before spawning or sending a child request. Pre-thread initialization/model-list failures are retryable with the same start operation, while a failure after thread/start or turn/start may have been sent becomes `reconciliation_required` and is never replayed blindly. Control is limited to typed `steer`, `resume`, and `interrupt` actions, and accepted operation IDs remain conflict-protected through task retention even when detailed receipts are compacted.
+
+Normal-session task start/control requests require local approval. Temote yolo does not change the Codex child approval policy: app-server command/file-change requests still require the explicit user-approval path and decline when that transport is unavailable. The integration exposes named status/task methods only; it does not expose arbitrary JSON-RPC, `thread/shellCommand`, remote shell, or automatic approval. Task prompts and control input are not written to task metadata or approval/activity summaries. `codex_task_get` reconciles the remote thread before returning `not_modified`; unexpired task records, including terminal records, are not pruned for capacity. Only expired terminal records without a live runtime are eligible for pruning, and a full retention limit rejects new starts. Thread data is retained only as bounded, expiring, session-and-scope-bound in-memory evidence read through an opaque reference.
+
+Generated Codex turns are requested with `workspaceWrite`, the canonical session directory as the writable root, and `networkAccess=false`. This is an app-server sandbox adapter, not a replacement for Temote's OS-level sandbox around direct commands: the app-server process itself must communicate with the inference service outside that direct command sandbox. Keep these MCP surfaces opt-in/experimental until the host's installed Codex build and sandbox behavior have been validated; do not treat them as equivalent to normal `execute`.
+
 For OpenAI bootstrap testing, `temote-mcp openai setup --workspace-id <id>` calls the production Tunnel Management API. When `OPENAI_ADMIN_KEY` is unset it uses a controlling-terminal hidden prompt; the returned tunnel ID alone is stored in `~/.config/temote-mcp/openai.env` (`0600`). Use `--config-file` for an isolated test path. The command refuses to overwrite an existing tunnel ID unless `--force` is explicit. `temote-mcp up --profile openai` similarly prompts for the Runtime API key when neither runtime-key environment variable is present, injects it only into the `tunnel-client` child, removes `OPENAI_ADMIN_KEY` from that child, and zeroizes the prompt buffer after spawn. Runtime/Admin keys are never persisted by these commands.
 
 ### Property-based tests

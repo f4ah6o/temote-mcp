@@ -7,8 +7,10 @@ mod approvals;
 mod checkpoints;
 mod child_env;
 mod cli;
+mod codex_app_server;
 mod config;
 mod doctor;
+mod evidence;
 mod friction;
 #[cfg(feature = "network")]
 mod gateway;

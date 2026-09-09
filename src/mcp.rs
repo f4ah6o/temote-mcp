@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,9 +14,9 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    apply_patch, approvals, checkpoints, child_env, config, friction, onepassword_cli,
-    onepassword_mcp, onepassword_sdk, recall, sandbox, session_control::SessionBackend,
-    work_handoff,
+    apply_patch, approvals, checkpoints, child_env, codex_app_server, config, evidence, friction,
+    onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
+    session_control::SessionBackend, work_handoff,
 };
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,6 +37,8 @@ const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MCP_RESPONSE_BYTES: usize = 52 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MIN_RETURN_OUTPUT_BYTES: usize = 256;
+const MAX_RETURN_OUTPUT_BYTES: usize = sandbox::MAX_COMMAND_OUTPUT_BYTES;
 const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_DIRECTORY_LIST_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_LIST_ENTRIES: usize = 256;
@@ -48,8 +50,20 @@ const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the local sessi
 
 #[derive(Clone)]
 enum CachedJobResult {
-    Success(String),
-    Error(String),
+    Success {
+        text: String,
+        evidence: Option<evidence::EvidenceRef>,
+    },
+    Error {
+        text: String,
+        evidence: Option<evidence::EvidenceRef>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OutputPolicy {
+    output_limit_bytes: Option<usize>,
+    status_only: bool,
 }
 
 #[derive(Default)]
@@ -63,6 +77,7 @@ struct Job {
     command: String,
     handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
+    output_policy: OutputPolicy,
 }
 
 struct JobSlot {
@@ -466,7 +481,12 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB from the local machine. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB. With optional start_line/end_line or offset_bytes plus max_bytes, return bounded range metadata with an unambiguous UTF-8 next offset. Omitting range arguments preserves whole-file behavior.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"offset_bytes":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":4,"maximum":8388608}},"required":["session_id","path"],"additionalProperties":false}},
+        {"name":"evidence_read","title":"Read scoped Temote evidence","description":"Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"evidence_id":{"type":"string","format":"uuid"},"offset_bytes":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384}},"required":["session_id","evidence_id"],"additionalProperties":false}},
+        {"name":"codex_status","title":"Check Codex app-server compatibility","description":"Check the locally installed Codex app-server through stdio, fail closed unless the supported protocol version is present, and return only model/effort compatibility metadata.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
+        {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
+        {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 regular file using the selected session permission mode. Existing special-file targets are rejected. Normal sessions are restricted to permitted roots and use the temote-mcp sandbox; yolo sessions may write anywhere the local user can.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
@@ -476,9 +496,9 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Normal sessions run in the temote-mcp sandbox with network disabled; yolo sessions run directly on the host with the local user's filesystem, environment, process, and network permissions. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
-        {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Normal sessions use the temote-mcp sandbox with network disabled; yolo sessions run directly on the host with the local user's permissions.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"}},"required":["session_id","command"],"additionalProperties":false}},
-        {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Returns running while active, or the command result once completed.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Optional output_limit_bytes or status_only becomes the default completed-result view for later polls.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
         {"name":"checkpoint_save","title":"Save a scoped work checkpoint","description":"Persist a bounded client-reported work checkpoint scoped to the current canonical working directory. A mandatory operation_id makes exact retries idempotent. Normal sessions require local approval.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_save_input_schema()},
         {"name":"checkpoint_load","title":"Load a scoped work checkpoint","description":"Read one client-reported checkpoint only when it belongs to the current canonical working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_load_input_schema()},
@@ -654,16 +674,31 @@ async fn call_tool(
             .await;
             result
         }
-        "read_file" => {
-            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
-            let result = read_text_file(&path).await;
-            report_result(
-                &session.id,
-                format!("Read {}", display_path(&path, &session.cwd)),
-                &result,
-            )
-            .await;
-            text_result(result?)
+        "read_file" => read_file_tool(&args, &session).await,
+        "evidence_read" => evidence_read_tool(&args, &session),
+        "codex_status" => {
+            let (detail, metadata) = codex_status_approval();
+            authorize_codex_operation(&session, "codex_status", detail, metadata).await?;
+            text_result(serde_json::to_string_pretty(
+                &codex_app_server::status(&session).await?,
+            )?)
+        }
+        "codex_task_start" => {
+            let (detail, metadata) = codex_task_start_approval(&args);
+            authorize_codex_operation(&session, "codex_task_start", detail, metadata).await?;
+            text_result(serde_json::to_string_pretty(
+                &codex_app_server::task_start(&args, &session).await?,
+            )?)
+        }
+        "codex_task_get" => text_result(serde_json::to_string_pretty(
+            &codex_app_server::task_get(&args, &session).await?,
+        )?),
+        "codex_task_control" => {
+            let (detail, metadata) = codex_task_control_approval(&args);
+            authorize_codex_operation(&session, "codex_task_control", detail, metadata).await?;
+            text_result(serde_json::to_string_pretty(
+                &codex_app_server::task_control(&args, &session).await?,
+            )?)
         }
         "list_directory" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
@@ -1119,8 +1154,257 @@ fn display_path<'a>(path: &'a Path, session_cwd: &Path) -> std::borrow::Cow<'a, 
         .to_string_lossy()
 }
 
+async fn authorize_codex_operation(
+    session: &config::Session,
+    action: &str,
+    detail: String,
+    metadata: BTreeMap<String, String>,
+) -> Result<()> {
+    if session.yolo {
+        return Ok(());
+    }
+    let approved = approvals::request_with_metadata(
+        &session.id,
+        action,
+        detail,
+        session.cwd.clone(),
+        metadata,
+    )
+    .await?;
+    anyhow::ensure!(approved, "user denied Codex operation");
+    Ok(())
+}
+
+fn codex_status_approval() -> (String, BTreeMap<String, String>) {
+    (
+        "Codex delegation request\naccess: read-only\nscope: current session\nresult: model and effort compatibility metadata".to_owned(),
+        codex_approval_metadata("codex_status", "status", false, "session_scope"),
+    )
+}
+
+fn codex_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
+    let operation_id = safe_codex_argument(args, "operation_id");
+    let model = safe_codex_argument(args, "model");
+    let effort = safe_codex_argument(args, "effort");
+    let mut metadata =
+        codex_approval_metadata("codex_task_start", "task_start", true, "session_scope");
+    metadata.insert("operation_id".to_owned(), operation_id.clone());
+    metadata.insert("model".to_owned(), model.clone());
+    metadata.insert("effort".to_owned(), effort.clone());
+    metadata.insert("task_input".to_owned(), "omitted".to_owned());
+    (
+        format!(
+            "Codex delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\neffort: {effort}\noperation_id: {operation_id}\ntask input: omitted"
+        ),
+        metadata,
+    )
+}
+
+fn codex_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
+    let task_id = safe_codex_argument(args, "task_id");
+    let operation_id = safe_codex_argument(args, "operation_id");
+    let action = safe_codex_argument(args, "action");
+    let mut metadata = codex_approval_metadata(
+        "codex_task_control",
+        "task_control",
+        true,
+        &format!("task:{task_id}"),
+    );
+    metadata.insert("task_id".to_owned(), task_id.clone());
+    metadata.insert("operation_id".to_owned(), operation_id.clone());
+    metadata.insert("action".to_owned(), action.clone());
+    metadata.insert("control_input".to_owned(), "omitted".to_owned());
+    (
+        format!(
+            "Codex delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
+        ),
+        metadata,
+    )
+}
+
+fn codex_approval_metadata(
+    tool: &str,
+    operation_type: &str,
+    mutation: bool,
+    target: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("provenance".to_owned(), "codex_delegation".to_owned()),
+        ("source".to_owned(), "codex_delegation".to_owned()),
+        ("tool".to_owned(), tool.to_owned()),
+        ("operation_type".to_owned(), operation_type.to_owned()),
+        ("target".to_owned(), target.to_owned()),
+        ("mutation".to_owned(), mutation.to_string()),
+        ("read_only".to_owned(), (!mutation).to_string()),
+        ("scope".to_owned(), "session_cwd".to_owned()),
+    ])
+}
+
+fn safe_codex_argument(args: &Value, key: &str) -> String {
+    let Some(value) = args.get(key).and_then(Value::as_str) else {
+        return "(not provided)".to_owned();
+    };
+    let mut rendered = String::new();
+    for character in value.chars() {
+        let part = if character.is_control() {
+            if character.is_ascii() {
+                format!("\\x{:02x}", character as u32)
+            } else {
+                format!("\\u{{{:x}}}", character as u32)
+            }
+        } else {
+            character.to_string()
+        };
+        if rendered.len().saturating_add(part.len()) > 256 {
+            rendered.push('…');
+            break;
+        }
+        rendered.push_str(&part);
+    }
+    rendered
+}
+
 fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
+}
+
+async fn read_file_tool(args: &Value, session: &config::Session) -> Result<Value> {
+    let path = config::resolve_existing_path(session, &required_path(args, "path")?)?;
+    let result = read_text_file(&path).await;
+    report_result(
+        &session.id,
+        format!("Read {}", display_path(&path, &session.cwd)),
+        &result,
+    )
+    .await;
+    let text = result?;
+    if !has_read_range_args(args) {
+        return text_result(text);
+    }
+    let ranged = ranged_text_result(args, &text)?;
+    text_result(serde_json::to_string(&ranged)?)
+}
+
+fn has_read_range_args(args: &Value) -> bool {
+    ["start_line", "end_line", "offset_bytes", "max_bytes"]
+        .iter()
+        .any(|key| args.get(*key).is_some())
+}
+
+fn ranged_text_result(args: &Value, text: &str) -> Result<Value> {
+    let start_line = optional_usize(args, "start_line")?;
+    let end_line = optional_usize(args, "end_line")?;
+    let offset_bytes = optional_usize(args, "offset_bytes")?;
+    let max_bytes = optional_usize(args, "max_bytes")?.unwrap_or(MAX_TEXT_FILE_BYTES);
+    anyhow::ensure!(
+        (4..=MAX_TEXT_FILE_BYTES).contains(&max_bytes),
+        "max_bytes must be 4..={MAX_TEXT_FILE_BYTES}"
+    );
+    anyhow::ensure!(
+        !(offset_bytes.is_some() && (start_line.is_some() || end_line.is_some())),
+        "offset_bytes cannot be combined with start_line or end_line"
+    );
+    if let Some(start_line) = start_line {
+        anyhow::ensure!(start_line >= 1, "start_line must be at least 1");
+    }
+    if let Some(end_line) = end_line {
+        anyhow::ensure!(end_line >= 1, "end_line must be at least 1");
+        anyhow::ensure!(
+            end_line >= start_line.unwrap_or(1),
+            "end_line must not precede start_line"
+        );
+    }
+
+    let start = if let Some(offset) = offset_bytes {
+        anyhow::ensure!(offset <= text.len(), "offset_bytes exceeds file length");
+        anyhow::ensure!(
+            text.is_char_boundary(offset),
+            "offset_bytes is not a UTF-8 boundary"
+        );
+        offset
+    } else {
+        line_start_offset(text, start_line.unwrap_or(1))
+            .context("start_line exceeds file length")?
+    };
+    let range_end = if offset_bytes.is_some() {
+        text.len()
+    } else if let Some(end_line) = end_line {
+        line_end_offset(text, end_line).context("end_line exceeds file length")?
+    } else {
+        text.len()
+    };
+    anyhow::ensure!(start <= range_end, "requested range is empty or reversed");
+
+    let desired_end = start.saturating_add(max_bytes).min(range_end);
+    let mut end = desired_end;
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let content = text[start..end].to_owned();
+    let truncated = end < range_end;
+    Ok(json!({
+        "content": content,
+        "file_bytes": text.len(),
+        "start_offset_bytes": start,
+        "returned_bytes": end.saturating_sub(start),
+        "range_end_offset_bytes": range_end,
+        "truncated": truncated,
+        "next_offset_bytes": truncated.then_some(end),
+        "utf8_boundary": true
+    }))
+}
+
+fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>> {
+    args.get(key)
+        .map(|value| {
+            let value = value
+                .as_u64()
+                .with_context(|| format!("{key} must be a non-negative integer"))?;
+            usize::try_from(value).with_context(|| format!("{key} is too large"))
+        })
+        .transpose()
+}
+
+fn line_start_offset(text: &str, line: usize) -> Option<usize> {
+    if line == 1 {
+        return Some(0);
+    }
+    let mut current = 1usize;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            current += 1;
+            if current == line {
+                return Some(index + 1);
+            }
+        }
+    }
+    None
+}
+
+fn line_end_offset(text: &str, line: usize) -> Option<usize> {
+    let start = line_start_offset(text, line)?;
+    match text[start..].find('\n') {
+        Some(relative) => Some(start + relative + 1),
+        None => Some(text.len()),
+    }
+}
+
+fn evidence_read_tool(args: &Value, session: &config::Session) -> Result<Value> {
+    let evidence_id = args
+        .get("evidence_id")
+        .and_then(Value::as_str)
+        .context("missing evidence_id")
+        .and_then(|value| Uuid::parse_str(value).context("invalid evidence_id"))?;
+    let offset_bytes = optional_usize(args, "offset_bytes")?.unwrap_or(0);
+    let max_bytes = optional_usize(args, "max_bytes")?.unwrap_or(evidence::DEFAULT_READ_BYTES);
+    let chunk = evidence::read(
+        &session.id,
+        &session.cwd,
+        evidence_id,
+        offset_bytes,
+        max_bytes,
+    )?;
+    text_result(serde_json::to_string(&chunk)?)
 }
 
 async fn read_text_file(path: &Path) -> Result<String> {
@@ -1688,6 +1972,7 @@ async fn run_git_and_report(
 }
 
 async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
+    let output_policy = parse_output_policy(args)?;
     let (rendered_command, mut handle, completion) = spawn_sandboxed_command(args, session).await?;
 
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
@@ -1699,7 +1984,7 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
                 .result
                 .clone()
                 .context("command task completed without a cached result")?;
-            cached_job_result(result)
+            cached_job_result(result, output_policy)
         }
         Err(_) => {
             store_job(
@@ -1707,6 +1992,7 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
                 rendered_command,
                 handle,
                 completion,
+                output_policy,
                 "Backgrounded",
             )
             .await
@@ -1715,8 +2001,17 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
 }
 
 async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
+    let output_policy = parse_output_policy(args)?;
     let (rendered_command, handle, completion) = spawn_sandboxed_command(args, session).await?;
-    store_job(session, rendered_command, handle, completion, "Started").await
+    store_job(
+        session,
+        rendered_command,
+        handle,
+        completion,
+        output_policy,
+        "Started",
+    )
+    .await
 }
 
 async fn spawn_sandboxed_command(
@@ -1731,6 +2026,7 @@ async fn spawn_sandboxed_command(
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     let session_id = session.id.clone();
+    let evidence_scope = session.cwd.clone();
     let task_command = rendered_command.clone();
     let completion = Arc::new(Mutex::new(JobCompletion::default()));
     let task_completion = Arc::clone(&completion);
@@ -1746,7 +2042,7 @@ async fn spawn_sandboxed_command(
                 Err(anyhow::anyhow!("sandbox job exceeded the two-hour lifetime limit"))
             }
         };
-        let cached = cache_job_result(&result);
+        let cached = cache_job_result(&result, &session_id, &evidence_scope);
         {
             let mut completion = task_completion.lock().unwrap();
             completion.result = Some(cached);
@@ -1777,6 +2073,7 @@ async fn store_job(
     rendered_command: String,
     handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
+    output_policy: OutputPolicy,
     activity: &str,
 ) -> Result<Value> {
     let job_id = Uuid::new_v4();
@@ -1789,6 +2086,7 @@ async fn store_job(
                 command: rendered_command.clone(),
                 handle,
                 completion,
+                output_policy,
             },
         );
         reap_jobs_at(&mut state, Instant::now());
@@ -1802,18 +2100,155 @@ async fn store_job(
     text_result(json!({"status":"running","job_id":job_id}).to_string())
 }
 
-fn cache_job_result(result: &Result<String>) -> CachedJobResult {
+fn cache_job_result(result: &Result<String>, session_id: &str, scope: &Path) -> CachedJobResult {
     match result {
-        Ok(text) => CachedJobResult::Success(text.clone()),
-        Err(error) => CachedJobResult::Error(format!("{error:#}")),
+        Ok(text) => CachedJobResult::Success {
+            evidence: cache_command_evidence(session_id, scope, text),
+            text: text.clone(),
+        },
+        Err(error) => {
+            let text = format!("{error:#}");
+            CachedJobResult::Error {
+                evidence: cache_command_evidence(session_id, scope, &text),
+                text,
+            }
+        }
     }
 }
 
-fn cached_job_result(result: CachedJobResult) -> Result<Value> {
+fn cache_command_evidence(
+    session_id: &str,
+    scope: &Path,
+    text: &str,
+) -> Option<evidence::EvidenceRef> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value.get("exit_code").and_then(Value::as_i64)?;
+    evidence::store(session_id, scope, text.to_owned())
+        .ok()
+        .flatten()
+}
+
+fn cached_job_result(result: CachedJobResult, policy: OutputPolicy) -> Result<Value> {
     match result {
-        CachedJobResult::Success(text) => text_result(text),
-        CachedJobResult::Error(error) => anyhow::bail!(error),
+        CachedJobResult::Success { text, evidence } => {
+            text_result(apply_output_policy(&text, policy, evidence.as_ref()))
+        }
+        CachedJobResult::Error { text, evidence } => {
+            anyhow::bail!(apply_output_policy(&text, policy, evidence.as_ref()))
+        }
     }
+}
+
+fn apply_output_policy(
+    text: &str,
+    policy: OutputPolicy,
+    evidence_ref: Option<&evidence::EvidenceRef>,
+) -> String {
+    if policy == OutputPolicy::default() {
+        return text.to_owned();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
+        return text.to_owned();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return text.to_owned();
+    };
+    if object.get("exit_code").and_then(Value::as_i64).is_none() {
+        return text.to_owned();
+    }
+
+    let mut omitted = false;
+    let mut returned_truncated = false;
+    if policy.status_only {
+        omitted = object
+            .get("stdout")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+            || object
+                .get("stderr")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+        object.remove("stdout");
+        object.remove("stderr");
+        object.insert("output_omitted".to_owned(), Value::Bool(omitted));
+    } else if let Some(limit) = policy.output_limit_bytes {
+        let stdout = object
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let stderr = object
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (stdout, stdout_truncated, remaining) = truncate_utf8(stdout, limit);
+        let (stderr, stderr_truncated, _) = truncate_utf8(stderr, remaining);
+        returned_truncated = stdout_truncated || stderr_truncated;
+        object.insert("stdout".to_owned(), Value::String(stdout));
+        object.insert("stderr".to_owned(), Value::String(stderr));
+        object.insert(
+            "returned_truncated".to_owned(),
+            Value::Bool(returned_truncated),
+        );
+        object.insert("output_limit_bytes".to_owned(), Value::Number(limit.into()));
+    }
+    if (omitted || returned_truncated)
+        && let Some(reference) = evidence_ref
+    {
+        object.insert(
+            "evidence".to_owned(),
+            serde_json::to_value(reference).unwrap_or(Value::Null),
+        );
+    }
+    value.to_string()
+}
+
+fn truncate_utf8(text: &str, limit: usize) -> (String, bool, usize) {
+    if text.len() <= limit {
+        return (text.to_owned(), false, limit - text.len());
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true, limit.saturating_sub(end))
+}
+
+fn parse_output_policy(args: &Value) -> Result<OutputPolicy> {
+    Ok(parse_output_policy_override(args)?.unwrap_or_default())
+}
+
+fn parse_output_policy_override(args: &Value) -> Result<Option<OutputPolicy>> {
+    let has_limit = args.get("output_limit_bytes").is_some();
+    let has_status = args.get("status_only").is_some();
+    if !has_limit && !has_status {
+        return Ok(None);
+    }
+    let output_limit_bytes = args
+        .get("output_limit_bytes")
+        .map(|value| {
+            let value = value
+                .as_u64()
+                .context("output_limit_bytes must be an integer")?;
+            anyhow::ensure!(
+                (MIN_RETURN_OUTPUT_BYTES as u64..=MAX_RETURN_OUTPUT_BYTES as u64).contains(&value),
+                "output_limit_bytes must be {MIN_RETURN_OUTPUT_BYTES}..={MAX_RETURN_OUTPUT_BYTES}"
+            );
+            Ok(value as usize)
+        })
+        .transpose()?;
+    let status_only = args
+        .get("status_only")
+        .map(|value| value.as_bool().context("status_only must be a boolean"))
+        .transpose()?
+        .unwrap_or(false);
+    anyhow::ensure!(
+        !(status_only && output_limit_bytes.is_some()),
+        "status_only and output_limit_bytes cannot be combined"
+    );
+    Ok(Some(OutputPolicy {
+        output_limit_bytes,
+        status_only,
+    }))
 }
 
 fn reserve_job_slot(session_id: &str) -> Result<JobSlot> {
@@ -1929,8 +2364,8 @@ async fn wait_for_session_stop(session_id: String) {
 }
 
 enum JobPollSnapshot {
-    Completed(CachedJobResult),
-    Running,
+    Completed(CachedJobResult, OutputPolicy),
+    Running(OutputPolicy),
     FinishedWithoutResult,
 }
 
@@ -1942,12 +2377,12 @@ fn inspect_job(job_id: Uuid, session_id: &str) -> Result<JobPollSnapshot> {
         "job does not belong to this session"
     );
     if let Some(result) = job.completion.lock().unwrap().result.clone() {
-        return Ok(JobPollSnapshot::Completed(result));
+        return Ok(JobPollSnapshot::Completed(result, job.output_policy));
     }
     if job.handle.is_finished() {
         Ok(JobPollSnapshot::FinishedWithoutResult)
     } else {
-        Ok(JobPollSnapshot::Running)
+        Ok(JobPollSnapshot::Running(job.output_policy))
     }
 }
 
@@ -1960,8 +2395,8 @@ pub(crate) fn snapshot_jobs_for_session(session_id: &str, limit: usize) -> JobLi
         .map(|(job_id, job)| {
             let completion = job.completion.lock().unwrap();
             let status = match completion.result.as_ref() {
-                Some(CachedJobResult::Success(_)) => "completed",
-                Some(CachedJobResult::Error(_)) => "failed",
+                Some(CachedJobResult::Success { .. }) => "completed",
+                Some(CachedJobResult::Error { .. }) => "failed",
                 None if job.handle.is_finished() => "unknown",
                 None => "running",
             };
@@ -2047,10 +2482,24 @@ fn job_list(args: &Value, session: &config::Session) -> Result<Value> {
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     let job_id = required_job_id(args)?;
+    let override_policy = parse_output_policy_override(args)?;
     match inspect_job(job_id, &session.id)? {
-        JobPollSnapshot::Completed(result) => cached_job_result(result),
-        JobPollSnapshot::Running => {
-            text_result(json!({"status":"running","job_id":job_id}).to_string())
+        JobPollSnapshot::Completed(result, stored_policy) => {
+            cached_job_result(result, override_policy.unwrap_or(stored_policy))
+        }
+        JobPollSnapshot::Running(stored_policy) => {
+            let policy = override_policy.unwrap_or(stored_policy);
+            let response = if policy == OutputPolicy::default() {
+                json!({"status":"running","job_id":job_id})
+            } else {
+                json!({
+                    "status":"running",
+                    "job_id":job_id,
+                    "status_only": policy.status_only,
+                    "output_limit_bytes": policy.output_limit_bytes
+                })
+            };
+            text_result(response.to_string())
         }
         JobPollSnapshot::FinishedWithoutResult => {
             anyhow::bail!("background command task finished without a cached result")
@@ -2359,6 +2808,66 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    fn cached_success(text: impl Into<String>) -> CachedJobResult {
+        CachedJobResult::Success {
+            text: text.into(),
+            evidence: None,
+        }
+    }
+
+    fn cached_error(text: impl Into<String>) -> CachedJobResult {
+        CachedJobResult::Error {
+            text: text.into(),
+            evidence: None,
+        }
+    }
+
+    #[test]
+    fn codex_approval_details_are_actionable_without_task_input() {
+        let task_marker = "prompt-secret-marker";
+        let (start_detail, start_metadata) = codex_task_start_approval(&json!({
+            "operation_id": "0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+            "task": task_marker,
+            "model": "gpt-5.6-luna",
+            "effort": "max"
+        }));
+        assert!(start_detail.contains("operation: start task"));
+        assert!(start_detail.contains("model: gpt-5.6-luna"));
+        assert!(start_detail.contains("effort: max"));
+        assert!(start_detail.contains("task input: omitted"));
+        assert!(!start_detail.contains(task_marker));
+        assert_eq!(start_metadata["provenance"], "codex_delegation");
+        assert_eq!(start_metadata["tool"], "codex_task_start");
+        assert_eq!(start_metadata["mutation"], "true");
+        assert_eq!(start_metadata["task_input"], "omitted");
+        assert!(
+            !serde_json::to_string(&start_metadata)
+                .unwrap()
+                .contains(task_marker)
+        );
+
+        let (control_detail, control_metadata) = codex_task_control_approval(&json!({
+            "task_id": "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb",
+            "operation_id": "0199cccc-cccc-7ccc-8ccc-cccccccccccc",
+            "action": "steer",
+            "input": task_marker
+        }));
+        assert!(control_detail.contains("action: steer"));
+        assert!(control_detail.contains("target: task 0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"));
+        assert!(control_detail.contains("control input: omitted"));
+        assert!(!control_detail.contains(task_marker));
+        assert_eq!(control_metadata["operation_type"], "task_control");
+        assert_eq!(
+            control_metadata["task_id"],
+            "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(control_metadata["control_input"], "omitted");
+
+        let (_, status_metadata) = codex_status_approval();
+        assert_eq!(status_metadata["read_only"], "true");
+        assert_eq!(status_metadata["mutation"], "false");
+    }
 
     #[test]
     fn service_account_approval_detail_lists_exact_nested_locator_scope() {
@@ -2672,6 +3181,103 @@ mod tests {
             assert_eq!(actual, text);
             Ok(())
         })
+    }
+
+    #[test]
+    fn ranged_text_reads_are_utf8_safe_and_resumable() {
+        let text = "αβγ\nbravo\ncharlie\n";
+        let full_lines = ranged_text_result(
+            &json!({"start_line": 2, "end_line": 3, "max_bytes": 64}),
+            text,
+        )
+        .unwrap();
+        assert_eq!(full_lines["content"], "bravo\ncharlie\n");
+        assert_eq!(full_lines["truncated"], false);
+        assert_eq!(full_lines["next_offset_bytes"], Value::Null);
+
+        let first = ranged_text_result(&json!({"start_line": 1, "max_bytes": 4}), text).unwrap();
+        assert_eq!(first["content"], "αβ");
+        assert_eq!(first["returned_bytes"], 4);
+        assert_eq!(first["truncated"], true);
+        let next = first["next_offset_bytes"].as_u64().unwrap() as usize;
+        let resumed =
+            ranged_text_result(&json!({"offset_bytes": next, "max_bytes": 64}), text).unwrap();
+        assert_eq!(resumed["content"], "γ\nbravo\ncharlie\n");
+        assert_eq!(resumed["start_offset_bytes"], next);
+        assert_eq!(resumed["utf8_boundary"], true);
+
+        assert!(ranged_text_result(&json!({"offset_bytes": 1, "max_bytes": 4}), text).is_err());
+        assert!(
+            ranged_text_result(
+                &json!({"start_line": 2, "offset_bytes": 0, "max_bytes": 4}),
+                text
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_output_policy_is_bounded_and_references_scoped_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let full = json!({
+            "exit_code": 0,
+            "stdout": "x".repeat(300),
+            "stderr": "tail",
+            "truncated": false
+        })
+        .to_string();
+        let reference = evidence::store("session", root.path(), full.clone())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            apply_output_policy(&full, OutputPolicy::default(), Some(&reference)),
+            full
+        );
+        let limited: Value = serde_json::from_str(&apply_output_policy(
+            &full,
+            OutputPolicy {
+                output_limit_bytes: Some(256),
+                status_only: false,
+            },
+            Some(&reference),
+        ))
+        .unwrap();
+        assert_eq!(limited["stdout"].as_str().unwrap().len(), 256);
+        assert_eq!(limited["stderr"], "");
+        assert_eq!(limited["returned_truncated"], true);
+        assert_eq!(limited["evidence"]["evidence_id"], reference.evidence_id);
+
+        let status: Value = serde_json::from_str(&apply_output_policy(
+            &full,
+            OutputPolicy {
+                output_limit_bytes: None,
+                status_only: true,
+            },
+            Some(&reference),
+        ))
+        .unwrap();
+        assert!(status.get("stdout").is_none());
+        assert!(status.get("stderr").is_none());
+        assert_eq!(status["output_omitted"], true);
+        assert_eq!(status["evidence"]["evidence_id"], reference.evidence_id);
+    }
+
+    #[test]
+    fn command_output_policy_validation_rejects_ambiguous_requests() {
+        assert!(
+            parse_output_policy(&json!({"status_only": true}))
+                .unwrap()
+                .status_only
+        );
+        assert!(
+            parse_output_policy(&json!({
+                "status_only": true,
+                "output_limit_bytes": 256
+            }))
+            .is_err()
+        );
+        assert!(parse_output_policy(&json!({"output_limit_bytes": 255})).is_err());
     }
 
     #[tokio::test]
@@ -3157,7 +3763,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 39);
+        assert_eq!(tools.len(), 44);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -3178,6 +3784,15 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_fetch"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_pull"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
+        for name in [
+            "codex_status",
+            "codex_task_start",
+            "codex_task_get",
+            "codex_task_control",
+        ] {
+            assert!(tools.iter().any(|tool| tool["name"] == name));
+        }
+        assert!(tools.iter().all(|tool| tool["name"] != "without_sandbox"));
         assert!(
             tools
                 .iter()
@@ -3490,7 +4105,7 @@ mod tests {
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion {
-                result: Some(CachedJobResult::Success("owned".to_owned())),
+                result: Some(cached_success("owned")),
                 completed_at: Some(Instant::now()),
             }));
             let handle = runtime.spawn(async {});
@@ -3501,6 +4116,7 @@ mod tests {
                     command: "test".to_owned(),
                     handle,
                     completion,
+                    output_policy: OutputPolicy::default(),
                 },
             );
             let args = json!({"job_id": job_id.to_string()});
@@ -3555,6 +4171,7 @@ mod tests {
                     command: "test".to_owned(),
                     handle,
                     completion,
+                    output_policy: OutputPolicy::default(),
                 },
             );
             let args = json!({"job_id": job_id.to_string()});
@@ -3595,6 +4212,7 @@ mod tests {
                     command: "test".to_owned(),
                     handle,
                     completion,
+                    output_policy: OutputPolicy::default(),
                 },
             );
 
@@ -3671,6 +4289,7 @@ mod tests {
                     command: "test".to_owned(),
                     handle,
                     completion,
+                    output_policy: OutputPolicy::default(),
                 },
             );
 
@@ -3755,7 +4374,7 @@ mod tests {
         let marker_command = "command-sentinel-must-not-leak";
         let marker_output = "output-sentinel-must-not-leak";
         let owner_completion = Arc::new(Mutex::new(JobCompletion {
-            result: Some(CachedJobResult::Success(marker_output.to_owned())),
+            result: Some(cached_success(marker_output)),
             completed_at: Some(Instant::now()),
         }));
         let other_completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -3766,6 +4385,7 @@ mod tests {
                 command: marker_command.to_owned(),
                 handle: tokio::spawn(async {}),
                 completion: owner_completion,
+                output_policy: OutputPolicy::default(),
             },
         );
         jobs().lock().unwrap().jobs.insert(
@@ -3775,6 +4395,7 @@ mod tests {
                 command: "other-secret-command".to_owned(),
                 handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 completion: other_completion,
+                output_policy: OutputPolicy::default(),
             },
         );
 
@@ -3806,12 +4427,12 @@ mod tests {
         for (job_id, result, command) in [
             (
                 success_id,
-                CachedJobResult::Success(success_sentinel.to_owned()),
+                cached_success(success_sentinel),
                 command_sentinel,
             ),
             (
                 failure_id,
-                CachedJobResult::Error(failure_sentinel.to_owned()),
+                cached_error(failure_sentinel),
                 "failure-command-secret-sentinel",
             ),
         ] {
@@ -3826,6 +4447,7 @@ mod tests {
                     command: command.to_owned(),
                     handle: tokio::spawn(async {}),
                     completion,
+                    output_policy: OutputPolicy::default(),
                 },
             );
         }
@@ -3852,7 +4474,7 @@ mod tests {
         let session_id = format!("job-list-repeat-{}", Uuid::new_v4());
         let job_id = Uuid::new_v4();
         let completion = Arc::new(Mutex::new(JobCompletion {
-            result: Some(CachedJobResult::Success("still-cached".to_owned())),
+            result: Some(cached_success("still-cached")),
             completed_at: Some(Instant::now()),
         }));
         jobs().lock().unwrap().jobs.insert(
@@ -3862,6 +4484,7 @@ mod tests {
                 command: "hidden".to_owned(),
                 handle: tokio::spawn(async {}),
                 completion,
+                output_policy: OutputPolicy::default(),
             },
         );
 
@@ -3870,7 +4493,7 @@ mod tests {
         assert_eq!(first, second);
         assert!(matches!(
             inspect_job(job_id, &session_id).unwrap(),
-            JobPollSnapshot::Completed(CachedJobResult::Success(_))
+            JobPollSnapshot::Completed(CachedJobResult::Success { .. }, _)
         ));
         if let Some(job) = remove_job(job_id) {
             job.handle.abort();
@@ -3892,7 +4515,7 @@ mod tests {
                 JobCompletion::default()
             } else {
                 JobCompletion {
-                    result: Some(CachedJobResult::Success("hidden".to_owned())),
+                    result: Some(cached_success("hidden")),
                     completed_at: Some(Instant::now()),
                 }
             }));
@@ -3908,6 +4531,7 @@ mod tests {
                     command: "hidden".to_owned(),
                     handle,
                     completion,
+                    output_policy: OutputPolicy::default(),
                 },
             );
         }
@@ -3945,6 +4569,7 @@ mod tests {
                 command: "hidden".to_owned(),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
+                output_policy: OutputPolicy::default(),
             },
         );
         let snapshot = snapshot_jobs_for_session(&session_id, 50);
@@ -3990,6 +4615,7 @@ mod tests {
                 command: "hidden".to_owned(),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
+                output_policy: OutputPolicy::default(),
             },
         );
 
@@ -4074,7 +4700,7 @@ mod tests {
         };
         let job_id = Uuid::new_v4();
         let completion = Arc::new(Mutex::new(JobCompletion {
-            result: Some(CachedJobResult::Success("cached-result".to_owned())),
+            result: Some(cached_success("cached-result")),
             completed_at: Some(Instant::now()),
         }));
         let handle = tokio::spawn(async {});
@@ -4085,6 +4711,7 @@ mod tests {
                 command: "test".to_owned(),
                 handle,
                 completion,
+                output_policy: OutputPolicy::default(),
             },
         );
         let args = json!({"job_id": job_id.to_string()});
@@ -4094,6 +4721,78 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first["content"][0]["text"], "cached-result");
+        remove_job(job_id);
+    }
+
+    #[tokio::test]
+    async fn default_running_job_poll_preserves_legacy_response_shape() {
+        let session_id = format!("test-job-running-default-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: session_id.clone(),
+            cwd: std::env::current_dir().unwrap(),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id,
+                command: "test".to_owned(),
+                handle,
+                completion: Arc::new(Mutex::new(JobCompletion::default())),
+                output_policy: OutputPolicy::default(),
+            },
+        );
+
+        let result = poll_job(&json!({"job_id": job_id.to_string()}), &session)
+            .await
+            .unwrap();
+        assert_eq!(
+            result["content"][0]["text"],
+            json!({"status":"running","job_id":job_id}).to_string()
+        );
+        remove_job(job_id);
+    }
+
+    #[tokio::test]
+    async fn explicit_running_job_poll_policy_is_opt_in() {
+        let session_id = format!("test-job-running-extended-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: session_id.clone(),
+            cwd: std::env::current_dir().unwrap(),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            yolo: true,
+        };
+        let job_id = Uuid::new_v4();
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        jobs().lock().unwrap().jobs.insert(
+            job_id,
+            Job {
+                session_id,
+                command: "test".to_owned(),
+                handle,
+                completion: Arc::new(Mutex::new(JobCompletion::default())),
+                output_policy: OutputPolicy::default(),
+            },
+        );
+
+        let result = poll_job(
+            &json!({"job_id": job_id.to_string(), "status_only": true}),
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["status_only"], true);
+        assert!(value.get("output_limit_bytes").is_some());
         remove_job(job_id);
     }
 
@@ -4215,7 +4914,7 @@ mod tests {
                     JobCompletion::default()
                 } else {
                     JobCompletion {
-                        result: Some(CachedJobResult::Success(format!("done-{step}"))),
+                        result: Some(cached_success(format!("done-{step}"))),
                         completed_at: Some(now + Duration::from_nanos(step as u64 + 1)),
                     }
                 }));
@@ -4232,6 +4931,7 @@ mod tests {
                         command: "test".to_owned(),
                         handle,
                         completion,
+                        output_policy: OutputPolicy::default(),
                     },
                 );
                 reap_jobs_with_limits(&mut state, now, per_session_limit, total_limit);
@@ -4272,7 +4972,7 @@ mod tests {
         let session_id = format!("test-job-ttl-{}", Uuid::new_v4());
         let job_id = Uuid::new_v4();
         let completion = Arc::new(Mutex::new(JobCompletion {
-            result: Some(CachedJobResult::Success("expired".to_owned())),
+            result: Some(cached_success("expired")),
             completed_at: Some(Instant::now() - COMPLETED_JOB_TTL - Duration::from_secs(1)),
         }));
         let handle = tokio::spawn(async {});
@@ -4283,6 +4983,7 @@ mod tests {
                 command: "test".to_owned(),
                 handle,
                 completion,
+                output_policy: OutputPolicy::default(),
             },
         );
 

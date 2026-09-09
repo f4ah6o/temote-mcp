@@ -114,10 +114,28 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 41);
+  assert.equal(names.length, 46);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(names.includes(required), true, required);
   }
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control"]) {
+    assert.equal(names.includes(required), true, required);
+  }
+  assert.deepEqual(
+    PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties,
+    {
+      host_id: PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties.host_id,
+      session_id: PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties.session_id,
+      path: { type: "string" },
+      start_line: { type: "integer", minimum: 1 },
+      end_line: { type: "integer", minimum: 1 },
+      offset_bytes: { type: "integer", minimum: 0 },
+      max_bytes: { type: "integer", minimum: 4, maximum: 8388608 },
+    },
+  );
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_status").annotations.openWorldHint, true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_start").inputSchema.required.includes("operation_id"), true);
+  assert.deepEqual(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_control").inputSchema.properties.action.enum, ["steer", "resume", "interrupt"]);
   assert.equal(names.includes("without_sandbox"), false);
 });
 
@@ -1523,7 +1541,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 41);
+  assert.equal(rpc.result.tools.length, 46);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

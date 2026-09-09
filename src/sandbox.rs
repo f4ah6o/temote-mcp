@@ -37,6 +37,7 @@ pub fn protect_current_process_from_peer_inspection() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
 pub struct Output {
     pub status: i32,
     pub stdout: String,
