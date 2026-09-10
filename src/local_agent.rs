@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -17,9 +18,20 @@ const MAX_MODEL_BYTES: usize = 256;
 const MAX_PROFILE_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
+const MAX_IMPORTED_AUTH_BYTES: u64 = 1024 * 1024;
 const AGENT_STATE_DIRECTORY_PREFIX: &str = "temote-mcp-local-agent-";
 
-const SAFE_ENV_NAMES: &[&str] = &["HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM"];
+const SAFE_ENV_NAMES: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "CODEX_HOME",
+    "XDG_DATA_HOME",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Agent {
@@ -75,10 +87,32 @@ impl Access {
 
 struct AgentState {
     root: PathBuf,
+    hidden_roots: Vec<PathBuf>,
+    read_only_paths: Vec<PathBuf>,
 }
 
 impl AgentState {
+    #[cfg(test)]
     fn create(agent: Agent, forbidden_roots: &[PathBuf]) -> Result<Self> {
+        Self::create_with_source_home(agent, forbidden_roots, None)
+    }
+
+    #[cfg(test)]
+    fn create_with_source_home(
+        agent: Agent,
+        forbidden_roots: &[PathBuf],
+        source_home: Option<&Path>,
+    ) -> Result<Self> {
+        Self::create_with_auth_sources(agent, forbidden_roots, source_home, None, None)
+    }
+
+    fn create_with_auth_sources(
+        agent: Agent,
+        forbidden_roots: &[PathBuf],
+        source_home: Option<&Path>,
+        source_codex_home: Option<&Path>,
+        source_xdg_data_home: Option<&Path>,
+    ) -> Result<Self> {
         let base = fs::canonicalize(env::temp_dir())
             .context("could not resolve the system temporary directory")?;
         anyhow::ensure!(
@@ -100,18 +134,73 @@ impl AgentState {
         })?;
         set_private_permissions(&root)?;
 
+        let mut hidden_roots = vec![base];
+        if let Some(home) = source_home {
+            anyhow::ensure!(
+                home != Path::new("/"),
+                "local agent authentication HOME must not be the filesystem root"
+            );
+            ensure_outside_permitted_roots(
+                home,
+                forbidden_roots,
+                "local agent authentication source is inside a permitted session root",
+            )?;
+            hidden_roots.push(home.to_owned());
+        }
+        for (source, name) in [
+            (source_codex_home, "CODEX_HOME"),
+            (source_xdg_data_home, "XDG_DATA_HOME"),
+        ] {
+            let Some(source) = source else {
+                continue;
+            };
+            let Ok(source) = fs::canonicalize(source) else {
+                continue;
+            };
+            anyhow::ensure!(
+                source != Path::new("/"),
+                "local agent {name} authentication source must not be the filesystem root"
+            );
+            ensure_outside_permitted_roots(
+                &source,
+                forbidden_roots,
+                "local agent authentication source is inside a permitted session root",
+            )?;
+            hidden_roots.push(source);
+        }
+        hidden_roots.sort();
+        hidden_roots.dedup();
+
+        let mut state = Self {
+            root,
+            hidden_roots,
+            read_only_paths: Vec::new(),
+        };
         let directories = match agent {
             Agent::Codex => ["tmp", "home", "codex"].as_slice(),
             Agent::OpenCode => ["tmp", "home", "config", "data", "cache", "state"].as_slice(),
         };
         for directory in directories {
-            let path = root.join(directory);
+            let path = state.root.join(directory);
             fs::create_dir(&path).with_context(|| {
                 format!("could not create local agent directory {}", path.display())
             })?;
             set_private_permissions(&path)?;
         }
-        Ok(Self { root })
+        let read_only_paths = source_home
+            .map(|home| {
+                import_authentication_file(
+                    agent,
+                    home,
+                    source_codex_home,
+                    source_xdg_data_home,
+                    &state.root,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        state.read_only_paths = read_only_paths;
+        Ok(state)
     }
 
     fn ensure_outside_permitted_roots(&self, permitted_roots: &[PathBuf]) -> Result<()> {
@@ -138,8 +227,10 @@ impl AgentState {
                     "CODEX_HOME".to_owned(),
                     self.root.join("codex").to_string_lossy().into_owned(),
                 );
+                environment.remove("XDG_DATA_HOME");
             }
             Agent::OpenCode => {
+                environment.remove("CODEX_HOME");
                 environment.insert(
                     "XDG_CONFIG_HOME".to_owned(),
                     self.root.join("config").to_string_lossy().into_owned(),
@@ -158,6 +249,18 @@ impl AgentState {
                 );
             }
         }
+    }
+
+    fn temporary_root(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
+    fn hidden_roots(&self) -> &[PathBuf] {
+        &self.hidden_roots
+    }
+
+    fn read_only_paths(&self) -> &[PathBuf] {
+        &self.read_only_paths
     }
 }
 
@@ -178,15 +281,126 @@ fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn import_authentication_file(
+    agent: Agent,
+    source_home: &Path,
+    source_codex_home: Option<&Path>,
+    source_xdg_data_home: Option<&Path>,
+    state_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    let (source, destination) = match agent {
+        Agent::Codex => {
+            let home = source_codex_home
+                .map(Path::to_owned)
+                .unwrap_or_else(|| source_home.join(".codex"));
+            (home.join("auth.json"), state_root.join("codex/auth.json"))
+        }
+        Agent::OpenCode => {
+            let data = source_xdg_data_home
+                .map(Path::to_owned)
+                .unwrap_or_else(|| source_home.join(".local/share"));
+            (
+                data.join("opencode/auth.json"),
+                state_root.join("data/opencode/auth.json"),
+            )
+        }
+    };
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect local agent auth file {}",
+                    source.display()
+                )
+            });
+        }
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "local agent auth path is not a regular file: {}",
+        source.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_IMPORTED_AUTH_BYTES,
+        "local agent auth file exceeds {MAX_IMPORTED_AUTH_BYTES} bytes: {}",
+        source.display()
+    );
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut input = options
+        .open(&source)
+        .with_context(|| format!("could not open local agent auth file {}", source.display()))?;
+    let input_metadata = input.metadata()?;
+    anyhow::ensure!(
+        input_metadata.file_type().is_file() && input_metadata.len() <= MAX_IMPORTED_AUTH_BYTES,
+        "local agent auth file changed while it was being opened: {}",
+        source.display()
+    );
+    let mut bytes = Vec::with_capacity(input_metadata.len() as usize);
+    std::io::Read::by_ref(&mut input)
+        .take(MAX_IMPORTED_AUTH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read local agent auth file {}", source.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_IMPORTED_AUTH_BYTES,
+        "local agent auth file exceeds {MAX_IMPORTED_AUTH_BYTES} bytes: {}",
+        source.display()
+    );
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not create local agent auth directory {}",
+                parent.display()
+            )
+        })?;
+        set_private_permissions(parent)?;
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .with_context(|| {
+            format!(
+                "could not create private local agent auth file {}",
+                destination.display()
+            )
+        })?;
+    std::io::Write::write_all(&mut output, &bytes)?;
+    set_read_only_private_file_permissions(&destination)?;
+    Ok(vec![destination])
+}
+
+#[cfg(unix)]
+fn set_read_only_private_file_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+        .with_context(|| format!("could not protect local agent auth file {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_read_only_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 pub(crate) struct PreparedRun {
     pub(crate) agent: Agent,
     pub(crate) access: Access,
     pub(crate) cwd: PathBuf,
     command: Vec<String>,
+    executable_target: PathBuf,
     environment: HashMap<String, String>,
+    session_roots: Vec<PathBuf>,
     task_bytes: usize,
     task_hash: String,
-    _state: AgentState,
+    state: AgentState,
 }
 
 impl PreparedRun {
@@ -224,24 +438,76 @@ impl PreparedRun {
     }
 
     pub(crate) fn revalidate(&self, session: &config::Session) -> Result<()> {
+        self.revalidate_with_resolver(session, resolve_executable_details)
+    }
+
+    pub(crate) fn revalidate_with_executable(
+        &self,
+        session: &config::Session,
+        executable: &Path,
+    ) -> Result<()> {
+        let executable = executable.to_owned();
+        self.revalidate_with_resolver(session, move |agent, _environment, session| {
+            resolve_explicit_executable(agent, &executable, session)
+        })
+    }
+
+    fn revalidate_with_resolver<F>(&self, session: &config::Session, resolve: F) -> Result<()>
+    where
+        F: FnOnce(Agent, &HashMap<String, String>, &config::Session) -> Result<ResolvedExecutable>,
+    {
         let cwd = resolve_cwd(session, Some(&self.cwd))?;
         anyhow::ensure!(
             cwd == self.cwd,
             "local agent cwd changed while approval was pending"
         );
-        let executable = resolve_executable(self.agent, &self.environment, session)?;
+        let executable = resolve(self.agent, &self.environment, session)?;
         anyhow::ensure!(
             self.command
                 .first()
-                .is_some_and(|value| value == executable.to_string_lossy().as_ref()),
+                .is_some_and(|value| value == executable.runtime.to_string_lossy().as_ref()),
             "local agent executable changed while approval was pending"
         );
-        self._state
-            .ensure_outside_permitted_roots(&session.permitted_directories)
+        anyhow::ensure!(
+            executable.canonical == self.executable_target,
+            "local agent executable target changed while approval was pending"
+        );
+        let current_roots = canonical_session_roots(session)?;
+        anyhow::ensure!(
+            current_roots == self.session_roots,
+            "local agent session roots changed while approval was pending"
+        );
+        self.state.ensure_outside_permitted_roots(&current_roots)
     }
 }
 
 pub(crate) fn prepare(args: &Value, session: &config::Session) -> Result<PreparedRun> {
+    prepare_with_resolver(args, session, resolve_executable_details)
+}
+
+/// Test-only dependency injection for approval-path tests.
+///
+/// The public MCP schema never accepts an executable path. Production callers
+/// use `prepare`, which resolves the fixed agent name from the captured PATH.
+pub(crate) fn prepare_with_executable(
+    args: &Value,
+    session: &config::Session,
+    executable: &Path,
+) -> Result<PreparedRun> {
+    let executable = executable.to_owned();
+    prepare_with_resolver(args, session, move |agent, _environment, session| {
+        resolve_explicit_executable(agent, &executable, session)
+    })
+}
+
+fn prepare_with_resolver<F>(
+    args: &Value,
+    session: &config::Session,
+    resolve: F,
+) -> Result<PreparedRun>
+where
+    F: FnOnce(Agent, &HashMap<String, String>, &config::Session) -> Result<ResolvedExecutable>,
+{
     let object = args
         .as_object()
         .context("local_agent_run arguments must be an object")?;
@@ -278,14 +544,43 @@ pub(crate) fn prepare(args: &Value, session: &config::Session) -> Result<Prepare
     let profile = optional_profile(args)?;
 
     let mut environment = filtered_environment()?;
-    let executable = resolve_executable(agent, &environment, session)?;
-    let state = AgentState::create(agent, &session.permitted_directories)?;
+    let executable = resolve(agent, &environment, session)?;
+    let source_home = environment
+        .get("HOME")
+        .map(PathBuf::from)
+        .context("HOME is unavailable for local agent authentication")?;
+    anyhow::ensure!(
+        source_home.is_absolute(),
+        "HOME must be an absolute path for local agent authentication"
+    );
+    let source_home = fs::canonicalize(&source_home).with_context(|| {
+        format!(
+            "could not resolve local agent HOME {}",
+            source_home.display()
+        )
+    })?;
+    anyhow::ensure!(
+        source_home.is_dir(),
+        "local agent HOME is not a directory: {}",
+        source_home.display()
+    );
+    let source_codex_home = optional_source_directory(environment.get("CODEX_HOME"), "CODEX_HOME")?;
+    let source_xdg_data_home =
+        optional_source_directory(environment.get("XDG_DATA_HOME"), "XDG_DATA_HOME")?;
+    let state = AgentState::create_with_auth_sources(
+        agent,
+        &session.permitted_directories,
+        Some(&source_home),
+        source_codex_home.as_deref(),
+        source_xdg_data_home.as_deref(),
+    )?;
     state.apply_to_environment(agent, &mut environment);
-    let executable = path_argument(&executable, "agent executable")?;
+    let executable_runtime = path_argument(&executable.runtime, "agent executable")?;
+    let executable_target = executable.canonical;
     let cwd_argument = path_argument(&cwd, "agent cwd")?;
     let command = match agent {
         Agent::Codex => build_codex_command(
-            &executable,
+            &executable_runtime,
             &cwd_argument,
             access,
             task,
@@ -300,7 +595,7 @@ pub(crate) fn prepare(args: &Value, session: &config::Session) -> Result<Prepare
             environment.insert("OPENCODE_DISABLE_AUTOUPDATE".to_owned(), "true".to_owned());
             environment.insert("OPENCODE_DISABLE_PRUNE".to_owned(), "true".to_owned());
             build_opencode_command(
-                &executable,
+                &executable_runtime,
                 &cwd_argument,
                 task,
                 model.as_deref(),
@@ -314,21 +609,70 @@ pub(crate) fn prepare(args: &Value, session: &config::Session) -> Result<Prepare
         access,
         cwd,
         command,
+        executable_target,
         environment,
+        session_roots: canonical_session_roots(session)?,
         task_bytes: task.len(),
         task_hash: task_hash(task.as_bytes()),
-        _state: state,
+        state,
     })
 }
 
 pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
-    sandbox::run_unrestricted_with_only_env(
+    let state_root = prepared.state.root.clone();
+    let writable_roots = if prepared.access == Access::WorkspaceWrite {
+        prepared.session_roots.clone()
+    } else {
+        Vec::new()
+    };
+    let mut writable_roots = writable_roots;
+    writable_roots.push(state_root);
+    let temporary_roots = [prepared.state.temporary_root()];
+    let mut read_only_roots = executable_read_only_roots(&prepared)?;
+    if prepared.access == Access::ReadOnly {
+        read_only_roots.push(prepared.cwd.clone());
+    }
+    read_only_roots.sort();
+    read_only_roots.dedup();
+    sandbox::run_local_agent(
         &prepared.command,
         &prepared.cwd,
+        sandbox::LocalAgentScope {
+            writable_roots: &writable_roots,
+            temporary_roots: &temporary_roots,
+            read_only_paths: prepared.state.read_only_paths(),
+            read_only_roots: &read_only_roots,
+            hidden_roots: prepared.state.hidden_roots(),
+        },
         None,
         &prepared.environment,
     )
     .await
+}
+
+fn executable_read_only_roots(prepared: &PreparedRun) -> Result<Vec<PathBuf>> {
+    let runtime = prepared
+        .command
+        .first()
+        .context("local agent command has no executable")?;
+    let runtime_parent = Path::new(runtime)
+        .parent()
+        .context("local agent executable has no parent")?;
+    let target_parent = prepared
+        .executable_target
+        .parent()
+        .context("local agent executable target has no parent")?;
+    [runtime_parent, target_parent]
+        .into_iter()
+        .map(|path| {
+            fs::canonicalize(path).with_context(|| {
+                format!(
+                    "could not resolve local agent executable directory {}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 fn required_string<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
@@ -434,6 +778,38 @@ fn ensure_outside_permitted_roots(
     Ok(())
 }
 
+fn canonical_session_roots(session: &config::Session) -> Result<Vec<PathBuf>> {
+    let mut roots = session
+        .permitted_directories
+        .iter()
+        .map(|root| config::canonical_directory(root))
+        .collect::<Result<Vec<_>>>()?;
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn optional_source_directory(value: Option<&String>, name: &str) -> Result<Option<PathBuf>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    anyhow::ensure!(path.is_absolute(), "{name} must be an absolute path");
+    match fs::canonicalize(&path) {
+        Ok(canonical) => {
+            anyhow::ensure!(
+                canonical.is_dir(),
+                "{name} is not a directory: {}",
+                path.display()
+            );
+            Ok(Some(canonical))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(path)),
+        Err(error) => Err(error)
+            .with_context(|| format!("could not resolve local agent {name} {}", path.display())),
+    }
+}
+
 fn is_protected_metadata_location(path: &Path) -> bool {
     path.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
@@ -488,16 +864,41 @@ fn filtered_environment_values(
     Ok(environment)
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedExecutable {
+    runtime: PathBuf,
+    canonical: PathBuf,
+}
+
+#[cfg(test)]
 fn resolve_executable(
     agent: Agent,
     environment: &HashMap<String, String>,
     session: &config::Session,
 ) -> Result<PathBuf> {
+    Ok(resolve_executable_details(agent, environment, session)?.runtime)
+}
+
+fn resolve_executable_details(
+    agent: Agent,
+    environment: &HashMap<String, String>,
+    session: &config::Session,
+) -> Result<ResolvedExecutable> {
     let path = environment
         .get("PATH")
         .context("PATH is unavailable for executable resolution")?;
+    let session_roots = canonical_session_roots(session)?;
     for directory in env::split_paths(path) {
         if !directory.is_absolute() {
+            continue;
+        }
+        let Ok(canonical_directory) = fs::canonicalize(&directory) else {
+            continue;
+        };
+        if session_roots
+            .iter()
+            .any(|root| canonical_directory == *root || canonical_directory.starts_with(root))
+        {
             continue;
         }
         let candidate = directory.join(agent.executable_name());
@@ -510,20 +911,78 @@ fn resolve_executable(
         if !metadata.is_file() || !is_executable(&metadata) {
             continue;
         }
-        let inside_session_root = session.permitted_directories.iter().any(|root| {
-            fs::canonicalize(root)
-                .map(|root| canonical == root || canonical.starts_with(root))
-                .unwrap_or(false)
-        });
-        if inside_session_root {
+        if session_roots
+            .iter()
+            .any(|root| canonical == *root || canonical.starts_with(root))
+        {
             continue;
         }
-        return Ok(canonical);
+        return Ok(ResolvedExecutable {
+            runtime: candidate,
+            canonical,
+        });
     }
     anyhow::bail!(
         "{} executable was not found on an absolute PATH entry outside the session roots",
         agent.executable_name()
     )
+}
+
+fn resolve_explicit_executable(
+    agent: Agent,
+    executable: &Path,
+    session: &config::Session,
+) -> Result<ResolvedExecutable> {
+    anyhow::ensure!(
+        executable.is_absolute(),
+        "injected local agent executable must be absolute"
+    );
+    anyhow::ensure!(
+        executable.file_name().and_then(|name| name.to_str()) == Some(agent.executable_name()),
+        "injected local agent executable has the wrong fixed name"
+    );
+    let canonical = fs::canonicalize(executable).with_context(|| {
+        format!(
+            "could not resolve agent executable {}",
+            executable.display()
+        )
+    })?;
+    let metadata = fs::metadata(&canonical).with_context(|| {
+        format!(
+            "could not inspect agent executable {}",
+            executable.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file() && is_executable(&metadata),
+        "agent executable is not an executable regular file: {}",
+        executable.display()
+    );
+    let session_roots = canonical_session_roots(session)?;
+    let candidate_parent = executable
+        .parent()
+        .context("injected local agent executable has no parent")?;
+    let canonical_parent = fs::canonicalize(candidate_parent).with_context(|| {
+        format!(
+            "could not resolve injected agent executable directory {}",
+            candidate_parent.display()
+        )
+    })?;
+    let candidate_inside_session_root = session_roots
+        .iter()
+        .any(|root| canonical_parent == *root || canonical_parent.starts_with(root));
+    let target_inside_session_root = session_roots
+        .iter()
+        .any(|root| canonical == *root || canonical.starts_with(root));
+    anyhow::ensure!(
+        !candidate_inside_session_root && !target_inside_session_root,
+        "agent executable path or target is inside a permitted session root: {}",
+        executable.display()
+    );
+    Ok(ResolvedExecutable {
+        runtime: executable.to_owned(),
+        canonical,
+    })
 }
 
 #[cfg(unix)]
@@ -835,10 +1294,12 @@ mod tests {
             access: Access::ReadOnly,
             cwd: PathBuf::from("/workspace"),
             command: vec!["/usr/bin/codex".to_owned()],
+            executable_target: PathBuf::from("/usr/bin/codex"),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
+            session_roots: Vec::new(),
             task_bytes: 32,
             task_hash: task_hash(b"SENTINEL-TASK-SECRET"),
-            _state: state,
+            state,
         };
         assert!(!prepared.approval_detail().contains("SENTINEL-TASK-SECRET"));
         assert!(!prepared.activity_label().contains("SENTINEL-TASK-SECRET"));
@@ -863,6 +1324,110 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn existing_authentication_is_imported_without_exposing_user_state() {
+        let source = tempfile::tempdir().unwrap();
+        let codex_home = source.path().join(".codex");
+        fs::create_dir(&codex_home).unwrap();
+        let source_auth = codex_home.join("auth.json");
+        fs::write(&source_auth, br#"{"provider":"test"}"#).unwrap();
+        fs::set_permissions(&source_auth, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let state =
+            AgentState::create_with_source_home(Agent::Codex, &[], Some(source.path())).unwrap();
+        let mut environment = HashMap::from([
+            ("HOME".to_owned(), "/unused".to_owned()),
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ]);
+        state.apply_to_environment(Agent::Codex, &mut environment);
+
+        let private_auth = state.root.join("codex/auth.json");
+        assert_eq!(
+            fs::read(&private_auth).unwrap(),
+            fs::read(&source_auth).unwrap()
+        );
+        assert_eq!(
+            environment["HOME"],
+            state.root.join("home").to_string_lossy()
+        );
+        assert_eq!(
+            environment["CODEX_HOME"],
+            state.root.join("codex").to_string_lossy()
+        );
+        assert_eq!(state.read_only_paths(), std::slice::from_ref(&private_auth));
+        assert_eq!(
+            fs::metadata(&private_auth).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert!(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&private_auth)
+                .is_err()
+        );
+        assert_eq!(fs::read(&source_auth).unwrap(), br#"{"provider":"test"}"#);
+
+        let opencode_data = source.path().join(".local/share/opencode");
+        fs::create_dir_all(&opencode_data).unwrap();
+        let source_opencode_auth = opencode_data.join("auth.json");
+        fs::write(&source_opencode_auth, br#"{"provider":"test"}"#).unwrap();
+        fs::set_permissions(&source_opencode_auth, fs::Permissions::from_mode(0o600)).unwrap();
+        let opencode_state =
+            AgentState::create_with_source_home(Agent::OpenCode, &[], Some(source.path())).unwrap();
+        let mut opencode_environment = HashMap::from([
+            ("HOME".to_owned(), "/unused".to_owned()),
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ]);
+        opencode_state.apply_to_environment(Agent::OpenCode, &mut opencode_environment);
+        let private_opencode_auth = opencode_state.root.join("data/opencode/auth.json");
+        assert_eq!(
+            fs::read(&private_opencode_auth).unwrap(),
+            fs::read(&source_opencode_auth).unwrap()
+        );
+        assert_eq!(
+            opencode_environment["XDG_DATA_HOME"],
+            opencode_state.root.join("data").to_string_lossy()
+        );
+        assert_eq!(
+            opencode_state.read_only_paths(),
+            std::slice::from_ref(&private_opencode_auth)
+        );
+
+        let custom_codex_home = source.path().join("custom-codex");
+        fs::create_dir(&custom_codex_home).unwrap();
+        let custom_auth = custom_codex_home.join("auth.json");
+        fs::write(&custom_auth, br#"{"provider":"custom"}"#).unwrap();
+        let custom_state = AgentState::create_with_auth_sources(
+            Agent::Codex,
+            &[],
+            Some(source.path()),
+            Some(&custom_codex_home),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(custom_state.root.join("codex/auth.json")).unwrap(),
+            fs::read(&custom_auth).unwrap()
+        );
+        assert!(
+            custom_state
+                .hidden_roots()
+                .contains(&fs::canonicalize(&custom_codex_home).unwrap())
+        );
+
+        let missing_custom_home = source.path().join("missing-codex");
+        let missing_custom_state = AgentState::create_with_auth_sources(
+            Agent::Codex,
+            &[],
+            Some(source.path()),
+            Some(&missing_custom_home),
+            None,
+        )
+        .unwrap();
+        assert!(!missing_custom_state.root.join("codex/auth.json").exists());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn output_uses_the_shared_bounded_capture() {
         let root = tempfile::tempdir().unwrap();
@@ -884,9 +1449,11 @@ mod tests {
                 ),
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ]),
+            executable_target: PathBuf::from("/usr/bin/head"),
+            session_roots: Vec::new(),
             task_bytes: 0,
             task_hash: String::new(),
-            _state: state,
+            state,
         };
         let output = run(prepared).await.unwrap();
         assert!(output.stdout.len() + output.stderr.len() <= sandbox::MAX_COMMAND_OUTPUT_BYTES);
@@ -895,14 +1462,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn executable_resolution_skips_relative_and_session_path_entries() {
+    fn executable_resolution_preserves_symlink_candidate_and_validates_target() {
+        use std::os::unix::fs::symlink;
+
         let root = tempfile::tempdir().unwrap();
         let safe = tempfile::tempdir().unwrap();
         let session = session(root.path());
         let workspace_binary = root.path().join("codex");
         make_executable(&workspace_binary);
+        let multicall_target = safe.path().join("vp");
+        make_executable(&multicall_target);
         let safe_binary = safe.path().join("codex");
-        make_executable(&safe_binary);
+        symlink(&multicall_target, &safe_binary).unwrap();
         let path = env::join_paths([
             OsString::from("."),
             root.path().as_os_str().to_owned(),
@@ -918,9 +1489,62 @@ mod tests {
             ),
             ("PATH".to_owned(), path),
         ]);
+        let resolved = resolve_executable(Agent::Codex, &environment, &session).unwrap();
+        assert_eq!(resolved, safe_binary);
         assert_eq!(
-            resolve_executable(Agent::Codex, &environment, &session).unwrap(),
-            fs::canonicalize(safe_binary).unwrap()
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(multicall_target).unwrap()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_resolution_rejects_a_candidate_in_a_session_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let target = safe.path().join("vp");
+        make_executable(&target);
+        symlink(&target, bin.join("codex")).unwrap();
+
+        let environment = HashMap::from([
+            (
+                "HOME".to_owned(),
+                safe.path().to_string_lossy().into_owned(),
+            ),
+            ("PATH".to_owned(), bin.to_string_lossy().into_owned()),
+        ]);
+        let error = resolve_executable_details(Agent::Codex, &environment, &session(root.path()))
+            .unwrap_err();
+        assert!(error.to_string().contains("outside the session roots"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approval_revalidation_rejects_a_changed_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        let target_a = safe.path().join("vp-a");
+        let target_b = safe.path().join("vp-b");
+        make_executable(&target_a);
+        make_executable(&target_b);
+        let candidate = safe.path().join("codex");
+        symlink(&target_a, &candidate).unwrap();
+
+        let session = session(root.path());
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &candidate).unwrap();
+        std::fs::remove_file(&candidate).unwrap();
+        symlink(&target_b, &candidate).unwrap();
+
+        let error = prepared
+            .revalidate_with_executable(&session, &candidate)
+            .unwrap_err();
+        assert!(error.to_string().contains("target changed"));
     }
 }

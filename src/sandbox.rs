@@ -45,6 +45,15 @@ pub struct Output {
     pub truncated: bool,
 }
 
+/// Canonical filesystem scope for a local-agent invocation.
+pub struct LocalAgentScope<'a> {
+    pub writable_roots: &'a [PathBuf],
+    pub temporary_roots: &'a [PathBuf],
+    pub read_only_paths: &'a [PathBuf],
+    pub read_only_roots: &'a [PathBuf],
+    pub hidden_roots: &'a [PathBuf],
+}
+
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -52,6 +61,81 @@ pub async fn run(
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     run_with_metadata_roots(command, cwd, writable_roots, &[], stdin).await
+}
+
+/// Runs the structured local-agent broker profile.
+///
+/// Unlike the deliberately unrestricted host runners below, this profile
+/// keeps the filesystem read-only by default and only grants writes to the
+/// caller-selected workspace roots and the agent's private run state. Network
+/// access is enabled because Codex/OpenCode need to reach their model service.
+/// This is a fixed profile; public MCP callers cannot select a generic sandbox
+/// escape or alter its filesystem/network policy.
+pub async fn run_local_agent(
+    command: &[String],
+    cwd: &Path,
+    scope: LocalAgentScope<'_>,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+) -> Result<Output> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve local agent cwd {}", cwd.display()))?;
+    validate_writable_scope(&cwd, scope.writable_roots)?;
+    validate_local_agent_scope(
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.hidden_roots,
+    )?;
+
+    #[cfg(target_os = "macos")]
+    let spec = policy::SandboxSpec::local_agent(
+        &cwd,
+        scope.writable_roots,
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.hidden_roots,
+    )?;
+
+    #[cfg(target_os = "linux")]
+    let mut process = linux::local_agent_command(
+        command,
+        &cwd,
+        scope.writable_roots,
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.hidden_roots,
+    )?;
+
+    #[cfg(target_os = "macos")]
+    let mut process = macos::command(&spec, command)?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut process = {
+        anyhow::bail!(
+            "bounded local-agent execution is currently implemented for Linux and macOS only"
+        )
+    };
+
+    process
+        .kill_on_drop(true)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(environment)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process
+        .spawn()
+        .context("failed to start bounded local-agent command")?;
+    wait_with_limited_output(child, stdin).await
 }
 
 /// Runs a narrowly validated Git operation with write access to the repository
@@ -362,6 +446,83 @@ fn validate_writable_scope(cwd: &Path, writable_roots: &[PathBuf]) -> Result<()>
     Ok(())
 }
 
+fn validate_local_agent_scope(
+    temporary_roots: &[PathBuf],
+    read_only_paths: &[PathBuf],
+    read_only_roots: &[PathBuf],
+    hidden_roots: &[PathBuf],
+) -> Result<()> {
+    for root in temporary_roots {
+        let canonical = std::fs::canonicalize(root).with_context(|| {
+            format!(
+                "cannot resolve local agent temporary root {}",
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "local agent temporary root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent temporary root must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    for path in read_only_paths {
+        let canonical = std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "cannot resolve local agent read-only path {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent read-only path must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    for root in read_only_roots {
+        let canonical = std::fs::canonicalize(root).with_context(|| {
+            format!(
+                "cannot resolve local agent read-only root {}",
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "local agent read-only root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent read-only root must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    for root in hidden_roots {
+        let canonical = std::fs::canonicalize(root).with_context(|| {
+            format!("cannot resolve local agent hidden root {}", root.display())
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "local agent hidden root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            canonical != Path::new("/"),
+            "local agent cannot hide the filesystem root"
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent hidden root must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
 fn is_protected_metadata_location(path: &Path) -> bool {
     path.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
@@ -460,39 +621,40 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_service_account_bwrap() -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
+pub(crate) fn trusted_service_account_bwrap() -> Result<PathBuf> {
     for candidate in [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")] {
-        let Ok(path) = std::fs::canonicalize(candidate) else {
-            continue;
-        };
-        let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("failed to inspect bubblewrap at {}", path.display()))?;
-        if !metadata.is_file()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o111 == 0
-            || metadata.mode() & 0o022 != 0
-        {
-            continue;
-        }
-        let mut trusted = true;
-        for ancestor in path.ancestors().skip(1) {
-            let metadata = std::fs::metadata(ancestor).with_context(|| {
-                format!("failed to inspect bubblewrap parent {}", ancestor.display())
-            })?;
-            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-                trusted = false;
-                break;
-            }
-        }
-        if trusted {
+        if let Some(path) = trusted_bwrap_candidate(candidate)? {
             return Ok(path);
         }
     }
-    anyhow::bail!(
-        "service-account target isolation requires a root-owned, non-writable /usr/bin/bwrap"
-    )
+    anyhow::bail!("Linux sandboxing requires a root-owned, non-writable /usr/bin/bwrap")
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_bwrap_candidate(candidate: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(path) = std::fs::canonicalize(candidate) else {
+        return Ok(None);
+    };
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("failed to inspect bubblewrap at {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Ok(None);
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = std::fs::metadata(ancestor).with_context(|| {
+            format!("failed to inspect bubblewrap parent {}", ancestor.display())
+        })?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(path))
 }
 
 pub async fn run_unrestricted_with_only_env(
@@ -820,6 +982,19 @@ mod generic_tests {
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn untrusted_bwrap_candidate_is_rejected_even_when_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let fake = fixture.path().join("bwrap");
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(trusted_bwrap_candidate(&fake).unwrap().is_none());
     }
 
     #[test]
@@ -1561,6 +1736,146 @@ done
         )
         .await?;
         assert_ne!(network.status, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_local_agent_profile_bounds_workspace_writes() -> Result<()> {
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        let state = root.path().join("state");
+        let state_tmp = state.join("tmp");
+        let git = workspace.join(".git");
+        std::fs::create_dir_all(&git)?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::create_dir_all(&state_tmp)?;
+        let outside_secret = outside.join("secret");
+        std::fs::write(&outside_secret, b"not visible to the agent")?;
+
+        let state_file = state.join("state-file");
+        let state_file_argument = state_file.to_str().context("state path is not UTF-8")?;
+        let hidden_root = root.path().to_path_buf();
+        let write_script = "set -eu; printf allowed > allowed; if printf outside > ../outside/denied; then exit 11; fi; if printf git > .git/denied; then exit 12; fi; printf state > \"$1\"; test -f allowed; test ! -e ../outside/denied; test ! -e .git/denied; test -f \"$1\"";
+        let write_command = command(
+            "/bin/sh",
+            &["-c", write_script, "local-agent", state_file_argument],
+        );
+        let environment = HashMap::from([
+            ("HOME".to_owned(), state.to_string_lossy().into_owned()),
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            (
+                "TMPDIR".to_owned(),
+                state_tmp.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let write = run_local_agent(
+            &write_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: &[workspace.clone(), state.clone()],
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: &[],
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(write.status, 0, "{}", write.stderr);
+
+        let outside_secret_argument = outside_secret
+            .to_str()
+            .context("outside secret path is not UTF-8")?;
+        let read_outside_command = command(
+            "/bin/sh",
+            &[
+                "-c",
+                "if cat \"$1\" >/dev/null 2>&1; then exit 31; else exit 0; fi",
+                "local-agent",
+                outside_secret_argument,
+            ],
+        );
+        let read_outside = run_local_agent(
+            &read_outside_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(
+            read_outside.status, 0,
+            "outside read was unexpectedly visible: stdout={:?} stderr={:?}",
+            read_outside.stdout, read_outside.stderr
+        );
+
+        std::fs::remove_file(workspace.join("allowed"))?;
+        std::fs::remove_file(&state_file)?;
+        let read_only_script = "set -eu; if printf denied > allowed; then exit 21; fi; printf state > \"$1\"; test ! -e allowed; test -f \"$1\"";
+        let read_command = command(
+            "/bin/sh",
+            &["-c", read_only_script, "local-agent", state_file_argument],
+        );
+        let read_only = run_local_agent(
+            &read_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(read_only.status, 0, "{}", read_only.stderr);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let accepted = std::thread::spawn(move || {
+            for _ in 0..400 {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            }
+            false
+        });
+        let network_script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{}; printf connected >&3",
+            address.port()
+        );
+        let network_command = command("/bin/bash", &["-c", &network_script]);
+        let network = run_local_agent(
+            &network_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(network.status, 0, "{}", network.stderr);
+        assert!(accepted.join().unwrap());
         Ok(())
     }
 }

@@ -558,6 +558,25 @@ async fn call_tool(
     public: bool,
     sessions: Option<&SessionBackend>,
 ) -> Result<Value> {
+    call_tool_with_local_agent_executable(params, public, sessions, None).await
+}
+
+#[cfg(test)]
+async fn call_tool_with_test_local_agent_executable(
+    params: &Value,
+    public: bool,
+    sessions: Option<&SessionBackend>,
+    executable: &Path,
+) -> Result<Value> {
+    call_tool_with_local_agent_executable(params, public, sessions, Some(executable)).await
+}
+
+async fn call_tool_with_local_agent_executable(
+    params: &Value,
+    public: bool,
+    sessions: Option<&SessionBackend>,
+    local_agent_executable: Option<&Path>,
+) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -701,7 +720,7 @@ async fn call_tool(
                 &codex_app_server::task_control(&args, &session).await?,
             )?)
         }
-        "local_agent_run" => local_agent_run(&args, &session).await,
+        "local_agent_run" => local_agent_run(&args, &session, local_agent_executable).await,
         "list_directory" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = list_directory(&path).await;
@@ -2016,8 +2035,15 @@ async fn start_command(args: &Value, session: &config::Session) -> Result<Value>
     .await
 }
 
-async fn local_agent_run(args: &Value, session: &config::Session) -> Result<Value> {
-    let prepared = local_agent::prepare(args, session)?;
+async fn local_agent_run(
+    args: &Value,
+    session: &config::Session,
+    executable: Option<&Path>,
+) -> Result<Value> {
+    let prepared = match executable {
+        Some(executable) => local_agent::prepare_with_executable(args, session, executable)?,
+        None => local_agent::prepare(args, session)?,
+    };
     let detail = prepared.approval_detail();
     approvals::ensure_approval_detail_fits(&detail)?;
     let approved = approvals::request_user_approval_for_instance(
@@ -2036,7 +2062,10 @@ async fn local_agent_run(args: &Value, session: &config::Session) -> Result<Valu
             && current_session.process_id == session.process_id,
         "session instance changed while local agent approval was pending"
     );
-    prepared.revalidate(&current_session)?;
+    match executable {
+        Some(executable) => prepared.revalidate_with_executable(&current_session, executable)?,
+        None => prepared.revalidate(&current_session)?,
+    }
     let (description, mut handle, completion) =
         spawn_local_agent(prepared, &current_session).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
@@ -3941,6 +3970,13 @@ mod tests {
     #[tokio::test]
     async fn local_agent_run_requires_approval_and_denial_starts_no_job() {
         let root = tempfile::tempdir().unwrap();
+        let fake_agent_dir = tempfile::tempdir().unwrap();
+        let fake_executable = fake_agent_dir.path().join("codex");
+        std::fs::write(&fake_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake_executable).unwrap().permissions();
+        #[cfg(unix)]
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&fake_executable, permissions).unwrap();
         let id = format!("local-agent-approval-{}", Uuid::new_v4());
         let (sender, mut receiver) = approvals::approval_channel();
         let handle = approvals::spawn_runtime(root.path(), Some(&id), false, sender)
@@ -3956,7 +3992,11 @@ mod tests {
                 "access": "read_only"
             }
         });
-        let task = tokio::spawn(async move { call_tool(&request, false, None).await });
+        let task = tokio::spawn(async move {
+            let _fake_agent_dir = fake_agent_dir;
+            call_tool_with_test_local_agent_executable(&request, false, None, &fake_executable)
+                .await
+        });
         let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
             .await
             .expect("local_agent_run did not request approval")

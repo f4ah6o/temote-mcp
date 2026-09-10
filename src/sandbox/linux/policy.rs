@@ -26,15 +26,12 @@ const GIT_READ_ONLY_PATHS: &[&str] = &[
     "objects/pack",
 ];
 
-/// The only network mode supported by the Temote Linux helper.
-///
-/// Keeping this as a one-variant enum makes a serialized policy explicit while
-/// ensuring that adding a future network mode requires an intentional helper
-/// implementation instead of silently widening an old policy.
+/// Network modes supported by the Temote Linux helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LinuxNetworkPolicy {
     Restricted,
+    LocalAgent,
 }
 
 /// Minimal Temote-specific policy passed across the helper process boundary.
@@ -50,6 +47,8 @@ pub struct LinuxSandboxPolicy {
     pub writable_roots: Vec<PathBuf>,
     pub temporary_roots: Vec<PathBuf>,
     pub read_only_paths: Vec<PathBuf>,
+    pub read_only_roots: Vec<PathBuf>,
+    pub hidden_roots: Vec<PathBuf>,
     pub network: LinuxNetworkPolicy,
 }
 
@@ -121,7 +120,69 @@ impl LinuxSandboxPolicy {
             writable_roots: writable,
             temporary_roots,
             read_only_paths,
+            read_only_roots: Vec::new(),
+            hidden_roots: Vec::new(),
             network: LinuxNetworkPolicy::Restricted,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn for_local_agent(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        temporary_roots: &[PathBuf],
+        read_only_paths: &[PathBuf],
+        read_only_roots: &[PathBuf],
+        hidden_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
+        let mut writable = writable_roots
+            .iter()
+            .map(|path| canonical_existing_directory(path, "writable root"))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_paths(&mut writable);
+
+        let mut temporary = temporary_roots
+            .iter()
+            .map(|path| canonical_existing_directory(path, "temporary root"))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_paths(&mut temporary);
+
+        let mut read_only = read_only_paths
+            .iter()
+            .map(|path| {
+                std::fs::canonicalize(path)
+                    .with_context(|| format!("cannot resolve read-only path {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for root in &writable {
+            for name in PROTECTED_METADATA_NAMES {
+                read_only.push(root.join(name));
+            }
+        }
+        normalize_paths(&mut read_only);
+
+        let mut visible_roots = read_only_roots
+            .iter()
+            .map(|path| canonical_existing_directory(path, "read-only root"))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_paths(&mut visible_roots);
+        let mut hidden = hidden_roots
+            .iter()
+            .map(|path| canonical_existing_directory(path, "hidden root"))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_paths(&mut hidden);
+
+        let policy = Self {
+            version: 1,
+            cwd,
+            writable_roots: writable,
+            temporary_roots: temporary,
+            read_only_paths: read_only,
+            read_only_roots: visible_roots,
+            hidden_roots: hidden,
+            network: LinuxNetworkPolicy::LocalAgent,
         };
         policy.validate()?;
         Ok(policy)
@@ -145,17 +206,51 @@ impl LinuxSandboxPolicy {
             "too many read-only paths"
         );
         anyhow::ensure!(
-            self.writable_roots.iter().any(|root| root == &self.cwd),
-            "sandbox cwd must be a writable root"
+            self.read_only_roots.len() <= MAX_ROOTS,
+            "too many read-only roots"
         );
         anyhow::ensure!(
-            self.network == LinuxNetworkPolicy::Restricted,
-            "unsupported Linux network policy"
+            self.hidden_roots.len() <= MAX_ROOTS,
+            "too many hidden roots"
         );
+        if self.network == LinuxNetworkPolicy::Restricted {
+            anyhow::ensure!(
+                self.writable_roots.iter().any(|root| root == &self.cwd),
+                "sandbox cwd must be a writable root"
+            );
+        }
 
         validate_existing_directory(&self.cwd, "sandbox cwd")?;
         validate_unique_existing_directories(&self.writable_roots, "writable root")?;
         validate_unique_existing_directories(&self.temporary_roots, "temporary root")?;
+        validate_unique_existing_directories(&self.read_only_roots, "read-only root")?;
+        validate_unique_existing_directories(&self.hidden_roots, "hidden root")?;
+
+        for root in &self.read_only_roots {
+            anyhow::ensure!(
+                !self.writable_roots.iter().any(|writable| writable == root),
+                "read-only root cannot be a writable root: {}",
+                root.display()
+            );
+        }
+        for hidden in &self.hidden_roots {
+            anyhow::ensure!(
+                hidden != Path::new("/"),
+                "hidden root cannot be the filesystem root"
+            );
+            for visible in self
+                .writable_roots
+                .iter()
+                .chain(self.temporary_roots.iter())
+                .chain(self.read_only_roots.iter())
+            {
+                anyhow::ensure!(
+                    hidden != visible && !hidden.starts_with(visible),
+                    "hidden root is inside a visible root: {}",
+                    hidden.display()
+                );
+            }
+        }
 
         for path in &self.read_only_paths {
             validate_absolute_clean_path(path, "read-only path")?;
@@ -307,6 +402,26 @@ mod tests {
         assert_eq!(value["network"], "restricted");
         assert!(value.get("permission_profile").is_none());
         assert!(value.get("entries").is_none());
+    }
+
+    #[test]
+    fn local_agent_policy_can_keep_a_read_only_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = root.path().join("tmp");
+        std::fs::create_dir(&temp).unwrap();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            root.path(),
+            &[],
+            std::slice::from_ref(&temp),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert!(!policy.writable_roots.contains(&policy.cwd));
+        assert_eq!(policy.network, LinuxNetworkPolicy::LocalAgent);
+        assert!(policy.validate().is_ok());
     }
 
     #[test]

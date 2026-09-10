@@ -8,7 +8,6 @@ use std::fmt::Display;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -18,7 +17,8 @@ use seccompiler::{
 };
 
 use super::policy::{
-    LinuxSandboxPolicy, is_linked_worktree_metadata_root, missing_path_is_directory,
+    LinuxNetworkPolicy, LinuxSandboxPolicy, is_linked_worktree_metadata_root,
+    missing_path_is_directory,
 };
 
 #[derive(Debug)]
@@ -69,11 +69,11 @@ pub(super) fn run_main() -> ! {
         Err(error) => fail(error.context("invalid Linux sandbox helper arguments")),
     };
 
-    let bwrap = match find_bwrap() {
+    let bwrap = match crate::sandbox::trusted_service_account_bwrap() {
         Ok(path) => path,
         Err(error) => fail(error.context("bubblewrap is required for Linux sandboxing")),
     };
-    let seccomp_program = match build_network_seccomp_filter() {
+    let seccomp_program = match build_seccomp_filter(args.policy.network) {
         Ok(program) => program,
         Err(error) => fail(error.context("failed to compile Linux seccomp filter")),
     };
@@ -133,17 +133,34 @@ fn build_bwrap_args(
         "/proc".to_owned(),
         "--unshare-user".to_owned(),
         "--unshare-pid".to_owned(),
-        "--unshare-net".to_owned(),
-        "--seccomp".to_owned(),
-        seccomp_fd.to_string(),
     ];
+    if policy.network == LinuxNetworkPolicy::Restricted {
+        args.push("--unshare-net".to_owned());
+    }
+    args.extend(["--seccomp".to_owned(), seccomp_fd.to_string()]);
+
+    let mut hidden_roots = policy.hidden_roots.clone();
+    hidden_roots.sort_by_key(|path| path_depth(path));
+    hidden_roots.dedup();
+    for root in &hidden_roots {
+        args.push("--tmpfs".to_owned());
+        args.push(path_to_string(root)?);
+    }
 
     let mut writable_roots = policy.writable_roots.clone();
     writable_roots.extend(policy.temporary_roots.iter().cloned());
     writable_roots.sort_by_key(|path| path_depth(path));
     writable_roots.dedup();
+    let mut visible_roots = writable_roots.clone();
+    visible_roots.extend(policy.read_only_roots.iter().cloned());
+    visible_roots.sort_by_key(|path| path_depth(path));
+    visible_roots.dedup();
+    append_namespace_directory_scaffolding(&mut args, &hidden_roots, &visible_roots)?;
     for root in writable_roots {
         append_pair(&mut args, "--bind", &root, &root)?;
+    }
+    for root in &policy.read_only_roots {
+        append_pair(&mut args, "--ro-bind", root, root)?;
     }
 
     let mut masked_paths = Vec::new();
@@ -201,6 +218,38 @@ fn build_bwrap_args(
     Ok(args)
 }
 
+fn append_namespace_directory_scaffolding(
+    args: &mut Vec<String>,
+    hidden_roots: &[PathBuf],
+    visible_roots: &[PathBuf],
+) -> Result<()> {
+    let mut directories = Vec::new();
+    for visible in visible_roots {
+        let Some(hidden) = hidden_roots
+            .iter()
+            .filter(|hidden| visible.starts_with(hidden))
+            .max_by_key(|hidden| path_depth(hidden))
+        else {
+            continue;
+        };
+        let relative = visible
+            .strip_prefix(hidden)
+            .context("visible sandbox root is not below its hidden root")?;
+        let mut current = hidden.clone();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            directories.push(current.clone());
+        }
+    }
+    directories.sort_by_key(|path| path_depth(path));
+    directories.dedup();
+    for directory in directories {
+        args.push("--dir".to_owned());
+        args.push(path_to_string(&directory)?);
+    }
+    Ok(())
+}
+
 fn append_pair(args: &mut Vec<String>, flag: &str, source: &Path, target: &Path) -> Result<()> {
     args.push(flag.to_owned());
     args.push(path_to_string(source)?);
@@ -254,27 +303,6 @@ fn first_missing_component(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn find_bwrap() -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").context("PATH is unavailable")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = if directory.as_os_str().is_empty() {
-            std::env::current_dir()?.join("bwrap")
-        } else {
-            directory.join("bwrap")
-        };
-        let Ok(canonical) = std::fs::canonicalize(&candidate) else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(&canonical) else {
-            continue;
-        };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Ok(canonical);
-        }
-    }
-    anyhow::bail!("no executable bwrap was found on PATH")
-}
-
 fn path_to_string(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
@@ -311,7 +339,7 @@ fn exec_absolute(program: &Path, args: &[String]) -> ! {
     fail(anyhow::anyhow!("failed to exec bubblewrap: {error}"));
 }
 
-fn build_network_seccomp_filter() -> Result<BpfProgram> {
+fn build_seccomp_filter(network: LinuxNetworkPolicy) -> Result<BpfProgram> {
     fn deny_syscall(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, syscall: i64) {
         rules.insert(syscall, Vec::new());
     }
@@ -324,34 +352,50 @@ fn build_network_seccomp_filter() -> Result<BpfProgram> {
     deny_syscall(&mut rules, libc::SYS_io_uring_enter);
     deny_syscall(&mut rules, libc::SYS_io_uring_register);
 
-    for syscall in [
-        libc::SYS_connect,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_getpeername,
-        libc::SYS_getsockname,
-        libc::SYS_shutdown,
-        libc::SYS_sendto,
-        libc::SYS_sendmmsg,
-        libc::SYS_recvmmsg,
-        libc::SYS_getsockopt,
-        libc::SYS_setsockopt,
-    ] {
-        deny_syscall(&mut rules, syscall);
-    }
+    if network == LinuxNetworkPolicy::Restricted {
+        for syscall in [
+            libc::SYS_connect,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_getpeername,
+            libc::SYS_getsockname,
+            libc::SYS_shutdown,
+            libc::SYS_sendto,
+            libc::SYS_sendmmsg,
+            libc::SYS_recvmmsg,
+            libc::SYS_getsockopt,
+            libc::SYS_setsockopt,
+        ] {
+            deny_syscall(&mut rules, syscall);
+        }
 
-    // Unix-domain sockets remain available for local subprocess management;
-    // all other socket families are rejected before a command can create one.
-    let unix_only_rule = SeccompRule::new(vec![SeccompCondition::new(
-        0,
-        SeccompCmpArgLen::Dword,
-        SeccompCmpOp::Ne,
-        libc::AF_UNIX as u64,
-    )?])?;
-    rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
-    rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
+        // The restricted command profile can still use Unix-domain sockets
+        // for local subprocess management; all other socket families are
+        // rejected before a command can create one.
+        let unix_only_rule = SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_UNIX as u64,
+        )?])?;
+        rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
+        rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
+    } else {
+        // The network-enabled local-agent profile has no inherited IPC file
+        // descriptors and does not need Unix-domain sockets. Blocking their
+        // creation prevents a child from reaching host control sockets while
+        // retaining AF_INET/AF_INET6 access to the model service.
+        let unix_rule = SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_UNIX as u64,
+        )?])?;
+        rules.insert(libc::SYS_socket, vec![unix_rule.clone()]);
+        rules.insert(libc::SYS_socketpair, vec![unix_rule]);
+    }
 
     let architecture = if cfg!(target_arch = "x86_64") {
         TargetArch::x86_64
@@ -484,6 +528,52 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|window| window == ["--chdir", root.path().to_str().unwrap()])
+        );
+    }
+
+    #[test]
+    fn local_agent_policy_keeps_network_and_uses_only_explicit_temp_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let temp = root.path().join("tmp");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let hidden = root.path().to_path_buf();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            &workspace,
+            &[],
+            std::slice::from_ref(&temp),
+            &[],
+            std::slice::from_ref(&workspace),
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
+
+        assert!(!args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--tmpfs", root.path().to_str().unwrap()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--dir", workspace.to_str().unwrap()])
+        );
+        assert!(args.windows(3).any(|window| {
+            window
+                == [
+                    "--ro-bind",
+                    workspace.to_str().unwrap(),
+                    workspace.to_str().unwrap(),
+                ]
+        }));
+        assert!(args.windows(3).any(|window| {
+            window == ["--bind", temp.to_str().unwrap(), temp.to_str().unwrap()]
+        }));
+        assert!(
+            !args
+                .windows(3)
+                .any(|window| window == ["--bind", "/tmp", "/tmp"])
         );
     }
 }

@@ -22,6 +22,9 @@ const GIT_READ_ONLY_PATHS: &[&str] = &[
 pub(super) struct SandboxSpec {
     writable_roots: Vec<PathBuf>,
     read_only_overrides: Vec<PathBuf>,
+    read_only_roots: Vec<PathBuf>,
+    hidden_roots: Vec<PathBuf>,
+    network_access: bool,
 }
 
 impl SandboxSpec {
@@ -40,6 +43,79 @@ impl SandboxSpec {
         Ok(Self {
             writable_roots: roots,
             read_only_overrides: Vec::new(),
+            read_only_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            network_access: false,
+        })
+    }
+
+    pub(super) fn local_agent(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        temporary_roots: &[PathBuf],
+        read_only_paths: &[PathBuf],
+        read_only_roots: &[PathBuf],
+        hidden_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let _cwd = canonical_existing_root(cwd)?;
+        let mut roots = Vec::with_capacity(writable_roots.len() + temporary_roots.len());
+        roots.extend(
+            writable_roots
+                .iter()
+                .map(|root| canonical_existing_root(root))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        roots.extend(
+            temporary_roots
+                .iter()
+                .map(|root| canonical_existing_root(root))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        normalize_roots(&mut roots);
+        let mut read_only_overrides = read_only_paths
+            .iter()
+            .map(|path| {
+                std::fs::canonicalize(path)
+                    .with_context(|| format!("cannot resolve read-only path {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        normalize_paths(&mut read_only_overrides);
+        let mut visible_roots = read_only_roots
+            .iter()
+            .map(|root| canonical_existing_root(root))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_roots(&mut visible_roots);
+        let mut hidden = hidden_roots
+            .iter()
+            .map(|root| canonical_existing_root(root))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_roots(&mut hidden);
+        for root in &visible_roots {
+            anyhow::ensure!(
+                !roots.iter().any(|writable| writable == root),
+                "read-only root cannot be a writable root: {}",
+                root.display()
+            );
+        }
+        for hidden_root in &hidden {
+            anyhow::ensure!(
+                hidden_root != Path::new("/"),
+                "hidden root cannot be the filesystem root"
+            );
+            for visible in roots.iter().chain(visible_roots.iter()) {
+                anyhow::ensure!(
+                    hidden_root != visible && !hidden_root.starts_with(visible),
+                    "hidden root is inside a visible root: {}",
+                    hidden_root.display()
+                );
+            }
+        }
+        Ok(Self {
+            writable_roots: roots,
+            read_only_overrides,
+            read_only_roots: visible_roots,
+            hidden_roots: hidden,
+            network_access: true,
         })
     }
 
@@ -71,6 +147,18 @@ impl SandboxSpec {
 
     pub(super) fn read_only_overrides(&self) -> &[PathBuf] {
         &self.read_only_overrides
+    }
+
+    pub(super) fn read_only_roots(&self) -> &[PathBuf] {
+        &self.read_only_roots
+    }
+
+    pub(super) fn hidden_roots(&self) -> &[PathBuf] {
+        &self.hidden_roots
+    }
+
+    pub(super) fn network_access(&self) -> bool {
+        self.network_access
     }
 
     pub(super) fn protected_metadata_paths(&self, root: &Path) -> Vec<PathBuf> {

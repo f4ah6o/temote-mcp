@@ -101,7 +101,9 @@ Temote の yolo は Temote 自身の local sandbox と approval behavior だけ�
 
 指定した `cwd` は canonicalize し、symlink 解決後も yolo を含むすべての session で permitted root 内に限定します。
 `read_only` と `workspace_write` は、それぞれ Codex の sandbox と OpenCode の edit policy に対応します。
-`.git`、`.agents`、`.codex` は保護したままにし、agent の state と cache は毎回専用 directory に分離します。
+Temote 側の agent profile でも filesystem boundary を適用します。
+`workspace_write` では選択した session root だけを書き込み可能にし、`read_only` では workspace を読み取り専用にします。
+どちらの mode でも agent の state と cache は毎回専用 directory に分離して書き込み可能にし、`.git`、`.agents`、`.codex` は保護したままにします。
 
 local agent の request は yolo session からでも local approval boundary を通ります。
 deny の場合は child process を起動せずに終了します。
@@ -110,6 +112,9 @@ foreground timeout を超える場合は通常の Temote `job_id` を返し、`p
 approval と activity には agent、scope、access mode、task byte数、bounded な task hash だけを記録し、task 本文と environment value は記録しません。
 
 child environment は一度消去して最小限の allow-list から再構成するため、Temote が保持する credential、token、proxy 設定を暗黙には渡しません。
+外側の agent profile は host の temporary root と user-agent state root を隠し、今回必要な workspace、実行ファイル directory、private run state だけを再公開します。
+既存の Codex (`~/.codex/auth.json`) と OpenCode (`~/.local/share/opencode/auth.json`) の login file は bounded な read-only input として private な run state に取り込みます。
+元の user file は child から書き込みできません。
 agent の file edit は Git remote 操作の認可を与えません。
 stage、commit、fetch、pull、push には専用の `git_*` tool を使います。
 公開 HTTP はこの構造化 broker だけを公開し、generic な `without_sandbox` tool は引き続き公開しません。
