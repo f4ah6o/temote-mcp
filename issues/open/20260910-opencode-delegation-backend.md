@@ -5,7 +5,6 @@
 - Priority: P1
 - Baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
 - Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
-- GitHub issue: pending creation after this proposal commit; this line will be replaced with the created issue URL.
 - Related:
   - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
   - `src/codex.rs`
