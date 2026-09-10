@@ -60,6 +60,14 @@ Do not tell the user that work is complete while a required job is still running
 
 When the experimental `codex_status`, `codex_task_start`, `codex_task_get`, or `codex_task_control` tools are available, call `codex_status` first and treat its version/model/effort result as compatibility metadata, not as proof that a task will succeed. Start and control require a fresh UUID `operation_id`; preserve it for an exact retry and never retry an uncertain side effect with a new ID. Pre-thread startup failures may be retried with the same start ID; once a thread/turn request may have been sent, keep the task in reconciliation and do not blindly replay it. Use `codex_task_get` to reconcile remote truth, `reconciliation_required`, `unknown`, approval waits, and process restarts before deciding whether to control a task; it reconciles before honoring `after_revision`. A session stop/restart finalizes nonterminal tasks owned by the ended full session instance as `interrupted`; those records remain retained for task retention and are fenced from a replacement instance. Unexpired terminal records are not evicted to make capacity; when no expired terminal record is available, a new start is rejected. Temote yolo does not authorize Codex child mutations: command/file-change approval requests still use the explicit user-approval path and fail closed if it is unavailable. Control is limited to typed `steer`, `resume`, and `interrupt` actions, and compacted receipts remain conflict-protected during task retention. These tools expose named operations only—do not attempt to tunnel arbitrary app-server JSON-RPC or a remote shell. Prompts, transcripts, and raw child output are not a substitute for the bounded evidence reference returned by the task API. The app-server adapter is experimental and its generated-turn sandbox is not equivalent to Temote's direct command sandbox; do not claim normal `execute` guarantees for it without host-specific validation.
 
+### Structured local agent broker
+
+Use `local_agent_run` for a single local Codex or OpenCode run with `{session_id, agent, task, cwd?, access, model?, profile?}`. `agent` is only `codex` or `opencode`, and `access` is only `read_only` or `workspace_write`. The caller cannot provide an executable, raw argv, environment, or network policy; Temote constructs and bounds the adapter command.
+
+The broker canonicalizes `cwd` and keeps it inside the selected session's permitted roots after symlink resolution, including in yolo sessions. It preserves `.git`, `.agents`, and `.codex` protection, gives the child private per-run state/cache directories, and does not forward Temote-held credentials, tokens, or proxy settings by default. Normal sessions require local approval before the child starts; this broker also keeps that explicit approval boundary in yolo sessions, and denial means no child process is started.
+
+The task and combined output are bounded. A run that exceeds the foreground timeout returns a session-owned `job_id`; use `poll_job` or `stop_job` as with other jobs. Approval/activity summaries contain only bounded scope and task-hash metadata, never the task body or environment values. Agent edits do not authorize Git remote mutation; use the dedicated `git_*` tools for Git operations. Do not substitute `without_sandbox`, which remains unavailable on public HTTP.
+
 ## Git
 
 Use ordinary `execute` for read-only Git inspection. Use Temote MCP's dedicated tools for Git metadata writes and remote synchronization:
@@ -75,7 +83,7 @@ Before committing, inspect the diff/status and run the task-relevant checks. Aft
 
 ## Approval model
 
-Normal sessions use Temote MCP's local approval boundary for host/network-sensitive operations. Yolo sessions intentionally skip Temote MCP approval prompts and path/sandbox restrictions.
+Normal sessions use Temote MCP's local approval boundary for host/network-sensitive operations. Yolo sessions intentionally skip Temote MCP approval prompts and path/sandbox restrictions for ordinary operations; the structured `local_agent_run` broker deliberately retains its explicit child-approval boundary.
 
 Do not add a redundant conversational confirmation for an operation the user already explicitly requested merely because Temote MCP may also display its own host approval UI. Still follow any confirmation or authorization rules imposed by the current agent/client.
 

@@ -290,6 +290,24 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "local_agent_run",
+    "Run a local coding agent",
+    "Run a verified Codex or OpenCode non-interactive agent in the selected host session with canonical workspace scope, bounded task/output, isolated agent state, and local approval.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        agent: { type: "string", enum: ["codex", "opencode"] },
+        task: { type: "string", minLength: 1, maxLength: 1048576 },
+        cwd: { type: "string" },
+        access: { type: "string", enum: ["read_only", "workspace_write"] },
+        model: { type: "string", minLength: 1, maxLength: 256 },
+        profile: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      ["session_id", "agent", "task", "access"],
+    ),
+  ),
+  tool(
     "get_image",
     "Read a local image",
     "Read a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image from the selected host.",

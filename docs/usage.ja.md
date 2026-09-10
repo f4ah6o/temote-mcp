@@ -92,6 +92,28 @@ Temote の yolo は Temote 自身の local sandbox と approval behavior だけ�
 
 生成される turn には Codex の `workspaceWrite`、session の canonical directory を writable root、network disabled を指定します。これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な app-server adapter です。app-server process 自体は inference service と直接通信するため、Codex build と sandbox behavior を検証できない場合はこの surface を無効または opt-in のままにしてください。generic JSON-RPC、remote shell、automatic approval は公開しません。
 
+### 構造化ローカルエージェント broker
+
+`local_agent_run({session_id, agent, task, cwd?, access, model?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。
+`agent` は `codex` と `opencode` に限定し、呼び出し側が渡せるのは bounded な task と access mode だけです。
+実行ファイル、raw argv、environment、network policy は Temote が構築し、caller から指定できません。
+実装対象の non-interactive CLI contract は、インストール済み CLI の help 出力で検証します。
+
+指定した `cwd` は canonicalize し、symlink 解決後も yolo を含むすべての session で permitted root 内に限定します。
+`read_only` と `workspace_write` は、それぞれ Codex の sandbox と OpenCode の edit policy に対応します。
+`.git`、`.agents`、`.codex` は保護したままにし、agent の state と cache は毎回専用 directory に分離します。
+
+local agent の request は yolo session からでも local approval boundary を通ります。
+deny の場合は child process を起動せずに終了します。
+task は 1 MiB、child の stdout/stderr 合計は 1 MiB に制限します。
+foreground timeout を超える場合は通常の Temote `job_id` を返し、`poll_job` または `stop_job` で確認または停止できます。
+approval と activity には agent、scope、access mode、task byte数、bounded な task hash だけを記録し、task 本文と environment value は記録しません。
+
+child environment は一度消去して最小限の allow-list から再構成するため、Temote が保持する credential、token、proxy 設定を暗黙には渡しません。
+agent の file edit は Git remote 操作の認可を与えません。
+stage、commit、fetch、pull、push には専用の `git_*` tool を使います。
+公開 HTTP はこの構造化 broker だけを公開し、generic な `without_sandbox` tool は引き続き公開しません。
+
 ## work checkpoint / handoff
 
 `checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。すべてのsaveで opaque UUID `operation_id` が必須です。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。同じlogical mutationを同一`operation_id`かつ同一canonical requestで再送すると、checkpoint/revisionを増やさず以前のcommit結果を返します。同じoperation IDを異なるrequestで再利用すると `OPERATION_CONFLICT`、通常のstale revisionは `CHECKPOINT_CONFLICT` になります。operation receiptはcheckpointと同じatomic write境界で永続化し、bounded historyとして保持します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。
