@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, and backend adapter extraction landed on main; live comparative measurement completed locally; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, and backend adapter extraction landed on main; live comparative measurement landed on main; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -580,7 +580,7 @@ Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/ses
 
 ## Live comparative measurement status (2026-09-12)
 
-Live comparison completed locally. Evidence: [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
+Live comparison landed on main. Evidence: [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
 
 - 3 read-only tasks (repository comprehension, targeted review, implementation planning) × Codex/OpenCode × 3 runs = 18 delegation runs at baseline `0f8a795`, with fixed prompts: Codex `gpt-5.6-luna` (`high`) and OpenCode `opencode-go/deepseek-v4-flash` (`1.18.30`).
 - Delivered normalized results: Codex 9/9; OpenCode 1/9 (`invalid_json` ×2 from raw newlines in strings, `invalid_report_schema` ×6 from summaries over the 1200-character bound). Blind content scores were close; the practical difference is report deliverability.

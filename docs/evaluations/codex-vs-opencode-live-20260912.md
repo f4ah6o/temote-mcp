@@ -1,6 +1,6 @@
 # Codex vs OpenCode live comparison (2026-09-12, Asia/Tokyo)
 
-Status: live comparison completed locally on 2026-09-12; measurement/evidence only, with no production code changes.
+Status: live comparison landed on main on 2026-09-12; measurement/evidence only, with no production code changes.
 
 ## Baseline and environment
 
