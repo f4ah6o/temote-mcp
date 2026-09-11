@@ -1275,6 +1275,7 @@ mod generic_tests {
         std::fs::write(fallback.join("entry-1"), b"1")?;
 
         let workspace = std::fs::canonicalize(workspace)?;
+        let fallback = workspace.join("large");
         let paths = discover_protected_metadata_paths_with_limits(
             &workspace,
             ProtectedMetadataScanLimits {
