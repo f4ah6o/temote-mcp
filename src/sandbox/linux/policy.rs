@@ -8,9 +8,10 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::sandbox::discover_protected_metadata_paths;
+
 const MAX_ROOTS: usize = 128;
 const MAX_READ_ONLY_PATHS: usize = 1024;
-const PROTECTED_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
 const GIT_READ_ONLY_PATHS: &[&str] = &[
     "config",
     "hooks",
@@ -89,16 +90,20 @@ impl LinuxSandboxPolicy {
 
         let mut read_only_paths = Vec::new();
         for root in &writable {
-            for name in PROTECTED_METADATA_NAMES {
-                let path = root.join(name);
-                // A validated run_git operation may write the repository's
-                // own metadata root. Its narrower config/hooks/etc. masks are
-                // added below instead.
-                if canonical_git_roots.iter().any(|git_root| git_root == &path) {
-                    continue;
-                }
-                read_only_paths.push(path);
+            // A validated run_git operation may write the repository's own
+            // metadata root. Its narrower config/hooks/etc. masks are added
+            // below instead; do not scan inside that root either.
+            if canonical_git_roots
+                .iter()
+                .any(|git_root| root == git_root || root.starts_with(git_root))
+            {
+                continue;
             }
+            read_only_paths.extend(
+                discover_protected_metadata_paths(root)?
+                    .into_iter()
+                    .filter(|path| !canonical_git_roots.iter().any(|git| git == path)),
+            );
         }
 
         for git_root in &canonical_git_roots {
@@ -157,9 +162,7 @@ impl LinuxSandboxPolicy {
             })
             .collect::<Result<Vec<_>>>()?;
         for root in &writable {
-            for name in PROTECTED_METADATA_NAMES {
-                read_only.push(root.join(name));
-            }
+            read_only.extend(discover_protected_metadata_paths(root)?);
         }
         normalize_paths(&mut read_only);
 
@@ -422,6 +425,41 @@ mod tests {
         assert!(!policy.writable_roots.contains(&policy.cwd));
         assert_eq!(policy.network, LinuxNetworkPolicy::LocalAgent);
         assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn local_agent_policy_masks_nested_metadata_files_and_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("nested/.git")).unwrap();
+        std::fs::create_dir_all(workspace.join("nested/.agents")).unwrap();
+        std::fs::create_dir_all(workspace.join("nested/deep")).unwrap();
+        std::fs::write(workspace.join("nested/deep/.codex"), b"metadata").unwrap();
+        std::fs::create_dir_all(workspace.join("ordinary")).unwrap();
+        std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
+
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        for expected in [
+            workspace.join("nested/.git"),
+            workspace.join("nested/.agents"),
+            workspace.join("nested/deep/.codex"),
+            workspace.join("ordinary/.git"),
+        ] {
+            assert!(
+                policy.read_only_paths.contains(&expected),
+                "missing nested protected path {expected:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,6 +18,100 @@ mod policy;
 
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
+pub(crate) const PROTECTED_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
+const MAX_PROTECTED_METADATA_SCAN_ENTRIES: usize = 16 * 1024;
+const MAX_PROTECTED_METADATA_SCAN_DEPTH: usize = 64;
+const MAX_PROTECTED_METADATA_PATHS: usize = 1024;
+
+/// Returns the protected metadata paths below an existing writable root.
+///
+/// The first three paths are retained even when they do not exist so a child
+/// cannot create a top-level metadata entry after the sandbox starts. Existing
+/// nested metadata is discovered with `symlink_metadata`; symbolic links are
+/// never followed, and protected directories are not traversed. Any
+/// inspection or resource-bound failure rejects the policy instead of
+/// silently leaving a writable gap.
+pub(crate) fn discover_protected_metadata_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("cannot resolve protected metadata root {}", root.display()))?;
+    anyhow::ensure!(
+        root.is_dir(),
+        "protected metadata root is not a directory: {}",
+        root.display()
+    );
+
+    let mut protected = PROTECTED_METADATA_NAMES
+        .iter()
+        .map(|name| root.join(name))
+        .collect::<Vec<_>>();
+    let mut pending = vec![(root.clone(), 0usize)];
+    let mut scanned_entries = 0usize;
+
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).with_context(|| {
+            format!(
+                "cannot enumerate protected metadata root directory {}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!(
+                    "cannot read an entry while walking protected metadata root {}",
+                    directory.display()
+                )
+            })?;
+            scanned_entries = scanned_entries
+                .checked_add(1)
+                .context("protected metadata scan entry count overflow")?;
+            anyhow::ensure!(
+                scanned_entries <= MAX_PROTECTED_METADATA_SCAN_ENTRIES,
+                "protected metadata scan exceeds {MAX_PROTECTED_METADATA_SCAN_ENTRIES} entries"
+            );
+
+            let path = entry.path();
+            anyhow::ensure!(
+                path.starts_with(&root),
+                "protected metadata scan escaped its root: {}",
+                path.display()
+            );
+            let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+                format!(
+                    "cannot inspect protected metadata scan entry {}",
+                    path.display()
+                )
+            })?;
+            if is_protected_metadata_name(&entry.file_name()) {
+                protected.push(path);
+                anyhow::ensure!(
+                    protected.len() <= MAX_PROTECTED_METADATA_PATHS,
+                    "protected metadata path count exceeds {MAX_PROTECTED_METADATA_PATHS}"
+                );
+                continue;
+            }
+
+            if metadata.file_type().is_dir() {
+                let child_depth = depth
+                    .checked_add(1)
+                    .context("protected metadata scan depth overflow")?;
+                anyhow::ensure!(
+                    child_depth <= MAX_PROTECTED_METADATA_SCAN_DEPTH,
+                    "protected metadata scan exceeds depth {MAX_PROTECTED_METADATA_SCAN_DEPTH}"
+                );
+                pending.push((path, child_depth));
+            }
+        }
+    }
+
+    protected.sort();
+    protected.dedup();
+    Ok(protected)
+}
+
+fn is_protected_metadata_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| PROTECTED_METADATA_NAMES.contains(&name))
+}
 
 pub fn protect_current_process_if_service_account_token_present() -> Result<()> {
     if std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_some() {
@@ -1025,6 +1120,73 @@ mod generic_tests {
     }
 
     #[test]
+    fn protected_metadata_walk_discovers_nested_entries_without_following_symlinks() -> Result<()> {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let nested = workspace.join("nested");
+        let deep = nested.join("deep");
+        let ordinary = workspace.join("ordinary");
+        std::fs::create_dir_all(workspace.join(".git/ignored"))?;
+        std::fs::create_dir_all(nested.join(".git"))?;
+        std::fs::create_dir_all(nested.join(".agents"))?;
+        std::fs::create_dir_all(&deep)?;
+        std::fs::write(deep.join(".codex"), b"metadata")?;
+        std::fs::create_dir_all(&ordinary)?;
+        std::fs::write(ordinary.join(".git"), b"gitdir: ../real-git")?;
+
+        #[cfg(unix)]
+        {
+            let external = fixture.path().join("external");
+            std::fs::create_dir_all(external.join(".codex"))?;
+            std::os::unix::fs::symlink(&external, workspace.join("linked"))?;
+        }
+
+        let workspace = std::fs::canonicalize(workspace)?;
+        let paths = discover_protected_metadata_paths(&workspace)?;
+        for expected in [
+            workspace.join(".git"),
+            workspace.join(".agents"),
+            workspace.join(".codex"),
+            workspace.join("nested/.git"),
+            workspace.join("nested/.agents"),
+            workspace.join("nested/deep/.codex"),
+            workspace.join("ordinary/.git"),
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "missing protected path {expected:?}"
+            );
+        }
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.ends_with(".git/ignored/.codex")),
+            "protected metadata directories must not be traversed"
+        );
+        #[cfg(unix)]
+        assert!(
+            !paths.iter().any(|path| path.ends_with("external/.codex")),
+            "symbolic-link directories must not be followed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protected_metadata_walk_fails_closed_at_its_depth_bound() -> Result<()> {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let mut current = workspace.clone();
+        for index in 0..=MAX_PROTECTED_METADATA_SCAN_DEPTH {
+            current.push(format!("level-{index}"));
+            std::fs::create_dir(&current)?;
+        }
+
+        assert!(discover_protected_metadata_paths(&workspace).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn generated_writable_scope_fails_closed_for_protected_metadata() -> noprop::TestResult {
         const PROTECTED: [&str; 3] = [".git", ".agents", ".codex"];
         let fixture = tempfile::tempdir().unwrap();
@@ -1747,16 +1909,32 @@ done
         let state = root.path().join("state");
         let state_tmp = state.join("tmp");
         let git = workspace.join(".git");
+        let agents = workspace.join(".agents");
+        let codex = workspace.join(".codex");
+        let nested_git = workspace.join("nested/.git");
+        let nested_agents = workspace.join("nested/.agents");
+        let nested_codex = workspace.join("nested/deep/.codex");
+        let ordinary_git = workspace.join("ordinary/.git");
         std::fs::create_dir_all(&git)?;
+        std::fs::create_dir_all(&agents)?;
+        std::fs::create_dir_all(&codex)?;
+        std::fs::create_dir_all(&nested_git)?;
+        std::fs::create_dir_all(&nested_agents)?;
+        std::fs::create_dir_all(nested_codex.parent().context("nested .codex parent")?)?;
+        std::fs::create_dir_all(ordinary_git.parent().context("ordinary .git parent")?)?;
         std::fs::create_dir_all(&outside)?;
         std::fs::create_dir_all(&state_tmp)?;
+        std::fs::write(nested_git.join("existing"), b"protected")?;
+        std::fs::write(nested_agents.join("existing"), b"protected")?;
+        std::fs::write(&nested_codex, b"protected")?;
+        std::fs::write(&ordinary_git, b"protected")?;
         let outside_secret = outside.join("secret");
         std::fs::write(&outside_secret, b"not visible to the agent")?;
 
         let state_file = state.join("state-file");
         let state_file_argument = state_file.to_str().context("state path is not UTF-8")?;
         let hidden_root = root.path().to_path_buf();
-        let write_script = "set -eu; printf allowed > allowed; if printf outside > ../outside/denied; then exit 11; fi; if printf git > .git/denied; then exit 12; fi; printf state > \"$1\"; test -f allowed; test ! -e ../outside/denied; test ! -e .git/denied; test -f \"$1\"";
+        let write_script = "set -eu; printf allowed > allowed; if printf outside > ../outside/denied; then exit 11; fi; if printf git > .git/denied; then exit 12; fi; if printf agents > .agents/denied; then exit 13; fi; if printf codex > .codex/denied; then exit 14; fi; if printf nested-git > nested/.git/denied; then exit 15; fi; if printf nested-agents > nested/.agents/denied; then exit 16; fi; if printf nested-codex > nested/deep/.codex; then exit 17; fi; if printf ordinary-git > ordinary/.git; then exit 18; fi; printf state > \"$1\"; test -f allowed; test ! -e ../outside/denied; test ! -e .git/denied; test ! -e .agents/denied; test ! -e .codex/denied; test ! -e nested/.git/denied; test ! -e nested/.agents/denied; test \"$(cat nested/deep/.codex)\" = protected; test \"$(cat ordinary/.git)\" = protected; test -f \"$1\"";
         let write_command = command(
             "/bin/sh",
             &["-c", write_script, "local-agent", state_file_argument],
@@ -1784,6 +1962,10 @@ done
         )
         .await?;
         assert_eq!(write.status, 0, "{}", write.stderr);
+        assert_eq!(std::fs::read(nested_git.join("existing"))?, b"protected");
+        assert_eq!(std::fs::read(nested_agents.join("existing"))?, b"protected");
+        assert_eq!(std::fs::read(&nested_codex)?, b"protected");
+        assert_eq!(std::fs::read(&ordinary_git)?, b"protected");
 
         let outside_secret_argument = outside_secret
             .to_str()
@@ -2105,22 +2287,43 @@ mod tests {
         let root = test_directory();
         let workspace = root.join("workspace");
         let git = workspace.join(".git");
+        let agents = workspace.join(".agents");
+        let codex = workspace.join(".codex");
+        let nested_git = workspace.join("nested/.git");
+        let nested_agents = workspace.join("nested/.agents");
+        let nested_codex = workspace.join("nested/deep/.codex");
+        let ordinary_git = workspace.join("ordinary/.git");
         std::fs::create_dir_all(&git)?;
+        std::fs::create_dir_all(&agents)?;
+        std::fs::create_dir_all(&codex)?;
+        std::fs::create_dir_all(&nested_git)?;
+        std::fs::create_dir_all(&nested_agents)?;
+        std::fs::create_dir_all(nested_codex.parent().context("nested .codex parent")?)?;
+        std::fs::create_dir_all(ordinary_git.parent().context("ordinary .git parent")?)?;
+        std::fs::write(&nested_codex, b"protected")?;
+        std::fs::write(&ordinary_git, b"protected")?;
 
-        let index = git.join("index");
-        let output = run(
-            &[
-                "/usr/bin/touch".into(),
-                index.to_string_lossy().into_owned(),
-            ],
-            &workspace,
-            &[],
-            None,
-        )
-        .await?;
+        for path in [
+            git.join("index"),
+            agents.join("config"),
+            codex.join("config"),
+            nested_git.join("index"),
+            nested_agents.join("config"),
+            nested_codex.clone(),
+            ordinary_git.clone(),
+        ] {
+            let output = run(
+                &["/usr/bin/touch".into(), path.to_string_lossy().into_owned()],
+                &workspace,
+                &[],
+                None,
+            )
+            .await?;
 
-        assert_ne!(output.status, 0);
-        assert!(!index.exists());
+            assert_ne!(output.status, 0, "protected path became writable: {path:?}");
+        }
+        assert_eq!(std::fs::read(&nested_codex)?, b"protected");
+        assert_eq!(std::fs::read(&ordinary_git)?, b"protected");
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -199,6 +199,50 @@ mod tests {
     }
 
     #[test]
+    fn generated_write_policy_protects_nested_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("nested/.git")).unwrap();
+        std::fs::create_dir_all(workspace.join("nested/.agents")).unwrap();
+        std::fs::create_dir_all(workspace.join("nested/deep")).unwrap();
+        std::fs::write(workspace.join("nested/deep/.codex"), b"metadata").unwrap();
+        std::fs::create_dir_all(workspace.join("ordinary")).unwrap();
+        std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
+
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let spec = SandboxSpec::local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (policy, definitions) = build_write_policy(&spec).unwrap();
+        let defined_paths = definitions
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for expected in [
+            workspace.join("nested/.git"),
+            workspace.join("nested/.agents"),
+            workspace.join("nested/deep/.codex"),
+            workspace.join("ordinary/.git"),
+        ] {
+            assert!(
+                defined_paths.contains(&expected),
+                "missing nested protected path {expected:?}"
+            );
+            assert!(
+                !policy.contains(expected.to_string_lossy().as_ref()),
+                "raw nested protected path leaked into Seatbelt policy: {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn generated_git_policy_parameterizes_every_read_only_override() -> noprop::TestResult {
         let fixture = tempfile::tempdir().unwrap();
         let workspace = fixture.path().join("workspace");

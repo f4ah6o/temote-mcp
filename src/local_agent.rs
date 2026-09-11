@@ -15,6 +15,10 @@ use uuid::Uuid;
 use crate::{approvals, child_env, config, sandbox};
 
 pub(crate) const MAX_TASK_BYTES: usize = 1024 * 1024;
+// OpenCode exposes its prompt only as a positional `message..` argument in
+// the verified CLI contract. Keep that argument well below Linux's per-string
+// exec limit instead of claiming the Codex stdin budget for it.
+pub(crate) const MAX_OPENCODE_TASK_BYTES: usize = 64 * 1024;
 const MAX_CWD_BYTES: usize = 4096;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_PROFILE_BYTES: usize = 128;
@@ -406,6 +410,7 @@ pub(crate) struct PreparedRun {
     executable_target: PathBuf,
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
+    task: String,
     task_bytes: usize,
     task_sha256: String,
     task_preview: String,
@@ -544,7 +549,7 @@ where
     let agent = Agent::parse(required_string(args, "agent")?)?;
     let access = Access::parse(required_string(args, "access")?)?;
     let task = required_string(args, "task")?;
-    validate_task(task)?;
+    validate_task(task, max_task_bytes(agent))?;
 
     let cwd = match object.get("cwd") {
         Some(value) => {
@@ -597,7 +602,6 @@ where
             &executable_runtime,
             &cwd_argument,
             access,
-            task,
             model.as_deref(),
             profile.as_deref(),
             state.read_only_paths(),
@@ -627,6 +631,7 @@ where
         executable_target,
         environment,
         session_roots: canonical_session_roots(session)?,
+        task: task.to_owned(),
         task_bytes: task.len(),
         task_sha256: task_sha256(task.as_bytes()),
         task_preview: task_preview(task),
@@ -651,6 +656,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     }
     read_only_roots.sort();
     read_only_roots.dedup();
+    let stdin = (prepared.agent == Agent::Codex).then_some(prepared.task.as_bytes());
     sandbox::run_local_agent(
         &prepared.command,
         &prepared.cwd,
@@ -661,7 +667,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
             read_only_roots: &read_only_roots,
             hidden_roots: prepared.state.hidden_roots(),
         },
-        None,
+        stdin,
         &prepared.environment,
     )
     .await
@@ -726,11 +732,15 @@ fn optional_profile(args: &Value) -> Result<Option<String>> {
     Ok(profile)
 }
 
-fn validate_task(task: &str) -> Result<()> {
-    anyhow::ensure!(
-        task.len() <= MAX_TASK_BYTES,
-        "task exceeds {MAX_TASK_BYTES} bytes"
-    );
+fn max_task_bytes(agent: Agent) -> usize {
+    match agent {
+        Agent::Codex => MAX_TASK_BYTES,
+        Agent::OpenCode => MAX_OPENCODE_TASK_BYTES,
+    }
+}
+
+fn validate_task(task: &str, maximum: usize) -> Result<()> {
+    anyhow::ensure!(task.len() <= maximum, "task exceeds {maximum} bytes");
     anyhow::ensure!(!task.as_bytes().contains(&0), "task contains a NUL byte");
     anyhow::ensure!(!task.is_empty(), "task must not be empty");
     Ok(())
@@ -1022,7 +1032,6 @@ fn build_codex_command(
     executable: &str,
     cwd: &str,
     access: Access,
-    task: &str,
     model: Option<&str>,
     profile: Option<&str>,
     auth_paths: &[PathBuf],
@@ -1061,7 +1070,10 @@ fn build_codex_command(
         "--config".to_owned(),
         format!("permissions.{CODEX_PERMISSION_PROFILE_NAME}.network={{enabled=true}}"),
     ]);
-    command.extend(["--".to_owned(), task.to_owned()]);
+    // Codex formally accepts `-` as the prompt source for stdin. Keep the
+    // task body out of argv and the process list so the full task byte limit
+    // is independent of execve's per-argument limit.
+    command.extend(["--".to_owned(), "-".to_owned()]);
     Ok(command)
 }
 
@@ -1255,7 +1267,7 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn make_executable_with_contents(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -1325,12 +1337,93 @@ mod tests {
 
     #[test]
     fn task_and_profile_bounds_fail_closed() {
-        assert!(validate_task("").is_err());
-        assert!(validate_task(&"x".repeat(MAX_TASK_BYTES + 1)).is_err());
-        assert!(validate_task("first line\nsecond line").is_ok());
-        assert!(validate_task("task\0injection").is_err());
+        assert!(validate_task("", MAX_TASK_BYTES).is_err());
+        assert!(validate_task(&"x".repeat(MAX_TASK_BYTES), MAX_TASK_BYTES).is_ok());
+        assert!(validate_task(&"x".repeat(MAX_TASK_BYTES + 1), MAX_TASK_BYTES).is_err());
+        assert!(validate_task("first line\nsecond line", MAX_TASK_BYTES).is_ok());
+        assert!(validate_task("task\0injection", MAX_TASK_BYTES).is_err());
+        assert!(
+            validate_task(
+                &"x".repeat(MAX_OPENCODE_TASK_BYTES),
+                MAX_OPENCODE_TASK_BYTES
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_task(
+                &"x".repeat(MAX_OPENCODE_TASK_BYTES + 1),
+                MAX_OPENCODE_TASK_BYTES
+            )
+            .is_err()
+        );
         assert!(optional_profile(&json!({"profile": "../escape"})).is_err());
         assert!(validate_text_argument("line\nfeed", "model", MAX_MODEL_BYTES).is_err());
+    }
+
+    #[test]
+    fn task_transport_keeps_codex_body_out_of_argv_and_bounds_opencode_message() {
+        let codex_task = "x".repeat(MAX_TASK_BYTES);
+        let codex_command = build_codex_command(
+            "/usr/bin/codex",
+            "/workspace",
+            Access::ReadOnly,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(codex_command.last(), Some(&"-".to_owned()));
+        assert!(!codex_command.iter().any(|argument| argument == &codex_task));
+        assert_eq!(codex_task.len(), MAX_TASK_BYTES);
+
+        let opencode_task = "y".repeat(MAX_OPENCODE_TASK_BYTES);
+        let opencode_command = build_opencode_command(
+            "/usr/bin/opencode",
+            "/workspace",
+            &opencode_task,
+            None,
+            None,
+        );
+        assert_eq!(opencode_command.last(), Some(&opencode_task));
+        assert_eq!(opencode_task.len(), max_task_bytes(Agent::OpenCode));
+        assert!(opencode_task.len() < 128 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_task_is_delivered_exactly_over_stdin() -> Result<()> {
+        let root = tempfile::tempdir().unwrap();
+        let state = AgentState::create(Agent::Codex, &[]).unwrap();
+        let task = "x".repeat(MAX_TASK_BYTES);
+        let task_sha = task_sha256(task.as_bytes());
+        let prepared = PreparedRun {
+            agent: Agent::Codex,
+            access: Access::ReadOnly,
+            cwd: root.path().canonicalize().unwrap(),
+            command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "wc -c".to_owned()],
+            executable_target: PathBuf::from("/bin/sh"),
+            environment: {
+                let mut environment = HashMap::new();
+                state.apply_to_environment(Agent::Codex, &mut environment);
+                environment
+            },
+            session_roots: Vec::new(),
+            task: task.clone(),
+            task_bytes: task.len(),
+            task_sha256: task_sha.clone(),
+            task_preview: task_preview(&task),
+            state,
+        };
+        assert_eq!(prepared.task_sha256, task_sha);
+        assert!(!prepared.command.iter().any(|argument| argument == &task));
+
+        let prepared_sha = prepared.task_sha256.clone();
+        let output = run(prepared).await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(output.stdout.trim(), task.len().to_string());
+        assert_eq!(prepared_sha, task_sha);
+        assert!(!output.truncated);
+        Ok(())
     }
 
     #[test]
@@ -1360,7 +1453,6 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::ReadOnly,
-            "task --dangerously-bypass-approvals-and-sandbox",
             Some("gpt-test"),
             Some("luna-max"),
             &[],
@@ -1371,7 +1463,12 @@ mod tests {
         assert!(read_only.contains(&"--strict-config".to_owned()));
         assert!(read_only.contains(&"--ephemeral".to_owned()));
         assert!(!read_only.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
-        assert!(read_only.contains(&"task --dangerously-bypass-approvals-and-sandbox".to_owned()));
+        assert!(
+            read_only
+                .iter()
+                .all(|value| !value.contains("dangerously-bypass-approvals-and-sandbox"))
+        );
+        assert_eq!(read_only.last(), Some(&"-".to_owned()));
         assert!(
             read_only
                 .iter()
@@ -1385,7 +1482,6 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::ReadOnly,
-            "task",
             None,
             None,
             &[],
@@ -1395,7 +1491,6 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::WorkspaceWrite,
-            "task",
             None,
             None,
             &[],
@@ -1455,6 +1550,7 @@ mod tests {
             executable_target: PathBuf::from("/usr/bin/codex"),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             session_roots: Vec::new(),
+            task: String::new(),
             task_bytes: task.len(),
             task_sha256: task_sha256(task.as_bytes()),
             task_preview: task_preview(&task),
@@ -1505,7 +1601,6 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::WorkspaceWrite,
-            "task",
             None,
             None,
             std::slice::from_ref(&auth_path),
@@ -1676,6 +1771,7 @@ mod tests {
             ]),
             executable_target: PathBuf::from("/usr/bin/head"),
             session_roots: Vec::new(),
+            task: String::new(),
             task_bytes: 0,
             task_sha256: String::new(),
             task_preview: String::new(),
@@ -1686,9 +1782,15 @@ mod tests {
         assert!(output.truncated);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn linux_local_agent_workspace_write_is_limited_to_selected_cwd() {
+    async fn local_agent_workspace_visibility_and_write_scope_is_limited_to_selected_cwd() {
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
+        {
+            return;
+        }
         let root_a = tempfile::tempdir().unwrap();
         let selected = root_a.path().join("selected");
         let sibling = root_a.path().join("sibling");
@@ -1697,20 +1799,45 @@ mod tests {
         let root_b = tempfile::tempdir().unwrap();
         let agent_dir = tempfile::tempdir().unwrap();
         let executable = agent_dir.path().join("codex");
+        let selected_input = selected.join("selected-input");
+        let sibling_input = sibling.join("sibling-input");
+        let extra_input = root_b.path().join("extra-input");
+        fs::write(&selected_input, "selected").unwrap();
+        fs::write(&sibling_input, "sibling").unwrap();
+        fs::write(&extra_input, "extra").unwrap();
         let selected_marker = selected.join("selected-marker");
         let sibling_marker = sibling.join("sibling-marker");
-        let outside_marker = root_b.path().join("outside-marker");
+        let extra_marker = root_b.path().join("extra-marker");
         make_executable_with_contents(
             &executable,
             &format!(
                 "#!/bin/sh\n\
-                 /usr/bin/touch \"{}\" 2>/dev/null || true\n\
-                 /usr/bin/touch \"{}\" 2>/dev/null || true\n\
-                 /usr/bin/touch \"{}\" 2>/dev/null || true\n\
+                 test \"$(/usr/bin/cat \"{}\" 2>/dev/null)\" = selected || exit 10\n\
+                 if /usr/bin/cat \"{}\" >/dev/null 2>&1; then exit 11; fi\n\
+                 if /usr/bin/cat \"{}\" >/dev/null 2>&1; then exit 12; fi\n\
+                 case \"$1\" in\n\
+                   workspace_write)\n\
+                     /usr/bin/touch \"{}\" || exit 13\n\
+                     if /usr/bin/touch \"{}\" 2>/dev/null; then exit 14; fi\n\
+                     if /usr/bin/touch \"{}\" 2>/dev/null; then exit 15; fi\n\
+                     ;;\n\
+                   read_only)\n\
+                     if /usr/bin/touch \"{}\" 2>/dev/null; then exit 16; fi\n\
+                     if /usr/bin/touch \"{}\" 2>/dev/null; then exit 17; fi\n\
+                     if /usr/bin/touch \"{}\" 2>/dev/null; then exit 18; fi\n\
+                     ;;\n\
+                   *) exit 19 ;;\n\
+                 esac\n\
                  exit 0\n",
+                selected_input.display(),
+                sibling_input.display(),
+                extra_input.display(),
                 selected_marker.display(),
                 sibling_marker.display(),
-                outside_marker.display(),
+                extra_marker.display(),
+                selected_marker.display(),
+                sibling_marker.display(),
+                extra_marker.display(),
             ),
         );
 
@@ -1722,13 +1849,17 @@ mod tests {
                 agent: Agent::Codex,
                 access,
                 cwd: selected.canonicalize().unwrap(),
-                command: vec![executable.to_string_lossy().into_owned()],
                 executable_target: executable.canonicalize().unwrap(),
                 environment,
                 session_roots: vec![
                     root_a.path().canonicalize().unwrap(),
                     root_b.path().canonicalize().unwrap(),
                 ],
+                command: vec![
+                    executable.to_string_lossy().into_owned(),
+                    access.as_str().to_owned(),
+                ],
+                task: "test".to_owned(),
                 task_bytes: 4,
                 task_sha256: task_sha256(b"test"),
                 task_preview: task_preview("test"),
@@ -1736,16 +1867,18 @@ mod tests {
             }
         };
 
-        run(prepare(Access::WorkspaceWrite)).await.unwrap();
+        let output = run(prepare(Access::WorkspaceWrite)).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
         assert!(selected_marker.is_file());
         assert!(!sibling_marker.exists());
-        assert!(!outside_marker.exists());
+        assert!(!extra_marker.exists());
 
         fs::remove_file(&selected_marker).unwrap();
-        run(prepare(Access::ReadOnly)).await.unwrap();
+        let output = run(prepare(Access::ReadOnly)).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
         assert!(!selected_marker.exists());
         assert!(!sibling_marker.exists());
-        assert!(!outside_marker.exists());
+        assert!(!extra_marker.exists());
     }
 
     #[test]

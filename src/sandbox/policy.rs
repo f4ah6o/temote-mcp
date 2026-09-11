@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-const PROTECTED_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
+use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
+
 const GIT_READ_ONLY_PATHS: &[&str] = &[
     "config",
     "hooks",
@@ -24,6 +25,7 @@ pub(super) struct SandboxSpec {
     read_only_overrides: Vec<PathBuf>,
     read_only_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
+    discovered_protected_metadata_paths: Vec<PathBuf>,
     network_access: bool,
 }
 
@@ -35,6 +37,8 @@ impl SandboxSpec {
         for root in writable_roots {
             roots.push(canonical_existing_root(root)?);
         }
+        normalize_roots(&mut roots);
+        let discovered_protected_metadata_paths = discover_metadata_for_roots(&roots)?;
         roots.push(canonical_existing_root(Path::new("/tmp"))?);
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             roots.push(canonical_existing_root(Path::new(&tmpdir))?);
@@ -45,6 +49,7 @@ impl SandboxSpec {
             read_only_overrides: Vec::new(),
             read_only_roots: Vec::new(),
             hidden_roots: Vec::new(),
+            discovered_protected_metadata_paths,
             network_access: false,
         })
     }
@@ -58,13 +63,14 @@ impl SandboxSpec {
         hidden_roots: &[PathBuf],
     ) -> Result<Self> {
         let _cwd = canonical_existing_root(cwd)?;
-        let mut roots = Vec::with_capacity(writable_roots.len() + temporary_roots.len());
-        roots.extend(
-            writable_roots
-                .iter()
-                .map(|root| canonical_existing_root(root))
-                .collect::<Result<Vec<_>>>()?,
-        );
+        let mut writable = writable_roots
+            .iter()
+            .map(|root| canonical_existing_root(root))
+            .collect::<Result<Vec<_>>>()?;
+        normalize_roots(&mut writable);
+        let discovered_protected_metadata_paths = discover_metadata_for_roots(&writable)?;
+        let mut roots = Vec::with_capacity(writable.len() + temporary_roots.len());
+        roots.extend(writable);
         roots.extend(
             temporary_roots
                 .iter()
@@ -115,6 +121,7 @@ impl SandboxSpec {
             read_only_overrides,
             read_only_roots: visible_roots,
             hidden_roots: hidden,
+            discovered_protected_metadata_paths,
             network_access: true,
         })
     }
@@ -128,6 +135,8 @@ impl SandboxSpec {
         for root in git_metadata_roots {
             let root = canonical_existing_root(root)?;
             spec.writable_roots.push(root.clone());
+            spec.discovered_protected_metadata_paths
+                .retain(|path| path != &root);
             if root.join("gitdir").is_file() {
                 spec.read_only_overrides.push(root.join("gitdir"));
                 spec.read_only_overrides.push(root.join("commondir"));
@@ -162,11 +171,28 @@ impl SandboxSpec {
     }
 
     pub(super) fn protected_metadata_paths(&self, root: &Path) -> Vec<PathBuf> {
-        PROTECTED_METADATA_NAMES
+        let mut paths = PROTECTED_METADATA_NAMES
             .iter()
             .map(|name| root.join(name))
-            .collect()
+            .collect::<Vec<_>>();
+        paths.extend(
+            self.discovered_protected_metadata_paths
+                .iter()
+                .filter(|path| path.starts_with(root))
+                .cloned(),
+        );
+        normalize_paths(&mut paths);
+        paths
     }
+}
+
+fn discover_metadata_for_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for root in roots {
+        paths.extend(discover_protected_metadata_paths(root)?);
+    }
+    normalize_paths(&mut paths);
+    Ok(paths)
 }
 
 fn canonical_existing_root(path: &Path) -> Result<PathBuf> {

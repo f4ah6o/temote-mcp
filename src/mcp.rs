@@ -474,6 +474,34 @@ fn work_handoff_input_schema() -> Value {
     })
 }
 
+fn local_agent_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "session_id":{"type":"string"},
+            "agent":{"type":"string","enum":["codex","opencode"]},
+            "task":{"type":"string","minLength":1,"maxLength":local_agent::MAX_TASK_BYTES},
+            "cwd":{"type":"string"},
+            "access":{"type":"string","enum":["read_only","workspace_write"]},
+            "model":{"type":"string","minLength":1,"maxLength":256},
+            "profile":{"type":"string","minLength":1,"maxLength":128}
+        },
+        "required":["session_id","agent","task","access"],
+        "additionalProperties":false,
+        "allOf":[
+            {
+                "if":{
+                    "properties":{"agent":{"const":"opencode"}},
+                    "required":["agent"]
+                },
+                "then":{
+                    "properties":{"task":{"maxLength":local_agent::MAX_OPENCODE_TASK_BYTES}}
+                }
+            }
+        ]
+    })
+}
+
 fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -487,7 +515,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
         {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
-        {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"agent":{"type":"string","enum":["codex","opencode"]},"task":{"type":"string","minLength":1,"maxLength":1048576},"cwd":{"type":"string"},"access":{"type":"string","enum":["read_only","workspace_write"]},"model":{"type":"string","minLength":1,"maxLength":256},"profile":{"type":"string","minLength":1,"maxLength":128}},"required":["session_id","agent","task","access"],"additionalProperties":false}},
+        {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 regular file using the selected session permission mode. Existing special-file targets are rejected. Normal sessions are restricted to permitted roots and use the temote-mcp sandbox; yolo sessions may write anywhere the local user can.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
@@ -3958,6 +3986,14 @@ mod tests {
         assert_eq!(
             local_agent["inputSchema"]["properties"]["access"]["enum"],
             json!(["read_only", "workspace_write"])
+        );
+        assert_eq!(
+            local_agent["inputSchema"]["properties"]["task"]["maxLength"],
+            json!(local_agent::MAX_TASK_BYTES)
+        );
+        assert_eq!(
+            local_agent["inputSchema"]["allOf"][0]["then"]["properties"]["task"]["maxLength"],
+            json!(local_agent::MAX_OPENCODE_TASK_BYTES)
         );
         assert!(tools.iter().all(|tool| tool["name"] != "without_sandbox"));
         assert!(

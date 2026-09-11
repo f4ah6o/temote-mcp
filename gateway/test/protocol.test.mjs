@@ -146,6 +146,8 @@ test("gateway routed tools and protocol versions match the Rust contract", () =>
   assert.equal(localAgent.inputSchema.additionalProperties, false);
   assert.deepEqual(localAgent.inputSchema.properties.agent.enum, ["codex", "opencode"]);
   assert.deepEqual(localAgent.inputSchema.properties.access.enum, ["read_only", "workspace_write"]);
+  assert.equal(localAgent.inputSchema.properties.task.maxLength, 1048576);
+  assert.equal(localAgent.inputSchema.allOf[0].then.properties.task.maxLength, 65536);
   assert.equal(names.includes("without_sandbox"), false);
 });
 
