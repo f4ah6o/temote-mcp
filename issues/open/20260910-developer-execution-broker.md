@@ -2,7 +2,31 @@
 
 ## Status
 
-Design issue. Runtime implementation has not started.
+Partially implemented.
+
+`local_agent_run` for Codex/OpenCode landed in PR #13 (`feat: add structured local agent broker`) and is now part of `main`. The remaining implementation scope in this issue is the structured Cargo/Vite+ developer-tool path (`dev_tool_run`) plus the policy/tests/docs needed for that path.
+
+Do not reimplement or replace the existing `local_agent_run` broker while completing this issue. Changes to the default approval behavior for that broker belong to `20260911-default-agent-permission-mode.md`.
+
+## Current state on `main`
+
+The merged local-agent broker already provides the important shape this issue proposed for agent delegation:
+
+- structured `local_agent_run` rather than caller-controlled raw argv;
+- Codex/OpenCode adapter selection;
+- canonical session-root cwd validation;
+- bounded output/job ownership/cancellation;
+- minimized child environment and isolated agent state;
+- dedicated local-agent sandbox profiles rather than whole-session yolo;
+- public HTTP/gateway contract coverage and operator documentation.
+
+Still missing from this issue:
+
+- `dev_tool_run` MCP surface;
+- Cargo operation classification and execution;
+- Vite+ operation classification and execution;
+- dependency/network and arbitrary-code-sensitive policy for those tools;
+- deterministic tests proving that selecting `cargo` or `vp` cannot become generic host execution.
 
 ## Background
 
@@ -15,15 +39,18 @@ That binary split is awkward for day-to-day development workloads:
 - Codex and OpenCode are useful implementation workers, but they need controlled workspace write access, their own state/cache, and sometimes network access.
 - Making the whole Temote session yolo is too broad and can conflict with MCP-client safety/authorization policy.
 
-The desired model is therefore not “more yolo”. It is narrowly scoped host-capability brokering, following the existing `git_*`, kintone, and 1Password integration pattern.
+The desired model is therefore not “more yolo”. It is narrowly scoped host-capability brokering, following the existing `git_*`, kintone, 1Password, and now `local_agent_run` integration patterns.
 
 ## Goal
 
-Add a **Developer Execution Broker** that lets a normal `yolo=false` Temote session delegate approved development operations without exposing generic unrestricted host execution on the public MCP surface.
+Complete the **Developer Execution Broker** so that a normal `yolo=false` Temote session can run approved Cargo and Vite+ development operations without exposing generic unrestricted host execution on the public MCP surface.
 
-Initial capabilities:
+Remaining public capability:
 
 1. `dev_tool_run` for Cargo and Vite+.
+
+Already implemented and preserved as a sibling capability:
+
 2. `local_agent_run` for Codex and OpenCode.
 
 ## Non-goals
@@ -33,6 +60,7 @@ Initial capabilities:
 - Do not make `$HOME` globally writable.
 - Do not treat executable-name allow-listing as a sufficient security boundary.
 - Do not silently approve network, package installation, self-update, arbitrary project scripts, or local-agent execution.
+- Do not redesign `local_agent_run` as part of the Cargo/Vite+ work unless a concrete shared-policy defect requires a narrow change.
 
 ## Proposed model
 
@@ -47,11 +75,11 @@ Temote normal session (yolo=false)
       |     network denied
       |
       +-- Developer Execution Broker
-            +-- dev_tool_run
+            +-- dev_tool_run            # remaining work
             |     +-- cargo
             |     `-- vp
             |
-            `-- local_agent_run
+            `-- local_agent_run         # already implemented
                   +-- codex
                   `-- opencode
 ```
@@ -96,7 +124,7 @@ Examples:
 - `update`
 - registry-backed operations that require index/download access
 
-These require explicit local approval in a normal session and receive only the minimum writable Cargo/Rust cache/config paths needed by the operation.
+These require explicit policy classification and, while `ask` mode remains in use, the appropriate local approval. They receive only the minimum writable Cargo/Rust cache/config paths needed by the operation. The later `agent` permission-mode issue may remove the Temote approval prompt, but it must not change this capability classification.
 
 ### Vite+ operation classes
 
@@ -131,7 +159,7 @@ Examples:
 - `dlx`
 - package lifecycle scripts triggered by install/rebuild
 
-These must never be treated as safe merely because the top-level executable is `vp`. They require an explicit policy class and local approval in normal sessions. `dlx` additionally combines network download with arbitrary code execution.
+These must never be treated as safe merely because the top-level executable is `vp`. They require an explicit policy class. `dlx` additionally combines network download with arbitrary code execution.
 
 #### Self-mutation
 
@@ -142,38 +170,25 @@ Examples:
 
 Keep these outside the initial implementation or require a separate explicit capability/approval contract.
 
-## `local_agent_run`
+## Existing `local_agent_run` boundary
 
-Proposed public contract:
+The merged broker should be treated as an implementation dependency, not unfinished work in this issue.
 
-```text
-local_agent_run
-  session_id: string
-  agent: codex | opencode
-  task: string
-  cwd?: string
-  access: read_only | workspace_write
-  profile?: string
-```
+Preserve these behaviors while introducing shared developer-policy helpers:
 
-The caller provides a task, not arbitrary agent CLI argv.
+- resolve `cwd` through the selected Temote session and permitted roots;
+- caller supplies a bounded task, not arbitrary agent CLI argv;
+- selected workspace/access mode remains explicit;
+- child environment is minimized and Temote startup secrets are not inherited implicitly;
+- bounded stdout/stderr and Temote-owned background jobs remain in force;
+- cancellation/session stop terminates the child process tree;
+- agent-specific approval/sandbox behavior remains separate from Temote authorization.
 
-### Required behavior
-
-- Resolve `cwd` through the selected Temote session and permitted roots.
-- Normal sessions require local approval before host-side agent execution.
-- Give the child agent only the selected workspace and explicit agent state/cache paths.
-- Sanitize the inherited environment; do not forward Temote startup secrets or unrelated host credentials.
-- Do not infer that the child agent may bypass Temote authorization or production-operation gates.
-- Capture bounded stdout/stderr and return a normal foreground result or Temote-owned background job.
-- Cancellation/session stop must terminate the child process tree.
-- Agent-specific approval/sandbox behavior remains separate from Temote's own authorization decision.
+If policy code is shared between `dev_tool_run` and `local_agent_run`, add regression tests proving the existing agent contract did not broaden.
 
 ## Sandbox profiles
 
 The implementation should model capabilities explicitly rather than as `yolo=true/false` internally.
-
-Suggested initial profiles:
 
 ### `strict`
 
@@ -199,18 +214,13 @@ For dependency resolution and registry operations:
 - permitted workspace write
 - narrowly scoped Cargo / Vite+ / package-manager cache and state write
 - outbound network enabled
-- normal-session local approval required
+- authorization determined by the session permission-mode policy, without widening the capability itself
 
 ### `agent-workspace`
 
-For Codex/OpenCode:
+Already used by the local-agent broker. Preserve its current reviewed implementation rather than replacing it to make the Cargo/Vite+ work fit.
 
-- selected workspace access according to `read_only` / `workspace_write`
-- narrowly scoped agent home/cache
-- optional network according to an explicit policy
-- normal-session local approval required
-
-Do not implement these profiles by making the whole session yolo.
+Do not implement any of these profiles by making the whole session yolo.
 
 ## Security invariants
 
@@ -223,49 +233,62 @@ The change must preserve all existing Temote safety invariants, including:
 - Git metadata remains protected except through existing dedicated Git operations or an explicitly reviewed broker requirement.
 - Secrets are not copied into logs, approval summaries, session metadata, or ordinary command output.
 - Network enablement is a capability decision, not a side effect of selecting a command name.
-- Child commands/agents cannot request arbitrary extra host paths or silently broaden environment inheritance.
+- Child commands cannot request arbitrary extra host paths or silently broaden environment inheritance.
+- Reusing local-agent sandbox/policy code must not weaken the already-merged `local_agent_run` contract.
 
-## Implementation phases
+## Executable implementation slices
 
-### Phase 1 — contract and policy engine
+Each slice should be independently reviewable and testable by a local implementation agent.
 
-- Add internal developer-execution request types and policy classification.
-- Implement Cargo and Vite+ operation classification.
-- Add unit/property tests for argument validation, path containment, network classification, and dangerous subcommands.
-- No local-agent launch yet.
+### Slice A — Cargo/Vite+ policy classifier only
 
-### Phase 2 — `dev_tool_run`
+- Add backend-neutral developer-tool request/policy types.
+- Classify Cargo and Vite+ operations into `dev-offline`, `dependency-network`, `arbitrary-code-sensitive`, or rejected/self-mutation.
+- Reject unknown tool names, invalid operations, NUL/oversized args, and caller-controlled executable paths.
+- Add table-driven/property tests for every listed operation class and unknown/dangerous cases.
+- Do not expose a new MCP tool or launch a child process in this slice.
 
-- Expose Cargo and Vite+ through the MCP tool surface.
-- Add local approval for network/arbitrary-code-sensitive classes.
-- Add bounded job/output handling using existing Temote runtime patterns.
-- Add Linux live acceptance coverage.
+### Slice B — Cargo offline execution
 
-### Phase 3 — `local_agent_run`
+- Add `dev_tool_run` plumbing for `tool=cargo` and offline development operations only.
+- Canonicalize cwd and reuse the narrow developer sandbox/state model.
+- Keep network disabled.
+- Cover `fmt`, `check`, `clippy`, `test`, and `build`, including build-script/proc-macro containment tests.
+- Update gateway contract only for the exact new structured surface.
 
-- Add Codex and OpenCode adapters behind one structured contract.
-- Add environment minimization, workspace access modes, cancellation, and output handling.
-- Prefer adapter-specific argv construction inside Temote; do not pass caller-controlled raw argv.
+### Slice C — Vite+ offline execution
 
-### Phase 4 — documentation and extension points
+- Add `tool=vp` for offline-classified operations only.
+- Pin command construction inside Temote; no raw argv/executable passthrough.
+- Prove `run`, `exec`, `dlx`, dependency operations, and self-mutation cannot enter the offline path.
+- Add fake-tool deterministic tests before any live acceptance.
 
-- Document the developer broker in `docs/usage*` or a narrow dedicated document.
-- Update `skills/temote-mcp/SKILL.md` so agents prefer broker tools instead of yolo for supported development work.
-- Keep the internal policy generic enough to add tools such as `pnpm`, `npm`, `uv`, `go`, or `zig` later without exposing a generic unrestricted executor.
+### Slice D — dependency/network operations
+
+- Add the explicit network-enabled profile only after A-C pass.
+- Scope writable tool caches/state narrowly.
+- Map authorization through the current permission-mode policy (`ask`/future `agent`) without turning classification into approval bypass.
+- Cover Cargo fetch/update/install and Vite+ install/add/update behavior plus secret/environment isolation.
+
+### Slice E — docs and live acceptance
+
+- Update the narrowest English/Japanese operator docs and `skills/temote-mcp/SKILL.md` only for the final surface.
+- Add Linux/macOS deterministic checks where platform behavior differs.
+- Record credential/network-dependent evidence in the live acceptance matrix rather than keeping implementation slices open.
 
 ## Acceptance criteria
 
 - [ ] A normal `yolo=false` session can run representative Cargo check/test/clippy/build workflows without requiring the whole session to become yolo.
 - [ ] A normal session can run representative `vp check`, `vp test`, and `vp build` workflows.
-- [ ] Dependency/network operations are explicitly classified and local-approval-gated.
+- [ ] Dependency/network operations are explicitly classified and authorized according to permission mode.
 - [ ] `vp run`, `vp exec`, and `vp dlx` cannot bypass arbitrary-code/network policy by virtue of the `vp` executable name.
 - [ ] Cargo build scripts/proc macros/tests remain filesystem-contained according to the selected developer profile.
-- [ ] Codex and OpenCode can be invoked through a structured `local_agent_run` contract without caller-controlled arbitrary argv.
-- [ ] Child agent environment inheritance is allow-listed/minimized and does not expose Temote-held credentials by default.
-- [ ] Public HTTP still omits `without_sandbox` and cannot create/promote yolo sessions.
-- [ ] Existing Git, 1Password, kintone, session lifecycle, approval, and sandbox regression tests continue to pass.
+- [x] Codex and OpenCode can be invoked through a structured `local_agent_run` contract without caller-controlled arbitrary argv (PR #13).
+- [x] Child agent environment inheritance is minimized and does not expose Temote-held credentials by default (PR #13).
+- [x] Public HTTP still omits `without_sandbox` and cannot create/promote yolo sessions after the local-agent broker change.
+- [ ] Existing `local_agent_run`, Git, 1Password, kintone, session lifecycle, approval, and sandbox regression tests continue to pass after `dev_tool_run` lands.
 - [ ] `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, gateway tests, and `git diff --check` pass before merge.
 
-## Recommended first implementation slice
+## Recommended next implementation slice
 
-Start with **Phase 1 only**: policy types + Cargo/Vite+ classifier + tests. This keeps the first PR reviewable and establishes the security model before any new host/network execution path is introduced.
+Start with **Slice A only**. It establishes the Cargo/Vite+ policy boundary without creating another host/network execution path and is small enough for one implementation agent to complete and review independently.
