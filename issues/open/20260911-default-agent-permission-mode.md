@@ -2,7 +2,9 @@
 
 ## Status
 
-Design issue. Not implemented.
+Open. Implementation has not started.
+
+`local_agent_run` itself is already implemented on `main` by PR #13. This issue changes session permission semantics and defaults; it must not redesign the local-agent broker or weaken its sandbox/environment contract.
 
 ## Problem
 
@@ -105,7 +107,7 @@ Change the default for newly created sessions from `ask` to `agent`:
 - explicit `ask` remains available for stricter sessions
 - explicit `yolo` remains local-only
 
-Existing persisted/running sessions should keep their stored permission mode across upgrade/restart; do not silently rewrite an existing `ask` session to `agent` during restoration.
+Existing persisted/running sessions must keep their stored permission mode across upgrade/restart; do not silently rewrite an existing `ask` session to `agent` during restoration.
 
 Provide an explicit local permission transition for existing sessions, conceptually:
 
@@ -145,7 +147,7 @@ kintone mutation      approve      allow*        allow*
 
 ## Public MCP contract
 
-`agent` must work through the public MCP endpoint without relying on the public-yolo exception proposed elsewhere.
+`agent` must work through the public MCP endpoint without relying on a public-yolo exception.
 
 The public boundary remains:
 
@@ -155,6 +157,50 @@ The public boundary remains:
 - `agent` does not grant arbitrary host execution
 
 This should eliminate the current deadlock where `ask` requires an attached local approval console but `yolo` is rejected by the public endpoint.
+
+## Executable implementation slices
+
+Keep each slice independently reviewable. Do not combine the default change with broad approval removal in the first commit.
+
+### Slice A — permission enum and persistence, behavior-preserving
+
+- Introduce `PermissionMode::{Ask, Agent, Yolo}` as the canonical internal representation.
+- Parse/serialize all three values in session metadata/control protocol.
+- Map legacy persisted `yolo=true/false` state without changing behavior: legacy non-yolo sessions remain `Ask`; legacy yolo remains `Yolo`.
+- Keep current new-session default as `Ask` in this slice.
+- Add round-trip, malformed-value, restart/restore, and upgrade-handoff tests.
+
+**Done when:** the enum exists everywhere authorization needs it, old state restores deterministically, and no approval behavior has changed yet.
+
+### Slice B — new-session default only
+
+- Change newly created local managed sessions from `Ask` to `Agent` when permission mode is omitted.
+- Change authenticated public `session_start` default to `Agent` while continuing to reject remote `Yolo`.
+- Keep explicitly requested `Ask` unchanged.
+- Do not rewrite persisted/running sessions.
+- Update list/info/CLI output and gateway contracts to report `ask | agent | yolo` consistently.
+
+**Done when:** only newly created implicit-mode sessions change behavior; existing sessions remain byte-for-byte permission-compatible after restore.
+
+### Slice C — policy-driven approval decisions
+
+- Centralize the Temote-local approval decision on `(PermissionMode, operation class)`.
+- Make Git fetch/pull/push and `local_agent_run` approval-free in `Agent` while preserving all tool-specific validation/sandbox rules.
+- Preserve `Ask` approval behavior and `Yolo` semantics.
+- Add negative tests for force push, arbitrary refspec/URL, raw agent argv, cwd escape, public `without_sandbox`, and secret leakage.
+- For 1Password/kintone/other structured integrations, change only the Temote approval layer; keep each integration's own authentication, authorization, argument validation, and secret isolation unchanged.
+
+**Done when:** approval prompts disappear in `Agent` only after the request has already passed the same structural capability checks required in `Ask`.
+
+### Slice D — lifecycle transition and docs
+
+- Add/confirm explicit local `session permission <id> ask|agent|yolo` transition behavior.
+- Serialize permission mutation against start/stop/restart/automatic restart/upgrade handoff.
+- Keep remote promotion to `Yolo` impossible.
+- Update `docs/usage.md`, `docs/usage.ja.md`, gateway/public HTTP docs where necessary, and `skills/temote-mcp/SKILL.md`.
+- Run the full repository checks from `AGENTS.md`.
+
+**Done when:** operators can intentionally move an existing local session between supported modes and the restored mode is stable across supervisor lifecycle events.
 
 ## Required tests
 
@@ -181,3 +227,7 @@ This should eliminate the current deadlock where `ask` requires an attached loca
 - [ ] No force-push or arbitrary Git/host-command capability is introduced.
 - [ ] Public MCP does not gain yolo capability.
 - [ ] `agent` is the default for new sessions; `ask` and local-only `yolo` remain explicit alternatives.
+
+## Recommended next implementation slice
+
+Start with **Slice A only**. It is deliberately behavior-preserving and establishes a single permission source of truth before changing defaults or approval decisions.
