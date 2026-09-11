@@ -1,6 +1,6 @@
 # Codex delegation evaluation
 
-Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends and read-only OpenCode diagnostics landed on main; backend adapter extraction implemented and verified in the current worktree; comparative measurement remains pending.
+Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends, read-only OpenCode diagnostics, and backend adapter extraction landed on main; comparative measurement remains pending.
 
 ## Current evidence
 

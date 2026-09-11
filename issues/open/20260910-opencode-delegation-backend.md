@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, and diagnostics landed on main; backend adapter extraction implemented and verified in the current worktree; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, and backend adapter extraction landed on main; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -553,7 +553,7 @@ Not implemented: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume beha
 
 ## Phase 2 adapter extraction status (2026-09-11)
 
-Backend adapter extraction implemented and verified in the current worktree without changing external behavior:
+Backend adapter extraction landed on main without changing external behavior:
 
 - `src/codex_delegation.rs` was split into `src/delegation/{mod,codex,opencode}.rs`; the delegation module path and all caller-facing functions are unchanged.
 - Shared layer (`mod.rs`) keeps `DelegationBackend`, options/result/evidence/report types, CLI parsing and backend selection, artifact creation and permissions, bounded artifact capture, the shared process wait/capture helper, report validation, and parent serialization.
