@@ -1817,9 +1817,9 @@ mod tests {
             &executable,
             &format!(
                 "#!/bin/sh\n\
-                 test \"$(/usr/bin/cat \"{}\")\" = selected || exit 10\n\
-                 if /usr/bin/cat \"{}\" >/dev/null 2>&1; then exit 11; fi\n\
-                 if /usr/bin/cat \"{}\" >/dev/null 2>&1; then exit 12; fi\n\
+                 test \"$(/bin/cat \"{}\")\" = selected || exit 10\n\
+                 if /bin/cat \"{}\" >/dev/null 2>&1; then exit 11; fi\n\
+                 if /bin/cat \"{}\" >/dev/null 2>&1; then exit 12; fi\n\
                  case \"$1\" in\n\
                    workspace_write)\n\
                      /usr/bin/touch \"{}\" || exit 13\n\
