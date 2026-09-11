@@ -2,12 +2,12 @@
 
 ## Result
 
-- status: implemented and verified locally (pre-push; finalization commit below marks it landed on main)
+- status: landed on main
 - baseline commit: `d7affe0ff2fb0758a84a7450aca60bd1eab96896`
 - implementation commit: `97e8d79e27ccab01f6678238f2ca9e390c61ebab`
-- report commit: the commit containing this report (see `git log --oneline -5`)
-- final HEAD: run `git rev-parse HEAD`; the newest commit in the log is the status-only finalization commit
-- origin/main: same as final HEAD after the last push
+- report commit: `ec0f683af96e44ab0007abbf6bf8ea54f7952bd0`
+- final HEAD: the status-only finalization commit listed in `git log -5 --oneline` (no code or content changes in it); use `git rev-parse HEAD` for the exact hash
+- origin/main: same as final HEAD after the last push (verified with `git rev-parse origin/main`; see Temote verification)
 - pushed: yes (two pushes: fix + docs, then the status finalization commit)
 - tracked worktree clean: yes (`?? .worktrees/` only, untouched)
 
@@ -76,8 +76,8 @@ OpenCode emits one `step_finish` record per step whose `tokens` are per-step del
 ## Commits
 
 - `97e8d79e27ccab01f6678238f2ca9e390c61ebab` fix: stabilize OpenCode normalized report delivery
-- report commit: docs: record OpenCode report delivery verification (see `git log`)
-- finalization commit: docs: mark OpenCode report fix as landed (see `git log`)
+- `ec0f683af96e44ab0007abbf6bf8ea54f7952bd0` docs: record OpenCode report delivery verification
+- finalization commit (status-only): docs: mark OpenCode report fix as landed (see `git log`)
 
 ## Remaining work
 

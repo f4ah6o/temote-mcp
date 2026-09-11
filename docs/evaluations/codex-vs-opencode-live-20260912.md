@@ -154,7 +154,7 @@ Comparability caveat: these are the backends' own normalized usage fields, not a
 
 ## Follow-up: OpenCode normalized-report delivery fix (2026-09-12)
 
-Status: fix implemented and verified locally; original 1/9 evidence above is preserved unchanged.
+Status: fix landed on main; original 1/9 evidence above is preserved unchanged.
 
 ### Before
 

@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, and live comparative measurement landed on main; OpenCode normalized-report delivery fix implemented and verified locally; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, and live comparative measurement landed on main; OpenCode normalized-report delivery fix landed on main; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -592,7 +592,7 @@ Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/ses
 
 ## OpenCode normalized-report delivery fix status (2026-09-12)
 
-Follow-up fix implemented and verified locally. Report: [`docs/evaluations/opencode-normalized-report-fix-20260912.md`](../../docs/evaluations/opencode-normalized-report-fix-20260912.md); before/after detail appended to [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
+Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-report-fix-20260912.md`](../../docs/evaluations/opencode-normalized-report-fix-20260912.md); before/after detail appended to [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
 
 - Root cause: report delivery depended on the model emitting strict JSON within every schema bound; the adapter had no bounded repair or normalization. Raw newlines in strings caused `invalid_json`; summaries of 1380–2989 chars caused `invalid_report_schema`; requested values were read back from model output (double-quoted); `artifacts.report` was never written; per-step `step_finish` usage was dropped except for the last step.
 - Fix: bounded report extraction (balanced-object scan with raw control-character sanitization), adapter-side normalization (canonical requested values, UTF-8-safe summary truncation with a ` …[truncated]` marker, bounded arrays/scalars), canonical report persisted to `artifacts.report` through one normalization path, accumulated per-step usage, and a valid prompt-contract example. The Codex adapter is unchanged.
