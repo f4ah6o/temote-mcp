@@ -1817,7 +1817,7 @@ mod tests {
             &executable,
             &format!(
                 "#!/bin/sh\n\
-                 test \"$(/usr/bin/cat \"{}\" 2>/dev/null)\" = selected || exit 10\n\
+                 test \"$(/usr/bin/cat \"{}\")\" = selected || exit 10\n\
                  if /usr/bin/cat \"{}\" >/dev/null 2>&1; then exit 11; fi\n\
                  if /usr/bin/cat \"{}\" >/dev/null 2>&1; then exit 12; fi\n\
                  case \"$1\" in\n\
