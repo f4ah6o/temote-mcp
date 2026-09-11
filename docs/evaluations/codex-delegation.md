@@ -1,11 +1,12 @@
 # Codex delegation evaluation
 
-Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends implemented in the current worktree; comparative measurement remains pending.
+Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends and read-only OpenCode diagnostics implemented in the current worktree; comparative measurement remains pending.
 
 ## Current evidence
 
 - `codex delegate` uses `codex exec --ignore-user-config --ephemeral --sandbox workspace-write`, bounded JSONL/stderr capture, a schema-validated final report, and filtered usage fields.
 - `delegate --backend opencode` uses one-shot `opencode run --pure --format json --dir <cwd> --model <provider/model> [--variant <variant>] -- <prompt>` with the same bounded artifact capture and report schema. The prompt is passed as one argv element (no shell); the child environment is rebuilt from a small OpenCode allowlist; `opencode` is resolved from PATH and callers cannot supply an executable path. JSON events are normalized to the same parent result: the last assistant message's text parts form the final report, `step_finish.part.tokens` provides usage, and top-level `sessionID` becomes the bounded thread/session evidence. A bounded timeout kills the child and returns `process_timeout`.
+- `delegate diagnose --backend opencode [--model <provider/model>]` prints read-only bounded JSON readiness for the OpenCode CLI: executable resolution and version, `opencode models --pure` discovery status/count/truncation, and `present`/`absent`/`unknown`/`not_checked` requested-model validation. It never logs in, mutates credentials, downloads models, or runs a delegation task, and it maps unavailable, failed, timed-out, empty, or truncated model discovery to `unknown` instead of a false `absent`.
 - The generic `temote-mcp delegate --backend codex|opencode ...` command selects the backend (explicit flag, then `TEMOTE_DELEGATION_BACKEND`, then Codex); the legacy `temote-mcp codex delegate ...` command always forces Codex.
 - The app-server adapter uses local stdio, an exact `0.153.4` compatibility check, session-instance and canonical-scope ownership, durable pre-side-effect operation receipts, child approvals independent of Temote yolo, bounded evidence, and reconciliation states. Pre-thread transient failures are retryable with the same start operation; uncertain thread/turn boundaries remain reconciliation-required. Unexpired task records, including terminal records, are retained until task retention expires; only expired terminal records without a live runtime are prunable, and a full scope rejects new starts. Compacted operation receipts fail closed on exact replay for the full task retention period.
 - Rust unit/property tests, gateway contract tests, formatting, clippy, no-default-features checks, and diff checks are the repeatable verification set for this implementation.
@@ -47,6 +48,18 @@ Result (non-secret fields):
 - evidence: `session_id` captured as `thread_id`; usage mapped as `input_tokens=10647`, `cached_input_tokens=0`, `output_tokens=346`, `reasoning_output_tokens=0`, `total_tokens=10993`;
 - the delegated directory contained no created, modified, or deleted files;
 - no credential values, prompts, transcripts, or raw logs are recorded here.
+
+OpenCode diagnostics: OpenCode CLI `1.18.30`, read-only probes only (`opencode --version`, `opencode models --pure`):
+
+```sh
+temote-mcp delegate diagnose --backend opencode --model opencode-go/deepseek-v4-flash
+```
+
+Result (non-secret fields):
+
+- `executable=available resolved=true`, `version=ready 1.18.30`, `models=ready count=64 truncated=false`;
+- `requested_model=present opencode-go/deepseek-v4-flash`; without `--model` the status is `not_checked`;
+- no login, auth, config, or model-cache mutation and no delegation process; diagnostics temp artifacts are removed.
 
 Limitations observed: the Codex child's `changed_files` entry was an absolute artifact path rather than a repository-relative path, and child-reported `requested_model`/`requested_effort` fields were empty; the parent result keeps requested and observed values distinct. This is child report content, not a Temote serialization defect.
 

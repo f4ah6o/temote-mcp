@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1 landed on main; one-shot OpenCode backend landed on main; module extraction, diagnostics, and persistent/session features not started
+- Status: Open / Phase 1 and one-shot 1.18.30 OpenCode backend landed on main; OpenCode diagnostics implemented in current worktree; module extraction and persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -547,7 +547,20 @@ One-shot OpenCode backend landed on main:
 - Tests cover backend selection and flag validation, argv construction, cwd canonicalization, missing executable, success normalization, non-zero exit, timeout, bounded stdout, secret sentinel filtering, and Codex compatibility.
 - Live smoke on 2026-09-11: OpenCode CLI `1.18.30`, `--model opencode/mimo-v2.5-free`, read-only task; parent `status=success` with a schema-valid report and mapped usage; no files created or changed.
 
-Not implemented: extraction of a separate delegation adapter module, `opencode models` diagnostics and `TEMOTE_OPENCODE_BIN`, and persistent server/session/resume behavior.
+Not implemented: extraction of a separate delegation adapter module, `TEMOTE_OPENCODE_BIN`, and persistent server/session/resume behavior.
+
+## Phase 3 diagnostics status (2026-09-11)
+
+Read-only OpenCode CLI diagnostics implemented in the current worktree:
+
+- `temote-mcp delegate diagnose --backend opencode [--model <provider/model>]` prints one bounded JSON document with `executable` (`available`/`unavailable`, `resolved`), `version` (`ready`/`unavailable`/`failed`/`timeout` plus a bounded value), `models` (`ready`/`unavailable`/`unsupported`/`failed`/`timeout` plus a bounded count and truncation flag), and `requested_model` (`present`/`absent`/`unknown`/`not_checked`).
+- The backend selector honors explicit `--backend`, then `TEMOTE_DELEGATION_BACKEND`. Diagnostics currently implement only OpenCode and fail closed for Codex instead of reporting a false ready state.
+- Probes are `opencode --version` and `opencode models --pure`, run through the existing bounded artifact/timeout subprocess helper with the same OpenCode child-environment allowlist. There are no login, auth, credential, config, model-download, session, or delegation side effects; child stdout/stderr is never echoed and only bounded identifiers/version values are reported.
+- `opencode models` line output is treated as stable structured CLI output: lines are recognized only when they look like `provider/model` identifiers. Empty, failed, timed-out, or truncated listings map `requested_model` to `unknown` rather than reporting a false `absent`.
+- Deterministic fake-CLI tests cover missing binary, version success/failure/timeout/oversized/malformed, model listing success/empty/mixed/failure/unsupported/timeout/oversized, requested-model present/absent/unknown, environment allowlist filtering, and secret/output non-leakage.
+- Read-only smoke on 2026-09-11 with OpenCode CLI `1.18.30`: `executable=available`, `version=1.18.30`, `models=ready count=64`, `requested_model=opencode-go/deepseek-v4-flash present`; no credential mutation and no delegation execution.
+
+Remaining work after this slice: adapter-module extraction, `TEMOTE_OPENCODE_BIN`, persistent server/session/resume, and live comparative measurement.
 
 ## Phase 1 status (2026-09-11)
 

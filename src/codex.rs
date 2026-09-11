@@ -58,7 +58,10 @@ OAuth, or ingress policy.\n"
 }
 
 pub fn run_delegate(args: &[String]) -> Result<String, String> {
-    delegation::run_generic_cli(args)
+    match args {
+        [command, rest @ ..] if command == "diagnose" => delegation::run_diagnose_cli(rest),
+        _ => delegation::run_generic_cli(args),
+    }
 }
 
 pub fn delegate_usage() -> String {
