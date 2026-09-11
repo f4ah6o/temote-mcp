@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{approvals, child_env, config, sandbox};
@@ -16,10 +18,16 @@ pub(crate) const MAX_TASK_BYTES: usize = 1024 * 1024;
 const MAX_CWD_BYTES: usize = 4096;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_PROFILE_BYTES: usize = 128;
+const MAX_TASK_PREVIEW_BYTES: usize = 2048;
+const MAX_TASK_PREVIEW_CHARS: usize = 384;
+const MAX_TASK_PREVIEW_LINES: usize = 8;
+const TASK_PREVIEW_TRUNCATION_MARKER: &str = "… [truncated]";
+const MAX_APPROVAL_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_IMPORTED_AUTH_BYTES: u64 = 1024 * 1024;
 const AGENT_STATE_DIRECTORY_PREFIX: &str = "temote-mcp-local-agent-";
+const CODEX_PERMISSION_PROFILE_NAME: &str = "temote_local_agent";
 
 const SAFE_ENV_NAMES: &[&str] = &[
     "HOME",
@@ -399,29 +407,34 @@ pub(crate) struct PreparedRun {
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
     task_bytes: usize,
-    task_hash: String,
+    task_sha256: String,
+    task_preview: String,
     state: AgentState,
 }
 
 impl PreparedRun {
     pub(crate) fn approval_detail(&self) -> String {
-        format!(
-            "agent: {}\ncwd: {}\naccess: {}\ntask_bytes: {}\ntask_hash: {}\ntask_input: omitted",
+        let detail = format!(
+            "agent: {}\ncwd: {}\naccess: {}\ntask_bytes: {}\ntask_sha256: {}\ntask_preview:\n{}",
             self.agent.as_str(),
             self.cwd.display(),
             self.access.as_str(),
             self.task_bytes,
-            self.task_hash
-        )
+            self.task_sha256,
+            self.task_preview,
+        );
+        debug_assert!(detail.len() <= MAX_APPROVAL_DETAIL_BYTES);
+        detail
     }
 
     pub(crate) fn activity_label(&self) -> String {
         format!(
-            "local_agent_run agent={} cwd={} access={} task_hash={}",
+            "local_agent_run agent={} cwd={} access={} task_bytes={} task_sha256={}",
             self.agent.as_str(),
             self.cwd.display(),
             self.access.as_str(),
-            self.task_hash
+            self.task_bytes,
+            self.task_sha256
         )
     }
 
@@ -431,9 +444,10 @@ impl PreparedRun {
             ("source".to_owned(), "local_agent_run".to_owned()),
             ("agent".to_owned(), self.agent.as_str().to_owned()),
             ("access".to_owned(), self.access.as_str().to_owned()),
+            ("cwd".to_owned(), self.cwd.display().to_string()),
             ("scope".to_owned(), "session_cwd".to_owned()),
-            ("task_input".to_owned(), "omitted".to_owned()),
-            ("task_hash".to_owned(), self.task_hash.clone()),
+            ("task_bytes".to_owned(), self.task_bytes.to_string()),
+            ("task_sha256".to_owned(), self.task_sha256.clone()),
         ])
     }
 
@@ -586,11 +600,12 @@ where
             task,
             model.as_deref(),
             profile.as_deref(),
-        ),
+            state.read_only_paths(),
+        )?,
         Agent::OpenCode => {
             environment.insert(
                 "OPENCODE_CONFIG_CONTENT".to_owned(),
-                opencode_config(access).to_string(),
+                opencode_config(access, state.read_only_paths())?.to_string(),
             );
             environment.insert("OPENCODE_DISABLE_AUTOUPDATE".to_owned(), "true".to_owned());
             environment.insert("OPENCODE_DISABLE_PRUNE".to_owned(), "true".to_owned());
@@ -613,19 +628,21 @@ where
         environment,
         session_roots: canonical_session_roots(session)?,
         task_bytes: task.len(),
-        task_hash: task_hash(task.as_bytes()),
+        task_sha256: task_sha256(task.as_bytes()),
+        task_preview: task_preview(task),
         state,
     })
 }
 
 pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     let state_root = prepared.state.root.clone();
-    let writable_roots = if prepared.access == Access::WorkspaceWrite {
-        prepared.session_roots.clone()
-    } else {
-        Vec::new()
-    };
-    let mut writable_roots = writable_roots;
+    let mut writable_roots = Vec::new();
+    if prepared.access == Access::WorkspaceWrite {
+        // `session_roots` authorizes cwd selection and is revalidated across
+        // approval, but it must not widen the selected workspace's write
+        // capability to sibling permitted roots.
+        writable_roots.push(prepared.cwd.clone());
+    }
     writable_roots.push(state_root);
     let temporary_roots = [prepared.state.temporary_root()];
     let mut read_only_roots = executable_read_only_roots(&prepared)?;
@@ -1008,7 +1025,8 @@ fn build_codex_command(
     task: &str,
     model: Option<&str>,
     profile: Option<&str>,
-) -> Vec<String> {
+    auth_paths: &[PathBuf],
+) -> Result<Vec<String>> {
     let mut command = vec![
         executable.to_owned(),
         "exec".to_owned(),
@@ -1016,13 +1034,12 @@ fn build_codex_command(
         "--ignore-rules".to_owned(),
         "--ephemeral".to_owned(),
         "--skip-git-repo-check".to_owned(),
+        // The broker supplies a permission profile with an exact deny rule
+        // for imported auth. `--strict-config` makes an older or incompatible
+        // Codex fail closed instead of silently falling back to broad reads.
+        "--strict-config".to_owned(),
         "--color".to_owned(),
         "never".to_owned(),
-        "--sandbox".to_owned(),
-        match access {
-            Access::ReadOnly => "read-only".to_owned(),
-            Access::WorkspaceWrite => "workspace-write".to_owned(),
-        },
         "--cd".to_owned(),
         cwd.to_owned(),
         "--json".to_owned(),
@@ -1033,8 +1050,19 @@ fn build_codex_command(
     if let Some(profile) = profile {
         command.extend(["--profile".to_owned(), profile.to_owned()]);
     }
+    command.extend([
+        "--config".to_owned(),
+        format!(
+            "default_permissions={}",
+            toml_basic_string(CODEX_PERMISSION_PROFILE_NAME)
+        ),
+        "--config".to_owned(),
+        codex_permission_profile_filesystem(cwd, access, auth_paths)?,
+        "--config".to_owned(),
+        format!("permissions.{CODEX_PERMISSION_PROFILE_NAME}.network={{enabled=true}}"),
+    ]);
     command.extend(["--".to_owned(), task.to_owned()]);
-    command
+    Ok(command)
 }
 
 fn build_opencode_command(
@@ -1063,44 +1091,155 @@ fn build_opencode_command(
     command
 }
 
-fn opencode_config(access: Access) -> Value {
+fn opencode_config(access: Access, auth_paths: &[PathBuf]) -> Result<Value> {
     let edit = if access == Access::WorkspaceWrite {
-        json!({
-            "*": "allow",
-            ".git": "deny",
-            ".git/**": "deny",
-            "**/.git": "deny",
-            "**/.git/**": "deny",
-            ".agents": "deny",
-            ".agents/**": "deny",
-            "**/.agents": "deny",
-            "**/.agents/**": "deny",
-            ".codex": "deny",
-            ".codex/**": "deny",
-            "**/.codex": "deny",
-            "**/.codex/**": "deny"
-        })
+        let mut rules = serde_json::Map::from_iter([
+            ("*".to_owned(), json!("allow")),
+            (".git".to_owned(), json!("deny")),
+            (".git/**".to_owned(), json!("deny")),
+            ("**/.git".to_owned(), json!("deny")),
+            ("**/.git/**".to_owned(), json!("deny")),
+            (".agents".to_owned(), json!("deny")),
+            (".agents/**".to_owned(), json!("deny")),
+            ("**/.agents".to_owned(), json!("deny")),
+            ("**/.agents/**".to_owned(), json!("deny")),
+            (".codex".to_owned(), json!("deny")),
+            (".codex/**".to_owned(), json!("deny")),
+            ("**/.codex".to_owned(), json!("deny")),
+            ("**/.codex/**".to_owned(), json!("deny")),
+        ]);
+        for path in auth_paths {
+            rules.insert(path_argument(path, "local agent auth path")?, json!("deny"));
+        }
+        Value::Object(rules)
     } else {
         json!("deny")
     };
-    json!({
+
+    let read = if auth_paths.is_empty() {
+        json!("allow")
+    } else {
+        let mut rules = serde_json::Map::new();
+        rules.insert("*".to_owned(), json!("allow"));
+        for path in auth_paths {
+            rules.insert(path_argument(path, "local agent auth path")?, json!("deny"));
+        }
+        Value::Object(rules)
+    };
+    Ok(json!({
         "permission": {
+            "read": read,
             "edit": edit,
             "bash": "deny",
             "external_directory": "deny",
             "webfetch": "allow",
             "websearch": "allow"
         }
-    })
+    }))
 }
 
-fn task_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+fn codex_permission_profile_filesystem(
+    cwd: &str,
+    access: Access,
+    auth_paths: &[PathBuf],
+) -> Result<String> {
+    let mut entries = vec![
+        format!("{}=\"read\"", toml_basic_string(":root")),
+        format!("{}=\"read\"", toml_basic_string(":minimal")),
+        format!("{}=\"write\"", toml_basic_string(":tmpdir")),
+    ];
+    for path in auth_paths {
+        let path = path.to_str().with_context(|| {
+            format!(
+                "local agent auth path is not valid UTF-8: {}",
+                path.display()
+            )
+        })?;
+        entries.push(format!("{}=\"deny\"", toml_basic_string(path)));
     }
-    format!("{hash:016x}")
+    entries.push(format!(
+        "{}=\"{}\"",
+        toml_basic_string(cwd),
+        match access {
+            Access::ReadOnly => "read",
+            Access::WorkspaceWrite => "write",
+        }
+    ));
+    Ok(format!(
+        "permissions.{CODEX_PERMISSION_PROFILE_NAME}.filesystem={{{}}}",
+        entries.join(",")
+    ))
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if character.is_control() => {
+                write!(quoted, "\\u{:04x}", character as u32)
+                    .expect("writing a TOML string to String cannot fail");
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn task_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn task_preview(task: &str) -> String {
+    let truncation_suffix_len = TASK_PREVIEW_TRUNCATION_MARKER.len() + "\n  ".len();
+    let body_limit = MAX_TASK_PREVIEW_BYTES.saturating_sub(truncation_suffix_len);
+    let mut preview = String::from("  ");
+    let mut character_count = 0usize;
+    let mut line_count = 1usize;
+    let mut truncated = false;
+
+    for character in task.chars() {
+        if character_count >= MAX_TASK_PREVIEW_CHARS {
+            truncated = true;
+            break;
+        }
+        if character == '\n' {
+            if line_count >= MAX_TASK_PREVIEW_LINES || preview.len() + "\n  ".len() > body_limit {
+                truncated = true;
+                break;
+            }
+            preview.push('\n');
+            preview.push_str("  ");
+            line_count += 1;
+            character_count += 1;
+            continue;
+        }
+
+        let rendered = if character.is_control() {
+            "�".to_owned()
+        } else {
+            character.to_string()
+        };
+        if preview.len() + rendered.len() > body_limit {
+            truncated = true;
+            break;
+        }
+        preview.push_str(&rendered);
+        character_count += 1;
+    }
+
+    if truncated {
+        preview.push_str("\n  ");
+        preview.push_str(TASK_PREVIEW_TRUNCATION_MARKER);
+    }
+    debug_assert!(preview.len() <= MAX_TASK_PREVIEW_BYTES);
+    preview
 }
 
 #[cfg(test)]
@@ -1111,6 +1250,14 @@ mod tests {
     #[cfg(unix)]
     fn make_executable(path: &Path) {
         fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn make_executable_with_contents(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
@@ -1216,17 +1363,20 @@ mod tests {
             "task --dangerously-bypass-approvals-and-sandbox",
             Some("gpt-test"),
             Some("luna-max"),
-        );
+            &[],
+        )
+        .unwrap();
         assert_eq!(read_only[0], "/usr/bin/codex");
-        assert!(
-            read_only
-                .windows(2)
-                .any(|pair| pair == ["--sandbox", "read-only"])
-        );
         assert!(read_only.contains(&"--ignore-user-config".to_owned()));
+        assert!(read_only.contains(&"--strict-config".to_owned()));
         assert!(read_only.contains(&"--ephemeral".to_owned()));
         assert!(!read_only.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
         assert!(read_only.contains(&"task --dangerously-bypass-approvals-and-sandbox".to_owned()));
+        assert!(
+            read_only
+                .iter()
+                .any(|value| { value.contains("default_permissions=\"temote_local_agent\"") })
+        );
     }
 
     #[test]
@@ -1238,7 +1388,9 @@ mod tests {
             "task",
             None,
             None,
-        );
+            &[],
+        )
+        .unwrap();
         let write = build_codex_command(
             "/usr/bin/codex",
             "/workspace",
@@ -1246,16 +1398,18 @@ mod tests {
             "task",
             None,
             None,
-        );
+            &[],
+        )
+        .unwrap();
         assert!(
             read_only
-                .windows(2)
-                .any(|pair| pair == ["--sandbox", "read-only"])
+                .iter()
+                .any(|value| value.contains("\"/workspace\"=\"read\""))
         );
         assert!(
             write
-                .windows(2)
-                .any(|pair| pair == ["--sandbox", "workspace-write"])
+                .iter()
+                .any(|value| value.contains("\"/workspace\"=\"write\""))
         );
     }
 
@@ -1273,22 +1427,26 @@ mod tests {
         assert!(command.windows(2).any(|pair| pair == ["--format", "json"]));
         assert!(!command.contains(&"--dangerously-skip-permissions".to_owned()));
         assert_eq!(
-            opencode_config(Access::WorkspaceWrite)["permission"]["bash"],
+            opencode_config(Access::WorkspaceWrite, &[]).unwrap()["permission"]["bash"],
             "deny"
         );
         assert_eq!(
-            opencode_config(Access::WorkspaceWrite)["permission"]["edit"]["**/.git/**"],
+            opencode_config(Access::WorkspaceWrite, &[]).unwrap()["permission"]["edit"]["**/.git/**"],
             "deny"
         );
         assert_eq!(
-            opencode_config(Access::ReadOnly)["permission"]["edit"],
+            opencode_config(Access::ReadOnly, &[]).unwrap()["permission"]["edit"],
             "deny"
         );
     }
 
     #[test]
-    fn approval_and_activity_summaries_omit_task_and_environment_values() {
+    fn approval_preview_is_bounded_and_durable_summaries_omit_task_body() {
         let state = AgentState::create(Agent::Codex, &[]).unwrap();
+        let task = format!(
+            "visible task\n{}\nSENTINEL-TASK-SECRET",
+            "x".repeat(MAX_TASK_PREVIEW_CHARS + 32)
+        );
         let prepared = PreparedRun {
             agent: Agent::Codex,
             access: Access::ReadOnly,
@@ -1297,16 +1455,83 @@ mod tests {
             executable_target: PathBuf::from("/usr/bin/codex"),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             session_roots: Vec::new(),
-            task_bytes: 32,
-            task_hash: task_hash(b"SENTINEL-TASK-SECRET"),
+            task_bytes: task.len(),
+            task_sha256: task_sha256(task.as_bytes()),
+            task_preview: task_preview(&task),
             state,
         };
-        assert!(!prepared.approval_detail().contains("SENTINEL-TASK-SECRET"));
+        let detail = prepared.approval_detail();
+        assert!(detail.contains("task_preview:"));
+        assert!(detail.contains("visible task"));
+        assert!(detail.contains("[truncated]"));
+        assert!(!detail.contains("SENTINEL-TASK-SECRET"));
+        assert!(detail.len() <= MAX_APPROVAL_DETAIL_BYTES);
+        assert!(!prepared.activity_label().contains("visible task"));
         assert!(!prepared.activity_label().contains("SENTINEL-TASK-SECRET"));
+        let metadata = prepared.approval_metadata();
+        assert_eq!(metadata["task_bytes"], task.len().to_string());
+        assert_eq!(metadata["task_sha256"], task_sha256(task.as_bytes()));
         assert!(
-            !serde_json::to_string(&prepared.approval_metadata())
+            !serde_json::to_string(&metadata)
                 .unwrap()
-                .contains("secret")
+                .contains("SENTINEL-TASK-SECRET")
+        );
+        assert!(
+            !serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("visible task")
+        );
+    }
+
+    #[test]
+    fn task_preview_sanitizes_controls_and_sha256_is_deterministic() {
+        let preview = task_preview("line\t\u{1b}[31m\nsecond line\r\nthird");
+        assert!(preview.contains("line��[31m"));
+        assert!(preview.contains("\n  second line�\n"));
+        assert!(!preview.contains('\t'));
+        assert!(!preview.contains('\r'));
+        assert!(!preview.contains('\u{1b}'));
+        assert_eq!(
+            task_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(task_sha256(b"same"), task_sha256(b"same"));
+    }
+
+    #[test]
+    fn codex_auth_permission_profile_denies_only_imported_auth() {
+        let auth_path = PathBuf::from("/tmp/temote-local-agent/codex/auth.json");
+        let command = build_codex_command(
+            "/usr/bin/codex",
+            "/workspace",
+            Access::WorkspaceWrite,
+            "task",
+            None,
+            None,
+            std::slice::from_ref(&auth_path),
+        )
+        .unwrap();
+        let profile = command
+            .iter()
+            .find(|value| value.starts_with("permissions.temote_local_agent.filesystem="))
+            .unwrap();
+        assert!(profile.contains("\"/tmp/temote-local-agent/codex/auth.json\"=\"deny\""));
+        assert!(profile.contains("\"/workspace\"=\"write\""));
+        assert!(command.contains(&"--strict-config".to_owned()));
+    }
+
+    #[test]
+    fn opencode_auth_permission_rules_deny_imported_auth() {
+        let auth_path = PathBuf::from("/tmp/temote-local-agent/data/opencode/auth.json");
+        let config =
+            opencode_config(Access::WorkspaceWrite, std::slice::from_ref(&auth_path)).unwrap();
+        assert_eq!(
+            config["permission"]["read"][auth_path.to_string_lossy().as_ref()],
+            "deny"
+        );
+        assert_eq!(
+            config["permission"]["edit"][auth_path.to_string_lossy().as_ref()],
+            "deny"
         );
     }
 
@@ -1452,12 +1677,75 @@ mod tests {
             executable_target: PathBuf::from("/usr/bin/head"),
             session_roots: Vec::new(),
             task_bytes: 0,
-            task_hash: String::new(),
+            task_sha256: String::new(),
+            task_preview: String::new(),
             state,
         };
         let output = run(prepared).await.unwrap();
         assert!(output.stdout.len() + output.stderr.len() <= sandbox::MAX_COMMAND_OUTPUT_BYTES);
         assert!(output.truncated);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_local_agent_workspace_write_is_limited_to_selected_cwd() {
+        let root_a = tempfile::tempdir().unwrap();
+        let selected = root_a.path().join("selected");
+        let sibling = root_a.path().join("sibling");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let executable = agent_dir.path().join("codex");
+        let selected_marker = selected.join("selected-marker");
+        let sibling_marker = sibling.join("sibling-marker");
+        let outside_marker = root_b.path().join("outside-marker");
+        make_executable_with_contents(
+            &executable,
+            &format!(
+                "#!/bin/sh\n\
+                 /usr/bin/touch \"{}\" 2>/dev/null || true\n\
+                 /usr/bin/touch \"{}\" 2>/dev/null || true\n\
+                 /usr/bin/touch \"{}\" 2>/dev/null || true\n\
+                 exit 0\n",
+                selected_marker.display(),
+                sibling_marker.display(),
+                outside_marker.display(),
+            ),
+        );
+
+        let prepare = |access| {
+            let state = AgentState::create(Agent::Codex, &[]).unwrap();
+            let mut environment = HashMap::new();
+            state.apply_to_environment(Agent::Codex, &mut environment);
+            PreparedRun {
+                agent: Agent::Codex,
+                access,
+                cwd: selected.canonicalize().unwrap(),
+                command: vec![executable.to_string_lossy().into_owned()],
+                executable_target: executable.canonicalize().unwrap(),
+                environment,
+                session_roots: vec![
+                    root_a.path().canonicalize().unwrap(),
+                    root_b.path().canonicalize().unwrap(),
+                ],
+                task_bytes: 4,
+                task_sha256: task_sha256(b"test"),
+                task_preview: task_preview("test"),
+                state,
+            }
+        };
+
+        run(prepare(Access::WorkspaceWrite)).await.unwrap();
+        assert!(selected_marker.is_file());
+        assert!(!sibling_marker.exists());
+        assert!(!outside_marker.exists());
+
+        fs::remove_file(&selected_marker).unwrap();
+        run(prepare(Access::ReadOnly)).await.unwrap();
+        assert!(!selected_marker.exists());
+        assert!(!sibling_marker.exists());
+        assert!(!outside_marker.exists());
     }
 
     #[test]

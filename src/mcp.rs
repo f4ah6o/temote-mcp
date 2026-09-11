@@ -4002,8 +4002,8 @@ mod tests {
             .expect("local_agent_run did not request approval")
             .expect("approval channel closed before local_agent_run request");
         assert_eq!(prompt.request.operation, "local_agent_run");
-        assert!(prompt.request.detail.contains("task_input: omitted"));
-        assert!(!prompt.request.detail.contains("approval-only test task"));
+        assert!(prompt.request.detail.contains("task_preview:"));
+        assert!(prompt.request.detail.contains("approval-only test task"));
         prompt.respond(false);
 
         let error = task
