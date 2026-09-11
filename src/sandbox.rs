@@ -19,19 +19,42 @@ mod policy;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
 pub(crate) const PROTECTED_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
-const MAX_PROTECTED_METADATA_SCAN_ENTRIES: usize = 16 * 1024;
-const MAX_PROTECTED_METADATA_SCAN_DEPTH: usize = 64;
-const MAX_PROTECTED_METADATA_PATHS: usize = 1024;
+const MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_ENTRIES: usize = 2_000_000;
+const MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_DEPTH: usize = 64;
+const MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProtectedMetadataScanLimits {
+    pub(crate) max_entries: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) max_paths: usize,
+}
+
+const LOCAL_AGENT_PROTECTED_METADATA_SCAN_LIMITS: ProtectedMetadataScanLimits =
+    ProtectedMetadataScanLimits {
+        max_entries: MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_ENTRIES,
+        max_depth: MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_DEPTH,
+        max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+    };
 
 /// Returns the protected metadata paths below an existing writable root.
 ///
 /// The first three paths are retained even when they do not exist so a child
 /// cannot create a top-level metadata entry after the sandbox starts. Existing
-/// nested metadata is discovered with `symlink_metadata`; symbolic links are
-/// never followed, and protected directories are not traversed. Any
-/// inspection or resource-bound failure rejects the policy instead of
-/// silently leaving a writable gap.
+/// nested metadata is discovered with symlink metadata; symbolic links are
+/// never followed, and protected directories are not traversed. The local-agent
+/// profile uses a bounded walk; when a nested subtree cannot be fully inspected
+/// within the bound, that subtree is returned as a read-only fallback. If the
+/// writable root itself cannot be inspected, the policy fails closed instead
+/// of silently leaving a writable gap.
 pub(crate) fn discover_protected_metadata_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    discover_protected_metadata_paths_with_limits(root, LOCAL_AGENT_PROTECTED_METADATA_SCAN_LIMITS)
+}
+
+pub(crate) fn discover_protected_metadata_paths_with_limits(
+    root: &Path,
+    limits: ProtectedMetadataScanLimits,
+) -> Result<Vec<PathBuf>> {
     let root = std::fs::canonicalize(root)
         .with_context(|| format!("cannot resolve protected metadata root {}", root.display()))?;
     anyhow::ensure!(
@@ -44,49 +67,96 @@ pub(crate) fn discover_protected_metadata_paths(root: &Path) -> Result<Vec<PathB
         .iter()
         .map(|name| root.join(name))
         .collect::<Vec<_>>();
+    anyhow::ensure!(
+        protected.len() <= limits.max_paths,
+        "protected metadata path count exceeds {}",
+        limits.max_paths
+    );
     let mut pending = vec![(root.clone(), 0usize)];
     let mut scanned_entries = 0usize;
 
     while let Some((directory, depth)) = pending.pop() {
-        let entries = std::fs::read_dir(&directory).with_context(|| {
-            format!(
-                "cannot enumerate protected metadata root directory {}",
-                directory.display()
-            )
-        })?;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                if directory == root {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot enumerate protected metadata root directory {}",
+                            directory.display()
+                        )
+                    });
+                }
+                add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                continue;
+            }
+        };
         for entry in entries {
-            let entry = entry.with_context(|| {
-                format!(
-                    "cannot read an entry while walking protected metadata root {}",
-                    directory.display()
-                )
-            })?;
-            scanned_entries = scanned_entries
-                .checked_add(1)
-                .context("protected metadata scan entry count overflow")?;
-            anyhow::ensure!(
-                scanned_entries <= MAX_PROTECTED_METADATA_SCAN_ENTRIES,
-                "protected metadata scan exceeds {MAX_PROTECTED_METADATA_SCAN_ENTRIES} entries"
-            );
+            if scanned_entries >= limits.max_entries {
+                if directory == root {
+                    anyhow::bail!(
+                        "protected metadata scan exceeds {} entries at writable root {}",
+                        limits.max_entries,
+                        root.display()
+                    );
+                }
+                add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                break;
+            }
+            scanned_entries += 1;
 
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if directory == root {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "cannot read an entry while walking protected metadata root {}",
+                                directory.display()
+                            )
+                        });
+                    }
+                    add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                    break;
+                }
+            };
             let path = entry.path();
             anyhow::ensure!(
                 path.starts_with(&root),
                 "protected metadata scan escaped its root: {}",
                 path.display()
             );
-            let metadata = std::fs::symlink_metadata(&path).with_context(|| {
-                format!(
-                    "cannot inspect protected metadata scan entry {}",
-                    path.display()
-                )
-            })?;
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    if directory == root {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "cannot inspect protected metadata scan entry {}",
+                                path.display()
+                            )
+                        });
+                    }
+                    add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                    break;
+                }
+            };
             if is_protected_metadata_name(&entry.file_name()) {
+                if protected.contains(&path) {
+                    continue;
+                }
+                if protected.len() >= limits.max_paths {
+                    if directory == root {
+                        anyhow::bail!(
+                            "protected metadata path count exceeds {} at writable root {}",
+                            limits.max_paths,
+                            root.display()
+                        );
+                    }
+                    add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                    break;
+                }
                 protected.push(path);
-                anyhow::ensure!(
-                    protected.len() <= MAX_PROTECTED_METADATA_PATHS,
-                    "protected metadata path count exceeds {MAX_PROTECTED_METADATA_PATHS}"
-                );
                 continue;
             }
 
@@ -94,10 +164,10 @@ pub(crate) fn discover_protected_metadata_paths(root: &Path) -> Result<Vec<PathB
                 let child_depth = depth
                     .checked_add(1)
                     .context("protected metadata scan depth overflow")?;
-                anyhow::ensure!(
-                    child_depth <= MAX_PROTECTED_METADATA_SCAN_DEPTH,
-                    "protected metadata scan exceeds depth {MAX_PROTECTED_METADATA_SCAN_DEPTH}"
-                );
+                if child_depth > limits.max_depth {
+                    add_read_only_fallback(&mut protected, &root, &path, limits.max_paths)?;
+                    continue;
+                }
                 pending.push((path, child_depth));
             }
         }
@@ -106,6 +176,29 @@ pub(crate) fn discover_protected_metadata_paths(root: &Path) -> Result<Vec<PathB
     protected.sort();
     protected.dedup();
     Ok(protected)
+}
+
+fn add_read_only_fallback(
+    protected: &mut Vec<PathBuf>,
+    root: &Path,
+    directory: &Path,
+    max_paths: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        directory != root,
+        "protected metadata scan cannot safely bound writable root {}",
+        root.display()
+    );
+    if protected.iter().any(|path| directory.starts_with(path)) {
+        return Ok(());
+    }
+    protected.retain(|path| !path.starts_with(directory));
+    anyhow::ensure!(
+        protected.len() < max_paths,
+        "protected metadata fallback path count exceeds {max_paths}"
+    );
+    protected.push(directory.to_owned());
+    Ok(())
 }
 
 fn is_protected_metadata_name(name: &OsStr) -> bool {
@@ -1172,17 +1265,98 @@ mod generic_tests {
     }
 
     #[test]
-    fn protected_metadata_walk_fails_closed_at_its_depth_bound() -> Result<()> {
+    fn protected_metadata_walk_falls_back_to_an_unscanned_nested_subtree() -> Result<()> {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let fallback = workspace.join("large");
+        std::fs::create_dir_all(&fallback)?;
+        std::fs::write(workspace.join("normal.txt"), b"normal")?;
+        std::fs::create_dir_all(fallback.join("nested/.git"))?;
+        std::fs::write(fallback.join("entry-0"), b"0")?;
+        std::fs::write(fallback.join("entry-1"), b"1")?;
+
+        let workspace = std::fs::canonicalize(workspace)?;
+        let paths = discover_protected_metadata_paths_with_limits(
+            &workspace,
+            ProtectedMetadataScanLimits {
+                max_entries: 3,
+                max_depth: 64,
+                max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+            },
+        )?;
+
+        assert!(
+            paths.contains(&fallback),
+            "an unscanned nested subtree must become read-only"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(&fallback) && path != &fallback),
+            "fallback should replace narrower paths below the subtree"
+        );
+        assert!(
+            !paths.contains(&workspace.join("normal.txt")),
+            "ordinary files outside the fallback remain writable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protected_metadata_walk_falls_back_at_its_depth_bound() -> Result<()> {
         let fixture = tempfile::tempdir().unwrap();
         let workspace = fixture.path().join("workspace");
         std::fs::create_dir(&workspace)?;
         let mut current = workspace.clone();
-        for index in 0..=MAX_PROTECTED_METADATA_SCAN_DEPTH {
+        for index in 0..=2 {
             current.push(format!("level-{index}"));
             std::fs::create_dir(&current)?;
         }
 
-        assert!(discover_protected_metadata_paths(&workspace).is_err());
+        let workspace = std::fs::canonicalize(workspace)?;
+        let paths = discover_protected_metadata_paths_with_limits(
+            &workspace,
+            ProtectedMetadataScanLimits {
+                max_entries: 64,
+                max_depth: 1,
+                max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+            },
+        )?;
+        assert!(paths.contains(&workspace.join("level-0/level-1")));
+        Ok(())
+    }
+
+    #[test]
+    fn protected_metadata_walk_fails_closed_when_a_root_bound_cannot_be_represented() -> Result<()>
+    {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        for index in 0..3 {
+            std::fs::create_dir(workspace.join(format!("entry-{index}")))?;
+        }
+
+        let limits = ProtectedMetadataScanLimits {
+            max_entries: 2,
+            max_depth: 64,
+            max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+        };
+        assert!(
+            discover_protected_metadata_paths_with_limits(&workspace, limits).is_err(),
+            "an over-budget writable root must fail closed"
+        );
+        assert!(
+            discover_protected_metadata_paths_with_limits(
+                &workspace,
+                ProtectedMetadataScanLimits {
+                    max_entries: 64,
+                    max_depth: 64,
+                    max_paths: 2,
+                }
+            )
+            .is_err(),
+            "a path budget that cannot retain top-level masks must fail closed"
+        );
         Ok(())
     }
 

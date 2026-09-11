@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::discover_protected_metadata_paths;
+use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
 
 const MAX_ROOTS: usize = 128;
 const MAX_READ_ONLY_PATHS: usize = 1024;
@@ -90,20 +90,16 @@ impl LinuxSandboxPolicy {
 
         let mut read_only_paths = Vec::new();
         for root in &writable {
-            // A validated run_git operation may write the repository's own
-            // metadata root. Its narrower config/hooks/etc. masks are added
-            // below instead; do not scan inside that root either.
-            if canonical_git_roots
-                .iter()
-                .any(|git_root| root == git_root || root.starts_with(git_root))
-            {
-                continue;
+            for name in PROTECTED_METADATA_NAMES {
+                let path = root.join(name);
+                // A validated run_git operation may write the repository's
+                // own metadata root. Its narrower config/hooks/etc. masks are
+                // added below instead.
+                if canonical_git_roots.iter().any(|git_root| git_root == &path) {
+                    continue;
+                }
+                read_only_paths.push(path);
             }
-            read_only_paths.extend(
-                discover_protected_metadata_paths(root)?
-                    .into_iter()
-                    .filter(|path| !canonical_git_roots.iter().any(|git| git == path)),
-            );
         }
 
         for git_root in &canonical_git_roots {
@@ -393,6 +389,10 @@ pub fn missing_path_is_directory(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::{
+        PROTECTED_METADATA_NAMES, ProtectedMetadataScanLimits,
+        discover_protected_metadata_paths_with_limits,
+    };
     use crate::test_support;
 
     #[test]
@@ -405,6 +405,35 @@ mod tests {
         assert_eq!(value["network"], "restricted");
         assert!(value.get("permission_profile").is_none());
         assert!(value.get("entries").is_none());
+    }
+
+    #[test]
+    fn command_policy_keeps_top_level_masks_without_recursive_scan() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        for index in 0..3 {
+            std::fs::create_dir(workspace.join(format!("entry-{index}"))).unwrap();
+        }
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+
+        assert!(
+            discover_protected_metadata_paths_with_limits(
+                &workspace,
+                ProtectedMetadataScanLimits {
+                    max_entries: 2,
+                    max_depth: 64,
+                    max_paths: 1024,
+                }
+            )
+            .is_err(),
+            "fixture must exceed the injected local-agent scan budget"
+        );
+
+        let policy = LinuxSandboxPolicy::for_command(&workspace, &[], &[]).unwrap();
+        for name in PROTECTED_METADATA_NAMES {
+            assert!(policy.read_only_paths.contains(&workspace.join(name)));
+        }
     }
 
     #[test]

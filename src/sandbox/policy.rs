@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
+use crate::sandbox::{
+    PROTECTED_METADATA_NAMES, ProtectedMetadataScanLimits, discover_protected_metadata_paths,
+    discover_protected_metadata_paths_with_limits,
+};
 
 const GIT_READ_ONLY_PATHS: &[&str] = &[
     "config",
@@ -38,7 +41,6 @@ impl SandboxSpec {
             roots.push(canonical_existing_root(root)?);
         }
         normalize_roots(&mut roots);
-        let discovered_protected_metadata_paths = discover_metadata_for_roots(&roots)?;
         roots.push(canonical_existing_root(Path::new("/tmp"))?);
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             roots.push(canonical_existing_root(Path::new(&tmpdir))?);
@@ -49,7 +51,7 @@ impl SandboxSpec {
             read_only_overrides: Vec::new(),
             read_only_roots: Vec::new(),
             hidden_roots: Vec::new(),
-            discovered_protected_metadata_paths,
+            discovered_protected_metadata_paths: Vec::new(),
             network_access: false,
         })
     }
@@ -68,7 +70,8 @@ impl SandboxSpec {
             .map(|root| canonical_existing_root(root))
             .collect::<Result<Vec<_>>>()?;
         normalize_roots(&mut writable);
-        let discovered_protected_metadata_paths = discover_metadata_for_roots(&writable)?;
+        let discovered_protected_metadata_paths =
+            discover_local_agent_metadata_for_roots(&writable)?;
         let mut roots = Vec::with_capacity(writable.len() + temporary_roots.len());
         roots.extend(writable);
         roots.extend(
@@ -186,7 +189,7 @@ impl SandboxSpec {
     }
 }
 
-fn discover_metadata_for_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn discover_local_agent_metadata_for_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for root in roots {
         paths.extend(discover_protected_metadata_paths(root)?);
@@ -237,6 +240,38 @@ mod tests {
         let file = root.path().join("not-a-directory");
         std::fs::write(&file, b"x").unwrap();
         assert!(SandboxSpec::command(root.path(), &[file]).is_err());
+    }
+
+    #[test]
+    fn command_spec_keeps_top_level_masks_without_recursive_scan() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        for index in 0..3 {
+            std::fs::create_dir(workspace.join(format!("entry-{index}"))).unwrap();
+        }
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+
+        assert!(
+            discover_protected_metadata_paths_with_limits(
+                &workspace,
+                ProtectedMetadataScanLimits {
+                    max_entries: 2,
+                    max_depth: 64,
+                    max_paths: 1024,
+                }
+            )
+            .is_err(),
+            "fixture must exceed the injected local-agent scan budget"
+        );
+
+        let spec = SandboxSpec::command(&workspace, &[]).unwrap();
+        for name in PROTECTED_METADATA_NAMES {
+            assert!(
+                spec.protected_metadata_paths(&workspace)
+                    .contains(&workspace.join(name))
+            );
+        }
     }
 
     #[test]
