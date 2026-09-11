@@ -20,6 +20,11 @@ const ARTIFACT_DIRECTORY_PREFIX: &str = "temote-codex-delegation-";
 const MAX_PARENT_RESULT_BYTES: usize = 4096;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_REPORT_SUMMARY_CHARS: usize = 1200;
+const MAX_REPORT_COMMIT_CHARS: usize = 200;
+const MAX_REPORT_ARGUMENT_CHARS: usize = 256;
+const MAX_REPORT_ARRAY_ITEMS: usize = 128;
+const MAX_REPORT_ARRAY_ITEM_CHARS: usize = 512;
 const MAX_EVIDENCE_STRING_BYTES: usize = 256;
 const MAX_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
@@ -934,15 +939,27 @@ fn validate_report_schema(report: &Value) -> bool {
     matches!(
         object.get("status").and_then(Value::as_str),
         Some("completed" | "failed" | "blocked" | "needs_decision")
-    ) && bounded_report_string(object.get("summary"), 1200)
-        && bounded_report_string(object.get("base_commit"), 200)
-        && bounded_report_array(object.get("changed_files"), 128, 512)
-        && bounded_report_array(object.get("checks"), 128, 512)
-        && bounded_report_array(object.get("unresolved"), 128, 512)
-        && bounded_report_string(object.get("requested_model"), 256)
-        && bounded_report_string(object.get("requested_effort"), 256)
-        && bounded_nullable_report_string(object.get("observed_model"), 256)
-        && bounded_nullable_report_string(object.get("observed_effort"), 256)
+    ) && bounded_report_string(object.get("summary"), MAX_REPORT_SUMMARY_CHARS)
+        && bounded_report_string(object.get("base_commit"), MAX_REPORT_COMMIT_CHARS)
+        && bounded_report_array(
+            object.get("changed_files"),
+            MAX_REPORT_ARRAY_ITEMS,
+            MAX_REPORT_ARRAY_ITEM_CHARS,
+        )
+        && bounded_report_array(
+            object.get("checks"),
+            MAX_REPORT_ARRAY_ITEMS,
+            MAX_REPORT_ARRAY_ITEM_CHARS,
+        )
+        && bounded_report_array(
+            object.get("unresolved"),
+            MAX_REPORT_ARRAY_ITEMS,
+            MAX_REPORT_ARRAY_ITEM_CHARS,
+        )
+        && bounded_report_string(object.get("requested_model"), MAX_REPORT_ARGUMENT_CHARS)
+        && bounded_report_string(object.get("requested_effort"), MAX_REPORT_ARGUMENT_CHARS)
+        && bounded_nullable_report_string(object.get("observed_model"), MAX_REPORT_ARGUMENT_CHARS)
+        && bounded_nullable_report_string(object.get("observed_effort"), MAX_REPORT_ARGUMENT_CHARS)
 }
 
 fn bounded_report_string(value: Option<&Value>, max_chars: usize) -> bool {

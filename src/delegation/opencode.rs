@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -24,6 +24,10 @@ const MAX_DIAGNOSTIC_VERSION_BYTES: usize = 128;
 const MAX_DIAGNOSTIC_LISTING_BYTES: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_ERROR_BYTES: usize = 4096;
 const OPENCODE_BINARY_NAME: &str = "opencode";
+const MAX_JSON_OBJECT_CANDIDATES: usize = 16;
+const MAX_JSON_SCAN_ATTEMPTS: usize = 64;
+const MAX_REPORT_SCAN_BYTES: usize = 64 * 1024;
+const SUMMARY_TRUNCATION_MARKER: &str = " …[truncated]";
 
 const OPENCODE_CHILD_ENV_ALLOWLIST: &[&str] = &[
     "ALL_PROXY",
@@ -51,10 +55,10 @@ const OPENCODE_REPORT_INSTRUCTIONS: &str = r#"You are a delegated implementation
 
 When finished, respond with ONLY one JSON object and nothing else: no markdown, no code fences, no text before or after the JSON.
 The JSON object must contain exactly these fields:
-{"status":"completed|failed|blocked|needs_decision","summary":"short summary, at most 1200 characters","base_commit":"","changed_files":[],"checks":[],"unresolved":[],"requested_model":"__REQUESTED_MODEL__","requested_effort":"__REQUESTED_EFFORT__","observed_model":null,"observed_effort":null}
+{"status":"completed|failed|blocked|needs_decision","summary":"short summary, at most 1200 characters","base_commit":"","changed_files":[],"checks":[],"unresolved":[],"requested_model":__REQUESTED_MODEL__,"requested_effort":__REQUESTED_EFFORT__,"observed_model":null,"observed_effort":null}
 Rules:
 - All string values are plain strings; changed_files, checks, and unresolved are arrays of strings (use [] when empty).
-- Set "requested_model" to "__REQUESTED_MODEL__" and "requested_effort" to "__REQUESTED_EFFORT__".
+- Set "requested_model" to __REQUESTED_MODEL__ and "requested_effort" to __REQUESTED_EFFORT__.
 - Set "observed_model"/"observed_effort" only when you can actually observe them; otherwise keep null.
 - Do not include any other fields.
 
@@ -584,11 +588,21 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
     }
 
     let (report_status, report) = match report_state {
+        ReportState::Valid(value) => match normalize_opencode_report(value, &options) {
+            Some(report) if validate_report_schema(&report) => {
+                if canonical_report_fits(&report) {
+                    persist_opencode_report(&paths, &report)?;
+                    (Status::Success, Some(report))
+                } else {
+                    (Status::OversizedReport, None)
+                }
+            }
+            _ => (Status::InvalidReportSchema, None),
+        },
         ReportState::Missing => (Status::MissingReport, None),
         ReportState::InvalidJson => (Status::InvalidJson, None),
         ReportState::InvalidSchema => (Status::InvalidReportSchema, None),
         ReportState::Oversized => (Status::OversizedReport, None),
-        ReportState::Valid(report) => (Status::Success, Some(report)),
     };
 
     Ok(DelegationResult {
@@ -714,7 +728,7 @@ fn collect_opencode_output(path: &Path) -> std::io::Result<(Evidence, ReportStat
                     .and_then(|part| part.get("tokens"))
                     .and_then(Value::as_object)
                 {
-                    evidence.usage = Some(opencode_usage(tokens));
+                    accumulate_opencode_usage(&mut evidence.usage, opencode_usage(tokens));
                 }
             }
             Some("text") => {
@@ -734,9 +748,14 @@ fn collect_opencode_output(path: &Path) -> std::io::Result<(Evidence, ReportStat
 }
 
 fn opencode_report_state(text_parts: &[(Option<String>, String)]) -> ReportState {
-    let Some((last_message_id, _)) = text_parts.last() else {
+    let Some(text) = opencode_report_text(text_parts) else {
         return ReportState::Missing;
     };
+    parse_opencode_report(&text)
+}
+
+fn opencode_report_text(text_parts: &[(Option<String>, String)]) -> Option<String> {
+    let (last_message_id, _) = text_parts.last()?;
     let mut text = String::new();
     if last_message_id.is_some() {
         for (message_id, part) in text_parts {
@@ -749,17 +768,214 @@ fn opencode_report_state(text_parts: &[(Option<String>, String)]) -> ReportState
             text.push_str(part);
         }
     }
+    Some(text)
+}
 
-    if text.len() > DEFAULT_MAX_REPORT_BYTES {
+fn parse_opencode_report(text: &str) -> ReportState {
+    let over_budget = text.len() > DEFAULT_MAX_REPORT_BYTES;
+    if text.len() > MAX_REPORT_SCAN_BYTES {
         return ReportState::Oversized;
     }
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return ReportState::InvalidJson;
-    };
-    if !validate_report_schema(&value) {
-        return ReportState::InvalidSchema;
+    if let Some(value) = parse_json_object(text.trim()) {
+        return ReportState::Valid(value);
     }
-    ReportState::Valid(value)
+    for candidate in json_object_candidates(text).into_iter().rev() {
+        if let Some(value) = parse_json_object(candidate) {
+            return ReportState::Valid(value);
+        }
+        if let Some(value) = parse_json_object(&sanitize_json_strings(candidate)) {
+            return ReportState::Valid(value);
+        }
+    }
+    if over_budget {
+        ReportState::Oversized
+    } else {
+        ReportState::InvalidJson
+    }
+}
+
+fn parse_json_object(text: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    value.is_object().then_some(value)
+}
+
+fn json_object_candidates(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0;
+    let mut attempts = 0;
+    while index < bytes.len()
+        && candidates.len() < MAX_JSON_OBJECT_CANDIDATES
+        && attempts < MAX_JSON_SCAN_ATTEMPTS
+    {
+        if bytes[index] != b'{' {
+            index += 1;
+            continue;
+        }
+        attempts += 1;
+        let start = index;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            index += 1;
+        }
+        let Some(end) = end else {
+            index = start + 1;
+            continue;
+        };
+        candidates.push(&text[start..=end]);
+        index = end + 1;
+    }
+    candidates
+}
+
+fn sanitize_json_strings(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in text.chars() {
+        if !in_string {
+            if character == '"' {
+                in_string = true;
+            }
+            sanitized.push(character);
+            continue;
+        }
+        if escaped {
+            sanitized.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            sanitized.push(character);
+            escaped = true;
+        } else if character == '"' {
+            sanitized.push(character);
+            in_string = false;
+        } else if character == '\n' {
+            sanitized.push_str("\\n");
+        } else if character == '\r' {
+            sanitized.push_str("\\r");
+        } else if character == '\t' {
+            sanitized.push_str("\\t");
+        } else if (character as u32) < 0x20 {
+            sanitized.push_str(&format!("\\u{:04x}", character as u32));
+        } else {
+            sanitized.push(character);
+        }
+    }
+    sanitized
+}
+
+fn normalize_opencode_report(value: Value, options: &Options) -> Option<Value> {
+    let object = value.as_object()?;
+    let status = object.get("status").and_then(Value::as_str)?;
+    if !matches!(
+        status,
+        "completed" | "failed" | "blocked" | "needs_decision"
+    ) {
+        return None;
+    }
+
+    Some(json!({
+        "status": status,
+        "summary": bounded_summary(object.get("summary")?)?,
+        "base_commit": bounded_report_text(object.get("base_commit")?, MAX_REPORT_COMMIT_CHARS)?,
+        "changed_files": bounded_report_items(object.get("changed_files")?)?,
+        "checks": bounded_report_items(object.get("checks")?)?,
+        "unresolved": bounded_report_items(object.get("unresolved")?)?,
+        "requested_model": options.model,
+        "requested_effort": options.variant.clone().unwrap_or_default(),
+        "observed_model": bounded_nullable_report_text(object.get("observed_model")?)?,
+        "observed_effort": bounded_nullable_report_text(object.get("observed_effort")?)?,
+    }))
+}
+
+fn bounded_summary(value: &Value) -> Option<String> {
+    let summary = value.as_str()?;
+    if summary.chars().count() <= MAX_REPORT_SUMMARY_CHARS {
+        return Some(summary.to_owned());
+    }
+    let marker_chars = SUMMARY_TRUNCATION_MARKER.chars().count();
+    let limit = MAX_REPORT_SUMMARY_CHARS.saturating_sub(marker_chars);
+    let mut bounded: String = summary.chars().take(limit).collect();
+    bounded.push_str(SUMMARY_TRUNCATION_MARKER);
+    Some(bounded)
+}
+
+fn bounded_report_text(value: &Value, max_chars: usize) -> Option<String> {
+    let text = value.as_str()?;
+    Some(text.chars().take(max_chars).collect())
+}
+
+fn bounded_nullable_report_text(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    bounded_report_text(value, MAX_REPORT_ARGUMENT_CHARS).map(Value::String)
+}
+
+fn bounded_report_items(value: &Value) -> Option<Vec<Value>> {
+    let items = value.as_array()?;
+    items
+        .iter()
+        .take(MAX_REPORT_ARRAY_ITEMS)
+        .map(|item| bounded_report_text(item, MAX_REPORT_ARRAY_ITEM_CHARS).map(Value::String))
+        .collect::<Option<Vec<_>>>()
+}
+
+fn canonical_report_fits(report: &Value) -> bool {
+    serde_json::to_vec(report).is_ok_and(|encoded| encoded.len() <= DEFAULT_MAX_REPORT_BYTES)
+}
+
+fn persist_opencode_report(paths: &ArtifactPaths, report: &Value) -> Result<(), String> {
+    let encoded = serde_json::to_vec(report)
+        .map_err(|error| format!("could not encode OpenCode delegation report: {error}"))?;
+    let mut file = create_private_file(&paths.report)?;
+    file.write_all(&encoded)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("could not write OpenCode delegation report: {error}"))
+}
+
+fn accumulate_opencode_usage(target: &mut Option<Map<String, Value>>, step: Map<String, Value>) {
+    let usage = target.get_or_insert_with(Map::new);
+    for (field, value) in step {
+        let Some(current) = usage.get_mut(&field) else {
+            usage.insert(field, value);
+            continue;
+        };
+        match (current.as_u64(), value.as_u64()) {
+            (Some(existing), Some(addition)) => {
+                *current = Value::from(existing.saturating_add(addition));
+            }
+            _ => {
+                *current = value;
+            }
+        }
+    }
 }
 
 fn opencode_observed_model(object: &Map<String, Value>) -> Option<String> {
@@ -859,6 +1075,17 @@ case "$0" in
         printf '%s' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"'
         yes x | head -c 9000000
         printf '%s\n' '"}}'
+        exit 0
+        ;;
+    *long_summary)
+        long=$(head -c 1500 /dev/zero | tr '\0' 'y')
+        printf '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\\"status\\":\\"completed\\",\\"summary\\":\\"%s\\",\\"base_commit\\":\\"\\",\\"changed_files\\":[],\\"checks\\":[],\\"unresolved\\":[],\\"requested_model\\":\\"raw\\",\\"requested_effort\\":\\"\\",\\"observed_model\\":null,\\"observed_effort\\":null}"}}\n' "$long"
+        exit 0
+        ;;
+    *multi_step)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"\",\"changed_files\":[],\"checks\":[],\"unresolved\":[],\"requested_model\":\"raw\",\"requested_effort\":\"\",\"observed_model\":null,\"observed_effort\":null}"}}'
+        printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":12,"input":10,"output":2,"reasoning":0,"cache":{"read":0}}}}'
+        printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":8,"input":5,"output":3,"reasoning":0,"cache":{"read":4}}}}'
         exit 0
         ;;
     *timeout)
@@ -1541,5 +1768,310 @@ esac
         assert!(!is_opencode_model_identifier("/usr/bin/opencode"));
         assert!(!is_opencode_model_identifier("opencode/"));
         assert!(!is_opencode_model_identifier(""));
+    }
+
+    fn text_parts_for(text: &str) -> Vec<(Option<String>, String)> {
+        vec![(Some("msg_1".to_owned()), text.to_owned())]
+    }
+
+    fn report_object(summary: &str) -> Value {
+        json!({
+            "status": "completed",
+            "summary": summary,
+            "base_commit": "",
+            "changed_files": [],
+            "checks": [],
+            "unresolved": [],
+            "requested_model": "raw-model",
+            "requested_effort": "raw-effort",
+            "observed_model": null,
+            "observed_effort": null,
+        })
+    }
+
+    #[test]
+    fn opencode_report_repairs_raw_newlines_in_strings() {
+        let report = report_object("first line\nsecond line").to_string();
+        let state = opencode_report_state(&text_parts_for(&report));
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+    }
+
+    #[test]
+    fn opencode_report_repairs_markdown_fenced_json() {
+        let report = report_object("ok").to_string();
+        let text = format!("```json\n{report}\n```");
+        let state = opencode_report_state(&text_parts_for(&text));
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+    }
+
+    #[test]
+    fn opencode_report_finds_json_after_surrounding_prose() {
+        let report = report_object("ok").to_string();
+        let text = format!("Here is the delegation report.\n{report}\nEnd of report.");
+        let state = opencode_report_state(&text_parts_for(&text));
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+    }
+
+    #[test]
+    fn opencode_report_uses_the_last_parseable_block() {
+        let report = report_object("the real report").to_string();
+        let text = format!("{{\"note\":\"an earlier example\"}}\n{report}");
+        let state = opencode_report_state(&text_parts_for(&text));
+        match state {
+            ReportState::Valid(value) => {
+                assert_eq!(value["summary"], "the real report");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_report_rejects_truncated_json() {
+        let text = "{\"status\":\"completed\",\"summary\":\"cut off";
+        let state = opencode_report_state(&text_parts_for(text));
+        assert!(
+            matches!(state, ReportState::InvalidJson),
+            "state: {state:?}"
+        );
+    }
+
+    #[test]
+    fn opencode_report_extracts_from_text_beyond_the_direct_budget() {
+        let prose = "analysis line with details\n".repeat(300);
+        let report = report_object("ok").to_string();
+        let text = format!("{prose}{report}");
+        assert!(text.len() > DEFAULT_MAX_REPORT_BYTES);
+        assert!(text.len() < MAX_REPORT_SCAN_BYTES);
+        let state = opencode_report_state(&text_parts_for(&text));
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+    }
+
+    #[test]
+    fn opencode_report_handles_unmatched_braces_before_the_json() {
+        let report = report_object("ok").to_string();
+        let text = format!("Consider the shape {{ like this\n{report}");
+        let state = opencode_report_state(&text_parts_for(&text));
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+    }
+
+    #[test]
+    fn opencode_report_rejects_text_beyond_the_scan_budget() {
+        let text = "x".repeat(MAX_REPORT_SCAN_BYTES + 1);
+        let state = opencode_report_state(&text_parts_for(&text));
+        assert!(matches!(state, ReportState::Oversized), "state: {state:?}");
+    }
+
+    #[test]
+    fn opencode_canonical_report_budget_rejects_oversized_arrays() {
+        let mut value = report_object("ok");
+        value["changed_files"] = json!(vec![
+            "x".repeat(MAX_REPORT_ARRAY_ITEM_CHARS);
+            MAX_REPORT_ARRAY_ITEMS
+        ]);
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+        let normalized = normalize_opencode_report(value, &options).unwrap();
+        assert!(validate_report_schema(&normalized));
+        assert!(!canonical_report_fits(&normalized));
+    }
+
+    #[test]
+    fn opencode_normalization_bounds_summary_at_utf8_boundaries() {
+        let long = "界".repeat(MAX_REPORT_SUMMARY_CHARS + 40);
+        let value = report_object(&long);
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+        let normalized = normalize_opencode_report(value, &options).unwrap();
+        let summary = normalized["summary"].as_str().unwrap();
+        assert_eq!(summary.chars().count(), MAX_REPORT_SUMMARY_CHARS);
+        assert!(summary.ends_with("…[truncated]"));
+        assert!(!summary.is_empty());
+        assert!(validate_report_schema(&normalized));
+    }
+
+    #[test]
+    fn opencode_normalization_keeps_short_summary_unmodified() {
+        let value = report_object("short summary");
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            Some("high"),
+            PathBuf::from("opencode"),
+        );
+        let normalized = normalize_opencode_report(value, &options).unwrap();
+        assert_eq!(normalized["summary"], "short summary");
+        assert_eq!(normalized["requested_model"], "opencode-go/canonical");
+        assert_eq!(normalized["requested_effort"], "high");
+        assert!(validate_report_schema(&normalized));
+    }
+
+    #[test]
+    fn opencode_normalization_replaces_raw_requested_values() {
+        let mut value = report_object("ok");
+        value["requested_model"] = json!("\"opencode-go/quoted\"");
+        value["requested_effort"] = json!("\"\"");
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/deepseek-v4-flash",
+            Some("high"),
+            PathBuf::from("opencode"),
+        );
+        let normalized = normalize_opencode_report(value, &options).unwrap();
+        assert_eq!(
+            normalized["requested_model"],
+            "opencode-go/deepseek-v4-flash"
+        );
+        assert_eq!(normalized["requested_effort"], "high");
+        assert!(
+            !normalized["requested_model"]
+                .as_str()
+                .unwrap()
+                .contains('"')
+        );
+    }
+
+    #[test]
+    fn opencode_normalization_rejects_unrecoverable_reports() {
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+        let mut missing_summary = report_object("ok");
+        missing_summary.as_object_mut().unwrap().remove("summary");
+        assert!(normalize_opencode_report(missing_summary, &options).is_none());
+
+        let mut invalid_status = report_object("ok");
+        invalid_status["status"] = json!("done");
+        assert!(normalize_opencode_report(invalid_status, &options).is_none());
+
+        let mut non_string_summary = report_object("ok");
+        non_string_summary["summary"] = json!(42);
+        assert!(normalize_opencode_report(non_string_summary, &options).is_none());
+    }
+
+    #[test]
+    fn opencode_normalization_bounds_arrays_and_scalars() {
+        let mut value = report_object("ok");
+        value["base_commit"] = json!("b".repeat(300));
+        value["changed_files"] = json!(vec!["x".repeat(600); 200]);
+        value["observed_model"] = json!("m".repeat(400));
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+        let normalized = normalize_opencode_report(value, &options).unwrap();
+        assert_eq!(
+            normalized["base_commit"].as_str().unwrap().chars().count(),
+            200
+        );
+        assert_eq!(
+            normalized["changed_files"].as_array().unwrap().len(),
+            MAX_REPORT_ARRAY_ITEMS
+        );
+        assert!(
+            normalized["changed_files"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= MAX_REPORT_ARRAY_ITEM_CHARS
+        );
+        assert!(
+            normalized["observed_model"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= MAX_REPORT_ARGUMENT_CHARS
+        );
+        assert!(validate_report_schema(&normalized));
+    }
+
+    #[test]
+    fn opencode_usage_accumulates_each_step_once() {
+        let mut usage: Option<Map<String, Value>> = None;
+        accumulate_opencode_usage(
+            &mut usage,
+            opencode_usage(
+                json!({"input": 10, "output": 2, "total": 12, "cache": {"read": 0}})
+                    .as_object()
+                    .unwrap(),
+            ),
+        );
+        accumulate_opencode_usage(
+            &mut usage,
+            opencode_usage(
+                json!({"input": 5, "output": 3, "total": 8, "cache": {"read": 4}})
+                    .as_object()
+                    .unwrap(),
+            ),
+        );
+        let usage = usage.unwrap();
+        assert_eq!(usage["input_tokens"], 15);
+        assert_eq!(usage["output_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 20);
+        assert_eq!(usage["cached_input_tokens"], 4);
+    }
+
+    #[test]
+    fn opencode_success_persists_the_canonical_report_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "success", None);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["report"]["requested_model"], "opencode-go/test-model");
+        let report_path = value["artifacts"]["report"].as_str().unwrap();
+        let persisted: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(persisted, value["report"]);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_delivers_oversized_summary_with_a_truncation_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "long_summary", None);
+        assert_eq!(value["status"], "success");
+        let summary = value["report"]["summary"].as_str().unwrap();
+        assert_eq!(summary.chars().count(), MAX_REPORT_SUMMARY_CHARS);
+        assert!(summary.ends_with("…[truncated]"));
+        assert!(validate_report_schema(&value["report"]));
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_delivers_accumulated_multi_step_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "multi_step", None);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["evidence"]["usage"]["input_tokens"], 15);
+        assert_eq!(value["evidence"]["usage"]["output_tokens"], 5);
+        assert_eq!(value["evidence"]["usage"]["total_tokens"], 20);
+        assert_eq!(value["evidence"]["usage"]["cached_input_tokens"], 4);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_report_contract_example_is_valid_json() {
+        let root = tempfile::tempdir().unwrap();
+        let options = opencode_options(root.path(), "success", Some("high"));
+        let prompt = opencode_effective_prompt(&options).unwrap();
+        let example = prompt
+            .lines()
+            .find(|line| line.starts_with("{\"status\":\"completed|failed"))
+            .expect("report example line");
+        let parsed: Value = serde_json::from_str(example).unwrap();
+        assert_eq!(parsed["requested_model"], "opencode-go/test-model");
+        assert_eq!(parsed["requested_effort"], "high");
     }
 }
