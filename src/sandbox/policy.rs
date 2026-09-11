@@ -2,10 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::sandbox::{
-    PROTECTED_METADATA_NAMES, ProtectedMetadataScanLimits, discover_protected_metadata_paths,
-    discover_protected_metadata_paths_with_limits,
-};
+use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
 
 const GIT_READ_ONLY_PATHS: &[&str] = &[
     "config",
@@ -232,6 +229,9 @@ fn normalize_paths(paths: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::{
+        ProtectedMetadataScanLimits, discover_protected_metadata_paths_with_limits,
+    };
     use crate::test_support;
 
     #[test]
