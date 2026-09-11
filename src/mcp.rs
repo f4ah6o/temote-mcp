@@ -15,7 +15,7 @@ use crate::line_protocol::{
 };
 use crate::{
     apply_patch, approvals, checkpoints, child_env, codex_app_server, config, evidence, friction,
-    onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
+    local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
     session_control::SessionBackend, work_handoff,
 };
 
@@ -474,6 +474,34 @@ fn work_handoff_input_schema() -> Value {
     })
 }
 
+fn local_agent_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "session_id":{"type":"string"},
+            "agent":{"type":"string","enum":["codex","opencode"]},
+            "task":{"type":"string","minLength":1,"maxLength":local_agent::MAX_TASK_BYTES},
+            "cwd":{"type":"string"},
+            "access":{"type":"string","enum":["read_only","workspace_write"]},
+            "model":{"type":"string","minLength":1,"maxLength":256},
+            "profile":{"type":"string","minLength":1,"maxLength":128}
+        },
+        "required":["session_id","agent","task","access"],
+        "additionalProperties":false,
+        "allOf":[
+            {
+                "if":{
+                    "properties":{"agent":{"const":"opencode"}},
+                    "required":["agent"]
+                },
+                "then":{
+                    "properties":{"task":{"maxLength":local_agent::MAX_OPENCODE_TASK_BYTES}}
+                }
+            }
+        ]
+    })
+}
+
 fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
         {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -487,6 +515,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
         {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
+        {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 regular file using the selected session permission mode. Existing special-file targets are rejected. Normal sessions are restricted to permitted roots and use the temote-mcp sandbox; yolo sessions may write anywhere the local user can.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
@@ -556,6 +585,25 @@ async fn call_tool(
     params: &Value,
     public: bool,
     sessions: Option<&SessionBackend>,
+) -> Result<Value> {
+    call_tool_with_local_agent_executable(params, public, sessions, None).await
+}
+
+#[cfg(test)]
+async fn call_tool_with_test_local_agent_executable(
+    params: &Value,
+    public: bool,
+    sessions: Option<&SessionBackend>,
+    executable: &Path,
+) -> Result<Value> {
+    call_tool_with_local_agent_executable(params, public, sessions, Some(executable)).await
+}
+
+async fn call_tool_with_local_agent_executable(
+    params: &Value,
+    public: bool,
+    sessions: Option<&SessionBackend>,
+    local_agent_executable: Option<&Path>,
 ) -> Result<Value> {
     let name = params
         .get("name")
@@ -700,6 +748,7 @@ async fn call_tool(
                 &codex_app_server::task_control(&args, &session).await?,
             )?)
         }
+        "local_agent_run" => local_agent_run(&args, &session, local_agent_executable).await,
         "list_directory" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = list_directory(&path).await;
@@ -2014,6 +2063,101 @@ async fn start_command(args: &Value, session: &config::Session) -> Result<Value>
     .await
 }
 
+async fn local_agent_run(
+    args: &Value,
+    session: &config::Session,
+    executable: Option<&Path>,
+) -> Result<Value> {
+    let prepared = match executable {
+        Some(executable) => local_agent::prepare_with_executable(args, session, executable)?,
+        None => local_agent::prepare(args, session)?,
+    };
+    let detail = prepared.approval_detail();
+    approvals::ensure_approval_detail_fits(&detail)?;
+    let approved = approvals::request_user_approval_for_instance(
+        session,
+        "local_agent_run",
+        detail,
+        prepared.cwd.clone(),
+        prepared.approval_metadata(),
+    )
+    .await?;
+    anyhow::ensure!(approved, "user denied local_agent_run");
+
+    let current_session = config::load_session(&session.id).await?;
+    anyhow::ensure!(
+        current_session.started_at == session.started_at
+            && current_session.process_id == session.process_id,
+        "session instance changed while local agent approval was pending"
+    );
+    match executable {
+        Some(executable) => prepared.revalidate_with_executable(&current_session, executable)?,
+        None => prepared.revalidate(&current_session)?,
+    }
+    let (description, mut handle, completion) =
+        spawn_local_agent(prepared, &current_session).await?;
+    match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
+        Ok(joined) => {
+            joined.context("local agent task failed")?;
+            let result = completion
+                .lock()
+                .unwrap()
+                .result
+                .clone()
+                .context("local agent task completed without a cached result")?;
+            cached_job_result(result, OutputPolicy::default())
+        }
+        Err(_) => {
+            store_job(
+                session,
+                description,
+                handle,
+                completion,
+                OutputPolicy::default(),
+                "Backgrounded",
+            )
+            .await
+        }
+    }
+}
+
+async fn spawn_local_agent(
+    prepared: local_agent::PreparedRun,
+    session: &config::Session,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    let slot = reserve_job_slot(&session.id)?;
+    let description = prepared.activity_label();
+    approvals::activity(&session.id, format!("Running {description}"), None).await;
+    let session_id = session.id.clone();
+    let evidence_scope = session.cwd.clone();
+    let activity_label = description.clone();
+    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let task_completion = Arc::clone(&completion);
+    let handle = tokio::spawn(async move {
+        let result = tokio::select! {
+            result = local_agent::run(prepared) => {
+                result.and_then(render_output)
+            }
+            _ = wait_for_session_stop(session_id.clone()) => {
+                Err(anyhow::anyhow!("session stopped; local agent job cancelled"))
+            }
+            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
+                Err(anyhow::anyhow!("local agent job exceeded the two-hour lifetime limit"))
+            }
+        };
+        let cached = cache_job_result(&result, &session_id, &evidence_scope);
+        {
+            let mut completion = task_completion.lock().unwrap();
+            completion.result = Some(cached);
+            completion.completed_at = Some(Instant::now());
+        }
+        drop(slot);
+        reap_jobs();
+        report_local_agent_finished(session_id, activity_label, &result).await;
+    });
+    Ok((description, handle, completion))
+}
+
 async fn spawn_sandboxed_command(
     args: &Value,
     session: &config::Session,
@@ -2746,6 +2890,34 @@ async fn report_command_finished(
         .await;
     }
     approvals::activity(&session_id, format!("Ran {command}"), detail).await;
+}
+
+async fn report_local_agent_finished(
+    session_id: String,
+    activity_label: String,
+    result: &Result<String>,
+) {
+    if result.is_err() {
+        friction::record_observed_for_session_id(
+            &session_id,
+            friction::FrictionKind::ExecuteFailed,
+            Some("local_agent_run"),
+            None,
+            friction::EventOutcome::Failed,
+        )
+        .await;
+    }
+    let status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    approvals::activity(
+        &session_id,
+        format!("{activity_label} status={status}"),
+        None,
+    )
+    .await;
 }
 
 fn shell_word(value: &str) -> String {
@@ -3763,7 +3935,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 44);
+        assert_eq!(tools.len(), 45);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -3789,15 +3961,94 @@ mod tests {
             "codex_task_start",
             "codex_task_get",
             "codex_task_control",
+            "local_agent_run",
         ] {
             assert!(tools.iter().any(|tool| tool["name"] == name));
         }
+        let local_agent = tools
+            .iter()
+            .find(|tool| tool["name"] == "local_agent_run")
+            .unwrap();
+        assert_eq!(
+            local_agent["annotations"],
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            })
+        );
+        assert_eq!(local_agent["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            local_agent["inputSchema"]["properties"]["agent"]["enum"],
+            json!(["codex", "opencode"])
+        );
+        assert_eq!(
+            local_agent["inputSchema"]["properties"]["access"]["enum"],
+            json!(["read_only", "workspace_write"])
+        );
+        assert_eq!(
+            local_agent["inputSchema"]["properties"]["task"]["maxLength"],
+            json!(local_agent::MAX_TASK_BYTES)
+        );
+        assert_eq!(
+            local_agent["inputSchema"]["allOf"][0]["then"]["properties"]["task"]["maxLength"],
+            json!(local_agent::MAX_OPENCODE_TASK_BYTES)
+        );
         assert!(tools.iter().all(|tool| tool["name"] != "without_sandbox"));
         assert!(
             tools
                 .iter()
                 .any(|tool| tool["name"] == "onepassword_secret_resolve")
         );
+    }
+
+    #[tokio::test]
+    async fn local_agent_run_requires_approval_and_denial_starts_no_job() {
+        let root = tempfile::tempdir().unwrap();
+        let fake_agent_dir = tempfile::tempdir().unwrap();
+        let fake_executable = fake_agent_dir.path().join("codex");
+        std::fs::write(&fake_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake_executable).unwrap().permissions();
+        #[cfg(unix)]
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&fake_executable, permissions).unwrap();
+        let id = format!("local-agent-approval-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+
+        let request = json!({
+            "name": "local_agent_run",
+            "arguments": {
+                "session_id": id.clone(),
+                "agent": "codex",
+                "task": "approval-only test task",
+                "access": "read_only"
+            }
+        });
+        let task = tokio::spawn(async move {
+            let _fake_agent_dir = fake_agent_dir;
+            call_tool_with_test_local_agent_executable(&request, false, None, &fake_executable)
+                .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("local_agent_run did not request approval")
+            .expect("approval channel closed before local_agent_run request");
+        assert_eq!(prompt.request.operation, "local_agent_run");
+        assert!(prompt.request.detail.contains("task_preview:"));
+        assert!(prompt.request.detail.contains("approval-only test task"));
+        prompt.respond(false);
+
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("denied local_agent_run unexpectedly succeeded");
+        assert!(error.to_string().contains("user denied local_agent_run"));
+        assert!(snapshot_jobs_for_session(&id, 50).jobs.is_empty());
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]

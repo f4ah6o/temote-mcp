@@ -71,6 +71,8 @@ const CAPTURED_START_ENV_NAMES: &[&str] = &[
     "TEMOTE_MCP_KINTONE_CLI",
     "PATH",
     "HOME",
+    "CODEX_HOME",
+    "XDG_DATA_HOME",
     "TMPDIR",
     "LANG",
     "LC_ALL",

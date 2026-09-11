@@ -114,11 +114,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 46);
+  assert.equal(names.length, 47);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control"]) {
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "local_agent_run"]) {
     assert.equal(names.includes(required), true, required);
   }
   assert.deepEqual(
@@ -136,6 +136,18 @@ test("gateway routed tools and protocol versions match the Rust contract", () =>
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_status").annotations.openWorldHint, true);
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_start").inputSchema.required.includes("operation_id"), true);
   assert.deepEqual(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_control").inputSchema.properties.action.enum, ["steer", "resume", "interrupt"]);
+  const localAgent = PUBLIC_TOOLS.find((tool) => tool.name === "local_agent_run");
+  assert.deepEqual(localAgent.annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  });
+  assert.equal(localAgent.inputSchema.additionalProperties, false);
+  assert.deepEqual(localAgent.inputSchema.properties.agent.enum, ["codex", "opencode"]);
+  assert.deepEqual(localAgent.inputSchema.properties.access.enum, ["read_only", "workspace_write"]);
+  assert.equal(localAgent.inputSchema.properties.task.maxLength, 1048576);
+  assert.equal(localAgent.inputSchema.allOf[0].then.properties.task.maxLength, 65536);
   assert.equal(names.includes("without_sandbox"), false);
 });
 
@@ -1541,7 +1553,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 46);
+  assert.equal(rpc.result.tools.length, 47);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

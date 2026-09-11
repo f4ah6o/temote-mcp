@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,6 +18,193 @@ mod policy;
 
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
+pub(crate) const PROTECTED_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
+const MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_ENTRIES: usize = 2_000_000;
+const MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_DEPTH: usize = 64;
+const MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProtectedMetadataScanLimits {
+    pub(crate) max_entries: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) max_paths: usize,
+}
+
+const LOCAL_AGENT_PROTECTED_METADATA_SCAN_LIMITS: ProtectedMetadataScanLimits =
+    ProtectedMetadataScanLimits {
+        max_entries: MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_ENTRIES,
+        max_depth: MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_DEPTH,
+        max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+    };
+
+/// Returns the protected metadata paths below an existing writable root.
+///
+/// The first three paths are retained even when they do not exist so a child
+/// cannot create a top-level metadata entry after the sandbox starts. Existing
+/// nested metadata is discovered with symlink metadata; symbolic links are
+/// never followed, and protected directories are not traversed. The local-agent
+/// profile uses a bounded walk; when a nested subtree cannot be fully inspected
+/// within the bound, that subtree is returned as a read-only fallback. If the
+/// writable root itself cannot be inspected, the policy fails closed instead
+/// of silently leaving a writable gap.
+pub(crate) fn discover_protected_metadata_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    discover_protected_metadata_paths_with_limits(root, LOCAL_AGENT_PROTECTED_METADATA_SCAN_LIMITS)
+}
+
+pub(crate) fn discover_protected_metadata_paths_with_limits(
+    root: &Path,
+    limits: ProtectedMetadataScanLimits,
+) -> Result<Vec<PathBuf>> {
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("cannot resolve protected metadata root {}", root.display()))?;
+    anyhow::ensure!(
+        root.is_dir(),
+        "protected metadata root is not a directory: {}",
+        root.display()
+    );
+
+    let mut protected = PROTECTED_METADATA_NAMES
+        .iter()
+        .map(|name| root.join(name))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        protected.len() <= limits.max_paths,
+        "protected metadata path count exceeds {}",
+        limits.max_paths
+    );
+    let mut pending = vec![(root.clone(), 0usize)];
+    let mut scanned_entries = 0usize;
+
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                if directory == root {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot enumerate protected metadata root directory {}",
+                            directory.display()
+                        )
+                    });
+                }
+                add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                continue;
+            }
+        };
+        for entry in entries {
+            if scanned_entries >= limits.max_entries {
+                if directory == root {
+                    anyhow::bail!(
+                        "protected metadata scan exceeds {} entries at writable root {}",
+                        limits.max_entries,
+                        root.display()
+                    );
+                }
+                add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                break;
+            }
+            scanned_entries += 1;
+
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if directory == root {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "cannot read an entry while walking protected metadata root {}",
+                                directory.display()
+                            )
+                        });
+                    }
+                    add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                    break;
+                }
+            };
+            let path = entry.path();
+            anyhow::ensure!(
+                path.starts_with(&root),
+                "protected metadata scan escaped its root: {}",
+                path.display()
+            );
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    if directory == root {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "cannot inspect protected metadata scan entry {}",
+                                path.display()
+                            )
+                        });
+                    }
+                    add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                    break;
+                }
+            };
+            if is_protected_metadata_name(&entry.file_name()) {
+                if protected.contains(&path) {
+                    continue;
+                }
+                if protected.len() >= limits.max_paths {
+                    if directory == root {
+                        anyhow::bail!(
+                            "protected metadata path count exceeds {} at writable root {}",
+                            limits.max_paths,
+                            root.display()
+                        );
+                    }
+                    add_read_only_fallback(&mut protected, &root, &directory, limits.max_paths)?;
+                    break;
+                }
+                protected.push(path);
+                continue;
+            }
+
+            if metadata.file_type().is_dir() {
+                let child_depth = depth
+                    .checked_add(1)
+                    .context("protected metadata scan depth overflow")?;
+                if child_depth > limits.max_depth {
+                    add_read_only_fallback(&mut protected, &root, &path, limits.max_paths)?;
+                    continue;
+                }
+                pending.push((path, child_depth));
+            }
+        }
+    }
+
+    protected.sort();
+    protected.dedup();
+    Ok(protected)
+}
+
+fn add_read_only_fallback(
+    protected: &mut Vec<PathBuf>,
+    root: &Path,
+    directory: &Path,
+    max_paths: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        directory != root,
+        "protected metadata scan cannot safely bound writable root {}",
+        root.display()
+    );
+    if protected.iter().any(|path| directory.starts_with(path)) {
+        return Ok(());
+    }
+    protected.retain(|path| !path.starts_with(directory));
+    anyhow::ensure!(
+        protected.len() < max_paths,
+        "protected metadata fallback path count exceeds {max_paths}"
+    );
+    protected.push(directory.to_owned());
+    Ok(())
+}
+
+fn is_protected_metadata_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| PROTECTED_METADATA_NAMES.contains(&name))
+}
 
 pub fn protect_current_process_if_service_account_token_present() -> Result<()> {
     if std::env::var_os("OP_SERVICE_ACCOUNT_TOKEN").is_some() {
@@ -45,6 +233,15 @@ pub struct Output {
     pub truncated: bool,
 }
 
+/// Canonical filesystem scope for a local-agent invocation.
+pub struct LocalAgentScope<'a> {
+    pub writable_roots: &'a [PathBuf],
+    pub temporary_roots: &'a [PathBuf],
+    pub read_only_paths: &'a [PathBuf],
+    pub read_only_roots: &'a [PathBuf],
+    pub hidden_roots: &'a [PathBuf],
+}
+
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -52,6 +249,81 @@ pub async fn run(
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     run_with_metadata_roots(command, cwd, writable_roots, &[], stdin).await
+}
+
+/// Runs the structured local-agent broker profile.
+///
+/// Unlike the deliberately unrestricted host runners below, this profile
+/// keeps the filesystem read-only by default and only grants writes to the
+/// caller-selected workspace roots and the agent's private run state. Network
+/// access is enabled because Codex/OpenCode need to reach their model service.
+/// This is a fixed profile; public MCP callers cannot select a generic sandbox
+/// escape or alter its filesystem/network policy.
+pub async fn run_local_agent(
+    command: &[String],
+    cwd: &Path,
+    scope: LocalAgentScope<'_>,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+) -> Result<Output> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve local agent cwd {}", cwd.display()))?;
+    validate_writable_scope(&cwd, scope.writable_roots)?;
+    validate_local_agent_scope(
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.hidden_roots,
+    )?;
+
+    #[cfg(target_os = "macos")]
+    let spec = policy::SandboxSpec::local_agent(
+        &cwd,
+        scope.writable_roots,
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.hidden_roots,
+    )?;
+
+    #[cfg(target_os = "linux")]
+    let mut process = linux::local_agent_command(
+        command,
+        &cwd,
+        scope.writable_roots,
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.hidden_roots,
+    )?;
+
+    #[cfg(target_os = "macos")]
+    let mut process = macos::command(&spec, command)?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut process = {
+        anyhow::bail!(
+            "bounded local-agent execution is currently implemented for Linux and macOS only"
+        )
+    };
+
+    process
+        .kill_on_drop(true)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(environment)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process
+        .spawn()
+        .context("failed to start bounded local-agent command")?;
+    wait_with_limited_output(child, stdin).await
 }
 
 /// Runs a narrowly validated Git operation with write access to the repository
@@ -362,6 +634,83 @@ fn validate_writable_scope(cwd: &Path, writable_roots: &[PathBuf]) -> Result<()>
     Ok(())
 }
 
+fn validate_local_agent_scope(
+    temporary_roots: &[PathBuf],
+    read_only_paths: &[PathBuf],
+    read_only_roots: &[PathBuf],
+    hidden_roots: &[PathBuf],
+) -> Result<()> {
+    for root in temporary_roots {
+        let canonical = std::fs::canonicalize(root).with_context(|| {
+            format!(
+                "cannot resolve local agent temporary root {}",
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "local agent temporary root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent temporary root must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    for path in read_only_paths {
+        let canonical = std::fs::canonicalize(path).with_context(|| {
+            format!(
+                "cannot resolve local agent read-only path {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent read-only path must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    for root in read_only_roots {
+        let canonical = std::fs::canonicalize(root).with_context(|| {
+            format!(
+                "cannot resolve local agent read-only root {}",
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "local agent read-only root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent read-only root must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    for root in hidden_roots {
+        let canonical = std::fs::canonicalize(root).with_context(|| {
+            format!("cannot resolve local agent hidden root {}", root.display())
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "local agent hidden root is not a directory: {}",
+            root.display()
+        );
+        anyhow::ensure!(
+            canonical != Path::new("/"),
+            "local agent cannot hide the filesystem root"
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&canonical),
+            "local agent hidden root must not be inside protected metadata: {}",
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
 fn is_protected_metadata_location(path: &Path) -> bool {
     path.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
@@ -460,39 +809,40 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_service_account_bwrap() -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
+pub(crate) fn trusted_service_account_bwrap() -> Result<PathBuf> {
     for candidate in [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")] {
-        let Ok(path) = std::fs::canonicalize(candidate) else {
-            continue;
-        };
-        let metadata = std::fs::metadata(&path)
-            .with_context(|| format!("failed to inspect bubblewrap at {}", path.display()))?;
-        if !metadata.is_file()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o111 == 0
-            || metadata.mode() & 0o022 != 0
-        {
-            continue;
-        }
-        let mut trusted = true;
-        for ancestor in path.ancestors().skip(1) {
-            let metadata = std::fs::metadata(ancestor).with_context(|| {
-                format!("failed to inspect bubblewrap parent {}", ancestor.display())
-            })?;
-            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-                trusted = false;
-                break;
-            }
-        }
-        if trusted {
+        if let Some(path) = trusted_bwrap_candidate(candidate)? {
             return Ok(path);
         }
     }
-    anyhow::bail!(
-        "service-account target isolation requires a root-owned, non-writable /usr/bin/bwrap"
-    )
+    anyhow::bail!("Linux sandboxing requires a root-owned, non-writable /usr/bin/bwrap")
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_bwrap_candidate(candidate: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(path) = std::fs::canonicalize(candidate) else {
+        return Ok(None);
+    };
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("failed to inspect bubblewrap at {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Ok(None);
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = std::fs::metadata(ancestor).with_context(|| {
+            format!("failed to inspect bubblewrap parent {}", ancestor.display())
+        })?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(path))
 }
 
 pub async fn run_unrestricted_with_only_env(
@@ -822,6 +1172,19 @@ mod generic_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn untrusted_bwrap_candidate_is_rejected_even_when_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let fake = fixture.path().join("bwrap");
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(trusted_bwrap_candidate(&fake).unwrap().is_none());
+    }
+
     #[test]
     fn protected_metadata_detection_matches_component_reference_model() -> noprop::TestResult {
         const PROTECTED: [&str; 3] = [".git", ".agents", ".codex"];
@@ -847,6 +1210,152 @@ mod generic_tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn protected_metadata_walk_discovers_nested_entries_without_following_symlinks() -> Result<()> {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let nested = workspace.join("nested");
+        let deep = nested.join("deep");
+        let ordinary = workspace.join("ordinary");
+        std::fs::create_dir_all(workspace.join(".git/ignored"))?;
+        std::fs::create_dir_all(nested.join(".git"))?;
+        std::fs::create_dir_all(nested.join(".agents"))?;
+        std::fs::create_dir_all(&deep)?;
+        std::fs::write(deep.join(".codex"), b"metadata")?;
+        std::fs::create_dir_all(&ordinary)?;
+        std::fs::write(ordinary.join(".git"), b"gitdir: ../real-git")?;
+
+        #[cfg(unix)]
+        {
+            let external = fixture.path().join("external");
+            std::fs::create_dir_all(external.join(".codex"))?;
+            std::os::unix::fs::symlink(&external, workspace.join("linked"))?;
+        }
+
+        let workspace = std::fs::canonicalize(workspace)?;
+        let paths = discover_protected_metadata_paths(&workspace)?;
+        for expected in [
+            workspace.join(".git"),
+            workspace.join(".agents"),
+            workspace.join(".codex"),
+            workspace.join("nested/.git"),
+            workspace.join("nested/.agents"),
+            workspace.join("nested/deep/.codex"),
+            workspace.join("ordinary/.git"),
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "missing protected path {expected:?}"
+            );
+        }
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.ends_with(".git/ignored/.codex")),
+            "protected metadata directories must not be traversed"
+        );
+        #[cfg(unix)]
+        assert!(
+            !paths.iter().any(|path| path.ends_with("external/.codex")),
+            "symbolic-link directories must not be followed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protected_metadata_walk_falls_back_to_an_unscanned_nested_subtree() -> Result<()> {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let fallback = workspace.join("large");
+        std::fs::create_dir_all(&fallback)?;
+        std::fs::create_dir_all(fallback.join("nested/.git"))?;
+        std::fs::write(fallback.join("entry-0"), b"0")?;
+        std::fs::write(fallback.join("entry-1"), b"1")?;
+
+        let workspace = std::fs::canonicalize(workspace)?;
+        let fallback = workspace.join("large");
+        let paths = discover_protected_metadata_paths_with_limits(
+            &workspace,
+            ProtectedMetadataScanLimits {
+                // Keep the root deterministic: it contains only the subtree
+                // that must be replaced by a read-only fallback.
+                max_entries: 1,
+                max_depth: 64,
+                max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+            },
+        )?;
+
+        assert!(
+            paths.contains(&fallback),
+            "an unscanned nested subtree must become read-only"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(&fallback) && path != &fallback),
+            "fallback should replace narrower paths below the subtree"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn protected_metadata_walk_falls_back_at_its_depth_bound() -> Result<()> {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let mut current = workspace.clone();
+        for index in 0..=2 {
+            current.push(format!("level-{index}"));
+            std::fs::create_dir(&current)?;
+        }
+
+        let workspace = std::fs::canonicalize(workspace)?;
+        let paths = discover_protected_metadata_paths_with_limits(
+            &workspace,
+            ProtectedMetadataScanLimits {
+                max_entries: 64,
+                max_depth: 1,
+                max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+            },
+        )?;
+        assert!(paths.contains(&workspace.join("level-0/level-1")));
+        Ok(())
+    }
+
+    #[test]
+    fn protected_metadata_walk_fails_closed_when_a_root_bound_cannot_be_represented() -> Result<()>
+    {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        for index in 0..3 {
+            std::fs::create_dir(workspace.join(format!("entry-{index}")))?;
+        }
+
+        let limits = ProtectedMetadataScanLimits {
+            max_entries: 2,
+            max_depth: 64,
+            max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
+        };
+        assert!(
+            discover_protected_metadata_paths_with_limits(&workspace, limits).is_err(),
+            "an over-budget writable root must fail closed"
+        );
+        assert!(
+            discover_protected_metadata_paths_with_limits(
+                &workspace,
+                ProtectedMetadataScanLimits {
+                    max_entries: 64,
+                    max_depth: 64,
+                    max_paths: 2,
+                }
+            )
+            .is_err(),
+            "a path budget that cannot retain top-level masks must fail closed"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1561,6 +2070,166 @@ done
         )
         .await?;
         assert_ne!(network.status, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_local_agent_profile_bounds_workspace_writes() -> Result<()> {
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        let state = root.path().join("state");
+        let state_tmp = state.join("tmp");
+        let git = workspace.join(".git");
+        let agents = workspace.join(".agents");
+        let codex = workspace.join(".codex");
+        let nested_git = workspace.join("nested/.git");
+        let nested_agents = workspace.join("nested/.agents");
+        let nested_codex = workspace.join("nested/deep/.codex");
+        let ordinary_git = workspace.join("ordinary/.git");
+        std::fs::create_dir_all(&git)?;
+        std::fs::create_dir_all(&agents)?;
+        std::fs::create_dir_all(&codex)?;
+        std::fs::create_dir_all(&nested_git)?;
+        std::fs::create_dir_all(&nested_agents)?;
+        std::fs::create_dir_all(nested_codex.parent().context("nested .codex parent")?)?;
+        std::fs::create_dir_all(ordinary_git.parent().context("ordinary .git parent")?)?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::create_dir_all(&state_tmp)?;
+        std::fs::write(nested_git.join("existing"), b"protected")?;
+        std::fs::write(nested_agents.join("existing"), b"protected")?;
+        std::fs::write(&nested_codex, b"protected")?;
+        std::fs::write(&ordinary_git, b"protected")?;
+        let outside_secret = outside.join("secret");
+        std::fs::write(&outside_secret, b"not visible to the agent")?;
+
+        let state_file = state.join("state-file");
+        let state_file_argument = state_file.to_str().context("state path is not UTF-8")?;
+        let hidden_root = root.path().to_path_buf();
+        let write_script = "set -eu; printf allowed > allowed; if printf outside > ../outside/denied; then exit 11; fi; if printf git > .git/denied; then exit 12; fi; if printf agents > .agents/denied; then exit 13; fi; if printf codex > .codex/denied; then exit 14; fi; if printf nested-git > nested/.git/denied; then exit 15; fi; if printf nested-agents > nested/.agents/denied; then exit 16; fi; if printf nested-codex > nested/deep/.codex; then exit 17; fi; if printf ordinary-git > ordinary/.git; then exit 18; fi; printf state > \"$1\"; test -f allowed; test ! -e ../outside/denied; test ! -e .git/denied; test ! -e .agents/denied; test ! -e .codex/denied; test ! -e nested/.git/denied; test ! -e nested/.agents/denied; test \"$(cat nested/deep/.codex)\" = protected; test \"$(cat ordinary/.git)\" = protected; test -f \"$1\"";
+        let write_command = command(
+            "/bin/sh",
+            &["-c", write_script, "local-agent", state_file_argument],
+        );
+        let environment = HashMap::from([
+            ("HOME".to_owned(), state.to_string_lossy().into_owned()),
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            (
+                "TMPDIR".to_owned(),
+                state_tmp.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let write = run_local_agent(
+            &write_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: &[workspace.clone(), state.clone()],
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: &[],
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(write.status, 0, "{}", write.stderr);
+        assert_eq!(std::fs::read(nested_git.join("existing"))?, b"protected");
+        assert_eq!(std::fs::read(nested_agents.join("existing"))?, b"protected");
+        assert_eq!(std::fs::read(&nested_codex)?, b"protected");
+        assert_eq!(std::fs::read(&ordinary_git)?, b"protected");
+
+        let outside_secret_argument = outside_secret
+            .to_str()
+            .context("outside secret path is not UTF-8")?;
+        let read_outside_command = command(
+            "/bin/sh",
+            &[
+                "-c",
+                "if cat \"$1\" >/dev/null 2>&1; then exit 31; else exit 0; fi",
+                "local-agent",
+                outside_secret_argument,
+            ],
+        );
+        let read_outside = run_local_agent(
+            &read_outside_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(
+            read_outside.status, 0,
+            "outside read was unexpectedly visible: stdout={:?} stderr={:?}",
+            read_outside.stdout, read_outside.stderr
+        );
+
+        std::fs::remove_file(workspace.join("allowed"))?;
+        std::fs::remove_file(&state_file)?;
+        let read_only_script = "set -eu; if printf denied > allowed; then exit 21; fi; printf state > \"$1\"; test ! -e allowed; test -f \"$1\"";
+        let read_command = command(
+            "/bin/sh",
+            &["-c", read_only_script, "local-agent", state_file_argument],
+        );
+        let read_only = run_local_agent(
+            &read_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(read_only.status, 0, "{}", read_only.stderr);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let accepted = std::thread::spawn(move || {
+            for _ in 0..400 {
+                match listener.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            }
+            false
+        });
+        let network_script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{}; printf connected >&3",
+            address.port()
+        );
+        let network_command = command("/bin/bash", &["-c", &network_script]);
+        let network = run_local_agent(
+            &network_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(network.status, 0, "{}", network.stderr);
+        assert!(accepted.join().unwrap());
         Ok(())
     }
 }

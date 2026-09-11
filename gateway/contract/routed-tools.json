@@ -399,6 +399,86 @@
     },
     {
       "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "agent": {
+                  "const": "opencode"
+                }
+              },
+              "required": [
+                "agent"
+              ]
+            },
+            "then": {
+              "properties": {
+                "task": {
+                  "maxLength": 65536
+                }
+              }
+            }
+          }
+        ],
+        "properties": {
+          "access": {
+            "enum": [
+              "read_only",
+              "workspace_write"
+            ],
+            "type": "string"
+          },
+          "agent": {
+            "enum": [
+              "codex",
+              "opencode"
+            ],
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "profile": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "agent",
+          "task",
+          "access"
+        ],
+        "type": "object"
+      },
+      "name": "local_agent_run"
+    },
+    {
+      "annotations": {
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,

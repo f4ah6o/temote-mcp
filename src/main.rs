@@ -25,6 +25,7 @@ mod kintone_mcp;
 mod lifecycle;
 mod line_diff;
 mod line_protocol;
+mod local_agent;
 #[cfg(feature = "network")]
 mod local_oauth;
 mod mcp;

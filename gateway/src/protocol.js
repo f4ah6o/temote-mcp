@@ -6,6 +6,9 @@ export const SUPPORTED_LEGACY_PROTOCOL_VERSIONS = new Set([
   "2024-11-05",
 ]);
 
+const MAX_CODEX_TASK_BYTES = 1048576;
+const MAX_OPENCODE_TASK_BYTES = 65536;
+
 const SESSION_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}$/;
 const HOST_ID_PATTERN = /^(?=.{1,128}$)(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$/;
 
@@ -145,6 +148,31 @@ function workHandoffSchema() {
     { ...sessionProperty, checkpoint_id: { type: "string" } },
     ["session_id"],
   );
+}
+
+function localAgentSchema() {
+  const value = schema(
+    {
+      ...sessionProperty,
+      agent: { type: "string", enum: ["codex", "opencode"] },
+      task: { type: "string", minLength: 1, maxLength: MAX_CODEX_TASK_BYTES },
+      cwd: { type: "string" },
+      access: { type: "string", enum: ["read_only", "workspace_write"] },
+      model: { type: "string", minLength: 1, maxLength: 256 },
+      profile: { type: "string", minLength: 1, maxLength: 128 },
+    },
+    ["session_id", "agent", "task", "access"],
+  );
+  value.allOf = [
+    {
+      if: {
+        properties: { agent: { const: "opencode" } },
+        required: ["agent"],
+      },
+      then: { properties: { task: { maxLength: MAX_OPENCODE_TASK_BYTES } } },
+    },
+  ];
+  return value;
 }
 
 function tool(name, title, description, annotations, inputSchema) {
@@ -288,6 +316,13 @@ export const PUBLIC_TOOLS = [
       },
       ["session_id", "task_id", "operation_id", "action"],
     ),
+  ),
+  tool(
+    "local_agent_run",
+    "Run a local coding agent",
+    "Run a verified Codex or OpenCode non-interactive agent in the selected host session with canonical workspace scope, bounded task/output, isolated agent state, and local approval.",
+    networkMutation,
+    localAgentSchema(),
   ),
   tool(
     "get_image",

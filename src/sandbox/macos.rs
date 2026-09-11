@@ -10,9 +10,16 @@ const BASE_POLICY: &str = include_str!("macos_base_policy.sbpl");
 
 pub(super) fn command(spec: &SandboxSpec, argv: &[String]) -> Result<Command> {
     anyhow::ensure!(!argv.is_empty(), "command must not be empty");
-    let (write_policy, definitions) = build_write_policy(spec)?;
+    let (read_policy, mut definitions) = build_read_policy(spec)?;
+    let (write_policy, write_definitions) = build_write_policy(spec)?;
+    definitions.extend(write_definitions);
+    let network_policy = if spec.network_access() {
+        "(allow network-outbound)"
+    } else {
+        ""
+    };
     let policy = format!(
-        "{BASE_POLICY}\n; allow read-only file operations\n(allow file-read*)\n{write_policy}\n"
+        "{BASE_POLICY}\n; allow read-only file operations\n{read_policy}\n{network_policy}\n{write_policy}\n"
     );
 
     let mut args = vec!["-p".to_owned(), policy];
@@ -28,6 +35,52 @@ pub(super) fn command(spec: &SandboxSpec, argv: &[String]) -> Result<Command> {
     let mut command = Command::new(MACOS_PATH_TO_SEATBELT_EXECUTABLE);
     command.args(args);
     Ok(command)
+}
+
+fn build_read_policy(spec: &SandboxSpec) -> Result<(String, Vec<(String, PathBuf)>)> {
+    if spec.hidden_roots().is_empty() {
+        return Ok(("(allow file-read*)".to_owned(), Vec::new()));
+    }
+
+    let mut hidden_requirements = Vec::new();
+    let mut definitions = Vec::new();
+    for (index, root) in spec.hidden_roots().iter().enumerate() {
+        ensure_utf8(root)?;
+        let key = format!("HIDDEN_ROOT_{index}");
+        definitions.push((key.clone(), root.clone()));
+        hidden_requirements.push(format!("(require-not (subpath (param \"{key}\")))"));
+    }
+    let mut clauses = vec![format!(
+        "(allow file-read* (require-all {}))",
+        hidden_requirements.join(" ")
+    )];
+
+    let mut visible_roots = spec.writable_roots().to_vec();
+    visible_roots.extend(spec.read_only_roots().iter().cloned());
+    visible_roots.sort();
+    visible_roots.dedup();
+    for (index, root) in visible_roots.iter().enumerate() {
+        if !spec
+            .hidden_roots()
+            .iter()
+            .any(|hidden| root.starts_with(hidden))
+        {
+            continue;
+        }
+        ensure_utf8(root)?;
+        let key = format!("VISIBLE_ROOT_{index}");
+        definitions.push((key.clone(), root.clone()));
+        clauses.push(format!("(allow file-read* (subpath (param \"{key}\")))"));
+        // Seatbelt must be able to stat each directory on the way to a
+        // re-exposed root, even though the containing hidden root remains
+        // unreadable. Metadata access does not allow directory listing or
+        // file contents, so this does not re-expose hidden siblings.
+        clauses.push(format!(
+            "(allow file-read-metadata (path-ancestors (param \"{key}\")))"
+        ));
+    }
+
+    Ok((clauses.join("\n"), definitions))
 }
 
 fn build_write_policy(spec: &SandboxSpec) -> Result<(String, Vec<(String, PathBuf)>)> {
@@ -150,6 +203,76 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn generated_write_policy_protects_nested_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("nested/.git")).unwrap();
+        std::fs::create_dir_all(workspace.join("nested/.agents")).unwrap();
+        std::fs::create_dir_all(workspace.join("nested/deep")).unwrap();
+        std::fs::write(workspace.join("nested/deep/.codex"), b"metadata").unwrap();
+        std::fs::create_dir_all(workspace.join("ordinary")).unwrap();
+        std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
+
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let spec = SandboxSpec::local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let (policy, definitions) = build_write_policy(&spec).unwrap();
+        let defined_paths = definitions
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for expected in [
+            workspace.join("nested/.git"),
+            workspace.join("nested/.agents"),
+            workspace.join("nested/deep/.codex"),
+            workspace.join("ordinary/.git"),
+        ] {
+            assert!(
+                defined_paths.contains(&expected),
+                "missing nested protected path {expected:?}"
+            );
+            assert!(
+                !policy.contains(expected.to_string_lossy().as_ref()),
+                "raw nested protected path leaked into Seatbelt policy: {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_read_policy_allows_only_selected_hidden_root_ancestors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let hidden = fixture.path().join("hidden");
+        let selected = hidden.join("repo/crate");
+        std::fs::create_dir_all(&selected).unwrap();
+        let hidden = std::fs::canonicalize(hidden).unwrap();
+        let selected = std::fs::canonicalize(selected).unwrap();
+
+        let spec = SandboxSpec::local_agent(
+            &selected,
+            std::slice::from_ref(&selected),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+        let (policy, definitions) = build_read_policy(&spec).unwrap();
+
+        assert!(definitions.iter().any(|(_, path)| path == &hidden));
+        assert!(definitions.iter().any(|(_, path)| path == &selected));
+        assert!(policy.contains("(allow file-read-metadata (path-ancestors"));
+        assert!(policy.contains("(allow file-read* (subpath"));
     }
 
     #[test]
