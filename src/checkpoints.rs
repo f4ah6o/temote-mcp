@@ -892,7 +892,7 @@ mod tests {
             permitted_directories: vec![cwd],
             started_at: 123,
             process_id: 456,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         }
     }
 

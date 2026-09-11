@@ -1,6 +1,6 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open / implementation not started
+Status: open / Slice A (docs decision table + deterministic docs check) implemented in the current worktree; optional preflight and live acceptance not started
 Created: 2026-09-11
 Updated: 2026-09-11
 Priority: P1 operational correctness
@@ -141,3 +141,12 @@ Live acceptance（実装完了の repository-local gate とは分離）:
 ## Recommended next slice
 
 **Slice A only.** 実 Cloudflare mutation を伴わず、deployment target の選択・検証契約を先に固定する。
+
+## Implementation notes (2026-09-11)
+
+Slice A is implemented in the current worktree:
+
+- `docs/gateway.md` / `docs/gateway.ja.md` now contain the custom-domain vs existing-DNS + Worker-route decision table, the `workers_dev = false` requirement, the `No targets deployed` failure rule, `--keep-vars` and secret-boundary guidance, read-only post-deploy verification (`wrangler deployments status`, `/healthz` service identity), and exact-pattern rollback that leaves DNS, Access, and Tunnel untouched.
+- `tests/gateway_deployment_docs.rs` deterministically checks both documents for the required operator contract and rejects any `workers_dev = true` guidance.
+
+No Cloudflare route, DNS, Access, or Tunnel state was changed.

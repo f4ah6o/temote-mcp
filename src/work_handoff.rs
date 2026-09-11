@@ -204,7 +204,7 @@ mod tests {
             permitted_directories: vec![cwd],
             started_at: 7,
             process_id: 11,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         }
     }
 

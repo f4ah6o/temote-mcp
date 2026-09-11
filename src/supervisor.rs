@@ -16,15 +16,64 @@ const MAX_AUTOMATIC_RESTARTS: u32 = 5;
 const MAX_RESTART_BACKOFF_SECONDS: u64 = 30;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "UpgradeSessionPlanWire", into = "UpgradeSessionPlanWire")]
 pub struct UpgradeSessionPlan {
     pub session_id: String,
     pub cwd: PathBuf,
     pub permitted_directories: Vec<PathBuf>,
-    pub yolo: bool,
+    pub permission_mode: config::PermissionMode,
     pub logical_path: Option<String>,
     pub restart_policy: String,
     pub public: bool,
     pub restart_context_keys: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UpgradeSessionPlanWire {
+    session_id: String,
+    cwd: PathBuf,
+    permitted_directories: Vec<PathBuf>,
+    #[serde(default)]
+    permission_mode: Option<config::PermissionMode>,
+    #[serde(default)]
+    yolo: bool,
+    logical_path: Option<String>,
+    restart_policy: String,
+    public: bool,
+    restart_context_keys: Vec<String>,
+}
+
+impl From<UpgradeSessionPlanWire> for UpgradeSessionPlan {
+    fn from(wire: UpgradeSessionPlanWire) -> Self {
+        Self {
+            session_id: wire.session_id,
+            cwd: wire.cwd,
+            permitted_directories: wire.permitted_directories,
+            permission_mode: wire
+                .permission_mode
+                .unwrap_or_else(|| config::PermissionMode::from_legacy_yolo(wire.yolo)),
+            logical_path: wire.logical_path,
+            restart_policy: wire.restart_policy,
+            public: wire.public,
+            restart_context_keys: wire.restart_context_keys,
+        }
+    }
+}
+
+impl From<UpgradeSessionPlan> for UpgradeSessionPlanWire {
+    fn from(plan: UpgradeSessionPlan) -> Self {
+        Self {
+            session_id: plan.session_id,
+            cwd: plan.cwd,
+            permitted_directories: plan.permitted_directories,
+            permission_mode: Some(plan.permission_mode),
+            yolo: plan.permission_mode.is_yolo(),
+            logical_path: plan.logical_path,
+            restart_policy: plan.restart_policy,
+            public: plan.public,
+            restart_context_keys: plan.restart_context_keys,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,7 +111,7 @@ struct UpgradePlanOptions {
 #[derive(Clone)]
 struct RestartSpec {
     cwd: PathBuf,
-    yolo: bool,
+    permission_mode: config::PermissionMode,
     logical_path: Option<String>,
     environment: approvals::CapturedStartEnvironment,
     public: bool,
@@ -73,6 +122,7 @@ pub struct ManagedSessionInfo {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
     pub status: &'static str,
+    pub permission_mode: config::PermissionMode,
     pub yolo: bool,
 }
 
@@ -203,7 +253,7 @@ impl SessionSupervisor {
             .start_resolved(
                 cwd,
                 id.clone(),
-                false,
+                config::PermissionMode::Ask,
                 Some(logical_path.to_owned()),
                 environment,
                 public,
@@ -224,15 +274,22 @@ impl SessionSupervisor {
         self.reap_finished().await;
         let cwd = config::canonical_directory(cwd)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, yolo, None, environment, false)
-            .await
+        self.start_resolved(
+            cwd,
+            id,
+            config::PermissionMode::from_legacy_yolo(yolo),
+            None,
+            environment,
+            false,
+        )
+        .await
     }
 
     async fn start_resolved(
         &self,
         cwd: std::path::PathBuf,
         id: String,
-        yolo: bool,
+        permission_mode: config::PermissionMode,
         logical_path: Option<String>,
         environment: approvals::CapturedStartEnvironment,
         public: bool,
@@ -260,7 +317,7 @@ impl SessionSupervisor {
 
         let spec = RestartSpec {
             cwd: cwd.clone(),
-            yolo,
+            permission_mode,
             logical_path: logical_path.clone(),
             environment: environment.clone(),
             public,
@@ -268,7 +325,7 @@ impl SessionSupervisor {
         let handle = approvals::spawn_runtime_with_logical_path_and_environment(
             &cwd,
             Some(&id),
-            yolo,
+            permission_mode,
             self.approval_sender.clone(),
             logical_path,
             environment,
@@ -279,7 +336,8 @@ impl SessionSupervisor {
             session_id: id.clone(),
             cwd: handle.cwd().to_owned(),
             status: "active",
-            yolo,
+            permission_mode,
+            yolo: permission_mode.is_yolo(),
         };
         self.sessions.lock().await.insert(id.clone(), handle);
         self.restart_specs.lock().await.insert(id.clone(), spec);
@@ -297,7 +355,34 @@ impl SessionSupervisor {
         self.stop_owned(session_id, true).await
     }
 
-    pub async fn set_permission_yolo(&self, session_id: &str, value: bool) -> Result<()> {
+    pub async fn forget_session(
+        &self,
+        session_id: &str,
+    ) -> Result<config::ForgottenSessionArtifacts> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        anyhow::ensure!(
+            !self.sessions.lock().await.contains_key(session_id),
+            "session {session_id} is managed by this supervisor process; stop it before forgetting it"
+        );
+        anyhow::ensure!(
+            !self.restart_specs.lock().await.contains_key(session_id),
+            "session {session_id} has a pending restart or upgrade context; stop it before forgetting it"
+        );
+        anyhow::ensure!(
+            !self.public_sessions.lock().await.contains(session_id),
+            "session {session_id} is still registered as a public session; stop it before forgetting it"
+        );
+        config::forget_session_artifacts(session_id).await
+    }
+
+    pub async fn set_permission_mode(
+        &self,
+        session_id: &str,
+        permission_mode: config::PermissionMode,
+    ) -> Result<()> {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
@@ -306,10 +391,10 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.set_yolo(value).await?;
+        handle.set_permission_mode(permission_mode).await?;
         drop(sessions);
         if let Some(spec) = self.restart_specs.lock().await.get_mut(session_id) {
-            spec.yolo = value;
+            spec.permission_mode = permission_mode;
         }
         Ok(())
     }
@@ -448,7 +533,7 @@ impl SessionSupervisor {
                 .start_resolved(
                     spec.cwd.clone(),
                     id.clone(),
-                    spec.yolo,
+                    spec.permission_mode,
                     spec.logical_path.clone(),
                     spec.environment.clone(),
                     spec.public,
@@ -637,7 +722,7 @@ impl SessionSupervisor {
                         session_id: id.clone(),
                         cwd: snapshot.cwd,
                         permitted_directories: snapshot.permitted_directories,
-                        yolo: snapshot.yolo,
+                        permission_mode: snapshot.permission_mode,
                         logical_path: spec.logical_path,
                         restart_policy: lifecycle.restart_policy,
                         public: self.public_sessions.lock().await.contains(&id),
@@ -775,7 +860,7 @@ impl SessionSupervisor {
                     .start_resolved(
                         spec.cwd,
                         planned.session_id.clone(),
-                        spec.yolo,
+                        spec.permission_mode,
                         spec.logical_path,
                         spec.environment,
                         spec.public,
@@ -911,7 +996,7 @@ impl SessionSupervisor {
                 .start_resolved(
                     cwd,
                     planned.session_id.clone(),
-                    planned.yolo,
+                    planned.permission_mode,
                     planned.logical_path.clone(),
                     environment,
                     planned.public,
@@ -948,7 +1033,7 @@ impl SessionSupervisor {
             let metadata = config::read_session_metadata(&planned.session_id).await?;
             anyhow::ensure!(
                 metadata.cwd == planned.cwd
-                    && metadata.yolo == planned.yolo
+                    && metadata.permission_mode == planned.permission_mode
                     && metadata.permitted_directories == planned.permitted_directories,
                 "restored session {} metadata does not match the upgrade plan",
                 planned.session_id
@@ -1122,7 +1207,8 @@ mod tests {
             .unwrap();
         assert_eq!(first.status, "active");
         assert_eq!(second.status, "active");
-        assert!(!first.yolo && !second.yolo);
+        assert_eq!(first.permission_mode, config::PermissionMode::Ask);
+        assert_eq!(second.permission_mode, config::PermissionMode::Ask);
         assert!(config::session_is_active(&first_id).await.unwrap());
         assert!(config::session_is_active(&second_id).await.unwrap());
 
@@ -1599,7 +1685,10 @@ mod tests {
             .unwrap();
         let extra_root = std::fs::canonicalize(_temp.path().join("volume/repo-b")).unwrap();
         supervisor.allow_directory(&id, extra_root).await.unwrap();
-        supervisor.set_permission_yolo(&id, true).await.unwrap();
+        supervisor
+            .set_permission_mode(&id, config::PermissionMode::Yolo)
+            .await
+            .unwrap();
         supervisor
             .set_restart_policy(&id, "on-failure")
             .await
@@ -1611,7 +1700,10 @@ mod tests {
             .unwrap();
         assert!(plan.handoff_required);
         assert_eq!(plan.sessions.len(), 1);
-        assert!(plan.sessions[0].yolo);
+        assert_eq!(
+            plan.sessions[0].permission_mode,
+            config::PermissionMode::Yolo
+        );
         assert_eq!(plan.sessions[0].restart_policy, "on-failure");
         assert_eq!(
             plan.sessions[0].restart_context_keys,
@@ -1631,7 +1723,7 @@ mod tests {
             .unwrap();
         assert!(config::session_is_active(&id).await.unwrap());
         let metadata = config::read_session_metadata(&id).await.unwrap();
-        assert!(metadata.yolo);
+        assert_eq!(metadata.permission_mode, config::PermissionMode::Yolo);
         let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
         assert_eq!(lifecycle.restart_policy, "on-failure");
 
@@ -1839,5 +1931,122 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not configured"));
+    }
+
+    fn plan_with_mode(permission_mode: config::PermissionMode) -> UpgradeSessionPlan {
+        UpgradeSessionPlan {
+            session_id: "plan-mode".to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            permitted_directories: Vec::new(),
+            permission_mode,
+            logical_path: None,
+            restart_policy: "never".to_owned(),
+            public: false,
+            restart_context_keys: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_agent_permission_mode_survives_supervisor_handoff() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots.clone());
+        let id = format!("upgrade-agent-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::from_values(BTreeMap::from([(
+            "PATH".to_owned(),
+            "/usr/bin:/bin".to_owned(),
+        )]))
+        .unwrap();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        supervisor
+            .set_permission_mode(&id, config::PermissionMode::Agent)
+            .await
+            .unwrap();
+
+        let plan = supervisor
+            .build_upgrade_plan(env!("CARGO_PKG_VERSION"), 1, 1, &environment, true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.sessions[0].permission_mode,
+            config::PermissionMode::Agent
+        );
+        supervisor.quiesce_for_upgrade(&plan).await.unwrap();
+        supervisor.drain_for_upgrade(&plan).await.unwrap();
+
+        let (replacement, _replacement_approvals) = SessionSupervisor::new(roots);
+        replacement
+            .restore_upgrade_plan(&plan, &environment)
+            .await
+            .unwrap();
+        let metadata = config::read_session_metadata(&id).await.unwrap();
+        assert_eq!(metadata.permission_mode, config::PermissionMode::Agent);
+        assert!(!metadata.yolo());
+        replacement.shutdown().await.unwrap();
+        supervisor.clear_upgrade_fence();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn forget_session_removes_stopped_session_artifacts() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("forget-stopped-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        supervisor.stop(&id).await.unwrap();
+        assert!(config::session_path(&id).unwrap().exists());
+
+        let forgotten = supervisor.forget_session(&id).await.unwrap();
+        assert_eq!(forgotten.session_id, id);
+        assert!(forgotten.metadata_removed);
+        assert!(forgotten.lifecycle_removed);
+        assert!(!config::session_path(&id).unwrap().exists());
+        assert!(!config::session_lifecycle_path(&id).unwrap().exists());
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn forget_session_refuses_a_live_session_without_partial_cleanup() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("forget-live-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+
+        let error = supervisor.forget_session(&id).await.unwrap_err();
+        assert!(error.to_string().contains("stop it before forgetting"));
+        assert!(config::session_path(&id).unwrap().exists());
+        assert!(config::session_lifecycle_path(&id).unwrap().exists());
+        supervisor.stop(&id).await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[test]
+    fn upgrade_plan_permission_mode_round_trips_and_maps_legacy_yolo() {
+        for (mode, text) in [
+            (config::PermissionMode::Ask, "ask"),
+            (config::PermissionMode::Agent, "agent"),
+            (config::PermissionMode::Yolo, "yolo"),
+        ] {
+            let encoded = serde_json::to_value(plan_with_mode(mode)).unwrap();
+            assert_eq!(encoded["permission_mode"], text);
+            assert_eq!(encoded["yolo"], mode.is_yolo());
+            let decoded: UpgradeSessionPlan = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.permission_mode, mode);
+        }
+
+        let legacy: UpgradeSessionPlan = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy-plan",
+            "cwd": "/tmp",
+            "permitted_directories": [],
+            "yolo": true,
+            "logical_path": null,
+            "restart_policy": "never",
+            "public": false,
+            "restart_context_keys": [],
+        }))
+        .unwrap();
+        assert_eq!(legacy.permission_mode, config::PermissionMode::Yolo);
     }
 }

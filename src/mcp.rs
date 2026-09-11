@@ -707,7 +707,7 @@ async fn call_tool_with_local_agent_executable(
     }
     let session = config::load_session(&session_id).await?;
     anyhow::ensure!(
-        !public || !session.yolo,
+        !public || !session.yolo(),
         "yolo sessions are unavailable on the public MCP endpoint"
     );
     match name {
@@ -839,7 +839,7 @@ async fn call_tool_with_local_agent_executable(
                 .map(Uuid::parse_str)
                 .transpose()
                 .context("retry_group must be a UUID")?;
-            let approved = if session.yolo {
+            let approved = if session.yolo() {
                 true
             } else {
                 approvals::request(
@@ -1209,7 +1209,7 @@ async fn authorize_codex_operation(
     detail: String,
     metadata: BTreeMap<String, String>,
 ) -> Result<()> {
-    if session.yolo {
+    if session.yolo() {
         return Ok(());
     }
     let approved = approvals::request_with_metadata(
@@ -1681,7 +1681,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         "temote-mcp-write".to_owned(),
         absolute.display().to_string(),
     ];
-    let result = if session.yolo {
+    let result = if session.yolo() {
         tokio::fs::write(&absolute, content)
             .await
             .with_context(|| format!("failed to write {}", absolute.display()))
@@ -2002,7 +2002,7 @@ async fn run_git_and_report(
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
-    let output = if session.yolo {
+    let output = if session.yolo() {
         sandbox::run_unrestricted(&command, &cwd, None).await
     } else {
         let git_roots = sandbox::git_metadata_roots(&cwd)?;
@@ -2165,7 +2165,7 @@ async fn spawn_sandboxed_command(
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
-    let yolo = session.yolo;
+    let yolo = session.yolo();
     let slot = reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
@@ -4064,7 +4064,7 @@ mod tests {
             permitted_directories: vec![cwd],
             started_at: 1,
             process_id: 1,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
         config::save_session(&session).await.unwrap();
 
@@ -4168,7 +4168,7 @@ mod tests {
             permitted_directories: vec![root.clone()],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
 
         test_support::run(0x4749_5450_4154_4801, 512, |ctx| {
@@ -4344,7 +4344,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let other = config::Session {
                 id: other_id,
@@ -4352,7 +4352,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion {
@@ -4400,7 +4400,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let other = config::Session {
                 id: other_id,
@@ -4408,7 +4408,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -4451,7 +4451,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -4528,7 +4528,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -4586,7 +4586,7 @@ mod tests {
             permitted_directories: vec![config::canonical_directory(cwd.path()).unwrap()],
             started_at: 1,
             process_id: 2,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
         let marker = "denied-secret-sentinel";
         let request = checkpoints::parse_save_request(&json!({
@@ -4839,7 +4839,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         assert!(job_list(&json!({"session_id":session.id,"limit":1}), &session).is_ok());
         assert!(job_list(&json!({"session_id":session.id,"limit":128}), &session).is_ok());
@@ -4947,7 +4947,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         let job_id = Uuid::new_v4();
         let completion = Arc::new(Mutex::new(JobCompletion {
@@ -4984,7 +4984,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         let job_id = Uuid::new_v4();
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
@@ -5018,7 +5018,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         let job_id = Uuid::new_v4();
         let handle = tokio::spawn(async { std::future::pending::<()>().await });

@@ -1283,7 +1283,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         }
     }
 
@@ -1316,7 +1316,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let mut session = session(root.path());
-        session.yolo = true;
+        session.permission_mode = config::PermissionMode::Yolo;
         let mut value = args("codex", "workspace_write");
         value["cwd"] = Value::String(outside.path().to_string_lossy().into_owned());
         assert!(resolve_cwd(&session, Some(Path::new(value["cwd"].as_str().unwrap()))).is_err());
@@ -1974,5 +1974,129 @@ mod tests {
             .revalidate_with_executable(&session, &candidate)
             .unwrap_err();
         assert!(error.to_string().contains("target changed"));
+    }
+
+    struct VitePlusFixture {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        workspace: PathBuf,
+        candidate: PathBuf,
+        target: PathBuf,
+        package_store: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn vite_plus_shaped_fixture() -> VitePlusFixture {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let bin = home.join("bin");
+        let version_bin = home.join("0.2.9/bin");
+        let package_store = home.join("packages/@openai/codex/install");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&version_bin).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(package_store.join("bin")).unwrap();
+        fs::create_dir_all(package_store.join("lib/node_modules/@openai/codex/bin")).unwrap();
+
+        let target = version_bin.join("vp");
+        make_executable_with_contents(&target, "#!/bin/sh\nexit 0\n");
+        symlink(Path::new("../current/bin/vp"), bin.join("codex")).unwrap();
+        symlink(Path::new("0.2.9"), home.join("current")).unwrap();
+        symlink(
+            Path::new("../lib/node_modules/@openai/codex/bin/codex.js"),
+            package_store.join("bin/codex"),
+        )
+        .unwrap();
+        fs::write(
+            package_store.join("lib/node_modules/@openai/codex/bin/codex.js"),
+            b"// package runtime\n",
+        )
+        .unwrap();
+
+        VitePlusFixture {
+            _root: root,
+            home,
+            workspace,
+            candidate: bin.join("codex"),
+            target,
+            package_store,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_shaped_launcher_resolves_through_current_symlink() {
+        let fixture = vite_plus_shaped_fixture();
+        let session = session(&fixture.workspace);
+        let environment = HashMap::from([
+            (
+                "HOME".to_owned(),
+                fixture.home.to_string_lossy().into_owned(),
+            ),
+            (
+                "PATH".to_owned(),
+                fixture.home.join("bin").to_string_lossy().into_owned(),
+            ),
+        ]);
+
+        let resolved = resolve_executable_details(Agent::Codex, &environment, &session).unwrap();
+        assert_eq!(resolved.runtime, fixture.candidate);
+        assert_eq!(
+            resolved.canonical,
+            fs::canonicalize(&fixture.target).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_shaped_launcher_exposes_only_bin_roots_today() {
+        let fixture = vite_plus_shaped_fixture();
+        let session = session(&fixture.workspace);
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &fixture.candidate)
+                .unwrap();
+
+        let roots = executable_read_only_roots(&prepared).unwrap();
+        let canonical_bin = fs::canonicalize(fixture.home.join("bin")).unwrap();
+        let canonical_version_bin = fs::canonicalize(fixture.home.join("0.2.9/bin")).unwrap();
+        assert!(roots.contains(&canonical_bin));
+        assert!(roots.contains(&canonical_version_bin));
+        assert!(
+            !roots.contains(&fs::canonicalize(&fixture.home).unwrap()),
+            "the intermediate `current` symlink parent is not exposed"
+        );
+        assert!(
+            !roots.contains(&fs::canonicalize(fixture.home.join("packages")).unwrap()),
+            "package store must not be exposed until the launcher dependency closure is implemented"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "reproduces the Vite+ package-store sandbox gap for issues/open/20260911-local-agent-vp-installed-codex-runtime.md"]
+    async fn vite_plus_launcher_cannot_read_package_store_in_local_agent_sandbox() {
+        let fixture = vite_plus_shaped_fixture();
+        let store_file = fixture
+            .package_store
+            .join("lib/node_modules/@openai/codex/bin/codex.js");
+        let script = format!(
+            "#!/bin/sh\nif [ -r \"{}\" ]; then\n  exit 0\nfi\necho 'package store is not visible' >&2\nexit 1\n",
+            store_file.display()
+        );
+        make_executable_with_contents(&fixture.target, &script);
+
+        let session = session(&fixture.workspace);
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &fixture.candidate)
+                .unwrap();
+        let output = run(prepared).await.unwrap();
+        assert_eq!(
+            output.status, 0,
+            "expected the launcher to read its package store: {}",
+            output.stderr
+        );
     }
 }

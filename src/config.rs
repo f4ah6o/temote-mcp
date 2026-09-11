@@ -10,6 +10,19 @@ const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SESSION_PROBE_RESPONSE_BYTES: usize = 64;
 const MAX_SESSION_METADATA_BYTES: usize = 64 * 1024;
 
+fn file_type_is_socket(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_socket()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleStatus {
@@ -18,6 +31,106 @@ pub enum LifecycleStatus {
     Stopping,
     Stopped,
     Crashed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    #[default]
+    Ask,
+    Agent,
+    Yolo,
+}
+
+impl PermissionMode {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "ask" => Ok(Self::Ask),
+            "agent" => Ok(Self::Agent),
+            "yolo" => Ok(Self::Yolo),
+            _ => anyhow::bail!("unknown permission mode {value:?}; expected ask, agent, or yolo"),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Agent => "agent",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    pub fn from_legacy_yolo(yolo: bool) -> Self {
+        if yolo { Self::Yolo } else { Self::Ask }
+    }
+
+    pub fn is_yolo(self) -> bool {
+        matches!(self, Self::Yolo)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(from = "SessionWire", into = "SessionWire")]
+pub struct Session {
+    pub id: String,
+    pub cwd: PathBuf,
+    pub permitted_directories: Vec<PathBuf>,
+    pub started_at: u64,
+    pub process_id: u32,
+    pub permission_mode: PermissionMode,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionWire {
+    id: String,
+    cwd: PathBuf,
+    #[serde(default)]
+    permitted_directories: Vec<PathBuf>,
+    #[serde(default)]
+    started_at: u64,
+    #[serde(default)]
+    process_id: u32,
+    #[serde(default)]
+    permission_mode: Option<PermissionMode>,
+    #[serde(default)]
+    yolo: bool,
+}
+
+impl From<SessionWire> for Session {
+    fn from(wire: SessionWire) -> Self {
+        Self {
+            id: wire.id,
+            cwd: wire.cwd,
+            permitted_directories: wire.permitted_directories,
+            started_at: wire.started_at,
+            process_id: wire.process_id,
+            permission_mode: wire
+                .permission_mode
+                .unwrap_or_else(|| PermissionMode::from_legacy_yolo(wire.yolo)),
+        }
+    }
+}
+
+impl From<Session> for SessionWire {
+    fn from(session: Session) -> Self {
+        Self {
+            id: session.id,
+            cwd: session.cwd,
+            permitted_directories: session.permitted_directories,
+            started_at: session.started_at,
+            process_id: session.process_id,
+            permission_mode: Some(session.permission_mode),
+            yolo: session.permission_mode.is_yolo(),
+        }
+    }
+}
+
+impl Session {
+    pub fn yolo(&self) -> bool {
+        self.permission_mode.is_yolo()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,20 +168,6 @@ impl SessionLifecycle {
             restart_limit_reason: None,
         }
     }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub id: String,
-    pub cwd: PathBuf,
-    #[serde(default)]
-    pub permitted_directories: Vec<PathBuf>,
-    #[serde(default)]
-    pub started_at: u64,
-    #[serde(default)]
-    pub process_id: u32,
-    #[serde(default)]
-    pub yolo: bool,
 }
 
 pub fn state_dir() -> Result<PathBuf> {
@@ -150,7 +249,16 @@ pub fn session_id(id: Option<&str>) -> Result<String> {
     Ok(id)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn new_session(cwd: &Path, id: Option<&str>, yolo: bool) -> Result<Session> {
+    new_session_with_mode(cwd, id, PermissionMode::from_legacy_yolo(yolo))
+}
+
+pub fn new_session_with_mode(
+    cwd: &Path,
+    id: Option<&str>,
+    permission_mode: PermissionMode,
+) -> Result<Session> {
     let cwd = canonical_directory(cwd)?;
     let id = session_id(id)?;
     let session = Session {
@@ -159,7 +267,7 @@ pub fn new_session(cwd: &Path, id: Option<&str>, yolo: bool) -> Result<Session> 
         permitted_directories: vec![cwd],
         started_at: unix_time(),
         process_id: 0,
-        yolo,
+        permission_mode,
     };
     Ok(session)
 }
@@ -277,6 +385,70 @@ pub async fn remove_inactive_socket(id: &str) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("failed to remove stale session socket"),
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ForgottenSessionArtifacts {
+    pub session_id: String,
+    pub metadata_removed: bool,
+    pub lifecycle_removed: bool,
+    pub socket_removed: bool,
+}
+
+/// Removes the Temote-owned durable artifacts for one terminal session.
+///
+/// Liveness is decided only by the runtime socket probe: a successful probe is
+/// an unconditional refusal, and a probe error fails closed. Lifecycle metadata
+/// is never trusted to prove that a session is terminal.
+pub async fn forget_session_artifacts(id: &str) -> Result<ForgottenSessionArtifacts> {
+    validate_session_id(id)?;
+    anyhow::ensure!(
+        !session_is_active(id).await?,
+        "session {id} is live; stop it before forgetting it"
+    );
+
+    let socket_removed = remove_owned_session_entry(&socket_path(id)?, "session socket", true)
+        .await
+        .with_context(|| format!("cannot forget socket state for session {id}"))?;
+    let metadata_removed =
+        remove_owned_session_entry(&session_path(id)?, "session metadata", false)
+            .await
+            .with_context(|| format!("cannot forget metadata for session {id}"))?;
+    let lifecycle_removed =
+        remove_owned_session_entry(&session_lifecycle_path(id)?, "session lifecycle", false)
+            .await
+            .with_context(|| format!("cannot forget lifecycle state for session {id}"))?;
+
+    Ok(ForgottenSessionArtifacts {
+        session_id: id.to_owned(),
+        metadata_removed,
+        lifecycle_removed,
+        socket_removed,
+    })
+}
+
+async fn remove_owned_session_entry(path: &Path, kind: &str, allow_socket: bool) -> Result<bool> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {kind} {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "refusing to forget {kind} through a symlink: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.file_type().is_file() || (allow_socket && file_type_is_socket(&metadata)),
+        "refusing to forget {kind} that is not a regular file: {}",
+        path.display()
+    );
+    tokio::fs::remove_file(path)
+        .await
+        .with_context(|| format!("cannot remove {kind} {}", path.display()))?;
+    Ok(true)
 }
 
 pub async fn read_session_lifecycle(id: &str) -> Result<Option<SessionLifecycle>> {
@@ -511,7 +683,7 @@ pub fn resolve_cwd(session: &Session, path: Option<&Path>) -> Result<PathBuf> {
 }
 
 pub fn ensure_permitted(session: &Session, path: &Path) -> Result<()> {
-    if session.yolo {
+    if session.permission_mode.is_yolo() {
         return Ok(());
     }
     anyhow::ensure!(
@@ -711,7 +883,7 @@ mod tests {
             permitted_directories: vec![root.clone()],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: PermissionMode::Ask,
         };
         std::fs::write(root.join("inside.txt"), "ok").unwrap();
 
@@ -733,7 +905,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
         };
         std::fs::write(outside.join("outside.txt"), "ok").unwrap();
 
@@ -758,7 +930,7 @@ mod tests {
             permitted_directories: vec![canonical_root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: PermissionMode::Ask,
         };
 
         assert!(resolve_existing_path(&session, Path::new("outside/secret.txt")).is_err());
@@ -786,7 +958,11 @@ mod tests {
                 permitted_directories: vec![cwd.clone(), extra_a.clone(), extra_b.clone()],
                 started_at: noprop::sample_u64(ctx),
                 process_id: noprop::sample_u32(ctx),
-                yolo: noprop::sample_bool(ctx),
+                permission_mode: match noprop::sample_usize_in(ctx, 0..3) {
+                    0 => PermissionMode::Ask,
+                    1 => PermissionMode::Agent,
+                    _ => PermissionMode::Yolo,
+                },
             };
             let mutation = noprop::sample_usize_in(ctx, 0..=5);
             let expected = mutation == 0;
@@ -856,7 +1032,11 @@ mod tests {
                 permitted_directories: vec![cwd.clone()],
                 started_at: revision,
                 process_id: revision as u32,
-                yolo: revision % 2 == 0,
+                permission_mode: if revision % 2 == 0 {
+                    PermissionMode::Yolo
+                } else {
+                    PermissionMode::Ask
+                },
             };
             tasks.push(tokio::spawn(async move { save_session(&session).await }));
         }
@@ -930,7 +1110,7 @@ mod tests {
             permitted_directories: vec![canonical_root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: PermissionMode::Ask,
         };
 
         test_support::run(0x5041_5448_4553_4301, 512, |ctx| {
@@ -948,5 +1128,214 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn permission_mode_parses_and_serializes_all_modes() {
+        for (mode, text) in [
+            (PermissionMode::Ask, "ask"),
+            (PermissionMode::Agent, "agent"),
+            (PermissionMode::Yolo, "yolo"),
+        ] {
+            assert_eq!(PermissionMode::parse(text).unwrap(), mode);
+            assert_eq!(mode.as_str(), text);
+            assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{text}\""));
+            assert_eq!(
+                serde_json::from_str::<PermissionMode>(&format!("\"{text}\"")).unwrap(),
+                mode
+            );
+        }
+        assert_eq!(PermissionMode::default(), PermissionMode::Ask);
+        assert!(PermissionMode::parse("root").is_err());
+        assert!(serde_json::from_str::<PermissionMode>("\"root\"").is_err());
+        assert!(!PermissionMode::Ask.is_yolo() && !PermissionMode::Agent.is_yolo());
+        assert!(PermissionMode::Yolo.is_yolo());
+    }
+
+    fn session_with_mode(id: &str, permission_mode: PermissionMode) -> Session {
+        Session {
+            id: id.to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            permission_mode,
+        }
+    }
+
+    #[test]
+    fn session_permission_mode_round_trips_and_keeps_legacy_yolo_mirror() {
+        for (mode, text) in [
+            (PermissionMode::Ask, "ask"),
+            (PermissionMode::Agent, "agent"),
+            (PermissionMode::Yolo, "yolo"),
+        ] {
+            let session = session_with_mode("mode-test", mode);
+            let encoded = serde_json::to_value(&session).unwrap();
+            assert_eq!(encoded["permission_mode"], text);
+            assert_eq!(encoded["yolo"], mode.is_yolo());
+            let decoded: Session = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.permission_mode, mode);
+            assert_eq!(decoded.yolo(), mode.is_yolo());
+        }
+    }
+
+    #[test]
+    fn legacy_session_metadata_without_permission_mode_maps_yolo() {
+        let legacy_yolo: Session = serde_json::from_value(serde_json::json!({
+            "id": "legacy-yolo",
+            "cwd": "/tmp",
+            "yolo": true,
+        }))
+        .unwrap();
+        assert_eq!(legacy_yolo.permission_mode, PermissionMode::Yolo);
+
+        let legacy_ask: Session = serde_json::from_value(serde_json::json!({
+            "id": "legacy-ask",
+            "cwd": "/tmp",
+            "yolo": false,
+        }))
+        .unwrap();
+        assert_eq!(legacy_ask.permission_mode, PermissionMode::Ask);
+
+        let missing: Session = serde_json::from_value(serde_json::json!({
+            "id": "legacy-missing",
+            "cwd": "/tmp",
+        }))
+        .unwrap();
+        assert_eq!(missing.permission_mode, PermissionMode::Ask);
+    }
+
+    #[test]
+    fn explicit_permission_mode_wins_over_legacy_yolo_mirror() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": "agent-with-legacy-mirror",
+            "cwd": "/tmp",
+            "permission_mode": "agent",
+            "yolo": true,
+        }))
+        .unwrap();
+        assert_eq!(session.permission_mode, PermissionMode::Agent);
+        assert!(!session.yolo());
+    }
+
+    #[test]
+    fn malformed_permission_mode_metadata_fails_closed() {
+        let error = serde_json::from_value::<Session>(serde_json::json!({
+            "id": "bad-mode",
+            "cwd": "/tmp",
+            "permission_mode": "superuser",
+        }));
+        assert!(error.is_err());
+    }
+
+    async fn cleanup_forget_fixture(id: &str) {
+        let _ = tokio::fs::remove_file(session_path(id).unwrap()).await;
+        let _ = tokio::fs::remove_file(session_lifecycle_path(id).unwrap()).await;
+        let _ = tokio::fs::remove_file(socket_path(id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn forget_artifacts_removes_terminal_metadata_and_stale_socket() {
+        let id = format!("forget-terminal-{}", Uuid::new_v4());
+        cleanup_forget_fixture(&id).await;
+        let cwd = canonical_directory(&std::env::temp_dir()).unwrap();
+        let mut session = new_session(&cwd, Some(&id), false).unwrap();
+        session.permission_mode = PermissionMode::Agent;
+        save_session(&session).await.unwrap();
+        let lifecycle = SessionLifecycle::starting(session.started_at, None);
+        save_session_lifecycle(&id, &lifecycle).await.unwrap();
+        let socket = socket_path(&id).unwrap();
+        tokio::fs::create_dir_all(socket.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        assert!(socket.exists());
+
+        let forgotten = forget_session_artifacts(&id).await.unwrap();
+        assert_eq!(forgotten.session_id, id);
+        assert!(forgotten.metadata_removed);
+        assert!(forgotten.lifecycle_removed);
+        assert!(forgotten.socket_removed);
+        assert!(!session_path(&id).unwrap().exists());
+        assert!(!session_lifecycle_path(&id).unwrap().exists());
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn forget_artifacts_tolerates_missing_and_removed_cwd() {
+        let id = format!("forget-missing-{}", Uuid::new_v4());
+        cleanup_forget_fixture(&id).await;
+
+        let missing = forget_session_artifacts(&id).await.unwrap();
+        assert!(!missing.metadata_removed && !missing.lifecycle_removed && !missing.socket_removed);
+
+        let path = session_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": id,
+                "cwd": "/definitely/removed/worktree",
+                "permission_mode": "ask",
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let forgotten = forget_session_artifacts(&id).await.unwrap();
+        assert!(forgotten.metadata_removed);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forget_artifacts_rejects_symlink_metadata_target() {
+        use std::os::unix::fs::symlink;
+
+        let id = format!("forget-symlink-{}", Uuid::new_v4());
+        cleanup_forget_fixture(&id).await;
+        let path = session_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let target = path.with_extension("target");
+        tokio::fs::write(&target, b"keep").await.unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = forget_session_artifacts(&id).await.unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"));
+        assert!(target.exists());
+        tokio::fs::remove_file(&path).await.unwrap();
+        tokio::fs::remove_file(&target).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forget_artifacts_refuses_a_live_runtime_socket() {
+        let id = format!("forget-live-{}", Uuid::new_v4());
+        cleanup_forget_fixture(&id).await;
+        let path = socket_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 64];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(b"active\n").await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let error = forget_session_artifacts(&id).await.unwrap_err();
+        assert!(error.to_string().contains("is live"));
+        assert!(path.exists());
+        server.abort();
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

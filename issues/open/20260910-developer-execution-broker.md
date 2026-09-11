@@ -4,7 +4,7 @@
 
 Partially implemented.
 
-`local_agent_run` for Codex/OpenCode landed in PR #13 (`feat: add structured local agent broker`) and is now part of `main`. The remaining implementation scope in this issue is the structured Cargo/Vite+ developer-tool path (`dev_tool_run`) plus the policy/tests/docs needed for that path.
+`local_agent_run` for Codex/OpenCode landed in PR #13 (`feat: add structured local agent broker`) and is now part of `main`. Slice A of the remaining work (Cargo/Vite+ policy classifier) is implemented in the current worktree (`src/dev_tool.rs`): `DevTool::{Cargo, Vp}`, `DevToolClass::{DevOffline, DependencyNetwork, ArbitraryCodeSensitive, Rejected}`, request validation (operation grammar, NUL/oversized args, caller-controlled executable paths), and table/property tests. No MCP tool or child process was added. The remaining implementation scope in this issue is the structured `dev_tool_run` execution path (Slices B-E) plus policy/tests/docs needed for it.
 
 Do not reimplement or replace the existing `local_agent_run` broker while completing this issue. Changes to the default approval behavior for that broker belong to `20260911-default-agent-permission-mode.md`.
 

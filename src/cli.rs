@@ -96,6 +96,9 @@ pub enum SessionCommand {
     Stop {
         session_id: String,
     },
+    Forget {
+        session_id: String,
+    },
     Restart {
         session_id: String,
     },
@@ -354,6 +357,17 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
             .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
         return Ok(SessionCommand::Stop { session_id });
     }
+    if noargs::cmd("forget")
+        .doc("Remove durable metadata for one terminal, non-live session (stop keeps metadata)")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        return Ok(SessionCommand::Forget { session_id });
+    }
     if noargs::cmd("restart")
         .doc("Restart a stopped, crashed, or active supervisor-owned session")
         .take(args)
@@ -458,7 +472,7 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
     }
     Err(noargs::Error::other(
         args,
-        "session command is not specified (expected start, list, info, stop, restart, restart-policy, permission, or console)",
+        "session command is not specified (expected start, list, info, stop, forget, restart, restart-policy, permission, or console)",
     ))
 }
 
@@ -882,6 +896,22 @@ mod tests {
                 yolo: false
             } if id == "-dash-id"
         ));
+    }
+
+    #[test]
+    fn session_forget_is_available_and_distinct_from_stop() {
+        assert!(matches!(
+            command(&["temote-mcp", "session", "forget", "my-session"]),
+            Command::Session {
+                command: SessionCommand::Forget { session_id },
+            } if session_id == "my-session"
+        ));
+        let ParseOutcome::Print(help) = parse(argv(&["temote-mcp", "session", "--help"])).unwrap()
+        else {
+            panic!("expected forget help");
+        };
+        assert!(help.contains("forget"));
+        assert!(help.contains("stop keeps metadata"));
     }
 
     #[test]

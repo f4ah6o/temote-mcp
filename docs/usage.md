@@ -23,6 +23,8 @@ After replacing the installed binary, run `temote-mcp upgrade --dry-run` and the
 
 Session discovery is active-first: sessions owned by the running supervisor are returned before bounded historical metadata, so accumulated history cannot evict active sessions from `session list` / MCP `session_list`. Historical stopped/crashed entries are returned in a deterministic recent-first order within the list budget. Supervisor startup and periodic maintenance retain the 512 most recent safely confirmed terminal metadata pairs and prune only older confirmed stopped/crashed pairs. Live, ambiguous, malformed/orphaned, and supervisor-upgrade restore-plan-protected metadata is never automatically removed by retention; read-only listing and MCP fallback do not perform cleanup.
 
+Use `temote-mcp session forget <id>` to remove Temote-owned durable state for one terminal, non-live session: its metadata, lifecycle state, and a confirmed-stale socket entry. `stop` keeps that metadata for later `session list` / `session info`; `forget` intentionally removes it. The command refuses an unconditional live runtime socket probe, is serialized with supervisor lifecycle transitions, rejects symlink or non-regular metadata targets, and never touches the workspace, cwd, or worktree. Removing one session does not change the retention policy for other sessions.
+
 For compatibility, `cd ~/src/my-project && temote-mcp start my-project` asks the running local supervisor to start the current directory. `temote-mcp start my-project --yolo` remains the deliberately unrestricted local-only form.
 
 Relative paths resolve from the session working directory.

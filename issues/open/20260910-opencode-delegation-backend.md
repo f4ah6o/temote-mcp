@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / generic delegation backend not started; structured `local_agent_run` already supports OpenCode
+- Status: Open / Phase 1 (Codex freeze, boundary inventory, backend-neutral internal types) implemented in the current worktree; OpenCode backend not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -535,3 +535,27 @@ Resolve these from a pinned OpenCode CLI and fixtures before merging production 
 - What is the cleanest compatibility mapping between Codex `reasoning_effort` and OpenCode provider-specific `--variant` without making either concept falsely universal?
 
 Until these are answered, unknown fields remain unknown; they are not inferred from requested values.
+
+## Phase 1 status (2026-09-11)
+
+Phase 1 (freeze Codex behavior + boundary inventory + backend-neutral internal types) is implemented in the current worktree without launching OpenCode and without changing CLI output:
+
+- `src/codex_delegation.rs` now exposes `DelegationBackend::{Codex}` with explicit `parse`/`name`, plus internal `NormalizedResult`/`NormalizedEvidence` types. `result_to_json` converts through `DelegationResult::normalize()` and `normalized_to_json()`.
+- Compatibility is frozen by `parent_result_json_shape_is_frozen_for_compatibility` (exact parent JSON fixture), `normalized_result_keeps_requested_and_observed_distinct`, and the existing command/environment/report classification tests.
+- No OpenCode process is launched; the generic CLI, `--format json` parsing, diagnostics, and binary override remain Phase 3.
+
+### Boundary inventory: `src/local_agent.rs`
+
+Reusable as implementation detail (copy or extract, do not import local-agent authorization):
+
+- `Agent::parse`/`as_str`/`executable_name` naming conventions and the OpenCode binary name `opencode`.
+- Command-shape knowledge recorded by `build_opencode_command` (`run`, `--pure`, `--format json`, `--dir`, optional `--model`, task delivery), subject to re-verification against a pinned delegation CLI version.
+- `opencode_config` permission JSON shape as an input to a delegation-specific config if one is required.
+
+Local-agent-only policy; must not become the delegation contract:
+
+- `resolve_executable_details`/`resolve_explicit_executable` enforce session-root exclusion and are coupled to local-agent executable resolution; delegation needs its own executable policy and diagnostics.
+- `AgentState` auth import, HOME/XDG isolation, and `--pure`/config injection are local-agent sandbox behavior.
+- `prepare`/`run`/`revalidate` approvals, job ownership, and `LocalAgentScope` sandbox semantics stay in `local_agent`.
+- There is no existing version-probing helper; delegation diagnostics must add one for the pinned OpenCode version.
+- `local_agent_run` fixtures are local-agent-shaped; delegation fixtures stay separate unless the exact pinned output is identical.

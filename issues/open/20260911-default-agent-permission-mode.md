@@ -2,9 +2,17 @@
 
 ## Status
 
-Open. Implementation has not started.
+Open. Slice A (permission enum and persistence, behavior-preserving) is implemented in the current worktree; default changes and policy-driven approval remain.
 
 `local_agent_run` itself is already implemented on `main` by PR #13. This issue changes session permission semantics and defaults; it must not redesign the local-agent broker or weaken its sandbox/environment contract.
+
+### Slice A implementation (2026-09-11)
+
+- `config::PermissionMode::{Ask, Agent, Yolo}` is the canonical representation; session metadata serializes `permission_mode` plus a legacy `yolo` mirror and deserializes legacy files as `Ask`/`Yolo` when `permission_mode` is absent.
+- `config::Session` stores `permission_mode`; `Session::yolo()` is a compatibility view.
+- Supervisor restart specs and upgrade plans carry the mode through restore/handoff with legacy `yolo` fallback.
+- `ControlRequest::PermissionMode` prefers `permission_mode` and accepts legacy `yolo` requests; `SessionView` reports the mode and the derived boolean.
+- New-session defaults remain `Ask` in this slice; no approval behavior changed.
 
 ## Problem
 

@@ -1,6 +1,6 @@
 # Gateway federation の end-to-end readiness 診断を追加する
 
-Status: open / implementation not started
+Status: open / Slice A (staged local readiness) implemented in the current worktree; Slices B-D (remote endpoint, Access, host registration) not started
 Created: 2026-09-11
 Updated: 2026-09-11
 Priority: P1 operator diagnostics
@@ -163,3 +163,15 @@ remote status check を実装すると、Access や Worker API の一時障害�
 ## Recommended next slice
 
 **Slice A only.** まず既存 local `doctor` の結果を副作用なしで stage 化し、remote protocol 追加はその後にする。
+
+## Implementation notes (2026-09-11)
+
+Slice A is implemented in the current worktree (`src/doctor.rs`):
+
+- `GatewayStage` / `GatewayStageStatus` model `local_config`, `local_supervisor`, `remote_endpoint`, `access_auth`, `host_registration`, and `session_availability`; `not_checked` maps to a warning, never to pass.
+- Local configuration is reported per item (`host_id`, `gateway_url` origin validation via `gateway::normalize_gateway_url`, `host_token`, `access_service_token`), each with a non-secret detail.
+- The `local_supervisor` check reports control protocol and named-root count only; physical root paths are never printed.
+- `check_federation_readiness` performs no remote network call and still skips the supervisor probe when local config is invalid.
+- Sentinel tests cover per-item classification, invalid host IDs/URLs, Access pair completeness, secret non-leakage, physical-root non-leakage, and the not-checked/ready distinction.
+
+Remote stages remain unimplemented and are not silently reported as ready.

@@ -45,14 +45,51 @@ npx wrangler secret put HOST_TOKENS_JSON
 
 ```sh
 npm test
-npx wrangler deploy --dry-run
-npx wrangler deploy
+npx wrangler deploy --dry-run --keep-vars
+npx wrangler deploy --keep-vars
 ```
 
-5. Attach a custom domain, protect it with a self-hosted Cloudflare Access application, and enable Managed OAuth for the intended MCP clients. Keep `workers_dev = false` so the Access-protected custom hostname is the public route.
-6. Allow host agents through Access using a service-token policy. The Access service token and Temote host bearer token are independent credentials.
+5. Select a public deployment target before deploying. `gateway/wrangler.toml` keeps `workers_dev = false`, so a deploy without a target uploads a version without publishing it. See [Deployment target](#deployment-target).
+6. Protect the deployed hostname with a self-hosted Cloudflare Access application and enable Managed OAuth for the intended MCP clients.
+7. Allow host agents through Access using a service-token policy. The Access service token and Temote host bearer token are independent credentials.
 
 The public MCP URL is `https://<gateway-host>/mcp`.
+
+## Deployment target
+
+`workers_dev = false` means a deploy without a route or custom domain does not publish the Worker and can print `No targets deployed`. Treat that output as a failure even when the command exits 0, and choose exactly one target:
+
+| Option | Use when | Target setup | Access | Verification |
+| --- | --- | --- | --- | --- |
+| A. Custom domain | The Worker should own a dedicated hostname, or no DNS record exists yet. | Declare the hostname as a Worker custom domain, for example `routes = [{ pattern = "<gateway-host>", custom_domain = true }]` in `gateway/wrangler.toml`, or create it in the Cloudflare dashboard. | Protect the whole hostname with a Cloudflare Access application. | `npx wrangler deployments status --name temote-mcp-gateway` and `curl -sSf https://<gateway-host>/healthz`. |
+| B. Existing DNS + Worker route | A DNS record already exists and must not be deleted. | Pass the exact pattern to the deploy, for example `npx wrangler deploy --keep-vars --routes '<gateway-host>/*'`. | Protect the whole hostname with a Cloudflare Access application. | Same as A; also confirm the route pattern points at `temote-mcp-gateway` in the Cloudflare dashboard. |
+
+Both options follow the same rules:
+
+- Keep `workers_dev = false`. Do not enable the `*.workers.dev` route as a shortcut.
+- Do not delete existing DNS records. A Worker route takes precedence for matching requests without removing the record, so the direct origin stays recoverable.
+- Use `--keep-vars` when the deployment must preserve dashboard-managed non-secret variables. Worker secrets are unaffected and stay in `wrangler secret`; never write them to `wrangler.toml`, docs, or issue trackers.
+- Keep the Access service-token credential and the gateway host token as separate credentials.
+- A successful upload is not a successful deployment. Verify the target after every deploy.
+
+### Verify a deployment (read-only)
+
+```sh
+npx wrangler deployments status --name temote-mcp-gateway
+curl -sSf https://<gateway-host>/healthz
+```
+
+`/healthz` must return `{"status":"ok","service":"temote-mcp-gateway"}`. A direct-origin response or a different service identity means the hostname still points at the wrong target. Authenticated MCP reachability through Access is tracked separately from this local check.
+
+### Rollback
+
+Rollback removes only the exact Worker route or custom domain that was added:
+
+1. Remove the exact route pattern or custom-domain binding for `<gateway-host>` in the Cloudflare dashboard or by reverting `gateway/wrangler.toml`, then deploy the previous target set.
+2. Leave the DNS record, the Access application, and the Tunnel untouched so the direct origin remains usable.
+3. Confirm with `curl -sSf https://<gateway-host>/healthz` and the dashboard that the hostname no longer resolves to the Worker, then restore the intended direct-origin configuration if needed.
+
+Do not remove or rewrite unrelated routes, DNS records, or Access policies as part of a gateway rollback.
 
 ## Configure each Temote host
 
@@ -80,7 +117,7 @@ temote-mcp supervisor
 temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
-`--platform auto` detects macOS, Linux, and WSL2. `temote-mcp doctor` reports federation readiness when `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, including supervisor compatibility and named-root count without printing root paths or token values.
+`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. Doctor never prints root paths or token values, and remote endpoint/Access/host-registration stages remain unverified until the read-only remote diagnostics are implemented.
 
 ## MCP workflow
 

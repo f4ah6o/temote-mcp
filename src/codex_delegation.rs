@@ -183,6 +183,73 @@ enum ReportState {
     Valid(Value),
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DelegationBackend {
+    Codex,
+}
+
+#[allow(dead_code)]
+impl DelegationBackend {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            _ => Err(format!(
+                "unsupported delegation backend {value:?}; expected codex"
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NormalizedEvidence {
+    thread_id: Option<String>,
+    usage: Option<Map<String, Value>>,
+}
+
+#[derive(Debug)]
+struct NormalizedResult {
+    #[allow(dead_code)]
+    backend: DelegationBackend,
+    status: Status,
+    requested_model: String,
+    requested_variant: String,
+    observed_model: Option<String>,
+    observed_variant: Option<String>,
+    report: Option<Value>,
+    evidence: NormalizedEvidence,
+    exit_code: Option<i32>,
+    artifacts_truncated: bool,
+    artifacts: ArtifactPaths,
+}
+
+impl DelegationResult {
+    fn normalize(&self) -> NormalizedResult {
+        NormalizedResult {
+            backend: DelegationBackend::Codex,
+            status: self.status,
+            requested_model: self.requested_model.clone(),
+            requested_variant: self.requested_reasoning_effort.clone(),
+            observed_model: self.observed_model.clone(),
+            observed_variant: self.observed_reasoning_effort.clone(),
+            report: self.report.clone(),
+            evidence: NormalizedEvidence {
+                thread_id: self.evidence.thread_id.clone(),
+                usage: self.evidence.usage.clone(),
+            },
+            exit_code: self.exit_code,
+            artifacts_truncated: self.artifacts_truncated,
+            artifacts: self.artifacts.clone(),
+        }
+    }
+}
+
 pub(crate) fn usage() -> String {
     r#"Experimental Codex delegation bootstrap
 
@@ -812,15 +879,19 @@ fn serialize_parent_result(result: &DelegationResult) -> Result<String, serde_js
 }
 
 fn result_to_json(result: &DelegationResult) -> Value {
+    normalized_to_json(&result.normalize())
+}
+
+fn normalized_to_json(result: &NormalizedResult) -> Value {
     json!({
         "status": result.status.as_str(),
         "requested": {
             "model": result.requested_model,
-            "reasoning_effort": result.requested_reasoning_effort,
+            "reasoning_effort": result.requested_variant,
         },
         "observed": {
             "model": result.observed_model,
-            "reasoning_effort": result.observed_reasoning_effort,
+            "reasoning_effort": result.observed_variant,
         },
         "report": result.report,
         "evidence": {
@@ -1152,5 +1223,117 @@ esac
         assert_eq!(value["status"], "parent_result_oversized");
         assert_eq!(value["original_status"], "success");
         assert!(value.get("report").is_none());
+    }
+
+    #[test]
+    fn delegation_backend_selection_is_explicit() {
+        assert_eq!(
+            DelegationBackend::parse("codex").unwrap(),
+            DelegationBackend::Codex
+        );
+        assert_eq!(DelegationBackend::Codex.name(), "codex");
+        for value in ["opencode", "Codex", "", "codex extra"] {
+            assert!(
+                DelegationBackend::parse(value).is_err(),
+                "backend accepted {value:?}"
+            );
+        }
+    }
+
+    fn fixture_result() -> DelegationResult {
+        DelegationResult {
+            status: Status::Success,
+            requested_model: "test-model".to_owned(),
+            requested_reasoning_effort: "high".to_owned(),
+            observed_model: Some("observed-model".to_owned()),
+            observed_reasoning_effort: Some("medium".to_owned()),
+            report: Some(json!({
+                "status": "completed",
+                "summary": "ok",
+                "base_commit": "b75d1f7",
+                "changed_files": [],
+                "checks": ["cargo test"],
+                "unresolved": [],
+                "requested_model": "test-model",
+                "requested_effort": "high",
+                "observed_model": "observed-model",
+                "observed_effort": "medium",
+            })),
+            evidence: Evidence {
+                thread_id: Some("thread-test".to_owned()),
+                usage: Some(
+                    [("total_tokens".to_owned(), Value::from(20_u64))]
+                        .into_iter()
+                        .collect(),
+                ),
+                observed_model: Some("observed-model".to_owned()),
+                observed_reasoning_effort: Some("medium".to_owned()),
+            },
+            exit_code: Some(0),
+            artifacts_truncated: false,
+            artifacts: ArtifactPaths {
+                directory: PathBuf::from("/private/tmp/temote-codex"),
+                events: PathBuf::from("/private/tmp/temote-codex/events.jsonl"),
+                stderr: PathBuf::from("/private/tmp/temote-codex/stderr.log"),
+                report: PathBuf::from("/private/tmp/temote-codex/report.json"),
+                schema: PathBuf::from("/private/tmp/temote-codex/schema.json"),
+            },
+        }
+    }
+
+    #[test]
+    fn normalized_result_keeps_requested_and_observed_distinct() {
+        let result = fixture_result();
+        let normalized = result.normalize();
+        assert_eq!(normalized.backend, DelegationBackend::Codex);
+        assert_eq!(normalized.requested_model, "test-model");
+        assert_eq!(normalized.requested_variant, "high");
+        assert_eq!(normalized.observed_model.as_deref(), Some("observed-model"));
+        assert_eq!(normalized.observed_variant.as_deref(), Some("medium"));
+        assert_eq!(normalized_to_json(&normalized), result_to_json(&result));
+    }
+
+    #[test]
+    fn parent_result_json_shape_is_frozen_for_compatibility() {
+        let result = fixture_result();
+        assert_eq!(
+            result_to_json(&result),
+            json!({
+                "status": "success",
+                "requested": {
+                    "model": "test-model",
+                    "reasoning_effort": "high",
+                },
+                "observed": {
+                    "model": "observed-model",
+                    "reasoning_effort": "medium",
+                },
+                "report": {
+                    "status": "completed",
+                    "summary": "ok",
+                    "base_commit": "b75d1f7",
+                    "changed_files": [],
+                    "checks": ["cargo test"],
+                    "unresolved": [],
+                    "requested_model": "test-model",
+                    "requested_effort": "high",
+                    "observed_model": "observed-model",
+                    "observed_effort": "medium",
+                },
+                "evidence": {
+                    "thread_id": "thread-test",
+                    "usage": { "total_tokens": 20 },
+                },
+                "exit_code": 0,
+                "artifacts_truncated": false,
+                "artifacts": {
+                    "directory": "/private/tmp/temote-codex",
+                    "events": "/private/tmp/temote-codex/events.jsonl",
+                    "stderr": "/private/tmp/temote-codex/stderr.log",
+                    "report": "/private/tmp/temote-codex/report.json",
+                    "schema": "/private/tmp/temote-codex/schema.json",
+                },
+            })
+        );
     }
 }

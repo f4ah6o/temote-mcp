@@ -103,7 +103,7 @@ pub(crate) async fn apply(
     let parsed = parse_patch(&request.patch)?;
     let prepared = preflight(session, &parsed)?;
     let detail = approval_detail(&prepared);
-    let approved = if session.yolo {
+    let approved = if session.yolo() {
         true
     } else {
         approvals::request(&session.id, "apply_patch", detail, session.cwd.clone()).await?
@@ -218,7 +218,7 @@ fn commit_record(action: &str, path: &Path, destination: Option<&PathBuf>) -> Co
 
 async fn write_content(session: &config::Session, path: &Path, content: &str) -> Result<()> {
     let parent = path.parent().context("patch target has no parent")?;
-    if session.yolo {
+    if session.yolo() {
         tokio::fs::write(path, content)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -242,7 +242,7 @@ async fn write_content(session: &config::Session, path: &Path, content: &str) ->
 }
 
 async fn move_path(session: &config::Session, source: &Path, destination: &Path) -> Result<()> {
-    if session.yolo {
+    if session.yolo() {
         tokio::fs::rename(source, destination)
             .await
             .with_context(|| {
@@ -284,7 +284,7 @@ async fn move_path(session: &config::Session, source: &Path, destination: &Path)
 
 async fn remove_path(session: &config::Session, path: &Path) -> Result<()> {
     let parent = path.parent().context("patch target has no parent")?;
-    if session.yolo {
+    if session.yolo() {
         tokio::fs::remove_file(path)
             .await
             .with_context(|| format!("failed to delete {}", path.display()))?;
@@ -657,7 +657,7 @@ mod tests {
             permitted_directories: vec![cwd],
             started_at: 1,
             process_id: 2,
-            yolo,
+            permission_mode: config::PermissionMode::from_legacy_yolo(yolo),
         }
     }
 

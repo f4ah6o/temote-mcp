@@ -1,6 +1,6 @@
 # TEMOTE-08: Lunaへの実装委譲を今回の開発で実証し、Codex app server連携へ進める
 
-- Status: Open / implementation and fake-transport verification landed; real Codex dogfood and comparative measurement remain
+- Status: Open / implementation and fake-transport verification landed; one real `codex delegate` dogfood task recorded 2026-09-11; real app-server dogfood and comparative measurement remain
 - Date: 2026-09-08 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -16,6 +16,10 @@
 ## 現在の状態（2026-09-11）
 
 この issue の実装部分はすでに `main` に入っている。`codex delegate` の bounded structured report、scoped evidence、experimental app-server task controls、gateway contract、fake-transport/権限/失敗系テストが実装済みである。
+
+2026-09-11 に macOS 開発ホストで Vite+ 管理の Codex CLI `0.153.4` を使い、実 `codex delegate` を小タスクで1件実行した。`status=success`、exit 0、requested `gpt-5.6-luna`/`high`、observed model/effort は child event 非公開のため `null`、usage は入力 50442 / cached 32256 / 出力 512 / reasoning 151、worktree で `hello.txt` 作成を確認した。non-secret の記録は `docs/evaluations/codex-delegation.md` に保存している。app-server の live 実行と比較測定は未完了。
+
+同じ Vite+ 管理 Codex は `local_agent_run` の local-agent sandbox では launcher 依存 path 可視性の問題で起動できない。これは `20260911-local-agent-vp-installed-codex-runtime.md` で別途追跡しており、`codex delegate` の live 結果とは独立である。
 
 一方、実 Codex dogfood と効果測定は未完了。repository 内の評価記録では、対象環境の Codex vendor binary 欠落により real Luna Max task、real app-server model listing、authentication success、observed usage を確認できていない。
 

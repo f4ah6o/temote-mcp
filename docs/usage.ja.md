@@ -23,6 +23,8 @@ installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp 
 
 session discovery は active-first です。running supervisor が所有する session を bounded な historical metadata より先に返すため、履歴が蓄積しても active session が `session list` / MCP `session_list` から押し出されません。historical な stopped / crashed entry は list budget 内で deterministic な recent-first 順に返します。supervisor startup と periodic maintenance では、安全に terminal と確認できた metadata pair のうち最近512件を保持し、それより古い confirmed stopped / crashed pair だけを prune します。live、曖昧、malformed / orphan、supervisor upgrade restore plan で保護されている metadata は retention で自動削除しません。read-only listing と MCP fallback は cleanup を行いません。
 
+`temote-mcp session forget <id>` は、terminal で non-live な1 session の Temote-owned durable state（metadata、lifecycle state、stale と確認済みの socket entry）を削除します。`stop` は後から `session list` / `session info` で参照できるよう metadata を保持し、`forget` は意図的に削除します。runtime socket probe が live を返した場合は無条件で拒否し、supervisor の lifecycle transition と直列化され、symlink や非 regular file の metadata target を拒否し、workspace、cwd、worktree には触れません。1 session の forget は他 session の retention policy を変更しません。
+
 互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。これは起動中の local supervisor に current directory の session 作成を依頼します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。
 
 相対 path は session の working directory を基準に解決されます。

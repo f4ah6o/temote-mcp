@@ -887,7 +887,7 @@ fn append_bounded_body_chunk(
     Ok(())
 }
 
-fn normalize_gateway_url(value: &str) -> Result<String> {
+pub(crate) fn normalize_gateway_url(value: &str) -> Result<String> {
     let parsed = Url::parse(value.trim()).context("gateway URL is invalid")?;
     anyhow::ensure!(
         parsed.username().is_empty()

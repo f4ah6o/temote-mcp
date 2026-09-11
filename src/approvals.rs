@@ -817,8 +817,8 @@ pub async fn request_supervisor_approval(
 
 #[cfg_attr(not(test), allow(dead_code))]
 enum RuntimeCommand {
-    SetYolo {
-        value: bool,
+    SetPermissionMode {
+        mode: config::PermissionMode,
         response: oneshot::Sender<Result<()>>,
     },
     AllowDirectory {
@@ -863,10 +863,10 @@ impl RuntimeHandle {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn set_yolo(&self, value: bool) -> Result<()> {
+    pub(crate) async fn set_permission_mode(&self, mode: config::PermissionMode) -> Result<()> {
         let (response, receiver) = oneshot::channel();
         self.commands
-            .send(RuntimeCommand::SetYolo { value, response })
+            .send(RuntimeCommand::SetPermissionMode { mode, response })
             .await
             .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
         receiver
@@ -984,7 +984,7 @@ pub async fn spawn_runtime(
     spawn_runtime_with_logical_path_and_environment(
         cwd,
         session_id,
-        yolo,
+        config::PermissionMode::from_legacy_yolo(yolo),
         approval_sender,
         None,
         CapturedStartEnvironment::capture(),
@@ -995,7 +995,7 @@ pub async fn spawn_runtime(
 pub async fn spawn_runtime_with_logical_path_and_environment(
     cwd: &Path,
     session_id: Option<&str>,
-    yolo: bool,
+    permission_mode: config::PermissionMode,
     approval_sender: ApprovalSender,
     logical_path: Option<String>,
     environment: CapturedStartEnvironment,
@@ -1015,7 +1015,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     let previous_session = config::read_session_metadata(&id).await.ok();
     let previous_lifecycle = config::read_session_lifecycle(&id).await.ok().flatten();
     config::remove_inactive_socket(&id).await?;
-    let mut session = config::new_session(cwd, Some(&id), yolo)?;
+    let mut session = config::new_session_with_mode(cwd, Some(&id), permission_mode)?;
     let previous_started_at = previous_session
         .as_ref()
         .map(|previous| previous.started_at)
@@ -1370,7 +1370,7 @@ async fn run_runtime(
                         request,
                         require_user: false,
                         expected_session,
-                    } if session.yolo => {
+                    } if session.permission_mode.is_yolo() => {
                         if expected_session
                             .as_ref()
                             .is_some_and(|expected| !expected.matches(session))
@@ -1463,8 +1463,8 @@ async fn run_runtime(
                     anyhow::bail!("runtime command channel closed unexpectedly");
                 };
                 match command {
-                    RuntimeCommand::SetYolo { value, response } => {
-                        session.yolo = value;
+                    RuntimeCommand::SetPermissionMode { mode, response } => {
+                        session.permission_mode = mode;
                         let result = config::save_session(session).await;
                         let _ = response.send(result);
                     }
@@ -2304,7 +2304,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         }
     }
 
@@ -3192,7 +3192,7 @@ esac
 
         let snapshot = handle.snapshot().await.unwrap();
         assert_eq!(snapshot.id, id);
-        assert!(!snapshot.yolo);
+        assert_eq!(snapshot.permission_mode, config::PermissionMode::Ask);
         handle.shutdown().await.unwrap();
     }
 
@@ -3230,7 +3230,7 @@ esac
         tokio::time::sleep(Duration::from_millis(50)).await;
         let snapshot = handle.snapshot().await.unwrap();
         assert_eq!(snapshot.id, id);
-        assert!(snapshot.yolo);
+        assert_eq!(snapshot.permission_mode, config::PermissionMode::Yolo);
         assert!(config::session_is_active(&id).await.unwrap());
         handle.shutdown().await.unwrap();
     }
@@ -3679,14 +3679,19 @@ esac
                 let id = format!("permission-pbt-{nonce:x}");
                 let (sender, _receiver) = approval_channel();
                 let handle = spawn_runtime(&cwd, Some(&id), false, sender).await.unwrap();
-                let mut expected_yolo = false;
+                let mut expected_yolo = config::PermissionMode::Ask;
                 let mut expected_roots = vec![cwd.clone()];
 
                 for (operation, index, value) in steps {
                     match operation {
                         0 => {
-                            handle.set_yolo(value).await.unwrap();
-                            expected_yolo = value;
+                            handle
+                                .set_permission_mode(config::PermissionMode::from_legacy_yolo(
+                                    value,
+                                ))
+                                .await
+                                .unwrap();
+                            expected_yolo = config::PermissionMode::from_legacy_yolo(value);
                         }
                         1 | 2 => {
                             let path = extras[index].clone();
@@ -3707,7 +3712,7 @@ esac
                     }
 
                     let snapshot = handle.snapshot().await.unwrap();
-                    assert_eq!(snapshot.yolo, expected_yolo);
+                    assert_eq!(snapshot.permission_mode, expected_yolo);
                     assert_eq!(snapshot.permitted_directories, expected_roots);
                 }
 

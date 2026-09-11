@@ -529,7 +529,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
         assert!(
             enforce_path_boundary(
@@ -608,7 +608,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
 
         test_support::run(0x4f50_4d4f_554e_5401, 512, |ctx| {

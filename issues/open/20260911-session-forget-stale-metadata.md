@@ -2,7 +2,7 @@
 
 ## Status
 
-Design issue. Runtime implementation has not started.
+First implementation slice is implemented in the current worktree: `temote-mcp session forget <id>` is parsed, routed through `ControlRequest::Forget`, serialized by the supervisor with lifecycle transitions, and removes terminal session metadata, lifecycle state, and a confirmed-stale socket entry with symlink/special-file rejection. Live sessions are refused by an unconditional runtime socket probe. Retention policy is unchanged.
 
 ## Background
 

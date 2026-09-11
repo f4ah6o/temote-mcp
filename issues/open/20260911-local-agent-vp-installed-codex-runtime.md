@@ -1,6 +1,6 @@
 # `local_agent_run` cannot launch Codex installed through Vite+ (`vp`)
 
-Status: open / reproduced by operator, root cause not yet confirmed
+Status: open / reproduction and classification implemented in the current worktree; sandbox fix not implemented
 Created: 2026-09-11
 Priority: P1 developer workflow regression
 Related:
@@ -185,3 +185,28 @@ The existing post-approval executable identity check must remain fail-closed.
 ## Recommended next action
 
 Implement the **reproduction/classification slice only** first. Capture the real Vite+ `codex` launcher shape and add a deterministic failing fixture before changing `executable_read_only_roots` or sandbox policy.
+
+## Reproduction and classification (2026-09-11, macOS)
+
+Real operator installation shape, captured without credentials:
+
+```text
+PATH candidate:      /Users/<user>/.vite-plus/bin/codex
+candidate type:      symlink -> ../current/bin/vp
+intermediate:        /Users/<user>/.vite-plus/current -> 0.2.9
+canonical target:    /Users/<user>/.vite-plus/0.2.9/bin/vp
+target type:         Mach-O 64-bit executable arm64 (Vite+ multicall CLI, uses VP_HOME)
+runtime dependency:  /Users/<user>/.vite-plus/packages/@openai/codex/<installId>/lib/node_modules/@openai/codex/bin/codex.js
+package metadata:    /Users/<user>/.vite-plus/packages/@openai/codex.json
+managed runtime:     /Users/<user>/.vite-plus/js_runtime
+```
+
+This matches the working hypothesis: the command is not a self-contained executable, and a package-manager runtime layer is resolved through `VP_HOME` after launch.
+
+Classification with deterministic fixtures (`src/local_agent.rs` tests):
+
+- `vite_plus_shaped_launcher_resolves_through_current_symlink` resolves the two-hop symlink chain; the current resolver handles the candidate/target pair.
+- `vite_plus_shaped_launcher_exposes_only_bin_roots_today` shows that `executable_read_only_roots` exposes only the candidate parent (`.../bin`) and the canonical target parent (`.../0.2.9/bin`). The intermediate `current` symlink parent (`.../.vite-plus`) and the package store remain outside the visibility closure.
+- `vite_plus_launcher_cannot_read_package_store_in_local_agent_sandbox` (ignored) reproduces the operator failure class: the sandboxed launcher cannot exec/read through the missing dependency path (`sandbox-exec: execvp() ... Operation not permitted`).
+
+Identified missing runtime dependency class: launcher-side paths needed to resolve and run the package runtime, at minimum the intermediate symlink hop parent, the Vite+ package store entry for the agent package, and the managed runtime directory. None of these should become globally writable; the fix should add a bounded, verified read-only dependency closure (fix direction A/B/C in this issue).

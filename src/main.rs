@@ -9,6 +9,7 @@ mod child_env;
 mod cli;
 mod codex_app_server;
 mod config;
+mod dev_tool;
 mod doctor;
 mod evidence;
 mod friction;
@@ -45,6 +46,7 @@ mod session_control;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
+mod upgrade_transaction;
 mod work_handoff;
 
 use temote_mcp::sandbox;
@@ -116,6 +118,7 @@ async fn main() -> Result<()> {
             cli::SessionCommand::List => session_control::list().await,
             cli::SessionCommand::Info { session_id } => session_control::info(session_id).await,
             cli::SessionCommand::Stop { session_id } => session_control::stop(session_id).await,
+            cli::SessionCommand::Forget { session_id } => session_control::forget(session_id).await,
             cli::SessionCommand::Restart { session_id } => {
                 session_control::restart(session_id).await
             }

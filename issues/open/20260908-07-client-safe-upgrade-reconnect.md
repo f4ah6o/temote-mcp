@@ -2,6 +2,10 @@
 
 Date: 2026-09-08
 
+## Implementation status (2026-09-11)
+
+Suggested implementation order step 1 is implemented in the current worktree: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, boot-generation identity, and reconnect contract remain unimplemented.
+
 ## Background
 
 Temote already has a strong local upgrade path from `issues/open/20260902-zero-downtime-supervisor-upgrade.md`:

@@ -39,7 +39,6 @@ pub struct Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
     Pass,
-    #[cfg(any(target_os = "linux", feature = "network"))]
     Warn,
     Fail,
 }
@@ -61,7 +60,6 @@ impl Check {
         }
     }
 
-    #[cfg(any(target_os = "linux", feature = "network"))]
     fn warn(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             level: Level::Warn,
@@ -70,7 +68,6 @@ impl Check {
             hint: Some(hint.into()),
         }
     }
-
     fn fail(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             level: Level::Fail,
@@ -87,7 +84,6 @@ impl Check {
     fn print(&self) {
         let label = match self.level {
             Level::Pass => "PASS",
-            #[cfg(any(target_os = "linux", feature = "network"))]
             Level::Warn => "WARN",
             Level::Fail => "FAIL",
         };
@@ -123,14 +119,11 @@ impl Report {
             .iter()
             .filter(|check| check.is_failure())
             .count();
-        #[cfg(any(target_os = "linux", feature = "network"))]
         let warnings = self
             .checks
             .iter()
             .filter(|check| matches!(check.level, Level::Warn))
             .count();
-        #[cfg(not(any(target_os = "linux", feature = "network")))]
-        let warnings = 0;
         println!();
         println!(
             "doctor summary: {} failure(s), {} warning(s)",
@@ -271,87 +264,350 @@ pub async fn run(options: Options) -> Result<()> {
     report.finish()
 }
 
-async fn check_federation_readiness(report: &mut Report) {
-    let Ok(configured_host_id) = std::env::var("TEMOTE_MCP_GATEWAY_HOST_ID") else {
-        return;
-    };
-    let configured_host_id = match host_identity::validate(&configured_host_id) {
-        Ok(value) => value,
-        Err(error) => {
-            report.add(Check::fail(
-                "federation readiness",
-                format!("invalid TEMOTE_MCP_GATEWAY_HOST_ID: {error}"),
-                "Configure a stable diagnostic-safe host ID before starting gateway-agent in host mode.",
-            ));
-            return;
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayStage {
+    LocalConfig,
+    LocalSupervisor,
+    RemoteEndpoint,
+    AccessAuth,
+    HostRegistration,
+    SessionAvailability,
+}
+
+impl GatewayStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LocalConfig => "local_config",
+            Self::LocalSupervisor => "local_supervisor",
+            Self::RemoteEndpoint => "remote_endpoint",
+            Self::AccessAuth => "access_auth",
+            Self::HostRegistration => "host_registration",
+            Self::SessionAvailability => "session_availability",
         }
-    };
-    let gateway_url = std::env::var("TEMOTE_MCP_GATEWAY_URL").unwrap_or_default();
-    let host_token_present =
-        std::env::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").is_ok_and(|value| !value.trim().is_empty());
-    let access_client_id_present = std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID")
-        .is_ok_and(|value| !value.trim().is_empty());
-    let access_client_secret_present = std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET")
-        .is_ok_and(|value| !value.trim().is_empty());
-    if gateway_url.trim().is_empty()
-        || !host_token_present
-        || access_client_id_present != access_client_secret_present
-    {
-        report.add(Check::fail(
-            "federation readiness",
-            format!(
-                "host_id={configured_host_id}, gateway_url={}, host_token={}, access_service_token={}",
-                if gateway_url.trim().is_empty() {
-                    "missing"
-                } else {
-                    "configured"
-                },
-                if host_token_present {
-                    "configured"
-                } else {
-                    "missing"
-                },
-                if access_client_id_present == access_client_secret_present {
-                    if access_client_id_present { "configured" } else { "not configured" }
-                } else {
-                    "incomplete"
-                }
-            ),
-            "Set TEMOTE_MCP_GATEWAY_URL and TEMOTE_MCP_GATEWAY_HOST_TOKEN; provide both Access service-token fields together when Access protects host-agent traffic.",
-        ));
-        return;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayStageStatus {
+    Ready,
+    Failed,
+    Unavailable,
+    NotChecked,
+}
+
+impl GatewayStageStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+            Self::NotChecked => "not_checked",
+        }
     }
 
-    match crate::session_control::SessionBackend::local_control().await {
-        Ok(sessions) => match sessions.status().await {
-            Ok(status) => {
-                let roots = status
-                    .get("named_roots")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
-                let protocol = status
-                    .get("control_protocol")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                report.add(Check::pass(
-                    "federation readiness",
-                    format!(
-                        "host_id={configured_host_id}, supervisor=active, control_protocol={protocol}, named_roots={roots}, gateway_url=configured, host_token=configured"
-                    ),
-                ));
-            }
-            Err(error) => report.add(Check::fail(
-                "federation readiness",
-                format!("host_id={configured_host_id}, supervisor status failed: {error}"),
-                "Restart the Temote supervisor with the current binary before starting the host-level gateway agent.",
+    fn level(self) -> Level {
+        match self {
+            Self::Ready => Level::Pass,
+            Self::Failed | Self::Unavailable => Level::Fail,
+            Self::NotChecked => Level::Warn,
+        }
+    }
+}
+
+struct GatewayStageResult {
+    stage: GatewayStage,
+    item: &'static str,
+    status: GatewayStageStatus,
+    detail: String,
+    hint: Option<String>,
+}
+
+impl GatewayStageResult {
+    fn ready(stage: GatewayStage, item: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::Ready,
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
+    fn failed(
+        stage: GatewayStage,
+        item: &'static str,
+        detail: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::Failed,
+            detail: detail.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    fn unavailable(
+        stage: GatewayStage,
+        item: &'static str,
+        detail: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::Unavailable,
+            detail: detail.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn not_checked(stage: GatewayStage, item: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::NotChecked,
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn render(&self) -> String {
+        format!(
+            "[{}] gateway {}: {} ({})",
+            match self.status.level() {
+                Level::Pass => "PASS",
+                Level::Warn => "WARN",
+                Level::Fail => "FAIL",
+            },
+            self.stage.label(),
+            self.item,
+            self.detail
+        )
+    }
+
+    fn into_check(self) -> Check {
+        let name = format!("gateway {}: {}", self.stage.label(), self.item);
+        let detail = format!("{} ({})", self.status.label(), self.detail);
+        match self.status.level() {
+            Level::Pass => Check::pass(name, detail),
+            Level::Warn => Check::warn(
+                name,
+                detail,
+                self.hint.unwrap_or_else(|| {
+                    "Remote verification was not performed; do not treat this stage as ready."
+                        .to_owned()
+                }),
+            ),
+            Level::Fail => Check::fail(
+                name,
+                detail,
+                self.hint.unwrap_or_else(|| {
+                    "Fix the reported local or supervisor condition, then rerun doctor.".to_owned()
+                }),
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GatewayLocalConfig {
+    host_id: Option<String>,
+    gateway_url: Option<String>,
+    host_token: Option<String>,
+    access_client_id: Option<String>,
+    access_client_secret: Option<String>,
+}
+
+impl GatewayLocalConfig {
+    fn from_env() -> Option<Self> {
+        let host_id = std::env::var("TEMOTE_MCP_GATEWAY_HOST_ID").ok()?;
+        Some(Self {
+            host_id: Some(host_id),
+            gateway_url: std::env::var("TEMOTE_MCP_GATEWAY_URL").ok(),
+            host_token: std::env::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").ok(),
+            access_client_id: std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID").ok(),
+            access_client_secret: std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET").ok(),
+        })
+    }
+
+    fn validated_host_id(&self) -> Option<String> {
+        self.host_id
+            .as_deref()
+            .and_then(|value| host_identity::validate(value).ok())
+    }
+}
+
+fn nonempty(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn evaluate_gateway_local_config(config: &GatewayLocalConfig) -> Vec<GatewayStageResult> {
+    let mut results = Vec::new();
+
+    match config.host_id.as_deref() {
+        Some(raw) => match host_identity::validate(raw) {
+            Ok(value) => results.push(GatewayStageResult::ready(
+                GatewayStage::LocalConfig,
+                "host_id",
+                format!("host_id={value}"),
+            )),
+            Err(error) => results.push(GatewayStageResult::failed(
+                GatewayStage::LocalConfig,
+                "host_id",
+                format!("invalid host_id: {error}"),
+                "Configure a stable diagnostic-safe TEMOTE_MCP_GATEWAY_HOST_ID before starting the host-level gateway agent.",
             )),
         },
-        Err(error) => report.add(Check::fail(
-            "federation readiness",
-            format!("host_id={configured_host_id}, supervisor unavailable: {error}"),
-            "Start or upgrade the Temote supervisor before starting the host-level gateway agent.",
+        None => results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "host_id",
+            "missing",
+            "Set TEMOTE_MCP_GATEWAY_HOST_ID before starting the host-level gateway agent.",
         )),
     }
+
+    let gateway_url = config.gateway_url.as_deref().unwrap_or_default();
+    if gateway_url.trim().is_empty() {
+        results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "gateway_url",
+            "missing",
+            "Set TEMOTE_MCP_GATEWAY_URL to the HTTPS gateway origin.",
+        ));
+    } else {
+        #[cfg(feature = "network")]
+        {
+            if crate::gateway::normalize_gateway_url(gateway_url).is_ok() {
+                results.push(GatewayStageResult::ready(
+                    GatewayStage::LocalConfig,
+                    "gateway_url",
+                    "configured",
+                ));
+            } else {
+                results.push(GatewayStageResult::failed(
+                    GatewayStage::LocalConfig,
+                    "gateway_url",
+                    "invalid",
+                    "TEMOTE_MCP_GATEWAY_URL must be an HTTPS origin without credentials, path, query, or fragment.",
+                ));
+            }
+        }
+        #[cfg(not(feature = "network"))]
+        {
+            results.push(GatewayStageResult::not_checked(
+                GatewayStage::LocalConfig,
+                "gateway_url",
+                "configured; origin validation requires the network feature",
+            ));
+        }
+    }
+
+    if nonempty(&config.host_token) {
+        results.push(GatewayStageResult::ready(
+            GatewayStage::LocalConfig,
+            "host_token",
+            "configured",
+        ));
+    } else {
+        results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "host_token",
+            "missing",
+            "Set TEMOTE_MCP_GATEWAY_HOST_TOKEN; the value is never printed.",
+        ));
+    }
+
+    match (
+        nonempty(&config.access_client_id),
+        nonempty(&config.access_client_secret),
+    ) {
+        (false, false) => results.push(GatewayStageResult::ready(
+            GatewayStage::LocalConfig,
+            "access_service_token",
+            "not configured",
+        )),
+        (true, true) => results.push(GatewayStageResult::ready(
+            GatewayStage::LocalConfig,
+            "access_service_token",
+            "configured",
+        )),
+        _ => results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "access_service_token",
+            "incomplete",
+            "Provide both TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID and TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET together; values are never printed.",
+        )),
+    }
+
+    results
+}
+
+fn gateway_supervisor_detail(status: &serde_json::Value) -> String {
+    let roots = status
+        .get("named_roots")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let protocol = status
+        .get("control_protocol")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let supervisor = status
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    format!("supervisor={supervisor}, control_protocol={protocol}, named_roots={roots}")
+}
+
+async fn check_gateway_supervisor(report: &mut Report, host_id: &str) {
+    let result = match crate::session_control::SessionBackend::local_control().await {
+        Ok(sessions) => match sessions.status().await {
+            Ok(status) => GatewayStageResult::ready(
+                GatewayStage::LocalSupervisor,
+                "control",
+                format!("host_id={host_id}, {}", gateway_supervisor_detail(&status)),
+            ),
+            Err(error) => GatewayStageResult::failed(
+                GatewayStage::LocalSupervisor,
+                "control",
+                format!("host_id={host_id}, supervisor status failed: {error}"),
+                "Restart the Temote supervisor with the current binary before starting the host-level gateway agent.",
+            ),
+        },
+        Err(error) => GatewayStageResult::unavailable(
+            GatewayStage::LocalSupervisor,
+            "control",
+            format!("host_id={host_id}, supervisor unavailable: {error}"),
+            "Start or upgrade the Temote supervisor before starting the host-level gateway agent.",
+        ),
+    };
+    report.add(result.into_check());
+}
+
+async fn check_federation_readiness(report: &mut Report) {
+    let Some(config) = GatewayLocalConfig::from_env() else {
+        return;
+    };
+    let results = evaluate_gateway_local_config(&config);
+    let failed = results
+        .iter()
+        .any(|result| result.status == GatewayStageStatus::Failed);
+    for result in results {
+        report.add(result.into_check());
+    }
+    if failed {
+        return;
+    }
+    let Some(host_id) = config.validated_host_id() else {
+        return;
+    };
+    check_gateway_supervisor(report, &host_id).await;
 }
 
 fn check_platform(report: &mut Report) {
@@ -1526,5 +1782,180 @@ mod tests {
         assert!(is_cloudflare_account_id("0123456789abcdef0123456789abcdef"));
         assert!(!is_cloudflare_account_id("not-an-account-id"));
         assert!(!is_cloudflare_account_id("0123456789abcdef0123456789abcde"));
+    }
+
+    fn gateway_config(
+        host_id: Option<&str>,
+        gateway_url: Option<&str>,
+        host_token: Option<&str>,
+        access_client_id: Option<&str>,
+        access_client_secret: Option<&str>,
+    ) -> GatewayLocalConfig {
+        GatewayLocalConfig {
+            host_id: host_id.map(str::to_owned),
+            gateway_url: gateway_url.map(str::to_owned),
+            host_token: host_token.map(str::to_owned),
+            access_client_id: access_client_id.map(str::to_owned),
+            access_client_secret: access_client_secret.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn gateway_local_config_reports_each_item_independently() {
+        let config = gateway_config(Some("host-a"), None, None, Some("access-id"), None);
+        let results = evaluate_gateway_local_config(&config);
+        let statuses = results
+            .iter()
+            .map(|result| (result.item, result.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("host_id", GatewayStageStatus::Ready),
+                ("gateway_url", GatewayStageStatus::Failed),
+                ("host_token", GatewayStageStatus::Failed),
+                ("access_service_token", GatewayStageStatus::Failed),
+            ]
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.stage == GatewayStage::LocalConfig)
+        );
+    }
+
+    #[test]
+    fn gateway_local_config_invalid_host_id_is_its_own_failure() {
+        let config = gateway_config(
+            Some("not a valid host id"),
+            Some("https://gateway.example.test"),
+            Some("host-token"),
+            None,
+            None,
+        );
+        let results = evaluate_gateway_local_config(&config);
+        assert_eq!(results[0].item, "host_id");
+        assert_eq!(results[0].status, GatewayStageStatus::Failed);
+        assert!(results[0].detail.contains("invalid host_id"));
+    }
+
+    #[test]
+    fn gateway_local_config_never_emits_secret_values() {
+        let config = gateway_config(
+            Some("host-a"),
+            Some("https://sentinel-url.example"),
+            Some("sentinel-host-token-value"),
+            Some("sentinel-access-id"),
+            Some("sentinel-access-secret"),
+        );
+        let rendered = evaluate_gateway_local_config(&config)
+            .iter()
+            .map(GatewayStageResult::render)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for sentinel in [
+            "sentinel-host-token-value",
+            "sentinel-access-id",
+            "sentinel-access-secret",
+            "sentinel-url.example",
+        ] {
+            assert!(
+                !rendered.contains(sentinel),
+                "gateway diagnostic leaked {sentinel}: {rendered}"
+            );
+        }
+        assert!(rendered.contains("host_token"));
+        assert!(rendered.contains("access_service_token"));
+    }
+
+    #[test]
+    fn gateway_stage_statuses_never_treat_not_checked_as_ready() {
+        assert_eq!(GatewayStageStatus::Ready.level(), Level::Pass);
+        assert_eq!(GatewayStageStatus::Failed.level(), Level::Fail);
+        assert_eq!(GatewayStageStatus::Unavailable.level(), Level::Fail);
+        assert_eq!(GatewayStageStatus::NotChecked.level(), Level::Warn);
+        assert_ne!(GatewayStageStatus::NotChecked.level(), Level::Pass);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_local_config_accepts_complete_configuration() {
+        let config = gateway_config(
+            Some("host-a"),
+            Some("https://gateway.example.test"),
+            Some("host-token"),
+            Some("access-id"),
+            Some("access-secret"),
+        );
+        let results = evaluate_gateway_local_config(&config);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.status == GatewayStageStatus::Ready)
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_local_config_rejects_invalid_origins() {
+        for invalid in [
+            "http://gateway.example.test",
+            "https://gateway.example.test/mcp",
+            "https://user@gateway.example.test",
+            "not a url",
+        ] {
+            let config = gateway_config(
+                Some("host-a"),
+                Some(invalid),
+                Some("host-token"),
+                None,
+                None,
+            );
+            let results = evaluate_gateway_local_config(&config);
+            let url = results
+                .iter()
+                .find(|result| result.item == "gateway_url")
+                .expect("gateway_url result");
+            assert_eq!(
+                url.status,
+                GatewayStageStatus::Failed,
+                "origin {invalid:?} should fail"
+            );
+            assert!(!url.render().contains(invalid));
+        }
+        let local = gateway_config(
+            Some("host-a"),
+            Some("http://127.0.0.1:8787"),
+            Some("host-token"),
+            None,
+            None,
+        );
+        let results = evaluate_gateway_local_config(&local);
+        assert_eq!(results[1].status, GatewayStageStatus::Ready);
+    }
+
+    #[test]
+    fn gateway_supervisor_detail_counts_named_roots_without_paths() {
+        let status = serde_json::json!({
+            "status": "active",
+            "control_protocol": 2,
+            "named_roots": ["/Users/sentinel/physical-root", "/home/sentinel/other"],
+        });
+        let detail = gateway_supervisor_detail(&status);
+        assert_eq!(
+            detail,
+            "supervisor=active, control_protocol=2, named_roots=2"
+        );
+        assert!(!detail.contains("sentinel"));
+        assert!(!detail.contains("/Users"));
+    }
+
+    #[test]
+    fn gateway_supervisor_detail_handles_missing_fields() {
+        let detail = gateway_supervisor_detail(&serde_json::json!({}));
+        assert_eq!(
+            detail,
+            "supervisor=unknown, control_protocol=0, named_roots=0"
+        );
     }
 }
