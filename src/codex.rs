@@ -57,6 +57,14 @@ OAuth, or ingress policy.\n"
         .to_owned()
 }
 
+pub fn run_delegate(args: &[String]) -> Result<String, String> {
+    delegation::run_generic_cli(args)
+}
+
+pub fn delegate_usage() -> String {
+    delegation::generic_usage()
+}
+
 fn install_current() -> Result<String, String> {
     let codex_home = resolve_codex_home()?;
     let binary = current_binary()?;

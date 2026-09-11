@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -16,6 +17,8 @@ const ARTIFACT_DIRECTORY_PREFIX: &str = "temote-codex-delegation-";
 const MAX_PARENT_RESULT_BYTES: usize = 4096;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_OPENCODE_PROMPT_BYTES: usize = 64 * 1024;
+const OPENCODE_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_EVIDENCE_STRING_BYTES: usize = 256;
 const MAX_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
@@ -94,22 +97,85 @@ const TOKEN_USAGE_FIELDS: &[&str] = &[
     "total_tokens",
 ];
 
+const OPENCODE_CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
+
+const OPENCODE_REPORT_INSTRUCTIONS: &str = r#"You are a delegated implementation worker running non-interactively. You must not ask interactive questions, and you must finish the task below before answering.
+
+When finished, respond with ONLY one JSON object and nothing else: no markdown, no code fences, no text before or after the JSON.
+The JSON object must contain exactly these fields:
+{"status":"completed|failed|blocked|needs_decision","summary":"short summary, at most 1200 characters","base_commit":"","changed_files":[],"checks":[],"unresolved":[],"requested_model":"__REQUESTED_MODEL__","requested_effort":"__REQUESTED_EFFORT__","observed_model":null,"observed_effort":null}
+Rules:
+- All string values are plain strings; changed_files, checks, and unresolved are arrays of strings (use [] when empty).
+- Set "requested_model" to "__REQUESTED_MODEL__" and "requested_effort" to "__REQUESTED_EFFORT__".
+- Set "observed_model"/"observed_effort" only when you can actually observe them; otherwise keep null.
+- Do not include any other fields.
+
+Task:
+"#;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Options {
+    pub(crate) backend: DelegationBackend,
     pub(crate) prompt: String,
     pub(crate) model: String,
-    pub(crate) reasoning_effort: String,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) variant: Option<String>,
     pub(crate) codex_binary: PathBuf,
+    pub(crate) opencode_binary: PathBuf,
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl Options {
     #[cfg(test)]
     fn new(prompt: &str, model: &str, reasoning_effort: &str, codex_binary: PathBuf) -> Self {
         Self {
+            backend: DelegationBackend::Codex,
             prompt: prompt.to_owned(),
             model: model.to_owned(),
-            reasoning_effort: reasoning_effort.to_owned(),
+            reasoning_effort: Some(reasoning_effort.to_owned()),
+            variant: None,
             codex_binary,
+            opencode_binary: PathBuf::from("opencode"),
+            timeout: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_opencode(
+        prompt: &str,
+        model: &str,
+        variant: Option<&str>,
+        opencode_binary: PathBuf,
+    ) -> Self {
+        Self {
+            backend: DelegationBackend::OpenCode,
+            prompt: prompt.to_owned(),
+            model: model.to_owned(),
+            reasoning_effort: None,
+            variant: variant.map(str::to_owned),
+            codex_binary: PathBuf::from("codex"),
+            opencode_binary,
+            timeout: None,
         }
     }
 }
@@ -118,6 +184,7 @@ impl Options {
 enum Status {
     Success,
     ProcessNonzeroExit,
+    ProcessTimeout,
     MissingReport,
     InvalidJson,
     InvalidReportSchema,
@@ -129,6 +196,7 @@ impl Status {
         match self {
             Self::Success => "success",
             Self::ProcessNonzeroExit => "process_nonzero_exit",
+            Self::ProcessTimeout => "process_timeout",
             Self::MissingReport => "missing_report",
             Self::InvalidJson => "invalid_json",
             Self::InvalidReportSchema => "invalid_report_schema",
@@ -162,6 +230,7 @@ struct Artifacts {
 
 #[derive(Debug)]
 struct DelegationResult {
+    backend: DelegationBackend,
     status: Status,
     requested_model: String,
     requested_reasoning_effort: String,
@@ -183,25 +252,27 @@ enum ReportState {
     Valid(Value),
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DelegationBackend {
     Codex,
+    OpenCode,
 }
 
-#[allow(dead_code)]
 impl DelegationBackend {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Codex => "codex",
+            Self::OpenCode => "opencode",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "codex" => Ok(Self::Codex),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(format!(
-                "unsupported delegation backend {value:?}; expected codex"
+                "unsupported delegation backend {value:?}; expected codex or opencode"
             )),
         }
     }
@@ -232,7 +303,7 @@ struct NormalizedResult {
 impl DelegationResult {
     fn normalize(&self) -> NormalizedResult {
         NormalizedResult {
-            backend: DelegationBackend::Codex,
+            backend: self.backend,
             status: self.status,
             requested_model: self.requested_model.clone(),
             requested_variant: self.requested_reasoning_effort.clone(),
@@ -263,6 +334,22 @@ and stderr as private temporary artifacts, and prints one bounded JSON result.
     .to_owned()
 }
 
+pub(crate) fn generic_usage() -> String {
+    r#"Delegation backend
+
+Usage:
+  temote-mcp delegate --backend codex --model <MODEL> --reasoning-effort <EFFORT> --prompt <PROMPT>
+  temote-mcp delegate --backend codex --model <MODEL> --reasoning-effort <EFFORT> --prompt-file <PATH>
+  temote-mcp delegate --backend opencode --model <provider/model> [--variant <VARIANT>] --prompt <PROMPT>
+  temote-mcp delegate --backend opencode --model <provider/model> [--variant <VARIANT>] --prompt-file <PATH>
+
+Each request runs one bounded, non-interactive delegation process and prints
+one bounded JSON result. The legacy `temote-mcp codex delegate ...` command
+always uses the Codex backend.
+"#
+    .to_owned()
+}
+
 pub(crate) fn run_cli(args: &[String]) -> Result<String, String> {
     if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return Ok(usage());
@@ -273,6 +360,18 @@ pub(crate) fn run_cli(args: &[String]) -> Result<String, String> {
     serialize_parent_result(&result)
         .map(|json| format!("{json}\n"))
         .map_err(|error| format!("could not serialize Codex delegation result: {error}"))
+}
+
+pub(crate) fn run_generic_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok(generic_usage());
+    }
+
+    let options = parse_generic_args(args)?;
+    let result = run_with_options(options)?;
+    serialize_parent_result(&result)
+        .map(|json| format!("{json}\n"))
+        .map_err(|error| format!("could not serialize delegation result: {error}"))
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
@@ -301,25 +400,118 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         index += 1;
     }
 
-    let prompt = match (prompt, prompt_file) {
-        (Some(_), Some(_)) => {
-            return Err("--prompt and --prompt-file cannot be combined".to_owned());
-        }
-        (Some(prompt), None) => prompt,
-        (None, Some(path)) => read_prompt_file(Path::new(&path))?,
-        (None, None) => return Err(format!("a prompt is required\n\n{}", usage())),
-    };
-
+    let prompt = delegation_prompt(prompt, prompt_file)?;
     let model = model.ok_or_else(|| format!("--model is required\n\n{}", usage()))?;
     let reasoning_effort =
         reasoning_effort.ok_or_else(|| format!("--reasoning-effort is required\n\n{}", usage()))?;
 
     Ok(Options {
+        backend: DelegationBackend::Codex,
+        prompt,
+        model,
+        reasoning_effort: Some(reasoning_effort),
+        variant: None,
+        codex_binary: PathBuf::from("codex"),
+        opencode_binary: PathBuf::from("opencode"),
+        timeout: None,
+    })
+}
+
+fn parse_generic_args(args: &[String]) -> Result<Options, String> {
+    let mut backend = None;
+    let mut model = None;
+    let mut reasoning_effort = None;
+    let mut variant = None;
+    let mut prompt = None;
+    let mut prompt_file = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = &args[index];
+        match flag.as_str() {
+            "--backend" => {
+                let value = argument_value(args, &mut index, flag)?;
+                backend = Some(
+                    DelegationBackend::parse(&value)
+                        .map_err(|error| format!("{error}\n\n{}", generic_usage()))?,
+                );
+            }
+            "--model" => model = Some(argument_value(args, &mut index, flag)?),
+            "--reasoning-effort" => {
+                reasoning_effort = Some(argument_value(args, &mut index, flag)?)
+            }
+            "--variant" => variant = Some(argument_value(args, &mut index, flag)?),
+            "--prompt" => prompt = Some(argument_value(args, &mut index, flag)?),
+            "--prompt-file" => prompt_file = Some(argument_value(args, &mut index, flag)?),
+            _ => {
+                return Err(format!(
+                    "unsupported delegation option: {flag}\n\n{}",
+                    generic_usage()
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    let backend = match backend {
+        Some(backend) => backend,
+        None => match std::env::var("TEMOTE_DELEGATION_BACKEND") {
+            Ok(value) if !value.trim().is_empty() => DelegationBackend::parse(value.trim())
+                .map_err(|error| format!("{error}\n\n{}", generic_usage()))?,
+            _ => DelegationBackend::Codex,
+        },
+    };
+    let prompt = delegation_prompt(prompt, prompt_file)?;
+    let model = model.ok_or_else(|| format!("--model is required\n\n{}", generic_usage()))?;
+
+    let reasoning_effort = match backend {
+        DelegationBackend::Codex => {
+            if variant.is_some() {
+                return Err(format!(
+                    "--variant is only supported by the opencode backend\n\n{}",
+                    generic_usage()
+                ));
+            }
+            Some(reasoning_effort.ok_or_else(|| {
+                format!(
+                    "--reasoning-effort is required for the codex backend\n\n{}",
+                    generic_usage()
+                )
+            })?)
+        }
+        DelegationBackend::OpenCode => {
+            if reasoning_effort.is_some() {
+                return Err(format!(
+                    "--reasoning-effort is only supported by the codex backend; use --variant for opencode\n\n{}",
+                    generic_usage()
+                ));
+            }
+            None
+        }
+    };
+
+    Ok(Options {
+        backend,
         prompt,
         model,
         reasoning_effort,
+        variant,
         codex_binary: PathBuf::from("codex"),
+        opencode_binary: PathBuf::from("opencode"),
+        timeout: None,
     })
+}
+
+fn delegation_prompt(
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+) -> Result<String, String> {
+    match (prompt, prompt_file) {
+        (Some(_), Some(_)) => Err("--prompt and --prompt-file cannot be combined".to_owned()),
+        (Some(prompt), None) => Ok(prompt),
+        (None, Some(path)) => read_prompt_file(Path::new(&path)),
+        (None, None) => Err("a prompt is required".to_owned()),
+    }
 }
 
 fn argument_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
@@ -359,11 +551,22 @@ fn read_prompt_file(path: &Path) -> Result<String, String> {
 
 fn run_with_options(options: Options) -> Result<DelegationResult, String> {
     validate_options(&options)?;
+    match options.backend {
+        DelegationBackend::Codex => run_codex(options),
+        DelegationBackend::OpenCode => run_opencode(options),
+    }
+}
+
+fn run_codex(options: Options) -> Result<DelegationResult, String> {
     let artifacts = create_artifacts()?;
     let paths = artifacts.paths.clone();
+    let reasoning_effort = options
+        .reasoning_effort
+        .as_deref()
+        .ok_or_else(|| "Codex reasoning effort is required".to_owned())?;
     let reasoning_override = format!(
         "model_reasoning_effort={}",
-        serde_json::to_string(&options.reasoning_effort)
+        serde_json::to_string(reasoning_effort)
             .map_err(|error| format!("could not encode reasoning effort: {error}"))?
     );
 
@@ -399,9 +602,10 @@ fn run_with_options(options: Options) -> Result<DelegationResult, String> {
     let exit_code = status.code();
     if !status.success() {
         return Ok(DelegationResult {
+            backend: DelegationBackend::Codex,
             status: Status::ProcessNonzeroExit,
             requested_model: options.model,
-            requested_reasoning_effort: options.reasoning_effort,
+            requested_reasoning_effort: reasoning_effort.to_owned(),
             observed_model: evidence.observed_model.clone(),
             observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
             report: None,
@@ -422,9 +626,10 @@ fn run_with_options(options: Options) -> Result<DelegationResult, String> {
     };
 
     Ok(DelegationResult {
+        backend: DelegationBackend::Codex,
         status: report_status,
         requested_model: options.model,
-        requested_reasoning_effort: options.reasoning_effort,
+        requested_reasoning_effort: reasoning_effort.to_owned(),
         observed_model: evidence.observed_model.clone(),
         observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
         report,
@@ -433,6 +638,355 @@ fn run_with_options(options: Options) -> Result<DelegationResult, String> {
         artifacts_truncated,
         artifacts: paths,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    Exited,
+    TimedOut,
+}
+
+fn run_opencode(options: Options) -> Result<DelegationResult, String> {
+    let artifacts = create_artifacts()?;
+    let paths = artifacts.paths.clone();
+    let effective_prompt = opencode_effective_prompt(&options)?;
+
+    let working_directory =
+        std::env::current_dir()
+            .and_then(fs::canonicalize)
+            .map_err(|error| {
+                format!("could not resolve OpenCode delegation working directory: {error}")
+            })?;
+    let mut command = build_opencode_command(
+        &options,
+        &working_directory,
+        &effective_prompt,
+        std::env::vars_os(),
+    );
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| opencode_launch_error(&options, &error))?;
+
+    let timeout = options.timeout.unwrap_or(OPENCODE_RUN_TIMEOUT);
+    let (wait_outcome, stdout_truncated, stderr_truncated) = wait_with_bounded_artifacts_timeout(
+        &mut child,
+        artifacts.events_file,
+        artifacts.stderr_file,
+        timeout,
+    )?;
+    let status = child
+        .try_wait()
+        .map_err(|error| format!("could not inspect OpenCode delegation status: {error}"))?
+        .ok_or_else(|| "OpenCode delegation exited without a process status".to_owned())?;
+    secure_artifact_files(&paths);
+
+    let (evidence, report_state) = collect_opencode_output(&paths.events)
+        .unwrap_or((Evidence::default(), ReportState::Missing));
+    let exit_code = status.code();
+    let requested_variant = options.variant.clone().unwrap_or_default();
+
+    if wait_outcome == WaitOutcome::TimedOut {
+        return Ok(DelegationResult {
+            backend: DelegationBackend::OpenCode,
+            status: Status::ProcessTimeout,
+            requested_model: options.model,
+            requested_reasoning_effort: requested_variant,
+            observed_model: evidence.observed_model.clone(),
+            observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
+            report: None,
+            evidence,
+            exit_code,
+            artifacts_truncated: stdout_truncated || stderr_truncated,
+            artifacts: paths,
+        });
+    }
+
+    if !status.success() {
+        return Ok(DelegationResult {
+            backend: DelegationBackend::OpenCode,
+            status: Status::ProcessNonzeroExit,
+            requested_model: options.model,
+            requested_reasoning_effort: requested_variant,
+            observed_model: evidence.observed_model.clone(),
+            observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
+            report: None,
+            evidence,
+            exit_code,
+            artifacts_truncated: stdout_truncated || stderr_truncated,
+            artifacts: paths,
+        });
+    }
+
+    let (report_status, report) = match report_state {
+        ReportState::Missing => (Status::MissingReport, None),
+        ReportState::InvalidJson => (Status::InvalidJson, None),
+        ReportState::InvalidSchema => (Status::InvalidReportSchema, None),
+        ReportState::Oversized => (Status::OversizedReport, None),
+        ReportState::Valid(report) => (Status::Success, Some(report)),
+    };
+
+    Ok(DelegationResult {
+        backend: DelegationBackend::OpenCode,
+        status: report_status,
+        requested_model: options.model,
+        requested_reasoning_effort: requested_variant,
+        observed_model: evidence.observed_model.clone(),
+        observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
+        report,
+        evidence,
+        exit_code,
+        artifacts_truncated: stdout_truncated || stderr_truncated,
+        artifacts: paths,
+    })
+}
+
+fn opencode_effective_prompt(options: &Options) -> Result<String, String> {
+    let requested_model = serde_json::to_string(&options.model)
+        .map_err(|error| format!("could not encode OpenCode requested model: {error}"))?;
+    let requested_effort = serde_json::to_string(options.variant.as_deref().unwrap_or(""))
+        .map_err(|error| format!("could not encode OpenCode requested variant: {error}"))?;
+    let instructions = OPENCODE_REPORT_INSTRUCTIONS
+        .replace("__REQUESTED_MODEL__", &requested_model)
+        .replace("__REQUESTED_EFFORT__", &requested_effort);
+    let prompt = format!("{instructions}{}", options.prompt);
+    if prompt.len() > MAX_OPENCODE_PROMPT_BYTES {
+        return Err(format!(
+            "OpenCode delegation prompt exceeds {MAX_OPENCODE_PROMPT_BYTES} bytes"
+        ));
+    }
+    Ok(prompt)
+}
+
+fn opencode_launch_error(options: &Options, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "OpenCode backend unavailable: {} was not found; install OpenCode or add it to PATH (callers cannot supply an executable path)",
+            options.opencode_binary.display()
+        )
+    } else {
+        format!("could not start OpenCode delegation: {error}")
+    }
+}
+
+fn build_opencode_command<I>(
+    options: &Options,
+    working_directory: &Path,
+    effective_prompt: &str,
+    environment: I,
+) -> Command
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut command = Command::new(&options.opencode_binary);
+    command
+        .arg("run")
+        .arg("--pure")
+        .arg("--format")
+        .arg("json")
+        .arg("--dir")
+        .arg(working_directory)
+        .arg("--model")
+        .arg(&options.model);
+    if let Some(variant) = &options.variant {
+        command.arg("--variant").arg(variant);
+    }
+    command.arg("--").arg(effective_prompt);
+    command.env_clear();
+    for (key, value) in filtered_opencode_environment(environment) {
+        command.env(key, value);
+    }
+    command
+}
+
+fn filtered_opencode_environment<I>(environment: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    environment
+        .into_iter()
+        .filter(|(key, _)| opencode_environment_key_allowed(key))
+        .collect()
+}
+
+fn opencode_environment_key_allowed(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    key.starts_with("LC_") || OPENCODE_CHILD_ENV_ALLOWLIST.contains(&key)
+}
+
+fn wait_with_bounded_artifacts_timeout(
+    child: &mut Child,
+    events_file: File,
+    stderr_file: File,
+    timeout: Duration,
+) -> Result<(WaitOutcome, bool, bool), String> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "OpenCode delegation stdout pipe is unavailable".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "OpenCode delegation stderr pipe is unavailable".to_owned())?;
+    let deadline = Instant::now() + timeout;
+
+    let (outcome, stdout_result, stderr_result) = std::thread::scope(|scope| {
+        let stdout_handle = scope.spawn(|| capture_artifact(stdout, events_file));
+        let stderr_handle = scope.spawn(|| capture_artifact(stderr, stderr_file));
+        let outcome = (|| -> Result<WaitOutcome, String> {
+            loop {
+                if child
+                    .try_wait()
+                    .map_err(|error| format!("could not wait for OpenCode delegation: {error}"))?
+                    .is_some()
+                {
+                    return Ok(WaitOutcome::Exited);
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(WaitOutcome::TimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })();
+        (outcome, stdout_handle.join(), stderr_handle.join())
+    });
+
+    let stdout_truncated = stdout_result
+        .map_err(|_| "OpenCode delegation stdout capture thread panicked".to_owned())?
+        .map_err(|error| format!("could not capture OpenCode delegation JSON events: {error}"))?;
+    let stderr_truncated = stderr_result
+        .map_err(|_| "OpenCode delegation stderr capture thread panicked".to_owned())?
+        .map_err(|error| format!("could not capture OpenCode delegation stderr: {error}"))?;
+    Ok((outcome?, stdout_truncated, stderr_truncated))
+}
+
+fn collect_opencode_output(path: &Path) -> std::io::Result<(Evidence, ReportState)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let mut reader = BufReader::new(file.take(MAX_EVIDENCE_BYTES.saturating_add(1)));
+    let mut line = Vec::new();
+    let mut evidence = Evidence::default();
+    let mut text_parts: Vec<(Option<String>, String)> = Vec::new();
+
+    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line)? {
+        if !within_limit {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+
+        if evidence.thread_id.is_none() {
+            evidence.thread_id = bounded_string(object.get("sessionID"));
+        }
+        if evidence.observed_model.is_none() {
+            evidence.observed_model = opencode_observed_model(object);
+        }
+
+        match object.get("type").and_then(Value::as_str) {
+            Some("step_finish") => {
+                if let Some(tokens) = object
+                    .get("part")
+                    .and_then(|part| part.get("tokens"))
+                    .and_then(Value::as_object)
+                {
+                    evidence.usage = Some(opencode_usage(tokens));
+                }
+            }
+            Some("text") => {
+                if let Some(part) = object.get("part").and_then(Value::as_object)
+                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                    && text.len() <= MAX_EVENT_LINE_BYTES
+                {
+                    text_parts.push((bounded_string(part.get("messageID")), text.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let report = opencode_report_state(&text_parts);
+    Ok((evidence, report))
+}
+
+fn opencode_report_state(text_parts: &[(Option<String>, String)]) -> ReportState {
+    let Some((last_message_id, _)) = text_parts.last() else {
+        return ReportState::Missing;
+    };
+    let mut text = String::new();
+    if last_message_id.is_some() {
+        for (message_id, part) in text_parts {
+            if message_id == last_message_id {
+                text.push_str(part);
+            }
+        }
+    } else {
+        for (_, part) in text_parts {
+            text.push_str(part);
+        }
+    }
+
+    if text.len() > DEFAULT_MAX_REPORT_BYTES {
+        return ReportState::Oversized;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return ReportState::InvalidJson;
+    };
+    if !validate_report_schema(&value) {
+        return ReportState::InvalidSchema;
+    }
+    ReportState::Valid(value)
+}
+
+fn opencode_observed_model(object: &Map<String, Value>) -> Option<String> {
+    if let Some(model) =
+        bounded_string(object.get("modelID")).or_else(|| bounded_string(object.get("model")))
+    {
+        return Some(model);
+    }
+    let part = object.get("part").and_then(Value::as_object)?;
+    let model =
+        bounded_string(part.get("modelID")).or_else(|| bounded_string(part.get("model")))?;
+    let composed = match bounded_string(part.get("providerID")) {
+        Some(provider) => format!("{provider}/{model}"),
+        None => model,
+    };
+    (composed.len() <= MAX_EVIDENCE_STRING_BYTES).then_some(composed)
+}
+
+fn opencode_usage(tokens: &Map<String, Value>) -> Map<String, Value> {
+    let mut usage = Map::new();
+    for (source, target) in [
+        ("input", "input_tokens"),
+        ("output", "output_tokens"),
+        ("reasoning", "reasoning_output_tokens"),
+        ("total", "total_tokens"),
+    ] {
+        if let Some(value) = tokens.get(source).and_then(Value::as_u64) {
+            usage.insert(target.to_owned(), Value::from(value));
+        }
+    }
+    if let Some(cached) = tokens
+        .get("cache")
+        .and_then(Value::as_object)
+        .and_then(|cache| cache.get("read"))
+        .and_then(Value::as_u64)
+    {
+        usage.insert("cached_input_tokens".to_owned(), Value::from(cached));
+    }
+    usage
 }
 
 fn wait_with_bounded_artifacts(
@@ -547,15 +1101,7 @@ fn validate_options(options: &Options) -> Result<(), String> {
         || options.model.contains('\0')
     {
         return Err(format!(
-            "Codex model must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
-        ));
-    }
-    if options.reasoning_effort.is_empty()
-        || options.reasoning_effort.len() > MAX_ARGUMENT_BYTES
-        || options.reasoning_effort.contains('\0')
-    {
-        return Err(format!(
-            "Codex reasoning effort must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
+            "delegation model must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
         ));
     }
     if options.prompt.is_empty()
@@ -563,8 +1109,38 @@ fn validate_options(options: &Options) -> Result<(), String> {
         || options.prompt.contains('\0')
     {
         return Err(format!(
-            "Codex prompt must be non-empty, NUL-free, and at most {MAX_PROMPT_BYTES} bytes"
+            "delegation prompt must be non-empty, NUL-free, and at most {MAX_PROMPT_BYTES} bytes"
         ));
+    }
+    match options.backend {
+        DelegationBackend::Codex => {
+            let reasoning_effort = options
+                .reasoning_effort
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "Codex reasoning effort must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
+                    )
+                })?;
+            if reasoning_effort.len() > MAX_ARGUMENT_BYTES || reasoning_effort.contains('\0') {
+                return Err(format!(
+                    "Codex reasoning effort must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
+                ));
+            }
+        }
+        DelegationBackend::OpenCode => {
+            if let Some(variant) = &options.variant
+                && (variant.is_empty()
+                    || variant.len() > MAX_ARGUMENT_BYTES
+                    || variant.contains('\0'))
+            {
+                return Err(format!(
+                    "OpenCode variant must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
+                ));
+            }
+            opencode_effective_prompt(options)?;
+        }
     }
     Ok(())
 }
@@ -584,18 +1160,18 @@ fn create_artifacts() -> Result<Artifacts, String> {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(format!(
-                    "could not create Codex delegation artifact directory: {error}"
+                    "could not create delegation artifact directory: {error}"
                 ));
             }
         }
     }
-    Err("could not allocate a unique Codex delegation artifact directory".to_owned())
+    Err("could not allocate a unique delegation artifact directory".to_owned())
 }
 
 fn create_artifacts_in(directory: &Path) -> Result<Artifacts, String> {
     #[cfg(unix)]
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("could not secure Codex delegation artifacts: {error}"))?;
+        .map_err(|error| format!("could not secure delegation artifacts: {error}"))?;
 
     let paths = ArtifactPaths {
         directory: directory.to_path_buf(),
@@ -627,7 +1203,7 @@ fn create_private_file(path: &Path) -> Result<File, String> {
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     options
         .open(path)
-        .map_err(|error| format!("could not create private Codex delegation artifact: {error}"))
+        .map_err(|error| format!("could not create private delegation artifact: {error}"))
 }
 
 fn secure_artifact_files(paths: &ArtifactPaths) {
@@ -1200,6 +1776,7 @@ esac
             "observed_effort": null,
         });
         let result = DelegationResult {
+            backend: DelegationBackend::Codex,
             status: Status::Success,
             requested_model: "test-model".to_owned(),
             requested_reasoning_effort: "high".to_owned(),
@@ -1231,8 +1808,13 @@ esac
             DelegationBackend::parse("codex").unwrap(),
             DelegationBackend::Codex
         );
+        assert_eq!(
+            DelegationBackend::parse("opencode").unwrap(),
+            DelegationBackend::OpenCode
+        );
         assert_eq!(DelegationBackend::Codex.name(), "codex");
-        for value in ["opencode", "Codex", "", "codex extra"] {
+        assert_eq!(DelegationBackend::OpenCode.name(), "opencode");
+        for value in ["Codex", "OPENCODE", "", "codex extra", "other"] {
             assert!(
                 DelegationBackend::parse(value).is_err(),
                 "backend accepted {value:?}"
@@ -1242,6 +1824,7 @@ esac
 
     fn fixture_result() -> DelegationResult {
         DelegationResult {
+            backend: DelegationBackend::Codex,
             status: Status::Success,
             requested_model: "test-model".to_owned(),
             requested_reasoning_effort: "high".to_owned(),
@@ -1335,5 +1918,378 @@ esac
                 },
             })
         );
+    }
+
+    fn fake_opencode(root: &Path, mode: &str) -> PathBuf {
+        let path = root.join(format!("fake-opencode-{mode}"));
+        let script = r##"#!/bin/sh
+set -eu
+printf 'cwd=%s\n' "$(pwd -P)" >&2
+printf 'args=' >&2
+for arg in "$@"; do
+    printf '<%s>' "$arg" >&2
+done
+printf '\n' >&2
+
+report='{"status":"completed","summary":"ok","base_commit":"abc","changed_files":[],"checks":["cargo test"],"unresolved":[],"requested_model":"test-model","requested_effort":"high","observed_model":null,"observed_effort":null}'
+
+case "$0" in
+    *observed)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","providerID":"opencode-go","modelID":"deepseek-v4-flash","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[\"cargo test\"],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"high\",\"observed_model\":null,\"observed_effort\":null}"}}'
+        printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":30,"input":20,"output":5,"reasoning":2,"cache":{"read":3}}}}'
+        exit 0
+        ;;
+    *success)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[\"cargo test\"],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"high\",\"observed_model\":null,\"observed_effort\":null}"}}'
+        printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":30,"input":20,"output":5,"reasoning":2,"cache":{"read":3}}}}'
+        exit 0
+        ;;
+    *nonzero)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"not-json"}}'
+        exit 7
+        ;;
+    *missing)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        exit 0
+        ;;
+    *invalid_json)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"not-json"}}'
+        exit 0
+        ;;
+    *invalid_schema)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\"}"}}'
+        exit 0
+        ;;
+    *oversized)
+        printf '%s' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"'
+        head -c 4200 /dev/zero | tr '\0' 'x'
+        printf '%s\n' '"}}'
+        exit 0
+        ;;
+    *huge_stdout)
+        printf '%s' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"'
+        yes x | head -c 9000000
+        printf '%s\n' '"}}'
+        exit 0
+        ;;
+    *timeout)
+        sleep 30
+        exit 0
+        ;;
+esac
+"##;
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn opencode_options(root: &Path, mode: &str, variant: Option<&str>) -> Options {
+        Options::new_opencode(
+            "return a bounded report",
+            "opencode-go/test-model",
+            variant,
+            fake_opencode(root, mode),
+        )
+    }
+
+    fn run_fake_opencode(root: &Path, mode: &str, variant: Option<&str>) -> (Value, String) {
+        let result = run_with_options(opencode_options(root, mode, variant)).unwrap();
+        let value = result_to_json(&result);
+        let stderr = fs::read_to_string(value["artifacts"]["stderr"].as_str().unwrap()).unwrap();
+        (value, stderr)
+    }
+
+    #[test]
+    fn opencode_backend_selection_and_flag_validation() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "opencode",
+            "--model",
+            "opencode-go/deepseek-v4-flash",
+            "--variant",
+            "high",
+            "--prompt",
+            "task",
+        ]))
+        .unwrap();
+        assert_eq!(options.backend, DelegationBackend::OpenCode);
+        assert_eq!(options.variant.as_deref(), Some("high"));
+        assert_eq!(options.reasoning_effort, None);
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--reasoning-effort",
+            "high",
+            "--prompt",
+            "task",
+        ]))
+        .unwrap();
+        assert_eq!(options.backend, DelegationBackend::Codex);
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "codex",
+                "--model",
+                "m",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "codex",
+                "--model",
+                "m",
+                "--variant",
+                "high",
+                "--reasoning-effort",
+                "high",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "opencode",
+                "--model",
+                "m",
+                "--reasoning-effort",
+                "high",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "other",
+                "--model",
+                "m",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(parse_generic_args(&args(&["--backend", "opencode", "--prompt", "task"])).is_err());
+        assert!(run_generic_cli(&[]).unwrap().contains("--backend opencode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_command_is_structured_without_shell_and_filters_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let options = opencode_options(root.path(), "success", Some("high"));
+        let cwd = fs::canonicalize(root.path()).unwrap();
+        let environment = vec![
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+            (
+                OsString::from("OPENCODE_TEST_SECRET"),
+                OsString::from("sentinel-secret-value"),
+            ),
+            (
+                OsString::from("OP_SERVICE_ACCOUNT_TOKEN"),
+                OsString::from("sentinel-op-token"),
+            ),
+        ];
+        let command = build_opencode_command(&options, &cwd, "effective prompt", environment);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "--pure");
+        assert_eq!(args[2], "--format");
+        assert_eq!(args[3], "json");
+        assert_eq!(args[4], "--dir");
+        assert_eq!(Path::new(&args[5]), cwd);
+        assert_eq!(args[6], "--model");
+        assert_eq!(args[7], "opencode-go/test-model");
+        assert_eq!(args[8], "--variant");
+        assert_eq!(args[9], "high");
+        assert_eq!(args[10], "--");
+        assert_eq!(args[11], "effective prompt");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "sh" || arg == "-c" || arg == "bash")
+        );
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(envs.iter().any(|(key, _)| key == "HOME"));
+        assert!(envs.iter().any(|(key, _)| key == "LC_ALL"));
+        assert!(!envs.iter().any(|(key, _)| key == "OPENCODE_TEST_SECRET"));
+        assert!(
+            !envs
+                .iter()
+                .any(|(key, _)| key == "OP_SERVICE_ACCOUNT_TOKEN")
+        );
+    }
+
+    #[test]
+    fn opencode_effective_prompt_embeds_report_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let options = opencode_options(root.path(), "success", Some("high"));
+        let prompt = opencode_effective_prompt(&options).unwrap();
+        assert!(prompt.contains("respond with ONLY one JSON object"));
+        assert!(prompt.contains("\"opencode-go/test-model\""));
+        assert!(prompt.contains("\"high\""));
+        assert!(prompt.ends_with("return a bounded report"));
+    }
+
+    #[test]
+    fn opencode_success_is_normalized_to_backend_neutral_result() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, stderr) = run_fake_opencode(root.path(), "success", None);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["requested"]["model"], "opencode-go/test-model");
+        assert_eq!(value["requested"]["reasoning_effort"], "");
+        assert_eq!(value["report"]["status"], "completed");
+        assert_eq!(value["evidence"]["thread_id"], "ses_test");
+        assert_eq!(value["evidence"]["usage"]["input_tokens"], 20);
+        assert_eq!(value["evidence"]["usage"]["cached_input_tokens"], 3);
+        assert_eq!(value["evidence"]["usage"]["output_tokens"], 5);
+        assert_eq!(value["evidence"]["usage"]["reasoning_output_tokens"], 2);
+        assert_eq!(value["evidence"]["usage"]["total_tokens"], 30);
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["artifacts_truncated"], false);
+        assert!(stderr.contains("<run><--pure><--format><json><--dir>"));
+        assert!(stderr.contains("<--model><opencode-go/test-model><--><"));
+        assert!(stderr.contains("You are a delegated implementation worker"));
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_observed_model_and_variant_are_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "observed", Some("high"));
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["observed"]["model"], "opencode-go/deepseek-v4-flash");
+        assert_eq!(value["observed"]["reasoning_effort"], Value::Null);
+        assert_eq!(value["requested"]["reasoning_effort"], "high");
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_classifies_process_and_report_failures() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, expected) in [
+            ("nonzero", "process_nonzero_exit"),
+            ("missing", "missing_report"),
+            ("invalid_json", "invalid_json"),
+            ("invalid_schema", "invalid_report_schema"),
+            ("oversized", "oversized_report"),
+        ] {
+            let (value, _) = run_fake_opencode(root.path(), mode, None);
+            assert_eq!(value["status"], expected, "mode {mode}");
+            assert_eq!(value["report"], Value::Null, "mode {mode}");
+            fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn opencode_bounded_stdout_sets_truncation_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "huge_stdout", None);
+        assert_eq!(value["artifacts_truncated"], true);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_timeout_classifies_and_does_not_hang() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "timeout", None);
+        options.timeout = Some(Duration::from_millis(300));
+        let started = Instant::now();
+        let result = run_with_options(options).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout did not bound the child"
+        );
+        let value = result_to_json(&result);
+        assert_eq!(value["status"], "process_timeout");
+        assert_eq!(value["report"], Value::Null);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_missing_executable_is_backend_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist/opencode");
+        let options = Options::new_opencode("task", "opencode-go/test-model", None, missing);
+        let error = run_with_options(options).unwrap_err();
+        assert!(
+            error.contains("OpenCode backend unavailable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_and_variant_bounds_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "success", None);
+        options.prompt = "x".repeat(MAX_OPENCODE_PROMPT_BYTES);
+        assert!(validate_options(&options).is_err());
+
+        let options = opencode_options(root.path(), "success", Some(""));
+        assert!(validate_options(&options).is_err());
+
+        let mut options = opencode_options(root.path(), "success", Some("high"));
+        options.model = "x".repeat(MAX_ARGUMENT_BYTES + 1);
+        assert!(validate_options(&options).is_err());
+    }
+
+    #[test]
+    fn opencode_text_parts_use_the_last_message_and_ignore_earlier_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let report = r#"{"status":"completed","summary":"ok","base_commit":"abc","changed_files":[],"checks":[],"unresolved":[],"requested_model":"m","requested_effort":"","observed_model":null,"observed_effort":null}"#;
+        let (first, second) = report.split_at(20);
+        let events = [
+            r#"{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_old","type":"text","text":"ignore me"}}"#.to_owned(),
+            r#"{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"input":1,"output":2,"total":3}}}"#.to_owned(),
+            format!(
+                r#"{{"type":"text","sessionID":"ses_test","part":{{"messageID":"msg_final","type":"text","text":{}}}}}"#,
+                serde_json::to_string(first).unwrap()
+            ),
+            format!(
+                r#"{{"type":"text","sessionID":"ses_test","part":{{"messageID":"msg_final","type":"text","text":{}}}}}"#,
+                serde_json::to_string(second).unwrap()
+            ),
+        ];
+        fs::write(&path, format!("{}\n", events.join("\n"))).unwrap();
+
+        let (evidence, state) = collect_opencode_output(&path).unwrap();
+        assert_eq!(evidence.thread_id.as_deref(), Some("ses_test"));
+        assert_eq!(evidence.usage.as_ref().unwrap()["input_tokens"], 1);
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
     }
 }

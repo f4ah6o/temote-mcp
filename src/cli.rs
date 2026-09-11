@@ -131,6 +131,9 @@ pub fn parse_env() -> Result<ParseOutcome, String> {
     if raw.get(1).map(String::as_str) == Some("codex") {
         return codex::run(&raw[2..]).map(ParseOutcome::Print);
     }
+    if raw.get(1).map(String::as_str) == Some("delegate") {
+        return codex::run_delegate(&raw[2..]).map(ParseOutcome::Print);
+    }
     parse(raw.into_iter())
 }
 
@@ -247,6 +250,13 @@ where
         .is_present()
     {
         return Ok(ParseOutcome::Print(codex::usage()));
+    }
+    if noargs::cmd("delegate")
+        .doc("Run one bounded non-interactive delegation request")
+        .take(&mut args)
+        .is_present()
+    {
+        return Ok(ParseOutcome::Print(codex::delegate_usage()));
     }
     #[cfg(feature = "network")]
     if noargs::cmd("serve")

@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1 (Codex freeze, boundary inventory, backend-neutral internal types) landed on main; OpenCode backend not started
+- Status: Open / Phase 1 landed on main; one-shot OpenCode backend implemented in the current worktree; module extraction, diagnostics, and persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -535,6 +535,19 @@ Resolve these from a pinned OpenCode CLI and fixtures before merging production 
 - What is the cleanest compatibility mapping between Codex `reasoning_effort` and OpenCode provider-specific `--variant` without making either concept falsely universal?
 
 Until these are answered, unknown fields remain unknown; they are not inferred from requested values.
+
+## Phase 3 status (2026-09-11)
+
+One-shot OpenCode backend implemented in the current worktree:
+
+- `DelegationBackend::{Codex, OpenCode}`; `temote-mcp delegate --backend codex|opencode ...` selects the backend (explicit `--backend`, then `TEMOTE_DELEGATION_BACKEND`, then Codex). Legacy `temote-mcp codex delegate ...` always forces Codex and is not redirected by the environment variable.
+- OpenCode adapter: `opencode` is resolved from PATH and callers cannot inject an executable path; the child runs `opencode run --pure --format json --dir <canonical cwd> --model <provider/model> [--variant <variant>] -- <wrapped prompt>` with argv only and no shell.
+- The prompt wrapper embeds the strict final-report contract; JSON events are normalized into the existing backend-neutral parent result (last assistant message text parts for the report, `step_finish` tokens for usage, `sessionID` for bounded evidence). Requested and observed model/variant stay distinct.
+- The child environment is rebuilt from a small OpenCode allowlist (no host-wide passthrough), and a bounded run timeout kills the child and returns `process_timeout`.
+- Tests cover backend selection and flag validation, argv construction, cwd canonicalization, missing executable, success normalization, non-zero exit, timeout, bounded stdout, secret sentinel filtering, and Codex compatibility.
+- Live smoke on 2026-09-11: OpenCode CLI `1.18.30`, `--model opencode/mimo-v2.5-free`, read-only task; parent `status=success` with a schema-valid report and mapped usage; no files created or changed.
+
+Not implemented in this worktree: extraction of a separate delegation adapter module, `opencode models` diagnostics and `TEMOTE_OPENCODE_BIN`, and persistent server/session/resume behavior.
 
 ## Phase 1 status (2026-09-11)
 
