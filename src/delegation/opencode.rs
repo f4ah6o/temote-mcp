@@ -831,7 +831,7 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
     }
 
     let (report_status, report) = match report_state {
-        ReportState::Valid(value) => match normalize_opencode_report(value, &options) {
+        ReportState::Valid(value) => match normalize_opencode_report(value, &options, &evidence) {
             Some(report) if validate_report_schema(&report) => {
                 if canonical_report_fits(&report) {
                     persist_opencode_report(&paths, &report)?;
@@ -1131,7 +1131,11 @@ fn sanitize_json_strings(text: &str) -> String {
     sanitized
 }
 
-fn normalize_opencode_report(value: Value, options: &Options) -> Option<Value> {
+fn normalize_opencode_report(
+    value: Value,
+    options: &Options,
+    evidence: &Evidence,
+) -> Option<Value> {
     let object = value.as_object()?;
     if object.len() != REPORT_FIELDS.len()
         || REPORT_FIELDS
@@ -1147,6 +1151,8 @@ fn normalize_opencode_report(value: Value, options: &Options) -> Option<Value> {
     ) {
         return None;
     }
+    bounded_nullable_report_text(object.get("observed_model")?)?;
+    bounded_nullable_report_text(object.get("observed_effort")?)?;
 
     Some(json!({
         "status": status,
@@ -1157,8 +1163,8 @@ fn normalize_opencode_report(value: Value, options: &Options) -> Option<Value> {
         "unresolved": bounded_report_items(object.get("unresolved")?)?,
         "requested_model": options.model,
         "requested_effort": options.variant.clone().unwrap_or_default(),
-        "observed_model": bounded_nullable_report_text(object.get("observed_model")?)?,
-        "observed_effort": bounded_nullable_report_text(object.get("observed_effort")?)?,
+        "observed_model": evidence.observed_model.clone(),
+        "observed_effort": evidence.observed_reasoning_effort.clone(),
     }))
 }
 
@@ -1236,16 +1242,21 @@ fn opencode_observed_model(object: &Map<String, Value>) -> Option<String> {
     if let Some(model) =
         bounded_string(object.get("modelID")).or_else(|| bounded_string(object.get("model")))
     {
-        return Some(model);
+        let composed = compose_opencode_model(object, &model);
+        return (composed.len() <= MAX_EVIDENCE_STRING_BYTES).then_some(composed);
     }
     let part = object.get("part").and_then(Value::as_object)?;
     let model =
         bounded_string(part.get("modelID")).or_else(|| bounded_string(part.get("model")))?;
-    let composed = match bounded_string(part.get("providerID")) {
-        Some(provider) => format!("{provider}/{model}"),
-        None => model,
-    };
+    let composed = compose_opencode_model(part, &model);
     (composed.len() <= MAX_EVIDENCE_STRING_BYTES).then_some(composed)
+}
+
+fn compose_opencode_model(container: &Map<String, Value>, model: &str) -> String {
+    match bounded_string(container.get("providerID")) {
+        Some(provider) => format!("{provider}/{model}"),
+        None => model.to_owned(),
+    }
 }
 
 fn opencode_usage(tokens: &Map<String, Value>) -> Map<String, Value> {
@@ -1295,6 +1306,16 @@ case "$0" in
         printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
         printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","providerID":"opencode-go","modelID":"deepseek-v4-flash","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[\"cargo test\"],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"high\",\"observed_model\":null,\"observed_effort\":null}"}}'
         printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":30,"input":20,"output":5,"reasoning":2,"cache":{"read":3}}}}'
+        exit 0
+        ;;
+    *observed_conflict)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","providerID":"opencode-go","modelID":"deepseek-v4-flash","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"\",\"observed_model\":\"fake/self-reported\",\"observed_effort\":\"high\"}"}}'
+        exit 0
+        ;;
+    *self_report)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"\",\"observed_model\":\"fake/self-reported\",\"observed_effort\":\"high\"}"}}'
         exit 0
         ;;
     *success)
@@ -1584,6 +1605,39 @@ esac
         assert_eq!(value["observed"]["model"], "opencode-go/deepseek-v4-flash");
         assert_eq!(value["observed"]["reasoning_effort"], Value::Null);
         assert_eq!(value["requested"]["reasoning_effort"], "high");
+        assert_eq!(
+            value["report"]["observed_model"], value["observed"]["model"],
+            "canonical report must agree with parent evidence"
+        );
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_event_evidence_overrides_self_reported_observed_model() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "observed_conflict", None);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["observed"]["model"], "opencode-go/deepseek-v4-flash");
+        assert_eq!(value["observed"]["reasoning_effort"], Value::Null);
+        assert_eq!(
+            value["report"]["observed_model"],
+            "opencode-go/deepseek-v4-flash"
+        );
+        assert_eq!(value["report"]["observed_effort"], Value::Null);
+        assert_eq!(value["requested"]["model"], "opencode-go/test-model");
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_self_reported_observed_model_is_dropped_without_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "self_report", None);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["observed"]["model"], Value::Null);
+        assert_eq!(value["observed"]["reasoning_effort"], Value::Null);
+        assert_eq!(value["report"]["observed_model"], Value::Null);
+        assert_eq!(value["report"]["observed_effort"], Value::Null);
+        assert_eq!(value["requested"]["model"], "opencode-go/test-model");
         fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
     }
 
@@ -2204,7 +2258,7 @@ esac
             None,
             PathBuf::from("opencode"),
         );
-        let normalized = normalize_opencode_report(value, &options).unwrap();
+        let normalized = normalize_opencode_report(value, &options, &Evidence::default()).unwrap();
         assert!(validate_report_schema(&normalized));
         assert!(!canonical_report_fits(&normalized));
     }
@@ -2219,7 +2273,7 @@ esac
             None,
             PathBuf::from("opencode"),
         );
-        let normalized = normalize_opencode_report(value, &options).unwrap();
+        let normalized = normalize_opencode_report(value, &options, &Evidence::default()).unwrap();
         let summary = normalized["summary"].as_str().unwrap();
         assert_eq!(summary.chars().count(), MAX_REPORT_SUMMARY_CHARS);
         assert!(summary.ends_with("…[truncated]"));
@@ -2236,7 +2290,7 @@ esac
             Some("high"),
             PathBuf::from("opencode"),
         );
-        let normalized = normalize_opencode_report(value, &options).unwrap();
+        let normalized = normalize_opencode_report(value, &options, &Evidence::default()).unwrap();
         assert_eq!(normalized["summary"], "short summary");
         assert_eq!(normalized["requested_model"], "opencode-go/canonical");
         assert_eq!(normalized["requested_effort"], "high");
@@ -2254,7 +2308,7 @@ esac
             Some("high"),
             PathBuf::from("opencode"),
         );
-        let normalized = normalize_opencode_report(value, &options).unwrap();
+        let normalized = normalize_opencode_report(value, &options, &Evidence::default()).unwrap();
         assert_eq!(
             normalized["requested_model"],
             "opencode-go/deepseek-v4-flash"
@@ -2278,15 +2332,21 @@ esac
         );
         let mut missing_summary = report_object("ok");
         missing_summary.as_object_mut().unwrap().remove("summary");
-        assert!(normalize_opencode_report(missing_summary, &options).is_none());
+        assert!(
+            normalize_opencode_report(missing_summary, &options, &Evidence::default()).is_none()
+        );
 
         let mut invalid_status = report_object("ok");
         invalid_status["status"] = json!("done");
-        assert!(normalize_opencode_report(invalid_status, &options).is_none());
+        assert!(
+            normalize_opencode_report(invalid_status, &options, &Evidence::default()).is_none()
+        );
 
         let mut non_string_summary = report_object("ok");
         non_string_summary["summary"] = json!(42);
-        assert!(normalize_opencode_report(non_string_summary, &options).is_none());
+        assert!(
+            normalize_opencode_report(non_string_summary, &options, &Evidence::default()).is_none()
+        );
     }
 
     #[test]
@@ -2300,19 +2360,27 @@ esac
 
         let mut too_many_items = report_object("ok");
         too_many_items["unresolved"] = json!(vec!["item"; MAX_REPORT_ARRAY_ITEMS + 1]);
-        assert!(normalize_opencode_report(too_many_items, &options).is_none());
+        assert!(
+            normalize_opencode_report(too_many_items, &options, &Evidence::default()).is_none()
+        );
 
         let mut oversized_item = report_object("ok");
         oversized_item["checks"] = json!(vec!["x".repeat(MAX_REPORT_ARRAY_ITEM_CHARS + 1)]);
-        assert!(normalize_opencode_report(oversized_item, &options).is_none());
+        assert!(
+            normalize_opencode_report(oversized_item, &options, &Evidence::default()).is_none()
+        );
 
         let mut oversized_commit = report_object("ok");
         oversized_commit["base_commit"] = json!("b".repeat(MAX_REPORT_COMMIT_CHARS + 1));
-        assert!(normalize_opencode_report(oversized_commit, &options).is_none());
+        assert!(
+            normalize_opencode_report(oversized_commit, &options, &Evidence::default()).is_none()
+        );
 
         let mut oversized_observed = report_object("ok");
         oversized_observed["observed_model"] = json!("m".repeat(MAX_REPORT_ARGUMENT_CHARS + 1));
-        assert!(normalize_opencode_report(oversized_observed, &options).is_none());
+        assert!(
+            normalize_opencode_report(oversized_observed, &options, &Evidence::default()).is_none()
+        );
     }
 
     #[test]
@@ -2329,7 +2397,7 @@ esac
             None,
             PathBuf::from("opencode"),
         );
-        let normalized = normalize_opencode_report(value, &options).unwrap();
+        let normalized = normalize_opencode_report(value, &options, &Evidence::default()).unwrap();
         assert_eq!(
             normalized["unresolved"].as_array().unwrap().len(),
             MAX_REPORT_ARRAY_ITEMS
@@ -2348,7 +2416,146 @@ esac
             None,
             PathBuf::from("opencode"),
         );
-        assert!(normalize_opencode_report(value, &options).is_none());
+        assert!(normalize_opencode_report(value, &options, &Evidence::default()).is_none());
+    }
+
+    #[test]
+    fn opencode_normalization_uses_event_evidence_not_self_reported_observed() {
+        let mut value = report_object("ok");
+        value["observed_model"] = json!("fake/self-reported");
+        value["observed_effort"] = json!("high");
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            Some("low"),
+            PathBuf::from("opencode"),
+        );
+        let evidence = Evidence {
+            observed_model: Some("opencode-go/real-model".to_owned()),
+            ..Evidence::default()
+        };
+        let normalized = normalize_opencode_report(value, &options, &evidence).unwrap();
+        assert_eq!(normalized["observed_model"], "opencode-go/real-model");
+        assert_eq!(normalized["observed_effort"], Value::Null);
+        assert_eq!(normalized["requested_model"], "opencode-go/canonical");
+        assert_eq!(normalized["requested_effort"], "low");
+    }
+
+    #[test]
+    fn opencode_normalization_nulls_observed_without_event_evidence() {
+        let mut value = report_object("ok");
+        value["observed_model"] = json!("fake/self-reported");
+        value["observed_effort"] = json!("high");
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+        let normalized = normalize_opencode_report(value, &options, &Evidence::default()).unwrap();
+        assert_eq!(normalized["observed_model"], Value::Null);
+        assert_eq!(normalized["observed_effort"], Value::Null);
+    }
+
+    #[test]
+    fn opencode_normalization_still_validates_raw_observed_fields() {
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+
+        let mut oversized = report_object("ok");
+        oversized["observed_model"] = json!("m".repeat(MAX_REPORT_ARGUMENT_CHARS + 1));
+        assert!(normalize_opencode_report(oversized, &options, &Evidence::default()).is_none());
+
+        let mut wrong_type = report_object("ok");
+        wrong_type["observed_effort"] = json!(42);
+        assert!(normalize_opencode_report(wrong_type, &options, &Evidence::default()).is_none());
+
+        let mut missing = report_object("ok");
+        missing.as_object_mut().unwrap().remove("observed_model");
+        assert!(normalize_opencode_report(missing, &options, &Evidence::default()).is_none());
+    }
+
+    #[test]
+    fn opencode_observed_model_composes_top_level_provider_and_model() {
+        let top_level = json!({
+            "type": "step_start",
+            "providerID": "opencode-go",
+            "modelID": "deepseek-v4-flash",
+        });
+        assert_eq!(
+            opencode_observed_model(top_level.as_object().unwrap()).as_deref(),
+            Some("opencode-go/deepseek-v4-flash")
+        );
+
+        let top_level_model_fallback = json!({
+            "providerID": "opencode-go",
+            "model": "deepseek-v4-flash",
+        });
+        assert_eq!(
+            opencode_observed_model(top_level_model_fallback.as_object().unwrap()).as_deref(),
+            Some("opencode-go/deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn opencode_observed_model_preserves_existing_shapes() {
+        let part = json!({
+            "part": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
+        });
+        assert_eq!(
+            opencode_observed_model(part.as_object().unwrap()).as_deref(),
+            Some("opencode-go/deepseek-v4-flash")
+        );
+
+        let model_only_top_level = json!({"modelID": "deepseek-v4-flash"});
+        assert_eq!(
+            opencode_observed_model(model_only_top_level.as_object().unwrap()).as_deref(),
+            Some("deepseek-v4-flash")
+        );
+
+        let model_only_part = json!({"part": {"modelID": "deepseek-v4-flash"}});
+        assert_eq!(
+            opencode_observed_model(model_only_part.as_object().unwrap()).as_deref(),
+            Some("deepseek-v4-flash")
+        );
+
+        assert_eq!(
+            opencode_observed_model(json!({}).as_object().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_observed_model_does_not_guess_providers_or_exceed_bounds() {
+        let long_model = json!({
+            "providerID": "p",
+            "modelID": "m".repeat(MAX_EVIDENCE_STRING_BYTES),
+        });
+        assert_eq!(
+            opencode_observed_model(long_model.as_object().unwrap()),
+            None,
+            "a composed value over the evidence bound must not be returned"
+        );
+
+        let oversized_model = json!({"modelID": "m".repeat(MAX_EVIDENCE_STRING_BYTES + 1)});
+        assert_eq!(
+            opencode_observed_model(oversized_model.as_object().unwrap()),
+            None
+        );
+
+        let oversized_provider = json!({
+            "providerID": "p".repeat(MAX_EVIDENCE_STRING_BYTES + 1),
+            "modelID": "m",
+        });
+        assert_eq!(
+            opencode_observed_model(oversized_provider.as_object().unwrap()).as_deref(),
+            Some("m"),
+            "an out-of-bound provider must be ignored, not guessed"
+        );
     }
 
     #[test]
