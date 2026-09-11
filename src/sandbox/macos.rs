@@ -255,6 +255,8 @@ mod tests {
         let hidden = fixture.path().join("hidden");
         let selected = hidden.join("repo/crate");
         std::fs::create_dir_all(&selected).unwrap();
+        let hidden = std::fs::canonicalize(hidden).unwrap();
+        let selected = std::fs::canonicalize(selected).unwrap();
 
         let spec = SandboxSpec::local_agent(
             &selected,
