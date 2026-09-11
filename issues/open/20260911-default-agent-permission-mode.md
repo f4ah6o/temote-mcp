@@ -100,10 +100,20 @@ Public MCP must still be unable to create or promote a session to `yolo`.
 
 Change the default for newly created sessions from `ask` to `agent`:
 
+- `temote-mcp start foo` with no permission flag starts `foo` in `agent` mode
 - local managed session start defaults to `agent`
 - authenticated public `session_start` defaults to `agent`
 - explicit `ask` remains available for stricter sessions
 - explicit `yolo` remains local-only
+
+The zero-configuration CLI happy path must therefore be:
+
+```text
+temote-mcp start foo
+# => permission_mode=agent, yolo=false
+```
+
+Users should not need to spell an `--agent` flag for the normal case. Any explicit strict/unrestricted mode flag must override this default deterministically.
 
 Existing persisted/running sessions should keep their stored permission mode across upgrade/restart; do not silently rewrite an existing `ask` session to `agent` during restoration.
 
@@ -158,6 +168,7 @@ This should eliminate the current deadlock where `ask` requires an attached loca
 
 ## Required tests
 
+- [ ] `temote-mcp start foo` with no permission flag creates `foo` with `permission_mode=agent` and `yolo=false`.
 - [ ] Newly created local managed sessions default to `permission_mode=agent`.
 - [ ] Newly created public managed sessions default to `permission_mode=agent` and `yolo=false`.
 - [ ] Explicit `ask` sessions keep existing approval behavior.
