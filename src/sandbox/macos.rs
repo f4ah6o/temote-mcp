@@ -71,6 +71,13 @@ fn build_read_policy(spec: &SandboxSpec) -> Result<(String, Vec<(String, PathBuf
         let key = format!("VISIBLE_ROOT_{index}");
         definitions.push((key.clone(), root.clone()));
         clauses.push(format!("(allow file-read* (subpath (param \"{key}\")))"));
+        // Seatbelt must be able to stat each directory on the way to a
+        // re-exposed root, even though the containing hidden root remains
+        // unreadable. Metadata access does not allow directory listing or
+        // file contents, so this does not re-expose hidden siblings.
+        clauses.push(format!(
+            "(allow file-read-metadata (path-ancestors (param \"{key}\")))"
+        ));
     }
 
     Ok((clauses.join("\n"), definitions))
@@ -240,6 +247,30 @@ mod tests {
                 "raw nested protected path leaked into Seatbelt policy: {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn generated_read_policy_allows_only_selected_hidden_root_ancestors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let hidden = fixture.path().join("hidden");
+        let selected = hidden.join("repo/crate");
+        std::fs::create_dir_all(&selected).unwrap();
+
+        let spec = SandboxSpec::local_agent(
+            &selected,
+            std::slice::from_ref(&selected),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+        let (policy, definitions) = build_read_policy(&spec).unwrap();
+
+        assert!(definitions.iter().any(|(_, path)| path == &hidden));
+        assert!(definitions.iter().any(|(_, path)| path == &selected));
+        assert!(policy.contains("(allow file-read-metadata (path-ancestors"));
+        assert!(policy.contains("(allow file-read* (subpath"));
     }
 
     #[test]
