@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, and normalized-report fix landed on main; `TEMOTE_OPENCODE_BIN` landed on main; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN` landed on main; session/resume pre-implementation spike recorded; persistent/session implementation not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -601,7 +601,14 @@ Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-rep
 - Follow-up review fixes (2026-09-12): normalized reports now fail closed on oversized arrays/items/scalars and on unexpected top-level fields instead of silently truncating or accepting them, and early OpenCode launch failures clean up temporary artifacts. Report: [`docs/evaluations/opencode-review-fixes-20260912.md`](../../docs/evaluations/opencode-review-fixes-20260912.md).
 - Observed evidence trust-boundary fix (2026-09-12): canonical report `observed_model`/`observed_effort` are now sourced only from adapter event evidence and never from model self-report, so parent and canonical observed values cannot disagree; top-level `providerID`+`modelID` events compose `provider/model` like the part shape. Report: [`docs/evaluations/opencode-observed-evidence-fix-20260912.md`](../../docs/evaluations/opencode-observed-evidence-fix-20260912.md).
 
-Remaining work after this slice: persistent server/session/resume.
+## Session/resume spike status (2026-09-12)
+
+Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-spike-20260912.md`](../../docs/evaluations/opencode-session-resume-spike-20260912.md). No production session/resume behavior was implemented.
+
+- Verified on OpenCode 1.18.30: explicit `--session <id>` preserves the session ID and context, works with a different `--model`, and is unaffected by `--pure`. A session created in directory A and resumed with `--dir B` resolves to directory A and then hangs without emitting a final event, so a mismatched resume both ignores the caller's canonical cwd and fails to terminate.
+- `--continue` implicitly selects the most recent project session and silently creates a new session when the project has no history; `--fork` creates a new session with inherited context; `--attach` requires a server lifecycle and auth.
+- Recommended first slice: explicit caller-supplied `--session <id>` only, with a fail-closed bounded `opencode session list --format json` preflight requiring the session's canonical `directory` to equal the canonical cwd; no `--continue`, no `--fork`, no `--attach`, no server lifecycle, and no automatic resume from previously observed thread IDs.
+- Remaining work: implement the recommended explicit-resume slice (plus later, separately reviewed fork/attach slices if desired).
 
 ## OpenCode executable override status (2026-09-12)
 
