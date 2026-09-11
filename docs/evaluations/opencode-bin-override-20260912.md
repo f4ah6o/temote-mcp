@@ -2,9 +2,10 @@
 
 ## Result
 
-- status: implemented and verified locally (pre-push; the status-only finalization commit below marks it landed on main)
+- status: landed on main
 - baseline: `9486334ff90f33c5b1efcf2b1538413aa5e96a22`
 - implementation commit: `93c07b10ce85dc8de5cad4cf31abec1fd6a67714`
+- report commit: `7ccdfae79489440b93b1244ca890e5eeb5c3d0ea`
 - final HEAD: the status-only finalization commit listed in `git log -5 --oneline` (no code or content changes in it); use `git rev-parse HEAD` for the exact hash
 - pushed: yes (two pushes: implementation + docs, then the status finalization commit)
 - tracked worktree clean: yes (`?? .worktrees/` only, untouched)
