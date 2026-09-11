@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1 (Codex freeze, boundary inventory, backend-neutral internal types) implemented in the current worktree; OpenCode backend not started
+- Status: Open / Phase 1 (Codex freeze, boundary inventory, backend-neutral internal types) landed on main; OpenCode backend not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -538,7 +538,7 @@ Until these are answered, unknown fields remain unknown; they are not inferred f
 
 ## Phase 1 status (2026-09-11)
 
-Phase 1 (freeze Codex behavior + boundary inventory + backend-neutral internal types) is implemented in the current worktree without launching OpenCode and without changing CLI output:
+Phase 1 (freeze Codex behavior + boundary inventory + backend-neutral internal types) landed on main without launching OpenCode and without changing CLI output:
 
 - `src/codex_delegation.rs` now exposes `DelegationBackend::{Codex}` with explicit `parse`/`name`, plus internal `NormalizedResult`/`NormalizedEvidence` types. `result_to_json` converts through `DelegationResult::normalize()` and `normalized_to_json()`.
 - Compatibility is frozen by `parent_result_json_shape_is_frozen_for_compatibility` (exact parent JSON fixture), `normalized_result_keeps_requested_and_observed_distinct`, and the existing command/environment/report classification tests.

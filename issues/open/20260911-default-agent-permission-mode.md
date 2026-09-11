@@ -2,7 +2,7 @@
 
 ## Status
 
-Open. Slice A (permission enum and persistence, behavior-preserving) is implemented in the current worktree; default changes and policy-driven approval remain.
+Open. Slice A (permission enum and persistence, behavior-preserving) landed on main; default changes and policy-driven approval remain.
 
 `local_agent_run` itself is already implemented on `main` by PR #13. This issue changes session permission semantics and defaults; it must not redesign the local-agent broker or weaken its sandbox/environment contract.
 

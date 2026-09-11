@@ -1,6 +1,6 @@
 # `local_agent_run` cannot launch Codex installed through Vite+ (`vp`)
 
-Status: open / reproduction and classification implemented in the current worktree; sandbox fix not implemented
+Status: open / reproduction and classification landed on main; sandbox fix not implemented
 Created: 2026-09-11
 Priority: P1 developer workflow regression
 Related:
