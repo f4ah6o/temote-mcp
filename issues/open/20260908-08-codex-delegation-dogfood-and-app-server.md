@@ -1,14 +1,33 @@
 # TEMOTE-08: Lunaへの実装委譲を今回の開発で実証し、Codex app server連携へ進める
 
-- Status: Open / implementation and measurement not started
+- Status: Open / implementation and fake-transport verification landed; real Codex dogfood and comparative measurement remain
 - Date: 2026-09-08 (Asia/Tokyo)
+- Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
-- Baseline inspected: `8b95f1d91734e77e698d55d2babd097860f1c1b3` (`main`)
+- Original baseline inspected: `8b95f1d91734e77e698d55d2babd097860f1c1b3` (`main`)
+- Implementation baseline now in `main`: `da64a3800eafb9ef19237ebd9d7310502201873f` and follow-up commits
 - Requested outcome: この機能の開発自体で、Luna Maxへ調査・実装・テストを任せ、親モデルが短い報告と証拠をレビューする。
 - Related:
   - [TEMOTE-05: durable continuation / apply_patch](../done/20260908-05-durable-continuation-and-apply-patch.md)
   - [TEMOTE-06: friction / learning / recall](20260908-06-friction-learning-recall.md)
   - [TEMOTE-07: client-safe upgrade / reconnect](20260908-07-client-safe-upgrade-reconnect.md)
+  - [`docs/evaluations/codex-delegation.md`](../../docs/evaluations/codex-delegation.md)
+
+## 現在の状態（2026-09-11）
+
+この issue の実装部分はすでに `main` に入っている。`codex delegate` の bounded structured report、scoped evidence、experimental app-server task controls、gateway contract、fake-transport/権限/失敗系テストが実装済みである。
+
+一方、実 Codex dogfood と効果測定は未完了。repository 内の評価記録では、対象環境の Codex vendor binary 欠落により real Luna Max task、real app-server model listing、authentication success、observed usage を確認できていない。
+
+したがって、この issue の残作業は **新しい delegation 実装ではなく live dogfood / measurement / adoption decision** である。以下の historical phase checklist の unchecked 項目を機械的に再実装しない。現行コードと `docs/evaluations/codex-delegation.md` を先に確認する。
+
+### 次に着手する最小スライス
+
+1. 検証済み Codex build が利用できるホストで、要求 model/effort を確認する。
+2. 同じ小規模 repository task を `codex delegate` で1件実行し、worktree/diff/test と structured report を照合する。
+3. 同じ条件で app-server path を1件実行し、resume/control/usage/status evidence を確認する。
+4. 同一 base/permissions/acceptance criteria で direct Temote / `codex exec` / app-server の比較を記録する。
+5. 結果を `docs/evaluations/codex-delegation.md` に追記し、採用・条件付き採用・不採用を決める。live evidence で実装 defect が出た場合だけ、その defect を別の小さい修正単位として扱う。
 
 ## 目的と判断
 
