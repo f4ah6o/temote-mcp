@@ -1,8 +1,8 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, and backend adapter extraction landed on main; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, and backend adapter extraction landed on main; live comparative measurement completed locally; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
-- Updated: 2026-09-11 (Asia/Tokyo)
+- Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
 - Original baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
 - Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
@@ -563,7 +563,7 @@ Backend adapter extraction landed on main without changing external behavior:
 - All 37 delegation tests moved with their modules and pass unchanged; the frozen parent JSON fixture, Codex argv/environment tests, OpenCode argv/normalization tests, and diagnostics tests keep their assertions.
 - Smoke on 2026-09-11: `delegate diagnose --backend opencode` unchanged; one-shot `delegate --backend opencode --model opencode/mimo-v2.5-free` completed with `status=success` and no files created or changed.
 
-Remaining work after this slice: `TEMOTE_OPENCODE_BIN`, persistent server/session/resume, and live comparative measurement.
+Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
 
 ## Phase 3 diagnostics status (2026-09-11)
 
@@ -576,7 +576,19 @@ Read-only OpenCode CLI diagnostics landed on main:
 - Deterministic fake-CLI tests cover missing binary, version success/failure/timeout/oversized/malformed, model listing success/empty/mixed/failure/unsupported/timeout/oversized, requested-model present/absent/unknown, environment allowlist filtering, and secret/output non-leakage.
 - Read-only smoke on 2026-09-11 with OpenCode CLI `1.18.30`: `executable=available`, `version=1.18.30`, `models=ready count=64`, `requested_model=opencode-go/deepseek-v4-flash present`; no credential mutation and no delegation execution.
 
-Remaining work after this slice: `TEMOTE_OPENCODE_BIN`, persistent server/session/resume, and live comparative measurement.
+Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
+
+## Live comparative measurement status (2026-09-12)
+
+Live comparison completed locally. Evidence: [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
+
+- 3 read-only tasks (repository comprehension, targeted review, implementation planning) × Codex/OpenCode × 3 runs = 18 delegation runs at baseline `0f8a795`, with fixed prompts: Codex `gpt-5.6-luna` (`high`) and OpenCode `opencode-go/deepseek-v4-flash` (`1.18.30`).
+- Delivered normalized results: Codex 9/9; OpenCode 1/9 (`invalid_json` ×2 from raw newlines in strings, `invalid_report_schema` ×6 from summaries over the 1200-character bound). Blind content scores were close; the practical difference is report deliverability.
+- Median wall-clock: Codex 176.3 s vs OpenCode 87.3 s across all tasks, with high variance in Codex's review task (180–446 s). Usage units are not comparable between backends; no cost conclusion.
+- Recommendation in this sample: keep Codex as the default delegation backend; treat OpenCode as an interactive/session backend or a fallback only after report delivery is enforced. More evidence (more runs, second OpenCode model, report-contract fix) is needed before changing defaults.
+- Observed issues are recorded in the evidence file only; no production changes were made in this slice.
+
+Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
 
 ## Phase 1 status (2026-09-11)
 

@@ -1,6 +1,6 @@
 # Codex delegation evaluation
 
-Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends, read-only OpenCode diagnostics, and backend adapter extraction landed on main; comparative measurement remains pending.
+Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends, read-only OpenCode diagnostics, and backend adapter extraction landed on main; live Codex vs OpenCode comparison recorded in `codex-vs-opencode-live-20260912.md`; app-server comparative work remains pending.
 
 ## Current evidence
 
@@ -11,6 +11,7 @@ Status: implementation and fake-transport verification complete; one-shot Codex 
 - The generic `temote-mcp delegate --backend codex|opencode ...` command selects the backend (explicit flag, then `TEMOTE_DELEGATION_BACKEND`, then Codex); the legacy `temote-mcp codex delegate ...` command always forces Codex.
 - The app-server adapter uses local stdio, an exact `0.153.4` compatibility check, session-instance and canonical-scope ownership, durable pre-side-effect operation receipts, child approvals independent of Temote yolo, bounded evidence, and reconciliation states. Pre-thread transient failures are retryable with the same start operation; uncertain thread/turn boundaries remain reconciliation-required. Unexpired task records, including terminal records, are retained until task retention expires; only expired terminal records without a live runtime are prunable, and a full scope rejects new starts. Compacted operation receipts fail closed on exact replay for the full task retention period.
 - Rust unit/property tests, gateway contract tests, formatting, clippy, no-default-features checks, and diff checks are the repeatable verification set for this implementation.
+- Live comparison of the two delegation backends (3 read-only tasks × 3 runs each, fixed prompts, blind content scoring) is recorded in [`codex-vs-opencode-live-20260912.md`](codex-vs-opencode-live-20260912.md). In that sample Codex delivered normalized results 9/9 and OpenCode 1/9, with close underlying answer quality.
 
 ## Live dogfood record (2026-09-11, macOS)
 
@@ -68,4 +69,4 @@ Limitations observed: the Codex child's `changed_files` entry was an absolute ar
 
 ## Remaining live work
 
-App-server dogfood and the direct-Temote / `codex exec` / app-server comparison remain. Run those with the same base commit, permissions, and acceptance criteria, then record observed model/effort, usage source, process outcome, elapsed times, retries, and parent intervention. Do not infer token or cost savings from MCP response bytes.
+App-server dogfood and the direct-Temote / `codex exec` / app-server comparison remain. Run those with the same base commit, permissions, and acceptance criteria, then record observed model/effort, usage source, process outcome, elapsed times, retries, and parent intervention. Do not infer token or cost savings from MCP response bytes. The direct Codex-vs-OpenCode comparison is recorded in [`codex-vs-opencode-live-20260912.md`](codex-vs-opencode-live-20260912.md).
