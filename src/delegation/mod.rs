@@ -325,8 +325,7 @@ pub(crate) fn run_diagnose_cli(args: &[String]) -> Result<String, String> {
     }
 
     let requested_model = parse_diagnose_args(args)?;
-    let diagnostics = opencode::opencode_diagnostics(
-        &opencode::default_binary(),
+    let diagnostics = opencode::diagnose_default(
         requested_model.as_deref(),
         opencode::OpenCodeDiagnosticTimeouts::default(),
     )?;
@@ -515,6 +514,14 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
         }
     };
 
+    let opencode_binary = if backend == DelegationBackend::OpenCode {
+        let override_value = opencode::bin_override_value().map_err(delegation_override_error)?;
+        resolve_delegation_opencode_binary(backend, override_value.as_deref())
+            .map_err(delegation_override_error)?
+    } else {
+        opencode::default_binary()
+    };
+
     Ok(Options {
         backend,
         prompt,
@@ -522,9 +529,26 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
         reasoning_effort,
         variant,
         codex_binary: codex::default_binary(),
-        opencode_binary: opencode::default_binary(),
+        opencode_binary,
         timeout: None,
     })
+}
+
+fn delegation_override_error(error: opencode::OpenCodeExecutableError) -> String {
+    format!("{}\n\n{}", error.delegation_message(), generic_usage())
+}
+
+fn resolve_delegation_opencode_binary(
+    backend: DelegationBackend,
+    override_value: Option<&str>,
+) -> Result<PathBuf, opencode::OpenCodeExecutableError> {
+    match backend {
+        DelegationBackend::Codex => Ok(opencode::default_binary()),
+        DelegationBackend::OpenCode => {
+            opencode::resolve_opencode_executable(override_value, &opencode::default_binary())
+                .map(opencode::ResolvedOpenCodeExecutable::into_path)
+        }
+    }
 }
 
 fn delegation_prompt(
@@ -1215,5 +1239,41 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn delegation_opencode_binary_resolution_keeps_codex_unaffected() {
+        let binary =
+            resolve_delegation_opencode_binary(DelegationBackend::Codex, Some("relative/opencode"))
+                .unwrap();
+        assert_eq!(binary, opencode::default_binary());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegation_opencode_binary_resolution_uses_the_valid_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let override_path = root.path().join("opencode-override");
+        fs::write(&override_path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&override_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = resolve_delegation_opencode_binary(
+            DelegationBackend::OpenCode,
+            Some(override_path.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(binary, fs::canonicalize(&override_path).unwrap());
+    }
+
+    #[test]
+    fn delegation_opencode_binary_resolution_rejects_invalid_overrides() {
+        let error = resolve_delegation_opencode_binary(
+            DelegationBackend::OpenCode,
+            Some("relative/opencode"),
+        )
+        .unwrap_err();
+        assert_eq!(error, opencode::OpenCodeExecutableError::NotAbsolute);
+        assert!(!error.delegation_message().contains("relative/opencode"));
     }
 }

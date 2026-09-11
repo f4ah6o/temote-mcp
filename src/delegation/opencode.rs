@@ -24,6 +24,8 @@ const MAX_DIAGNOSTIC_VERSION_BYTES: usize = 128;
 const MAX_DIAGNOSTIC_LISTING_BYTES: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_ERROR_BYTES: usize = 4096;
 const OPENCODE_BINARY_NAME: &str = "opencode";
+pub(super) const OPENCODE_BIN_ENV: &str = "TEMOTE_OPENCODE_BIN";
+const MAX_OPENCODE_BIN_PATH_BYTES: usize = 4096;
 const MAX_JSON_OBJECT_CANDIDATES: usize = 16;
 const MAX_JSON_SCAN_ATTEMPTS: usize = 64;
 const MAX_REPORT_SCAN_BYTES: usize = 64 * 1024;
@@ -78,6 +80,155 @@ impl OpenCodeExecutableStatus {
             Self::Unavailable => "unavailable",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenCodeExecutableSource {
+    EnvOverride,
+    PathLookup,
+    InvalidOverride,
+}
+
+impl OpenCodeExecutableSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "env_override",
+            Self::PathLookup => "path",
+            Self::InvalidOverride => "invalid_override",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OpenCodeExecutableError {
+    Empty,
+    InvalidValue,
+    TooLong,
+    NotAbsolute,
+    Missing,
+    NotAFile,
+    NotExecutable,
+}
+
+impl OpenCodeExecutableError {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::InvalidValue => "invalid_value",
+            Self::TooLong => "too_long",
+            Self::NotAbsolute => "not_absolute",
+            Self::Missing => "not_found",
+            Self::NotAFile => "not_a_file",
+            Self::NotExecutable => "not_executable",
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Empty => {
+                "TEMOTE_OPENCODE_BIN is set but empty; unset it to use PATH lookup".to_owned()
+            }
+            Self::InvalidValue => "TEMOTE_OPENCODE_BIN is not a valid path value".to_owned(),
+            Self::TooLong => format!(
+                "TEMOTE_OPENCODE_BIN exceeds the {MAX_OPENCODE_BIN_PATH_BYTES}-byte path limit"
+            ),
+            Self::NotAbsolute => "TEMOTE_OPENCODE_BIN must be an absolute path".to_owned(),
+            Self::Missing => "TEMOTE_OPENCODE_BIN does not point to an existing file".to_owned(),
+            Self::NotAFile => "TEMOTE_OPENCODE_BIN must point to a regular file".to_owned(),
+            Self::NotExecutable => {
+                "TEMOTE_OPENCODE_BIN does not point to an executable file".to_owned()
+            }
+        }
+    }
+
+    pub(super) fn delegation_message(self) -> String {
+        format!("OpenCode backend unavailable: {}", self.message())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ResolvedOpenCodeExecutable {
+    source: OpenCodeExecutableSource,
+    binary: PathBuf,
+}
+
+impl ResolvedOpenCodeExecutable {
+    fn source(&self) -> OpenCodeExecutableSource {
+        self.source
+    }
+
+    fn binary(&self) -> &Path {
+        &self.binary
+    }
+
+    pub(super) fn into_path(self) -> PathBuf {
+        self.binary
+    }
+}
+
+pub(super) fn bin_override_value() -> Result<Option<String>, OpenCodeExecutableError> {
+    match std::env::var(OPENCODE_BIN_ENV) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(OpenCodeExecutableError::InvalidValue),
+    }
+}
+
+pub(super) fn resolve_opencode_executable(
+    override_value: Option<&str>,
+    fallback: &Path,
+) -> Result<ResolvedOpenCodeExecutable, OpenCodeExecutableError> {
+    let Some(value) = override_value else {
+        return Ok(ResolvedOpenCodeExecutable {
+            source: OpenCodeExecutableSource::PathLookup,
+            binary: fallback.to_path_buf(),
+        });
+    };
+
+    if value.is_empty() {
+        return Err(OpenCodeExecutableError::Empty);
+    }
+    if value.contains('\0') {
+        return Err(OpenCodeExecutableError::InvalidValue);
+    }
+    if value.len() > MAX_OPENCODE_BIN_PATH_BYTES {
+        return Err(OpenCodeExecutableError::TooLong);
+    }
+    if !Path::new(value).is_absolute() {
+        return Err(OpenCodeExecutableError::NotAbsolute);
+    }
+
+    let canonical = fs::canonicalize(value).map_err(|_| OpenCodeExecutableError::Missing)?;
+    let metadata = fs::metadata(&canonical).map_err(|_| OpenCodeExecutableError::Missing)?;
+    if !metadata.is_file() {
+        return Err(OpenCodeExecutableError::NotAFile);
+    }
+    if !is_executable_path_metadata(&metadata) {
+        return Err(OpenCodeExecutableError::NotExecutable);
+    }
+
+    Ok(ResolvedOpenCodeExecutable {
+        source: OpenCodeExecutableSource::EnvOverride,
+        binary: canonical,
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_path_metadata(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_path_metadata(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn resolve_default_opencode_executable()
+-> Result<ResolvedOpenCodeExecutable, OpenCodeExecutableError> {
+    let override_value = bin_override_value()?;
+    resolve_opencode_executable(override_value.as_deref(), &default_binary())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +308,8 @@ impl Default for OpenCodeDiagnosticTimeouts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct OpenCodeDiagnostics {
     executable: OpenCodeExecutableStatus,
+    executable_source: OpenCodeExecutableSource,
+    executable_reason: Option<&'static str>,
     version: OpenCodeVersionStatus,
     version_value: Option<String>,
     models: OpenCodeModelsStatus,
@@ -183,11 +336,46 @@ struct OpenCodeModelListing {
     saw_non_empty_line: bool,
 }
 
-pub(super) fn opencode_diagnostics(
-    binary: &Path,
+pub(super) fn diagnose_default(
     requested_model: Option<&str>,
     timeouts: OpenCodeDiagnosticTimeouts,
 ) -> Result<OpenCodeDiagnostics, String> {
+    match resolve_default_opencode_executable() {
+        Ok(executable) => opencode_diagnostics(&executable, requested_model, timeouts),
+        Err(error) => Ok(invalid_override_diagnostics(error, requested_model)),
+    }
+}
+
+fn invalid_override_diagnostics(
+    error: OpenCodeExecutableError,
+    requested_model: Option<&str>,
+) -> OpenCodeDiagnostics {
+    let requested_model = requested_model.map(str::to_owned);
+    let requested_model_status = if requested_model.is_some() {
+        OpenCodeRequestedModelStatus::Unknown
+    } else {
+        OpenCodeRequestedModelStatus::NotChecked
+    };
+    OpenCodeDiagnostics {
+        executable: OpenCodeExecutableStatus::Unavailable,
+        executable_source: OpenCodeExecutableSource::InvalidOverride,
+        executable_reason: Some(error.reason()),
+        version: OpenCodeVersionStatus::Unavailable,
+        version_value: None,
+        models: OpenCodeModelsStatus::Unavailable,
+        model_count: None,
+        models_truncated: false,
+        requested_model,
+        requested_model_status,
+    }
+}
+
+pub(super) fn opencode_diagnostics(
+    executable: &ResolvedOpenCodeExecutable,
+    requested_model: Option<&str>,
+    timeouts: OpenCodeDiagnosticTimeouts,
+) -> Result<OpenCodeDiagnostics, String> {
+    let binary = executable.binary();
     let version_probe = run_opencode_probe(
         binary,
         &["--version"],
@@ -203,6 +391,8 @@ pub(super) fn opencode_diagnostics(
         };
         return Ok(OpenCodeDiagnostics {
             executable: OpenCodeExecutableStatus::Unavailable,
+            executable_source: executable.source(),
+            executable_reason: None,
             version: OpenCodeVersionStatus::Unavailable,
             version_value: None,
             models: OpenCodeModelsStatus::Unavailable,
@@ -239,6 +429,8 @@ pub(super) fn opencode_diagnostics(
 
     Ok(OpenCodeDiagnostics {
         executable: OpenCodeExecutableStatus::Available,
+        executable_source: executable.source(),
+        executable_reason: None,
         version,
         version_value,
         models,
@@ -489,12 +681,26 @@ pub(super) fn diagnostics_to_json(diagnostics: &OpenCodeDiagnostics) -> Value {
         requested.insert("value".to_owned(), Value::from(model.clone()));
     }
 
+    let mut executable = Map::new();
+    executable.insert(
+        "status".to_owned(),
+        Value::from(diagnostics.executable.as_str()),
+    );
+    executable.insert(
+        "resolved".to_owned(),
+        Value::from(diagnostics.executable == OpenCodeExecutableStatus::Available),
+    );
+    executable.insert(
+        "source".to_owned(),
+        Value::from(diagnostics.executable_source.as_str()),
+    );
+    if let Some(reason) = diagnostics.executable_reason {
+        executable.insert("reason".to_owned(), Value::from(reason));
+    }
+
     json!({
         "backend": DelegationBackend::OpenCode.name(),
-        "executable": {
-            "status": diagnostics.executable.as_str(),
-            "resolved": diagnostics.executable == OpenCodeExecutableStatus::Available,
-        },
+        "executable": Value::Object(executable),
         "version": Value::Object(version),
         "models": Value::Object(models),
         "requested_model": Value::Object(requested),
@@ -535,7 +741,7 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| opencode_launch_error(&options, &error))?;
+        .map_err(|error| opencode_launch_error(&error))?;
 
     let timeout = options.timeout.unwrap_or(OPENCODE_RUN_TIMEOUT);
     let (wait_outcome, stdout_truncated, stderr_truncated) = wait_with_bounded_artifacts_timeout(
@@ -637,12 +843,9 @@ fn opencode_effective_prompt(options: &Options) -> Result<String, String> {
     Ok(prompt)
 }
 
-fn opencode_launch_error(options: &Options, error: &std::io::Error) -> String {
+fn opencode_launch_error(error: &std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::NotFound {
-        format!(
-            "OpenCode backend unavailable: {} was not found; install OpenCode or add it to PATH (callers cannot supply an executable path)",
-            options.opencode_binary.display()
-        )
+        "OpenCode backend unavailable: the configured OpenCode executable could not be found; install OpenCode, add it to PATH, or fix TEMOTE_OPENCODE_BIN".to_owned()
     } else {
         format!("could not start OpenCode delegation: {error}")
     }
@@ -1224,6 +1427,10 @@ esac
                 OsString::from("OP_SERVICE_ACCOUNT_TOKEN"),
                 OsString::from("sentinel-op-token"),
             ),
+            (
+                OsString::from("TEMOTE_OPENCODE_BIN"),
+                OsString::from("/sentinel/override/opencode"),
+            ),
         ];
         let command = build_opencode_command(&options, &cwd, "effective prompt", environment);
         let args = command
@@ -1265,6 +1472,7 @@ esac
                 .iter()
                 .any(|(key, _)| key == "OP_SERVICE_ACCOUNT_TOKEN")
         );
+        assert!(!envs.iter().any(|(key, _)| key == OPENCODE_BIN_ENV));
     }
 
     #[test]
@@ -1357,11 +1565,16 @@ esac
     fn opencode_missing_executable_is_backend_unavailable() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("does-not-exist/opencode");
-        let options = Options::new_opencode("task", "opencode-go/test-model", None, missing);
+        let options =
+            Options::new_opencode("task", "opencode-go/test-model", None, missing.clone());
         let error = run_with_options(options).unwrap_err();
         assert!(
             error.contains("OpenCode backend unavailable"),
             "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("does-not-exist"),
+            "error leaked the executable path: {error}"
         );
     }
 
@@ -1452,6 +1665,13 @@ esac
         diagnose_fake_with_timeouts(root, mode, model, OpenCodeDiagnosticTimeouts::default())
     }
 
+    fn resolved_for_test(binary: &Path) -> ResolvedOpenCodeExecutable {
+        ResolvedOpenCodeExecutable {
+            source: OpenCodeExecutableSource::PathLookup,
+            binary: binary.to_path_buf(),
+        }
+    }
+
     fn diagnose_fake_with_timeouts(
         root: &Path,
         mode: &str,
@@ -1459,7 +1679,8 @@ esac
         timeouts: OpenCodeDiagnosticTimeouts,
     ) -> Value {
         let binary = fake_opencode_diagnostic(root, mode);
-        let diagnostics = opencode_diagnostics(&binary, model, timeouts).unwrap();
+        let diagnostics =
+            opencode_diagnostics(&resolved_for_test(&binary), model, timeouts).unwrap();
         diagnostics_to_json(&diagnostics)
     }
 
@@ -1468,7 +1689,7 @@ esac
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing/opencode");
         let diagnostics = opencode_diagnostics(
-            &missing,
+            &resolved_for_test(&missing),
             Some("opencode-go/deepseek-v4-flash"),
             OpenCodeDiagnosticTimeouts::default(),
         )
@@ -1489,8 +1710,12 @@ esac
         assert_eq!(json["version"]["value"], Value::Null);
         assert_eq!(json["requested_model"]["status"], "unknown");
 
-        let diagnostics =
-            opencode_diagnostics(&missing, None, OpenCodeDiagnosticTimeouts::default()).unwrap();
+        let diagnostics = opencode_diagnostics(
+            &resolved_for_test(&missing),
+            None,
+            OpenCodeDiagnosticTimeouts::default(),
+        )
+        .unwrap();
         assert_eq!(
             diagnostics.requested_model_status,
             OpenCodeRequestedModelStatus::NotChecked
@@ -2073,5 +2298,152 @@ esac
         let parsed: Value = serde_json::from_str(example).unwrap();
         assert_eq!(parsed["requested_model"], "opencode-go/test-model");
         assert_eq!(parsed["requested_effort"], "high");
+    }
+
+    fn executable_file(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[test]
+    fn opencode_executable_resolver_prefers_a_valid_override() {
+        let root = tempfile::tempdir().unwrap();
+        let override_path = executable_file(root.path(), "override-opencode");
+        let fallback = root.path().join("fallback-opencode");
+        let resolved =
+            resolve_opencode_executable(Some(override_path.to_str().unwrap()), &fallback).unwrap();
+        assert_eq!(resolved.source(), OpenCodeExecutableSource::EnvOverride);
+        assert_eq!(resolved.binary(), fs::canonicalize(&override_path).unwrap());
+    }
+
+    #[test]
+    fn opencode_executable_resolver_falls_back_to_path_lookup_when_unset() {
+        let resolved = resolve_opencode_executable(None, Path::new(OPENCODE_BINARY_NAME)).unwrap();
+        assert_eq!(resolved.source(), OpenCodeExecutableSource::PathLookup);
+        assert_eq!(resolved.binary(), Path::new(OPENCODE_BINARY_NAME));
+    }
+
+    #[test]
+    fn opencode_executable_resolver_rejects_invalid_overrides_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing-opencode");
+
+        for (value, expected) in [
+            (String::new(), OpenCodeExecutableError::Empty),
+            ("opencode".to_owned(), OpenCodeExecutableError::NotAbsolute),
+            (
+                "/tmp/embedded\0nul".to_owned(),
+                OpenCodeExecutableError::InvalidValue,
+            ),
+            (
+                format!("/{}", "a".repeat(MAX_OPENCODE_BIN_PATH_BYTES)),
+                OpenCodeExecutableError::TooLong,
+            ),
+            (
+                missing.to_str().unwrap().to_owned(),
+                OpenCodeExecutableError::Missing,
+            ),
+            (
+                root.path().to_str().unwrap().to_owned(),
+                OpenCodeExecutableError::NotAFile,
+            ),
+        ] {
+            let error =
+                resolve_opencode_executable(Some(&value), Path::new("opencode")).unwrap_err();
+            assert_eq!(error, expected, "value {value:?}");
+        }
+
+        let plain_file = root.path().join("plain-opencode");
+        fs::write(&plain_file, "not executable").unwrap();
+        fs::set_permissions(&plain_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let error =
+            resolve_opencode_executable(Some(plain_file.to_str().unwrap()), Path::new("opencode"))
+                .unwrap_err();
+        assert_eq!(error, OpenCodeExecutableError::NotExecutable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_executable_resolver_canonicalizes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = executable_file(root.path(), "opencode-target");
+        let link = root.path().join("opencode-link");
+        symlink(&target, &link).unwrap();
+        let resolved =
+            resolve_opencode_executable(Some(link.to_str().unwrap()), Path::new("opencode"))
+                .unwrap();
+        assert_eq!(resolved.source(), OpenCodeExecutableSource::EnvOverride);
+        assert_eq!(resolved.binary(), fs::canonicalize(&target).unwrap());
+    }
+
+    #[test]
+    fn opencode_executable_error_messages_hide_the_configured_path() {
+        let root = tempfile::tempdir().unwrap();
+        let sentinel_dir = root.path().join("sentinel-secret-directory");
+        fs::create_dir_all(&sentinel_dir).unwrap();
+        let sentinel_missing = sentinel_dir.join("opencode");
+
+        for value in [
+            sentinel_dir.to_str().unwrap().to_owned(),
+            sentinel_missing.to_str().unwrap().to_owned(),
+        ] {
+            let error =
+                resolve_opencode_executable(Some(&value), Path::new("opencode")).unwrap_err();
+            assert!(!error.message().contains("sentinel-secret-directory"));
+            assert!(
+                !error
+                    .delegation_message()
+                    .contains("sentinel-secret-directory")
+            );
+            assert!(
+                error
+                    .delegation_message()
+                    .starts_with("OpenCode backend unavailable: ")
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_invalid_override_diagnostics_report_source_without_a_probe() {
+        let diagnostics = invalid_override_diagnostics(
+            OpenCodeExecutableError::Missing,
+            Some("opencode-go/deepseek-v4-flash"),
+        );
+        let json = diagnostics_to_json(&diagnostics);
+        assert_eq!(json["executable"]["status"], "unavailable");
+        assert_eq!(json["executable"]["resolved"], false);
+        assert_eq!(json["executable"]["source"], "invalid_override");
+        assert_eq!(json["executable"]["reason"], "not_found");
+        assert_eq!(json["version"]["status"], "unavailable");
+        assert_eq!(json["models"]["status"], "unavailable");
+        assert_eq!(json["requested_model"]["status"], "unknown");
+        assert!(!json.to_string().contains("sentinel"));
+    }
+
+    #[test]
+    fn opencode_diagnostics_reports_the_env_override_source() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_opencode_diagnostic(root.path(), "models_ok");
+        let executable = ResolvedOpenCodeExecutable {
+            source: OpenCodeExecutableSource::EnvOverride,
+            binary,
+        };
+        let diagnostics =
+            opencode_diagnostics(&executable, None, OpenCodeDiagnosticTimeouts::default()).unwrap();
+        let json = diagnostics_to_json(&diagnostics);
+        assert_eq!(json["executable"]["status"], "available");
+        assert_eq!(json["executable"]["source"], "env_override");
+        assert_eq!(json["executable"].get("reason"), None);
+    }
+
+    #[test]
+    fn opencode_diagnostics_reports_the_path_source_for_default_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(root.path(), "models_ok", None);
+        assert_eq!(json["executable"]["source"], "path");
     }
 }
