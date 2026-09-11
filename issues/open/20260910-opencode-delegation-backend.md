@@ -1,14 +1,41 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Draft proposal / implementation not started
+- Status: Open / generic delegation backend not started; structured `local_agent_run` already supports OpenCode
 - Date: 2026-09-10 (Asia/Tokyo)
+- Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
-- Baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
+- Original baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
 - Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
 - Related:
   - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
+  - [Developer Execution Broker](20260910-developer-execution-broker.md)
   - `src/codex.rs`
   - `src/codex_delegation.rs`
+  - `src/local_agent.rs`
+
+## Current `main` boundary (2026-09-11)
+
+PR #13 already added a structured `local_agent_run` broker for both Codex and OpenCode. That broker is a one-shot development execution capability with canonical session-root cwd checks, a fixed adapter-owned argv, bounded task/output, isolated environment/state, and a dedicated local-agent sandbox profile.
+
+This issue does **not** reimplement that broker. Its remaining product goal is narrower and different:
+
+> make the existing schema-validated `codex delegate` workflow backend-neutral, so OpenCode can participate in the same bounded delegation report/evidence contract and generic `temote-mcp delegate --backend ...` CLI.
+
+The two surfaces may share low-level OpenCode command/fixture knowledge where safe, but they have different contracts:
+
+- `local_agent_run`: structured host-side development worker execution;
+- `delegate`: bounded delegated-task report/evidence protocol with requested-vs-observed model/usage semantics and compatibility with the existing `codex delegate` workflow.
+
+Do not add a second generic local-agent executor while implementing this issue. Do not make `local_agent_run` depend on the delegation report schema merely to reuse code.
+
+## Recommended next implementation slice
+
+Start with **Phase 1 + a boundary inventory only**:
+
+1. freeze current `codex delegate` behavior with compatibility fixtures/tests;
+2. document which OpenCode launch/parsing helpers in `src/local_agent.rs` are reusable without importing local-agent authorization/sandbox semantics into delegation;
+3. introduce backend-neutral internal result/evidence types without changing CLI output or launching OpenCode;
+4. stop before the first OpenCode child process is added, so the extraction is independently reviewable.
 
 ## Motivation
 
@@ -28,8 +55,6 @@ Existing compatibility surface should remain available during migration:
 ```text
 temote-mcp codex delegate ...
 ```
-
-This proposal only defines the architecture, migration, diagnostics, tests, and acceptance criteria. It does not authorize production implementation in this task.
 
 A motivating live configuration is OpenCode with OpenCode Go and DeepSeek V4 Flash. The model/provider string must not be hard-coded. OpenCode documents model selection as `provider/model`, provides `opencode models` for discovery, and currently documents DeepSeek V4 Flash in OpenCode Go. The implementation must still discover or verify the effective provider/model ID on the target installation instead of assuming a stale identifier.
 
@@ -70,6 +95,8 @@ The inspected `src/codex_delegation.rs` already contains important behavior that
 The current Codex command construction is backend-specific: `codex exec`, Codex sandbox/config flags, `--json`, `--output-schema`, `--output-last-message`, Codex environment keys, and Codex event field interpretation. These pieces should move behind an adapter boundary rather than forcing OpenCode to emulate Codex.
 
 `src/codex.rs` also contains Codex plugin integration responsibilities such as install/uninstall/status/diagnose. Those are not delegation-generic and must remain separate from the backend abstraction.
+
+`src/local_agent.rs` now contains a separate OpenCode one-shot execution adapter. Reuse only narrowly compatible command-discovery/fixture knowledge; its host-execution authorization and sandbox contract are not automatically the delegation contract.
 
 ## Proposed architecture
 
@@ -209,7 +236,7 @@ opencode run \
   <prompt>
 ```
 
-Exact argument ordering and any needed isolation/config flags must be verified against the pinned CLI version during implementation.
+Exact argument ordering and any needed isolation/config flags must be verified against the pinned CLI version during implementation. The already-merged `local_agent_run` adapter is useful evidence for the installed CLI contract, but delegation must independently verify the pinned version/arguments it relies on.
 
 The prompt may be supplied as one argument if the CLI contract and current prompt-size bound make that safe. If a later OpenCode version gains a safer file/stdin contract, evaluate it separately. Do not write secrets into argv or temporary prompt files as a workaround.
 
@@ -396,7 +423,7 @@ Use a fake `opencode` executable selected through test-only configuration or `TE
 - missing final message;
 - executable-not-found behavior.
 
-Fixtures should be checked into the test suite and named with the OpenCode CLI version/protocol assumptions they represent.
+Fixtures should be checked into the test suite and named with the OpenCode CLI version/protocol assumptions they represent. Reuse fixture facts from `local_agent_run` only when the exact pinned CLI output is identical; otherwise keep delegation fixtures separate.
 
 ### Codex preservation tests
 
@@ -427,10 +454,11 @@ For the motivating case, discover the current OpenCode Go DeepSeek V4 Flash iden
 
 ## Migration strategy
 
-### Phase 1: freeze current Codex behavior
+### Phase 1: freeze current Codex behavior and broker boundary
 
 - add preservation tests around current `codex delegate` command, process construction, environment, bounded artifacts, report validation, and evidence;
-- record current parent-facing JSON examples as compatibility fixtures where useful.
+- record current parent-facing JSON examples as compatibility fixtures where useful;
+- inventory `src/local_agent.rs` OpenCode helpers and explicitly classify them as reusable implementation detail vs local-agent-only policy.
 
 ### Phase 2: extract backend boundary
 
@@ -445,7 +473,8 @@ For the motivating case, discover the current OpenCode Go DeepSeek V4 Flash iden
 - implement `opencode run --format json` adapter;
 - add fake CLI fixtures and deterministic tests;
 - add binary override and diagnostics;
-- keep provider/model configurable.
+- keep provider/model configurable;
+- reuse local-agent implementation only where it does not import the wrong authorization/report contract.
 
 ### Phase 4: optional live OpenCode acceptance
 
@@ -463,7 +492,7 @@ For the motivating case, discover the current OpenCode Go DeepSeek V4 Flash iden
 
 ## Non-goals
 
-This proposal does not include:
+This issue does not include:
 
 - providing or installing OpenCode itself;
 - managing OpenCode provider accounts or tokens;
@@ -475,7 +504,7 @@ This proposal does not include:
 - OpenCode UI integration;
 - OpenCode MCP configuration management;
 - agent/session federation changes;
-- production implementation as part of this proposal-writing task.
+- replacing or broadening the already-merged `local_agent_run` broker.
 
 ## Acceptance criteria
 
@@ -492,7 +521,8 @@ Implementation of this proposal is acceptable only when all of the following are
 - Codex plugin install/uninstall/status/diagnose continue to behave independently of the new backend layer;
 - fake OpenCode CLI tests are deterministic and cover success, failure, malformed/huge output, mismatch, and interruption;
 - the generic layer does not depend on OpenCode-specific event names or session features;
-- one-shot `opencode run` is sufficient for the first shipped OpenCode backend; persistent session/server features remain optional future work.
+- one-shot `opencode run` is sufficient for the first shipped OpenCode backend; persistent session/server features remain optional future work;
+- `local_agent_run` behavior, authorization, and sandboxing do not regress or become coupled to delegation schema requirements.
 
 ## Implementation-review questions
 
