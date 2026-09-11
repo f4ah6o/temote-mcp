@@ -598,6 +598,7 @@ Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-rep
 - Fix: bounded report extraction (balanced-object scan with raw control-character sanitization), adapter-side normalization (canonical requested values, UTF-8-safe summary truncation with a ` …[truncated]` marker, bounded arrays/scalars), canonical report persisted to `artifacts.report` through one normalization path, accumulated per-step usage, and a valid prompt-contract example. The Codex adapter is unchanged.
 - Verification: 19 new deterministic tests (44 OpenCode adapter tests), delegation 52, Codex 112, full cargo test 607 bin + 40 lib, gateway 60/60, fmt/clippy/check/diff green.
 - Post-fix live recheck with the same frozen prompts: OpenCode normalized success went from 1/9 to 9/9 (`invalid_json` 2→0, `invalid_report_schema` 6→0). Remaining limitation: the 1200-char summary bound truncates long answers (marker visible), and the model rarely uses `checks`/`unresolved` for detail.
+- Follow-up review fixes (2026-09-12): normalized reports now fail closed on oversized arrays/items/scalars and on unexpected top-level fields instead of silently truncating or accepting them, and early OpenCode launch failures clean up temporary artifacts. Report: [`docs/evaluations/opencode-review-fixes-20260912.md`](../../docs/evaluations/opencode-review-fixes-20260912.md).
 
 Remaining work after this slice: persistent server/session/resume.
 
