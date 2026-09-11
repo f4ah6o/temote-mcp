@@ -599,6 +599,7 @@ Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-rep
 - Verification: 19 new deterministic tests (44 OpenCode adapter tests), delegation 52, Codex 112, full cargo test 607 bin + 40 lib, gateway 60/60, fmt/clippy/check/diff green.
 - Post-fix live recheck with the same frozen prompts: OpenCode normalized success went from 1/9 to 9/9 (`invalid_json` 2→0, `invalid_report_schema` 6→0). Remaining limitation: the 1200-char summary bound truncates long answers (marker visible), and the model rarely uses `checks`/`unresolved` for detail.
 - Follow-up review fixes (2026-09-12): normalized reports now fail closed on oversized arrays/items/scalars and on unexpected top-level fields instead of silently truncating or accepting them, and early OpenCode launch failures clean up temporary artifacts. Report: [`docs/evaluations/opencode-review-fixes-20260912.md`](../../docs/evaluations/opencode-review-fixes-20260912.md).
+- Observed evidence trust-boundary fix (2026-09-12): canonical report `observed_model`/`observed_effort` are now sourced only from adapter event evidence and never from model self-report, so parent and canonical observed values cannot disagree; top-level `providerID`+`modelID` events compose `provider/model` like the part shape. Report: [`docs/evaluations/opencode-observed-evidence-fix-20260912.md`](../../docs/evaluations/opencode-observed-evidence-fix-20260912.md).
 
 Remaining work after this slice: persistent server/session/resume.
 
