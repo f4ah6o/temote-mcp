@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1 and one-shot 1.18.30 OpenCode backend landed on main; OpenCode diagnostics implemented in current worktree; module extraction and persistent/session features not started
+- Status: Open / Phase 1 and one-shot 1.18.30 OpenCode backend landed on main; OpenCode diagnostics landed on main; module extraction and persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -551,7 +551,7 @@ Not implemented: extraction of a separate delegation adapter module, `TEMOTE_OPE
 
 ## Phase 3 diagnostics status (2026-09-11)
 
-Read-only OpenCode CLI diagnostics implemented in the current worktree:
+Read-only OpenCode CLI diagnostics landed on main:
 
 - `temote-mcp delegate diagnose --backend opencode [--model <provider/model>]` prints one bounded JSON document with `executable` (`available`/`unavailable`, `resolved`), `version` (`ready`/`unavailable`/`failed`/`timeout` plus a bounded value), `models` (`ready`/`unavailable`/`unsupported`/`failed`/`timeout` plus a bounded count and truncation flag), and `requested_model` (`present`/`absent`/`unknown`/`not_checked`).
 - The backend selector honors explicit `--backend`, then `TEMOTE_DELEGATION_BACKEND`. Diagnostics currently implement only OpenCode and fail closed for Codex instead of reporting a false ready state.
