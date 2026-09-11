@@ -1255,7 +1255,7 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn make_executable_with_contents(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
