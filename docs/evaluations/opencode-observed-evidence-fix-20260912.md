@@ -2,10 +2,10 @@
 
 ## Result
 
-- status: fixed and verified locally (pre-push; finalization commit marks it landed)
+- status: fixed and landed on main
 - baseline HEAD: `af95984fa9aecd134c9ca4a4ce1fdb3232eab811`
 - implementation commit: `1a7f4f0b0d297255d45b8afa5c2451aecf92de54`
-- report commit: the commit containing this report (see `git log -5 --oneline`)
+- report commit: `7d24d02261659dc29459e16780b7b67bc65fe405`
 - final HEAD: the status-only finalization commit listed in `git log -5 --oneline`; use `git rev-parse HEAD` for the exact hash
 - pushed: yes
 - tracked worktree status: clean except the pre-existing untracked `.worktrees/` (untouched)
