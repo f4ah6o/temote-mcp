@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, and backend adapter extraction landed on main; live comparative measurement landed on main; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, and live comparative measurement landed on main; OpenCode normalized-report delivery fix implemented and verified locally; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -587,6 +587,17 @@ Live comparison landed on main. Evidence: [`docs/evaluations/codex-vs-opencode-l
 - Median wall-clock: Codex 176.3 s vs OpenCode 87.3 s across all tasks, with high variance in Codex's review task (180–446 s). Usage units are not comparable between backends; no cost conclusion.
 - Recommendation in this sample: keep Codex as the default delegation backend; treat OpenCode as an interactive/session backend or a fallback only after report delivery is enforced. More evidence (more runs, second OpenCode model, report-contract fix) is needed before changing defaults.
 - Observed issues are recorded in the evidence file only; no production changes were made in this slice.
+
+Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
+
+## OpenCode normalized-report delivery fix status (2026-09-12)
+
+Follow-up fix implemented and verified locally. Report: [`docs/evaluations/opencode-normalized-report-fix-20260912.md`](../../docs/evaluations/opencode-normalized-report-fix-20260912.md); before/after detail appended to [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
+
+- Root cause: report delivery depended on the model emitting strict JSON within every schema bound; the adapter had no bounded repair or normalization. Raw newlines in strings caused `invalid_json`; summaries of 1380–2989 chars caused `invalid_report_schema`; requested values were read back from model output (double-quoted); `artifacts.report` was never written; per-step `step_finish` usage was dropped except for the last step.
+- Fix: bounded report extraction (balanced-object scan with raw control-character sanitization), adapter-side normalization (canonical requested values, UTF-8-safe summary truncation with a ` …[truncated]` marker, bounded arrays/scalars), canonical report persisted to `artifacts.report` through one normalization path, accumulated per-step usage, and a valid prompt-contract example. The Codex adapter is unchanged.
+- Verification: 19 new deterministic tests (44 OpenCode adapter tests), delegation 52, Codex 112, full cargo test 607 bin + 40 lib, gateway 60/60, fmt/clippy/check/diff green.
+- Post-fix live recheck with the same frozen prompts: OpenCode normalized success went from 1/9 to 9/9 (`invalid_json` 2→0, `invalid_report_schema` 6→0). Remaining limitation: the 1200-char summary bound truncates long answers (marker visible), and the model rarely uses `checks`/`unresolved` for detail.
 
 Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
 

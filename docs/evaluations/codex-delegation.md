@@ -1,6 +1,6 @@
 # Codex delegation evaluation
 
-Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends, read-only OpenCode diagnostics, and backend adapter extraction landed on main; live Codex vs OpenCode comparison recorded in `codex-vs-opencode-live-20260912.md`; app-server comparative work remains pending.
+Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends, read-only OpenCode diagnostics, and backend adapter extraction landed on main; live Codex vs OpenCode comparison recorded in `codex-vs-opencode-live-20260912.md`; OpenCode normalized-report delivery fix verified in `opencode-normalized-report-fix-20260912.md`; app-server comparative work remains pending.
 
 ## Current evidence
 
@@ -11,7 +11,7 @@ Status: implementation and fake-transport verification complete; one-shot Codex 
 - The generic `temote-mcp delegate --backend codex|opencode ...` command selects the backend (explicit flag, then `TEMOTE_DELEGATION_BACKEND`, then Codex); the legacy `temote-mcp codex delegate ...` command always forces Codex.
 - The app-server adapter uses local stdio, an exact `0.153.4` compatibility check, session-instance and canonical-scope ownership, durable pre-side-effect operation receipts, child approvals independent of Temote yolo, bounded evidence, and reconciliation states. Pre-thread transient failures are retryable with the same start operation; uncertain thread/turn boundaries remain reconciliation-required. Unexpired task records, including terminal records, are retained until task retention expires; only expired terminal records without a live runtime are prunable, and a full scope rejects new starts. Compacted operation receipts fail closed on exact replay for the full task retention period.
 - Rust unit/property tests, gateway contract tests, formatting, clippy, no-default-features checks, and diff checks are the repeatable verification set for this implementation.
-- Live comparison of the two delegation backends (3 read-only tasks × 3 runs each, fixed prompts, blind content scoring) is recorded in [`codex-vs-opencode-live-20260912.md`](codex-vs-opencode-live-20260912.md). In that sample Codex delivered normalized results 9/9 and OpenCode 1/9, with close underlying answer quality.
+- Live comparison of the two delegation backends (3 read-only tasks × 3 runs each, fixed prompts, blind content scoring) is recorded in [`codex-vs-opencode-live-20260912.md`](codex-vs-opencode-live-20260912.md). In that sample Codex delivered normalized results 9/9 and OpenCode 1/9, with close underlying answer quality. A follow-up adapter fix raised OpenCode to 9/9 on the same prompts; see [`opencode-normalized-report-fix-20260912.md`](opencode-normalized-report-fix-20260912.md).
 
 ## Live dogfood record (2026-09-11, macOS)
 

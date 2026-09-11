@@ -151,3 +151,65 @@ Comparability caveat: these are the backends' own normalized usage fields, not a
 - Use Codex for bounded structured delegation results and for review/planning where the strict report contract and deterministic status matter.
 - Use OpenCode for interactive or session-based work today, or as a delegation backend after the report-delivery gap is fixed; its raw analysis was competitive and its median latency was lower, but unnormalized output makes it a poor default for one-shot delegated results. As a fallback it should come with explicit delivery validation.
 - Not enough evidence yet for latency or cost conclusions, or for claiming general model superiority. A follow-up with more runs, a second OpenCode model, and the report-contract fix would be needed.
+
+## Follow-up: OpenCode normalized-report delivery fix (2026-09-12)
+
+Status: fix implemented and verified locally; original 1/9 evidence above is preserved unchanged.
+
+### Before
+
+At baseline `d7affe0` (the comparison above), OpenCode delivered normalized results in 1/9 runs:
+
+- `invalid_json` ×2: the final assistant message was a complete JSON object containing raw newline control characters inside string values, which strict `serde_json` parsing rejected.
+- `invalid_report_schema` ×6: the report parsed but the model put 1380–2989 characters into `summary`, above the shared 1200-character schema bound.
+
+Additional defects observed: the report-contract example double-quoted requested values (`"requested_model":""provider/model""`), `artifacts.report` named a file that OpenCode runs never wrote, and multi-step `step_finish` usage was overwritten per step (last step only) instead of accumulated.
+
+### Root cause
+
+- Delivery depended entirely on the model emitting strict JSON within all schema bounds, with no adapter-side repair or normalization.
+- The prompt template wrapped `__REQUESTED_MODEL__`/`__REQUESTED_EFFORT__` placeholders in quotes while the substitution value was already JSON-quoted.
+- OpenCode `step_finish` token records are per-step; the adapter assigned instead of summing.
+- No canonical report artifact was persisted for OpenCode.
+
+### Implemented fix
+
+Changed files: `src/delegation/opencode.rs` (adapter) and `src/delegation/mod.rs` (shared schema-bound constants replacing literals in `validate_report_schema`; behavior-identical for Codex). Codex adapter untouched.
+
+- Report extraction: direct parse first, then a bounded balanced-object candidate scan (≤16 candidates, ≤64 scan attempts, ≤64 KiB scan window) over the final assistant message, trying the last parseable block first with a narrow raw-control-character sanitizer inside strings. No generic JSON repair parser.
+- Deterministic normalization: `requested_model`/`requested_effort` are replaced with the canonical Temote request values; `summary` is truncated at a UTF-8 character boundary to ≤1200 characters with a ` …[truncated]` marker; `base_commit` ≤200; arrays ≤128 items × 512 characters; observed values ≤256 or null; missing/invalid status, missing summary, or non-string fields fail closed as `invalid_report_schema`.
+- Canonical report budget: normalized reports over 4096 bytes map to `oversized_report`, matching the Codex report read bound.
+- One normalization path: the canonical report is persisted to `artifacts.report` (mode 0600, `create_new`, `O_NOFOLLOW`) and is byte-equivalent to the parent result `report`; only post-normalization content is written.
+- Usage: per-step `step_finish` token fields are accumulated with saturating addition; no double count (verified equal to raw event sums) and no drop of earlier steps.
+- Prompt contract example now renders valid JSON (placeholders unquoted before JSON-quoted substitution).
+
+### Regression tests
+
+Added 19 deterministic regression tests (44 OpenCode adapter tests total): raw newlines, markdown fences, surrounding prose, unmatched braces, multiple blocks, truncated JSON, text beyond the direct budget, scan-budget rejection, oversized-summary normalization with UTF-8 boundary and marker, canonical requested replacement, unrecoverable reports, array/scalar bounds, canonical report budget, canonical artifact persistence, accumulated multi-step usage, and prompt-example validity. All focused suites were run repeatedly without flakes.
+
+### After (post-fix live recheck, final build)
+
+Same frozen prompts (hashes unchanged) and model, 3 tasks × 3 runs:
+
+| Task | Run | Status | Duration | Summary chars | Truncated | Steps | Input | Cached | Output | Total |
+| --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| A | 1 | success | 69928 | 1200 | yes | 9 | 67331 | 348160 | 4187 | 419678 |
+| A | 2 | success | 25602 | 1200 | yes | 4 | 45785 | 73728 | 2129 | 121642 |
+| A | 3 | success | 41703 | 1200 | yes | 7 | 38038 | 187904 | 4304 | 230246 |
+| B | 1 | success | 76221 | 1200 | yes | 5 | 38285 | 125440 | 8258 | 171983 |
+| B | 2 | success | 199372 | 1200 | yes | 5 | 57484 | 153856 | 12259 | 223599 |
+| B | 3 | success | 137384 | 1200 | yes | 5 | 40328 | 146176 | 10599 | 197103 |
+| C | 1 | success | 166840 | 1200 | yes | 9 | 58931 | 400640 | 6793 | 466364 |
+| C | 2 | success | 157512 | 1191 | no | 19 | 68041 | 1190400 | 11210 | 1269651 |
+| C | 3 | success | 53998 | 1200 | yes | 10 | 75542 | 484608 | 5039 | 565189 |
+
+- Success rate: before 1/9 (11%); after 9/9 (100%). `invalid_json`: 2 → 0. `invalid_report_schema`: 6 → 0. Other failures: 0 → 0.
+- Median wall-clock: A 41.7 s, B 137.4 s, C 157.5 s; overall 76.2 s (before: 115.9/153.4/54.9, overall 87.3 s). The sample is small and runs vary with provider load; durations are directional only.
+- Every run verified: canonical `requested_model` without quotes, requested/observed distinct, non-empty bounded summary with an accurate truncation marker, usage equal to the sum of raw `step_finish` records, `sessionID` evidence present, `artifacts.report` present with mode 0600 and identical to the parent `report`, `artifacts_truncated=false`.
+- Usage numbers are larger than the before table because before reported only the last step; the after values are per-step sums and are the corrected semantics. They are still provider-specific normalized values, not a common meter or cost data.
+
+### Remaining limitations
+
+- The 1200-character `summary` bound means long review/planning answers are truncated (8/9 runs ended with the marker). The delivered prefix stays specific and readable, but the model rarely uses the `checks`/`unresolved` arrays for detail. A future schema/structure change is out of scope for this fix.
+- `observed_model` remains null in these runs because the OpenCode event stream did not expose model metadata; it is not copied from `requested_model`.
+- Extraction is deliberately bounded (64 KiB scan, 16 candidates, 64 attempts); exotic output beyond that maps to deterministic failure statuses rather than being repaired.
