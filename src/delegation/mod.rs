@@ -20,6 +20,18 @@ const ARTIFACT_DIRECTORY_PREFIX: &str = "temote-codex-delegation-";
 const MAX_PARENT_RESULT_BYTES: usize = 4096;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+const REPORT_FIELDS: &[&str] = &[
+    "status",
+    "summary",
+    "base_commit",
+    "changed_files",
+    "checks",
+    "unresolved",
+    "requested_model",
+    "requested_effort",
+    "observed_model",
+    "observed_effort",
+];
 const MAX_REPORT_SUMMARY_CHARS: usize = 1200;
 const MAX_REPORT_COMMIT_CHARS: usize = 200;
 const MAX_REPORT_ARGUMENT_CHARS: usize = 256;
@@ -940,20 +952,8 @@ fn validate_report_schema(report: &Value) -> bool {
     let Some(object) = report.as_object() else {
         return false;
     };
-    const REQUIRED_FIELDS: &[&str] = &[
-        "status",
-        "summary",
-        "base_commit",
-        "changed_files",
-        "checks",
-        "unresolved",
-        "requested_model",
-        "requested_effort",
-        "observed_model",
-        "observed_effort",
-    ];
-    if object.len() != REQUIRED_FIELDS.len()
-        || REQUIRED_FIELDS
+    if object.len() != REPORT_FIELDS.len()
+        || REPORT_FIELDS
             .iter()
             .any(|field| !object.contains_key(*field))
     {

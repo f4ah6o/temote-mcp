@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -719,9 +721,42 @@ pub(super) fn validate_options(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+static CLEANED_ARTIFACT_DIRECTORIES: AtomicUsize = AtomicUsize::new(0);
+
+struct ArtifactCleanup {
+    directory: PathBuf,
+    keep: bool,
+}
+
+impl ArtifactCleanup {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            keep: false,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for ArtifactCleanup {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        #[cfg(test)]
+        CLEANED_ARTIFACT_DIRECTORIES.fetch_add(1, Ordering::Relaxed);
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String> {
     let artifacts = create_artifacts()?;
     let paths = artifacts.paths.clone();
+    let mut cleanup = ArtifactCleanup::new(paths.directory.clone());
     let effective_prompt = opencode_effective_prompt(&options)?;
 
     let working_directory =
@@ -762,6 +797,7 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
     let requested_variant = options.variant.clone().unwrap_or_default();
 
     if wait_outcome == WaitOutcome::TimedOut {
+        cleanup.keep();
         return Ok(DelegationResult {
             backend: DelegationBackend::OpenCode,
             status: Status::ProcessTimeout,
@@ -778,6 +814,7 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
     }
 
     if !status.success() {
+        cleanup.keep();
         return Ok(DelegationResult {
             backend: DelegationBackend::OpenCode,
             status: Status::ProcessNonzeroExit,
@@ -810,6 +847,7 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
         ReportState::InvalidSchema => (Status::InvalidReportSchema, None),
         ReportState::Oversized => (Status::OversizedReport, None),
     };
+    cleanup.keep();
 
     Ok(DelegationResult {
         backend: DelegationBackend::OpenCode,
@@ -1095,6 +1133,13 @@ fn sanitize_json_strings(text: &str) -> String {
 
 fn normalize_opencode_report(value: Value, options: &Options) -> Option<Value> {
     let object = value.as_object()?;
+    if object.len() != REPORT_FIELDS.len()
+        || REPORT_FIELDS
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return None;
+    }
     let status = object.get("status").and_then(Value::as_str)?;
     if !matches!(
         status,
@@ -1131,7 +1176,7 @@ fn bounded_summary(value: &Value) -> Option<String> {
 
 fn bounded_report_text(value: &Value, max_chars: usize) -> Option<String> {
     let text = value.as_str()?;
-    Some(text.chars().take(max_chars).collect())
+    (text.chars().count() <= max_chars).then(|| text.to_owned())
 }
 
 fn bounded_nullable_report_text(value: &Value) -> Option<Value> {
@@ -1143,10 +1188,16 @@ fn bounded_nullable_report_text(value: &Value) -> Option<Value> {
 
 fn bounded_report_items(value: &Value) -> Option<Vec<Value>> {
     let items = value.as_array()?;
+    if items.len() > MAX_REPORT_ARRAY_ITEMS {
+        return None;
+    }
     items
         .iter()
-        .take(MAX_REPORT_ARRAY_ITEMS)
-        .map(|item| bounded_report_text(item, MAX_REPORT_ARRAY_ITEM_CHARS).map(Value::String))
+        .map(|item| {
+            let text = item.as_str()?;
+            (text.chars().count() <= MAX_REPORT_ARRAY_ITEM_CHARS)
+                .then(|| Value::String(text.to_owned()))
+        })
         .collect::<Option<Vec<_>>>()
 }
 
@@ -1289,6 +1340,23 @@ case "$0" in
         printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"\",\"changed_files\":[],\"checks\":[],\"unresolved\":[],\"requested_model\":\"raw\",\"requested_effort\":\"\",\"observed_model\":null,\"observed_effort\":null}"}}'
         printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":12,"input":10,"output":2,"reasoning":0,"cache":{"read":0}}}}'
         printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":8,"input":5,"output":3,"reasoning":0,"cache":{"read":4}}}}'
+        exit 0
+        ;;
+    *extra_field)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"\",\"changed_files\":[],\"checks\":[],\"unresolved\":[],\"requested_model\":\"raw\",\"requested_effort\":\"\",\"observed_model\":null,\"observed_effort\":null,\"extra\":1}"}}'
+        exit 0
+        ;;
+    *oversized_array)
+        items=''
+        i=0
+        while [ "$i" -lt 129 ]; do
+            items="${items}\"item\","
+            i=$((i + 1))
+        done
+        report="{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"\",\"changed_files\":[],\"checks\":[],\"unresolved\":[${items}\"last\"],\"requested_model\":\"raw\",\"requested_effort\":\"\",\"observed_model\":null,\"observed_effort\":null}"
+        printf '%s' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"'
+        printf '%s' "$report" | sed 's/\\/\\\\/g; s/"/\\"/g'
+        printf '%s\n' '"}}'
         exit 0
         ;;
     *timeout)
@@ -1567,6 +1635,7 @@ esac
         let missing = root.path().join("does-not-exist/opencode");
         let options =
             Options::new_opencode("task", "opencode-go/test-model", None, missing.clone());
+        let cleaned_before = CLEANED_ARTIFACT_DIRECTORIES.load(Ordering::Relaxed);
         let error = run_with_options(options).unwrap_err();
         assert!(
             error.contains("OpenCode backend unavailable"),
@@ -1576,6 +1645,28 @@ esac
             !error.contains("does-not-exist"),
             "error leaked the executable path: {error}"
         );
+        assert!(
+            CLEANED_ARTIFACT_DIRECTORIES.load(Ordering::Relaxed) > cleaned_before,
+            "early launch failure did not clean up its artifacts"
+        );
+    }
+
+    #[test]
+    fn opencode_oversized_array_is_not_silently_truncated() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "oversized_array", None);
+        assert_eq!(value["status"], "invalid_report_schema");
+        assert_eq!(value["report"], Value::Null);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_extra_report_fields_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "extra_field", None);
+        assert_eq!(value["status"], "invalid_report_schema");
+        assert_eq!(value["report"], Value::Null);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
     }
 
     #[test]
@@ -2016,9 +2107,23 @@ esac
 
     #[test]
     fn opencode_report_repairs_raw_newlines_in_strings() {
-        let report = report_object("first line\nsecond line").to_string();
-        let state = opencode_report_state(&text_parts_for(&report));
-        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+        let text = concat!(
+            "{\"status\":\"completed\",\"summary\":\"first line\n",
+            "second line\",\"base_commit\":\"\",\"changed_files\":[],\"checks\":[],",
+            "\"unresolved\":[],\"requested_model\":\"raw\",\"requested_effort\":\"\",",
+            "\"observed_model\":null,\"observed_effort\":null}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "the fixture must contain a raw newline and be invalid JSON"
+        );
+        let state = opencode_report_state(&text_parts_for(text));
+        match state {
+            ReportState::Valid(value) => {
+                assert_eq!(value["summary"], "first line\nsecond line");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
     }
 
     #[test]
@@ -2185,11 +2290,39 @@ esac
     }
 
     #[test]
-    fn opencode_normalization_bounds_arrays_and_scalars() {
+    fn opencode_normalization_rejects_oversized_arrays_and_scalars() {
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+
+        let mut too_many_items = report_object("ok");
+        too_many_items["unresolved"] = json!(vec!["item"; MAX_REPORT_ARRAY_ITEMS + 1]);
+        assert!(normalize_opencode_report(too_many_items, &options).is_none());
+
+        let mut oversized_item = report_object("ok");
+        oversized_item["checks"] = json!(vec!["x".repeat(MAX_REPORT_ARRAY_ITEM_CHARS + 1)]);
+        assert!(normalize_opencode_report(oversized_item, &options).is_none());
+
+        let mut oversized_commit = report_object("ok");
+        oversized_commit["base_commit"] = json!("b".repeat(MAX_REPORT_COMMIT_CHARS + 1));
+        assert!(normalize_opencode_report(oversized_commit, &options).is_none());
+
+        let mut oversized_observed = report_object("ok");
+        oversized_observed["observed_model"] = json!("m".repeat(MAX_REPORT_ARGUMENT_CHARS + 1));
+        assert!(normalize_opencode_report(oversized_observed, &options).is_none());
+    }
+
+    #[test]
+    fn opencode_normalization_accepts_values_at_the_schema_bounds() {
         let mut value = report_object("ok");
-        value["base_commit"] = json!("b".repeat(300));
-        value["changed_files"] = json!(vec!["x".repeat(600); 200]);
-        value["observed_model"] = json!("m".repeat(400));
+        value["base_commit"] = json!("b".repeat(MAX_REPORT_COMMIT_CHARS));
+        value["unresolved"] = json!(vec![
+            "x".repeat(MAX_REPORT_ARRAY_ITEM_CHARS);
+            MAX_REPORT_ARRAY_ITEMS
+        ]);
         let options = Options::new_opencode(
             "task",
             "opencode-go/canonical",
@@ -2198,30 +2331,43 @@ esac
         );
         let normalized = normalize_opencode_report(value, &options).unwrap();
         assert_eq!(
-            normalized["base_commit"].as_str().unwrap().chars().count(),
-            200
-        );
-        assert_eq!(
-            normalized["changed_files"].as_array().unwrap().len(),
+            normalized["unresolved"].as_array().unwrap().len(),
             MAX_REPORT_ARRAY_ITEMS
         );
-        assert!(
-            normalized["changed_files"].as_array().unwrap()[0]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count()
-                <= MAX_REPORT_ARRAY_ITEM_CHARS
-        );
-        assert!(
-            normalized["observed_model"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .count()
-                <= MAX_REPORT_ARGUMENT_CHARS
-        );
         assert!(validate_report_schema(&normalized));
+        assert!(!canonical_report_fits(&normalized));
+    }
+
+    #[test]
+    fn opencode_normalization_rejects_extra_top_level_fields() {
+        let mut value = report_object("ok");
+        value["extra"] = json!("unexpected");
+        let options = Options::new_opencode(
+            "task",
+            "opencode-go/canonical",
+            None,
+            PathBuf::from("opencode"),
+        );
+        assert!(normalize_opencode_report(value, &options).is_none());
+    }
+
+    #[test]
+    fn opencode_artifact_cleanup_removes_the_directory_unless_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let removed_directory = root.path().join("removed");
+        fs::create_dir(&removed_directory).unwrap();
+        {
+            let _cleanup = ArtifactCleanup::new(removed_directory.clone());
+        }
+        assert!(!removed_directory.exists());
+
+        let kept_directory = root.path().join("kept");
+        fs::create_dir(&kept_directory).unwrap();
+        {
+            let mut cleanup = ArtifactCleanup::new(kept_directory.clone());
+            cleanup.keep();
+        }
+        assert!(kept_directory.exists());
     }
 
     #[test]
