@@ -1,14 +1,15 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open
-Model: unknown
+Status: open / implementation not started
 Created: 2026-09-11
 Updated: 2026-09-11
-Branch: feat/developer-execution-broker-agent
+Priority: P1 operational correctness
 
 ## 概要
 
-`workers_dev = false` の Gateway Worker について、custom domain と既存 DNS hostname への Worker route の選択、deploy 時の target 指定、target の検証方法を docs と運用 tooling で明確にする。
+`workers_dev = false` の Gateway Worker について、custom domain と既存 DNS hostname への Worker route の選択、deploy 時の target 指定、target の検証方法を docs と必要最小限の運用 tooling で明確にする。
+
+この issue は **Gateway の routing/protocol 実装ではなく deployment correctness** を扱う。最初の実装スライスでは実 Cloudflare 設定を変更しない。
 
 ## 背景
 
@@ -33,16 +34,68 @@ Gateway の公開 target を再現可能な形で選択・deploy・検証でき�
 - Gateway の MCP protocol、Durable Object、host-agent routing semantics の変更
 - `workers_dev = true` への変更
 - Gateway federation readiness の end-to-end 診断（`20260911-gateway-doctor-readiness.md` で扱う）
+- 実 Cloudflare account の route/domain を repository test から自動変更すること
 
-## 提案する方針
+## 運用契約
 
-1. `docs/gateway.md` と `docs/gateway.ja.md` に、次の2方式を分けて記載する。
-   - Cloudflare custom domain binding を使う方式
-   - 既存 DNS hostname を維持し、`wrangler deploy --routes '<hostname>/*'` で Worker route を割り当てる方式
-2. 両方式で `workers_dev = false`、hostname 全体の Access 保護、Managed OAuth、host-agent 用 Access service-token policy を必須条件として明記する。
-3. dashboard-managed variables を保持する deploy では `--keep-vars` を使い、Worker secret は `wrangler secret` で別管理する手順を固定する。
-4. dry-run、deploy output、Cloudflare route/domain の read-only verification を一連の手順にする。既存 DNS record は削除しない。
-5. 必要なら `temote-mcp` または repository script に、target がない場合と direct/gateway hostname の不一致を秘密値なしで報告する preflight を追加する。
+Gateway を公開する operator は、deploy 前に次のどちらか一方を明示的に選ぶ。
+
+### A. Custom domain binding
+
+- Cloudflare Worker custom domain を明示的に作成する。
+- 対象 hostname 全体を Access で保護する。
+- MCP client 用 Managed OAuth と host-agent 用 Access service-token policy を混同しない。
+- deploy 後に domain binding が intended Worker/version を指すことを read-only で確認する。
+
+### B. Existing DNS + Worker route
+
+- 既存 DNS record を削除しない。
+- exact hostname/pattern を `wrangler deploy --routes '<hostname>/*'` などの明示 target として渡す。
+- 対象 hostname 全体を Access で保護する。
+- deploy 後に route が intended Worker/version を指すことを read-only で確認する。
+
+どちらの方式でも `workers_dev = false` を維持し、target 未指定の deploy を成功扱いしない。
+
+## Secret / variable boundary
+
+- dashboard-managed non-secret variables を保持する deploy では `--keep-vars` を使う。
+- Worker secrets は `wrangler secret` / Cloudflare の secret 管理に残し、issue/docs/log に値を保存しない。
+- Access service-token credential と Gateway host token は別の credential boundary として扱う。
+- verification は secret の「存在/認証結果」を扱っても値を表示しない。
+
+## Executable implementation slices
+
+### Slice A — docs + deterministic local checks
+
+- `docs/gateway.md` / `docs/gateway.ja.md` に custom domain と existing DNS + Worker route の decision table を追加する。
+- `workers_dev = false` の前提、Access/OAuth/service-token 境界、`--keep-vars`、secret 管理、rollback を明記する。
+- `No targets deployed` を成功扱いしない deploy checklist を追加する。
+- exact hostname/pattern 以外を変更しない rollback 手順を書く。
+- docs/example の決定論的 check を追加する。
+- **実 Cloudflare route/domain は変更しない。**
+
+**Done when:** operator が docs だけで target を選択し、dry-run/deploy/verify/rollback の順序を再現できる。
+
+### Slice B — optional target preflight
+
+Slice A の後、手作業だけでは target 欠落を十分検出できない場合にのみ実装する。
+
+- repository script または narrow CLI preflight として実装する。
+- `workers_dev=false` かつ target 未指定を明示 failure にする。
+- intended gateway hostname と configured route/domain の不一致を non-secret に報告する。
+- Cloudflare credential がない場合は remote verification を `unknown/not checked` とし、ready と偽装しない。
+- DNS/Access/route の mutation は行わない。
+
+**Done when:** target 未指定・hostname 不一致・remote 未確認を distinct status で返せる。
+
+### Slice C — live deployment acceptance
+
+- 実 account で選択した方式を一度適用する。
+- deploy output と route/domain の read-only verification を記録する。
+- public hostname の疎通、Access、host-agent の成立確認は live acceptance matrix に evidence を残す。
+- secret 値は保存しない。
+
+**Done when:** repository-local implementation issue と credential-dependent live evidence が分離されている。
 
 ## 受け入れ条件
 
@@ -52,13 +105,21 @@ Gateway の公開 target を再現可能な形で選択・deploy・検証でき�
 - [ ] `--keep-vars`、Worker secrets、Access service token、host token の管理境界が混同されない。
 - [ ] 意図しない workers.dev 公開を有効化しない。
 - [ ] docs または tooling の変更に対する決定論的な test/check が追加される。
+- [ ] 実環境でしか確認できない項目は `20260908-live-acceptance-matrix.md` に evidence として分離される。
 
 ## テスト計画
 
+Repository-local:
+
+- docs/example の deterministic check
+- preflight を追加した場合は fake wrangler/config を使った target-present / target-missing / mismatch / remote-unknown tests
+- `git diff --check`
+
+Live acceptance（実装完了の repository-local gate とは分離）:
+
 - `npx wrangler deploy --dry-run --keep-vars --routes '<hostname>/*'`
 - 実 Cloudflare account で target 一覧を read-only 確認し、対象 hostname が intended Worker に割り当てられていることを確認する
-- custom domain 方式と route 方式について、deploy output と公開 hostname の疎通を確認する
-- `git diff --check`
+- 選択した deployment 方式について deploy output と公開 hostname の疎通を確認する
 
 ## リスク
 
@@ -76,3 +137,7 @@ Gateway の公開 target を再現可能な形で選択・deploy・検証でき�
 
 - 2026-09-11: `localmcp.obr-grp.com/*` への Worker route は direct Temote 復旧のため削除した。DNS record、Access application、Tunnel は削除していない。
 - 2026-09-11: `workers_dev = false` の route/domain 未設定 deploy で `No targets deployed` が発生したため、再発防止の issue として記録した。
+
+## Recommended next slice
+
+**Slice A only.** 実 Cloudflare mutation を伴わず、deployment target の選択・検証契約を先に固定する。
