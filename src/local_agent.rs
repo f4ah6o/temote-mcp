@@ -1791,12 +1791,17 @@ mod tests {
         {
             return;
         }
-        let root_a = tempfile::tempdir().unwrap();
+        let fixture_parent_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let fixture_parent = tempfile::tempdir_in(&fixture_parent_path).unwrap();
+        let root_a = tempfile::tempdir_in(fixture_parent.path()).unwrap();
         let selected = root_a.path().join("selected");
         let sibling = root_a.path().join("sibling");
         fs::create_dir(&selected).unwrap();
         fs::create_dir(&sibling).unwrap();
-        let root_b = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir_in(fixture_parent.path()).unwrap();
         let agent_dir = tempfile::tempdir().unwrap();
         let executable = agent_dir.path().join("codex");
         let selected_input = selected.join("selected-input");
@@ -1842,7 +1847,9 @@ mod tests {
         );
 
         let prepare = |access| {
-            let state = AgentState::create(Agent::Codex, &[]).unwrap();
+            let state =
+                AgentState::create_with_source_home(Agent::Codex, &[], Some(fixture_parent.path()))
+                    .unwrap();
             let mut environment = HashMap::new();
             state.apply_to_environment(Agent::Codex, &mut environment);
             PreparedRun {
