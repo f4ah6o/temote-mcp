@@ -13,7 +13,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-#[path = "codex_delegation.rs"]
+#[path = "delegation/mod.rs"]
 mod delegation;
 
 const PLUGIN_NAME: &str = "temote-mcp";

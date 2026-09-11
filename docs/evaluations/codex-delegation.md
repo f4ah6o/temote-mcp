@@ -1,9 +1,10 @@
 # Codex delegation evaluation
 
-Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends and read-only OpenCode diagnostics landed on main; comparative measurement remains pending.
+Status: implementation and fake-transport verification complete; one-shot Codex and OpenCode delegation backends and read-only OpenCode diagnostics landed on main; backend adapter extraction implemented and verified in the current worktree; comparative measurement remains pending.
 
 ## Current evidence
 
+- The delegation implementation is split under `src/delegation/`: `mod.rs` keeps backend-neutral orchestration (backend selection, CLI parsing, options/result/evidence types, artifact and wait/capture policy, report validation, serialization), `codex.rs` owns Codex argv/environment/JSONL parsing and validation, and `opencode.rs` owns the one-shot `opencode run` adapter plus the read-only diagnostics probes. External CLI, JSON, and status behavior is unchanged.
 - `codex delegate` uses `codex exec --ignore-user-config --ephemeral --sandbox workspace-write`, bounded JSONL/stderr capture, a schema-validated final report, and filtered usage fields.
 - `delegate --backend opencode` uses one-shot `opencode run --pure --format json --dir <cwd> --model <provider/model> [--variant <variant>] -- <prompt>` with the same bounded artifact capture and report schema. The prompt is passed as one argv element (no shell); the child environment is rebuilt from a small OpenCode allowlist; `opencode` is resolved from PATH and callers cannot supply an executable path. JSON events are normalized to the same parent result: the last assistant message's text parts form the final report, `step_finish.part.tokens` provides usage, and top-level `sessionID` becomes the bounded thread/session evidence. A bounded timeout kills the child and returns `process_timeout`.
 - `delegate diagnose --backend opencode [--model <provider/model>]` prints read-only bounded JSON readiness for the OpenCode CLI: executable resolution and version, `opencode models --pure` discovery status/count/truncation, and `present`/`absent`/`unknown`/`not_checked` requested-model validation. It never logs in, mutates credentials, downloads models, or runs a delegation task, and it maps unavailable, failed, timed-out, empty, or truncated model discovery to `unknown` instead of a false `absent`.
@@ -60,6 +61,8 @@ Result (non-secret fields):
 - `executable=available resolved=true`, `version=ready 1.18.30`, `models=ready count=64 truncated=false`;
 - `requested_model=present opencode-go/deepseek-v4-flash`; without `--model` the status is `not_checked`;
 - no login, auth, config, or model-cache mutation and no delegation process; diagnostics temp artifacts are removed.
+
+Post-extraction parity re-run (2026-09-11, `src/delegation/{mod,codex,opencode}.rs`): the same read-only one-shot command and model returned `status=success`, report `status=completed`, child exit code `0`, `artifacts_truncated=false`, and a read-only disposable directory with no created, modified, or deleted files; `delegate diagnose --backend opencode` returned the same shape for both `opencode-go/deepseek-v4-flash` and `opencode/mimo-v2.5-free` (`present`, `version=1.18.30`, `models=ready count=64`).
 
 Limitations observed: the Codex child's `changed_files` entry was an absolute artifact path rather than a repository-relative path, and child-reported `requested_model`/`requested_effort` fields were empty; the parent result keeps requested and observed values distinct. This is child report content, not a Temote serialization defect.
 

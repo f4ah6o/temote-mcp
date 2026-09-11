@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1 and one-shot 1.18.30 OpenCode backend landed on main; OpenCode diagnostics landed on main; module extraction and persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, and diagnostics landed on main; backend adapter extraction implemented and verified in the current worktree; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-11 (Asia/Tokyo)
 - Priority: P1
@@ -10,7 +10,9 @@
   - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
   - [Developer Execution Broker](20260910-developer-execution-broker.md)
   - `src/codex.rs`
-  - `src/codex_delegation.rs`
+  - `src/delegation/mod.rs`
+  - `src/delegation/codex.rs`
+  - `src/delegation/opencode.rs`
   - `src/local_agent.rs`
 
 ## Current `main` boundary (2026-09-11)
@@ -79,7 +81,7 @@ These are discovery inputs, not a frozen protocol contract. Before implementatio
 
 ## Current Temote state and invariants
 
-The inspected `src/codex_delegation.rs` already contains important behavior that must survive backend extraction:
+The inspected delegation module (then `src/codex_delegation.rs`, now split under `src/delegation/`) already contains important behavior that must survive backend extraction:
 
 - prompt input is bounded (`MAX_PROMPT_BYTES`, currently 1 MiB), with regular-file and non-symlink checks for `--prompt-file`;
 - stdout/event and stderr artifacts are bounded (currently 8 MiB each capture path) and excess output is drained rather than accumulated in memory;
@@ -322,7 +324,7 @@ The following existing Codex plugin integration must remain Codex-specific and c
 - status;
 - diagnose.
 
-Do not genericize all of `src/codex.rs`. Extract only the delegation concerns currently concentrated in `src/codex_delegation.rs` and adjacent CLI dispatch.
+Do not genericize all of `src/codex.rs`. Extract only the delegation concerns then concentrated in `src/codex_delegation.rs` and adjacent CLI dispatch (landed in Phase 2 as `src/delegation/{mod,codex,opencode}.rs`).
 
 The legacy command:
 
@@ -547,7 +549,21 @@ One-shot OpenCode backend landed on main:
 - Tests cover backend selection and flag validation, argv construction, cwd canonicalization, missing executable, success normalization, non-zero exit, timeout, bounded stdout, secret sentinel filtering, and Codex compatibility.
 - Live smoke on 2026-09-11: OpenCode CLI `1.18.30`, `--model opencode/mimo-v2.5-free`, read-only task; parent `status=success` with a schema-valid report and mapped usage; no files created or changed.
 
-Not implemented: extraction of a separate delegation adapter module, `TEMOTE_OPENCODE_BIN`, and persistent server/session/resume behavior.
+Not implemented: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume behavior.
+
+## Phase 2 adapter extraction status (2026-09-11)
+
+Backend adapter extraction implemented and verified in the current worktree without changing external behavior:
+
+- `src/codex_delegation.rs` was split into `src/delegation/{mod,codex,opencode}.rs`; the delegation module path and all caller-facing functions are unchanged.
+- Shared layer (`mod.rs`) keeps `DelegationBackend`, options/result/evidence/report types, CLI parsing and backend selection, artifact creation and permissions, bounded artifact capture, the shared process wait/capture helper, report validation, and parent serialization.
+- `codex.rs` owns the Codex adapter: `build_codex_command` (including `--output-schema`), the Codex environment allowlist, Codex JSONL evidence/usage extraction, and Codex option validation.
+- `opencode.rs` owns the OpenCode adapter: `opencode run` argv, `--pure`/`--format json`/`--dir`/`--model`/`--variant`, event/report extraction, session/usage mapping, option validation, and the read-only diagnostics probes (`--version`, `models --pure`) with their parsing/classification.
+- Environment filtering and the two wait/capture paths are shared helpers with backend-specific allowlists/labels; no generic "arbitrary executable + argv" helper is exposed.
+- All 37 delegation tests moved with their modules and pass unchanged; the frozen parent JSON fixture, Codex argv/environment tests, OpenCode argv/normalization tests, and diagnostics tests keep their assertions.
+- Smoke on 2026-09-11: `delegate diagnose --backend opencode` unchanged; one-shot `delegate --backend opencode --model opencode/mimo-v2.5-free` completed with `status=success` and no files created or changed.
+
+Remaining work after this slice: `TEMOTE_OPENCODE_BIN`, persistent server/session/resume, and live comparative measurement.
 
 ## Phase 3 diagnostics status (2026-09-11)
 
@@ -560,13 +576,13 @@ Read-only OpenCode CLI diagnostics landed on main:
 - Deterministic fake-CLI tests cover missing binary, version success/failure/timeout/oversized/malformed, model listing success/empty/mixed/failure/unsupported/timeout/oversized, requested-model present/absent/unknown, environment allowlist filtering, and secret/output non-leakage.
 - Read-only smoke on 2026-09-11 with OpenCode CLI `1.18.30`: `executable=available`, `version=1.18.30`, `models=ready count=64`, `requested_model=opencode-go/deepseek-v4-flash present`; no credential mutation and no delegation execution.
 
-Remaining work after this slice: adapter-module extraction, `TEMOTE_OPENCODE_BIN`, persistent server/session/resume, and live comparative measurement.
+Remaining work after this slice: `TEMOTE_OPENCODE_BIN`, persistent server/session/resume, and live comparative measurement.
 
 ## Phase 1 status (2026-09-11)
 
 Phase 1 (freeze Codex behavior + boundary inventory + backend-neutral internal types) landed on main without launching OpenCode and without changing CLI output:
 
-- `src/codex_delegation.rs` now exposes `DelegationBackend::{Codex}` with explicit `parse`/`name`, plus internal `NormalizedResult`/`NormalizedEvidence` types. `result_to_json` converts through `DelegationResult::normalize()` and `normalized_to_json()`.
+- `src/delegation/mod.rs` now exposes `DelegationBackend::{Codex}` with explicit `parse`/`name`, plus internal `NormalizedResult`/`NormalizedEvidence` types. `result_to_json` converts through `DelegationResult::normalize()` and `normalized_to_json()`.
 - Compatibility is frozen by `parent_result_json_shape_is_frozen_for_compatibility` (exact parent JSON fixture), `normalized_result_keeps_requested_and_observed_distinct`, and the existing command/environment/report classification tests.
 - No OpenCode process is launched; the generic CLI, `--format json` parsing, diagnostics, and binary override remain Phase 3.
 

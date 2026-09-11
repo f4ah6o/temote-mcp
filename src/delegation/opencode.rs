@@ -1,0 +1,1545 @@
+use std::ffi::OsString;
+use std::fs;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use serde_json::{Map, Value, json};
+
+use super::*;
+
+pub(super) fn default_binary() -> PathBuf {
+    PathBuf::from(OPENCODE_BINARY_NAME)
+}
+
+const MAX_OPENCODE_PROMPT_BYTES: usize = 64 * 1024;
+const OPENCODE_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const OPENCODE_DIAGNOSTIC_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const OPENCODE_DIAGNOSTIC_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DIAGNOSTIC_VERSION_BYTES: usize = 128;
+const MAX_DIAGNOSTIC_LISTING_BYTES: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_ERROR_BYTES: usize = 4096;
+const OPENCODE_BINARY_NAME: &str = "opencode";
+
+const OPENCODE_CHILD_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
+
+const OPENCODE_REPORT_INSTRUCTIONS: &str = r#"You are a delegated implementation worker running non-interactively. You must not ask interactive questions, and you must finish the task below before answering.
+
+When finished, respond with ONLY one JSON object and nothing else: no markdown, no code fences, no text before or after the JSON.
+The JSON object must contain exactly these fields:
+{"status":"completed|failed|blocked|needs_decision","summary":"short summary, at most 1200 characters","base_commit":"","changed_files":[],"checks":[],"unresolved":[],"requested_model":"__REQUESTED_MODEL__","requested_effort":"__REQUESTED_EFFORT__","observed_model":null,"observed_effort":null}
+Rules:
+- All string values are plain strings; changed_files, checks, and unresolved are arrays of strings (use [] when empty).
+- Set "requested_model" to "__REQUESTED_MODEL__" and "requested_effort" to "__REQUESTED_EFFORT__".
+- Set "observed_model"/"observed_effort" only when you can actually observe them; otherwise keep null.
+- Do not include any other fields.
+
+Task:
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenCodeExecutableStatus {
+    Available,
+    Unavailable,
+}
+
+impl OpenCodeExecutableStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenCodeVersionStatus {
+    Ready,
+    Unavailable,
+    Failed,
+    Timeout,
+}
+
+impl OpenCodeVersionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenCodeModelsStatus {
+    Ready,
+    Unavailable,
+    Unsupported,
+    Failed,
+    Timeout,
+}
+
+impl OpenCodeModelsStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unavailable => "unavailable",
+            Self::Unsupported => "unsupported",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenCodeRequestedModelStatus {
+    Present,
+    Absent,
+    Unknown,
+    NotChecked,
+}
+
+impl OpenCodeRequestedModelStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Absent => "absent",
+            Self::Unknown => "unknown",
+            Self::NotChecked => "not_checked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OpenCodeDiagnosticTimeouts {
+    version: Duration,
+    models: Duration,
+}
+
+impl Default for OpenCodeDiagnosticTimeouts {
+    fn default() -> Self {
+        Self {
+            version: OPENCODE_DIAGNOSTIC_VERSION_TIMEOUT,
+            models: OPENCODE_DIAGNOSTIC_MODELS_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct OpenCodeDiagnostics {
+    executable: OpenCodeExecutableStatus,
+    version: OpenCodeVersionStatus,
+    version_value: Option<String>,
+    models: OpenCodeModelsStatus,
+    model_count: Option<usize>,
+    models_truncated: bool,
+    requested_model: Option<String>,
+    requested_model_status: OpenCodeRequestedModelStatus,
+}
+
+#[derive(Debug)]
+struct OpenCodeProbe {
+    executable: OpenCodeExecutableStatus,
+    timed_out: bool,
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug, Default)]
+struct OpenCodeModelListing {
+    count: usize,
+    requested_present: bool,
+    saw_non_empty_line: bool,
+}
+
+pub(super) fn opencode_diagnostics(
+    binary: &Path,
+    requested_model: Option<&str>,
+    timeouts: OpenCodeDiagnosticTimeouts,
+) -> Result<OpenCodeDiagnostics, String> {
+    let version_probe = run_opencode_probe(
+        binary,
+        &["--version"],
+        timeouts.version,
+        MAX_DIAGNOSTIC_VERSION_BYTES,
+    )?;
+    if version_probe.executable == OpenCodeExecutableStatus::Unavailable {
+        let requested_model = requested_model.map(str::to_owned);
+        let requested_model_status = if requested_model.is_some() {
+            OpenCodeRequestedModelStatus::Unknown
+        } else {
+            OpenCodeRequestedModelStatus::NotChecked
+        };
+        return Ok(OpenCodeDiagnostics {
+            executable: OpenCodeExecutableStatus::Unavailable,
+            version: OpenCodeVersionStatus::Unavailable,
+            version_value: None,
+            models: OpenCodeModelsStatus::Unavailable,
+            model_count: None,
+            models_truncated: false,
+            requested_model,
+            requested_model_status,
+        });
+    }
+
+    let (version, version_value) = classify_version_probe(&version_probe);
+    let models_probe = run_opencode_probe(
+        binary,
+        &["models", "--pure"],
+        timeouts.models,
+        MAX_DIAGNOSTIC_LISTING_BYTES,
+    )?;
+    let listing = summarize_opencode_models(&models_probe.stdout, requested_model);
+    let models = classify_models_probe(&models_probe, &listing);
+    let models_truncated = models_probe.truncated;
+    let model_count = (models == OpenCodeModelsStatus::Ready).then_some(listing.count);
+    let requested_model = requested_model.map(str::to_owned);
+    let requested_model_status = match (&requested_model, models, models_truncated) {
+        (None, _, _) => OpenCodeRequestedModelStatus::NotChecked,
+        (Some(_), OpenCodeModelsStatus::Ready, false) => {
+            if listing.requested_present {
+                OpenCodeRequestedModelStatus::Present
+            } else {
+                OpenCodeRequestedModelStatus::Absent
+            }
+        }
+        (Some(_), _, _) => OpenCodeRequestedModelStatus::Unknown,
+    };
+
+    Ok(OpenCodeDiagnostics {
+        executable: OpenCodeExecutableStatus::Available,
+        version,
+        version_value,
+        models,
+        model_count,
+        models_truncated,
+        requested_model,
+        requested_model_status,
+    })
+}
+
+fn classify_version_probe(probe: &OpenCodeProbe) -> (OpenCodeVersionStatus, Option<String>) {
+    if probe.timed_out {
+        return (OpenCodeVersionStatus::Timeout, None);
+    }
+    if probe.exit_code != Some(0) {
+        return (OpenCodeVersionStatus::Failed, None);
+    }
+    match parse_opencode_version(&probe.stdout) {
+        Some(version) => (OpenCodeVersionStatus::Ready, Some(version)),
+        None => (OpenCodeVersionStatus::Failed, None),
+    }
+}
+
+fn parse_opencode_version(bytes: &[u8]) -> Option<String> {
+    let line = first_bounded_line(bytes, MAX_DIAGNOSTIC_VERSION_BYTES)?;
+    if line.is_empty()
+        || !line.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_')
+        })
+        || !line.chars().any(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(line)
+}
+
+fn first_bounded_line(bytes: &[u8], max_bytes: usize) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if line.len() > max_bytes {
+        return None;
+    }
+    Some(line.to_owned())
+}
+
+fn classify_models_probe(
+    probe: &OpenCodeProbe,
+    listing: &OpenCodeModelListing,
+) -> OpenCodeModelsStatus {
+    if probe.executable == OpenCodeExecutableStatus::Unavailable {
+        return OpenCodeModelsStatus::Unavailable;
+    }
+    if probe.timed_out {
+        return OpenCodeModelsStatus::Timeout;
+    }
+    if probe.exit_code != Some(0) {
+        return if stderr_indicates_unknown_command(&probe.stderr) {
+            OpenCodeModelsStatus::Unsupported
+        } else {
+            OpenCodeModelsStatus::Failed
+        };
+    }
+    if listing.count > 0 {
+        return OpenCodeModelsStatus::Ready;
+    }
+    if listing.saw_non_empty_line {
+        OpenCodeModelsStatus::Failed
+    } else {
+        OpenCodeModelsStatus::Unavailable
+    }
+}
+
+fn summarize_opencode_models(bytes: &[u8], requested_model: Option<&str>) -> OpenCodeModelListing {
+    let text = String::from_utf8_lossy(bytes);
+    let mut listing = OpenCodeModelListing::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        listing.saw_non_empty_line = true;
+        if !is_opencode_model_identifier(line) {
+            continue;
+        }
+        listing.count += 1;
+        if requested_model == Some(line) {
+            listing.requested_present = true;
+        }
+    }
+    listing
+}
+
+fn is_opencode_model_identifier(candidate: &str) -> bool {
+    if candidate.is_empty() || candidate.len() > MAX_EVIDENCE_STRING_BYTES {
+        return false;
+    }
+    candidate.contains('/')
+        && candidate.split('/').all(|part| {
+            !part.is_empty()
+                && part.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '.' | '-' | '_' | '+' | ':' | '@')
+                })
+        })
+}
+
+fn stderr_indicates_unknown_command(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    [
+        "unknown command",
+        "unknown subcommand",
+        "unrecognized command",
+        "not a valid command",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+}
+
+fn run_opencode_probe(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdout_limit: usize,
+) -> Result<OpenCodeProbe, String> {
+    let artifacts = create_artifacts()?;
+    let paths = artifacts.paths.clone();
+    let mut command = build_opencode_probe_command(binary, args, std::env::vars_os());
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&paths.directory);
+            return Ok(OpenCodeProbe {
+                executable: OpenCodeExecutableStatus::Unavailable,
+                timed_out: false,
+                exit_code: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                truncated: false,
+            });
+        }
+    };
+
+    let captured = wait_with_bounded_artifacts_timeout(
+        &mut child,
+        artifacts.events_file,
+        artifacts.stderr_file,
+        timeout,
+    );
+    let (outcome, stdout_capture_truncated, stderr_capture_truncated) = match captured {
+        Ok(captured) => captured,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&paths.directory);
+            return Err(error);
+        }
+    };
+    let status = match child.try_wait() {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = fs::remove_dir_all(&paths.directory);
+            return Err("OpenCode diagnostics child exited without a process status".to_owned());
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&paths.directory);
+            return Err(format!(
+                "could not inspect OpenCode diagnostics status: {error}"
+            ));
+        }
+    };
+    secure_artifact_files(&paths);
+    let (stdout, stdout_read_truncated) =
+        read_probe_artifact(&paths.events, stdout_limit).unwrap_or_default();
+    let (stderr, stderr_read_truncated) =
+        read_probe_artifact(&paths.stderr, MAX_DIAGNOSTIC_ERROR_BYTES).unwrap_or_default();
+    let _ = fs::remove_dir_all(&paths.directory);
+
+    Ok(OpenCodeProbe {
+        executable: OpenCodeExecutableStatus::Available,
+        timed_out: outcome == WaitOutcome::TimedOut,
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        truncated: stdout_capture_truncated
+            || stderr_capture_truncated
+            || stdout_read_truncated
+            || stderr_read_truncated,
+    })
+}
+
+fn read_probe_artifact(path: &Path, max_bytes: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(8192));
+    BufReader::new(file)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    Ok((bytes, truncated))
+}
+
+fn build_opencode_probe_command<I>(binary: &Path, args: &[&str], environment: I) -> Command
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut command = Command::new(binary);
+    command.args(args);
+    configure_opencode_environment(&mut command, environment);
+    command
+}
+
+pub(super) fn diagnostics_to_json(diagnostics: &OpenCodeDiagnostics) -> Value {
+    let mut version = Map::new();
+    version.insert(
+        "status".to_owned(),
+        Value::from(diagnostics.version.as_str()),
+    );
+    if let Some(value) = &diagnostics.version_value {
+        version.insert("value".to_owned(), Value::from(value.clone()));
+    }
+
+    let mut models = Map::new();
+    models.insert(
+        "status".to_owned(),
+        Value::from(diagnostics.models.as_str()),
+    );
+    if let Some(count) = diagnostics.model_count {
+        models.insert("count".to_owned(), Value::from(count));
+    }
+    models.insert(
+        "truncated".to_owned(),
+        Value::from(diagnostics.models_truncated),
+    );
+
+    let mut requested = Map::new();
+    requested.insert(
+        "status".to_owned(),
+        Value::from(diagnostics.requested_model_status.as_str()),
+    );
+    if let Some(model) = &diagnostics.requested_model {
+        requested.insert("value".to_owned(), Value::from(model.clone()));
+    }
+
+    json!({
+        "backend": DelegationBackend::OpenCode.name(),
+        "executable": {
+            "status": diagnostics.executable.as_str(),
+            "resolved": diagnostics.executable == OpenCodeExecutableStatus::Available,
+        },
+        "version": Value::Object(version),
+        "models": Value::Object(models),
+        "requested_model": Value::Object(requested),
+    })
+}
+
+pub(super) fn validate_options(options: &Options) -> Result<(), String> {
+    if let Some(variant) = &options.variant
+        && (variant.is_empty() || variant.len() > MAX_ARGUMENT_BYTES || variant.contains('\0'))
+    {
+        return Err(format!(
+            "OpenCode variant must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
+        ));
+    }
+    opencode_effective_prompt(options)?;
+    Ok(())
+}
+
+pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String> {
+    let artifacts = create_artifacts()?;
+    let paths = artifacts.paths.clone();
+    let effective_prompt = opencode_effective_prompt(&options)?;
+
+    let working_directory =
+        std::env::current_dir()
+            .and_then(fs::canonicalize)
+            .map_err(|error| {
+                format!("could not resolve OpenCode delegation working directory: {error}")
+            })?;
+    let mut command = build_opencode_command(
+        &options,
+        &working_directory,
+        &effective_prompt,
+        std::env::vars_os(),
+    );
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| opencode_launch_error(&options, &error))?;
+
+    let timeout = options.timeout.unwrap_or(OPENCODE_RUN_TIMEOUT);
+    let (wait_outcome, stdout_truncated, stderr_truncated) = wait_with_bounded_artifacts_timeout(
+        &mut child,
+        artifacts.events_file,
+        artifacts.stderr_file,
+        timeout,
+    )?;
+    let status = child
+        .try_wait()
+        .map_err(|error| format!("could not inspect OpenCode delegation status: {error}"))?
+        .ok_or_else(|| "OpenCode delegation exited without a process status".to_owned())?;
+    secure_artifact_files(&paths);
+
+    let (evidence, report_state) = collect_opencode_output(&paths.events)
+        .unwrap_or((Evidence::default(), ReportState::Missing));
+    let exit_code = status.code();
+    let requested_variant = options.variant.clone().unwrap_or_default();
+
+    if wait_outcome == WaitOutcome::TimedOut {
+        return Ok(DelegationResult {
+            backend: DelegationBackend::OpenCode,
+            status: Status::ProcessTimeout,
+            requested_model: options.model,
+            requested_reasoning_effort: requested_variant,
+            observed_model: evidence.observed_model.clone(),
+            observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
+            report: None,
+            evidence,
+            exit_code,
+            artifacts_truncated: stdout_truncated || stderr_truncated,
+            artifacts: paths,
+        });
+    }
+
+    if !status.success() {
+        return Ok(DelegationResult {
+            backend: DelegationBackend::OpenCode,
+            status: Status::ProcessNonzeroExit,
+            requested_model: options.model,
+            requested_reasoning_effort: requested_variant,
+            observed_model: evidence.observed_model.clone(),
+            observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
+            report: None,
+            evidence,
+            exit_code,
+            artifacts_truncated: stdout_truncated || stderr_truncated,
+            artifacts: paths,
+        });
+    }
+
+    let (report_status, report) = match report_state {
+        ReportState::Missing => (Status::MissingReport, None),
+        ReportState::InvalidJson => (Status::InvalidJson, None),
+        ReportState::InvalidSchema => (Status::InvalidReportSchema, None),
+        ReportState::Oversized => (Status::OversizedReport, None),
+        ReportState::Valid(report) => (Status::Success, Some(report)),
+    };
+
+    Ok(DelegationResult {
+        backend: DelegationBackend::OpenCode,
+        status: report_status,
+        requested_model: options.model,
+        requested_reasoning_effort: requested_variant,
+        observed_model: evidence.observed_model.clone(),
+        observed_reasoning_effort: evidence.observed_reasoning_effort.clone(),
+        report,
+        evidence,
+        exit_code,
+        artifacts_truncated: stdout_truncated || stderr_truncated,
+        artifacts: paths,
+    })
+}
+
+fn opencode_effective_prompt(options: &Options) -> Result<String, String> {
+    let requested_model = serde_json::to_string(&options.model)
+        .map_err(|error| format!("could not encode OpenCode requested model: {error}"))?;
+    let requested_effort = serde_json::to_string(options.variant.as_deref().unwrap_or(""))
+        .map_err(|error| format!("could not encode OpenCode requested variant: {error}"))?;
+    let instructions = OPENCODE_REPORT_INSTRUCTIONS
+        .replace("__REQUESTED_MODEL__", &requested_model)
+        .replace("__REQUESTED_EFFORT__", &requested_effort);
+    let prompt = format!("{instructions}{}", options.prompt);
+    if prompt.len() > MAX_OPENCODE_PROMPT_BYTES {
+        return Err(format!(
+            "OpenCode delegation prompt exceeds {MAX_OPENCODE_PROMPT_BYTES} bytes"
+        ));
+    }
+    Ok(prompt)
+}
+
+fn opencode_launch_error(options: &Options, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "OpenCode backend unavailable: {} was not found; install OpenCode or add it to PATH (callers cannot supply an executable path)",
+            options.opencode_binary.display()
+        )
+    } else {
+        format!("could not start OpenCode delegation: {error}")
+    }
+}
+
+fn build_opencode_command<I>(
+    options: &Options,
+    working_directory: &Path,
+    effective_prompt: &str,
+    environment: I,
+) -> Command
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut command = Command::new(&options.opencode_binary);
+    command
+        .arg("run")
+        .arg("--pure")
+        .arg("--format")
+        .arg("json")
+        .arg("--dir")
+        .arg(working_directory)
+        .arg("--model")
+        .arg(&options.model);
+    if let Some(variant) = &options.variant {
+        command.arg("--variant").arg(variant);
+    }
+    command.arg("--").arg(effective_prompt);
+    configure_opencode_environment(&mut command, environment);
+    command
+}
+
+fn configure_opencode_environment<I>(command: &mut Command, environment: I)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    command.env_clear();
+    for (key, value) in filtered_opencode_environment(environment) {
+        command.env(key, value);
+    }
+}
+
+fn filtered_opencode_environment<I>(environment: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    super::filtered_child_environment(environment, OPENCODE_CHILD_ENV_ALLOWLIST)
+}
+
+fn collect_opencode_output(path: &Path) -> std::io::Result<(Evidence, ReportState)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let mut reader = BufReader::new(file.take(MAX_EVIDENCE_BYTES.saturating_add(1)));
+    let mut line = Vec::new();
+    let mut evidence = Evidence::default();
+    let mut text_parts: Vec<(Option<String>, String)> = Vec::new();
+
+    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line)? {
+        if !within_limit {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+
+        if evidence.thread_id.is_none() {
+            evidence.thread_id = bounded_string(object.get("sessionID"));
+        }
+        if evidence.observed_model.is_none() {
+            evidence.observed_model = opencode_observed_model(object);
+        }
+
+        match object.get("type").and_then(Value::as_str) {
+            Some("step_finish") => {
+                if let Some(tokens) = object
+                    .get("part")
+                    .and_then(|part| part.get("tokens"))
+                    .and_then(Value::as_object)
+                {
+                    evidence.usage = Some(opencode_usage(tokens));
+                }
+            }
+            Some("text") => {
+                if let Some(part) = object.get("part").and_then(Value::as_object)
+                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                    && text.len() <= MAX_EVENT_LINE_BYTES
+                {
+                    text_parts.push((bounded_string(part.get("messageID")), text.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let report = opencode_report_state(&text_parts);
+    Ok((evidence, report))
+}
+
+fn opencode_report_state(text_parts: &[(Option<String>, String)]) -> ReportState {
+    let Some((last_message_id, _)) = text_parts.last() else {
+        return ReportState::Missing;
+    };
+    let mut text = String::new();
+    if last_message_id.is_some() {
+        for (message_id, part) in text_parts {
+            if message_id == last_message_id {
+                text.push_str(part);
+            }
+        }
+    } else {
+        for (_, part) in text_parts {
+            text.push_str(part);
+        }
+    }
+
+    if text.len() > DEFAULT_MAX_REPORT_BYTES {
+        return ReportState::Oversized;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return ReportState::InvalidJson;
+    };
+    if !validate_report_schema(&value) {
+        return ReportState::InvalidSchema;
+    }
+    ReportState::Valid(value)
+}
+
+fn opencode_observed_model(object: &Map<String, Value>) -> Option<String> {
+    if let Some(model) =
+        bounded_string(object.get("modelID")).or_else(|| bounded_string(object.get("model")))
+    {
+        return Some(model);
+    }
+    let part = object.get("part").and_then(Value::as_object)?;
+    let model =
+        bounded_string(part.get("modelID")).or_else(|| bounded_string(part.get("model")))?;
+    let composed = match bounded_string(part.get("providerID")) {
+        Some(provider) => format!("{provider}/{model}"),
+        None => model,
+    };
+    (composed.len() <= MAX_EVIDENCE_STRING_BYTES).then_some(composed)
+}
+
+fn opencode_usage(tokens: &Map<String, Value>) -> Map<String, Value> {
+    let mut usage = Map::new();
+    for (source, target) in [
+        ("input", "input_tokens"),
+        ("output", "output_tokens"),
+        ("reasoning", "reasoning_output_tokens"),
+        ("total", "total_tokens"),
+    ] {
+        if let Some(value) = tokens.get(source).and_then(Value::as_u64) {
+            usage.insert(target.to_owned(), Value::from(value));
+        }
+    }
+    if let Some(cached) = tokens
+        .get("cache")
+        .and_then(Value::as_object)
+        .and_then(|cache| cache.get("read"))
+        .and_then(Value::as_u64)
+    {
+        usage.insert("cached_input_tokens".to_owned(), Value::from(cached));
+    }
+    usage
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_opencode(root: &Path, mode: &str) -> PathBuf {
+        let path = root.join(format!("fake-opencode-{mode}"));
+        let script = r##"#!/bin/sh
+set -eu
+printf 'cwd=%s\n' "$(pwd -P)" >&2
+printf 'args=' >&2
+for arg in "$@"; do
+    printf '<%s>' "$arg" >&2
+done
+printf '\n' >&2
+
+report='{"status":"completed","summary":"ok","base_commit":"abc","changed_files":[],"checks":["cargo test"],"unresolved":[],"requested_model":"test-model","requested_effort":"high","observed_model":null,"observed_effort":null}'
+
+case "$0" in
+    *observed)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","providerID":"opencode-go","modelID":"deepseek-v4-flash","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[\"cargo test\"],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"high\",\"observed_model\":null,\"observed_effort\":null}"}}'
+        printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":30,"input":20,"output":5,"reasoning":2,"cache":{"read":3}}}}'
+        exit 0
+        ;;
+    *success)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[\"cargo test\"],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"high\",\"observed_model\":null,\"observed_effort\":null}"}}'
+        printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":30,"input":20,"output":5,"reasoning":2,"cache":{"read":3}}}}'
+        exit 0
+        ;;
+    *nonzero)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"not-json"}}'
+        exit 7
+        ;;
+    *missing)
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
+        exit 0
+        ;;
+    *invalid_json)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"not-json"}}'
+        exit 0
+        ;;
+    *invalid_schema)
+        printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\"}"}}'
+        exit 0
+        ;;
+    *oversized)
+        printf '%s' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"'
+        head -c 4200 /dev/zero | tr '\0' 'x'
+        printf '%s\n' '"}}'
+        exit 0
+        ;;
+    *huge_stdout)
+        printf '%s' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"'
+        yes x | head -c 9000000
+        printf '%s\n' '"}}'
+        exit 0
+        ;;
+    *timeout)
+        exec sleep 30
+        ;;
+esac
+"##;
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn opencode_options(root: &Path, mode: &str, variant: Option<&str>) -> Options {
+        Options::new_opencode(
+            "return a bounded report",
+            "opencode-go/test-model",
+            variant,
+            fake_opencode(root, mode),
+        )
+    }
+
+    fn run_fake_opencode(root: &Path, mode: &str, variant: Option<&str>) -> (Value, String) {
+        let result = run_with_options(opencode_options(root, mode, variant)).unwrap();
+        let value = result_to_json(&result);
+        let stderr = fs::read_to_string(value["artifacts"]["stderr"].as_str().unwrap()).unwrap();
+        (value, stderr)
+    }
+
+    #[test]
+    fn opencode_backend_selection_and_flag_validation() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "opencode",
+            "--model",
+            "opencode-go/deepseek-v4-flash",
+            "--variant",
+            "high",
+            "--prompt",
+            "task",
+        ]))
+        .unwrap();
+        assert_eq!(options.backend, DelegationBackend::OpenCode);
+        assert_eq!(options.variant.as_deref(), Some("high"));
+        assert_eq!(options.reasoning_effort, None);
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--reasoning-effort",
+            "high",
+            "--prompt",
+            "task",
+        ]))
+        .unwrap();
+        assert_eq!(options.backend, DelegationBackend::Codex);
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "codex",
+                "--model",
+                "m",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "codex",
+                "--model",
+                "m",
+                "--variant",
+                "high",
+                "--reasoning-effort",
+                "high",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "opencode",
+                "--model",
+                "m",
+                "--reasoning-effort",
+                "high",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_generic_args(&args(&[
+                "--backend",
+                "other",
+                "--model",
+                "m",
+                "--prompt",
+                "task"
+            ]))
+            .is_err()
+        );
+        assert!(parse_generic_args(&args(&["--backend", "opencode", "--prompt", "task"])).is_err());
+        assert!(run_generic_cli(&[]).unwrap().contains("--backend opencode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_command_is_structured_without_shell_and_filters_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let options = opencode_options(root.path(), "success", Some("high"));
+        let cwd = fs::canonicalize(root.path()).unwrap();
+        let environment = vec![
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+            (
+                OsString::from("OPENCODE_TEST_SECRET"),
+                OsString::from("sentinel-secret-value"),
+            ),
+            (
+                OsString::from("OP_SERVICE_ACCOUNT_TOKEN"),
+                OsString::from("sentinel-op-token"),
+            ),
+        ];
+        let command = build_opencode_command(&options, &cwd, "effective prompt", environment);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "--pure");
+        assert_eq!(args[2], "--format");
+        assert_eq!(args[3], "json");
+        assert_eq!(args[4], "--dir");
+        assert_eq!(Path::new(&args[5]), cwd);
+        assert_eq!(args[6], "--model");
+        assert_eq!(args[7], "opencode-go/test-model");
+        assert_eq!(args[8], "--variant");
+        assert_eq!(args[9], "high");
+        assert_eq!(args[10], "--");
+        assert_eq!(args[11], "effective prompt");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "sh" || arg == "-c" || arg == "bash")
+        );
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(envs.iter().any(|(key, _)| key == "HOME"));
+        assert!(envs.iter().any(|(key, _)| key == "LC_ALL"));
+        assert!(!envs.iter().any(|(key, _)| key == "OPENCODE_TEST_SECRET"));
+        assert!(
+            !envs
+                .iter()
+                .any(|(key, _)| key == "OP_SERVICE_ACCOUNT_TOKEN")
+        );
+    }
+
+    #[test]
+    fn opencode_effective_prompt_embeds_report_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let options = opencode_options(root.path(), "success", Some("high"));
+        let prompt = opencode_effective_prompt(&options).unwrap();
+        assert!(prompt.contains("respond with ONLY one JSON object"));
+        assert!(prompt.contains("\"opencode-go/test-model\""));
+        assert!(prompt.contains("\"high\""));
+        assert!(prompt.ends_with("return a bounded report"));
+    }
+
+    #[test]
+    fn opencode_success_is_normalized_to_backend_neutral_result() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, stderr) = run_fake_opencode(root.path(), "success", None);
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["requested"]["model"], "opencode-go/test-model");
+        assert_eq!(value["requested"]["reasoning_effort"], "");
+        assert_eq!(value["report"]["status"], "completed");
+        assert_eq!(value["evidence"]["thread_id"], "ses_test");
+        assert_eq!(value["evidence"]["usage"]["input_tokens"], 20);
+        assert_eq!(value["evidence"]["usage"]["cached_input_tokens"], 3);
+        assert_eq!(value["evidence"]["usage"]["output_tokens"], 5);
+        assert_eq!(value["evidence"]["usage"]["reasoning_output_tokens"], 2);
+        assert_eq!(value["evidence"]["usage"]["total_tokens"], 30);
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["artifacts_truncated"], false);
+        assert!(stderr.contains("<run><--pure><--format><json><--dir>"));
+        assert!(stderr.contains("<--model><opencode-go/test-model><--><"));
+        assert!(stderr.contains("You are a delegated implementation worker"));
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_observed_model_and_variant_are_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "observed", Some("high"));
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["observed"]["model"], "opencode-go/deepseek-v4-flash");
+        assert_eq!(value["observed"]["reasoning_effort"], Value::Null);
+        assert_eq!(value["requested"]["reasoning_effort"], "high");
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_classifies_process_and_report_failures() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, expected) in [
+            ("nonzero", "process_nonzero_exit"),
+            ("missing", "missing_report"),
+            ("invalid_json", "invalid_json"),
+            ("invalid_schema", "invalid_report_schema"),
+            ("oversized", "oversized_report"),
+        ] {
+            let (value, _) = run_fake_opencode(root.path(), mode, None);
+            assert_eq!(value["status"], expected, "mode {mode}");
+            assert_eq!(value["report"], Value::Null, "mode {mode}");
+            fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn opencode_bounded_stdout_sets_truncation_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let (value, _) = run_fake_opencode(root.path(), "huge_stdout", None);
+        assert_eq!(value["artifacts_truncated"], true);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_timeout_classifies_and_does_not_hang() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "timeout", None);
+        options.timeout = Some(Duration::from_millis(300));
+        let started = Instant::now();
+        let result = run_with_options(options).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout did not bound the child"
+        );
+        let value = result_to_json(&result);
+        assert_eq!(value["status"], "process_timeout");
+        assert_eq!(value["report"], Value::Null);
+        fs::remove_dir_all(value["artifacts"]["directory"].as_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn opencode_missing_executable_is_backend_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist/opencode");
+        let options = Options::new_opencode("task", "opencode-go/test-model", None, missing);
+        let error = run_with_options(options).unwrap_err();
+        assert!(
+            error.contains("OpenCode backend unavailable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_and_variant_bounds_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "success", None);
+        options.prompt = "x".repeat(MAX_OPENCODE_PROMPT_BYTES);
+        assert!(super::super::validate_options(&options).is_err());
+
+        let options = opencode_options(root.path(), "success", Some(""));
+        assert!(super::super::validate_options(&options).is_err());
+
+        let mut options = opencode_options(root.path(), "success", Some("high"));
+        options.model = "x".repeat(MAX_ARGUMENT_BYTES + 1);
+        assert!(super::super::validate_options(&options).is_err());
+    }
+
+    #[test]
+    fn opencode_text_parts_use_the_last_message_and_ignore_earlier_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let report = r#"{"status":"completed","summary":"ok","base_commit":"abc","changed_files":[],"checks":[],"unresolved":[],"requested_model":"m","requested_effort":"","observed_model":null,"observed_effort":null}"#;
+        let (first, second) = report.split_at(20);
+        let events = [
+            r#"{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_old","type":"text","text":"ignore me"}}"#.to_owned(),
+            r#"{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"input":1,"output":2,"total":3}}}"#.to_owned(),
+            format!(
+                r#"{{"type":"text","sessionID":"ses_test","part":{{"messageID":"msg_final","type":"text","text":{}}}}}"#,
+                serde_json::to_string(first).unwrap()
+            ),
+            format!(
+                r#"{{"type":"text","sessionID":"ses_test","part":{{"messageID":"msg_final","type":"text","text":{}}}}}"#,
+                serde_json::to_string(second).unwrap()
+            ),
+        ];
+        fs::write(&path, format!("{}\n", events.join("\n"))).unwrap();
+
+        let (evidence, state) = collect_opencode_output(&path).unwrap();
+        assert_eq!(evidence.thread_id.as_deref(), Some("ses_test"));
+        assert_eq!(evidence.usage.as_ref().unwrap()["input_tokens"], 1);
+        assert!(matches!(state, ReportState::Valid(_)), "state: {state:?}");
+    }
+
+    fn fake_opencode_diagnostic(root: &Path, mode: &str) -> PathBuf {
+        let path = root.join(format!("fake-opencode-diagnostic-{mode}"));
+        let script = r##"#!/bin/sh
+set -eu
+mode=${0##*-}
+case "$1" in
+    --version)
+        case "$mode" in
+            version_fail) printf 'boom\n' >&2; exit 3 ;;
+            version_timeout) exec sleep 30 ;;
+            version_oversized) head -c 5000 /dev/zero | tr '\0' 'x'; printf '\n' ;;
+            version_malformed) printf 'not a version\n' ;;
+            version_empty) : ;;
+            *) printf '1.18.30\n' ;;
+        esac
+        ;;
+    models)
+        case "$mode" in
+            models_requested_absent) printf 'opencode/mimo-v2.5-free\nopencode/big-pickle\n' ;;
+            models_empty) : ;;
+            models_fail) printf 'provider listing failed\n' >&2; exit 1 ;;
+            models_unsupported) printf 'Unknown command: models\n' >&2; exit 1 ;;
+            models_timeout) exec sleep 30 ;;
+            models_oversized) yes opencode-go/model-x | head -c 9000000 ;;
+            models_mixed) printf 'Available models:\nopencode-go/deepseek-v4-flash\n' ;;
+            models_secret)
+                printf 'OPENCODE_DIAGNOSTIC_SENTINEL=%s\n' "${OPENCODE_DIAGNOSTIC_SENTINEL:-missing}"
+                printf 'stderr %s\n' "${OPENAI_API_KEY:-no-key}" >&2
+                ;;
+            *) printf 'opencode-go/deepseek-v4-flash\nopencode/mimo-v2.5-free\n' ;;
+        esac
+        ;;
+    *)
+        exit 9
+        ;;
+esac
+"##;
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn diagnose_fake(root: &Path, mode: &str, model: Option<&str>) -> Value {
+        diagnose_fake_with_timeouts(root, mode, model, OpenCodeDiagnosticTimeouts::default())
+    }
+
+    fn diagnose_fake_with_timeouts(
+        root: &Path,
+        mode: &str,
+        model: Option<&str>,
+        timeouts: OpenCodeDiagnosticTimeouts,
+    ) -> Value {
+        let binary = fake_opencode_diagnostic(root, mode);
+        let diagnostics = opencode_diagnostics(&binary, model, timeouts).unwrap();
+        diagnostics_to_json(&diagnostics)
+    }
+
+    #[test]
+    fn opencode_diagnostics_missing_binary_is_unavailable_without_false_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing/opencode");
+        let diagnostics = opencode_diagnostics(
+            &missing,
+            Some("opencode-go/deepseek-v4-flash"),
+            OpenCodeDiagnosticTimeouts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostics.executable,
+            OpenCodeExecutableStatus::Unavailable
+        );
+        assert_eq!(diagnostics.version, OpenCodeVersionStatus::Unavailable);
+        assert_eq!(diagnostics.models, OpenCodeModelsStatus::Unavailable);
+        assert_eq!(
+            diagnostics.requested_model_status,
+            OpenCodeRequestedModelStatus::Unknown
+        );
+        let json = diagnostics_to_json(&diagnostics);
+        assert_eq!(json["executable"]["status"], "unavailable");
+        assert_eq!(json["executable"]["resolved"], false);
+        assert_eq!(json["version"]["value"], Value::Null);
+        assert_eq!(json["requested_model"]["status"], "unknown");
+
+        let diagnostics =
+            opencode_diagnostics(&missing, None, OpenCodeDiagnosticTimeouts::default()).unwrap();
+        assert_eq!(
+            diagnostics.requested_model_status,
+            OpenCodeRequestedModelStatus::NotChecked
+        );
+    }
+
+    #[test]
+    fn opencode_diagnostics_reports_version_and_requested_model_presence() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(
+            root.path(),
+            "models_ok",
+            Some("opencode-go/deepseek-v4-flash"),
+        );
+        assert_eq!(json["backend"], "opencode");
+        assert_eq!(json["executable"]["status"], "available");
+        assert_eq!(json["executable"]["resolved"], true);
+        assert_eq!(json["version"]["status"], "ready");
+        assert_eq!(json["version"]["value"], "1.18.30");
+        assert_eq!(json["models"]["status"], "ready");
+        assert_eq!(json["models"]["count"], 2);
+        assert_eq!(json["models"]["truncated"], false);
+        assert_eq!(json["requested_model"]["status"], "present");
+        assert_eq!(
+            json["requested_model"]["value"],
+            "opencode-go/deepseek-v4-flash"
+        );
+    }
+
+    #[test]
+    fn opencode_diagnostics_distinguishes_absent_from_unknown_requested_model() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(
+            root.path(),
+            "models_requested_absent",
+            Some("opencode-go/deepseek-v4-flash"),
+        );
+        assert_eq!(json["models"]["status"], "ready");
+        assert_eq!(json["requested_model"]["status"], "absent");
+
+        let json = diagnose_fake(
+            root.path(),
+            "models_fail",
+            Some("opencode-go/deepseek-v4-flash"),
+        );
+        assert_eq!(json["models"]["status"], "failed");
+        assert_eq!(json["requested_model"]["status"], "unknown");
+    }
+
+    #[test]
+    fn opencode_diagnostics_empty_model_listing_is_unavailable_not_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(
+            root.path(),
+            "models_empty",
+            Some("opencode-go/deepseek-v4-flash"),
+        );
+        assert_eq!(json["models"]["status"], "unavailable");
+        assert_eq!(json["requested_model"]["status"], "unknown");
+    }
+
+    #[test]
+    fn opencode_diagnostics_classifies_unsupported_model_command() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(root.path(), "models_unsupported", Some("provider/model"));
+        assert_eq!(json["models"]["status"], "unsupported");
+        assert_eq!(json["requested_model"]["status"], "unknown");
+    }
+
+    #[test]
+    fn opencode_diagnostics_version_timeout_is_bounded_and_cleans_up_child() {
+        let root = tempfile::tempdir().unwrap();
+        let timeouts = OpenCodeDiagnosticTimeouts {
+            version: Duration::from_millis(300),
+            ..OpenCodeDiagnosticTimeouts::default()
+        };
+        let started = Instant::now();
+        let json = diagnose_fake_with_timeouts(root.path(), "version_timeout", None, timeouts);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "version timeout did not bound the child"
+        );
+        assert_eq!(json["version"]["status"], "timeout");
+        assert_eq!(json["version"]["value"], Value::Null);
+        assert_eq!(json["requested_model"]["status"], "not_checked");
+    }
+
+    #[test]
+    fn opencode_diagnostics_models_timeout_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let timeouts = OpenCodeDiagnosticTimeouts {
+            models: Duration::from_millis(300),
+            ..OpenCodeDiagnosticTimeouts::default()
+        };
+        let started = Instant::now();
+        let json = diagnose_fake_with_timeouts(
+            root.path(),
+            "models_timeout",
+            Some("opencode-go/deepseek-v4-flash"),
+            timeouts,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "models timeout did not bound the child"
+        );
+        assert_eq!(json["version"]["status"], "ready");
+        assert_eq!(json["models"]["status"], "timeout");
+        assert_eq!(json["requested_model"]["status"], "unknown");
+    }
+
+    #[test]
+    fn opencode_diagnostics_version_output_is_bounded_and_never_falsely_ready() {
+        let root = tempfile::tempdir().unwrap();
+        for mode in [
+            "version_oversized",
+            "version_malformed",
+            "version_empty",
+            "version_fail",
+        ] {
+            let json = diagnose_fake(root.path(), mode, None);
+            assert_eq!(json["version"]["status"], "failed", "mode {mode}");
+            assert_eq!(json["version"]["value"], Value::Null, "mode {mode}");
+            assert!(json.to_string().len() < 2048, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn opencode_diagnostics_oversized_model_listing_is_bounded_and_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let json = diagnose_fake(root.path(), "models_oversized", Some("opencode-go/model-x"));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "oversized listing was not drained within the bound"
+        );
+        assert_eq!(json["models"]["status"], "ready");
+        assert_eq!(json["models"]["truncated"], true);
+        assert_eq!(json["requested_model"]["status"], "unknown");
+        assert!(json.to_string().len() < 2048);
+    }
+
+    #[test]
+    fn opencode_diagnostics_ignores_unrecognized_listing_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(
+            root.path(),
+            "models_mixed",
+            Some("opencode-go/deepseek-v4-flash"),
+        );
+        assert_eq!(json["models"]["status"], "ready");
+        assert_eq!(json["models"]["count"], 1);
+        assert_eq!(json["requested_model"]["status"], "present");
+    }
+
+    #[test]
+    fn opencode_diagnostics_never_leaks_child_output_or_environment_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let json = diagnose_fake(root.path(), "models_secret", None);
+        let encoded = json.to_string();
+        assert!(!encoded.contains("OPENCODE_DIAGNOSTIC_SENTINEL"));
+        assert!(!encoded.contains("sentinel-secret-value"));
+        assert!(!encoded.contains("no-key"));
+
+        let environment = vec![
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+            (
+                OsString::from("OPENAI_API_KEY"),
+                OsString::from("sentinel-secret-value"),
+            ),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("sentinel-secret-value"),
+            ),
+            (
+                OsString::from("OP_SERVICE_ACCOUNT_TOKEN"),
+                OsString::from("sentinel-secret-value"),
+            ),
+            (
+                OsString::from("OPENCODE_DIAGNOSTIC_SENTINEL"),
+                OsString::from("sentinel-secret-value"),
+            ),
+        ];
+        let command =
+            build_opencode_probe_command(Path::new("opencode"), &["models", "--pure"], environment);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["models", "--pure"]);
+        let envs = command
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(envs.iter().any(|key| key == "HOME"));
+        assert!(envs.iter().any(|key| key == "LC_ALL"));
+        for forbidden in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "OPENCODE_DIAGNOSTIC_SENTINEL",
+        ] {
+            assert!(
+                !envs.iter().any(|key| key == forbidden),
+                "diagnostics environment leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_diagnostics_cli_requires_the_opencode_backend() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(parse_diagnose_args(&args(&["--backend", "codex"])).is_err());
+        assert!(parse_diagnose_args(&args(&["--backend", "other"])).is_err());
+        assert!(parse_diagnose_args(&args(&["--unknown", "value"])).is_err());
+        let oversized_model = "x".repeat(MAX_ARGUMENT_BYTES + 1);
+        assert!(
+            parse_diagnose_args(&args(&[
+                "--backend",
+                "opencode",
+                "--model",
+                &oversized_model
+            ]))
+            .is_err()
+        );
+        assert_eq!(
+            parse_diagnose_args(&args(&[
+                "--backend",
+                "opencode",
+                "--model",
+                "provider/model"
+            ]))
+            .unwrap()
+            .as_deref(),
+            Some("provider/model")
+        );
+        assert!(run_diagnose_cli(&[]).unwrap().contains("delegate diagnose"));
+        assert!(run_generic_cli(&[]).unwrap().contains("delegate diagnose"));
+    }
+
+    #[test]
+    fn parse_opencode_version_rejects_unexpected_output_without_panicking() {
+        assert_eq!(
+            parse_opencode_version(b"1.18.30\n").as_deref(),
+            Some("1.18.30")
+        );
+        assert_eq!(
+            parse_opencode_version(b"\n  1.18.30-dev.1+build  \n").as_deref(),
+            Some("1.18.30-dev.1+build")
+        );
+        assert_eq!(parse_opencode_version(b"\n"), None);
+        assert_eq!(parse_opencode_version(b"not a version\n"), None);
+        assert_eq!(parse_opencode_version(b"beta\n"), None);
+        assert_eq!(
+            parse_opencode_version(&[b'9'; MAX_DIAGNOSTIC_VERSION_BYTES + 1]),
+            None
+        );
+        assert!(parse_opencode_version(&[0xff, 0xfe, b'\n']).is_none());
+    }
+
+    #[test]
+    fn model_identifier_grammar_ignores_headers_and_urls() {
+        assert!(is_opencode_model_identifier(
+            "opencode-go/deepseek-v4-flash"
+        ));
+        assert!(is_opencode_model_identifier("opencode/mimo-v2.5-free"));
+        assert!(!is_opencode_model_identifier("Available models:"));
+        assert!(!is_opencode_model_identifier("https://models.dev/api.json"));
+        assert!(!is_opencode_model_identifier("/usr/bin/opencode"));
+        assert!(!is_opencode_model_identifier("opencode/"));
+        assert!(!is_opencode_model_identifier(""));
+    }
+}
