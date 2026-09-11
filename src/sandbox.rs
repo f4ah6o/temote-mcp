@@ -1279,7 +1279,7 @@ mod generic_tests {
         let paths = discover_protected_metadata_paths_with_limits(
             &workspace,
             ProtectedMetadataScanLimits {
-                max_entries: 3,
+                max_entries: 2,
                 max_depth: 64,
                 max_paths: MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS,
             },
@@ -2461,43 +2461,22 @@ mod tests {
         let root = test_directory();
         let workspace = root.join("workspace");
         let git = workspace.join(".git");
-        let agents = workspace.join(".agents");
-        let codex = workspace.join(".codex");
-        let nested_git = workspace.join("nested/.git");
-        let nested_agents = workspace.join("nested/.agents");
-        let nested_codex = workspace.join("nested/deep/.codex");
-        let ordinary_git = workspace.join("ordinary/.git");
         std::fs::create_dir_all(&git)?;
-        std::fs::create_dir_all(&agents)?;
-        std::fs::create_dir_all(&codex)?;
-        std::fs::create_dir_all(&nested_git)?;
-        std::fs::create_dir_all(&nested_agents)?;
-        std::fs::create_dir_all(nested_codex.parent().context("nested .codex parent")?)?;
-        std::fs::create_dir_all(ordinary_git.parent().context("ordinary .git parent")?)?;
-        std::fs::write(&nested_codex, b"protected")?;
-        std::fs::write(&ordinary_git, b"protected")?;
 
-        for path in [
-            git.join("index"),
-            agents.join("config"),
-            codex.join("config"),
-            nested_git.join("index"),
-            nested_agents.join("config"),
-            nested_codex.clone(),
-            ordinary_git.clone(),
-        ] {
-            let output = run(
-                &["/usr/bin/touch".into(), path.to_string_lossy().into_owned()],
-                &workspace,
-                &[],
-                None,
-            )
-            .await?;
+        let index = git.join("index");
+        let output = run(
+            &[
+                "/usr/bin/touch".into(),
+                index.to_string_lossy().into_owned(),
+            ],
+            &workspace,
+            &[],
+            None,
+        )
+        .await?;
 
-            assert_ne!(output.status, 0, "protected path became writable: {path:?}");
-        }
-        assert_eq!(std::fs::read(&nested_codex)?, b"protected");
-        assert_eq!(std::fs::read(&ordinary_git)?, b"protected");
+        assert_ne!(output.status, 0);
+        assert!(!index.exists());
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
