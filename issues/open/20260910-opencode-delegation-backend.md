@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, and live comparative measurement landed on main; OpenCode normalized-report delivery fix landed on main; persistent/session features not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, and normalized-report fix landed on main; `TEMOTE_OPENCODE_BIN` implemented and verified locally; persistent/session features not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -563,7 +563,7 @@ Backend adapter extraction landed on main without changing external behavior:
 - All 37 delegation tests moved with their modules and pass unchanged; the frozen parent JSON fixture, Codex argv/environment tests, OpenCode argv/normalization tests, and diagnostics tests keep their assertions.
 - Smoke on 2026-09-11: `delegate diagnose --backend opencode` unchanged; one-shot `delegate --backend opencode --model opencode/mimo-v2.5-free` completed with `status=success` and no files created or changed.
 
-Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
+Remaining work after this slice: persistent server/session/resume.
 
 ## Phase 3 diagnostics status (2026-09-11)
 
@@ -576,7 +576,7 @@ Read-only OpenCode CLI diagnostics landed on main:
 - Deterministic fake-CLI tests cover missing binary, version success/failure/timeout/oversized/malformed, model listing success/empty/mixed/failure/unsupported/timeout/oversized, requested-model present/absent/unknown, environment allowlist filtering, and secret/output non-leakage.
 - Read-only smoke on 2026-09-11 with OpenCode CLI `1.18.30`: `executable=available`, `version=1.18.30`, `models=ready count=64`, `requested_model=opencode-go/deepseek-v4-flash present`; no credential mutation and no delegation execution.
 
-Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
+Remaining work after this slice: persistent server/session/resume.
 
 ## Live comparative measurement status (2026-09-12)
 
@@ -588,7 +588,7 @@ Live comparison landed on main. Evidence: [`docs/evaluations/codex-vs-opencode-l
 - Recommendation in this sample: keep Codex as the default delegation backend; treat OpenCode as an interactive/session backend or a fallback only after report delivery is enforced. More evidence (more runs, second OpenCode model, report-contract fix) is needed before changing defaults.
 - Observed issues are recorded in the evidence file only; no production changes were made in this slice.
 
-Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
+Remaining work after this slice: persistent server/session/resume.
 
 ## OpenCode normalized-report delivery fix status (2026-09-12)
 
@@ -599,7 +599,19 @@ Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-rep
 - Verification: 19 new deterministic tests (44 OpenCode adapter tests), delegation 52, Codex 112, full cargo test 607 bin + 40 lib, gateway 60/60, fmt/clippy/check/diff green.
 - Post-fix live recheck with the same frozen prompts: OpenCode normalized success went from 1/9 to 9/9 (`invalid_json` 2→0, `invalid_report_schema` 6→0). Remaining limitation: the 1200-char summary bound truncates long answers (marker visible), and the model rarely uses `checks`/`unresolved` for detail.
 
-Remaining work after this slice: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume.
+Remaining work after this slice: persistent server/session/resume.
+
+## OpenCode executable override status (2026-09-12)
+
+`TEMOTE_OPENCODE_BIN` implemented and verified locally. Report: [`docs/evaluations/opencode-bin-override-20260912.md`](../../docs/evaluations/opencode-bin-override-20260912.md).
+
+- Contract: optional absolute path to an existing executable regular file; symlinks are canonicalized; takes precedence over PATH. An explicit but invalid override (empty, relative, missing, not a regular file, not executable, invalid value, or over the path-length bound) fails closed with a bounded error and does not fall back to PATH.
+- One resolver (`resolve_opencode_executable`) is shared by delegation (`delegate --backend opencode`) and diagnostics (`delegate diagnose --backend opencode`). Delegation resolves at argument parsing before any child or artifact is created; diagnostics reports `available`/`unavailable`, the source (`env_override`/`path`/`invalid_override`), and a bounded reason for invalid overrides.
+- The resolved physical path is never printed in diagnostics, results, or errors; the environment value is read only by the parent and is not passed to the OpenCode child. Codex delegation and the legacy `codex delegate` path are unaffected even when the override is invalid.
+- Verification: 8 new adapter tests + 3 shared delegation tests (52 OpenCode adapter tests), including precedence, unset fallback, empty/relative/missing/directory/non-executable/NUL/overlong rejection, symlink canonicalization, invalid-override diagnostics, source labeling, error-path non-disclosure, and child-environment filtering.
+- Smoke: valid override diagnosed `source=env_override`, `status=available`, `version=1.18.30`, requested model `present`; unset override diagnosed `source=path`; invalid override diagnosed `source=invalid_override` with `not_absolute`/`not_found` and delegation exited non-zero without producing a result; one-shot read-only delegation through the override returned `status=success` and left the disposable directory unchanged.
+
+Remaining work after this slice: persistent server/session/resume.
 
 ## Phase 1 status (2026-09-11)
 

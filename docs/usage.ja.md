@@ -126,6 +126,15 @@ agent の file edit は Git remote 操作の認可を与えません。
 stage、commit、fetch、pull、push には専用の `git_*` tool を使います。
 公開 HTTP はこの構造化 broker だけを公開し、generic な `without_sandbox` tool は引き続き公開しません。
 
+### Delegation backend (ローカル CLI)
+
+`temote-mcp delegate --backend codex|opencode ...` は、ローカル CLI から bounded な非対話 delegation を1回実行し、bounded な JSON result を1つ出力します。OpenCode backend の executable は次の順で解決します。
+
+1. `TEMOTE_OPENCODE_BIN` が設定されている場合、既存の実行可能な regular file への絶対 path でなければなりません。symlink は canonical target に解決します。PATH より優先されます。
+2. 未設定の場合は PATH から `opencode` を解決します。
+
+明示された `TEMOTE_OPENCODE_BIN` が不正（空、相対 path、存在しない、regular file でない、実行可能でない）な場合は fail closed とし、PATH 上の別 executable へ暗黙に fallback しません。設定された path は diagnostics や error に出力しません。`temote-mcp delegate diagnose --backend opencode` が示すのは `available` / `unavailable`、source (`env_override` / `path` / `invalid_override`)、invalid override の bounded な reason だけです。`TEMOTE_OPENCODE_BIN` は parent process が読むだけで、OpenCode child の environment には渡しません。
+
 ## work checkpoint / handoff
 
 `checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。すべてのsaveで opaque UUID `operation_id` が必須です。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。同じlogical mutationを同一`operation_id`かつ同一canonical requestで再送すると、checkpoint/revisionを増やさず以前のcommit結果を返します。同じoperation IDを異なるrequestで再利用すると `OPERATION_CONFLICT`、通常のstale revisionは `CHECKPOINT_CONFLICT` になります。operation receiptはcheckpointと同じatomic write境界で永続化し、bounded historyとして保持します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。
