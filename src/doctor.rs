@@ -5,6 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 #[cfg(feature = "network")]
 use serde::Deserialize;
+#[cfg(feature = "network")]
+use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -608,6 +610,339 @@ async fn check_federation_readiness(report: &mut Report) {
         return;
     };
     check_gateway_supervisor(report, &host_id).await;
+    #[cfg(feature = "network")]
+    check_gateway_remote(report, &config, &host_id).await;
+}
+
+#[cfg(feature = "network")]
+fn gateway_health_identity_ok(success: bool, body: Option<&Value>) -> bool {
+    success
+        && body
+            .and_then(|value| value.get("identity"))
+            .and_then(Value::as_str)
+            == Some("temote-mcp-gateway")
+        && body
+            .and_then(|value| value.get("readiness"))
+            .and_then(Value::as_str)
+            == Some("ready")
+}
+
+#[cfg(feature = "network")]
+fn gateway_host_registration_result(
+    body: Option<&Value>,
+    host_id: &str,
+    expected_generation: Option<u64>,
+) -> GatewayStageResult {
+    let registered = body
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("registered")
+        && body
+            .and_then(|value| value.get("host_id"))
+            .and_then(Value::as_str)
+            == Some(host_id);
+    if !registered {
+        return GatewayStageResult::failed(
+            GatewayStage::HostRegistration,
+            "host",
+            "gateway returned an invalid host registration status",
+            "Restart the host-level gateway agent and verify the configured host identity.",
+        );
+    }
+    let generation = body
+        .and_then(|value| value.get("generation"))
+        .and_then(Value::as_u64);
+    if let (Some(expected), Some(remote)) = (expected_generation, generation) {
+        if remote > expected {
+            return GatewayStageResult::failed(
+                GatewayStage::HostRegistration,
+                "host",
+                format!(
+                    "gateway agent generation was replaced (local generation={expected}, gateway generation={remote})"
+                ),
+                "Restart the local host-level gateway agent so it reconnects to the current generation.",
+            );
+        }
+        if remote < expected {
+            return GatewayStageResult::unavailable(
+                GatewayStage::HostRegistration,
+                "host",
+                format!(
+                    "gateway reports an older generation than the local agent (local generation={expected}, gateway generation={remote})"
+                ),
+                "Treat gateway registration state as unknown and verify the gateway deployment.",
+            );
+        }
+    }
+    let detail = match generation {
+        Some(generation) if expected_generation.is_some() => {
+            format!("host is registered and matches the local agent generation={generation}")
+        }
+        Some(generation) => {
+            format!("host is registered with an active lease (generation={generation})")
+        }
+        None => "host is registered with an active lease".to_owned(),
+    };
+    GatewayStageResult::ready(GatewayStage::HostRegistration, "host", detail)
+}
+
+#[cfg(feature = "network")]
+fn classify_gateway_host_status(
+    status_code: reqwest::StatusCode,
+    body: Option<&Value>,
+    host_id: &str,
+    expected_generation: Option<u64>,
+) -> Vec<GatewayStageResult> {
+    use reqwest::StatusCode;
+    match status_code {
+        StatusCode::OK => vec![
+            GatewayStageResult::ready(
+                GatewayStage::AccessAuth,
+                "service_token",
+                "gateway host status authorization succeeded",
+            ),
+            gateway_host_registration_result(body, host_id, expected_generation),
+        ],
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => vec![
+            GatewayStageResult::failed(
+                GatewayStage::AccessAuth,
+                "service_token",
+                "gateway rejected the host status credentials",
+                "Verify the Access service-token policy and host token configuration; values are never printed.",
+            ),
+            GatewayStageResult::not_checked(
+                GatewayStage::HostRegistration,
+                "host",
+                "host credentials were rejected; registration state cannot be determined",
+            ),
+        ],
+        StatusCode::NOT_FOUND => {
+            let registration = match body
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("not_registered") => GatewayStageResult::failed(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "host is not registered",
+                    "Start or reconnect the host-level gateway agent for this host ID.",
+                ),
+                Some("lease_expired") => GatewayStageResult::failed(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "host lease has expired",
+                    "Start or reconnect the host-level gateway agent for this host ID.",
+                ),
+                _ => GatewayStageResult::failed(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "host is not registered or its lease has expired",
+                    "Start or reconnect the host-level gateway agent for this host ID.",
+                ),
+            };
+            vec![
+                GatewayStageResult::ready(
+                    GatewayStage::AccessAuth,
+                    "service_token",
+                    "gateway host status authorization succeeded",
+                ),
+                registration,
+            ]
+        }
+        _ => vec![
+            GatewayStageResult::unavailable(
+                GatewayStage::AccessAuth,
+                "service_token",
+                format!("gateway status probe returned HTTP {status_code}"),
+                "Treat remote readiness as unknown and inspect the gateway deployment without exposing credentials.",
+            ),
+            GatewayStageResult::not_checked(
+                GatewayStage::HostRegistration,
+                "host",
+                "gateway status probe returned an unexpected response",
+            ),
+        ],
+    }
+}
+
+#[cfg(feature = "network")]
+async fn check_gateway_remote(report: &mut Report, config: &GatewayLocalConfig, host_id: &str) {
+    let Some(gateway_url) = config.gateway_url.as_deref() else {
+        return;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            report.add(
+                GatewayStageResult::unavailable(
+                    GatewayStage::RemoteEndpoint,
+                    "endpoint",
+                    format!("HTTPS client unavailable: {error}"),
+                    "Retry with the standard network-enabled temote-mcp build.",
+                )
+                .into_check(),
+            );
+            return;
+        }
+    };
+
+    let health = match client.get(format!("{gateway_url}/healthz")).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            report.add(
+                GatewayStageResult::failed(
+                    GatewayStage::RemoteEndpoint,
+                    "endpoint",
+                    format!("gateway health request failed: {error}"),
+                    "Verify DNS, TLS, routing, and that the Worker endpoint is deployed.",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::AccessAuth,
+                    "service_token",
+                    "remote endpoint could not be reached",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "remote endpoint could not be reached",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::SessionAvailability,
+                    "sessions",
+                    "session discovery is not part of the read-only gateway status probe",
+                )
+                .into_check(),
+            );
+            return;
+        }
+    };
+    let health_status = health.status();
+    let health_body = match read_bounded_doctor_response(health).await {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
+        Err(_) => None,
+    };
+    if gateway_health_identity_ok(health_status.is_success(), health_body.as_ref()) {
+        report.add(
+            GatewayStageResult::ready(
+                GatewayStage::RemoteEndpoint,
+                "endpoint",
+                "authenticated gateway status endpoint is reachable and identifies the Temote gateway",
+            )
+            .into_check(),
+        );
+    } else {
+        report.add(
+            GatewayStageResult::failed(
+                GatewayStage::RemoteEndpoint,
+                "endpoint",
+                format!("unexpected gateway identity response ({health_status})"),
+                "Verify that the configured origin is the Temote gateway Worker, not a direct origin or unrelated route.",
+            )
+            .into_check(),
+        );
+    }
+
+    let mut status_request = client
+        .post(format!("{gateway_url}/v1/hosts/status"))
+        .bearer_auth(config.host_token.as_deref().unwrap_or_default())
+        .header("x-temote-host-id", host_id);
+    if let (Some(client_id), Some(client_secret)) = (
+        config.access_client_id.as_deref(),
+        config.access_client_secret.as_deref(),
+    ) {
+        status_request = status_request
+            .header("cf-access-client-id", client_id)
+            .header("cf-access-client-secret", client_secret);
+    }
+    let status = match status_request
+        .json(&serde_json::json!({ "host_id": host_id }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            report.add(
+                GatewayStageResult::unavailable(
+                    GatewayStage::AccessAuth,
+                    "service_token",
+                    format!("authenticated status probe could not complete: {error}"),
+                    "Verify the Access service-token pair and gateway host token without printing their values.",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "authenticated status probe could not complete",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::SessionAvailability,
+                    "sessions",
+                    "session discovery is not part of the read-only gateway status probe",
+                )
+                .into_check(),
+            );
+            return;
+        }
+    };
+    let status_code = status.status();
+    let status_body = read_bounded_doctor_response(status)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let expected_generation = crate::gateway::read_host_agent_generation(host_id);
+    for result in classify_gateway_host_status(
+        status_code,
+        status_body.as_ref(),
+        host_id,
+        expected_generation,
+    ) {
+        report.add(result.into_check());
+    }
+    report.add(
+        GatewayStageResult::not_checked(
+            GatewayStage::SessionAvailability,
+            "sessions",
+            "session discovery is not part of the read-only gateway status probe",
+        )
+        .into_check(),
+    );
+}
+
+#[cfg(feature = "network")]
+async fn read_bounded_doctor_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(length <= 64 * 1024, "doctor response is too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read doctor response")?
+    {
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= 64 * 1024,
+            "doctor response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn check_platform(report: &mut Report) {
@@ -1956,6 +2291,179 @@ mod tests {
         assert_eq!(
             detail,
             "supervisor=unknown, control_protocol=0, named_roots=0"
+        );
+    }
+
+    #[cfg(feature = "network")]
+    fn gateway_status(
+        results: &[GatewayStageResult],
+        stage: GatewayStage,
+    ) -> Option<GatewayStageStatus> {
+        results
+            .iter()
+            .find(|result| result.stage == stage)
+            .map(|result| result.status)
+    }
+
+    #[cfg(feature = "network")]
+    fn gateway_detail(results: &[GatewayStageResult], stage: GatewayStage) -> &str {
+        results
+            .iter()
+            .find(|result| result.stage == stage)
+            .map(|result| result.detail.as_str())
+            .unwrap_or("")
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_health_identity_requires_explicit_gateway_metadata() {
+        let ready = serde_json::json!({"identity": "temote-mcp-gateway", "readiness": "ready"});
+        assert!(gateway_health_identity_ok(true, Some(&ready)));
+        assert!(!gateway_health_identity_ok(false, Some(&ready)));
+        let direct = serde_json::json!({"status": "ok", "service": "temote-mcp"});
+        assert!(!gateway_health_identity_ok(true, Some(&direct)));
+        let wrong_readiness =
+            serde_json::json!({"identity": "temote-mcp-gateway", "readiness": "degraded"});
+        assert!(!gateway_health_identity_ok(true, Some(&wrong_readiness)));
+        assert!(!gateway_health_identity_ok(true, None));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_host_status_classifies_registration_states() {
+        use reqwest::StatusCode;
+        let host_id = "mac-main";
+
+        let registered = serde_json::json!({
+            "status": "registered",
+            "host_id": host_id,
+            "generation": 7,
+        });
+        let results =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::AccessAuth),
+            Some(GatewayStageStatus::Ready)
+        );
+        assert_eq!(
+            gateway_status(&results, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Ready)
+        );
+        let registration_detail = gateway_detail(&results, GatewayStage::HostRegistration);
+        assert!(registration_detail.contains("generation=7"));
+
+        let other_host = serde_json::json!({"status": "registered", "host_id": "other-main"});
+        let results =
+            classify_gateway_host_status(StatusCode::OK, Some(&other_host), host_id, None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Failed)
+        );
+
+        for (status, detail) in [
+            ("not_registered", "host is not registered"),
+            ("lease_expired", "host lease has expired"),
+        ] {
+            let body = serde_json::json!({"status": status});
+            let results =
+                classify_gateway_host_status(StatusCode::NOT_FOUND, Some(&body), host_id, None);
+            assert_eq!(
+                gateway_status(&results, GatewayStage::AccessAuth),
+                Some(GatewayStageStatus::Ready)
+            );
+            assert_eq!(
+                gateway_status(&results, GatewayStage::HostRegistration),
+                Some(GatewayStageStatus::Failed)
+            );
+            let registration_detail = gateway_detail(&results, GatewayStage::HostRegistration);
+            assert_eq!(registration_detail, detail);
+        }
+
+        let results = classify_gateway_host_status(StatusCode::NOT_FOUND, None, host_id, None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Failed)
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_host_status_distinguishes_a_replaced_agent_generation() {
+        use reqwest::StatusCode;
+        let host_id = "mac-main";
+        let registered = serde_json::json!({
+            "status": "registered",
+            "host_id": host_id,
+            "generation": 9,
+        });
+
+        let replaced =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, Some(7));
+        assert_eq!(
+            gateway_status(&replaced, GatewayStage::AccessAuth),
+            Some(GatewayStageStatus::Ready)
+        );
+        assert_eq!(
+            gateway_status(&replaced, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Failed)
+        );
+        let detail = gateway_detail(&replaced, GatewayStage::HostRegistration);
+        assert!(detail.contains("replaced"), "{detail}");
+        assert!(detail.contains("local generation=7"), "{detail}");
+        assert!(detail.contains("gateway generation=9"), "{detail}");
+
+        let matched =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, Some(9));
+        assert_eq!(
+            gateway_status(&matched, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Ready)
+        );
+        let detail = gateway_detail(&matched, GatewayStage::HostRegistration);
+        assert!(detail.contains("matches the local agent"), "{detail}");
+
+        let older =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, Some(11));
+        assert_eq!(
+            gateway_status(&older, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Unavailable)
+        );
+        assert_eq!(
+            gateway_status(&older, GatewayStage::HostRegistration).map(GatewayStageStatus::level),
+            Some(Level::Fail)
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_host_status_never_claims_ready_on_auth_or_unexpected_failure() {
+        use reqwest::StatusCode;
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let results = classify_gateway_host_status(status, None, "mac-main", None);
+            assert_eq!(
+                gateway_status(&results, GatewayStage::AccessAuth),
+                Some(GatewayStageStatus::Failed)
+            );
+            assert_eq!(
+                gateway_status(&results, GatewayStage::HostRegistration),
+                Some(GatewayStageStatus::NotChecked)
+            );
+        }
+
+        let results = classify_gateway_host_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "mac-main",
+            None,
+        );
+        assert_eq!(
+            gateway_status(&results, GatewayStage::AccessAuth),
+            Some(GatewayStageStatus::Unavailable)
+        );
+        let registration = gateway_status(&results, GatewayStage::HostRegistration);
+        assert_eq!(registration, Some(GatewayStageStatus::NotChecked));
+        assert_eq!(
+            registration.map(GatewayStageStatus::level),
+            Some(Level::Warn)
         );
     }
 }

@@ -88,7 +88,7 @@ npx wrangler deployments status --name temote-mcp-gateway
 curl -sSf https://<gateway-host>/healthz
 ```
 
-`/healthz` は `{"status":"ok","service":"temote-mcp-gateway"}` を返す必要があります。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。Access 経由の MCP 疎通は、この local check とは別に確認します。
+`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway"}`）。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。Access 経由の MCP 疎通は、この local check とは別に確認します。
 
 ### Rollback
 
@@ -126,7 +126,7 @@ temote-mcp supervisor
 temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
-`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は gateway readiness を stage 別に表示します。`local_config` の各項目（host ID、gateway URL origin、host token の存在、Access service-token の組）と `local_supervisor` の control protocol が個別の結果になります。doctor は root path や token 値を表示せず、remote endpoint / Access / host registration の stage は read-only remote 診断が実装されるまで未確認のままです。
+`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は gateway readiness を stage 別に表示します。`local_config` の各項目（host ID、gateway URL origin、host token の存在、Access service-token の組）と `local_supervisor` の control protocol が個別の結果になります。network-enabled build では read-only の `/healthz` identity check と認証付き `/v1/hosts/status` probe も実行し、remote endpoint、Access 認証、この host の active lease を分類します。local の host-level `gateway-agent` generation が記録されている場合、doctor は認証済み gateway の `generation` と比較し、remote の generation が新しいときは `generation_replaced` として報告するため、置き換えられた古い local agent を healthy と誤認しません。session availability は MCP tool を dispatch しないため `not_checked` のままです。root path や token 値は表示しません。
 
 ## MCP workflow
 

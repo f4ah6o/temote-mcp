@@ -88,7 +88,7 @@ npx wrangler deployments status --name temote-mcp-gateway
 curl -sSf https://<gateway-host>/healthz
 ```
 
-`/healthz` must return `{"status":"ok","service":"temote-mcp-gateway"}`. A direct-origin response or a different service identity means the hostname still points at the wrong target. Authenticated MCP reachability through Access is tracked separately from this local check.
+`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway"}`). A direct-origin response or a different service identity means the hostname still points at the wrong target. Authenticated MCP reachability through Access is tracked separately from this local check.
 
 ### Rollback
 
@@ -126,7 +126,7 @@ temote-mcp supervisor
 temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
-`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. Doctor never prints root paths or token values, and remote endpoint/Access/host-registration stages remain unverified until the read-only remote diagnostics are implemented.
+`--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. With the network-enabled build it also performs a read-only `/healthz` identity check and authenticated `/v1/hosts/status` probe. These classify the remote endpoint, Access authorization, and this host's active lease; session availability remains `not_checked` because doctor never dispatches an MCP tool. When a local host-level `gateway-agent` generation is recorded, doctor compares the authenticated gateway `generation` against it and reports `generation_replaced` when the remote generation is newer, so a superseded local agent is not mistaken for a healthy one. Doctor never prints root paths or token values.
 
 ## MCP workflow
 

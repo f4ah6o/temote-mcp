@@ -2,9 +2,18 @@
 
 Date: 2026-09-08
 
+## Implementation status (2026-09-12)
+
+The repository-local boot identity slice is implemented: each Temote process now
+generates one UUID-shaped, non-secret `boot_generation`, and the existing
+`/healthz` response reports it together with the effective `host_id`. This is
+an identity primitive for later reconnect verification only; remote upgrade
+tools, response-flush commit barriers, coordinator ownership, and live
+reconnect acceptance remain unimplemented.
+
 ## Implementation status (2026-09-11)
 
-Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, boot-generation identity, and reconnect contract remain unimplemented.
+Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.
 
 ## Background
 

@@ -1,8 +1,8 @@
 # Gateway federation の end-to-end readiness 診断を追加する
 
-Status: open / Slice A (staged local readiness) landed on main; Slices B-D (remote endpoint, Access, host registration) not started
+Status: partially implemented / Slice A and the read-only remote endpoint, Access, and host-registration probe are implemented, including explicit `not_registered`/`lease_expired`/`generation_replaced` classification; session availability remains not_checked and live Cloudflare acceptance is pending
 Created: 2026-09-11
-Updated: 2026-09-11
+Updated: 2026-09-12
 Priority: P1 operator diagnostics
 
 ## 概要
@@ -174,4 +174,35 @@ Slice A landed on main (`src/doctor.rs`):
 - `check_federation_readiness` performs no remote network call and still skips the supervisor probe when local config is invalid.
 - Sentinel tests cover per-item classification, invalid host IDs/URLs, Access pair completeness, secret non-leakage, physical-root non-leakage, and the not-checked/ready distinction.
 
-Remote stages remain unimplemented and are not silently reported as ready.
+## Implementation notes (2026-09-12)
+
+The first remote read-only slice is implemented:
+
+- `/healthz` exposes explicit non-secret gateway identity/readiness metadata.
+- Authenticated `POST /v1/hosts/status` reports only `registered`/`not_registered`, active generation, lease state, and `session_availability=not_checked`; it does not renew a lease or dispatch an MCP tool.
+- `temote-mcp doctor` classifies endpoint identity, Access/host-token authorization, and host registration with bounded responses. Network failures become `failed`, authentication failures remain distinct, and unavailable session discovery is never treated as ready.
+- Gateway tests cover the bounded status response. Credential-dependent Cloudflare route, Access, and live lease verification remain pending in the live acceptance matrix.
+
+## Implementation notes (2026-09-12 classification slice)
+
+- Remote health/status classification in `src/doctor.rs` now goes through pure helpers (`gateway_health_identity_ok`, `classify_gateway_host_status`) so endpoint identity and host registration are decided by explicit non-secret response fields rather than by HTTP status alone.
+- An authenticated `404` distinguishes `host is not registered` from `host lease has expired`; a rejected `401`/`403` or an unexpected status now reports `host_registration=not_checked` instead of omitting the stage. No failure path maps to `ready`, and the successful registration detail may include the non-secret active `generation`.
+- Deterministic unit tests cover gateway identity metadata, a registered host, a mismatched host ID, `not_registered`, `lease_expired`, unauthorized, and unexpected-status classification. These tests make no network calls.
+- The gateway Worker now has a deterministic protocol test asserting that `/healthz` returns the explicit `identity=temote-mcp-gateway` and `readiness=ready` fields the Rust doctor classifies against, without requiring credentials.
+- `session_availability` remains intentionally `not_checked`, and live Cloudflare route, Access, and lease verification remains tracked in `20260908-live-acceptance-matrix.md`.
+
+## Classification slice residue
+
+- The gateway read-only status contract reports the active generation but has no separate `generation_replaced` signal, so doctor cannot yet distinguish a replaced agent generation from a healthy one without a further read-only protocol addition.
+
+## Implementation notes (2026-09-12 generation_replaced slice)
+
+- The host-level gateway agent now owns a bounded, owner-only, non-secret local connection record under `<state>/gateway-agents/<host_id>.json` containing only `schema`, `host_id`, `generation`, and `updated_at`. It is written atomically after a successful `connect` and removed when the owning generation ends. No credential, token, or path is stored, and unsafe or malformed records are ignored.
+- `temote-mcp doctor` reads that record read-only (no directory creation, `O_NOFOLLOW`, owner-only mode, bounded size) and compares it against the authenticated `/v1/hosts/status` `generation`. A newer remote generation is classified as `generation_replaced`, an older remote generation as `unavailable`, and an exact match as `ready` while naming the local generation.
+- This resolves the `generation_replaced` residue without a remote protocol change: the classification is decided from the existing read-only status `generation` plus the non-secret local agent record. It distinguishes a superseded/stale local agent from a healthy one and never maps the state to `ready`.
+- Deterministic Rust unit tests cover the record round-trip, removal on generation end, owner-only/symlink rejection, and the `generation_replaced`/`unavailable`/matched classifications. No network calls are made in tests.
+- Limitation recorded honestly: a record left behind by a crashed agent whose gateway lease is still current and unadvanced cannot be distinguished from a live agent by read-only status alone; this remains an availability gap, not a false `ready` claim about registration identity.
+
+## Classification slice residue (updated)
+
+- `generation_replaced` is now classified from the non-secret local gateway-agent record. Remaining: `session_availability` is still intentionally `not_checked`, and live Cloudflare route/Access/lease evidence remains in `20260908-live-acceptance-matrix.md`.

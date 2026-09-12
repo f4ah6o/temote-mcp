@@ -120,7 +120,14 @@ async fn shutdown_signal() {
 }
 
 async fn healthz() -> Response {
-    Json(json!({"status": "ok", "service": "temote-mcp"})).into_response()
+    let host_id = crate::host_identity::resolve().unwrap_or_else(|_| "unknown".to_owned());
+    Json(json!({
+        "status": "ok",
+        "service": "temote-mcp",
+        "host_id": host_id,
+        "boot_generation": crate::boot_identity::generation(),
+    }))
+    .into_response()
 }
 
 async fn oauth_protected_resource(State(runtime): State<Runtime>) -> Response {
@@ -563,6 +570,19 @@ mod tests {
     async fn body_json(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthz_exposes_non_secret_process_identity() {
+        let value = body_json(super::healthz().await).await;
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["service"], "temote-mcp");
+        assert!(value["host_id"].as_str().is_some());
+        let generation = value["boot_generation"].as_str().unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(generation).unwrap().to_string(),
+            generation
+        );
     }
 
     #[test]

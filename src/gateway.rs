@@ -1,3 +1,7 @@
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,6 +25,9 @@ const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_AGENT_PROTOCOL_VERSION: u64 = 1;
 const HOST_CAPABILITIES: &[&str] = &["session_lifecycle", "session_tools", "named_roots"];
+const HOST_AGENT_RECORD_SCHEMA_VERSION: u64 = 1;
+const MAX_HOST_AGENT_RECORD_BYTES: usize = 4096;
+const HOST_AGENT_RECORD_DIRECTORY: &str = "gateway-agents";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -371,6 +378,12 @@ async fn run_host_agent(
                 metadata.named_roots.join(",")
             }
         );
+        let connection_record =
+            HostAgentConnectionRecordFile::create(&host_id, connection.generation);
+        if let Err(error) = &connection_record {
+            eprintln!("gateway agent connection record unavailable: {error:#}");
+        }
+        let _connection_record = connection_record.ok();
 
         let outcome = tokio::select! {
             result = run_host_generation(
@@ -434,6 +447,133 @@ where
             Ok(true)
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HostAgentConnectionRecord {
+    schema: u64,
+    host_id: String,
+    generation: u64,
+    updated_at: u64,
+}
+
+fn host_agent_record_directory() -> Result<PathBuf> {
+    Ok(config::state_dir()?.join(HOST_AGENT_RECORD_DIRECTORY))
+}
+
+fn host_agent_record_path_in(directory: &Path, host_id: &str) -> Result<PathBuf> {
+    host_identity::validate(host_id)?;
+    Ok(directory.join(format!("{host_id}.json")))
+}
+
+/// Owns the non-secret local record of the active host-level gateway agent
+/// generation. The record lets a local `doctor` distinguish a replaced agent
+/// generation from a healthy one without a remote protocol change. It contains
+/// no credential and is removed when the owning generation ends.
+struct HostAgentConnectionRecordFile {
+    path: PathBuf,
+}
+
+impl HostAgentConnectionRecordFile {
+    fn create(host_id: &str, generation: u64) -> Result<Self> {
+        Self::create_in(&host_agent_record_directory()?, host_id, generation)
+    }
+
+    fn create_in(directory: &Path, host_id: &str, generation: u64) -> Result<Self> {
+        let path = host_agent_record_path_in(directory, host_id)?;
+        std::fs::create_dir_all(directory).with_context(|| {
+            format!(
+                "cannot create gateway agent record directory {}",
+                directory.display()
+            )
+        })?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+        let record = HostAgentConnectionRecord {
+            schema: HOST_AGENT_RECORD_SCHEMA_VERSION,
+            host_id: host_id.to_owned(),
+            generation,
+            updated_at: config::unix_time(),
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_HOST_AGENT_RECORD_BYTES,
+            "gateway agent record is oversized"
+        );
+        let temporary = directory.join(format!(".{host_id}.{}.tmp", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)
+                .with_context(|| {
+                    format!("cannot create gateway agent record {}", temporary.display())
+                })?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &path).with_context(|| {
+                format!("cannot replace gateway agent record {}", path.display())
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for HostAgentConnectionRecordFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Reads the non-secret generation recorded by the local host-level gateway
+/// agent, if a trusted record exists. Any unsafe or malformed record is treated
+/// as absent rather than as a diagnostic failure.
+pub fn read_host_agent_generation(host_id: &str) -> Option<u64> {
+    let directory = host_agent_record_directory().ok()?;
+    read_host_agent_generation_in(&directory, host_id)
+}
+
+fn read_host_agent_generation_in(directory: &Path, host_id: &str) -> Option<u64> {
+    let path = host_agent_record_path_in(directory, host_id).ok()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    if metadata.len() > MAX_HOST_AGENT_RECORD_BYTES as u64 {
+        return None;
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_HOST_AGENT_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_HOST_AGENT_RECORD_BYTES {
+        return None;
+    }
+    let record: HostAgentConnectionRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.schema != HOST_AGENT_RECORD_SCHEMA_VERSION
+        || record.host_id != host_id
+        || record.generation == 0
+        || record.updated_at == 0
+    {
+        return None;
+    }
+    Some(record.generation)
 }
 
 async fn connect_legacy(
@@ -1162,5 +1302,58 @@ mod tests {
         let response = dispatch_response(&request).await;
         assert_eq!(response["id"], "request-1");
         assert_eq!(response["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn host_agent_connection_record_round_trips_and_is_removed_on_drop() {
+        let state = tempfile::tempdir().unwrap();
+        let host_id = format!("record-{}", Uuid::new_v4().simple());
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+
+        let record = HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 7).unwrap();
+        assert_eq!(
+            read_host_agent_generation_in(state.path(), &host_id),
+            Some(7)
+        );
+        let path = host_agent_record_path_in(state.path(), &host_id).unwrap();
+        assert!(path.is_file());
+
+        drop(record);
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_agent_connection_record_read_rejects_public_mode_and_symlink() {
+        use std::os::unix::fs::symlink;
+
+        fn set_mode(path: &std::path::Path, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let host_id = format!("record-{}", Uuid::new_v4().simple());
+        let record = HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 3).unwrap();
+        let path = host_agent_record_path_in(state.path(), &host_id).unwrap();
+
+        set_mode(&path, 0o644);
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+
+        set_mode(&path, 0o600);
+        drop(record);
+
+        let target = path.with_extension("target");
+        std::fs::write(
+            &target,
+            b"{\"schema\":1,\"host_id\":\"other\",\"generation\":1,\"updated_at\":0}",
+        )
+        .unwrap();
+        set_mode(&target, 0o600);
+        symlink(&target, &path).unwrap();
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&target).unwrap();
     }
 }

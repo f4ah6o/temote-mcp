@@ -197,6 +197,17 @@ test("gateway identity comes only from deployment version metadata", () => {
   }
 });
 
+test("healthz exposes explicit gateway identity and readiness without credentials", async () => {
+  const response = await worker.fetch(new Request("https://gateway.example.test/healthz"), {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    status: "ok",
+    service: "temote-mcp-gateway",
+    readiness: "ready",
+    identity: "temote-mcp-gateway",
+  });
+});
+
 test("Access email allowlist is fail-closed and case-insensitive", () => {
   for (const configured of [undefined, null, "", "   ", ",,,", " , "]) {
     assert.equal(accessEmailAllowed(configured, "user@example.com"), false);
@@ -590,6 +601,34 @@ test("host-level reconnect fences the stale agent generation", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("host status is read-only and reports bounded registration metadata", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  }));
+
+  const response = await session.fetch(post("status", { host_id: "mac-main" }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    status: "registered",
+    host_id: "mac-main",
+    generation: 1,
+    lease: "active",
+    session_availability: "not_checked",
+  });
+  assert.equal((await session.fetch(post("status", { host_id: "mac-main" }))).status, 200);
+});
+
 test("registry upsert failure makes connect fail closed and leaves no active route", async () => {
   const storage = new MemoryStorage();
   const actions = [];
@@ -766,7 +805,12 @@ test("same session_id on two hosts is addressable explicitly and ambiguous when 
   };
   const hostStub = (routeName) => ({
     fetch: async (url, init) => {
-      if (new URL(url).pathname === "/status") return new Response(null, { status: 204 });
+      if (new URL(url).pathname === "/status") {
+        return new Response(JSON.stringify({ status: "registered" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
       const request = JSON.parse(init.body).request;
       if (request.params.name === "session_list") {
         return new Response(JSON.stringify({
@@ -835,7 +879,10 @@ test("unavailable federated host status fails unqualified ownership while explic
           const path = new URL(url).pathname;
           if (path === "/status") {
             if (name === "host:mac-main") throw new Error("transient status failure");
-            return new Response(null, { status: 204 });
+            return new Response(JSON.stringify({ status: "registered" }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
           }
           const request = JSON.parse(init.body).request;
           if (request.params.name === "session_list") {
@@ -902,7 +949,10 @@ test("unavailable legacy status blocks read and mutating unqualified routing wit
           const path = new URL(url).pathname;
           if (path === "/status") {
             if (name === "same") throw new Error("legacy status unavailable");
-            return new Response(null, { status: 204 });
+            return new Response(JSON.stringify({ status: "registered" }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
           }
           const request = JSON.parse(init.body).request;
           if (request.params.name === "session_list") {
@@ -1373,24 +1423,28 @@ test("session status reflects the current host lease", async () => {
     { storage },
     { GATEWAY_REGISTRY: noOpRegistry() },
   );
-  const connected = await session.fetch(post("connect", {
+  const connectedResponse = await session.fetch(post("connect", {
     session_id: "status-check",
     instance_id: "instance-status",
     platform: "macos",
   }));
-  assert.equal(connected.status, 200);
-  assert.equal(
-    (await session.fetch(new Request("https://session.internal/status"))).status,
-    204,
-  );
+  assert.equal(connectedResponse.status, 200);
+  const connected = await connectedResponse.json();
+  const activeStatus = await session.fetch(new Request("https://session.internal/status"));
+  assert.equal(activeStatus.status, 200);
+  assert.deepEqual(await activeStatus.json(), {
+    status: "registered",
+    generation: connected.generation,
+    lease: "active",
+    session_availability: "not_checked",
+  });
 
   const host = await storage.get("host");
   host.expires_at = Date.now() - 1;
   await storage.put("host", host);
-  assert.equal(
-    (await session.fetch(new Request("https://session.internal/status"))).status,
-    404,
-  );
+  const expiredStatus = await session.fetch(new Request("https://session.internal/status"));
+  assert.equal(expiredStatus.status, 404);
+  assert.deepEqual(await expiredStatus.json(), { status: "lease_expired" });
   assert.equal(await storage.get("host"), undefined);
 });
 

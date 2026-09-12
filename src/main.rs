@@ -4,6 +4,7 @@
 mod access;
 mod apply_patch;
 mod approvals;
+mod boot_identity;
 mod checkpoints;
 mod child_env;
 mod cli;
