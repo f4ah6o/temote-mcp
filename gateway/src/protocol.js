@@ -325,6 +325,26 @@ export const PUBLIC_TOOLS = [
     localAgentSchema(),
   ),
   tool(
+    "dev_tool_run",
+    "Run a structured developer tool operation",
+    "Run a validated Cargo or Vite+ operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. The caller selects a tool and operation, never an executable or raw host command.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        tool: { type: "string", enum: ["cargo", "vp"] },
+        operation: { type: "string", minLength: 1, maxLength: 64 },
+        args: {
+          type: "array",
+          items: { type: "string", maxLength: 8192 },
+          maxItems: 64,
+        },
+        cwd: { type: "string" },
+      },
+      ["session_id", "tool", "operation"],
+    ),
+  ),
+  tool(
     "get_image",
     "Read a local image",
     "Read a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image from the selected host.",

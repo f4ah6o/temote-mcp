@@ -1126,6 +1126,7 @@ mod tests {
         let first_info: Value = serde_json::from_str(tool_text(&first)).unwrap();
         assert_eq!(first_info["status"], "active");
         assert_eq!(first_info["yolo"], false);
+        assert_eq!(first_info["permission_mode"], "agent");
         assert_eq!(
             first_info["cwd"],
             std::fs::canonicalize(volume.join("repo-a"))
@@ -1162,6 +1163,7 @@ mod tests {
             call_public_tool(&runtime, "session_info", json!({"session_id": first_id})).await;
         let info: Value = serde_json::from_str(tool_text(&info)).unwrap();
         assert_eq!(info["yolo"], false);
+        assert_eq!(info["permission_mode"], "agent");
 
         let read = call_public_tool(
             &runtime,
@@ -1191,6 +1193,7 @@ mod tests {
         let restarted: Value = serde_json::from_str(tool_text(&restarted)).unwrap();
         assert_eq!(restarted["status"], "active");
         assert_eq!(restarted["yolo"], false);
+        assert_eq!(restarted["permission_mode"], "agent");
         let reread = call_public_tool(
             &runtime,
             "read_file",

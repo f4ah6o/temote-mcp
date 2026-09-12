@@ -31,6 +31,25 @@ pub(super) struct SandboxSpec {
 
 impl SandboxSpec {
     pub(super) fn command(cwd: &Path, writable_roots: &[PathBuf]) -> Result<Self> {
+        Self::scoped_command(cwd, writable_roots, false)
+    }
+
+    /// Developer-tool profile: workspace plus narrowly scoped tool
+    /// cache/state roots, top-level protected metadata masks, and an explicit
+    /// network capability selected by the dev-tool operation class.
+    pub(super) fn developer_tool(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        network_access: bool,
+    ) -> Result<Self> {
+        Self::scoped_command(cwd, writable_roots, network_access)
+    }
+
+    fn scoped_command(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        network_access: bool,
+    ) -> Result<Self> {
         let cwd = canonical_existing_root(cwd)?;
         let mut roots = Vec::with_capacity(writable_roots.len() + 3);
         roots.push(cwd.clone());
@@ -49,7 +68,7 @@ impl SandboxSpec {
             read_only_roots: Vec::new(),
             hidden_roots: Vec::new(),
             discovered_protected_metadata_paths: Vec::new(),
-            network_access: false,
+            network_access,
         })
     }
 

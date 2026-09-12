@@ -116,6 +116,7 @@ pub enum SessionCommand {
 pub enum SessionPermissionCommand {
     Status,
     Ask,
+    Agent,
     Yolo,
     Allow { path: PathBuf },
     Revoke { path: PathBuf },
@@ -431,6 +432,12 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
             .is_present()
         {
             SessionPermissionCommand::Ask
+        } else if noargs::cmd("agent")
+            .doc("Use the sandboxed, approval-free agent policy")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Agent
         } else if noargs::cmd("yolo")
             .doc("Explicitly use unrestricted local execution for this session")
             .take(args)
@@ -462,7 +469,7 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
         } else {
             return Err(noargs::Error::other(
                 args,
-                "permission command is not specified (expected status, ask, yolo, allow, or revoke)",
+                "permission command is not specified (expected status, ask, agent, yolo, allow, or revoke)",
             ));
         };
         return Ok(SessionCommand::Permission {
@@ -1027,6 +1034,15 @@ mod tests {
                     command: SessionPermissionCommand::Allow { path },
                 }
             } if session_id == "work" && path == std::path::Path::new("/tmp/example")
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "session", "permission", "work", "agent"]),
+            Command::Session {
+                command: SessionCommand::Permission {
+                    session_id,
+                    command: SessionPermissionCommand::Agent,
+                }
+            } if session_id == "work"
         ));
         assert!(matches!(
             command(&["temote-mcp", "session", "permission", "work", "yolo"]),

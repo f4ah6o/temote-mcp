@@ -53,7 +53,6 @@ impl PermissionMode {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ask => "ask",

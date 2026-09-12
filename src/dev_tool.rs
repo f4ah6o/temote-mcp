@@ -1,8 +1,12 @@
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+use crate::config;
+use serde_json::Value;
 
 pub const MAX_DEV_TOOL_OPERATION_BYTES: usize = 64;
 pub const MAX_DEV_TOOL_ARGUMENT_BYTES: usize = 8 * 1024;
@@ -188,10 +192,173 @@ pub fn classify(tool: DevTool, operation: &str) -> DevToolClassification {
     DevToolClassification::new(class, reason)
 }
 
+pub(crate) struct PreparedDevToolRun {
+    tool: DevTool,
+    class: DevToolClass,
+    operation: String,
+    cwd: PathBuf,
+    command: Vec<String>,
+    environment: HashMap<String, String>,
+    writable_roots: Vec<PathBuf>,
+}
+
+impl PreparedDevToolRun {
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub(crate) fn network_access(&self) -> bool {
+        self.class == DevToolClass::DependencyNetwork
+    }
+
+    pub(crate) fn activity_label(&self) -> String {
+        format!("{} {}", self.tool.as_str(), self.operation)
+    }
+
+    pub(crate) fn approval_detail(&self) -> String {
+        format!(
+            "tool: {}; operation: {}; argv: {:?}",
+            self.tool.as_str(),
+            self.operation,
+            self.command
+        )
+    }
+
+    pub(crate) fn revalidate(&self, session: &config::Session) -> Result<()> {
+        let cwd = crate::local_agent::resolve_cwd(session, Some(&self.cwd))?;
+        anyhow::ensure!(
+            cwd == self.cwd,
+            "developer-tool cwd changed since validation"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn prepare(args: &Value, session: &config::Session) -> Result<PreparedDevToolRun> {
+    prepare_with_executable(args, session, None)
+}
+
+pub(crate) fn prepare_with_executable(
+    args: &Value,
+    session: &config::Session,
+    executable: Option<&Path>,
+) -> Result<PreparedDevToolRun> {
+    const KEYS: &[&str] = &["session_id", "tool", "operation", "args", "cwd"];
+    let object = args
+        .as_object()
+        .context("dev_tool_run arguments must be an object")?;
+    for key in object.keys() {
+        anyhow::ensure!(
+            KEYS.contains(&key.as_str()),
+            "unsupported dev_tool_run argument: {key}"
+        );
+    }
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("missing session_id")?;
+    anyhow::ensure!(session_id == session.id, "session ID mismatch");
+    let tool = DevTool::parse(
+        args.get("tool")
+            .and_then(Value::as_str)
+            .context("missing tool")?,
+    )?;
+    let operation = args
+        .get("operation")
+        .and_then(Value::as_str)
+        .context("missing operation")?;
+    let arguments = match args.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("dev_tool_run args entries must be strings")
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => anyhow::bail!("dev_tool_run args must be an array of strings"),
+    };
+    let cwd = match args.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(PathBuf::from(
+            value.as_str().context("cwd must be a string")?,
+        )),
+    };
+    let request = DevToolRequest::new(tool, operation, arguments, cwd)?;
+    let classification = request.classification();
+    anyhow::ensure!(
+        matches!(
+            classification.class,
+            DevToolClass::DevOffline | DevToolClass::DependencyNetwork
+        ),
+        "developer tool operation rejected: {}",
+        classification.reason
+    );
+    let cwd = crate::local_agent::resolve_cwd(session, request.cwd().map(PathBuf::as_path))?;
+    let writable_roots = tool_state_roots(tool);
+    let program = match executable {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => tool.executable_name().to_owned(),
+    };
+    let mut command = vec![program, request.operation().to_owned()];
+    command.extend(request.args().iter().cloned());
+    let environment = crate::local_agent::filtered_environment()?;
+    Ok(PreparedDevToolRun {
+        tool,
+        class: classification.class,
+        operation: request.operation().to_owned(),
+        cwd,
+        command,
+        environment,
+        writable_roots,
+    })
+}
+
+pub(crate) async fn run(prepared: PreparedDevToolRun) -> Result<crate::sandbox::Output> {
+    let scope = crate::sandbox::DeveloperToolScope {
+        writable_roots: &prepared.writable_roots,
+        network_access: prepared.class == DevToolClass::DependencyNetwork,
+    };
+    crate::sandbox::run_developer_tool(
+        &prepared.command,
+        &prepared.cwd,
+        scope,
+        None,
+        &prepared.environment,
+    )
+    .await
+}
+
+fn tool_state_roots(tool: DevTool) -> Vec<PathBuf> {
+    let Some(home) = crate::platform_paths::home_dir() else {
+        return Vec::new();
+    };
+    let candidates: &[&str] = match tool {
+        DevTool::Cargo => &[".cargo", ".rustup"],
+        DevTool::Vp => &[
+            ".vite-plus",
+            ".bun",
+            ".npm",
+            ".pnpm-store",
+            ".local/share/pnpm",
+            ".cache/vite-plus",
+            ".cache/pnpm",
+        ],
+    };
+    candidates
+        .iter()
+        .map(|relative| home.join(relative))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support;
+    use serde_json::json;
 
     #[test]
     fn cargo_operations_are_classified_by_table() {
@@ -374,5 +541,210 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    fn test_session(cwd: &Path) -> config::Session {
+        config::Session {
+            id: "dev-tool-test-session".to_owned(),
+            cwd: cwd.to_path_buf(),
+            permitted_directories: vec![cwd.to_path_buf()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        }
+    }
+
+    #[test]
+    fn prepare_builds_exact_argv_without_arbitrary_executables() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let fake = root.path().join("fake-cargo");
+        let session = test_session(&cwd);
+        let args = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check",
+            "args": ["--workspace", "--quiet"]
+        });
+        let prepared = prepare_with_executable(&args, &session, Some(&fake)).unwrap();
+        assert_eq!(
+            prepared.command,
+            vec![
+                fake.to_string_lossy().into_owned(),
+                "check".to_owned(),
+                "--workspace".to_owned(),
+                "--quiet".to_owned()
+            ]
+        );
+        assert_eq!(prepared.cwd, cwd);
+        assert!(prepared.approval_detail().contains("cargo"));
+        assert!(!prepared.approval_detail().contains("dev-tool-test-session"));
+    }
+
+    #[test]
+    fn prepare_selects_the_classified_network_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let session = test_session(&cwd);
+        let offline = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "vp",
+            "operation": "build"
+        });
+        let prepared = prepare(&offline, &session).unwrap();
+        assert_eq!(prepared.class, DevToolClass::DevOffline);
+        assert!(!prepared.network_access());
+        assert_eq!(prepared.command[0], "vp");
+
+        let network = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "fetch"
+        });
+        let prepared = prepare(&network, &session).unwrap();
+        assert_eq!(prepared.class, DevToolClass::DependencyNetwork);
+        assert!(prepared.network_access());
+    }
+
+    #[test]
+    fn prepare_rejects_dangerous_operations_and_unexpected_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let session = test_session(&cwd);
+
+        for (tool, operation) in [
+            ("vp", "run"),
+            ("vp", "exec"),
+            ("vp", "dlx"),
+            ("vp", "upgrade"),
+            ("vp", "implode"),
+            ("cargo", "run"),
+            ("cargo", "publish"),
+            ("cargo", "login"),
+            ("cargo", "bench"),
+        ] {
+            let args = json!({
+                "session_id": "dev-tool-test-session",
+                "tool": tool,
+                "operation": operation
+            });
+            assert!(
+                prepare(&args, &session).is_err(),
+                "{tool} {operation} must be rejected"
+            );
+        }
+
+        let executable_key = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check",
+            "executable": "/bin/sh"
+        });
+        assert!(prepare(&executable_key, &session).is_err());
+
+        let wrong_args_type = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check",
+            "args": "check --all"
+        });
+        assert!(prepare(&wrong_args_type, &session).is_err());
+
+        let oversized = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check",
+            "args": ["x".repeat(MAX_DEV_TOOL_ARGUMENT_BYTES + 1)]
+        });
+        assert!(prepare(&oversized, &session).is_err());
+
+        let unknown_tool = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "make",
+            "operation": "check"
+        });
+        assert!(prepare(&unknown_tool, &session).is_err());
+    }
+
+    #[test]
+    fn prepare_rejects_cwd_outside_permitted_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let session = test_session(&cwd);
+        let args = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check",
+            "cwd": outside.path().to_string_lossy()
+        });
+        assert!(prepare(&args, &session).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn run_executes_in_the_bounded_sandbox_and_denies_outside_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let fake = root.path().join("fake-cargo");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf 'argv=%s\\n' \"$*\"\ntouch \"$HOME/dev-tool-outside-marker\" 2>/dev/null || true\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = test_session(&cwd);
+        let args = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "test",
+            "args": ["--lib"]
+        });
+        let prepared = prepare_with_executable(&args, &session, Some(&fake)).unwrap();
+        let output = run(prepared).await.unwrap();
+        assert_eq!(output.status, 0, "stderr: {}", output.stderr);
+        assert!(output.stdout.contains("argv=test --lib"));
+        assert!(
+            !crate::platform_paths::home_dir()
+                .unwrap()
+                .join("dev-tool-outside-marker")
+                .exists()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[ignore = "live acceptance: requires a real cargo installation"]
+    #[tokio::test]
+    async fn live_cargo_check_in_the_developer_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"temote-dev-tool-smoke\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub fn ok() -> bool { true }\n",
+        )
+        .unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let session = test_session(&cwd);
+        let args = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check"
+        });
+        let prepared = prepare(&args, &session).unwrap();
+        let output = run(prepared).await.unwrap();
+        assert_eq!(output.status, 0, "stderr: {}", output.stderr);
+        assert!(
+            output.stderr.contains("Checking") || output.stdout.contains("Checking"),
+            "cargo did not actually run: stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
     }
 }

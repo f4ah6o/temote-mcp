@@ -491,6 +491,87 @@ pub(crate) fn ensure_approval_detail_fits(detail: &str) -> Result<()> {
     Ok(())
 }
 
+/// Explicit operation classes for the Temote-local approval layer. A class
+/// describes which authorization invariant a tool operation belongs to; mode
+/// policy is applied centrally by [`local_approval`] instead of handlers
+/// special-casing individual permission modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalClass {
+    /// Host/network Git operations through the structured Git tools.
+    GitNetwork,
+    /// Structured Codex/OpenCode delegation through `local_agent_run`.
+    LocalAgent,
+    /// Structured Cargo/Vite+ operations through `dev_tool_run`.
+    DeveloperTool,
+    /// Structured integrations with their own authentication boundary
+    /// (1Password, kintone).
+    Integration,
+    /// Session-local structured state changes (checkpoints, patches, recall).
+    LocalStructured,
+    /// Experimental Codex app-server task operations.
+    CodexAppServer,
+    /// Local-only escape hatches that leave the Temote sandbox
+    /// (`without_sandbox`).
+    HostUnrestricted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalApproval {
+    /// The operation is valid under the current permission mode and needs no
+    /// local approval console.
+    Skip,
+    /// Request a normal local approval; yolo sessions auto-allow this class.
+    Request,
+    /// Request a user approval that yolo does not auto-allow.
+    RequestUser,
+}
+
+/// Central permission-mode policy for the Temote-local approval layer.
+///
+/// `Ask` keeps the existing approval behavior. `Agent` is sandboxed and
+/// approval-free for otherwise-valid structured operations; it never widens
+/// the operation's own validation or capability checks. `Yolo` keeps its
+/// existing local-only behavior.
+pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass) -> LocalApproval {
+    use ApprovalClass::*;
+    use LocalApproval::*;
+    match class {
+        LocalAgent => match mode {
+            config::PermissionMode::Agent => Skip,
+            _ => RequestUser,
+        },
+        GitNetwork | DeveloperTool | Integration | LocalStructured => match mode {
+            config::PermissionMode::Ask => Request,
+            _ => Skip,
+        },
+        CodexAppServer | HostUnrestricted => match mode {
+            config::PermissionMode::Yolo => Skip,
+            _ => Request,
+        },
+    }
+}
+
+/// Apply the centralized permission-mode policy, then request approval when
+/// the policy requires it. Returns `true` when the operation may proceed.
+pub(crate) async fn ensure_local_approval(
+    session: &Session,
+    class: ApprovalClass,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+) -> Result<bool> {
+    match local_approval(session.permission_mode, class) {
+        LocalApproval::Skip => Ok(true),
+        LocalApproval::Request => {
+            request_with_metadata(&session.id, operation, detail, cwd, metadata).await
+        }
+        LocalApproval::RequestUser => {
+            request_user_approval_for_instance(session, operation, detail, cwd, metadata).await
+        }
+    }
+}
+
 pub async fn request(
     session_id: &str,
     operation: &str,
@@ -3800,5 +3881,71 @@ esac
             );
             Ok(())
         })
+    }
+
+    #[test]
+    fn local_approval_policy_matrix_is_explicit() {
+        use ApprovalClass::*;
+        use LocalApproval::*;
+        use config::PermissionMode::{Agent, Ask, Yolo};
+
+        for class in [GitNetwork, DeveloperTool, Integration, LocalStructured] {
+            assert_eq!(local_approval(Ask, class), Request, "{class:?}");
+            assert_eq!(local_approval(Agent, class), Skip, "{class:?}");
+            assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");
+        }
+        assert_eq!(local_approval(Ask, LocalAgent), RequestUser);
+        assert_eq!(local_approval(Agent, LocalAgent), Skip);
+        assert_eq!(local_approval(Yolo, LocalAgent), RequestUser);
+        for class in [CodexAppServer, HostUnrestricted] {
+            assert_eq!(local_approval(Ask, class), Request, "{class:?}");
+            assert_eq!(local_approval(Agent, class), Request, "{class:?}");
+            assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_structured_operations_skip_the_local_console_and_ask_fails_closed() {
+        let cwd = tempfile::tempdir().unwrap();
+        let agent_session = config::Session {
+            id: format!("agent-no-console-{}", uuid::Uuid::new_v4()),
+            cwd: cwd.path().to_owned(),
+            permitted_directories: vec![cwd.path().to_owned()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let approved = ensure_local_approval(
+            &agent_session,
+            ApprovalClass::GitNetwork,
+            "git_fetch",
+            "argv: test".to_owned(),
+            cwd.path().to_owned(),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            approved,
+            "agent mode must not require a local approval console"
+        );
+
+        let ask_session = config::Session {
+            permission_mode: config::PermissionMode::Ask,
+            ..agent_session
+        };
+        assert!(
+            ensure_local_approval(
+                &ask_session,
+                ApprovalClass::GitNetwork,
+                "git_fetch",
+                "argv: test".to_owned(),
+                cwd.path().to_owned(),
+                BTreeMap::new(),
+            )
+            .await
+            .is_err(),
+            "ask mode must still fail closed without a running approval console"
+        );
     }
 }

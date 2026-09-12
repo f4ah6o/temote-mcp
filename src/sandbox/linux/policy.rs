@@ -59,6 +59,29 @@ impl LinuxSandboxPolicy {
         writable_roots: &[PathBuf],
         git_metadata_roots: &[PathBuf],
     ) -> Result<Self> {
+        Self::for_scoped_command(cwd, writable_roots, git_metadata_roots)
+    }
+
+    /// Developer-tool profile: the same workspace/state containment as
+    /// `command`, with the operation class selecting whether outbound network
+    /// is enabled (`dependency-network`) or denied (`dev-offline`).
+    pub fn for_developer_tool(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        network_access: bool,
+    ) -> Result<Self> {
+        let mut policy = Self::for_scoped_command(cwd, writable_roots, &[])?;
+        if network_access {
+            policy.network = LinuxNetworkPolicy::LocalAgent;
+        }
+        Ok(policy)
+    }
+
+    fn for_scoped_command(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        git_metadata_roots: &[PathBuf],
+    ) -> Result<Self> {
         let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
         let mut writable = vec![cwd.clone()];
         writable.extend(

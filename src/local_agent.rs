@@ -756,7 +756,7 @@ fn validate_text_argument(value: &str, name: &str, maximum: usize) -> Result<()>
     Ok(())
 }
 
-fn resolve_cwd(session: &config::Session, path: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn resolve_cwd(session: &config::Session, path: Option<&Path>) -> Result<PathBuf> {
     let candidate = path
         .map(|path| {
             if path.is_absolute() {
@@ -846,7 +846,7 @@ fn is_protected_metadata_location(path: &Path) -> bool {
     })
 }
 
-fn filtered_environment() -> Result<HashMap<String, String>> {
+pub(crate) fn filtered_environment() -> Result<HashMap<String, String>> {
     let captured = approvals::CapturedStartEnvironment::capture();
     captured.validate()?;
     filtered_environment_values(captured.values())

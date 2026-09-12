@@ -242,6 +242,15 @@ pub struct LocalAgentScope<'a> {
     pub hidden_roots: &'a [PathBuf],
 }
 
+/// Filesystem/network scope for the structured developer-tool broker
+/// (Cargo / Vite+). Writes stay limited to the caller-selected workspace
+/// (implicitly the cwd) plus narrowly scoped tool cache/state roots; the
+/// operation class decides whether outbound network is enabled.
+pub struct DeveloperToolScope<'a> {
+    pub writable_roots: &'a [PathBuf],
+    pub network_access: bool,
+}
+
 pub async fn run(
     command: &[String],
     cwd: &Path,
@@ -323,6 +332,60 @@ pub async fn run_local_agent(
     let child = process
         .spawn()
         .context("failed to start bounded local-agent command")?;
+    wait_with_limited_output(child, stdin).await
+}
+
+/// Runs the structured developer-tool profile for Cargo / Vite+ operations.
+///
+/// Writes are limited to the canonical cwd plus the caller-provided tool
+/// cache/state roots; top-level protected metadata stays read-only. The
+/// operation class decides whether outbound network is enabled. This is a
+/// fixed profile; callers cannot select an arbitrary sandbox escape.
+pub async fn run_developer_tool(
+    command: &[String],
+    cwd: &Path,
+    scope: DeveloperToolScope<'_>,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+) -> Result<Output> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve developer-tool cwd {}", cwd.display()))?;
+    validate_writable_scope(&cwd, scope.writable_roots)?;
+
+    #[cfg(target_os = "macos")]
+    let spec =
+        policy::SandboxSpec::developer_tool(&cwd, scope.writable_roots, scope.network_access)?;
+
+    #[cfg(target_os = "linux")]
+    let mut process =
+        linux::developer_tool_command(command, &cwd, scope.writable_roots, scope.network_access)?;
+
+    #[cfg(target_os = "macos")]
+    let mut process = macos::command(&spec, command)?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut process = {
+        anyhow::bail!(
+            "bounded developer-tool execution is currently implemented for Linux and macOS only"
+        )
+    };
+
+    process
+        .kill_on_drop(true)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(environment)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process
+        .spawn()
+        .context("failed to start bounded developer-tool command")?;
     wait_with_limited_output(child, stdin).await
 }
 

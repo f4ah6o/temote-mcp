@@ -305,11 +305,13 @@ pub async fn call_tool(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !read_only
-        && !approvals::request(
-            &session.id,
+        && !approvals::ensure_local_approval(
+            session,
+            approvals::ApprovalClass::Integration,
             "onepassword_mcp_call",
             safe_call_summary(tool_name, &arguments),
             session.cwd.clone(),
+            Default::default(),
         )
         .await?
     {

@@ -103,11 +103,15 @@ pub(crate) async fn apply(
     let parsed = parse_patch(&request.patch)?;
     let prepared = preflight(session, &parsed)?;
     let detail = approval_detail(&prepared);
-    let approved = if session.yolo() {
-        true
-    } else {
-        approvals::request(&session.id, "apply_patch", detail, session.cwd.clone()).await?
-    };
+    let approved = approvals::ensure_local_approval(
+        session,
+        approvals::ApprovalClass::LocalStructured,
+        "apply_patch",
+        detail,
+        session.cwd.clone(),
+        Default::default(),
+    )
+    .await?;
     let outcome = apply_prepared_after_approval(session, prepared, approved).await?;
     if outcome.status == "partial_failure" {
         friction::record_observed(

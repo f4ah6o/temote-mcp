@@ -25,6 +25,21 @@ pub fn command(
     Ok(process)
 }
 
+pub fn developer_tool_command(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    network_access: bool,
+) -> Result<Command> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let policy = LinuxSandboxPolicy::for_developer_tool(cwd, writable_roots, network_access)?;
+    let executable = helper_executable()?;
+    let args = helper::command_args(&policy, command)?;
+    let mut process = Command::new(executable);
+    process.args(args);
+    Ok(process)
+}
+
 pub fn local_agent_command(
     command: &[String],
     cwd: &Path,

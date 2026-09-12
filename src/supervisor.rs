@@ -219,8 +219,30 @@ impl SessionSupervisor {
         session_id: Option<&str>,
         environment: approvals::CapturedStartEnvironment,
     ) -> Result<ManagedSessionInfo> {
-        self.start_named_with_environment(logical_path, session_id, environment, false)
-            .await
+        self.start_with_mode_with_environment(
+            logical_path,
+            session_id,
+            config::PermissionMode::Agent,
+            environment,
+        )
+        .await
+    }
+
+    pub async fn start_with_mode_with_environment(
+        &self,
+        logical_path: &str,
+        session_id: Option<&str>,
+        permission_mode: config::PermissionMode,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<ManagedSessionInfo> {
+        self.start_named_with_environment(
+            logical_path,
+            session_id,
+            permission_mode,
+            environment,
+            false,
+        )
+        .await
     }
 
     pub async fn start_public_with_environment(
@@ -229,14 +251,37 @@ impl SessionSupervisor {
         session_id: Option<&str>,
         environment: approvals::CapturedStartEnvironment,
     ) -> Result<ManagedSessionInfo> {
-        self.start_named_with_environment(logical_path, session_id, environment, true)
-            .await
+        self.start_public_with_mode_with_environment(
+            logical_path,
+            session_id,
+            config::PermissionMode::Agent,
+            environment,
+        )
+        .await
+    }
+
+    pub async fn start_public_with_mode_with_environment(
+        &self,
+        logical_path: &str,
+        session_id: Option<&str>,
+        permission_mode: config::PermissionMode,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<ManagedSessionInfo> {
+        self.start_named_with_environment(
+            logical_path,
+            session_id,
+            permission_mode,
+            environment,
+            true,
+        )
+        .await
     }
 
     async fn start_named_with_environment(
         &self,
         logical_path: &str,
         session_id: Option<&str>,
+        permission_mode: config::PermissionMode,
         environment: approvals::CapturedStartEnvironment,
         public: bool,
     ) -> Result<ManagedSessionInfo> {
@@ -253,7 +298,7 @@ impl SessionSupervisor {
             .start_resolved(
                 cwd,
                 id.clone(),
-                config::PermissionMode::Ask,
+                permission_mode,
                 Some(logical_path.to_owned()),
                 environment,
                 public,
@@ -269,20 +314,29 @@ impl SessionSupervisor {
         yolo: bool,
         environment: approvals::CapturedStartEnvironment,
     ) -> Result<ManagedSessionInfo> {
+        let permission_mode = if yolo {
+            config::PermissionMode::Yolo
+        } else {
+            config::PermissionMode::Agent
+        };
+        self.start_local_with_mode_with_environment(cwd, session_id, permission_mode, environment)
+            .await
+    }
+
+    pub async fn start_local_with_mode_with_environment(
+        &self,
+        cwd: &std::path::Path,
+        session_id: Option<&str>,
+        permission_mode: config::PermissionMode,
+        environment: approvals::CapturedStartEnvironment,
+    ) -> Result<ManagedSessionInfo> {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         let cwd = config::canonical_directory(cwd)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(
-            cwd,
-            id,
-            config::PermissionMode::from_legacy_yolo(yolo),
-            None,
-            environment,
-            false,
-        )
-        .await
+        self.start_resolved(cwd, id, permission_mode, None, environment, false)
+            .await
     }
 
     async fn start_resolved(
@@ -1207,8 +1261,9 @@ mod tests {
             .unwrap();
         assert_eq!(first.status, "active");
         assert_eq!(second.status, "active");
-        assert_eq!(first.permission_mode, config::PermissionMode::Ask);
-        assert_eq!(second.permission_mode, config::PermissionMode::Ask);
+        assert_eq!(first.permission_mode, config::PermissionMode::Agent);
+        assert_eq!(second.permission_mode, config::PermissionMode::Agent);
+        assert!(!first.yolo && !second.yolo);
         assert!(config::session_is_active(&first_id).await.unwrap());
         assert!(config::session_is_active(&second_id).await.unwrap());
 
@@ -1240,6 +1295,82 @@ mod tests {
         );
         cleanup_session(&first_id).await;
         cleanup_session(&second_id).await;
+    }
+
+    #[tokio::test]
+    async fn new_session_defaults_and_explicit_modes_are_stable() {
+        let (temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let default_id = format!("mode-default-{}", uuid::Uuid::new_v4());
+        let public_id = format!("mode-public-{}", uuid::Uuid::new_v4());
+        let ask_id = format!("mode-ask-{}", uuid::Uuid::new_v4());
+        let local_id = format!("mode-local-{}", uuid::Uuid::new_v4());
+        let yolo_id = format!("mode-yolo-{}", uuid::Uuid::new_v4());
+        let cwd = temp.path().join("volume/repo-a");
+
+        let default = supervisor
+            .start("src/repo-a", Some(&default_id))
+            .await
+            .unwrap();
+        assert_eq!(default.permission_mode, config::PermissionMode::Agent);
+        assert!(!default.yolo);
+
+        let public = supervisor
+            .start_public_with_environment(
+                "src/repo-a",
+                Some(&public_id),
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.permission_mode, config::PermissionMode::Agent);
+        assert!(!public.yolo);
+
+        let ask = supervisor
+            .start_with_mode_with_environment(
+                "src/repo-a",
+                Some(&ask_id),
+                config::PermissionMode::Ask,
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask.permission_mode, config::PermissionMode::Ask);
+
+        let local = supervisor
+            .start_local_with_environment(
+                &cwd,
+                Some(&local_id),
+                false,
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.permission_mode, config::PermissionMode::Agent);
+
+        let yolo = supervisor
+            .start_local_with_environment(
+                &cwd,
+                Some(&yolo_id),
+                true,
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(yolo.permission_mode, config::PermissionMode::Yolo);
+        assert!(yolo.yolo);
+
+        let stored = config::read_session_metadata(&default_id).await.unwrap();
+        assert_eq!(stored.permission_mode, config::PermissionMode::Agent);
+        let stored_local = config::read_session_metadata(&local_id).await.unwrap();
+        assert_eq!(stored_local.permission_mode, config::PermissionMode::Agent);
+        let stored_yolo = config::read_session_metadata(&yolo_id).await.unwrap();
+        assert_eq!(stored_yolo.permission_mode, config::PermissionMode::Yolo);
+
+        supervisor.shutdown().await.unwrap();
+        for id in [&default_id, &public_id, &ask_id, &local_id, &yolo_id] {
+            cleanup_session(id).await;
+        }
     }
 
     #[tokio::test]
@@ -1633,6 +1764,69 @@ mod tests {
         assert_eq!(stopped.restart_count, 1);
         assert!(stopped.next_restart_at.is_none());
         assert!(!config::session_is_active(&id).await.unwrap());
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_preserves_agent_permission_mode() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("auto-restart-agent-{}", uuid::Uuid::new_v4());
+        supervisor
+            .start_with_mode_with_environment(
+                "src/repo-a",
+                Some(&id),
+                config::PermissionMode::Agent,
+                approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .set_restart_policy(&id, "on-failure")
+            .await
+            .unwrap();
+        supervisor.crash_for_test(&id).await.unwrap();
+        let mut scheduled = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                supervisor.reap_finished().await;
+                let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+                if lifecycle.status == config::LifecycleStatus::Crashed
+                    && lifecycle.restart_count == 1
+                    && lifecycle.next_restart_at.is_some()
+                {
+                    break lifecycle;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("crashed agent session did not schedule an automatic restart");
+        scheduled.next_restart_at = Some(config::unix_time());
+        config::save_session_lifecycle(&id, &scheduled)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                supervisor.reap_finished().await;
+                let lifecycle = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+                if lifecycle.status == config::LifecycleStatus::Active
+                    && lifecycle.restart_count == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("scheduled agent restart did not become active");
+        assert_eq!(
+            config::read_session_metadata(&id)
+                .await
+                .unwrap()
+                .permission_mode,
+            config::PermissionMode::Agent
+        );
         supervisor.shutdown().await.unwrap();
         cleanup_session(&id).await;
     }

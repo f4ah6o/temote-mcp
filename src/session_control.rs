@@ -463,17 +463,18 @@ pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> 
 pub async fn list() -> Result<()> {
     let result = request(ControlRequest::List).await?;
     let sessions: Vec<SessionView> = serde_json::from_value(result)?;
-    println!("SESSION\tSTATUS\tPID\tCWD");
+    println!("SESSION\tSTATUS\tPID\tPERMISSION\tCWD");
     for session in sessions {
         let pid = session
             .pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_owned());
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             session.session_id,
             session.status,
             pid,
+            session.permission_mode.as_str(),
             session.cwd.display()
         );
     }
@@ -525,6 +526,11 @@ pub async fn permission(
         crate::cli::SessionPermissionCommand::Ask => ControlRequest::PermissionMode {
             session_id,
             permission_mode: Some(config::PermissionMode::Ask),
+            yolo: false,
+        },
+        crate::cli::SessionPermissionCommand::Agent => ControlRequest::PermissionMode {
+            session_id,
+            permission_mode: Some(config::PermissionMode::Agent),
             yolo: false,
         },
         crate::cli::SessionPermissionCommand::Yolo => ControlRequest::PermissionMode {
@@ -1514,7 +1520,12 @@ async fn restart_session(
             .context("public managed session has no named-root path")?;
         supervisor.stop_public(session_id).await?;
         supervisor
-            .start_public_with_environment(path, Some(session_id), environment)
+            .start_public_with_mode_with_environment(
+                path,
+                Some(session_id),
+                session.permission_mode,
+                environment,
+            )
             .await?;
     } else {
         crate::codex_app_server::begin_session_shutdown(&session);
@@ -1528,14 +1539,19 @@ async fn restart_session(
             .and_then(|state| state.logical_path.as_deref())
         {
             supervisor
-                .start_with_environment(path, Some(session_id), environment)
+                .start_with_mode_with_environment(
+                    path,
+                    Some(session_id),
+                    session.permission_mode,
+                    environment,
+                )
                 .await?;
         } else {
             supervisor
-                .start_local_with_environment(
+                .start_local_with_mode_with_environment(
                     &session.cwd,
                     Some(session_id),
-                    session.yolo(),
+                    session.permission_mode,
                     environment,
                 )
                 .await?;
@@ -2706,6 +2722,71 @@ mod tests {
 
         supervisor.shutdown().await.unwrap();
         cleanup(&id).await;
+    }
+
+    #[tokio::test]
+    async fn manual_restart_preserves_agent_and_ask_permission_modes() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let agent_id = format!("restart-agent-{}", uuid::Uuid::new_v4());
+        let ask_id = format!("restart-ask-{}", uuid::Uuid::new_v4());
+
+        supervisor
+            .start_with_mode_with_environment(
+                "src/repo",
+                Some(&agent_id),
+                config::PermissionMode::Agent,
+                CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .start_with_mode_with_environment(
+                "src/repo",
+                Some(&ask_id),
+                config::PermissionMode::Ask,
+                CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+
+        restart_session(
+            &supervisor,
+            &agent_id,
+            CapturedStartEnvironment::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        restart_session(
+            &supervisor,
+            &ask_id,
+            CapturedStartEnvironment::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            config::read_session_metadata(&agent_id)
+                .await
+                .unwrap()
+                .permission_mode,
+            config::PermissionMode::Agent,
+            "manual restart must not downgrade agent to ask"
+        );
+        assert_eq!(
+            config::read_session_metadata(&ask_id)
+                .await
+                .unwrap()
+                .permission_mode,
+            config::PermissionMode::Ask,
+            "manual restart must not migrate an explicit ask session"
+        );
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&agent_id).await;
+        cleanup(&ask_id).await;
     }
 
     #[tokio::test]
