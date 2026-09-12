@@ -35,6 +35,17 @@ pub enum LinuxNetworkPolicy {
     LocalAgent,
 }
 
+/// A verified intermediate launcher symlink that the helper recreates inside
+/// the sandbox. `link` is the lexical path that must exist and `target` is its
+/// already validated canonical destination; both are re-validated by the helper
+/// before bubblewrap arguments are constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxReadOnlySymlink {
+    pub link: PathBuf,
+    pub target: PathBuf,
+}
+
 /// Minimal Temote-specific policy passed across the helper process boundary.
 ///
 /// This is deliberately not a compatibility representation of Codex's
@@ -49,6 +60,7 @@ pub struct LinuxSandboxPolicy {
     pub temporary_roots: Vec<PathBuf>,
     pub read_only_paths: Vec<PathBuf>,
     pub read_only_roots: Vec<PathBuf>,
+    pub read_only_symlinks: Vec<LinuxReadOnlySymlink>,
     pub hidden_roots: Vec<PathBuf>,
     pub network: LinuxNetworkPolicy,
 }
@@ -145,6 +157,7 @@ impl LinuxSandboxPolicy {
             temporary_roots,
             read_only_paths,
             read_only_roots: Vec::new(),
+            read_only_symlinks: Vec::new(),
             hidden_roots: Vec::new(),
             network: LinuxNetworkPolicy::Restricted,
         };
@@ -158,6 +171,7 @@ impl LinuxSandboxPolicy {
         temporary_roots: &[PathBuf],
         read_only_paths: &[PathBuf],
         read_only_roots: &[PathBuf],
+        read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
         hidden_roots: &[PathBuf],
     ) -> Result<Self> {
         let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
@@ -195,6 +209,15 @@ impl LinuxSandboxPolicy {
             .map(|path| canonical_existing_directory(path, "hidden root"))
             .collect::<Result<Vec<_>>>()?;
         normalize_paths(&mut hidden);
+        let mut read_only_symlinks = read_only_symlinks
+            .iter()
+            .map(|symlink| LinuxReadOnlySymlink {
+                link: symlink.link.clone(),
+                target: symlink.target.clone(),
+            })
+            .collect::<Vec<_>>();
+        read_only_symlinks.sort_by_key(|symlink| symlink.link.clone());
+        read_only_symlinks.dedup();
 
         let policy = Self {
             version: 1,
@@ -203,6 +226,7 @@ impl LinuxSandboxPolicy {
             temporary_roots: temporary,
             read_only_paths: read_only,
             read_only_roots: visible_roots,
+            read_only_symlinks,
             hidden_roots: hidden,
             network: LinuxNetworkPolicy::LocalAgent,
         };
@@ -230,6 +254,10 @@ impl LinuxSandboxPolicy {
         anyhow::ensure!(
             self.read_only_roots.len() <= MAX_ROOTS,
             "too many read-only roots"
+        );
+        anyhow::ensure!(
+            self.read_only_symlinks.len() <= MAX_ROOTS,
+            "too many read-only symlinks"
         );
         anyhow::ensure!(
             self.hidden_roots.len() <= MAX_ROOTS,
@@ -289,6 +317,42 @@ impl LinuxSandboxPolicy {
                 path.display()
             );
             validate_no_symlink_components(path)?;
+        }
+
+        for symlink in &self.read_only_symlinks {
+            validate_absolute_clean_path(&symlink.link, "read-only symlink link")?;
+            validate_absolute_clean_path(&symlink.target, "read-only symlink target")?;
+            anyhow::ensure!(
+                symlink.target != Path::new("/"),
+                "read-only symlink target cannot be the filesystem root: {}",
+                symlink.link.display()
+            );
+            anyhow::ensure!(
+                !self
+                    .writable_roots
+                    .iter()
+                    .chain(self.temporary_roots.iter())
+                    .chain(self.read_only_roots.iter())
+                    .any(|root| symlink.link.starts_with(root)),
+                "read-only symlink is inside a visible root: {}",
+                symlink.link.display()
+            );
+            anyhow::ensure!(
+                symlink.link.parent().is_some_and(|parent| parent.is_dir()),
+                "read-only symlink parent is not a directory: {}",
+                symlink.link.display()
+            );
+            let canonical = std::fs::canonicalize(&symlink.link).with_context(|| {
+                format!(
+                    "cannot resolve read-only symlink {}",
+                    symlink.link.display()
+                )
+            })?;
+            anyhow::ensure!(
+                canonical == symlink.target,
+                "read-only symlink target changed: {}",
+                symlink.link.display()
+            );
         }
 
         Ok(())
@@ -471,6 +535,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
 
@@ -494,6 +559,7 @@ mod tests {
         let policy = LinuxSandboxPolicy::for_local_agent(
             &workspace,
             std::slice::from_ref(&workspace),
+            &[],
             &[],
             &[],
             &[],

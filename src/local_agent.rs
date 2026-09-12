@@ -31,6 +31,7 @@ const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_IMPORTED_AUTH_BYTES: u64 = 1024 * 1024;
 const MAX_LAUNCHER_SYMLINK_HOPS: usize = 16;
+const MAX_LAUNCHER_PATH_STEPS: usize = 256;
 const MAX_PACKAGE_INSTALL_ENTRIES: usize = 64;
 const MAX_PACKAGE_METADATA_BYTES: u64 = 1024 * 1024;
 const AGENT_STATE_DIRECTORY_PREFIX: &str = "temote-mcp-local-agent-";
@@ -412,6 +413,7 @@ pub(crate) struct PreparedRun {
     command: Vec<String>,
     executable_target: PathBuf,
     dependency_roots: Vec<PathBuf>,
+    dependency_symlinks: Vec<sandbox::LocalAgentSymlink>,
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
     task: String,
@@ -498,6 +500,10 @@ impl PreparedRun {
         anyhow::ensure!(
             executable.dependency_roots == self.dependency_roots,
             "local agent launcher dependencies changed while approval was pending"
+        );
+        anyhow::ensure!(
+            executable.symlinks == self.dependency_symlinks,
+            "local agent launcher symlinks changed while approval was pending"
         );
         let current_roots = canonical_session_roots(session)?;
         anyhow::ensure!(
@@ -641,6 +647,7 @@ where
         command,
         executable_target,
         dependency_roots: executable.dependency_roots,
+        dependency_symlinks: executable.symlinks,
         environment,
         session_roots: canonical_session_roots(session)?,
         task: task.to_owned(),
@@ -677,6 +684,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
             temporary_roots: &temporary_roots,
             read_only_paths: prepared.state.read_only_paths(),
             read_only_roots: &read_only_roots,
+            read_only_symlinks: &prepared.dependency_symlinks,
             hidden_roots: prepared.state.hidden_roots(),
         },
         stdin,
@@ -910,12 +918,14 @@ struct ResolvedExecutable {
     runtime: PathBuf,
     canonical: PathBuf,
     dependency_roots: Vec<PathBuf>,
+    symlinks: Vec<sandbox::LocalAgentSymlink>,
     environment: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
 struct LauncherDependencyClosure {
     dependency_roots: Vec<PathBuf>,
+    symlinks: Vec<sandbox::LocalAgentSymlink>,
     environment: Vec<(String, String)>,
 }
 
@@ -971,6 +981,7 @@ fn resolve_executable_details(
             runtime: candidate,
             canonical,
             dependency_roots: closure.dependency_roots,
+            symlinks: closure.symlinks,
             environment: closure.environment,
         });
     }
@@ -1036,6 +1047,7 @@ fn resolve_explicit_executable(
         runtime: executable.to_owned(),
         canonical,
         dependency_roots: closure.dependency_roots,
+        symlinks: closure.symlinks,
         environment: closure.environment,
     })
 }
@@ -1054,6 +1066,7 @@ fn launcher_dependency_closure(
     if !metadata.file_type().is_symlink() {
         return Ok(LauncherDependencyClosure {
             dependency_roots: Vec::new(),
+            symlinks: Vec::new(),
             environment: Vec::new(),
         });
     }
@@ -1104,24 +1117,28 @@ fn launcher_dependency_closure(
     let Some(bin) = runtime.parent() else {
         return Ok(LauncherDependencyClosure {
             dependency_roots: Vec::new(),
+            symlinks: Vec::new(),
             environment: Vec::new(),
         });
     };
     let Some(vite_home) = bin.parent() else {
         return Ok(LauncherDependencyClosure {
             dependency_roots: Vec::new(),
+            symlinks: Vec::new(),
             environment: Vec::new(),
         });
     };
     let Ok(canonical_home) = fs::canonicalize(vite_home) else {
         return Ok(LauncherDependencyClosure {
             dependency_roots: Vec::new(),
+            symlinks: Vec::new(),
             environment: Vec::new(),
         });
     };
     if !hop_parents.iter().any(|parent| parent == bin) || !canonical.starts_with(&canonical_home) {
         return Ok(LauncherDependencyClosure {
             dependency_roots: Vec::new(),
+            symlinks: Vec::new(),
             environment: Vec::new(),
         });
     }
@@ -1131,6 +1148,7 @@ fn launcher_dependency_closure(
     if !metadata_path.exists() && !package_root.exists() && !managed_runtime.exists() {
         return Ok(LauncherDependencyClosure {
             dependency_roots: Vec::new(),
+            symlinks: Vec::new(),
             environment: Vec::new(),
         });
     }
@@ -1255,13 +1273,143 @@ fn launcher_dependency_closure(
             root.display()
         );
     }
+    // Vite+ launchers resolve through a bounded `current` symlink that lives
+    // beside the exposed `bin` directory. Recreate only the intermediate
+    // symlinks that are not already carried by a dependency root, and only
+    // when their verified target stays inside VP_HOME.
+    let mut symlinks = launcher_symlink_chain(runtime)?;
+    symlinks.retain(|symlink| !roots.iter().any(|root| symlink.link.starts_with(root)));
+    for symlink in &symlinks {
+        anyhow::ensure!(
+            symlink.target.starts_with(&canonical_home),
+            "local agent launcher symlink resolves outside VP_HOME: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            !session_roots
+                .iter()
+                .any(|session| symlink.target == *session || symlink.target.starts_with(session)),
+            "local agent launcher symlink target is inside a permitted session root: {}",
+            symlink.target.display()
+        );
+    }
     Ok(LauncherDependencyClosure {
         dependency_roots: roots,
+        symlinks,
         environment: vec![(
             "VP_HOME".to_owned(),
             canonical_home.to_string_lossy().into_owned(),
         )],
     })
+}
+
+/// Collects the symlink hops needed to resolve a launcher to its verified
+/// target. Each hop records the canonical link path and its canonical target.
+///
+/// The walk starts below the canonicalized launcher directory so host-level
+/// symlinks such as `/var -> /private/var` are resolved once and never treated
+/// as part of the package-manager chain. Intermediate symlinks (for example
+/// Vite+ `current`) are still discovered and recorded.
+fn launcher_symlink_chain(runtime: &Path) -> Result<Vec<sandbox::LocalAgentSymlink>> {
+    let parent = runtime
+        .parent()
+        .context("local agent launcher has no parent")?;
+    let name = runtime
+        .file_name()
+        .context("local agent launcher has no file name")?;
+    let mut base = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "could not resolve local agent launcher directory {}",
+            parent.display()
+        )
+    })?;
+    let mut pending: Vec<std::ffi::OsString> = vec![name.to_owned()];
+    let mut symlinks = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut steps = 0usize;
+    while !pending.is_empty() {
+        steps += 1;
+        anyhow::ensure!(
+            steps <= MAX_LAUNCHER_PATH_STEPS,
+            "local agent launcher dependency traversal exceeds {MAX_LAUNCHER_PATH_STEPS} steps"
+        );
+        let component = pending.remove(0);
+        match component.to_str() {
+            Some(".") => continue,
+            Some("..") => {
+                base = base
+                    .parent()
+                    .context("local agent launcher symlink escapes its root")?
+                    .to_owned();
+                continue;
+            }
+            _ => {}
+        }
+        let candidate = base.join(&component);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not inspect local agent launcher path {}",
+                        candidate.display()
+                    )
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::ensure!(
+                symlinks.len() < MAX_LAUNCHER_SYMLINK_HOPS,
+                "local agent launcher dependency chain exceeds {} symlink hops",
+                MAX_LAUNCHER_SYMLINK_HOPS
+            );
+            if !seen.insert(candidate.clone()) {
+                anyhow::bail!(
+                    "local agent launcher dependency cycle at {}",
+                    candidate.display()
+                );
+            }
+            let raw_target = fs::read_link(&candidate).with_context(|| {
+                format!(
+                    "could not read local agent launcher symlink {}",
+                    candidate.display()
+                )
+            })?;
+            let canonical_target = fs::canonicalize(&candidate).with_context(|| {
+                format!(
+                    "could not resolve local agent launcher symlink {}",
+                    candidate.display()
+                )
+            })?;
+            symlinks.push(sandbox::LocalAgentSymlink {
+                link: candidate,
+                target: canonical_target,
+            });
+            if raw_target.is_absolute() {
+                base = PathBuf::from("/");
+            }
+            let mut inserted = Vec::new();
+            for component in raw_target.components() {
+                match component {
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir => {}
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        inserted.push(std::ffi::OsString::from(".."));
+                    }
+                    std::path::Component::Normal(name) => inserted.push(name.to_owned()),
+                }
+            }
+            inserted.append(&mut pending);
+            pending = inserted;
+            continue;
+        }
+        if !metadata.is_dir() {
+            break;
+        }
+        base = candidate;
+    }
+    Ok(symlinks)
 }
 
 #[cfg(unix)]
@@ -1659,6 +1807,7 @@ mod tests {
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "wc -c".to_owned()],
             executable_target: PathBuf::from("/bin/sh"),
             dependency_roots: Vec::new(),
+            dependency_symlinks: Vec::new(),
             environment: {
                 let mut environment = HashMap::new();
                 state.apply_to_environment(Agent::Codex, &mut environment);
@@ -1807,6 +1956,7 @@ mod tests {
             command: vec!["/usr/bin/codex".to_owned()],
             executable_target: PathBuf::from("/usr/bin/codex"),
             dependency_roots: Vec::new(),
+            dependency_symlinks: Vec::new(),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             session_roots: Vec::new(),
             task: String::new(),
@@ -2040,6 +2190,7 @@ mod tests {
             ]),
             executable_target: PathBuf::from("/usr/bin/head"),
             dependency_roots: Vec::new(),
+            dependency_symlinks: Vec::new(),
             session_roots: Vec::new(),
             task: String::new(),
             task_bytes: 0,
@@ -2126,6 +2277,7 @@ mod tests {
                 cwd: selected.canonicalize().unwrap(),
                 executable_target: executable.canonicalize().unwrap(),
                 dependency_roots: Vec::new(),
+                dependency_symlinks: Vec::new(),
                 environment,
                 session_roots: vec![
                     root_a.path().canonicalize().unwrap(),
@@ -2444,6 +2596,42 @@ mod tests {
         );
         assert!(roots.contains(&fs::canonicalize(fixture.home.join("js_runtime")).unwrap()));
         assert!(prepared.environment.contains_key("VP_HOME"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_shaped_launcher_exposes_only_the_verified_symlink_chain() {
+        let fixture = vite_plus_shaped_fixture();
+        let canonical_home = fs::canonicalize(&fixture.home).unwrap();
+        // Unrelated package-manager state exists before resolution and must
+        // never enter the symlink closure.
+        let unrelated = fixture.home.join("node_modules/unrelated");
+        fs::create_dir_all(&unrelated).unwrap();
+
+        let session = session(&fixture.workspace);
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &fixture.candidate)
+                .unwrap();
+
+        let expected = sandbox::LocalAgentSymlink {
+            link: canonical_home.join("current"),
+            target: fs::canonicalize(fixture.home.join("0.2.9")).unwrap(),
+        };
+        assert_eq!(prepared.dependency_symlinks, vec![expected]);
+        // The launcher symlink itself is already carried by the bound `bin`
+        // directory, so it must not be recreated separately.
+        assert!(
+            !prepared
+                .dependency_symlinks
+                .iter()
+                .any(|symlink| symlink.link == fixture.candidate)
+        );
+        let exposes_unrelated = prepared.dependency_symlinks.iter().any(|symlink| {
+            symlink
+                .link
+                .starts_with(canonical_home.join("node_modules"))
+        });
+        assert!(!exposes_unrelated);
     }
 
     #[tokio::test]

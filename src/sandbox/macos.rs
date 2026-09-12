@@ -80,6 +80,26 @@ fn build_read_policy(spec: &SandboxSpec) -> Result<(String, Vec<(String, PathBuf
         ));
     }
 
+    // Seatbelt matches some symlink lookups on the lexical link path rather
+    // than only the resolved target, so re-allow exactly the verified
+    // intermediate launcher symlinks below hidden roots by literal path.
+    for (index, link) in spec.read_only_symlinks().iter().enumerate() {
+        if !spec
+            .hidden_roots()
+            .iter()
+            .any(|hidden| link.starts_with(hidden))
+        {
+            continue;
+        }
+        ensure_utf8(link)?;
+        let key = format!("READ_ONLY_SYMLINK_{index}");
+        definitions.push((key.clone(), link.clone()));
+        clauses.push(format!("(allow file-read* (literal (param \"{key}\")))"));
+        clauses.push(format!(
+            "(allow file-read-metadata (path-ancestors (param \"{key}\")))"
+        ));
+    }
+
     Ok((clauses.join("\n"), definitions))
 }
 
@@ -224,6 +244,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let (policy, definitions) = build_write_policy(&spec).unwrap();
@@ -264,6 +285,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             std::slice::from_ref(&hidden),
         )
         .unwrap();
@@ -273,6 +295,45 @@ mod tests {
         assert!(definitions.iter().any(|(_, path)| path == &selected));
         assert!(policy.contains("(allow file-read-metadata (path-ancestors"));
         assert!(policy.contains("(allow file-read* (subpath"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generated_read_policy_allows_verified_symlink_literals_below_hidden_roots() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let hidden = fixture.path().join("hidden");
+        let home = hidden.join("home");
+        let version = home.join("0.2.9");
+        std::fs::create_dir_all(version.join("bin")).unwrap();
+        symlink(Path::new("0.2.9"), home.join("current")).unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let hidden = std::fs::canonicalize(hidden).unwrap();
+        let current = hidden.join("home/current");
+        let target = std::fs::canonicalize(version).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+
+        let spec = SandboxSpec::local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[crate::sandbox::LocalAgentSymlink {
+                link: current.clone(),
+                target,
+            }],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+        let (policy, definitions) = build_read_policy(&spec).unwrap();
+
+        assert!(definitions.iter().any(|(_, path)| path == &current));
+        assert!(policy.contains("(allow file-read* (literal (param \"READ_ONLY_SYMLINK_0\")))"));
+        assert!(policy.contains("READ_ONLY_SYMLINK_0"));
     }
 
     #[test]

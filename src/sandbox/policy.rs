@@ -24,6 +24,7 @@ pub(super) struct SandboxSpec {
     writable_roots: Vec<PathBuf>,
     read_only_overrides: Vec<PathBuf>,
     read_only_roots: Vec<PathBuf>,
+    read_only_symlinks: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     discovered_protected_metadata_paths: Vec<PathBuf>,
     network_access: bool,
@@ -66,6 +67,7 @@ impl SandboxSpec {
             writable_roots: roots,
             read_only_overrides: Vec::new(),
             read_only_roots: Vec::new(),
+            read_only_symlinks: Vec::new(),
             hidden_roots: Vec::new(),
             discovered_protected_metadata_paths: Vec::new(),
             network_access,
@@ -78,6 +80,7 @@ impl SandboxSpec {
         temporary_roots: &[PathBuf],
         read_only_paths: &[PathBuf],
         read_only_roots: &[PathBuf],
+        read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
         hidden_roots: &[PathBuf],
     ) -> Result<Self> {
         let _cwd = canonical_existing_root(cwd)?;
@@ -115,6 +118,33 @@ impl SandboxSpec {
             .map(|root| canonical_existing_root(root))
             .collect::<Result<Vec<_>>>()?;
         normalize_roots(&mut hidden);
+        let mut read_only_symlinks = read_only_symlinks
+            .iter()
+            .map(|symlink| symlink.link.clone())
+            .collect::<Vec<_>>();
+        normalize_paths(&mut read_only_symlinks);
+        for link in &read_only_symlinks {
+            anyhow::ensure!(
+                link.is_absolute(),
+                "read-only symlink is not absolute: {}",
+                link.display()
+            );
+            anyhow::ensure!(
+                !roots
+                    .iter()
+                    .chain(visible_roots.iter())
+                    .any(|root| link.starts_with(root)),
+                "read-only symlink is inside a visible root: {}",
+                link.display()
+            );
+            let canonical = std::fs::canonicalize(link)
+                .with_context(|| format!("cannot resolve read-only symlink {}", link.display()))?;
+            anyhow::ensure!(
+                canonical.is_dir(),
+                "read-only symlink target is not a directory: {}",
+                link.display()
+            );
+        }
         for root in &visible_roots {
             anyhow::ensure!(
                 !roots.iter().any(|writable| writable == root),
@@ -139,6 +169,7 @@ impl SandboxSpec {
             writable_roots: roots,
             read_only_overrides,
             read_only_roots: visible_roots,
+            read_only_symlinks,
             hidden_roots: hidden,
             discovered_protected_metadata_paths,
             network_access: true,
@@ -179,6 +210,10 @@ impl SandboxSpec {
 
     pub(super) fn read_only_roots(&self) -> &[PathBuf] {
         &self.read_only_roots
+    }
+
+    pub(super) fn read_only_symlinks(&self) -> &[PathBuf] {
+        &self.read_only_symlinks
     }
 
     pub(super) fn hidden_roots(&self) -> &[PathBuf] {

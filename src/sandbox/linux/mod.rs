@@ -47,6 +47,7 @@ pub fn local_agent_command(
     temporary_roots: &[PathBuf],
     read_only_paths: &[PathBuf],
     read_only_roots: &[PathBuf],
+    read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
     hidden_roots: &[PathBuf],
 ) -> Result<Command> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
@@ -56,6 +57,7 @@ pub fn local_agent_command(
         temporary_roots,
         read_only_paths,
         read_only_roots,
+        read_only_symlinks,
         hidden_roots,
     )?;
     let executable = helper_executable()?;

@@ -233,12 +233,26 @@ pub struct Output {
     pub truncated: bool,
 }
 
+/// A verified intermediate symlink that must be visible for a bounded launcher
+/// chain (for example Vite+ `current -> 0.2.9`) to resolve inside the sandbox.
+///
+/// `link` is the lexical path that must exist and `target` is its already
+/// validated canonical destination. Only symlinks that are not already inside
+/// an exposed dependency root are conveyed this way, so unrelated index state
+/// is never widened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalAgentSymlink {
+    pub link: PathBuf,
+    pub target: PathBuf,
+}
+
 /// Canonical filesystem scope for a local-agent invocation.
 pub struct LocalAgentScope<'a> {
     pub writable_roots: &'a [PathBuf],
     pub temporary_roots: &'a [PathBuf],
     pub read_only_paths: &'a [PathBuf],
     pub read_only_roots: &'a [PathBuf],
+    pub read_only_symlinks: &'a [LocalAgentSymlink],
     pub hidden_roots: &'a [PathBuf],
 }
 
@@ -283,6 +297,7 @@ pub async fn run_local_agent(
         scope.temporary_roots,
         scope.read_only_paths,
         scope.read_only_roots,
+        scope.read_only_symlinks,
         scope.hidden_roots,
     )?;
 
@@ -293,6 +308,7 @@ pub async fn run_local_agent(
         scope.temporary_roots,
         scope.read_only_paths,
         scope.read_only_roots,
+        scope.read_only_symlinks,
         scope.hidden_roots,
     )?;
 
@@ -304,6 +320,7 @@ pub async fn run_local_agent(
         scope.temporary_roots,
         scope.read_only_paths,
         scope.read_only_roots,
+        scope.read_only_symlinks,
         scope.hidden_roots,
     )?;
 
@@ -701,6 +718,7 @@ fn validate_local_agent_scope(
     temporary_roots: &[PathBuf],
     read_only_paths: &[PathBuf],
     read_only_roots: &[PathBuf],
+    read_only_symlinks: &[LocalAgentSymlink],
     hidden_roots: &[PathBuf],
 ) -> Result<()> {
     for root in temporary_roots {
@@ -750,6 +768,38 @@ fn validate_local_agent_scope(
             !is_protected_metadata_location(&canonical),
             "local agent read-only root must not be inside protected metadata: {}",
             canonical.display()
+        );
+    }
+    for symlink in read_only_symlinks {
+        anyhow::ensure!(
+            symlink.link.is_absolute(),
+            "local agent read-only symlink is not absolute: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&symlink.link),
+            "local agent read-only symlink must not be inside protected metadata: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            symlink.target.is_absolute(),
+            "local agent read-only symlink target is not absolute: {}",
+            symlink.target.display()
+        );
+        anyhow::ensure!(
+            symlink.target != Path::new("/"),
+            "local agent read-only symlink target must not be the filesystem root"
+        );
+        let canonical = std::fs::canonicalize(&symlink.link).with_context(|| {
+            format!(
+                "cannot resolve local agent read-only symlink {}",
+                symlink.link.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical == symlink.target,
+            "local agent read-only symlink target changed: {}",
+            symlink.link.display()
         );
     }
     for root in hidden_roots {
@@ -2242,6 +2292,7 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: &[],
+                read_only_symlinks: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2274,6 +2325,7 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2301,6 +2353,7 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2337,6 +2390,7 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,

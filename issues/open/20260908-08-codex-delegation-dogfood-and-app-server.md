@@ -2,7 +2,7 @@
 
 - Status: Open / implementation and fake-transport verification landed; one real `codex delegate` dogfood task recorded 2026-09-11; real app-server dogfood and comparative measurement remain
 - Date: 2026-09-08 (Asia/Tokyo)
-- Updated: 2026-09-11 (Asia/Tokyo)
+- Updated: 2026-09-13 (Asia/Tokyo)
 - Priority: P1
 - Original baseline inspected: `8b95f1d91734e77e698d55d2babd097860f1c1b3` (`main`)
 - Implementation baseline now in `main`: `da64a3800eafb9ef19237ebd9d7310502201873f` and follow-up commits
@@ -13,13 +13,15 @@
   - [TEMOTE-07: client-safe upgrade / reconnect](20260908-07-client-safe-upgrade-reconnect.md)
   - [`docs/evaluations/codex-delegation.md`](../../docs/evaluations/codex-delegation.md)
 
-## 現在の状態（2026-09-11）
+## 現在の状態（2026-09-13）
 
 この issue の実装部分はすでに `main` に入っている。`codex delegate` の bounded structured report、scoped evidence、experimental app-server task controls、gateway contract、fake-transport/権限/失敗系テストが実装済みである。
 
 2026-09-11 に macOS 開発ホストで Vite+ 管理の Codex CLI `0.153.4` を使い、実 `codex delegate` を小タスクで1件実行した。`status=success`、exit 0、requested `gpt-5.6-luna`/`high`、observed model/effort は child event 非公開のため `null`、usage は入力 50442 / cached 32256 / 出力 512 / reasoning 151、worktree で `hello.txt` 作成を確認した。non-secret の記録は `docs/evaluations/codex-delegation.md` に保存している。app-server の live 実行と比較測定は未完了。
 
 同じ Vite+ 管理 Codex は `local_agent_run` の local-agent sandbox では launcher 依存 path 可視性の問題で起動できない。これは `20260911-local-agent-vp-installed-codex-runtime.md` で別途追跡しており、`codex delegate` の live 結果とは独立である。
+
+2026-09-13 の再開インクリメントでは、`main` (`091529db1b69d7e2b608ea60761a63d56dccb7b9`) 上で作業したが、実行環境に shell / プロセス実行ツールが存在しなかった。このため Codex 起動、`codex app-server --stdio` の `model/list`、実 `codex_task_start`、resume/control/usage の観測、direct Temote / `codex exec` / app-server の比較、および `AGENTS.md` の各チェックをいずれも実行できなかった。usage / cost / model / effort / 所要時間は観測不能のため `unknown` のまま記録し、推定値は入れていない。静的確認では app-server 経路（`validate_initialize_response` の `0.153.4` 検証、`codex_status` の `model/list` と `supportedReasoningEfforts`、`task_start` の model/effort 検証、型付き `steer`/`resume`/`interrupt`）が存在することを確認したが、これは live evidence ではない。この時点では実装 defect を検出していなかったが、その後、取得済みの 0.153.4 protocol schema と `thread/start` / `thread/resume` の要求値を静的に突き合わせ、`sandbox` を wire enum でない `workspaceWrite` として送っている実装 defect（正しくは `workspace-write`）を検出して修正した。加えて、`model/list` の `supportedReasoningEfforts` が `reasoningEffort` field を返すのに対し実装が `effort` を読んでいたため、実機では model/effort 検証が常に失敗し `codex_status` の effort 一覧も空になる defect を検出し、`advertised_effort_name` parser と fake-transport fixture の更新で修正した。live app-server dogfood は引き続き未完了であり、採用判断は保留（live evidence 待ち）である。
 
 一方、実 Codex dogfood と効果測定は未完了。repository 内の評価記録では、対象環境の Codex vendor binary 欠落により real Luna Max task、real app-server model listing、authentication success、observed usage を確認できていない。
 

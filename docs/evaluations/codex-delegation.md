@@ -71,3 +71,28 @@ Limitations observed: the Codex child's `changed_files` entry was an absolute ar
 ## Remaining live work
 
 App-server dogfood and the direct-Temote / `codex exec` / app-server comparison remain. Run those with the same base commit, permissions, and acceptance criteria, then record observed model/effort, usage source, process outcome, elapsed times, retries, and parent intervention. Do not infer token or cost savings from MCP response bytes. The direct Codex-vs-OpenCode comparison is recorded in [`codex-vs-opencode-live-20260912.md`](codex-vs-opencode-live-20260912.md).
+
+## Increment attempt (2026-09-13): live app-server dogfood blocked
+
+Attempted from `main` at `091529db1b69d7e2b608ea60761a63d56dccb7b9`. The execution environment available to this increment exposed no shell/process-execution capability, so no Codex or `temote-mcp` process could be launched. The following remain unperformed, and every associated field is `unknown`; no value was inferred:
+
+- installed Codex version, `codex app-server --stdio` handshake, and `model/list` for `gpt-5.6-luna` with `max`/`high`;
+- one real `codex_task_start` dogfood and any `codex_task_get` status/usage/resume/control evidence;
+- the direct-Temote / `codex exec` / app-server comparison under identical base, permissions, and acceptance criteria;
+- the `AGENTS.md` local checks (format, Rust tests, clippy, no-default-features, gateway tests, `git diff --check`).
+
+Static verification only (not live evidence): `src/codex_app_server.rs` pins the initialize handshake to `codex_cli_rs/0.153.4` (`validate_initialize_response`), `codex_status` issues `model/list` with `includeHidden:true` and returns each model's `supportedReasoningEfforts`, `codex_task_start` validates the requested model/effort against that advertised list before `thread/start`, control is limited to typed `steer`/`resume`/`interrupt`, and the four tools are registered in `src/mcp.rs`. That pass exposed no implementation defect, so no code change was made in this attempt; a follow-up schema review below found and fixed a real protocol mismatch.
+
+Adoption decision for this increment: unchanged / undecided pending live evidence. This attempt does not satisfy Phase D or the live acceptance criteria, and it does not alter the existing one-shot `codex delegate` evidence.
+
+## Offline schema review (2026-09-13): `thread/start` sandbox value defect
+
+A follow-up static review compared the app-server request parameters against the captured 0.153.4 protocol schemas (`.artifacts/codex-app-server-schema-0.153.4`, a local reference not committed here). Both `thread/start` and `thread/resume` were sending `"sandbox": "workspaceWrite"`, but the 0.153.4 wire `SandboxMode` enum is `read-only` / `workspace-write` / `danger-full-access`. The camelCase value is rejected by the real app-server, so `codex_task_start` (and runtime re-establishment through `thread/resume`) could not complete against a live host. This is a separate field from `turn/start`'s `sandboxPolicy.type`, which is correctly the camelCase `workspaceWrite`.
+
+Fixed in `src/codex_app_server.rs`: both `thread/start` and `thread/resume` now send `"workspace-write"`. The fake app-server transport now rejects any `thread/start`/`thread/resume` `sandbox` other than `workspace-write`, so the mismatch cannot silently recur in fake-transport tests. This fix is offline-verified only; live app-server dogfood and the exec/app-server comparison remain pending.
+
+## Offline schema review (2026-09-13): `reasoningEffort` field mismatch
+
+The same 0.153.4 schema review found a second wire mismatch in the effort-compatibility path. `model/list` returns `data[].supportedReasoningEfforts[]` as `ReasoningEffortOption` objects with a `reasoningEffort` field (`v2/ModelListResponse.json`, `v2/ReasoningEffortOption.json`), but `validate_model_request` and `codex_status` read `effort` (or a bare string). Against a real 0.153.4 app-server every requested effort would have been reported as not advertised, so `codex_task_start` would terminate as `failed`, and `codex_status` would list empty effort sets. The fake app-server fixtures also emitted `effort`, so fake-transport tests could not catch it.
+
+Fixed in `src/codex_app_server.rs`: a single `advertised_effort_name` parser reads `reasoningEffort` first and keeps `effort`/bare-string tolerance; the fake app-server fixtures now emit the real `reasoningEffort` shape; a regression test pins the parser and the negative case. No public tool argument, approval, sandbox, retention, or evidence behavior changed. This fix is offline-verified only; live app-server dogfood and the exec/app-server comparison remain pending.

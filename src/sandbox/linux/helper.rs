@@ -155,7 +155,22 @@ fn build_bwrap_args(
     visible_roots.extend(policy.read_only_roots.iter().cloned());
     visible_roots.sort_by_key(|path| path_depth(path));
     visible_roots.dedup();
-    append_namespace_directory_scaffolding(&mut args, &hidden_roots, &visible_roots)?;
+    let symlink_paths = policy
+        .read_only_symlinks
+        .iter()
+        .filter(|symlink| {
+            hidden_roots
+                .iter()
+                .any(|hidden| symlink.link.starts_with(hidden))
+        })
+        .filter_map(|symlink| symlink.link.parent().map(Path::to_owned))
+        .collect::<Vec<_>>();
+    append_namespace_directory_scaffolding(
+        &mut args,
+        &hidden_roots,
+        &visible_roots,
+        &symlink_paths,
+    )?;
     for root in writable_roots {
         append_pair(&mut args, "--bind", &root, &root)?;
     }
@@ -211,6 +226,20 @@ fn build_bwrap_args(
         }
     }
 
+    // Recreate only the verified intermediate launcher symlinks (for example
+    // Vite+ `current -> 0.2.9`) that were hidden by the tmpfs overlay. Their
+    // parents were scaffolded above and the destination is validated by the
+    // policy, so no unrelated path becomes visible.
+    for symlink in &policy.read_only_symlinks {
+        if !hidden_roots
+            .iter()
+            .any(|hidden| symlink.link.starts_with(hidden))
+        {
+            continue;
+        }
+        append_pair(&mut args, "--symlink", &symlink.target, &symlink.link)?;
+    }
+
     args.push("--chdir".to_owned());
     args.push(path_to_string(&policy.cwd)?);
     args.push("--".to_owned());
@@ -222,9 +251,10 @@ fn append_namespace_directory_scaffolding(
     args: &mut Vec<String>,
     hidden_roots: &[PathBuf],
     visible_roots: &[PathBuf],
+    symlink_paths: &[PathBuf],
 ) -> Result<()> {
     let mut directories = Vec::new();
-    for visible in visible_roots {
+    for visible in visible_roots.iter().chain(symlink_paths.iter()) {
         let Some(hidden) = hidden_roots
             .iter()
             .filter(|hidden| visible.starts_with(hidden))
@@ -545,6 +575,7 @@ mod tests {
             std::slice::from_ref(&temp),
             &[],
             std::slice::from_ref(&workspace),
+            &[],
             std::slice::from_ref(&hidden),
         )
         .unwrap();
@@ -574,6 +605,58 @@ mod tests {
             !args
                 .windows(3)
                 .any(|window| window == ["--bind", "/tmp", "/tmp"])
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_agent_policy_recreates_only_verified_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let hidden = root.path().join("home");
+        let bin = hidden.join("bin");
+        let version = hidden.join("0.2.9");
+        let current = hidden.join("current");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(version.join("bin")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(version.join("bin/vp"), b"#!/bin/sh\n").unwrap();
+        symlink(Path::new("../current/bin/vp"), bin.join("codex")).unwrap();
+        symlink(Path::new("0.2.9"), &current).unwrap();
+        let canonical_version = std::fs::canonicalize(&version).unwrap();
+        let hidden = std::fs::canonicalize(&hidden).unwrap();
+
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            &workspace,
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&bin),
+            &[crate::sandbox::LocalAgentSymlink {
+                link: hidden.join("current"),
+                target: canonical_version.clone(),
+            }],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
+
+        assert!(args.windows(3).any(|window| {
+            window
+                == [
+                    "--symlink",
+                    canonical_version.to_str().unwrap(),
+                    hidden.join("current").to_str().unwrap(),
+                ]
+        }));
+        // The launcher symlink is carried by the bound `bin` directory and must
+        // not be recreated as a separate sandbox symlink.
+        assert!(
+            !args
+                .iter()
+                .any(|argument| Path::new(argument) == hidden.join("bin/codex"))
         );
     }
 }

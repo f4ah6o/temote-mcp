@@ -1397,18 +1397,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn forget_artifacts_rejects_special_metadata_target() {
+        use std::os::unix::ffi::OsStrExt;
+
         let id = format!("forget-special-{}", Uuid::new_v4());
         cleanup_forget_fixture(&id).await;
         let path = session_path(&id).unwrap();
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // A FIFO is a portable special file that exercises the same
+        // "not a regular file" rejection without the platform Unix-socket
+        // path limit (SUN_LEN) that a long session metadata path can exceed.
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
         let error = forget_session_artifacts(&id).await.unwrap_err();
         assert!(format!("{error:#}").contains("not a regular file"));
         assert!(path.exists());
-        drop(_listener);
         tokio::fs::remove_file(path).await.unwrap();
     }
 

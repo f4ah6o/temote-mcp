@@ -2363,6 +2363,17 @@ fn mark_waiting_approval(session: &config::Session, task_id: Uuid, waiting: bool
     }
 }
 
+fn advertised_effort_name(entry: &Value) -> Option<&str> {
+    // Codex 0.153.4 `model/list` advertises `ReasoningEffortOption` objects with a
+    // `reasoningEffort` field. Accept the legacy `effort` key and a bare string so a
+    // schema alias never silently empties the advertised effort set.
+    entry
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("effort").and_then(Value::as_str))
+        .or_else(|| entry.as_str())
+}
+
 fn validate_model_request(models: &Value, model: &str, effort: &str) -> Result<()> {
     let data = models
         .get("data")
@@ -2377,10 +2388,9 @@ fn validate_model_request(models: &Value, model: &str, effort: &str) -> Result<(
         .and_then(Value::as_array)
         .context("Codex model is missing supportedReasoningEfforts")?;
     anyhow::ensure!(
-        efforts.iter().any(|entry| {
-            entry.get("effort").and_then(Value::as_str) == Some(effort)
-                || entry.as_str() == Some(effort)
-        }),
+        efforts
+            .iter()
+            .any(|entry| advertised_effort_name(entry) == Some(effort)),
         "Codex effort {effort} is not advertised for model {model}"
     );
     Ok(())
@@ -2419,12 +2429,7 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
                 .map(|items| {
                     items
                         .iter()
-                        .filter_map(|item| {
-                            item.get("effort")
-                                .and_then(Value::as_str)
-                                .or_else(|| item.as_str())
-                                .map(str::to_owned)
-                        })
+                        .filter_map(|item| advertised_effort_name(item).map(str::to_owned))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -2634,7 +2639,7 @@ async fn task_start_with_store_and_binary_inner(
                 "model": model,
                 "approvalPolicy": CODEX_APPROVAL_POLICY,
                 "approvalsReviewer": "user",
-                "sandbox": "workspaceWrite",
+                "sandbox": "workspace-write",
                 "runtimeWorkspaceRoots": [record.scope_cwd],
                 "ephemeral": false,
                 "threadSource": "temote-mcp",
@@ -3035,7 +3040,7 @@ async fn ensure_runtime_with_binary(
             "model": record.model,
             "approvalPolicy": CODEX_APPROVAL_POLICY,
             "approvalsReviewer": "user",
-            "sandbox": "workspaceWrite",
+            "sandbox": "workspace-write",
             "runtimeWorkspaceRoots": [record.scope_cwd],
             "excludeTurns": true,
         }),
@@ -3274,13 +3279,16 @@ for raw in sys.stdin:
             print(json.dumps({'id':i,'error':{'code':-1,'message':'model list unavailable'}}), flush=True)
             continue
         model = 'other-model' if mode == 'invalid-model' else 'gpt-5.6-luna'
-        result = {'data':[{'model':model,'id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'xhigh'}]}]}
+        result = {'data':[{'model':model,'id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'reasoningEffort':'low'},{'reasoningEffort':'medium'},{'reasoningEffort':'high'},{'reasoningEffort':'max'},{'reasoningEffort':'xhigh'}]}]}
     elif method == 'thread/start':
         if mode == 'thread-uncertain':
             print(json.dumps({'id':i,'error':{'code':-1,'message':'thread start response lost'}}), flush=True)
             continue
         if mode == 'reject-never' and req.get('params',{}).get('approvalPolicy') == 'never':
             print(json.dumps({'id':i,'error':{'code':-1,'message':'never approval policy rejected'}}), flush=True)
+            continue
+        if req.get('params',{}).get('sandbox') not in (None, 'workspace-write'):
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'invalid sandbox mode'}}), flush=True)
             continue
         result = {'thread':{'id':thread_id}}
     elif method == 'turn/start':
@@ -3297,6 +3305,9 @@ for raw in sys.stdin:
     elif method == 'thread/resume':
         if mode == 'reject-never' and req.get('params',{}).get('approvalPolicy') == 'never':
             print(json.dumps({'id':i,'error':{'code':-1,'message':'never approval policy rejected'}}), flush=True)
+            continue
+        if req.get('params',{}).get('sandbox') not in (None, 'workspace-write'):
+            print(json.dumps({'id':i,'error':{'code':-1,'message':'invalid sandbox mode'}}), flush=True)
             continue
         result = {'thread':{'id':thread_id}}
     elif method == 'thread/read':
@@ -3345,7 +3356,7 @@ for raw in sys.stdin:
     if method == 'initialize':
         result = {'userAgent':'codex_cli_rs/0.153.4 (temote-mcp; test)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'macos'}
     elif method == 'model/list':
-        result = {'data':[{'model':'gpt-5.6-luna','id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'effort':'low'},{'effort':'medium'},{'effort':'high'},{'effort':'max'},{'effort':'xhigh'}]}]}
+        result = {'data':[{'model':'gpt-5.6-luna','id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'reasoningEffort':'low'},{'reasoningEffort':'medium'},{'reasoningEffort':'high'},{'reasoningEffort':'max'},{'reasoningEffort':'xhigh'}]}]}
     elif method == blocked_method:
         open(entered, 'w').close()
         if method == 'turn/start':
@@ -5505,6 +5516,30 @@ for raw in sys.stdin:
         )));
     }
 
+    #[test]
+    fn model_list_effort_parser_accepts_the_0_153_4_reasoning_effort_field() {
+        let models = json!({
+            "data": [{
+                "model": "gpt-5.6-luna",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "low"},
+                    {"reasoningEffort": "max", "description": "max"},
+                ],
+            }]
+        });
+        validate_model_request(&models, "gpt-5.6-luna", "max").unwrap();
+        assert!(validate_model_request(&models, "gpt-5.6-luna", "ultra").is_err());
+        assert_eq!(
+            advertised_effort_name(&json!({"reasoningEffort": "max"})),
+            Some("max")
+        );
+        assert_eq!(
+            advertised_effort_name(&json!({"effort": "high"})),
+            Some("high")
+        );
+        assert_eq!(advertised_effort_name(&json!("medium")), Some("medium"));
+    }
+
     #[tokio::test]
     async fn fake_app_server_handshake_start_read_steer_interrupt_and_evidence() {
         let root = tempfile::tempdir().unwrap();
@@ -5524,7 +5559,7 @@ for raw in sys.stdin:
         let thread = client
             .request(
                 "thread/start",
-                json!({"cwd":session.cwd,"sandbox":"workspaceWrite"}),
+                json!({"cwd":session.cwd,"sandbox":"workspace-write"}),
             )
             .await
             .unwrap();
