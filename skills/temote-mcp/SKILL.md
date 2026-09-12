@@ -9,7 +9,7 @@ metadata:
 
 # Use Temote MCP effectively
 
-Temote MCP exposes a user's local machine through explicit sessions. Treat the selected session as the source of truth for its working directory, permission mode, filesystem roots, and host process state.
+Temote MCP exposes a user's local machine through explicit sessions. Treat the selected session as the source of truth for its working directory, permission mode (`ask`, `agent`, or `yolo`), filesystem roots, and host process state. New sessions default to the sandboxed `agent` mode.
 
 ## Select the host and session first
 
@@ -50,7 +50,7 @@ In normal sessions, stay within permitted roots. If a required path is outside t
 
 ## Commands and jobs
 
-Use `execute` for normal commands. It takes argv, not a shell command string. Normal sessions run commands in the Temote MCP sandbox with network disabled; yolo sessions run with the local user's host permissions.
+Use `execute` for normal commands. It takes argv, not a shell command string. Normal `ask`/`agent` sessions run commands in the Temote MCP sandbox with network disabled; yolo sessions run with the local user's host permissions.
 
 If `execute` returns a `job_id`, the work is still running. Poll it with `poll_job` until it finishes when completion is needed for the user's current task. Use `start_command` when backgrounding immediately is intentional. Use `stop_job` when the running command is no longer needed or must be cancelled.
 
@@ -64,9 +64,13 @@ When the experimental `codex_status`, `codex_task_start`, `codex_task_get`, or `
 
 Use `local_agent_run` for a single local Codex or OpenCode run with `{session_id, agent, task, cwd?, access, model?, profile?}`. `agent` is only `codex` or `opencode`, and `access` is only `read_only` or `workspace_write`. The caller cannot provide an executable, raw argv, environment, or network policy; Temote constructs and bounds the adapter command.
 
-The broker canonicalizes `cwd` and keeps it inside the selected session's permitted roots after symlink resolution, including in yolo sessions. Permitted roots authorize which cwd may be selected; they are not automatically exposed to the child. Its Temote-owned filesystem profile hides the host temporary and user-agent state roots, re-exposes only the selected canonical cwd, executable directories, and private run state, makes the selected cwd writable for `workspace_write`, and keeps it read-only for `read_only`. Other permitted roots are not automatically visible. Every `.git`, `.agents`, and `.codex` entry under the selected workspace, including nested entries and metadata files, remains protected. It does not forward Temote-held credentials, tokens, or proxy settings by default. Existing standard Codex/OpenCode auth files are imported as bounded read-only inputs for the top-level runtime and denied to generated command/tool execution by the broker-controlled adapter policy. Normal sessions require local approval before the child starts; this broker also keeps that explicit approval boundary in yolo sessions, and denial means no child process is started.
+The broker canonicalizes `cwd` and keeps it inside the selected session's permitted roots after symlink resolution, including in yolo sessions. Permitted roots authorize which cwd may be selected; they are not automatically exposed to the child. Its Temote-owned filesystem profile hides the host temporary and user-agent state roots, re-exposes only the selected canonical cwd, executable directories, and private run state, makes the selected cwd writable for `workspace_write`, and keeps it read-only for `read_only`. Other permitted roots are not automatically visible. Every `.git`, `.agents`, and `.codex` entry under the selected workspace, including nested entries and metadata files, remains protected. It does not forward Temote-held credentials, tokens, or proxy settings by default. Existing standard Codex/OpenCode auth files are imported as bounded read-only inputs for the top-level runtime and denied to generated command/tool execution by the broker-controlled adapter policy. In `ask` and `yolo` sessions the child starts only after the explicit user-approval boundary returns allow; in the default `agent` mode an otherwise-valid structured request skips only the Temote-local prompt. In every mode denial means no child process is started.
 
-Codex accepts tasks up to 1 MiB through stdin (`codex exec ... -`); OpenCode's verified `run [message..]` contract has no stdin prompt transport, so its positional task is limited to 64 KiB. Combined output is also bounded to 1 MiB. A run that exceeds the foreground timeout returns a session-owned `job_id`; use `poll_job` or `stop_job` as with other jobs. Interactive approval shows a bounded sanitized task preview; durable approval/activity metadata contains only bounded scope, task byte count, and task SHA-256, never the task body, preview, or environment values. Agent edits do not authorize Git remote mutation; use the dedicated `git_*` tools for Git operations. Do not substitute `without_sandbox`, which remains unavailable on public HTTP.
+Codex accepts tasks up to 1 MiB through stdin (`codex exec ... -`); OpenCode's verified `run [message..]` contract has no stdin prompt transport, so its positional task is limited to 64 KiB. Combined output is also bounded to 1 MiB. A run that exceeds the foreground timeout returns a session-owned `job_id`; use `poll_job` or `stop_job` as with other jobs. Interactive approval shows a bounded sanitized task preview; durable approval/activity metadata contains only bounded scope, task byte count, and task SHA-256, never the task body, preview, or environment values. Agent edits do not authorize Git remote mutation; use the dedicated `git_*` tools for Git operations. Do not substitute `without_sandbox`, which remains unavailable on public HTTP and stays approval-gated in `ask`/`agent` because it leaves the sandbox.
+
+### Structured developer tool broker
+
+Use `dev_tool_run` for validated Cargo or Vite+ work instead of raw shell commands. `tool` is only `cargo` or `vp`; pass a classified `operation` such as `check`, `test`, `build`, or `clippy` for Cargo, or `check`, `lint`, `fmt`, `test`, `build`, or `pack` for Vite+. Offline development operations run with network disabled and scoped tool cache writes; dependency/network operations (`fetch`, `install`, `update`, and the Vite+ equivalents) use the explicit network profile. `vp run`, `vp exec`, `vp dlx`, `vp upgrade`, `vp implode`, unknown operations, and caller-selected executables or raw host commands are rejected. In `ask` mode a validated operation requires local approval; in the default `agent` mode it runs without the local approval console.
 
 ## Git
 
@@ -77,13 +81,13 @@ Use ordinary `execute` for read-only Git inspection. Use Temote MCP's dedicated 
 3. `git_fetch` or `git_pull` when remote updates are required.
 4. `git_push` after local validation when the user requested pushing.
 
-`git_pull` is fast-forward-only. `git_push` does not expose force push or arbitrary URL/refspec input. Do not bypass these restrictions with a shell command.
+`git_pull` is fast-forward-only. `git_push` does not expose force push or arbitrary URL/refspec input. Do not bypass these restrictions with a shell command. In `ask` these Git tools require local approval; in the default `agent` mode the validated structured operation runs without the local approval console; `yolo` keeps its existing local behavior.
 
 Before committing, inspect the diff/status and run the task-relevant checks. After pushing, verify the branch is synchronized when practical.
 
 ## Approval model
 
-Normal sessions use Temote MCP's local approval boundary for host/network-sensitive operations. Yolo sessions intentionally skip Temote MCP approval prompts and path/sandbox restrictions for ordinary operations; the structured `local_agent_run` broker deliberately retains its explicit child-approval boundary.
+`ask` uses Temote MCP's local approval boundary for host/network-sensitive structured operations. The default sandboxed `agent` mode skips only that Temote-local prompt for otherwise-valid structured operations; it never widens sandbox, path, network, or tool-specific capability. Yolo sessions intentionally skip Temote MCP approval prompts and path/sandbox restrictions for ordinary operations; the structured `local_agent_run` broker deliberately retains its explicit child-approval boundary in ask/yolo.
 
 Do not add a redundant conversational confirmation for an operation the user already explicitly requested merely because Temote MCP may also display its own host approval UI. Still follow any confirmation or authorization rules imposed by the current agent/client.
 
@@ -93,7 +97,7 @@ Never infer that yolo mode disables authorization outside Temote MCP.
 
 Normal `execute` commands have no network access. Prefer dedicated network-aware tools such as `git_fetch`, `git_pull`, and `git_push` for supported operations.
 
-`without_sandbox` may exist only on local stdio and requires host approval in normal mode; it is not available on the public HTTP endpoint. Do not depend on it being present.
+`without_sandbox` may exist only on local stdio and requires host approval in `ask`/`agent` mode; it is not available on the public HTTP endpoint. Do not depend on it being present.
 
 ## 1Password bridge
 
@@ -121,7 +125,7 @@ Prefer the official MCP server for structured kintone operations:
 
 Use `kintone_cli_status` and then `kintone_cli_run` when cli-kintone covers a gap better: attachment-aware bulk record export/import, guest-space record work, customization export/apply, or plugin upload. Pass CLI arguments without connection/authentication flags; those values belong to the `temote-mcp start` environment. Use `stdout_path` for large record exports instead of relying on captured stdout.
 
-Do not guess tenant credentials or expose them. In normal sessions, forwarded kintone MCP calls and all cli-kintone runs are approval-gated.
+Do not guess tenant credentials or expose them. In `ask` mode forwarded kintone MCP calls and cli-kintone runs are approval-gated; in the default `agent` mode only the Temote-local prompt is skipped while kintone authentication, discovery gating, and argument validation remain enforced.
 
 ## Supervisor upgrades
 

@@ -49,7 +49,7 @@ temote-mcp supervisor
 
 The client calls `session_list`, then `session_start(path="src/project")` when needed, then `session_info`. The configured root itself is canonicalized, so a host alias such as `~/src -> /Volumes/devstorage/Developer` is allowed. Descendant symlinks or `..` traversal that resolve outside that canonical physical root are rejected. Missing roots fail closed with no HOME, `/`, cwd, or repository fallback.
 
-`session_stop` can stop only sessions marked as HTTP-owned by the lifecycle supervisor; it cannot stop local CLI/yolo sessions even though they share the same supervisor process. HTTP managed sessions are always non-yolo and retain the same local approval gates through `temote-mcp session console`. Public session-bound tools also reject separately started yolo sessions, so remote access cannot inherit their unrestricted local semantics. Stopped/crashed metadata remains visible through `session_list` / `session_info`; ordinary session-bound tools still require an active socket. `temote-mcp down` stops only the HTTP origin and its managed ingress child, not the lifecycle supervisor or its sessions. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
+`session_stop` can stop only sessions marked as HTTP-owned by the lifecycle supervisor; it cannot stop local CLI/yolo sessions even though they share the same supervisor process. HTTP managed sessions are always non-yolo and default to `agent`, so the normal structured development workflow does not need a local approval console; an operator can still request the stricter `ask` mode locally with `session permission`. Public session-bound tools also reject separately started yolo sessions, so remote access cannot inherit their unrestricted local semantics. Stopped/crashed metadata remains visible through `session_list` / `session_info`; ordinary session-bound tools still require an active socket. `temote-mcp down` stops only the HTTP origin and its managed ingress child, not the lifecycle supervisor or its sessions. In a repository checkout, `just up/down` are development wrappers around these installed-binary commands.
 
 ## Migrating an older always-on runtime
 
@@ -73,6 +73,18 @@ Migration validates the legacy state file and verifies live process names before
 A normal session starts with its canonical startup directory as its permitted root. Local named-root selection determines which project directory is used; remote `session_start` can only resolve paths below administrator-configured named roots. Normal sessions reject paths, symlink targets, and command working directories that escape their permitted roots.
 
 The legacy inline `/permission ...` terminal command UI is not the owner of detached runtimes and is not exposed through the first supervisor control surface. This does not widen permissions: the runtime remains fail-closed with its persisted permitted roots.
+
+## Permission modes
+
+An explicit session permission mode controls the Temote-local approval layer:
+
+- `ask` keeps the strictest policy: sandbox and path containment stay in force, and host/network-sensitive structured operations require the local approval console.
+- `agent` is the default for newly created sessions, including authenticated public `session_start`. It keeps the same sandbox, path containment, network restriction for ordinary commands, and tool-specific validation, but does not require the local approval console for otherwise-valid structured operations: Git fetch/pull/push, `local_agent_run`, `dev_tool_run`, checkpoints, patches, and the structured 1Password/kintone integrations.
+- `yolo` remains the local-only unrestricted mode and cannot be created or promoted through public HTTP.
+
+`agent` is not a weaker spelling of `yolo`: ordinary `execute`/`start_command` remain sandboxed with network disabled, public `without_sandbox` remains unavailable, force-push and arbitrary Git URLs/refspecs remain rejected, and integrations keep their own authentication and capability boundaries.
+
+Use `temote-mcp session permission <id> status|ask|agent|yolo` to inspect or intentionally change a running managed session. Existing persisted sessions keep their stored mode across restart, automatic restart, restore, and upgrade handoff; an explicit `ask` session is not silently migrated to `agent`.
 
 ## Commands
 
@@ -100,9 +112,21 @@ Generated turns are requested with Codex `workspaceWrite`, the session's canonic
 
 The optional `cwd` is canonicalized and must remain inside a permitted session root, including after symlink resolution, even when the session is yolo. Permitted roots authorize which `cwd` may be selected; they are not an automatic list of paths exposed to the child. Only the selected canonical `cwd` is re-exposed as the agent workspace: it is writable for `workspace_write` and read-only for `read_only`. Other permitted roots are not automatically exposed to the agent. Private per-run state/cache remains writable in either mode, and every `.git`, `.agents`, and `.codex` entry found under the selected workspace is protected.
 
-Every local-agent request crosses the local approval boundary, including from a yolo session. A denial is returned before the child process is started. Codex tasks are limited to 1 MiB and are delivered through stdin using the verified `codex exec ... -` contract, so the task body is not placed in argv. The installed OpenCode `run [message..]` contract has no verified stdin prompt transport, so its positional message is limited to 64 KiB. Combined child output is limited to 1 MiB, and work longer than the foreground timeout returns a normal Temote `job_id` that can be inspected with `poll_job` or cancelled with `stop_job`. The interactive approval detail shows a bounded, control-sanitized task preview; durable activity and metadata retain only the agent, scope, access mode, task byte count, and SHA-256, never the task body, preview, or environment values.
+In `ask` and `yolo` modes every local-agent request crosses the local approval boundary. In `agent` mode an otherwise-valid structured request skips only the Temote-local approval prompt; the broker contract below is unchanged. A denial is returned before the child process is started. Codex tasks are limited to 1 MiB and are delivered through stdin using the verified `codex exec ... -` contract, so the task body is not placed in argv. The installed OpenCode `run [message..]` contract has no verified stdin prompt transport, so its positional message is limited to 64 KiB. Combined child output is limited to 1 MiB, and work longer than the foreground timeout returns a normal Temote `job_id` that can be inspected with `poll_job` or cancelled with `stop_job`. The interactive approval detail shows a bounded, control-sanitized task preview; durable activity and metadata retain only the agent, scope, access mode, task byte count, and SHA-256, never the task body, preview, or environment values.
 
 The child environment is cleared and rebuilt from a small allow-list, so Temote-held credentials, tokens, and proxy settings are not forwarded implicitly. The outer profile hides the host temporary and user-agent state roots, then re-exposes only the selected workspace, executable directories, and private run state needed for this invocation. Existing Codex (`~/.codex/auth.json`) and OpenCode (`~/.local/share/opencode/auth.json`) login files are imported as bounded read-only inputs into the private run state for the top-level agent runtime. The broker supplies Codex's strict permission profile and OpenCode's read/external-directory restrictions so model-generated command/tool execution cannot read the imported auth file; the original user files are hidden and never writable by the child. Agent edits are not Git remote authorization; use the dedicated `git_*` tools for staging, commits, fetch, pull, and push. Public HTTP exposes only this structured broker and continues to omit the generic `without_sandbox` tool.
+
+### Structured developer tool broker
+
+`dev_tool_run({session_id, tool, operation, args?, cwd?})` runs a validated Cargo or Vite+ operation through the developer broker. `tool` is limited to `cargo` and `vp`; callers cannot select an executable or supply a raw host command. The cwd is canonicalized inside the permitted session roots, child output is bounded, and long operations return a normal `job_id`.
+
+Operation classes:
+
+- offline development (`cargo fmt|check|clippy|test|build`; `vp check|lint|fmt|format|test|build|pack`) run in the developer sandbox with network disabled; workspace write plus narrowly scoped tool cache/state write only;
+- dependency/network (`cargo fetch|install|update`; `vp install|add|update|outdated|info|rebuild`) use the explicit network profile with the same scoped writes;
+- `vp run|exec|dlx`, `vp upgrade|implode`, and every unknown operation stay rejected rather than entering an offline/safe path.
+
+In `ask` mode a validated operation requires local approval; in `agent` mode it runs without the local approval console; in `yolo` mode the existing local behavior is unchanged. The classification and containment rules are identical in every mode.
 
 ### Delegation backend (local CLI)
 
@@ -154,7 +178,7 @@ Ordinary sandboxed commands keep Git metadata read-only. Use the dedicated tools
 - `git_pull` is fast-forward-only.
 - `git_push` pushes the current branch and exposes no force option or arbitrary remote URL/refspec.
 
-Remote Git operations are host operations and require local approval in normal sessions.
+Remote Git operations are host operations. In `ask` mode they require local approval; in `agent` mode the validated structured operation runs without the local approval console, and in `yolo` mode the existing local behavior is unchanged. The safe-remote, fast-forward-only, current-branch, and no-force rules are identical in every mode.
 
 ## Yolo mode
 

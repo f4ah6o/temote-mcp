@@ -108,7 +108,7 @@ Temote 側の agent profile では、選択した canonical `cwd` だけを agen
 他の permitted root は agent に自動公開しません。
 どちらの mode でも agent の state と cache は毎回専用 directory に分離して書き込み可能にし、選択 workspace 以下のすべての `.git`、`.agents`、`.codex`（nested を含む）は保護したままにします。
 
-local agent の request は yolo session からでも local approval boundary を通ります。
+`ask` と `yolo` では local agent の request が local approval boundary を通ります。`agent` では otherwise-valid な構造化 request が Temote 側の local approval prompt だけを省略し、以下の broker contract は変わりません。
 deny の場合は child process を起動せずに終了します。
 Codex の task は 1 MiB まで受け付け、検証済みの `codex exec ... -` contract に従って stdin で渡すため argv には載せません。
 インストール済み OpenCode の `run [message..]` には検証済みの stdin prompt transport がないため、positional message の task は 64 KiB に制限します。
@@ -125,6 +125,18 @@ broker が Codex の strict permission profile と OpenCode の read / external-
 agent の file edit は Git remote 操作の認可を与えません。
 stage、commit、fetch、pull、push には専用の `git_*` tool を使います。
 公開 HTTP はこの構造化 broker だけを公開し、generic な `without_sandbox` tool は引き続き公開しません。
+
+### 構造化 developer tool broker
+
+`dev_tool_run({session_id, tool, operation, args?, cwd?})` は、検証済みの Cargo / Vite+ operation を developer broker 経由で実行します。`tool` は `cargo` と `vp` のみで、caller は executable や raw host command を指定できません。cwd は permitted root 内に canonicalize し、child output は bounded、長時間 operation は通常の `job_id` を返します。
+
+operation class:
+
+- offline development（`cargo fmt|check|clippy|test|build`、`vp check|lint|fmt|format|test|build|pack`）は network 無効の developer sandbox で実行し、workspace write と限定的な tool cache/state write だけを許可します。
+- dependency/network（`cargo fetch|install|update`、`vp install|add|update|outdated|info|rebuild`）は明示的に分類された network profile を使い、write scope は同じです。
+- `vp run|exec|dlx`、`vp upgrade|implode`、その他の未知 operation は offline/safe path に入れず拒否します。
+
+`ask` では検証済み operation に local approval が必要で、`agent` では local approval console なしで実行し、`yolo` は従来の local behavior を維持します。分類と containment の規則はどの mode でも同一です。
 
 ### Delegation backend (ローカル CLI)
 

@@ -2,9 +2,14 @@
 
 ## Status
 
-Partially implemented.
+Implemented. `local_agent_run` for Codex/OpenCode landed in PR #13, and the remaining `dev_tool_run` work (Slices B-E) is complete:
 
-`local_agent_run` for Codex/OpenCode landed in PR #13 (`feat: add structured local agent broker`) and is now part of `main`. Slice A of the remaining work (Cargo/Vite+ policy classifier) landed on main (`src/dev_tool.rs`): `DevTool::{Cargo, Vp}`, `DevToolClass::{DevOffline, DependencyNetwork, ArbitraryCodeSensitive, Rejected}`, request validation (operation grammar, NUL/oversized args, caller-controlled executable paths), and table/property tests. No MCP tool or child process was added. The remaining implementation scope in this issue is the structured `dev_tool_run` execution path (Slices B-E) plus policy/tests/docs needed for it.
+- `dev_tool_run({session_id, tool, operation, args?, cwd?})` is registered with an exact-key, no-executable schema; Cargo and Vite+ operations are classified as `dev-offline` (network disabled) or `dependency-network` (explicit network profile), while `vp run|exec|dlx`, `vp upgrade|implode`, unknown operations, and caller-selected executables/raw argv stay rejected.
+- Offline operations run in a dedicated developer sandbox (workspace write plus narrowly scoped tool cache/state roots, top-level Git metadata protected, network disabled); dependency/network operations reuse the same containment with the explicit network capability.
+- Approval is policy-driven: `ask` prompts, the default sandboxed `agent` mode skips only the Temote-local prompt after structural validation, and `yolo` keeps its existing behavior.
+- Deterministic tests cover the classifier tables, argv construction, unsafe-class rejection, cwd containment, network-class selection, a sandboxed fake-tool run with outside-write denial, Agent approval-free execution, and the gateway contract parity snapshot.
+
+See `docs/evaluations/agent-mode-release-readiness-20260912.md` for the verification record.
 
 Do not reimplement or replace the existing `local_agent_run` broker while completing this issue. Changes to the default approval behavior for that broker belong to `20260911-default-agent-permission-mode.md`.
 
@@ -289,6 +294,12 @@ Each slice should be independently reviewable and testable by a local implementa
 - [ ] Existing `local_agent_run`, Git, 1Password, kintone, session lifecycle, approval, and sandbox regression tests continue to pass after `dev_tool_run` lands.
 - [ ] `cargo fmt --all -- --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, gateway tests, and `git diff --check` pass before merge.
 
+## Implementation status (2026-09-12)
+
+- Slice B/C: `dev_tool_run` executes `cargo fmt|check|clippy|test|build` and `vp check|lint|fmt|format|test|build|pack` offline with workspace + scoped tool-cache writes and network disabled.
+- Slice D: `cargo fetch|install|update` and `vp install|add|update|outdated|info|rebuild` use the explicit dependency-network scope; authorization flows through the shared permission-mode policy.
+- Slice E: operator docs (`docs/usage.md`/`.ja.md`) and the Agent Skill document the final surface. Live Cargo acceptance has a local ignored test (`live_cargo_check_in_the_developer_sandbox`); Vite+ live acceptance depends on an installed `vp` and remains an operator check.
+
 ## Recommended next implementation slice
 
-Start with **Slice A only**. It establishes the Cargo/Vite+ policy boundary without creating another host/network execution path and is small enough for one implementation agent to complete and review independently.
+None required for the broker contract. Future work would be live Vite+ acceptance on a host with `vp` installed and any further capability classes the product explicitly approves.

@@ -2,7 +2,7 @@
 
 ## Status
 
-Open. Slice A (permission enum and persistence, behavior-preserving) landed on main; default changes and policy-driven approval remain.
+Implemented. Slices A-D are complete: new local managed and authenticated public sessions default to `agent`, approval policy is centralized on `(PermissionMode, operation class)`, `session permission <id> ask|agent|yolo` is available, and mode preservation across restart/restore/automatic restart/upgrade handoff is covered by tests. See `docs/evaluations/agent-mode-release-readiness-20260912.md` for the verification record.
 
 `local_agent_run` itself is already implemented on `main` by PR #13. This issue changes session permission semantics and defaults; it must not redesign the local-agent broker or weaken its sandbox/environment contract.
 
@@ -236,6 +236,13 @@ Keep each slice independently reviewable. Do not combine the default change with
 - [ ] Public MCP does not gain yolo capability.
 - [ ] `agent` is the default for new sessions; `ask` and local-only `yolo` remain explicit alternatives.
 
+## Implementation status (2026-09-12)
+
+- Slice B: `supervisor::start_named_with_environment` and `start_public_with_environment` default to `Agent`; `start_local_with_environment` maps `--yolo` to `Yolo` and otherwise `Agent`. Explicit `Ask` remains available.
+- Slice C: `approvals::ApprovalClass` plus `local_approval`/`ensure_local_approval` centralize the mode policy. `Ask` keeps approval for Git/`local_agent_run`/`dev_tool_run`/checkpoints/patches/integrations; `Agent` skips only the Temote-local prompt for those validated structured operations; `Yolo` keeps its existing local behavior. `without_sandbox` stays approval-gated in `Agent` because it leaves the sandbox.
+- Slice D: `session permission <id> ask|agent|yolo` is supported end to end; `session list` reports the permission mode; manual `session restart` preserves the stored mode instead of downgrading `Agent` to `Ask`; automatic restart and upgrade handoff already carried the mode and now have explicit coverage.
+- Required tests for Agent defaults, explicit Ask/Yolo, public `Agent`/non-yolo, approval-free Git/`dev_tool_run`, sandboxed Agent `execute`, mode preservation across manual/automatic restart and handoff, and Ask fail-closed behavior are in place.
+
 ## Recommended next implementation slice
 
-Start with **Slice A only**. It is deliberately behavior-preserving and establishes a single permission source of truth before changing defaults or approval decisions.
+Both issues' remaining scope is documentation/live-acceptance upkeep; no further implementation slice is required for the agent-mode contract itself.

@@ -10,7 +10,7 @@ Temote MCP supports three production connection profiles. Cloudflare and Tailsca
 | `tailscale` | Tailscale Funnel public HTTPS | Temote local OAuth |
 | `openai` | OpenAI Secure MCP Tunnel | OpenAI tunnel connection + Temote local sandbox/approval |
 
-Omitting `--profile` keeps the existing `cloudflare` behavior for compatibility. All three profiles terminate at the same provider-neutral MCP core. Remote access never exposes `without_sandbox`; managed sessions keep the same named-root, sandbox, and local runtime-approval rules regardless of profile.
+Omitting `--profile` keeps the existing `cloudflare` behavior for compatibility. All three profiles terminate at the same provider-neutral MCP core. Remote access never exposes `without_sandbox`; managed sessions keep the same named-root, sandbox, and tool-specific rules regardless of profile. New public sessions default to the sandboxed `agent` permission mode, so validated structured operations do not need a local approval console; the stricter `ask` mode remains available through a local `session permission` transition.
 
 ## Cloudflare profile
 
@@ -161,7 +161,7 @@ tunnel-client run \
 
 The exact local port follows `--addr`; non-loopback bind addresses are rejected. `temote-mcp down` stops the Temote HTTP origin and its direct `tunnel-client` child only; the lifecycle supervisor and sessions remain alive. It does not create a public listener, public OAuth server, Cloudflare Tunnel, or Tailscale Funnel.
 
-The tunnel transport is not treated as a reason to enable yolo mode. Remote tool calls still enter the same managed-session, named-root, sandbox, and host/network-sensitive approval boundaries. OpenAI tunnel identity fields that are not supplied by the tunnel are not invented by Temote.
+The tunnel transport is not treated as a reason to enable yolo mode. Remote tool calls still enter the same managed-session, named-root, and sandbox boundaries; validated structured operations in the default `agent` mode skip only the Temote-local approval prompt. OpenAI tunnel identity fields that are not supplied by the tunnel are not invented by Temote.
 
 Official references: [OpenAI tunnel-client](https://github.com/openai/tunnel-client) and [ChatGPT developer mode / MCP connectors](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt).
 
@@ -191,6 +191,6 @@ For the Tailscale profile, an unauthenticated `/mcp` request returns `401` with 
 
 ## Remote tool and managed-session boundary
 
-With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start`, `session_stop`, and `session_restart`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` and `session_restart` are limited to sessions marked HTTP-owned by the lifecycle supervisor. Public session-bound tools reject separately started yolo sessions instead of inheriting their unrestricted local semantics.
+With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start`, `session_stop`, and `session_restart`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` and `session_restart` are limited to sessions marked HTTP-owned by the lifecycle supervisor. Public session-bound tools reject separately started yolo sessions instead of inheriting their unrestricted local semantics. New public sessions default to `agent`.
 
-Remote profiles do not expose `without_sandbox`. Normal sessions keep filesystem containment and a network-disabled sandbox, while host/network-sensitive operations still require local approval. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.
+Remote profiles do not expose `without_sandbox`. Normal sessions keep filesystem containment and a network-disabled sandbox. The default `agent` mode skips only the Temote-local approval prompt for validated structured operations; tool-specific validation, integration authentication, and the sandbox boundary remain authoritative. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.

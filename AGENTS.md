@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Temote MCP is a Rust MCP server for operating local machines through explicit sessions. Normal sessions are path-scoped, command execution is sandboxed with network disabled, and host/network operations are approval-gated. `--yolo` intentionally removes those Temote MCP boundaries.
+Temote MCP is a Rust MCP server for operating local machines through explicit sessions. Normal sessions are path-scoped, command execution is sandboxed with network disabled, and the default `agent` permission mode is sandboxed but approval-free for validated structured operations. `ask` keeps the local approval console for host/network-sensitive operations, and `--yolo` intentionally removes those Temote MCP boundaries.
 
 ## Repository rules
 
@@ -29,7 +29,9 @@ Do not weaken these without an explicit issue describing the security model chan
 - Ordinary sandboxed commands must not gain write access to Git metadata. Use the dedicated Git tools for index/commit/remote operations.
 - `git_pull` stays fast-forward-only; `git_push` must not expose force or arbitrary URL/refspec input.
 - Public HTTP must not expose `without_sandbox`.
-- Host/network operations remain approval-gated in normal sessions.
+- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (Git fetch/pull/push, `local_agent_run`, `dev_tool_run`, checkpoints/patches, and structured integrations) and must never widen sandbox, path, network, or tool-specific capability.
+- New local managed and authenticated public sessions default to `agent`; public HTTP must not create or promote `yolo`.
+- `dev_tool_run` accepts only classified Cargo/Vite+ operations, never an executable or raw argv. `vp run|exec|dlx`, self-mutation operations, and unknown operations must stay rejected rather than entering an offline/safe path.
 - `--yolo` may bypass Temote MCP sandbox/path/approval boundaries, but should not silently change unrelated client authorization semantics.
 - Secrets must not be written to session metadata, audit logs, approval summaries, or ordinary tool output.
 - Child MCP approval summaries should expose argument keys, not secret values.
@@ -40,8 +42,8 @@ Do not weaken these without an explicit issue describing the security model chan
 - `execute` returns inline when it completes within the foreground timeout; longer work returns a `job_id` for `poll_job` / `stop_job`.
 - Background jobs are session-owned and cancelled when the session stops or reaches its lifetime limit.
 - 1Password child MCP usage is discover-first: `onepassword_mcp_discover`, then resource/tool calls.
-- kintone child MCP usage is status/discover-first and mutating ambiguity remains approval-gated in normal mode.
-- cli-kintone usage is status-first; keep credentials/session target out of agent-supplied argv, validate file paths against permitted roots, and approval-gate all runs in normal mode.
+- kintone child MCP usage is status/discover-first; `agent` skips only the Temote-local approval prompt for validated structured calls, while kintone authentication and argument validation remain enforced.
+- cli-kintone usage is status-first; keep credentials/session target out of agent-supplied argv, validate file paths against permitted roots, and keep `ask` approval-gated (in `agent`, only the Temote-local prompt is skipped).
 
 ## Development workflow
 

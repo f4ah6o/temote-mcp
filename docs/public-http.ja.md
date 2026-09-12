@@ -10,7 +10,7 @@ Temote MCP は3つの production connection profile を提供します。Cloudfl
 | `tailscale` | Tailscale Funnel public HTTPS | Temote local OAuth |
 | `openai` | OpenAI Secure MCP Tunnel | OpenAI tunnel connection + Temote local sandbox/approval |
 
-`--profile` を省略した場合は既存互換のため `cloudflare` として動作します。3 profile とも同じ provider-neutral MCP core に到達します。remote access に `without_sandbox` は出ず、managed session の named root、sandbox、runtime approval の境界も profile によって変わりません。
+`--profile` を省略した場合は既存互換のため `cloudflare` として動作します。3 profile とも同じ provider-neutral MCP core に到達します。remote access に `without_sandbox` は出ず、managed session の named root、sandbox、tool 固有規則も profile によって変わりません。新規 public session の permission mode は sandboxed な `agent` が既定で、検証済み structured operation に local approval console は不要です。より厳格な `ask` は local の `session permission` で選べます。
 
 ## Cloudflare profile
 
@@ -159,7 +159,7 @@ tunnel-client run \
 
 local port は `--addr` に従い、non-loopback bind は拒否します。`temote-mcp down` が停止するのは Temote の HTTP origin と直接起動した `tunnel-client` child だけで、lifecycle supervisor と session は停止しません。public listener、public OAuth server、Cloudflare Tunnel、Tailscale Funnel は作成しません。
 
-tunnel 接続成功を yolo の根拠にはしません。remote tool call は同じ managed-session / named-root / sandbox / host・network-sensitive approval 境界へ入ります。OpenAI tunnel から提供されない identity claim を Temote 側で推測して生成しません。
+tunnel 接続成功を yolo の根拠にはしません。remote tool call は同じ managed-session / named-root / sandbox 境界へ入り、既定の `agent` では検証済み structured operation が Temote 側の local approval prompt だけを省略します。OpenAI tunnel から提供されない identity claim を Temote 側で推測して生成しません。
 
 公式資料: [OpenAI tunnel-client](https://github.com/openai/tunnel-client)、[ChatGPT developer mode / MCP connectors](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt)。
 
@@ -189,6 +189,6 @@ Tailscale profile の未認証 `/mcp` は `401` と Bearer `WWW-Authenticate` ch
 
 ## Remote tool / managed session の境界
 
-`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` / `session_restart` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` / `session_restart` は lifecycle supervisor が public-owned として保持する session に限定されます。public session-bound tool は別途起動した yolo session を拒否し、unrestricted な local semantics を remote access に引き継ぎません。
+`TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` / `session_restart` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません（新規 session は `agent` が既定）。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` / `session_restart` は lifecycle supervisor が public-owned として保持する session に限定されます。public session-bound tool は別途起動した yolo session を拒否し、unrestricted な local semantics を remote access に引き継ぎません。
 
-remote profile に `without_sandbox` は出ません。通常 session は filesystem containment と network-disabled sandbox を維持し、host/network-sensitive operation は引き続き local approval が必要です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。
+remote profile に `without_sandbox` は出ません。通常 session は filesystem containment と network-disabled sandbox を維持します。既定の `agent` は検証済み structured operation の Temote 側 approval prompt だけを省略し、tool 固有 validation、integration の authentication、sandbox 境界は引き続き有効です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。

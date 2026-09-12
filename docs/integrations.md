@@ -19,13 +19,13 @@ Use the bridge in this order:
 2. `onepassword_mcp_read_resource` for documentation/resources advertised by the child server.
 3. `onepassword_mcp_call` for a named child tool.
 
-Normal sessions approval-gate child tools that are not marked read-only. Argument values are not persisted in approval summaries.
+In `ask` mode, child tools that are not marked read-only are approval-gated; in the default `agent` mode the validated structured call skips only the Temote-local approval prompt while 1Password's own authorization still applies. Argument values are not persisted in approval summaries.
 
 ### Batched item reads with the official CLI
 
 `onepassword_item_get` reads general 1Password items through the official `op` CLI and batches multiple requested items into one upstream `op item get -` call. Supply exact item IDs or exact titles; use `vault` to disambiguate repeated titles and `account` when the host has multiple 1Password accounts.
 
-The bridge first resolves item overviews with the official CLI, removes duplicate resolved item IDs, and then performs one batch fetch. Concurrent reads in the same session and `(account, vault)` scope are held for a bounded 15 ms micro-batch window and share one list/get pair up to the 100-item limit. Results are fanned back out by resolved item ID; a canceled or invalid caller does not cancel or poison unrelated callers. No secret plaintext is stored in a durable cache. The returned JSON can contain secret values. Normal sessions therefore require local approval even though the operation is read-only. Approval/activity text reports only counts and whether a scope was configured; item titles and returned values are not logged.
+The bridge first resolves item overviews with the official CLI, removes duplicate resolved item IDs, and then performs one batch fetch. Concurrent reads in the same session and `(account, vault)` scope are held for a bounded 15 ms micro-batch window and share one list/get pair up to the 100-item limit. Results are fanned back out by resolved item ID; a canceled or invalid caller does not cancel or poison unrelated callers. No secret plaintext is stored in a durable cache. The returned JSON can contain secret values. `ask` mode therefore requires local approval even though the operation is read-only; `agent` mode skips the Temote-local prompt, but the operation still requires the configured 1Password account and its own authorization. Approval/activity text reports only counts and whether a scope was configured; item titles and returned values are not logged.
 
 This path keeps the official 1Password authentication, encryption, synchronization, and cache semantics. It does not write the local 1Password database.
 
@@ -60,7 +60,7 @@ The broker uses one JSON line per connection:
 
 A successful response is `{"value":"..."}`; failures are `{"error":"..."}`. Clients should treat broker connection, authorization, locator, and resolution errors as hard failures and must not fall back to plaintext files or interactive credentials. Keep this protocol behind the application's `SecretReader` abstraction rather than coupling business logic to Temote. Temote removes the socket after the command and redacts the capability token and any values returned by the broker if the child later writes them to captured stdout/stderr. No resolved value or service-account token is persisted by the broker.
 
-Normal sessions still require host approval. `--yolo` removes that Temote MCP approval boundary.
+`ask` mode still requires host approval. `agent` skips the Temote-local approval prompt for the validated structured call, and `--yolo` removes the Temote approval boundary entirely; the service account token capability rules are unchanged in every mode.
 
 ## kintone MCP Server
 
@@ -88,7 +88,7 @@ Use the bridge in this order:
 2. `kintone_mcp_discover` lists the child server's current tool schemas.
 3. `kintone_mcp_call` invokes a discovered tool.
 
-Because the upstream server does not currently annotate every tool as read-only versus mutating, forwarded kintone calls are approval-gated in normal Temote MCP sessions.
+Because the upstream server does not currently annotate every tool as read-only versus mutating, forwarded kintone calls are approval-gated in `ask` mode and skip only the Temote-local prompt in `agent` mode; kintone authentication, discovery gating, and argument validation are unchanged.
 
 The child process receives only a small runtime environment plus allow-listed kintone settings. Other credentials inherited by `temote-mcp start` are not passed through automatically.
 
@@ -115,4 +115,4 @@ Use `kintone_cli_status` first. `kintone_cli_run` then accepts only these API-ba
 
 Connection/authentication and target options such as `--base-url`, `--username`, `--password`, `--api-token`, proxy, PFX, and `--guest-space-id` are rejected in agent-supplied arguments so credentials and the tenant/guest-space target stay pinned to the session process. PFX is intentionally not forwarded through the CLI bridge because current cli-kintone exposes its certificate password only as a command-line option; use the kintone MCP bridge when PFX authentication is required.
 
-Path-bearing CLI options such as `--attachments-dir`, `--file-path`, `--input`, and `--output` are resolved against the requested working directory and must remain inside permitted roots in normal sessions. Customize manifests are preflighted so local JS/CSS references cannot escape those roots; attachment imports reject parent traversal and symlinks in the attachment tree. `stdout_path` can atomically save stdout, which is useful for large `record export` CSV output. All `kintone_cli_run` calls require local approval in normal mode. The CLI child receives only allow-listed runtime/kintone environment variables rather than the full `temote-mcp start` environment.
+Path-bearing CLI options such as `--attachments-dir`, `--file-path`, `--input`, and `--output` are resolved against the requested working directory and must remain inside permitted roots in normal sessions. Customize manifests are preflighted so local JS/CSS references cannot escape those roots; attachment imports reject parent traversal and symlinks in the attachment tree. `stdout_path` can atomically save stdout, which is useful for large `record export` CSV output. All `kintone_cli_run` calls require local approval in `ask` mode and skip only the Temote-local prompt in `agent` mode. The CLI child receives only allow-listed runtime/kintone environment variables rather than the full `temote-mcp start` environment.
