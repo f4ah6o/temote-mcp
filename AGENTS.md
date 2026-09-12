@@ -76,3 +76,6 @@ When behavior changes, update the narrowest relevant document and the skill only
 ## Release
 
 Releases use CalVer `YYYY.MM.PATCH` in `Asia/Tokyo` through `f4ah6o/calver-action`. The `latest` tag selects the release candidate; the allocator workflow creates a release-only version commit and immutable CalVer tag rather than merging that version bump back into `main`, then dispatches cargo-dist on that tag. Keep binary distribution settings in `dist-workspace.toml` and regenerate `.github/workflows/release.yml` with `dist generate` instead of hand-editing the generated workflow.
+
+- Version bumps are owned exclusively by the GitHub Actions CalVer workflow. Do not manually edit `Cargo.toml`, `Cargo.lock`, or other package/version metadata merely to advance the Temote version on `main` or in an implementation branch.
+- A local rebuild/install from `main` may therefore report the repository's baseline package version and must not be treated as a release-version bump. Release/version verification should use the CalVer workflow output/tag rather than locally mutating version metadata.

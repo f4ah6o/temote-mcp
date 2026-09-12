@@ -1644,6 +1644,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn codex_task_is_delivered_exactly_over_stdin() -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if running_inside_non_nestable_macos_sandbox() {
+            return Ok(());
+        }
         let root = tempfile::tempdir().unwrap();
         let state = AgentState::create(Agent::Codex, &[]).unwrap();
         let task = "x".repeat(MAX_TASK_BYTES);
@@ -1658,6 +1662,7 @@ mod tests {
             environment: {
                 let mut environment = HashMap::new();
                 state.apply_to_environment(Agent::Codex, &mut environment);
+                environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
                 environment
             },
             session_roots: Vec::new(),
@@ -2004,8 +2009,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn output_uses_the_shared_bounded_capture() {
+        #[cfg(target_os = "macos")]
+        if running_inside_non_nestable_macos_sandbox() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let state = AgentState::create(Agent::Codex, &[]).unwrap();
+        let output_fixture = root.path().join("output-fixture");
+        fs::write(
+            &output_fixture,
+            vec![b'x'; sandbox::MAX_COMMAND_OUTPUT_BYTES + 1],
+        )
+        .unwrap();
         let prepared = PreparedRun {
             agent: Agent::Codex,
             access: Access::ReadOnly,
@@ -2014,7 +2029,7 @@ mod tests {
                 "/usr/bin/head".to_owned(),
                 "-c".to_owned(),
                 (sandbox::MAX_COMMAND_OUTPUT_BYTES + 1).to_string(),
-                "/dev/zero".to_owned(),
+                output_fixture.to_string_lossy().into_owned(),
             ],
             environment: HashMap::from([
                 (
@@ -2041,9 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn local_agent_workspace_visibility_and_write_scope_is_limited_to_selected_cwd() {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
-        {
+        if running_inside_non_nestable_macos_sandbox() {
             return;
         }
         let fixture_parent_path = std::env::var_os("HOME")
@@ -2324,6 +2337,33 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn vite_plus_launcher_reports_missing_package_runtime_and_managed_runtime() {
+        let fixture = vite_plus_shaped_fixture();
+        let package_runtime = fixture
+            .package_store
+            .join("lib/node_modules/@openai/codex/bin/codex.js");
+        fs::remove_file(&package_runtime).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("package runtime is missing"));
+
+        let fixture = vite_plus_shaped_fixture();
+        fs::remove_dir(fixture.home.join("js_runtime")).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("managed runtime is missing"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn launcher_dependency_traversal_rejects_cycles() {
         use std::os::unix::fs::symlink;
 
@@ -2334,6 +2374,55 @@ mod tests {
         symlink(&first, &second).unwrap();
         let error = launcher_dependency_closure(&first, Path::new("/tmp/target"), &[]).unwrap_err();
         assert!(error.to_string().contains("dependency cycle"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launcher_dependency_traversal_rejects_excessive_hops() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("codex");
+        for index in 0..=MAX_LAUNCHER_SYMLINK_HOPS {
+            let current = fixture.path().join(format!("hop-{index}"));
+            let next = fixture.path().join(format!("hop-{}", index + 1));
+            symlink(&next, &current).unwrap();
+        }
+        symlink(fixture.path().join("hop-0"), &first).unwrap();
+        let error = launcher_dependency_closure(&first, Path::new("/tmp/target"), &[]).unwrap_err();
+        assert!(error.to_string().contains("exceeds 16 symlink hops"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_launcher_rejects_dependency_paths_outside_vp_home() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = vite_plus_shaped_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let package_root = fixture.home.join("packages/@openai/codex");
+        fs::remove_dir_all(&package_root).unwrap();
+        fs::create_dir_all(
+            outside
+                .path()
+                .join("install/lib/node_modules/@openai/codex/bin"),
+        )
+        .unwrap();
+        fs::write(
+            outside
+                .path()
+                .join("install/lib/node_modules/@openai/codex/bin/codex.js"),
+            b"// outside package runtime\n",
+        )
+        .unwrap();
+        symlink(outside.path(), &package_root).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("resolves outside VP_HOME"));
     }
 
     #[test]
@@ -2360,6 +2449,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn vite_plus_launcher_reads_verified_inputs_in_local_agent_sandbox() {
+        #[cfg(target_os = "macos")]
+        if running_inside_non_nestable_macos_sandbox() {
+            return;
+        }
         let fixture = vite_plus_shaped_fixture();
         let store_file = fixture
             .package_store
@@ -2406,5 +2499,22 @@ mod tests {
                 .iter()
                 .any(|root| unrelated == *root || unrelated.starts_with(root))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running_inside_non_nestable_macos_sandbox() -> bool {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
+        {
+            return true;
+        }
+
+        // A developer broker may sandbox the test process already. macOS
+        // rejects a nested Seatbelt launch with status 71 in that case.
+        std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1) (allow default)", "--", "/usr/bin/true"])
+            .status()
+            .map(|status| status.code() == Some(71))
+            .unwrap_or(false)
     }
 }

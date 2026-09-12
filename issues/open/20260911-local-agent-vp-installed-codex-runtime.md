@@ -214,3 +214,43 @@ Identified missing runtime dependency class: launcher-side paths needed to resol
 ## Implementation notes (2026-09-12)
 
 `local_agent_run` now recognizes only the reproduced symlinked Vite+ Codex layout. It verifies a bounded symlink chain, the Codex metadata file, exactly one package install, the package runtime, and `js_runtime`; it then exposes the canonical dependency directories read-only and supplies the derived `VP_HOME` internally. Standalone and unrelated symlinked executables retain the existing two-root behavior. The dependency closure and derived launcher environment are revalidated after approval, and missing metadata/runtime, install escapes, and cycles fail with precise errors.
+
+## Verification (2026-09-12, external Temote run)
+
+Verification remains pending. The test-harness edits were verified externally, but nested macOS Seatbelt execution is unavailable under the already-sandboxed Temote developer broker. The active Temote server also appears to run the pre-closure behavior, so the live Codex result is not authoritative for the current source. No credentials, prompts, or environment values were collected.
+
+### Latest verification status
+
+- `cargo test local_agent::tests:: -- --nocapture`: **PASS**, 31 passed, 0 failed, 0 ignored. The nested Seatbelt probe emits status-71 stderr; affected tests skip only after that explicit probe.
+- `cargo test sandbox:: -- --nocapture`: 29 passed, 11 failed. All 11 failures are macOS Seatbelt execution tests, each failing with `Operation not permitted` under the already-sandboxed Temote developer broker. This is an environment limitation for nested Seatbelt, not evidence that the Vite+ closure is broken.
+- `cargo test --all-targets`: same early library result, 29 passed and 11 failed on those same Seatbelt tests; the suite stops at the library failure.
+- `cargo fmt --all -- --check`: initially found one formatting diff in the newly added excessive-hop test; `cargo fmt --all` was applied and the recheck now **PASS**.
+- `cargo clippy --all-targets -- -D warnings`: **PASS**.
+- `cargo check --no-default-features --all-targets`: **PASS**, with 5 existing `dead_code` warnings.
+- `git diff --check`: **PASS**.
+
+### Coverage map
+
+The following deterministic coverage is present in `src/local_agent.rs`:
+
+- standalone and unrelated symlink resolution: `executable_resolution_preserves_symlink_candidate_and_validates_target`;
+- Vite+-shaped resolution and sandbox visibility: `vite_plus_shaped_launcher_resolves_through_current_symlink`, `vite_plus_launcher_reads_verified_inputs_in_local_agent_sandbox`, and `vite_plus_shaped_launcher_exposes_verified_dependency_closure`;
+- approval-time target replacement: `approval_revalidation_rejects_a_changed_symlink_target`;
+- precise missing dependency errors: `vite_plus_launcher_reports_missing_managed_dependency`, `vite_plus_launcher_reports_missing_package_runtime_and_managed_runtime`;
+- bounded and cycle-safe traversal: `launcher_dependency_traversal_rejects_cycles` and `launcher_dependency_traversal_rejects_excessive_hops`;
+- unsafe package-store escape rejection: `vite_plus_launcher_rejects_dependency_paths_outside_vp_home`;
+- package-manager state restriction: `vite_plus_launcher_does_not_expose_unrelated_package_manager_state`;
+- read-only/workspace-write scope and bounded output: `local_agent_workspace_visibility_and_write_scope_is_limited_to_selected_cwd` and `output_uses_the_shared_bounded_capture`;
+- auth/environment isolation: `environment_allowlist_excludes_credentials_and_proxy_values`, `existing_authentication_is_imported_without_exposing_user_state`, and the Codex/OpenCode auth permission tests;
+- OpenCode contract: `opencode_contract_uses_json_and_denies_shell`.
+
+Platform-specific sandbox policy coverage remains in `src/sandbox/macos.rs` and `src/sandbox/linux/policy.rs`; the fixture coverage is Unix-gated and does not substitute for a live macOS Vite+ installation check.
+
+The live call from the active `temo` session also still fails:
+
+```text
+local_agent_run(agent=codex, access=read_only)
+exit 71 at /Users/fu2hito/.vite-plus/bin/codex
+```
+
+Current source inspection indicates that the active server is likely pre-closure. Rebuild and restart the active Temote server before treating this live result as verification of the fix. Acceptance remains incomplete pending an unsandboxed macOS run and a successful live Codex call through the rebuilt server.
