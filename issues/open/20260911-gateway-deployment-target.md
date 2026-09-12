@@ -1,8 +1,8 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open / Slice A (docs decision table + deterministic docs check) landed on main; optional preflight and live acceptance not started
+Status: open / Slice A landed on main; Slice B implemented in the current worktree and awaiting review/commit; live acceptance not started
 Created: 2026-09-11
-Updated: 2026-09-11
+Updated: 2026-09-12
 Priority: P1 operational correctness
 
 ## 概要
@@ -140,7 +140,7 @@ Live acceptance（実装完了の repository-local gate とは分離）:
 
 ## Recommended next slice
 
-**Slice A only.** 実 Cloudflare mutation を伴わず、deployment target の選択・検証契約を先に固定する。
+**Slice B implemented in the current worktree.** 実 Cloudflare mutation を伴わず、local target selection を preflight で検査する。review/commit 後に main へ landed と記録する。
 
 ## Implementation notes (2026-09-11)
 
@@ -150,3 +150,14 @@ Slice A landed on main:
 - `tests/gateway_deployment_docs.rs` deterministically checks both documents for the required operator contract and rejects any `workers_dev = true` guidance.
 
 No Cloudflare route, DNS, Access, or Tunnel state was changed.
+
+## Implementation notes (2026-09-12)
+
+Slice B implemented in the current worktree (not yet committed):
+
+- `gateway/scripts/deployment-preflight.mjs` checks local `workers_dev = false` configuration and an explicitly supplied route or custom-domain target.
+- It distinguishes `target_missing`, `target_mismatch`, and `remote_unknown`; it never uses Cloudflare credentials or claims remote readiness.
+- `gateway/test/deployment-preflight.test.mjs` covers target-present, missing, mismatch, unsafe workers.dev configuration, and non-disclosure of target values.
+- `npm run deploy:preflight -- --hostname <host> --route '<host>/*'` is documented in both gateway operator guides.
+
+Cloudflare route/domain verification remains Slice C live acceptance.

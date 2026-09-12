@@ -59,6 +59,15 @@ npx wrangler deploy --keep-vars
 
 `workers_dev = false` では route または custom domain を指定しない deploy が Worker を公開せず、`No targets deployed` を表示することがあります。command が exit 0 でもこの出力は失敗として扱い、次のどちらか一方の target を明示します。
 
+Wrangler を実行する前に、意図した target を repository-local preflight で確認します。
+
+```sh
+cd gateway
+npm run deploy:preflight -- --hostname gateway.example.com --route 'gateway.example.com/*'
+```
+
+preflight は `target_missing`、`target_mismatch`、`remote_unknown` を区別して返します。`remote_unknown` は Cloudflare credential を使わないこの local check が、deploy 済み route や custom domain の存在を成功と偽装しないための状態です。non-zero 結果は target を修正し、下記の deploy 後 read-only verification が成功するまで停止として扱います。
+
 | Option | 使う条件 | target の設定 | Access | 確認 |
 | --- | --- | --- | --- | --- |
 | A. Custom domain | Worker に専用 hostname を割り当てる場合、または DNS record がまだ無い場合。 | hostname を Worker custom domain として宣言します。例: `gateway/wrangler.toml` の `routes = [{ pattern = "<gateway-host>", custom_domain = true }]`、または Cloudflare dashboard で作成します。 | hostname 全体を Cloudflare Access application で保護します。 | `npx wrangler deployments status --name temote-mcp-gateway` と `curl -sSf https://<gateway-host>/healthz`。 |

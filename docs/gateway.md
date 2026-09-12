@@ -59,6 +59,15 @@ The public MCP URL is `https://<gateway-host>/mcp`.
 
 `workers_dev = false` means a deploy without a route or custom domain does not publish the Worker and can print `No targets deployed`. Treat that output as a failure even when the command exits 0, and choose exactly one target:
 
+Before invoking Wrangler, run the repository-local preflight with the intended target:
+
+```sh
+cd gateway
+npm run deploy:preflight -- --hostname gateway.example.com --route 'gateway.example.com/*'
+```
+
+The preflight reports `target_missing`, `target_mismatch`, or `remote_unknown` as distinct statuses. `remote_unknown` is intentional: this local check does not use Cloudflare credentials and never claims that a deployed route or custom domain exists. Treat every non-zero result as a deployment stop until the target is corrected and the post-deploy read-only verification below succeeds.
+
 | Option | Use when | Target setup | Access | Verification |
 | --- | --- | --- | --- | --- |
 | A. Custom domain | The Worker should own a dedicated hostname, or no DNS record exists yet. | Declare the hostname as a Worker custom domain, for example `routes = [{ pattern = "<gateway-host>", custom_domain = true }]` in `gateway/wrangler.toml`, or create it in the Cloudflare dashboard. | Protect the whole hostname with a Cloudflare Access application. | `npx wrangler deployments status --name temote-mcp-gateway` and `curl -sSf https://<gateway-host>/healthz`. |
