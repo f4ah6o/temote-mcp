@@ -432,3 +432,72 @@ Post-agent verification was run through the Temote session:
 
 No commit or push was performed. All existing worktree changes and the untracked `.worktrees/`
 directory were preserved.
+
+## Pass 8 — MCP handshake process identity (2026-09-13)
+
+### Issue addressed
+
+`issues/open/20260908-07-client-safe-upgrade-reconnect.md` (endpoint generation-identity
+remainder). This pass stays repository-local and read-only: it exposes the existing
+non-secret process identity through the MCP handshake so a reconnecting client can
+verify host/version/boot generation, without adding remote upgrade tools, transport
+barriers, or credential-dependent calls.
+
+### Files changed
+
+- `src/mcp.rs`
+- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- Added `process_identity()` and `process_identity_meta()` in `src/mcp.rs`, returning
+  `host_id` (validated stable host identity with the existing OS-hostname fallback),
+  the running package `version`, and the existing per-process `boot_generation`.
+- `initialize`, `ping`, and `server/discover` now include
+  `_meta["io.temote/processIdentity"]`.
+- `modernize_result` now merges the modern `serverInfo` entry into an existing `_meta`
+  object instead of replacing it, so modern `initialize`/`ping` keep the identity field
+  while retaining the existing serverInfo metadata.
+- No MCP tool, schema, gateway contract, session, filesystem, or approval behavior
+  changed; the added values are non-secret and bounded.
+
+### Checks
+
+Post-agent verification was run through the Temote session:
+
+```text
+cargo test process_identity                        # PASS: 4 passed / 0 failed
+cargo test mcp::                                   # 82 passed / 6 failed (see note)
+cargo fmt --all -- --check                         # PASS
+cargo clippy --all-targets -- -D warnings          # PASS
+cargo check --no-default-features --all-targets    # PASS (5 existing dead_code warnings)
+(cd gateway && npm test)                           # PASS: 67 passed / 0 failed
+git diff --check                                   # PASS
+```
+
+`cargo test process_identity` passed 4/4, including the three new MCP identity tests plus
+the existing healthz identity test. All new identity tests also pass in `cargo test mcp::`
+(82 passed / 6 failed). The six failures are environment/Temote sandbox-host-state failures
+unrelated to this change:
+
+- `agent_dev_tool_run_executes_without_a_local_console`
+- `agent_git_fetch_skips_the_local_console`
+- `ask_git_fetch_still_fails_closed_without_a_console`
+- `file_tools_reject_special_file_targets_without_blocking`
+- `local_agent_run_requires_approval_and_denial_starts_no_job`
+- `session_list_surfaces_ambiguous_probe_as_unknown`
+
+Their errors are `Operation not permitted` / lifecycle-state or nested-sandbox constraints.
+
+### Remaining blockers
+
+- The one-shot upgrade coordinator, response-flush commit barrier, remote
+  `upgrade_preflight`/`upgrade_apply`/`upgrade_status` tools, and macOS/Linux
+  deliberate-disconnect E2E remain unimplemented.
+- Live Cloudflare route/Access/lease evidence remains credential/deployment dependent.
+
+### Git status
+
+No commit or push was performed. All existing worktree changes and the untracked
+`.worktrees/` directory were preserved.

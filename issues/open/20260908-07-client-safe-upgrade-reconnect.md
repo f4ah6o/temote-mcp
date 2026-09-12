@@ -35,6 +35,24 @@ response-flush commit barrier, the remote `upgrade_preflight` / `upgrade_apply`
 / `upgrade_status` tools, and the deliberate-disconnect process E2E on macOS and
 Linux.
 
+## Implementation status (2026-09-13, reconnect identity metadata)
+
+The MCP handshake now exposes the same bounded, non-secret process identity that
+`/healthz` already reports, so a reconnecting MCP client can verify the intended
+host, version, and boot generation without an out-of-band health probe:
+
+- `initialize`, `ping`, and `server/discover` include
+  `_meta["io.temote/processIdentity"] = {host_id, version, boot_generation}`.
+- `host_id` is the validated stable host identity (OS-hostname fallback),
+  `version` is the running package version, and `boot_generation` is the existing
+  per-process UUID. All three are non-secret.
+- `modernize_result` now merges the modern `serverInfo` entry into an existing
+  `_meta` object instead of replacing it, so modern `initialize`/`ping` retain the
+  identity field alongside the existing server metadata.
+- This completes the "health/initialize/ping identity metadata" item of the endpoint
+  generation-identity contract. The coordinator process, response-flush commit
+  barrier, remote upgrade tools, and both-platform deliberate-disconnect E2E remain.
+
 ## Implementation status (2026-09-11)
 
 Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.

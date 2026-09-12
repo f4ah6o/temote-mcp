@@ -47,6 +47,7 @@ const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the local session supervisor has no session for the required project, create one with session_start using a configured named-root path, then call session_info before normal tools. Existing tools require session_id except session_list and session_start.";
+const PROCESS_IDENTITY_META_KEY: &str = "io.temote/processIdentity";
 
 #[derive(Clone)]
 enum CachedJobResult {
@@ -243,14 +244,22 @@ async fn dispatch_with_mode(
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "initialize" => Ok(json!({
-            "protocolVersion": negotiate_protocol_version(request),
-            "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "temote-mcp", "title": "Temote MCP", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Call session_list first. On the public serve endpoint, use session_start with a configured named-root path when the required project session is absent, then call session_info before normal tools. Managed sessions are always normal sandboxed sessions; remote clients cannot create yolo sessions or self-approve host operations. A CLI session started locally with `temote-mcp start <session-id> --yolo` remains a separate local choice. The session mode does not control confirmation or authorization enforced by the MCP client."
-        })),
+        "initialize" => {
+            let mut result = json!({
+                "protocolVersion": negotiate_protocol_version(request),
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "temote-mcp", "title": "Temote MCP", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "Call session_list first. On the public serve endpoint, use session_start with a configured named-root path when the required project session is absent, then call session_info before normal tools. Managed sessions are always normal sandboxed sessions; remote clients cannot create yolo sessions or self-approve host operations. A CLI session started locally with `temote-mcp start <session-id> --yolo` remains a separate local choice. The session mode does not control confirmation or authorization enforced by the MCP client."
+            });
+            result["_meta"] = process_identity_meta();
+            Ok(result)
+        }
         "server/discover" => Ok(discover_result()),
-        "ping" => Ok(json!({})),
+        "ping" => {
+            let mut result = json!({});
+            result["_meta"] = process_identity_meta();
+            Ok(result)
+        }
         "tools/list" => Ok(json!({"tools": tools(public, sessions.is_some())})),
         "tools/call" => {
             call_tool(
@@ -362,6 +371,23 @@ fn validate_modern_request(request: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Bounded, non-secret process identity that a reconnecting MCP client can use to
+/// confirm it reached the intended host, version, and boot generation. It is not a
+/// credential and is never derived from session or environment secret material.
+fn process_identity() -> Value {
+    json!({
+        "host_id": crate::host_identity::resolve().unwrap_or_else(|_| "unknown".to_owned()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "boot_generation": crate::boot_identity::generation(),
+    })
+}
+
+fn process_identity_meta() -> Value {
+    let mut meta = serde_json::Map::new();
+    meta.insert(PROCESS_IDENTITY_META_KEY.to_owned(), process_identity());
+    Value::Object(meta)
+}
+
 fn server_info() -> Value {
     json!({
         "name": "temote-mcp",
@@ -371,6 +397,12 @@ fn server_info() -> Value {
 }
 
 fn discover_result() -> Value {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "io.modelcontextprotocol/serverInfo".to_owned(),
+        server_info(),
+    );
+    meta.insert(PROCESS_IDENTITY_META_KEY.to_owned(), process_identity());
     json!({
         "resultType": "complete",
         "supportedVersions": [MODERN_PROTOCOL_VERSION],
@@ -378,7 +410,7 @@ fn discover_result() -> Value {
         "instructions": SERVER_INSTRUCTIONS,
         "ttlMs": 0,
         "cacheScope": "private",
-        "_meta": {"io.modelcontextprotocol/serverInfo": server_info()}
+        "_meta": Value::Object(meta)
     })
 }
 
@@ -390,9 +422,15 @@ fn modernize_result(method: &str, mut result: Value) -> Value {
         return result;
     };
     object.insert("resultType".to_owned(), json!("complete"));
-    object.insert(
-        "_meta".to_owned(),
-        json!({"io.modelcontextprotocol/serverInfo": server_info()}),
+    let meta = object
+        .entry("_meta".to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    meta.as_object_mut().unwrap().insert(
+        "io.modelcontextprotocol/serverInfo".to_owned(),
+        server_info(),
     );
     if method == "tools/list" {
         object.insert("ttlMs".to_owned(), json!(0));
@@ -3835,6 +3873,111 @@ mod tests {
         });
         let result = dispatch(&request).await.unwrap();
         assert_eq!(result["protocolVersion"], LATEST_LEGACY_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn handshake_exposes_non_secret_process_identity() {
+        let initialize = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        let identity = &initialize["_meta"][PROCESS_IDENTITY_META_KEY];
+        let version = &identity["version"];
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        let boot_generation = &identity["boot_generation"];
+        assert_eq!(boot_generation, crate::boot_identity::generation());
+        assert!(identity["host_id"].is_string());
+        assert!(!identity["host_id"].as_str().unwrap().is_empty());
+
+        let ping = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        let ping_identity = &ping["_meta"][PROCESS_IDENTITY_META_KEY];
+        let initialize_identity = &initialize["_meta"][PROCESS_IDENTITY_META_KEY];
+        assert_eq!(ping_identity, initialize_identity);
+
+        let discover = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .await
+        .unwrap();
+        let discovered = &discover["_meta"][PROCESS_IDENTITY_META_KEY]["boot_generation"];
+        assert_eq!(discovered, crate::boot_identity::generation());
+
+        let encoded = serde_json::to_string(&initialize["_meta"])
+            .unwrap()
+            .to_ascii_lowercase();
+        for forbidden in ["token", "secret", "password", "authorization", "cookie"] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_initialize_keeps_server_info_and_process_identity() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "modern-init",
+            "method": "initialize",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        let server_name = &result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"];
+        assert_eq!(server_name, "temote-mcp");
+        let identity = &result["_meta"][PROCESS_IDENTITY_META_KEY];
+        let boot_generation = &identity["boot_generation"];
+        assert_eq!(boot_generation, crate::boot_identity::generation());
+    }
+
+    #[tokio::test]
+    async fn modern_ping_keeps_server_info_and_process_identity() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "modern-ping",
+            "method": "ping",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "temote-mcp"
+        );
+        let identity = &result["_meta"][PROCESS_IDENTITY_META_KEY];
+        assert_eq!(identity["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            identity["boot_generation"],
+            crate::boot_identity::generation()
+        );
+        assert!(identity["host_id"].is_string());
+        assert!(result.get(PROCESS_IDENTITY_META_KEY).is_none());
     }
 
     #[test]
