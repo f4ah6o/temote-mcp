@@ -375,7 +375,7 @@ pub async fn run_developer_tool(
         .kill_on_drop(true)
         .current_dir(&cwd)
         .env_clear()
-        .envs(environment)
+        .envs(developer_tool_environment(environment))
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -1079,6 +1079,18 @@ fn reserve_bytes(remaining: &AtomicUsize, maximum: usize) -> usize {
     }
 }
 
+/// Environment for a developer-tool child.
+///
+/// The caller-provided environment is already validated and filtered, so it is
+/// preserved verbatim. The sandbox marker is then forced so a nested
+/// Temote-aware tool always observes that it is running inside the bounded
+/// developer-tool profile, matching ordinary sandboxed execution.
+fn developer_tool_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut environment = environment.clone();
+    environment.insert("TEMOTE_MCP_SANDBOX".to_owned(), "1".to_owned());
+    environment
+}
+
 fn safe_environment() -> HashMap<String, String> {
     let mut environment = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "HOME"]
         .into_iter()
@@ -1233,6 +1245,46 @@ mod generic_tests {
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn developer_tool_environment_forces_the_sandbox_marker() {
+        let caller = HashMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("HOME".to_owned(), "/home/tester".to_owned()),
+            // filtered_environment strips TEMOTE_MCP_* names, but force the
+            // marker even if a caller supplies its own value.
+            ("TEMOTE_MCP_SANDBOX".to_owned(), "caller".to_owned()),
+        ]);
+        let environment = developer_tool_environment(&caller);
+        assert_eq!(
+            environment.get("TEMOTE_MCP_SANDBOX").map(String::as_str),
+            Some("1"),
+            "developer-tool children must always carry the sandbox marker"
+        );
+        assert_eq!(
+            environment.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin"),
+            "the filtered caller environment must be preserved"
+        );
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/home/tester")
+        );
+        assert_eq!(
+            environment.len(),
+            caller.len(),
+            "the marker must not add or drop unrelated entries"
+        );
+
+        let mut without_marker = caller.clone();
+        without_marker.remove("TEMOTE_MCP_SANDBOX");
+        let environment = developer_tool_environment(&without_marker);
+        assert_eq!(
+            environment.get("TEMOTE_MCP_SANDBOX").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(environment.len(), caller.len());
     }
 
     #[cfg(target_os = "linux")]

@@ -2449,12 +2449,8 @@ mod tests {
             );
         }
 
-        let results = classify_gateway_host_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            "mac-main",
-            None,
-        );
+        let results =
+            classify_gateway_host_status(StatusCode::INTERNAL_SERVER_ERROR, None, "mac-main", None);
         assert_eq!(
             gateway_status(&results, GatewayStage::AccessAuth),
             Some(GatewayStageStatus::Unavailable)

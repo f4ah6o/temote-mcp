@@ -171,3 +171,144 @@ git diff --check
 ### Git status
 
 No commit or push was performed. All uncommitted work from the previous passes was preserved.
+
+## Pass 4 — client-safe upgrade coordinator/observation core (2026-09-12)
+
+### Issue addressed
+
+`issues/open/20260908-07-client-safe-upgrade-reconnect.md`. This pass implemented the
+repository-local coordinator-safe primitives and durable read-only status that the
+issue's steps 2-4 and 7 require, without adding a remote protocol, transport barrier,
+or any credential-dependent call.
+
+### Files changed
+
+- `src/upgrade_transaction.rs`
+- `src/http.rs`
+- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- Added `UpgradeTransactionStatus` plus `UpgradeTransaction::status()`: a bounded,
+  non-secret, reconnect-safe projection (`terminal`, source/target version, host,
+  timestamps, reconnect/handoff/ingress flags, failure summary).
+- Added deterministic selection helpers `recent_transaction`,
+  `latest_completed_transaction`, and `active_transactions`; ties are broken by
+  transaction ID so two writes within the same second resolve consistently.
+- Added `classify_apply`, which returns `ExistingActive` for an idempotent same-target
+  retry, `ConflictActive` for a different active target, `AlreadyCompleted` for a
+  completed same-target request, and `StartNew` otherwise. This enforces "only one
+  destructive upgrade owns the runtime".
+- Added `transaction_lock_is_held`, a read-only owner probe that opens the existing
+  lock with `O_NOFOLLOW`, verifies regular file/owner-only mode, and uses
+  `flock(LOCK_EX|LOCK_NB)` without creating the lock file.
+- Added `incomplete_upgrade_transactions`, which classifies non-terminal transactions
+  with no live owner lock as stale/incomplete instead of success.
+- `/healthz` now includes `last_upgrade_transaction` via `latest_transaction_id`, a
+  best-effort read-only lookup that never creates state directories and reports `null`
+  rather than claiming state on any anomaly.
+- Added deterministic tests for the status view, recency/tie-break, completed
+  selection, non-terminal filtering, apply disposition, and read-only lock-owner
+  probing. None of the new tests perform network calls.
+
+### What was intentionally not changed
+
+- No `upgrade-coordinator` process, no response-flush commit barrier, and no remote
+  `upgrade_preflight` / `upgrade_apply` / `upgrade_status` tools.
+- No credential use, no Cloudflare/ingress state change, and no local CLI `upgrade`
+  behavior change.
+
+### Checks
+
+The parent Temote session reran the repository-local checks after implementation:
+
+```text
+cargo fmt --all -- --check                              # PASS (repository-wide)
+cargo test sandbox::generic_tests::developer_tool_environment_forces_the_sandbox_marker --locked  # PASS
+cargo test upgrade_transaction --locked                 # PASS: 16/16
+cargo test healthz --locked                             # PASS: 1/1
+cargo clippy --all-targets --locked -- -D warnings      # PASS
+cargo check --no-default-features --all-targets --locked  # PASS (existing dead_code warnings only)
+git diff --check                                        # PASS
+```
+
+Repository-wide `cargo fmt --all -- --check` now passes; the earlier
+`src/doctor.rs` formatting failure was corrected by rustfmt and is no longer present.
+
+The latest controlled broad-suite attempt was `cargo test --all-targets --all-features
+--locked`, run by the parent Temote session under the dev-offline sandbox with `HOME`
+redirected into the workspace and `TEMOTE_MCP_SANDBOX=1` forced through Cargo
+configuration so upgrade transaction and developer-broker state is writable. Result:
+**FAIL** overall — 604 passed, 76 failed, 1 ignored. The representative failures are the
+inability to bind `/tmp/temote-mcp-<uid>/*.sock` Unix sockets and loopback/host-IPC
+listeners under macOS Seatbelt, which returns `Operation not permitted (os error 1)`;
+this affects approvals, codex_app_server, config, http, mcp, session_control,
+supervisor, and related integration-style tests. The newly touched
+`upgrade_transaction` tests and
+`http::tests::healthz_exposes_non_secret_process_identity` passed in that broad run as
+well. This run used the existing live developer broker plus Cargo environment overrides,
+because the live server has not been replaced with the source-built broker. The remaining
+failures are a macOS Seatbelt capability boundary that intentionally denies host-IPC and
+loopback network operations; they are not evidence that the broad suite is green, and
+developer-tool network/IPC capability was not broadened to make them pass.
+
+### Remaining blockers
+
+- The one-shot coordinator, transport commit barrier, remote tools, and macOS/Linux
+  deliberate-disconnect E2E remain unimplemented.
+- Live Cloudflare route/Access/lease evidence remains credential/deployment dependent.
+
+### Git status
+
+No commit or push was performed. Existing worktree changes were preserved.
+
+## Pass 5 — upgrade transaction test-cleanup robustness (2026-09-12)
+
+### Issue addressed
+
+A real test-robustness defect surfaced while triaging the dev-offline full-suite
+failures: `upgrade_transaction::tests::Fixture::drop` derived its lock-file cleanup
+path with `lock_path(...).unwrap()`. `lock_path` calls `ensure_directory()`, so when the
+state directory was unavailable the `unwrap()` panicked during unwinding and aborted the
+entire test binary instead of letting the original failure be reported.
+
+### Files changed
+
+- `src/upgrade_transaction.rs`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- `Fixture::drop` now attempts `remove_transaction` first and then derives the lock-file
+  path from the read-only `upgrade_transaction_directory()` result. It performs no
+  `unwrap`, creates no state directories merely to compute the cleanup path, and ignores
+  missing artifacts or removal errors.
+- Extended the deterministic `transaction_lock_is_exclusive_and_released_on_drop` test to
+  remove the transaction and lock artifacts and then drop the fixture explicitly. This
+  freezes the non-panicking, best-effort cleanup contract without any global environment
+  mutation or new test binary.
+- No sandbox, path, network, permission, or release/version metadata was changed.
+
+### Checks
+
+The parent Temote session reran the repository-local checks after this change:
+
+```text
+cargo fmt --all -- --check                              # PASS (repository-wide)
+cargo test sandbox::generic_tests::developer_tool_environment_forces_the_sandbox_marker --locked  # PASS
+cargo test upgrade_transaction --locked                 # PASS: 16/16
+cargo test healthz --locked                             # PASS: 1/1
+cargo clippy --all-targets --locked -- -D warnings      # PASS
+cargo check --no-default-features --all-targets --locked  # PASS (existing dead_code warnings only)
+git diff --check                                        # PASS
+```
+
+The dev-offline broad suite still cannot exercise host-IPC/loopback integration tests
+under macOS Seatbelt (the `/tmp/temote-mcp-<uid>` socket and loopback `EPERM` failures
+described in Pass 4). That is a sandbox capability boundary, not a claim that the broad
+suite is green.
+
+### Git status
+
+No commit or push was performed. All existing worktree changes were preserved.

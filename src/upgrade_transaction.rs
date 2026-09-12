@@ -353,6 +353,218 @@ impl UpgradeTransactionLock {
     }
 }
 
+/// Bounded, non-secret, reconnect-safe view of a durable upgrade transaction.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpgradeTransactionStatus {
+    pub transaction_id: String,
+    pub state: UpgradeTransactionState,
+    pub terminal: bool,
+    pub source_version: String,
+    pub target_version: String,
+    pub host_id: String,
+    pub reconnect_expected: bool,
+    pub supervisor_handoff_required: bool,
+    pub ingress_restart_required: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub failure_summary: Option<String>,
+}
+
+impl UpgradeTransaction {
+    /// Projects the transaction into the fields a reconnect-safe status response
+    /// may expose, without introducing any credential or path material.
+    pub fn status(&self) -> UpgradeTransactionStatus {
+        UpgradeTransactionStatus {
+            transaction_id: self.transaction_id.clone(),
+            state: self.state,
+            terminal: self.state.is_terminal(),
+            source_version: self.source_version.clone(),
+            target_version: self.target_version.clone(),
+            host_id: self.host_id.clone(),
+            reconnect_expected: self.reconnect_expected,
+            supervisor_handoff_required: self.supervisor_handoff_required,
+            ingress_restart_required: self.ingress_restart_required,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            failure_summary: self.failure_summary.clone(),
+        }
+    }
+}
+
+/// Deterministic disposition for a newly requested remote upgrade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpgradeApplyDisposition {
+    /// No durable transaction owns the runtime; a coordinator may be started.
+    StartNew,
+    /// An active transaction already targets the same version; retry is idempotent.
+    ExistingActive(String),
+    /// An active transaction owns the runtime for a different version; fail closed.
+    ConflictActive(String),
+    /// The requested target was already completed; treat as a no-op.
+    AlreadyCompleted(String),
+}
+
+/// Selects the most recently updated transaction deterministically.
+///
+/// Recency is ordered by `updated_at`, then by transaction ID so two
+/// transactions touched within the same second still resolve to one record.
+pub fn recent_transaction(transactions: &[UpgradeTransaction]) -> Option<&UpgradeTransaction> {
+    transactions
+        .iter()
+        .max_by_key(|transaction| (transaction.updated_at, transaction.transaction_id.clone()))
+}
+
+/// Selects the most recently updated completed transaction, if any.
+pub fn latest_completed_transaction(
+    transactions: &[UpgradeTransaction],
+) -> Option<&UpgradeTransaction> {
+    transactions
+        .iter()
+        .filter(|transaction| transaction.state == UpgradeTransactionState::Completed)
+        .max_by_key(|transaction| (transaction.updated_at, transaction.transaction_id.clone()))
+}
+
+/// Returns the transactions that could still own the runtime.
+pub fn active_transactions(transactions: &[UpgradeTransaction]) -> Vec<&UpgradeTransaction> {
+    transactions
+        .iter()
+        .filter(|transaction| !transaction.state.is_terminal())
+        .collect()
+}
+
+/// Decides how a new remote apply request relates to durable transaction state.
+///
+/// A retried request for the same active target is idempotent, a different active
+/// target fails closed, and an already-completed target is a no-op. This keeps
+/// only one destructive transaction in charge of the runtime.
+pub fn classify_apply(
+    active: Option<&UpgradeTransaction>,
+    latest_completed: Option<&UpgradeTransaction>,
+    target_version: &str,
+) -> UpgradeApplyDisposition {
+    if let Some(active) = active {
+        return if active.target_version == target_version {
+            UpgradeApplyDisposition::ExistingActive(active.transaction_id.clone())
+        } else {
+            UpgradeApplyDisposition::ConflictActive(active.transaction_id.clone())
+        };
+    }
+    if let Some(completed) =
+        latest_completed.filter(|completed| completed.target_version == target_version)
+    {
+        return UpgradeApplyDisposition::AlreadyCompleted(completed.transaction_id.clone());
+    }
+    UpgradeApplyDisposition::StartNew
+}
+
+/// Read-only best-effort lookup of the most recent transaction identifier.
+///
+/// This never creates state directories and never fails health reporting: on any
+/// unexpected condition it reports `None` rather than claiming upgrade state.
+pub fn latest_transaction_id() -> Option<String> {
+    let directory = upgrade_transaction_directory().ok()?;
+    let entries = std::fs::read_dir(directory).ok()?;
+    let mut ids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if validate_transaction_id(id).is_err() {
+            continue;
+        }
+        ids.push(id.to_owned());
+        if ids.len() > MAX_UPGRADE_TRANSACTIONS {
+            return None;
+        }
+    }
+    let mut transactions = Vec::new();
+    for id in ids {
+        if let Ok(transaction) = read_transaction(&id) {
+            transactions.push(transaction);
+        }
+    }
+    recent_transaction(&transactions).map(|transaction| transaction.transaction_id.clone())
+}
+
+/// Read-only probe for whether another process currently owns the transaction lock.
+///
+/// A missing lock file means no owner and is not created by this probe, so the
+/// call is safe to make from diagnostics and startup classification.
+pub fn transaction_lock_is_held(transaction_id: &str) -> Result<bool> {
+    validate_transaction_id(transaction_id)?;
+    let path = upgrade_transaction_directory()?.join(format!("{transaction_id}.lock"));
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot open upgrade transaction lock {}", path.display())
+            });
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "upgrade transaction lock must be a regular file"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode & 0o077 == 0,
+        "upgrade transaction lock must be owner-only (mode {mode:04o})"
+    );
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if locked == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(true)
+    } else {
+        Err(error).context("cannot probe upgrade transaction lock")
+    }
+}
+
+/// A non-terminal transaction with no live owner lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncompleteUpgradeTransaction {
+    pub transaction_id: String,
+    pub state: UpgradeTransactionState,
+    pub target_version: String,
+}
+
+/// Classifies non-terminal transactions that no live process currently owns.
+///
+/// These are the candidates a later `upgrade_status`/repair invocation must
+/// report as stale or incomplete instead of silently claiming success.
+pub fn incomplete_upgrade_transactions() -> Result<Vec<IncompleteUpgradeTransaction>> {
+    let mut incomplete = Vec::new();
+    for id in list_transaction_ids()? {
+        let transaction = read_transaction(&id)?;
+        if transaction.state.is_terminal() {
+            continue;
+        }
+        if transaction_lock_is_held(&id)? {
+            continue;
+        }
+        incomplete.push(IncompleteUpgradeTransaction {
+            transaction_id: transaction.transaction_id,
+            state: transaction.state,
+            target_version: transaction.target_version,
+        });
+    }
+    Ok(incomplete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,8 +590,11 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = remove_transaction(&self.transaction.transaction_id);
-            let _ = std::fs::remove_file(lock_path(&self.transaction.transaction_id).unwrap());
+            let transaction_id = &self.transaction.transaction_id;
+            let _ = remove_transaction(transaction_id);
+            if let Ok(directory) = upgrade_transaction_directory() {
+                let _ = std::fs::remove_file(directory.join(format!("{transaction_id}.lock")));
+            }
         }
     }
 
@@ -537,6 +752,13 @@ mod tests {
         assert!(acquire_transaction_lock(&fixture.transaction.transaction_id).is_err());
         drop(lock);
         assert!(acquire_transaction_lock(&fixture.transaction.transaction_id).is_ok());
+
+        let id = fixture.transaction.transaction_id.clone();
+        let _ = remove_transaction(&id);
+        if let Ok(directory) = upgrade_transaction_directory() {
+            let _ = std::fs::remove_file(directory.join(format!("{id}.lock")));
+        }
+        drop(fixture);
     }
 
     #[cfg(unix)]
@@ -567,5 +789,127 @@ mod tests {
         assert!(!ids.iter().any(|id| id == "notes"));
         let _ = std::fs::remove_file(directory.join("not-a-transaction.txt"));
         let _ = std::fs::remove_file(directory.join("notes.json"));
+    }
+
+    #[test]
+    fn status_view_marks_terminal_states() {
+        let mut transaction = Fixture::new().transaction.clone();
+        transaction.state = UpgradeTransactionState::Prepared;
+        let status = transaction.status();
+        assert_eq!(status.transaction_id, transaction.transaction_id);
+        assert_eq!(status.target_version, transaction.target_version);
+        assert!(!status.terminal);
+
+        transaction.state = UpgradeTransactionState::Completed;
+        assert!(transaction.status().terminal);
+
+        let encoded = serde_json::to_string(&transaction.status()).unwrap();
+        for forbidden in ["token", "secret", "authorization", "cookie", "password"] {
+            assert!(!encoded.to_ascii_lowercase().contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn recent_transaction_prefers_updated_at_then_id() {
+        let mut older = Fixture::new().transaction.clone();
+        older.updated_at = 10;
+        let mut newer = Fixture::new().transaction.clone();
+        newer.updated_at = 20;
+        let transactions = vec![older.clone(), newer.clone()];
+        assert_eq!(
+            recent_transaction(&transactions).unwrap().transaction_id,
+            newer.transaction_id
+        );
+
+        let mut first = Fixture::new().transaction.clone();
+        let mut second = Fixture::new().transaction.clone();
+        first.updated_at = 5;
+        second.updated_at = 5;
+        let (greater, lesser) = if first.transaction_id > second.transaction_id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let transactions = vec![lesser.clone(), greater.clone()];
+        assert_eq!(
+            recent_transaction(&transactions).unwrap().transaction_id,
+            greater.transaction_id
+        );
+    }
+
+    #[test]
+    fn latest_completed_transaction_ignores_non_terminal_records() {
+        let mut completed = Fixture::new().transaction.clone();
+        completed.state = UpgradeTransactionState::Completed;
+        completed.updated_at = 10;
+        let mut active = Fixture::new().transaction.clone();
+        active.state = UpgradeTransactionState::Committed;
+        active.updated_at = 50;
+        let transactions = vec![completed.clone(), active];
+        assert_eq!(
+            latest_completed_transaction(&transactions)
+                .unwrap()
+                .transaction_id,
+            completed.transaction_id
+        );
+
+        let only_active = vec![Fixture::new().transaction.clone()];
+        assert!(latest_completed_transaction(&only_active).is_none());
+    }
+
+    #[test]
+    fn active_transactions_exclude_terminal_states() {
+        let mut prepared = Fixture::new().transaction.clone();
+        prepared.state = UpgradeTransactionState::Prepared;
+        let mut completed = Fixture::new().transaction.clone();
+        completed.state = UpgradeTransactionState::Completed;
+        let mut failed = Fixture::new().transaction.clone();
+        failed.state = UpgradeTransactionState::Failed;
+        let transactions = vec![prepared.clone(), completed, failed];
+        let active = active_transactions(&transactions);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].transaction_id, prepared.transaction_id);
+    }
+
+    #[test]
+    fn classify_apply_is_idempotent_and_conflict_safe() {
+        let mut active = Fixture::new().transaction.clone();
+        active.target_version = "2026.10.0".to_owned();
+        active.state = UpgradeTransactionState::Committed;
+        assert_eq!(
+            classify_apply(Some(&active), None, "2026.10.0"),
+            UpgradeApplyDisposition::ExistingActive(active.transaction_id.clone())
+        );
+        assert_eq!(
+            classify_apply(Some(&active), None, "2026.11.0"),
+            UpgradeApplyDisposition::ConflictActive(active.transaction_id.clone())
+        );
+
+        let mut completed = Fixture::new().transaction.clone();
+        completed.target_version = "2026.10.0".to_owned();
+        completed.state = UpgradeTransactionState::Completed;
+        assert_eq!(
+            classify_apply(None, Some(&completed), "2026.10.0"),
+            UpgradeApplyDisposition::AlreadyCompleted(completed.transaction_id.clone())
+        );
+        assert_eq!(
+            classify_apply(None, Some(&completed), "2026.11.0"),
+            UpgradeApplyDisposition::StartNew
+        );
+        assert_eq!(
+            classify_apply(None, None, "2026.10.0"),
+            UpgradeApplyDisposition::StartNew
+        );
+    }
+
+    #[test]
+    fn transaction_lock_probe_detects_live_owner_without_creating_files() {
+        let fixture = Fixture::new();
+        let id = fixture.transaction.transaction_id.clone();
+        assert!(!transaction_lock_is_held(&id).unwrap());
+        let lock = acquire_transaction_lock(&id).unwrap();
+        assert!(transaction_lock_is_held(&id).unwrap());
+        drop(lock);
+        assert!(!transaction_lock_is_held(&id).unwrap());
     }
 }

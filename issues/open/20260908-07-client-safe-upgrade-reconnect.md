@@ -11,6 +11,30 @@ an identity primitive for later reconnect verification only; remote upgrade
 tools, response-flush commit barriers, coordinator ownership, and live
 reconnect acceptance remain unimplemented.
 
+## Implementation status (2026-09-12, coordinator-safe transaction primitives)
+
+The repository-local coordinator/observation core is implemented on top of the
+step-1 schema:
+
+- `upgrade_transaction` exposes a bounded, non-secret `UpgradeTransactionStatus`
+  view (`terminal` flag, versions, host, timestamps, restart/reconnect flags,
+  failure summary) for a reconnect-safe status response.
+- Deterministic selection helpers (`recent_transaction`,
+  `latest_completed_transaction`, `active_transactions`) and
+  `classify_apply` implement retry idempotency (`ExistingActive`),
+  conflicting-active-target rejection (`ConflictActive`), and
+  completed-target no-op (`AlreadyCompleted`).
+- `transaction_lock_is_held` probes the existing owner lock read-only without
+  creating files, and `incomplete_upgrade_transactions` classifies non-terminal
+  transactions with no live owner as stale/incomplete rather than success.
+- `/healthz` now reports `last_upgrade_transaction` (bounded, non-secret,
+  best-effort) in addition to `host_id` and `boot_generation`.
+
+Still unimplemented: the one-shot `upgrade-coordinator` process, the transport
+response-flush commit barrier, the remote `upgrade_preflight` / `upgrade_apply`
+/ `upgrade_status` tools, and the deliberate-disconnect process E2E on macOS and
+Linux.
+
 ## Implementation status (2026-09-11)
 
 Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.

@@ -126,6 +126,7 @@ async fn healthz() -> Response {
         "service": "temote-mcp",
         "host_id": host_id,
         "boot_generation": crate::boot_identity::generation(),
+        "last_upgrade_transaction": crate::upgrade_transaction::latest_transaction_id(),
     }))
     .into_response()
 }
@@ -583,6 +584,7 @@ mod tests {
             uuid::Uuid::parse_str(generation).unwrap().to_string(),
             generation
         );
+        assert!(value.get("last_upgrade_transaction").is_some());
     }
 
     #[test]
