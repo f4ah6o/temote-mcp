@@ -501,3 +501,77 @@ Their errors are `Operation not permitted` / lifecycle-state or nested-sandbox c
 
 No commit or push was performed. All existing worktree changes and the untracked
 `.worktrees/` directory were preserved.
+
+## Pass 9 — client-safe upgrade coordinator state machine (2026-09-13)
+
+### Issue addressed
+
+`issues/open/20260908-07-client-safe-upgrade-reconnect.md` (suggested implementation
+order steps 4-5). This pass implements the repository-local coordinator state machine
+that owns durable transaction transitions and the response-flush commit barrier. It
+does not add an OS process wrapper, transport wiring, or remote tools.
+
+### Files changed
+
+- `src/upgrade_transaction.rs`
+- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- Added `UpgradeCoordinatorStep` (`Continue`/`Rollback`), the
+  `UpgradeCoordinatorExecutor` trait, and `run_upgrade_coordinator`.
+- `run_upgrade_coordinator` requires a `prepared` durable transaction, holds the
+  exclusive transaction lock for the whole run (a second live owner fails closed),
+  and awaits the existing `UpgradeCommitBarrier` before any destructive phase. A lost
+  or aborted transport records a terminal `failed` transaction and runs no phase; no
+  wall-clock delay is involved.
+- Successful phases are persisted one at a time before the next begins, so a crash or
+  a failed phase leaves a deterministic non-success record that
+  `incomplete_upgrade_transactions()` can report after reconnect. Phase rollback maps
+  to terminal `rolled_back`; a phase error maps to terminal `failed` with a bounded,
+  NUL-free, non-secret summary.
+- `UpgradeCommitBarrier::decide` now performs the pending-check and decision update
+  atomically inside `watch::Sender::send_if_modified`; concurrent cloned senders can
+  no longer both report success. A regression test asserts exactly one concurrent
+  `commit`/`abort` decision wins.
+- Added five deterministic `#[tokio::test]` cases: lost-transport abort with zero
+  phases, ordered completion of every required phase, rollback short-circuit, bounded
+  phase failure, and second-owner / non-prepared refusal.
+
+### What was intentionally not changed
+
+- No `upgrade-coordinator` CLI/process, no concrete executor, no transport commit
+  wiring, no remote `upgrade_preflight` / `upgrade_apply` / `upgrade_status` tools.
+- No Cloudflare/ingress state change, no credential use, and no local CLI `upgrade`
+  behavior change.
+- No real filesystem, path, sandbox, permission, or release metadata changes.
+
+### Checks
+
+Post-review verification was run through the Temote session. The ordinary developer
+broker uses the real macOS state directory, which is intentionally outside the
+repository sandbox and therefore produced `Operation not permitted` for filesystem
+fixtures. Re-running with `HOME` redirected to a workspace-local path while preserving
+the existing Cargo/Rustup toolchain paths exercised the same code without weakening
+the sandbox and passed all focused tests:
+
+```text
+cargo test upgrade_transaction                      # PASS: 28/28
+cargo fmt --all -- --check                           # PASS
+cargo clippy --all-targets -- -D warnings            # PASS
+cargo check --no-default-features --all-targets      # PASS (5 existing dead_code warnings)
+git diff --check                                     # PASS
+```
+
+### Remaining blockers
+
+- The one-shot coordinator process, its concrete executor, response-flush transport
+  wiring, remote upgrade tools, and macOS/Linux deliberate-disconnect E2E remain
+  unimplemented.
+- Live Cloudflare route/Access/lease evidence remains credential/deployment dependent.
+
+### Git status
+
+No commit or push was performed. No shell was available to capture `git status`;
+existing worktree changes were left untouched.

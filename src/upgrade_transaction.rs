@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::config;
 
@@ -50,6 +51,44 @@ impl UpgradeTransactionState {
 
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::RolledBack)
+    }
+
+    /// Position of a state along the coordinator's monotonic progress sequence.
+    ///
+    /// Terminal failure states have no position because they may be entered from
+    /// any non-terminal state rather than in sequence.
+    fn forward_order(self) -> Option<u8> {
+        Some(match self {
+            Self::Prepared => 0,
+            Self::Committed => 1,
+            Self::SupervisorHandoff => 2,
+            Self::SessionsVerifying => 3,
+            Self::IngressRestarting => 4,
+            Self::EndpointVerifying => 5,
+            Self::PluginReconciling => 6,
+            Self::Completed => 7,
+            Self::Failed | Self::RolledBack => return None,
+        })
+    }
+
+    /// Reports whether a coordinator may move the transaction into `next`.
+    ///
+    /// Non-terminal states advance strictly forward along
+    /// `prepared -> committed -> supervisor_handoff -> sessions_verifying ->
+    /// ingress_restarting -> endpoint_verifying -> plugin_reconciling -> completed`,
+    /// skipping stages that are not required. `failed`/`rolled_back` may be
+    /// entered from any non-terminal state. Terminal states never transition.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        if matches!(next, Self::Failed | Self::RolledBack) {
+            return true;
+        }
+        match (self.forward_order(), next.forward_order()) {
+            (Some(current), Some(next)) => next > current,
+            _ => false,
+        }
     }
 }
 
@@ -105,9 +144,86 @@ impl UpgradeTransaction {
             self.transaction_id,
             self.state.as_str()
         );
+        anyhow::ensure!(
+            self.state.can_transition_to(state),
+            "invalid upgrade transaction transition {} -> {}",
+            self.state.as_str(),
+            state.as_str()
+        );
         self.state = state;
         self.updated_at = config::unix_time();
         Ok(())
+    }
+
+    /// Records a deterministic terminal failure.
+    ///
+    /// Any non-terminal transaction may fail; the bounded summary is validated
+    /// with the same rules as a persisted transaction.
+    pub fn mark_failed(&mut self, summary: impl Into<String>) -> Result<()> {
+        anyhow::ensure!(
+            !self.state.is_terminal(),
+            "upgrade transaction {} is already terminal ({})",
+            self.transaction_id,
+            self.state.as_str()
+        );
+        let summary = summary.into();
+        anyhow::ensure!(
+            summary.len() <= MAX_FAILURE_SUMMARY_BYTES,
+            "upgrade transaction failure summary exceeds {MAX_FAILURE_SUMMARY_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            !summary.contains('\0'),
+            "upgrade transaction failure summary must not contain NUL"
+        );
+        self.state = UpgradeTransactionState::Failed;
+        self.failure_summary = Some(summary);
+        self.updated_at = config::unix_time();
+        Ok(())
+    }
+
+    /// Records a terminal rollback, optionally with a bounded failure summary.
+    pub fn mark_rolled_back(&mut self, summary: Option<String>) -> Result<()> {
+        anyhow::ensure!(
+            !self.state.is_terminal(),
+            "upgrade transaction {} is already terminal ({})",
+            self.transaction_id,
+            self.state.as_str()
+        );
+        if let Some(summary) = summary {
+            anyhow::ensure!(
+                summary.len() <= MAX_FAILURE_SUMMARY_BYTES,
+                "upgrade transaction failure summary exceeds {MAX_FAILURE_SUMMARY_BYTES} bytes"
+            );
+            anyhow::ensure!(
+                !summary.contains('\0'),
+                "upgrade transaction failure summary must not contain NUL"
+            );
+            self.failure_summary = Some(summary);
+        }
+        self.state = UpgradeTransactionState::RolledBack;
+        self.updated_at = config::unix_time();
+        Ok(())
+    }
+
+    /// Ordered coordinator phases this transaction must traverse after commit.
+    ///
+    /// Derived from the transaction's required work so a coordinator never
+    /// revisits a completed stage: supervisor handoff and ingress restart are
+    /// skipped when not required, while session/endpoint verification and plugin
+    /// reconciliation are always included before `completed`.
+    pub fn coordinator_phases(&self) -> Vec<UpgradeTransactionState> {
+        let mut phases = Vec::new();
+        if self.supervisor_handoff_required {
+            phases.push(UpgradeTransactionState::SupervisorHandoff);
+        }
+        phases.push(UpgradeTransactionState::SessionsVerifying);
+        if self.ingress_restart_required {
+            phases.push(UpgradeTransactionState::IngressRestarting);
+        }
+        phases.push(UpgradeTransactionState::EndpointVerifying);
+        phases.push(UpgradeTransactionState::PluginReconciling);
+        phases.push(UpgradeTransactionState::Completed);
+        phases
     }
 }
 
@@ -353,6 +469,107 @@ impl UpgradeTransactionLock {
     }
 }
 
+/// Decision observed on the response-flush commit barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpgradeCommitDecision {
+    /// The transport has not yet written/flushed the `accepted` response.
+    Pending,
+    /// The response was written and flushed; destructive work may begin.
+    Committed,
+    /// The response could not be delivered; destructive work must not begin.
+    Aborted,
+}
+
+/// One-shot gate that replaces timing-based ordering between an upgrade
+/// response and the destructive phase that follows it.
+///
+/// The request handler subscribes before returning a response and keeps the
+/// waiter; the transport calls [`commit`](Self::commit) only after the
+/// `accepted` response has been written and flushed, or
+/// [`abort`](Self::abort) when serialization/write/flush fails. The coordinator
+/// then awaits the decision. A sender dropped before any decision resolves the
+/// waiter to [`UpgradeCommitDecision::Aborted`], so a lost transport can never
+/// authorize destructive work.
+#[derive(Clone)]
+pub struct UpgradeCommitBarrier {
+    sender: watch::Sender<UpgradeCommitDecision>,
+}
+
+impl UpgradeCommitBarrier {
+    pub fn new() -> Self {
+        let (sender, _receiver) = watch::channel(UpgradeCommitDecision::Pending);
+        Self { sender }
+    }
+
+    /// Records that the response was successfully written and flushed.
+    pub fn commit(&self) -> Result<()> {
+        self.decide(UpgradeCommitDecision::Committed)
+    }
+
+    /// Records that the response could not be delivered.
+    pub fn abort(&self) -> Result<()> {
+        self.decide(UpgradeCommitDecision::Aborted)
+    }
+
+    fn decide(&self, decision: UpgradeCommitDecision) -> Result<()> {
+        let decided = self.sender.send_if_modified(|current| {
+            if *current != UpgradeCommitDecision::Pending {
+                return false;
+            }
+            *current = decision;
+            true
+        });
+        anyhow::ensure!(
+            decided,
+            "upgrade commit barrier was already decided as {}",
+            match self.decision() {
+                UpgradeCommitDecision::Pending => "pending",
+                UpgradeCommitDecision::Committed => "committed",
+                UpgradeCommitDecision::Aborted => "aborted",
+            }
+        );
+        Ok(())
+    }
+
+    /// Returns the current decision without awaiting.
+    pub fn decision(&self) -> UpgradeCommitDecision {
+        *self.sender.borrow()
+    }
+
+    /// Creates a waiter that resolves once the transport decides.
+    pub fn waiter(&self) -> UpgradeCommitWaiter {
+        UpgradeCommitWaiter {
+            receiver: self.sender.subscribe(),
+        }
+    }
+}
+
+impl Default for UpgradeCommitBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Coordinator-side view of an [`UpgradeCommitBarrier`].
+pub struct UpgradeCommitWaiter {
+    receiver: watch::Receiver<UpgradeCommitDecision>,
+}
+
+impl UpgradeCommitWaiter {
+    /// Awaits the transport's commit/abort decision without any wall-clock delay.
+    pub async fn wait(mut self) -> UpgradeCommitDecision {
+        loop {
+            let decision = *self.receiver.borrow_and_update();
+            if decision != UpgradeCommitDecision::Pending {
+                return decision;
+            }
+            if self.receiver.changed().await.is_err() {
+                return UpgradeCommitDecision::Aborted;
+            }
+        }
+    }
+}
+
 /// Bounded, non-secret, reconnect-safe view of a durable upgrade transaction.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeTransactionStatus {
@@ -563,6 +780,107 @@ pub fn incomplete_upgrade_transactions() -> Result<Vec<IncompleteUpgradeTransact
         });
     }
     Ok(incomplete)
+}
+
+/// Result of a single coordinator-driven phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpgradeCoordinatorStep {
+    /// The phase finished and the coordinator may advance to the next one.
+    Continue,
+    /// The phase cannot be completed safely; stop and record a terminal rollback.
+    Rollback,
+}
+
+/// Future returned by [`UpgradeCoordinatorExecutor::execute_phase`].
+pub type UpgradeCoordinatorStepFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<UpgradeCoordinatorStep>> + 'a>>;
+
+/// Performs the destructive work for a single coordinator phase.
+///
+/// All durable transaction bookkeeping stays in [`run_upgrade_coordinator`]; an
+/// executor only reports whether its phase completed or must roll back. An
+/// executor must not write transaction state itself.
+pub trait UpgradeCoordinatorExecutor {
+    fn execute_phase(&mut self, phase: UpgradeTransactionState)
+    -> UpgradeCoordinatorStepFuture<'_>;
+}
+
+fn bounded_failure_summary(text: &str) -> String {
+    let sanitized = text.replace('\0', " ");
+    if sanitized.len() <= MAX_FAILURE_SUMMARY_BYTES {
+        return sanitized;
+    }
+    let mut end = MAX_FAILURE_SUMMARY_BYTES;
+    while end > 0 && !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    sanitized[..end].to_owned()
+}
+
+/// Drives one durable upgrade transaction through its coordinator phases.
+///
+/// The transaction must already exist in `prepared` state. The coordinator
+/// waits for the transport's response-flush [`UpgradeCommitBarrier`] decision
+/// before any destructive phase, so an aborted or lost transport records a
+/// terminal failure and never runs a phase. Each successful phase is persisted
+/// before the next begins, so a crash leaves a deterministic non-success state
+/// that [`incomplete_upgrade_transactions`] can report. The exclusive
+/// transaction lock makes a second live coordinator fail closed.
+pub async fn run_upgrade_coordinator<E: UpgradeCoordinatorExecutor>(
+    transaction_id: &str,
+    waiter: UpgradeCommitWaiter,
+    executor: &mut E,
+) -> Result<UpgradeTransactionStatus> {
+    let _lock = acquire_transaction_lock(transaction_id)?;
+    let mut transaction = read_transaction(transaction_id)?;
+    anyhow::ensure!(
+        transaction.state == UpgradeTransactionState::Prepared,
+        "upgrade transaction {} is not prepared (state {})",
+        transaction.transaction_id,
+        transaction.state.as_str()
+    );
+
+    match waiter.wait().await {
+        UpgradeCommitDecision::Committed => {}
+        UpgradeCommitDecision::Aborted | UpgradeCommitDecision::Pending => {
+            transaction
+                .mark_failed("upgrade response was not delivered; destructive phase aborted")?;
+            write_transaction(&transaction)?;
+            return Ok(transaction.status());
+        }
+    }
+
+    transaction.set_state(UpgradeTransactionState::Committed)?;
+    write_transaction(&transaction)?;
+
+    for phase in transaction.coordinator_phases() {
+        if phase == UpgradeTransactionState::Completed {
+            transaction.set_state(UpgradeTransactionState::Completed)?;
+            write_transaction(&transaction)?;
+            break;
+        }
+        match executor.execute_phase(phase).await {
+            Ok(UpgradeCoordinatorStep::Continue) => {
+                transaction.set_state(phase)?;
+                write_transaction(&transaction)?;
+            }
+            Ok(UpgradeCoordinatorStep::Rollback) => {
+                transaction.mark_rolled_back(Some(format!(
+                    "upgrade coordinator rolled back at {}",
+                    phase.as_str()
+                )))?;
+                write_transaction(&transaction)?;
+                return Ok(transaction.status());
+            }
+            Err(error) => {
+                transaction.mark_failed(bounded_failure_summary(&format!("{error:#}")))?;
+                write_transaction(&transaction)?;
+                return Ok(transaction.status());
+            }
+        }
+    }
+
+    Ok(transaction.status())
 }
 
 #[cfg(test)]
@@ -911,5 +1229,357 @@ mod tests {
         assert!(transaction_lock_is_held(&id).unwrap());
         drop(lock);
         assert!(!transaction_lock_is_held(&id).unwrap());
+    }
+
+    #[test]
+    fn state_transitions_are_monotonic_and_reject_regressions() {
+        let mut transaction = Fixture::new().transaction.clone();
+        assert!(
+            transaction
+                .state
+                .can_transition_to(UpgradeTransactionState::Committed)
+        );
+        assert!(
+            !transaction
+                .state
+                .can_transition_to(UpgradeTransactionState::Prepared)
+        );
+        // A coordinator may skip stages that are not required.
+        assert!(
+            transaction
+                .state
+                .can_transition_to(UpgradeTransactionState::EndpointVerifying)
+        );
+
+        transaction
+            .set_state(UpgradeTransactionState::Committed)
+            .unwrap();
+        assert!(
+            transaction
+                .set_state(UpgradeTransactionState::Prepared)
+                .is_err()
+        );
+        transaction
+            .set_state(UpgradeTransactionState::SessionsVerifying)
+            .unwrap();
+        assert!(
+            transaction
+                .set_state(UpgradeTransactionState::SupervisorHandoff)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failure_and_rollback_are_reachable_from_any_non_terminal_state() {
+        for state in [
+            UpgradeTransactionState::Prepared,
+            UpgradeTransactionState::Committed,
+            UpgradeTransactionState::IngressRestarting,
+            UpgradeTransactionState::PluginReconciling,
+        ] {
+            let mut failed = Fixture::new().transaction.clone();
+            failed.state = state;
+            failed.mark_failed("handoff failed").unwrap();
+            assert_eq!(failed.state, UpgradeTransactionState::Failed);
+            assert_eq!(failed.failure_summary.as_deref(), Some("handoff failed"));
+            assert!(
+                failed
+                    .set_state(UpgradeTransactionState::Completed)
+                    .is_err(),
+                "a failed transaction must stay terminal"
+            );
+
+            let mut rolled_back = Fixture::new().transaction.clone();
+            rolled_back.state = state;
+            rolled_back.mark_rolled_back(None).unwrap();
+            assert_eq!(rolled_back.state, UpgradeTransactionState::RolledBack);
+            assert!(rolled_back.failure_summary.is_none());
+        }
+    }
+
+    #[test]
+    fn transaction_failure_summary_is_bounded_and_nul_free() {
+        let mut transaction = Fixture::new().transaction.clone();
+        assert!(
+            transaction
+                .mark_failed("x".repeat(MAX_FAILURE_SUMMARY_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(transaction.state, UpgradeTransactionState::Prepared);
+        assert!(transaction.mark_failed("bad\0summary").is_err());
+        assert_eq!(transaction.state, UpgradeTransactionState::Prepared);
+        transaction.mark_failed("bounded").unwrap();
+        assert!(transaction.mark_failed("again").is_err());
+    }
+
+    #[test]
+    fn coordinator_phases_skip_optional_stages_and_progress_forward() {
+        let mut transaction = Fixture::new().transaction.clone();
+        transaction.state = UpgradeTransactionState::Committed;
+        transaction.supervisor_handoff_required = true;
+        transaction.ingress_restart_required = true;
+        let full = transaction.coordinator_phases();
+        assert_eq!(
+            full,
+            vec![
+                UpgradeTransactionState::SupervisorHandoff,
+                UpgradeTransactionState::SessionsVerifying,
+                UpgradeTransactionState::IngressRestarting,
+                UpgradeTransactionState::EndpointVerifying,
+                UpgradeTransactionState::PluginReconciling,
+                UpgradeTransactionState::Completed,
+            ]
+        );
+        let mut current = UpgradeTransactionState::Committed;
+        for phase in full {
+            assert!(
+                current.can_transition_to(phase),
+                "phase {} -> {} must be a valid forward transition",
+                current.as_str(),
+                phase.as_str()
+            );
+            current = phase;
+        }
+
+        transaction.supervisor_handoff_required = false;
+        transaction.ingress_restart_required = false;
+        let minimal = transaction.coordinator_phases();
+        assert_eq!(
+            minimal,
+            vec![
+                UpgradeTransactionState::SessionsVerifying,
+                UpgradeTransactionState::EndpointVerifying,
+                UpgradeTransactionState::PluginReconciling,
+                UpgradeTransactionState::Completed,
+            ]
+        );
+        assert!(
+            UpgradeTransactionState::Committed.can_transition_to(minimal[0]),
+            "committed must skip directly to the first required phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_barrier_commits_only_after_a_transport_decision() {
+        let barrier = UpgradeCommitBarrier::new();
+        assert_eq!(barrier.decision(), UpgradeCommitDecision::Pending);
+        let waiter = barrier.waiter();
+        barrier.commit().unwrap();
+        assert_eq!(waiter.wait().await, UpgradeCommitDecision::Committed);
+        assert_eq!(barrier.decision(), UpgradeCommitDecision::Committed);
+        assert!(
+            barrier.commit().is_err(),
+            "a barrier may only be decided once"
+        );
+        assert!(barrier.abort().is_err());
+    }
+
+    #[tokio::test]
+    async fn commit_barrier_abort_and_drop_never_authorize_work() {
+        let aborted = UpgradeCommitBarrier::new();
+        let abort_waiter = aborted.waiter();
+        aborted.abort().unwrap();
+        assert_eq!(abort_waiter.wait().await, UpgradeCommitDecision::Aborted);
+
+        let dropped = UpgradeCommitBarrier::new();
+        let dropped_waiter = dropped.waiter();
+        drop(dropped);
+        assert_eq!(
+            dropped_waiter.wait().await,
+            UpgradeCommitDecision::Aborted,
+            "a lost transport must fail closed"
+        );
+    }
+
+    #[test]
+    fn commit_barrier_concurrent_decisions_are_one_shot() {
+        let barrier = UpgradeCommitBarrier::new();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let commit_barrier = barrier.clone();
+        let commit_start = start.clone();
+        let commit = std::thread::spawn(move || {
+            commit_start.wait();
+            commit_barrier.commit()
+        });
+
+        let abort_barrier = barrier.clone();
+        let abort_start = start.clone();
+        let abort = std::thread::spawn(move || {
+            abort_start.wait();
+            abort_barrier.abort()
+        });
+
+        start.wait();
+        let commit = commit.join().unwrap();
+        let abort = abort.join().unwrap();
+        assert_eq!(
+            usize::from(commit.is_ok()) + usize::from(abort.is_ok()),
+            1,
+            "exactly one concurrent decision may win"
+        );
+        assert_ne!(barrier.decision(), UpgradeCommitDecision::Pending);
+    }
+
+    struct RecordingExecutor {
+        steps: Vec<UpgradeTransactionState>,
+        outcome: UpgradeCoordinatorStep,
+        fail_at: Option<UpgradeTransactionState>,
+    }
+
+    impl RecordingExecutor {
+        fn new(outcome: UpgradeCoordinatorStep) -> Self {
+            Self {
+                steps: Vec::new(),
+                outcome,
+                fail_at: None,
+            }
+        }
+    }
+
+    impl UpgradeCoordinatorExecutor for RecordingExecutor {
+        fn execute_phase(
+            &mut self,
+            phase: UpgradeTransactionState,
+        ) -> UpgradeCoordinatorStepFuture<'_> {
+            Box::pin(async move {
+                self.steps.push(phase);
+                if self.fail_at == Some(phase) {
+                    anyhow::bail!("phase {} failed in test executor", phase.as_str());
+                }
+                Ok(self.outcome)
+            })
+        }
+    }
+
+    fn prepared_fixture() -> Fixture {
+        let fixture = Fixture::new();
+        write_transaction(&fixture.transaction).unwrap();
+        fixture
+    }
+
+    #[tokio::test]
+    async fn coordinator_aborts_without_running_phases_when_response_is_lost() {
+        let fixture = prepared_fixture();
+        let barrier = UpgradeCommitBarrier::new();
+        let waiter = barrier.waiter();
+        drop(barrier);
+        let mut executor = RecordingExecutor::new(UpgradeCoordinatorStep::Continue);
+
+        let id = &fixture.transaction.transaction_id;
+        let status = run_upgrade_coordinator(id, waiter, &mut executor)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, UpgradeTransactionState::Failed);
+        assert!(status.terminal);
+        assert!(
+            executor.steps.is_empty(),
+            "destructive phases must not run before the transport commits"
+        );
+        assert_eq!(
+            read_transaction(&fixture.transaction.transaction_id)
+                .unwrap()
+                .state,
+            UpgradeTransactionState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_commits_then_completes_every_required_phase_in_order() {
+        let fixture = prepared_fixture();
+        let barrier = UpgradeCommitBarrier::new();
+        let waiter = barrier.waiter();
+        barrier.commit().unwrap();
+        let mut executor = RecordingExecutor::new(UpgradeCoordinatorStep::Continue);
+
+        let id = &fixture.transaction.transaction_id;
+        let status = run_upgrade_coordinator(id, waiter, &mut executor)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, UpgradeTransactionState::Completed);
+        assert!(status.terminal);
+        let expected = fixture
+            .transaction
+            .coordinator_phases()
+            .into_iter()
+            .filter(|phase| *phase != UpgradeTransactionState::Completed)
+            .collect::<Vec<_>>();
+        assert_eq!(executor.steps, expected);
+        assert_eq!(
+            read_transaction(&fixture.transaction.transaction_id)
+                .unwrap()
+                .state,
+            UpgradeTransactionState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_records_rollback_when_a_phase_requests_it() {
+        let fixture = prepared_fixture();
+        let barrier = UpgradeCommitBarrier::new();
+        let waiter = barrier.waiter();
+        barrier.commit().unwrap();
+        let mut executor = RecordingExecutor::new(UpgradeCoordinatorStep::Rollback);
+
+        let id = &fixture.transaction.transaction_id;
+        let status = run_upgrade_coordinator(id, waiter, &mut executor)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, UpgradeTransactionState::RolledBack);
+        assert!(status.terminal);
+        assert_eq!(
+            executor.steps.len(),
+            1,
+            "rollback must stop before the next phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_records_a_bounded_failure_when_a_phase_errors() {
+        let fixture = prepared_fixture();
+        let barrier = UpgradeCommitBarrier::new();
+        let waiter = barrier.waiter();
+        barrier.commit().unwrap();
+        let mut executor = RecordingExecutor::new(UpgradeCoordinatorStep::Continue);
+        executor.fail_at = Some(UpgradeTransactionState::SessionsVerifying);
+
+        let id = &fixture.transaction.transaction_id;
+        let status = run_upgrade_coordinator(id, waiter, &mut executor)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, UpgradeTransactionState::Failed);
+        let summary = status.failure_summary.unwrap();
+        assert!(summary.contains("sessions_verifying"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn coordinator_fails_closed_on_a_second_owner_or_non_prepared_state() {
+        let fixture = prepared_fixture();
+        let id = &fixture.transaction.transaction_id;
+        let held = acquire_transaction_lock(id).unwrap();
+        let barrier = UpgradeCommitBarrier::new();
+        barrier.commit().unwrap();
+        let mut executor = RecordingExecutor::new(UpgradeCoordinatorStep::Continue);
+
+        let result = run_upgrade_coordinator(id, barrier.waiter(), &mut executor).await;
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("owned by another live process"),
+            "{error}"
+        );
+        drop(held);
+
+        let mut committed = fixture.transaction.clone();
+        committed.state = UpgradeTransactionState::Committed;
+        write_transaction(&committed).unwrap();
+        let barrier = UpgradeCommitBarrier::new();
+        barrier.commit().unwrap();
+        let result = run_upgrade_coordinator(id, barrier.waiter(), &mut executor).await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("not prepared"), "{error}");
     }
 }

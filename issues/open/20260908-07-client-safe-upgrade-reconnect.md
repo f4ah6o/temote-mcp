@@ -53,6 +53,59 @@ host, version, and boot generation without an out-of-band health probe:
   generation-identity contract. The coordinator process, response-flush commit
   barrier, remote upgrade tools, and both-platform deliberate-disconnect E2E remain.
 
+## Implementation status (2026-09-13, coordinator-safe transition primitives)
+
+The next repository-local slice adds the coordinator-safe primitives the one-shot
+coordinator will drive:
+
+- `UpgradeTransactionState::can_transition_to` plus an enforcing `set_state`
+  make coordinator progress monotonic (`prepared -> committed ->
+  supervisor_handoff -> sessions_verifying -> ingress_restarting ->
+  endpoint_verifying -> plugin_reconciling -> completed`) while still allowing
+  optional stages to be skipped. Terminal states never transition again.
+- `UpgradeTransaction::mark_failed` / `mark_rolled_back` record deterministic
+  terminal outcomes with the same bounded, NUL-free failure-summary rules as
+  persisted transactions.
+- `UpgradeTransaction::coordinator_phases` derives the ordered post-commit
+  phases from `supervisor_handoff_required` / `ingress_restart_required`.
+- `UpgradeCommitBarrier` / `UpgradeCommitWaiter` replace timing-based ordering:
+  the transport commits only after the `accepted` response is written and
+  flushed, aborts on delivery failure, and a dropped sender fails closed to
+  `Aborted`. Concurrent cloned senders are serialized inside the watch update,
+  so exactly one `commit`/`abort` decision can win. The waiter resolves without
+  any wall-clock sleep.
+
+Remaining: the one-shot upgrade-coordinator process, the response-flush barrier
+wired into the HTTP/MCP transport, the remote upgrade tools, and both-platform
+deliberate-disconnect E2E. The new primitives are not yet wired into the local
+`session_control` upgrade path, so no runtime behavior changes in this slice.
+
+## Implementation status (2026-09-13, coordinator state machine)
+
+The repository-local coordinator state machine is implemented on top of the durable
+transaction schema, still without an OS process wrapper, transport wiring, or remote
+tools:
+
+- `UpgradeCoordinatorExecutor` plus `run_upgrade_coordinator` drive one `prepared`
+  transaction through `coordinator_phases()`.
+- The driver holds the exclusive transaction lock for the whole run, so a second live
+  coordinator fails closed. It refuses a transaction that is not `prepared`.
+- It awaits the existing response-flush `UpgradeCommitBarrier` before any destructive
+  phase. An aborted or lost transport records a terminal `failed` transaction and runs
+  no phase (no timing heuristic).
+- Each phase is persisted before the next begins. A phase may report `Continue`,
+  `Rollback` (terminal `rolled_back`), or an error (terminal `failed` with a bounded
+  non-secret summary), so a crash or failed phase leaves a deterministic non-success
+  state that `incomplete_upgrade_transactions()` reports after reconnect.
+- Deterministic coverage: lost-transport abort with zero phases, ordered completion
+  of every required phase, rollback short-circuit, bounded phase failure,
+  second-owner / non-prepared refusal, and concurrent commit/abort one-shot
+  enforcement.
+
+Still unimplemented: the one-shot `upgrade-coordinator` OS process and its concrete
+executor, transport commit wiring, remote `upgrade_preflight` / `upgrade_apply` /
+`upgrade_status` tools, and the deliberate-disconnect process E2E.
+
 ## Implementation status (2026-09-11)
 
 Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.
