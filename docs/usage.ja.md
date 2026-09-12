@@ -140,7 +140,7 @@ operation class:
 
 ### Delegation backend (ローカル CLI)
 
-`temote-mcp delegate --backend codex|opencode ...` は、ローカル CLI から bounded な非対話 delegation を1回実行し、bounded な JSON result を1つ出力します。OpenCode backend の executable は次の順で解決します。
+`temote-mcp delegate --backend codex|opencode ...` は、ローカル CLI から bounded な非対話 delegation を1回実行し、bounded な JSON result を1つ出力します。OpenCode は明示的な `--session <id>` resume も受け付けます。resume 前に bounded な read-only `opencode session list --format json` preflight を行い、session の canonical directory が現在の canonical delegation directory と一致する場合だけ `run` を起動します。metadata の欠落、曖昧さ、不正 JSON、サイズ超過、probe失敗、directory不一致は fail closed で、`run` より前に拒否します。`--continue`、`--fork`、`--attach` はサポートしません。OpenCode backend の executable は次の順で解決します。
 
 1. `TEMOTE_OPENCODE_BIN` が設定されている場合、既存の実行可能な regular file への絶対 path でなければなりません。symlink は canonical target に解決します。PATH より優先されます。
 2. 未設定の場合は PATH から `opencode` を解決します。

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Read, Write};
@@ -41,6 +43,11 @@ const MAX_EVIDENCE_STRING_BYTES: usize = 256;
 const MAX_EVIDENCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EVENT_LINE_BYTES: usize = 128 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ARTIFACT_TEMP_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
 
 const OUTPUT_SCHEMA: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -95,6 +102,7 @@ pub(crate) struct Options {
     pub(crate) model: String,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) variant: Option<String>,
+    pub(crate) session: Option<String>,
     pub(crate) codex_binary: PathBuf,
     pub(crate) opencode_binary: PathBuf,
     pub(crate) timeout: Option<Duration>,
@@ -109,6 +117,7 @@ impl Options {
             model: model.to_owned(),
             reasoning_effort: Some(reasoning_effort.to_owned()),
             variant: None,
+            session: None,
             codex_binary,
             opencode_binary: opencode::default_binary(),
             timeout: None,
@@ -128,6 +137,7 @@ impl Options {
             model: model.to_owned(),
             reasoning_effort: None,
             variant: variant.map(str::to_owned),
+            session: None,
             codex_binary: codex::default_binary(),
             opencode_binary,
             timeout: None,
@@ -297,6 +307,7 @@ Usage:
   temote-mcp delegate --backend codex --model <MODEL> --reasoning-effort <EFFORT> --prompt-file <PATH>
   temote-mcp delegate --backend opencode --model <provider/model> [--variant <VARIANT>] --prompt <PROMPT>
   temote-mcp delegate --backend opencode --model <provider/model> [--variant <VARIANT>] --prompt-file <PATH>
+  temote-mcp delegate --backend opencode --model <provider/model> --session <ID> [--variant <VARIANT>] --prompt <PROMPT>
   temote-mcp delegate diagnose --backend opencode [--model <provider/model>]
 
 Each request runs one bounded, non-interactive delegation process and prints
@@ -447,6 +458,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         model,
         reasoning_effort: Some(reasoning_effort),
         variant: None,
+        session: None,
         codex_binary: codex::default_binary(),
         opencode_binary: opencode::default_binary(),
         timeout: None,
@@ -458,6 +470,7 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
     let mut model = None;
     let mut reasoning_effort = None;
     let mut variant = None;
+    let mut session = None;
     let mut prompt = None;
     let mut prompt_file = None;
     let mut index = 0;
@@ -477,6 +490,7 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
                 reasoning_effort = Some(argument_value(args, &mut index, flag)?)
             }
             "--variant" => variant = Some(argument_value(args, &mut index, flag)?),
+            "--session" => session = Some(argument_value(args, &mut index, flag)?),
             "--prompt" => prompt = Some(argument_value(args, &mut index, flag)?),
             "--prompt-file" => prompt_file = Some(argument_value(args, &mut index, flag)?),
             _ => {
@@ -502,9 +516,9 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
 
     let reasoning_effort = match backend {
         DelegationBackend::Codex => {
-            if variant.is_some() {
+            if variant.is_some() || session.is_some() {
                 return Err(format!(
-                    "--variant is only supported by the opencode backend\n\n{}",
+                    "--variant and --session are only supported by the opencode backend\n\n{}",
                     generic_usage()
                 ));
             }
@@ -540,6 +554,7 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
         model,
         reasoning_effort,
         variant,
+        session,
         codex_binary: codex::default_binary(),
         opencode_binary,
         timeout: None,
@@ -782,7 +797,7 @@ fn validate_options(options: &Options) -> Result<(), String> {
 }
 
 fn create_artifacts() -> Result<Artifacts, String> {
-    let parent = std::env::temp_dir();
+    let parent = artifact_temp_root();
     for _ in 0..8 {
         let directory = parent.join(format!("{ARTIFACT_DIRECTORY_PREFIX}{}", Uuid::new_v4()));
         match fs::create_dir(&directory) {
@@ -802,6 +817,35 @@ fn create_artifacts() -> Result<Artifacts, String> {
         }
     }
     Err("could not allocate a unique delegation artifact directory".to_owned())
+}
+
+fn artifact_temp_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_ARTIFACT_TEMP_ROOT.with(|value| value.borrow().clone()) {
+        return root;
+    }
+    std::env::temp_dir()
+}
+
+#[cfg(test)]
+pub(super) struct TestArtifactTempRootGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for TestArtifactTempRootGuard {
+    fn drop(&mut self) {
+        TEST_ARTIFACT_TEMP_ROOT.with(|value| {
+            *value.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_artifact_temp_root(root: &Path) -> TestArtifactTempRootGuard {
+    let previous =
+        TEST_ARTIFACT_TEMP_ROOT.with(|value| value.borrow_mut().replace(root.to_path_buf()));
+    TestArtifactTempRootGuard { previous }
 }
 
 fn create_artifacts_in(directory: &Path) -> Result<Artifacts, String> {

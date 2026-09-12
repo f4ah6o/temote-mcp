@@ -130,7 +130,7 @@ In `ask` mode a validated operation requires local approval; in `agent` mode it 
 
 ### Delegation backend (local CLI)
 
-`temote-mcp delegate --backend codex|opencode ...` runs one bounded, non-interactive delegation process from the local CLI and prints one bounded JSON result. The OpenCode backend resolves its executable in this order:
+`temote-mcp delegate --backend codex|opencode ...` runs one bounded, non-interactive delegation process from the local CLI and prints one bounded JSON result. OpenCode also accepts an explicit `--session <id>` for resume. Resume first performs a bounded, read-only `opencode session list --format json` preflight and requires the session's canonical directory to equal the current canonical delegation directory; missing, ambiguous, malformed, oversized, failed, or mismatched metadata fails closed before `run` starts. `--continue`, `--fork`, and `--attach` are not supported. The OpenCode backend resolves its executable in this order:
 
 1. `TEMOTE_OPENCODE_BIN`, when set, must be an absolute path to an existing executable regular file. Symlinks are resolved to their canonical target. It takes precedence over PATH.
 2. otherwise `opencode` is resolved from PATH.

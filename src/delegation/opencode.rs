@@ -10,6 +10,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -22,9 +23,11 @@ const MAX_OPENCODE_PROMPT_BYTES: usize = 64 * 1024;
 const OPENCODE_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const OPENCODE_DIAGNOSTIC_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const OPENCODE_DIAGNOSTIC_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENCODE_SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DIAGNOSTIC_VERSION_BYTES: usize = 128;
 const MAX_DIAGNOSTIC_LISTING_BYTES: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_ERROR_BYTES: usize = 4096;
+const MAX_SESSION_ID_BYTES: usize = 256;
 const OPENCODE_BINARY_NAME: &str = "opencode";
 pub(super) const OPENCODE_BIN_ENV: &str = "TEMOTE_OPENCODE_BIN";
 const MAX_OPENCODE_BIN_PATH_BYTES: usize = 4096;
@@ -336,6 +339,30 @@ struct OpenCodeModelListing {
     count: usize,
     requested_present: bool,
     saw_non_empty_line: bool,
+}
+
+#[derive(Debug)]
+struct OpenCodeSessionListProbe {
+    timed_out: bool,
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeSessionEntry {
+    id: Option<String>,
+    #[serde(alias = "sessionID")]
+    session_id: Option<String>,
+    directory: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OpenCodeSessionList {
+    Array(Vec<OpenCodeSessionEntry>),
+    Object { sessions: Vec<OpenCodeSessionEntry> },
 }
 
 pub(super) fn diagnose_default(
@@ -717,6 +744,9 @@ pub(super) fn validate_options(options: &Options) -> Result<(), String> {
             "OpenCode variant must be non-empty, NUL-free, and at most {MAX_ARGUMENT_BYTES} bytes"
         ));
     }
+    if let Some(session) = &options.session {
+        validate_session_id(session)?;
+    }
     opencode_effective_prompt(options)?;
     Ok(())
 }
@@ -754,9 +784,7 @@ impl Drop for ArtifactCleanup {
 }
 
 pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String> {
-    let artifacts = create_artifacts()?;
-    let paths = artifacts.paths.clone();
-    let mut cleanup = ArtifactCleanup::new(paths.directory.clone());
+    validate_options(&options)?;
     let effective_prompt = opencode_effective_prompt(&options)?;
 
     let working_directory =
@@ -765,6 +793,13 @@ pub(super) fn run_opencode(options: Options) -> Result<DelegationResult, String>
             .map_err(|error| {
                 format!("could not resolve OpenCode delegation working directory: {error}")
             })?;
+    if let Some(session) = options.session.as_deref() {
+        preflight_opencode_session(&options.opencode_binary, session, &working_directory)?;
+    }
+
+    let artifacts = create_artifacts()?;
+    let paths = artifacts.paths.clone();
+    let mut cleanup = ArtifactCleanup::new(paths.directory.clone());
     let mut command = build_opencode_command(
         &options,
         &working_directory,
@@ -911,9 +946,160 @@ where
     if let Some(variant) = &options.variant {
         command.arg("--variant").arg(variant);
     }
+    if let Some(session) = &options.session {
+        command.arg("--session").arg(session);
+    }
     command.arg("--").arg(effective_prompt);
     configure_opencode_environment(&mut command, environment);
     command
+}
+
+fn validate_session_id(session: &str) -> Result<(), String> {
+    if session.is_empty()
+        || session.len() > MAX_SESSION_ID_BYTES
+        || session.starts_with('-')
+        || session.chars().any(|character| {
+            character.is_ascii_control() || character.is_ascii_whitespace() || character == '\0'
+        })
+        || !session
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(
+            "OpenCode session must be a bounded ASCII identifier without whitespace or control characters"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn preflight_opencode_session(
+    binary: &Path,
+    session: &str,
+    working_directory: &Path,
+) -> Result<(), String> {
+    let probe = run_opencode_session_list_probe(binary, working_directory)?;
+    if probe.timed_out {
+        return Err("OpenCode session unavailable: preflight timed out".to_owned());
+    }
+    if probe.exit_code != Some(0) {
+        return Err("OpenCode session unavailable: preflight failed".to_owned());
+    }
+    if probe.stdout_truncated || probe.stderr_truncated {
+        return Err("OpenCode session unavailable: preflight metadata was oversized".to_owned());
+    }
+
+    let list = serde_json::from_slice::<OpenCodeSessionList>(&probe.stdout)
+        .map_err(|_| "OpenCode session unavailable: invalid preflight JSON".to_owned())?;
+    let entries = match list {
+        OpenCodeSessionList::Array(entries) => entries,
+        OpenCodeSessionList::Object { sessions } => sessions,
+    };
+    let matching = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.id.as_deref() == Some(session) || entry.session_id.as_deref() == Some(session)
+        })
+        .collect::<Vec<_>>();
+    let [entry] = matching.as_slice() else {
+        return Err(if matching.is_empty() {
+            "OpenCode session unavailable: session was not found".to_owned()
+        } else {
+            "OpenCode session unavailable: session metadata was ambiguous".to_owned()
+        });
+    };
+    let Some(directory) = entry.directory.as_deref() else {
+        return Err("OpenCode session unavailable: session directory was missing".to_owned());
+    };
+    let canonical_directory = fs::canonicalize(directory).map_err(|_| {
+        "OpenCode session unavailable: session directory was unavailable".to_owned()
+    })?;
+    if canonical_directory != working_directory {
+        return Err("OpenCode session unavailable: session directory did not match".to_owned());
+    }
+    Ok(())
+}
+
+fn run_opencode_session_list_probe(
+    binary: &Path,
+    working_directory: &Path,
+) -> Result<OpenCodeSessionListProbe, String> {
+    let mut command = build_opencode_probe_command(
+        binary,
+        &["session", "list", "--format", "json"],
+        std::env::vars_os(),
+    );
+    command.current_dir(working_directory);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "OpenCode session unavailable: preflight could not start".to_owned())?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        "OpenCode session unavailable: preflight stdout was unavailable".to_owned()
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        "OpenCode session unavailable: preflight stderr was unavailable".to_owned()
+    })?;
+    let (wait_result, stdout_result, stderr_result) = std::thread::scope(|scope| {
+        let stdout_handle =
+            scope.spawn(|| capture_session_probe_pipe(stdout, MAX_DIAGNOSTIC_LISTING_BYTES));
+        let stderr_handle =
+            scope.spawn(|| capture_session_probe_pipe(stderr, MAX_DIAGNOSTIC_ERROR_BYTES));
+        let wait_result = super::wait_for_child(
+            &mut child,
+            Some(OPENCODE_SESSION_LIST_TIMEOUT),
+            "OpenCode session preflight",
+        );
+        (wait_result, stdout_handle.join(), stderr_handle.join())
+    });
+    let outcome = wait_result
+        .map_err(|_| "OpenCode session unavailable: preflight wait failed".to_owned())?;
+    let (stdout, stdout_truncated) = stdout_result
+        .map_err(|_| "OpenCode session unavailable: stdout capture failed".to_owned())?
+        .map_err(|_| "OpenCode session unavailable: stdout capture failed".to_owned())?;
+    let (_, stderr_truncated) = stderr_result
+        .map_err(|_| "OpenCode session unavailable: stderr capture failed".to_owned())?
+        .map_err(|_| "OpenCode session unavailable: stderr capture failed".to_owned())?;
+    let status = child
+        .try_wait()
+        .map_err(|_| "OpenCode session unavailable: preflight status failed".to_owned())?
+        .ok_or_else(|| {
+            "OpenCode session unavailable: preflight status was unavailable".to_owned()
+        })?;
+
+    Ok(OpenCodeSessionListProbe {
+        timed_out: outcome == WaitOutcome::TimedOut,
+        exit_code: status.code(),
+        stdout,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+fn capture_session_probe_pipe<R: Read>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut oversized = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        if remaining > 0 {
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        if read > remaining {
+            oversized = true;
+        }
+    }
+    Ok((retained, oversized))
 }
 
 fn configure_opencode_environment<I>(command: &mut Command, environment: I)
@@ -1292,6 +1478,21 @@ mod tests {
         let path = root.join(format!("fake-opencode-{mode}"));
         let script = r##"#!/bin/sh
 set -eu
+if [ "${1-}" = "session" ]; then
+    case "$0" in
+        *session_ok) printf '[{"id":"ses_resume","directory":"%s"}]\n' "$(pwd -P)"; exit 0 ;;
+        *session_missing) printf '[]\n'; exit 0 ;;
+        *session_mismatch) printf '[{"id":"ses_resume","directory":"/tmp"}]\n'; exit 0 ;;
+        *session_invalid) printf '{not-json}\n'; exit 0 ;;
+        *session_duplicate) printf '[{"id":"ses_resume","directory":"%s"},{"id":"ses_resume","directory":"%s"}]\n' "$(pwd -P)" "$(pwd -P)"; exit 0 ;;
+        *session_missing_directory) printf '[{"id":"ses_resume"}]\n'; exit 0 ;;
+        *session_nonzero) printf 'probe failed\n' >&2; exit 7 ;;
+        *session_timeout) sleep 30; exit 0 ;;
+        *session_huge_stdout) head -c 1048577 /dev/zero; exit 0 ;;
+        *session_huge_stderr) head -c 4097 /dev/zero >&2; exit 0 ;;
+    esac
+fi
+touch "$0.run-marker"
 printf 'cwd=%s\n' "$(pwd -P)" >&2
 printf 'args=' >&2
 for arg in "$@"; do
@@ -1318,7 +1519,7 @@ case "$0" in
         printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"\",\"observed_model\":\"fake/self-reported\",\"observed_effort\":\"high\"}"}}'
         exit 0
         ;;
-    *success)
+    *success|*session_ok)
         printf '%s\n' '{"type":"step_start","sessionID":"ses_test"}'
         printf '%s\n' '{"type":"text","sessionID":"ses_test","part":{"messageID":"msg_1","type":"text","text":"{\"status\":\"completed\",\"summary\":\"ok\",\"base_commit\":\"abc\",\"changed_files\":[],\"checks\":[\"cargo test\"],\"unresolved\":[],\"requested_model\":\"test-model\",\"requested_effort\":\"high\",\"observed_model\":null,\"observed_effort\":null}"}}'
         printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step-finish","tokens":{"total":30,"input":20,"output":5,"reasoning":2,"cache":{"read":3}}}}'
@@ -1397,6 +1598,118 @@ esac
             variant,
             fake_opencode(root, mode),
         )
+    }
+
+    #[test]
+    fn session_id_validation_is_bounded_and_rejects_argument_injection() {
+        for value in [
+            "",
+            " ",
+            "-session",
+            "ses\nresume",
+            "ses\tresume",
+            "ses/resume",
+        ] {
+            assert!(validate_session_id(value).is_err(), "accepted {value:?}");
+        }
+        assert!(validate_session_id(&"s".repeat(MAX_SESSION_ID_BYTES + 1)).is_err());
+        assert!(validate_session_id("ses_resume-1").is_ok());
+    }
+
+    #[test]
+    fn resume_command_places_session_before_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "success", None);
+        options.session = Some("ses_resume".to_owned());
+        let cwd = std::env::current_dir().unwrap();
+        let args =
+            build_opencode_command(&options, &cwd, "prompt", Vec::<(OsString, OsString)>::new())
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..10],
+            &[
+                "run".to_owned(),
+                "--pure".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+                "--dir".to_owned(),
+                cwd.to_string_lossy().into_owned(),
+                "--model".to_owned(),
+                "opencode-go/test-model".to_owned(),
+                "--session".to_owned(),
+                "ses_resume".to_owned(),
+            ]
+        );
+        assert_eq!(args[10], "--");
+    }
+
+    #[test]
+    fn resume_preflight_requires_matching_session_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let ok = fake_opencode(root.path(), "session_ok");
+        assert!(preflight_opencode_session(&ok, "ses_resume", &cwd).is_ok());
+
+        for mode in [
+            "session_missing",
+            "session_mismatch",
+            "session_invalid",
+            "session_duplicate",
+            "session_missing_directory",
+            "session_nonzero",
+            "session_timeout",
+            "session_huge_stdout",
+            "session_huge_stderr",
+        ] {
+            let binary = fake_opencode(root.path(), mode);
+            assert!(preflight_opencode_session(&binary, "ses_resume", &cwd).is_err());
+        }
+    }
+
+    #[test]
+    fn session_preflight_uses_delegation_cwd_and_never_launches_run_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact_root = tempfile::tempdir().unwrap();
+        let delegation_cwd = tempfile::tempdir().unwrap();
+        let parent_cwd = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let delegation_cwd = fs::canonicalize(delegation_cwd.path()).unwrap();
+        assert_ne!(delegation_cwd, parent_cwd);
+        let _artifact_root = test_artifact_temp_root(artifact_root.path());
+        let binary = fake_opencode(root.path(), "session_ok");
+        assert!(preflight_opencode_session(&binary, "ses_resume", &delegation_cwd).is_ok());
+        assert!(!binary.with_extension("run-marker").exists());
+        assert!(fs::read_dir(artifact_root.path()).unwrap().next().is_none());
+
+        for mode in [
+            "session_missing",
+            "session_mismatch",
+            "session_invalid",
+            "session_duplicate",
+            "session_missing_directory",
+            "session_nonzero",
+            "session_timeout",
+            "session_huge_stdout",
+            "session_huge_stderr",
+        ] {
+            let binary = fake_opencode(root.path(), mode);
+            let mut options = opencode_options(root.path(), mode, None);
+            options.session = Some("ses_resume".to_owned());
+            assert!(run_with_options(options).is_err());
+            assert!(!binary.with_extension("run-marker").exists());
+        }
+        assert!(fs::read_dir(artifact_root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn resume_preflight_precedes_run_and_normalizes_result() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "session_ok", None);
+        options.session = Some("ses_resume".to_owned());
+        let result = run_with_options(options).unwrap();
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(result.evidence.thread_id.as_deref(), Some("ses_test"));
     }
 
     fn run_fake_opencode(root: &Path, mode: &str, variant: Option<&str>) -> (Value, String) {

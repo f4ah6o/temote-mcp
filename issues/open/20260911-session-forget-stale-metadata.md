@@ -121,7 +121,7 @@ Adding `forget` must not silently change the existing retention policy.
 
 - Active session with a responsive runtime socket: **refused**, no lifecycle artifacts removed.
 - Starting / stopping session owned by the current supervisor: **refused**, no partial cleanup.
-- A race where a runtime becomes live during cleanup must fail closed.
+- A race where a runtime becomes live during cleanup must fail closed; the shared lifecycle ownership lock makes the probe/removal and runtime-establishment critical sections mutually exclusive across supervisor processes.
 
 ### Terminal cleanup
 
@@ -167,6 +167,8 @@ Add focused unit/integration coverage for:
 
 ## Implementation notes
 
+The repository-local coverage includes crashed/orphaned cleanup after supervisor replacement, concurrent stop/forget serialization, upgrade-fence refusal without partial cleanup, special-file rejection, and disappearance from list/info after a successful forget. Runtime ownership establishment and forget now share a stable, owner-only regular-file flock at `<state>/temote-mcp/session-lifecycle.lock`; the lock covers the runtime socket probe plus all artifact removal and the complete runtime socket/metadata establishment path. The boundary is never removed when an individual session is forgotten, so a runtime cannot become live between forget's probe and removal across supervisor processes.
+
 Likely touch points include:
 
 ```text
@@ -175,6 +177,7 @@ src/main.rs
 src/session_control.rs
 src/supervisor.rs
 src/config.rs
+src/approvals.rs
 ```
 
 The implementation should reuse existing session validation, socket probing, lifecycle transition locking, no-follow metadata handling, and platform-path resolution rather than introducing a second cleanup path.

@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN` landed on main; session/resume pre-implementation spike recorded; persistent/session implementation not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN` and explicit same-directory session resume landed; persistent/session lifecycle implementation not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -563,7 +563,18 @@ Backend adapter extraction landed on main without changing external behavior:
 - All 37 delegation tests moved with their modules and pass unchanged; the frozen parent JSON fixture, Codex argv/environment tests, OpenCode argv/normalization tests, and diagnostics tests keep their assertions.
 - Smoke on 2026-09-11: `delegate diagnose --backend opencode` unchanged; one-shot `delegate --backend opencode --model opencode/mimo-v2.5-free` completed with `status=success` and no files created or changed.
 
-Remaining work after this slice: persistent server/session/resume.
+Remaining work after this slice: persistent server/session lifecycle, automatic resume, fork, and attach.
+
+## Explicit resume status (2026-09-12)
+
+The recommended explicit-resume slice landed locally:
+
+- `--session <id>` is accepted only by the OpenCode backend and is passed as one fixed argv value.
+- Before artifacts or `opencode run` are created, Temote runs bounded `opencode session list --format json` and requires exactly one matching ID whose canonical `directory` equals the canonical delegation cwd.
+- Invalid IDs, missing or ambiguous sessions, directory mismatch, non-zero/timeout/oversized/malformed probes, and incomplete metadata fail closed without launching the delegated task.
+- Deterministic fake-CLI coverage covers validation, argv ordering, matching-directory success, and preflight failures. The frozen parent result shape is unchanged.
+
+Remaining work is persistent server/session lifecycle and the explicitly deferred `--continue`, `--fork`, and `--attach` behavior.
 
 ## Phase 3 diagnostics status (2026-09-11)
 
@@ -603,12 +614,12 @@ Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-rep
 
 ## Session/resume spike status (2026-09-12)
 
-Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-spike-20260912.md`](../../docs/evaluations/opencode-session-resume-spike-20260912.md). No production session/resume behavior was implemented.
+Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-spike-20260912.md`](../../docs/evaluations/opencode-session-resume-spike-20260912.md). The explicit, caller-supplied session resume slice is now implemented; persistent lifecycle behavior remains out of scope.
 
 - Verified on OpenCode 1.18.30: explicit `--session <id>` preserves the session ID and context, works with a different `--model`, and is unaffected by `--pure`. A session created in directory A and resumed with `--dir B` resolves to directory A and then hangs without emitting a final event, so a mismatched resume both ignores the caller's canonical cwd and fails to terminate.
 - `--continue` implicitly selects the most recent project session and silently creates a new session when the project has no history; `--fork` creates a new session with inherited context; `--attach` requires a server lifecycle and auth.
 - Recommended first slice: explicit caller-supplied `--session <id>` only, with a fail-closed bounded `opencode session list --format json` preflight requiring the session's canonical `directory` to equal the canonical cwd; no `--continue`, no `--fork`, no `--attach`, no server lifecycle, and no automatic resume from previously observed thread IDs.
-- Remaining work: implement the recommended explicit-resume slice (plus later, separately reviewed fork/attach slices if desired).
+- Explicit resume is now implemented as a bounded, fail-closed slice: `--session <id>` is OpenCode-only; a read-only `session list --format json` preflight requires one exact ID and a canonical directory match before artifacts or `run` are started. `--continue`, `--fork`, and `--attach` remain unsupported.
 
 ## OpenCode executable override status (2026-09-12)
 
@@ -620,7 +631,7 @@ Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-
 - Verification: 8 new adapter tests + 3 shared delegation tests (52 OpenCode adapter tests), including precedence, unset fallback, empty/relative/missing/directory/non-executable/NUL/overlong rejection, symlink canonicalization, invalid-override diagnostics, source labeling, error-path non-disclosure, and child-environment filtering.
 - Smoke: valid override diagnosed `source=env_override`, `status=available`, `version=1.18.30`, requested model `present`; unset override diagnosed `source=path`; invalid override diagnosed `source=invalid_override` with `not_absolute`/`not_found` and delegation exited non-zero without producing a result; one-shot read-only delegation through the override returned `status=success` and left the disposable directory unchanged.
 
-Remaining work after this slice: persistent server/session/resume.
+Remaining work after this slice: persistent server/session lifecycle, automatic resume, fork, and attach.
 
 ## Phase 1 status (2026-09-11)
 

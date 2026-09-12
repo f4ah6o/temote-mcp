@@ -9,6 +9,20 @@ use uuid::Uuid;
 const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SESSION_PROBE_RESPONSE_BYTES: usize = 64;
 const MAX_SESSION_METADATA_BYTES: usize = 64 * 1024;
+const SESSION_LIFECYCLE_LOCK_FILE: &str = "session-lifecycle.lock";
+
+pub struct SessionLifecycleLock {
+    file: std::fs::File,
+}
+
+impl Drop for SessionLifecycleLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
+        }
+    }
+}
 
 fn file_type_is_socket(metadata: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
@@ -194,6 +208,68 @@ pub fn sessions_dir() -> Result<PathBuf> {
     Ok(state_dir()?.join("sessions"))
 }
 
+pub fn session_lifecycle_lock_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join(SESSION_LIFECYCLE_LOCK_FILE))
+}
+
+/// Serialize runtime ownership establishment and stale-session cleanup across
+/// supervisor processes. The inode is intentionally stable and never cleaned
+/// up as part of forgetting an individual session.
+pub async fn acquire_session_lifecycle_lock() -> Result<SessionLifecycleLock> {
+    let path = session_lifecycle_lock_path()?;
+    tokio::task::spawn_blocking(move || open_session_lifecycle_lock(&path))
+        .await
+        .context("session lifecycle lock task failed")?
+}
+
+fn open_session_lifecycle_lock(path: &Path) -> Result<SessionLifecycleLock> {
+    let parent = path
+        .parent()
+        .context("session lifecycle lock has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create session state directory {}", parent.display()))?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(path)
+            .with_context(|| format!("cannot open session lifecycle lock {}", path.display()))?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "session lifecycle lock is not a regular file: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "session lifecycle lock is not owned by the current user: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "session lifecycle lock must be owner-only: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } == 0,
+            "cannot acquire session lifecycle lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        Ok(SessionLifecycleLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        let file = options.open(path)?;
+        anyhow::ensure!(file.metadata()?.file_type().is_file());
+        Ok(SessionLifecycleLock { file })
+    }
+}
+
 pub fn socket_path(id: &str) -> Result<PathBuf> {
     validate_session_id(id)?;
     Ok(socket_dir()?.join(format!("{id}.sock")))
@@ -375,6 +451,11 @@ fn validate_session_probe_response(response: &str) -> Result<()> {
 }
 
 pub async fn remove_inactive_socket(id: &str) -> Result<()> {
+    let _lifecycle_lock = acquire_session_lifecycle_lock().await?;
+    remove_inactive_socket_unlocked(id).await
+}
+
+pub(crate) async fn remove_inactive_socket_unlocked(id: &str) -> Result<()> {
     if session_is_active(id).await? {
         anyhow::bail!("session {id} is already running");
     }
@@ -401,6 +482,7 @@ pub struct ForgottenSessionArtifacts {
 /// is never trusted to prove that a session is terminal.
 pub async fn forget_session_artifacts(id: &str) -> Result<ForgottenSessionArtifacts> {
     validate_session_id(id)?;
+    let _lifecycle_lock = acquire_session_lifecycle_lock().await?;
     anyhow::ensure!(
         !session_is_active(id).await?,
         "session {id} is live; stop it before forgetting it"
@@ -1312,6 +1394,24 @@ mod tests {
         tokio::fs::remove_file(&target).await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forget_artifacts_rejects_special_metadata_target() {
+        let id = format!("forget-special-{}", Uuid::new_v4());
+        cleanup_forget_fixture(&id).await;
+        let path = session_path(&id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let error = forget_session_artifacts(&id).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        assert!(path.exists());
+        drop(_listener);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
     #[tokio::test]
     async fn forget_artifacts_refuses_a_live_runtime_socket() {
         let id = format!("forget-live-{}", Uuid::new_v4());
@@ -1336,5 +1436,92 @@ mod tests {
         assert!(path.exists());
         server.abort();
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_rejects_untrusted_shapes_and_is_stable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        use tempfile::tempdir;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("session-lifecycle.lock");
+        let target = root.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(open_session_lifecycle_lock(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::create_dir(&path).unwrap();
+        assert!(open_session_lifecycle_lock(&path).is_err());
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_session_lifecycle_lock(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        drop(open_session_lifecycle_lock(&path).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_serializes_tasks_without_removing_the_boundary() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::mpsc;
+        use std::thread;
+        use tempfile::tempdir;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("session-lifecycle.lock");
+        let held = open_session_lifecycle_lock(&path).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let lock = open_session_lifecycle_lock(&worker_path).unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(lock);
+        });
+        started_rx.recv().unwrap();
+        assert!(acquired_rx.try_recv().is_err());
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        drop(held);
+        acquired_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[tokio::test]
+    async fn runtime_start_wins_before_forget_and_forget_remains_non_destructive() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("forget-start-wins-{}", Uuid::new_v4());
+        cleanup_forget_fixture(&id).await;
+        let lock = acquire_session_lifecycle_lock().await.unwrap();
+        let (sender, _receiver) = crate::approvals::approval_channel();
+        let cwd = root.path().to_path_buf();
+        let start_id = id.clone();
+        let start = tokio::spawn(async move {
+            crate::approvals::spawn_runtime_with_logical_path_and_environment(
+                &cwd,
+                Some(&start_id),
+                PermissionMode::Agent,
+                sender,
+                None,
+                crate::approvals::CapturedStartEnvironment::default(),
+            )
+            .await
+        });
+        drop(lock);
+        let handle = start.await.unwrap().unwrap();
+
+        let error = forget_session_artifacts(&id).await.unwrap_err();
+        assert!(error.to_string().contains("is live"));
+        assert!(session_path(&id).unwrap().exists());
+        assert!(session_lifecycle_path(&id).unwrap().exists());
+        handle.shutdown().await.unwrap();
+        cleanup_forget_fixture(&id).await;
     }
 }

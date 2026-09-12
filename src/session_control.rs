@@ -2465,6 +2465,27 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn forgotten_session_disappears_from_list_and_info() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("forget-views-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo", Some(&id)).await.unwrap();
+        supervisor.stop(&id).await.unwrap();
+
+        let listed = list_session_views(&supervisor).await.unwrap();
+        assert!(listed.iter().any(|session| session.session_id == id));
+        assert_eq!(inspect_session(&id).await.unwrap().session_id, id);
+
+        supervisor.forget_session(&id).await.unwrap();
+        let listed = list_session_views(&supervisor).await.unwrap();
+        assert!(!listed.iter().any(|session| session.session_id == id));
+        assert!(inspect_session(&id).await.is_err());
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
+    }
+
     #[cfg(unix)]
     #[test]
     fn upgrade_executable_gate_rejects_incompatible_protocol_without_running_handoff() {

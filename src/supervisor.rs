@@ -2216,6 +2216,91 @@ mod tests {
         cleanup_session(&id).await;
     }
 
+    #[tokio::test]
+    async fn concurrent_stop_and_forget_are_serialized() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("forget-race-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+
+        let stop = {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            tokio::spawn(async move { supervisor.stop(&id).await })
+        };
+        let forget = {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            tokio::spawn(async move { supervisor.forget_session(&id).await })
+        };
+        let (stop, forget) = tokio::join!(stop, forget);
+        stop.unwrap().unwrap();
+        if let Err(error) = forget.unwrap() {
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("managed by this supervisor") || text.contains("is live"),
+                "unexpected concurrent forget error: {text}"
+            );
+        }
+
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn forget_session_removes_crashed_orphaned_session() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots.clone());
+        let id = format!("forget-crashed-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        supervisor.crash_for_test(&id).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                supervisor.reap_finished().await;
+                if config::read_session_lifecycle(&id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|state| state.status == config::LifecycleStatus::Crashed)
+                    && !supervisor.is_managed_for_test(&id).await
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("crashed session was not reaped");
+
+        supervisor.shutdown().await.unwrap();
+        let (replacement, _replacement_approvals) = SessionSupervisor::new(roots);
+        let forgotten = replacement.forget_session(&id).await.unwrap();
+        assert!(forgotten.metadata_removed);
+        assert!(forgotten.lifecycle_removed);
+        replacement.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn forget_session_is_refused_while_upgrade_is_fenced() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("forget-fenced-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo-a", Some(&id)).await.unwrap();
+        supervisor.stop(&id).await.unwrap();
+        supervisor.upgrade_fenced.store(true, Ordering::Release);
+
+        let error = supervisor.forget_session(&id).await.unwrap_err();
+        assert!(error.to_string().contains("temporarily fenced"));
+        assert!(config::session_path(&id).unwrap().exists());
+        assert!(config::session_lifecycle_path(&id).unwrap().exists());
+
+        supervisor.clear_upgrade_fence();
+        supervisor.forget_session(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
     #[test]
     fn upgrade_plan_permission_mode_round_trips_and_maps_legacy_yolo() {
         for (mode, text) in [

@@ -1,6 +1,6 @@
 # `local_agent_run` cannot launch Codex installed through Vite+ (`vp`)
 
-Status: open / reproduction and classification landed on main; sandbox fix not implemented
+Status: open / bounded launcher dependency closure implemented; verification pending
 Created: 2026-09-11
 Priority: P1 developer workflow regression
 Related:
@@ -210,3 +210,7 @@ Classification with deterministic fixtures (`src/local_agent.rs` tests):
 - `vite_plus_launcher_cannot_read_package_store_in_local_agent_sandbox` (ignored) reproduces the operator failure class: the sandboxed launcher cannot exec/read through the missing dependency path (`sandbox-exec: execvp() ... Operation not permitted`).
 
 Identified missing runtime dependency class: launcher-side paths needed to resolve and run the package runtime, at minimum the intermediate symlink hop parent, the Vite+ package store entry for the agent package, and the managed runtime directory. None of these should become globally writable; the fix should add a bounded, verified read-only dependency closure (fix direction A/B/C in this issue).
+
+## Implementation notes (2026-09-12)
+
+`local_agent_run` now recognizes only the reproduced symlinked Vite+ Codex layout. It verifies a bounded symlink chain, the Codex metadata file, exactly one package install, the package runtime, and `js_runtime`; it then exposes the canonical dependency directories read-only and supplies the derived `VP_HOME` internally. Standalone and unrelated symlinked executables retain the existing two-root behavior. The dependency closure and derived launcher environment are revalidated after approval, and missing metadata/runtime, install escapes, and cycles fail with precise errors.
