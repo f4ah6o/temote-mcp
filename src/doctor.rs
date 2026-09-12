@@ -592,6 +592,73 @@ async fn check_gateway_supervisor(report: &mut Report, host_id: &str) {
     report.add(result.into_check());
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SessionAvailabilitySummary {
+    listed: usize,
+    active: usize,
+}
+
+fn session_status_is_live(status: &str) -> bool {
+    matches!(status, "active" | "starting")
+}
+
+/// Counts the local supervisor session inventory without exposing session IDs,
+/// paths, or any credential. The gateway ultimately serves this host's
+/// supervisor, so this local read-only inventory is the authoritative source.
+fn summarize_session_availability(statuses: &[&str]) -> SessionAvailabilitySummary {
+    let mut summary = SessionAvailabilitySummary::default();
+    for status in statuses {
+        summary.listed += 1;
+        if session_status_is_live(status) {
+            summary.active += 1;
+        }
+    }
+    summary
+}
+
+fn classify_session_availability(
+    host_id: &str,
+    summary: SessionAvailabilitySummary,
+) -> GatewayStageResult {
+    let detail = format!(
+        "host_id={host_id}, listed_sessions={}, active_sessions={}",
+        summary.listed, summary.active
+    );
+    if summary.active == 0 {
+        return GatewayStageResult::failed(
+            GatewayStage::SessionAvailability,
+            "sessions",
+            format!("{detail}, session_unavailable"),
+            "Start or reconnect a Temote session for this host before relying on the gateway endpoint.",
+        );
+    }
+    GatewayStageResult::ready(GatewayStage::SessionAvailability, "sessions", detail)
+}
+
+/// Reports whether this host can currently serve sessions through the gateway.
+///
+/// The check reuses the existing read-only supervisor control protocol; it does
+/// not dispatch an MCP tool, create a session, or mutate lease/approval state.
+/// Counts are bounded by the supervisor list response and no path is printed.
+async fn check_gateway_session_availability(report: &mut Report, host_id: &str) {
+    let result = match crate::session_control::request_session_views().await {
+        Ok(sessions) => {
+            let statuses = sessions
+                .iter()
+                .map(|session| session.status.as_str())
+                .collect::<Vec<_>>();
+            classify_session_availability(host_id, summarize_session_availability(&statuses))
+        }
+        Err(_) => GatewayStageResult::unavailable(
+            GatewayStage::SessionAvailability,
+            "sessions",
+            format!("host_id={host_id}, session inventory could not be determined"),
+            "Confirm the local supervisor can enumerate sessions (for example with `temote-mcp session list`) before relying on the gateway endpoint.",
+        ),
+    };
+    report.add(result.into_check());
+}
+
 async fn check_federation_readiness(report: &mut Report) {
     let Some(config) = GatewayLocalConfig::from_env() else {
         return;
@@ -612,6 +679,7 @@ async fn check_federation_readiness(report: &mut Report) {
     check_gateway_supervisor(report, &host_id).await;
     #[cfg(feature = "network")]
     check_gateway_remote(report, &config, &host_id).await;
+    check_gateway_session_availability(report, &host_id).await;
 }
 
 #[cfg(feature = "network")]
@@ -817,14 +885,6 @@ async fn check_gateway_remote(report: &mut Report, config: &GatewayLocalConfig, 
                 )
                 .into_check(),
             );
-            report.add(
-                GatewayStageResult::not_checked(
-                    GatewayStage::SessionAvailability,
-                    "sessions",
-                    "session discovery is not part of the read-only gateway status probe",
-                )
-                .into_check(),
-            );
             return;
         }
     };
@@ -890,14 +950,6 @@ async fn check_gateway_remote(report: &mut Report, config: &GatewayLocalConfig, 
                 )
                 .into_check(),
             );
-            report.add(
-                GatewayStageResult::not_checked(
-                    GatewayStage::SessionAvailability,
-                    "sessions",
-                    "session discovery is not part of the read-only gateway status probe",
-                )
-                .into_check(),
-            );
             return;
         }
     };
@@ -915,14 +967,6 @@ async fn check_gateway_remote(report: &mut Report, config: &GatewayLocalConfig, 
     ) {
         report.add(result.into_check());
     }
-    report.add(
-        GatewayStageResult::not_checked(
-            GatewayStage::SessionAvailability,
-            "sessions",
-            "session discovery is not part of the read-only gateway status probe",
-        )
-        .into_check(),
-    );
 }
 
 #[cfg(feature = "network")]
@@ -2292,6 +2336,99 @@ mod tests {
             detail,
             "supervisor=unknown, control_protocol=0, named_roots=0"
         );
+    }
+
+    #[test]
+    fn gateway_session_availability_summarizes_listed_and_active_sessions() {
+        let statuses = ["active", "stopped", "crashed", "starting"];
+        let summary = summarize_session_availability(&statuses);
+        assert_eq!(summary.listed, 4);
+        assert_eq!(summary.active, 2);
+
+        let result = classify_session_availability("host-a", summary);
+        assert_eq!(result.stage, GatewayStage::SessionAvailability);
+        assert_eq!(result.status, GatewayStageStatus::Ready);
+        assert!(
+            result.detail.contains("listed_sessions=4"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("active_sessions=2"),
+            "{}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn gateway_session_availability_empty_inventory_is_not_ready() {
+        let statuses: [&str; 0] = [];
+        let summary = summarize_session_availability(&statuses);
+        assert_eq!(summary.listed, 0);
+        assert_eq!(summary.active, 0);
+
+        let result = classify_session_availability("host-a", summary);
+        assert_eq!(result.status, GatewayStageStatus::Failed);
+        assert!(
+            result.detail.contains("listed_sessions=0"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("active_sessions=0"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("session_unavailable"),
+            "{}",
+            result.detail
+        );
+        let check = result.into_check();
+        assert_eq!(check.level, Level::Fail);
+        assert!(
+            check.hint.is_some(),
+            "failed availability needs remediation"
+        );
+    }
+
+    #[test]
+    fn gateway_session_availability_without_live_sessions_is_not_ready() {
+        let statuses = ["stopped", "crashed", "expired"];
+        let summary = summarize_session_availability(&statuses);
+        assert_eq!(summary.listed, 3);
+        assert_eq!(summary.active, 0);
+
+        let result = classify_session_availability("host-a", summary);
+        assert_eq!(result.status, GatewayStageStatus::Failed);
+        assert!(
+            result.detail.contains("listed_sessions=3"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("active_sessions=0"),
+            "{}",
+            result.detail
+        );
+        assert_eq!(result.into_check().level, Level::Fail);
+    }
+
+    #[test]
+    fn gateway_session_availability_detail_is_non_secret() {
+        let cases: [&[&str]; 3] = [&["active"], &["stopped"], &[]];
+        for statuses in cases {
+            let summary = summarize_session_availability(statuses);
+            let result = classify_session_availability("host-a", summary);
+            let rendered = result.render();
+            let hint = result.into_check().hint.unwrap_or_default();
+            for sentinel in ["/Users/sentinel", "/home/sentinel", "token", "secret"] {
+                assert!(
+                    !rendered.contains(sentinel) && !hint.contains(sentinel),
+                    "session availability diagnostic leaked {sentinel}: {rendered} / {hint}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "network")]

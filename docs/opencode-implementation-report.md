@@ -312,3 +312,123 @@ suite is green.
 ### Git status
 
 No commit or push was performed. All existing worktree changes were preserved.
+
+## Pass 6 — gateway doctor session_availability stage (2026-09-12)
+
+### Issue addressed
+
+`issues/open/20260911-gateway-doctor-readiness.md`. This pass completes the last
+recorded repository-local residue: the `session_availability` stage previously stayed
+`not_checked` in every case.
+
+### Files changed
+
+- `src/doctor.rs`
+- `docs/gateway.md`
+- `docs/gateway.ja.md`
+- `issues/open/20260911-gateway-doctor-readiness.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- Added `summarize_session_availability` and `classify_session_availability` pure helpers
+  plus `check_gateway_session_availability`.
+- `check_federation_readiness` now runs the new stage after the remote probe. It reuses the
+  existing read-only supervisor control protocol (`request_session_views` /
+  `ControlRequest::List`) and reports bounded `listed_sessions`/`active_sessions` counts with
+  the non-secret `host_id`.
+- Removed the three `session_availability=not_checked` emissions from `check_gateway_remote`;
+  the stage is now always determined locally when the gateway host identity is valid.
+- A supervisor that cannot enumerate its inventory maps to `unavailable`, never `ready`.
+  A confirmed inventory with no live (`active`/`starting`) session maps to `failed`, never
+  `ready`: the gateway endpoint can be alive while the target host has no available session,
+  and that `session_unavailable` state must not be reported as healthy.
+- No MCP tool is dispatched and no session, lease, approval, or filesystem state is mutated.
+- Added deterministic unit tests: listed/active counting (`active`/`starting` are live), the
+  empty-inventory not-ready case, the non-empty inventory with no live session case, the
+  live-session `ready` case, and path/credential non-disclosure.
+- Updated the English/Japanese gateway operator guides and the issue notes.
+
+### What was intentionally not changed
+
+- No Cloudflare call, route/Access mutation, or credential use.
+- The gateway Worker `/v1/hosts/status` payload is unchanged; its own
+  `session_availability=not_checked` field remains, and the Rust doctor does not depend on it.
+- No remote upgrade-coordinator or OpenCode persistent-lifecycle work.
+
+### Checks
+
+This environment exposes no shell/command-execution tool, so the Rust and gateway suites
+could not be executed here. The change is type-checked by inspection only and must be
+verified before merge:
+
+```text
+cargo test doctor
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo check --no-default-features --all-targets
+(cd gateway && npm test)
+git diff --check
+```
+
+### Remaining blockers
+
+- Live Cloudflare route, Access, host-agent lease, and multi-host evidence remain
+  credential/deployment dependent.
+- `session_availability` is not yet exposed through the remote `/v1/hosts/status` payload;
+  doctor derives it locally from the supervisor the gateway serves.
+
+### Git status
+
+No commit or push was performed. All existing worktree changes were preserved.
+
+## Pass 7 — session_availability zero-live-session correction (2026-09-12)
+
+### Issue addressed
+
+`issues/open/20260911-gateway-doctor-readiness.md`. This pass repairs a defect in Pass 6:
+`classify_session_availability` returned `ready` whenever it could enumerate the inventory,
+including an empty inventory (`active_sessions=0`). That contradicted the issue's requirement
+to distinguish "gateway endpoint is alive but the target host has no available session".
+
+### Files changed
+
+- `src/doctor.rs`
+- `docs/gateway.md`
+- `docs/gateway.ja.md`
+- `issues/open/20260911-gateway-doctor-readiness.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- `classify_session_availability` now returns `failed` with a short non-secret remediation when
+  `active_sessions == 0`. This covers both the empty inventory and the non-empty inventory with
+  no live (`active`/`starting`) session. `active_sessions > 0` remains `ready`.
+- Enumeration failure remains `unavailable`; it is not conflated with the determinate
+  zero-live-session failure or with `ready`.
+- Deterministic tests updated/added: the empty-inventory case now asserts `failed` (was `ready`),
+  a new non-empty no-live-session case asserts `failed`, and the non-disclosure test now covers
+  the ready, no-live, and empty details plus the remediation hint.
+- Operator docs and the issue implementation notes now state the corrected `failed` semantics and
+  no longer claim an empty inventory is `ready`.
+
+### Checks
+
+Post-agent verification was run through the Temote session:
+
+- `cargo fmt --all -- --check`: PASS after applying `cargo fmt --all` to the newly added tests.
+- `cargo test doctor`: PASS, 26 passed / 0 failed in the filtered doctor suite, including all new
+  `session_availability` tests.
+- `cargo check --no-default-features --all-targets`: PASS (exit 0; existing dead-code warnings only).
+- `cargo clippy --all-targets -- -D warnings`: PASS.
+- `(cd gateway && npm test)`: PASS, 67 passed / 0 failed.
+- `git diff --check`: PASS.
+- `cargo test --all-targets --all-features --locked`: environment-limited in the normal `agent`
+  sandbox: 591 passed / 93 failed / 1 ignored. The failures are unrelated host-state tests that
+  require access under `~/Library/Application Support/temote-mcp/...`, which the repository-scoped
+  sandbox correctly rejects with `Operation not permitted`. The new doctor tests passed in this run.
+
+### Git status
+
+No commit or push was performed. All existing worktree changes and the untracked `.worktrees/`
+directory were preserved.

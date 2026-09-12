@@ -1,6 +1,6 @@
 # Gateway federation の end-to-end readiness 診断を追加する
 
-Status: partially implemented / Slice A and the read-only remote endpoint, Access, and host-registration probe are implemented, including explicit `not_registered`/`lease_expired`/`generation_replaced` classification; session availability remains not_checked and live Cloudflare acceptance is pending
+Status: partially implemented / Slice A and the read-only remote endpoint, Access, and host-registration probe are implemented, including explicit `not_registered`/`lease_expired`/`generation_replaced` classification; `session_availability` is now reported from the local supervisor's read-only session inventory, with a confirmed zero-live-session inventory classified as `failed` (`session_unavailable`) rather than `ready`; live Cloudflare acceptance is pending
 Created: 2026-09-11
 Updated: 2026-09-12
 Priority: P1 operator diagnostics
@@ -205,4 +205,19 @@ The first remote read-only slice is implemented:
 
 ## Classification slice residue (updated)
 
-- `generation_replaced` is now classified from the non-secret local gateway-agent record. Remaining: `session_availability` is still intentionally `not_checked`, and live Cloudflare route/Access/lease evidence remains in `20260908-live-acceptance-matrix.md`.
+- `generation_replaced` is now classified from the non-secret local gateway-agent record. Remaining: live Cloudflare route/Access/lease evidence remains in `20260908-live-acceptance-matrix.md`.
+
+## Implementation notes (2026-09-12 session_availability slice)
+
+- `temote-mcp doctor` now emits the `session_availability` stage instead of the previous blanket `not_checked`. It reuses the existing read-only local supervisor control protocol (`ControlRequest::List`) to count the host's listed and active sessions.
+- The detail reports only bounded `listed_sessions`/`active_sessions` counts and the non-secret `host_id`; no session ID, physical root, command, or credential is printed. A deterministically enumerated inventory with zero live (`active`/`starting`) sessions maps to `failed`, and a supervisor that cannot enumerate the inventory maps to `unavailable`; neither is treated as `ready`.
+- No MCP tool is dispatched, no session is created or stopped, and no lease, approval, or filesystem state is mutated. The remote `/v1/hosts/status` probe is unchanged and continues to report its own read-only registration fields.
+- The gateway-agent host DO still reports `session_availability=not_checked` in its own read-only status payload; the doctor stage is derived locally because the doctor runs on the host whose supervisor the gateway serves.
+- Deterministic unit tests cover listed/active counting (including `starting`), the empty-inventory not-ready case, the non-empty inventory with no live session case, the live-session `ready` classification, and non-disclosure of paths/credentials.
+- Remaining residue: live Cloudflare route, Access, and lease verification; the `session_availability` value is not yet exposed through the remote `/v1/hosts/status` payload.
+
+### Correction (2026-09-12): zero-live-session inventory
+
+- The initial `session_availability` slice incorrectly classified an empty inventory (or any inventory with no live session) as `ready` because it counted sessions but did not gate readiness on a live session. That contradicted the issue's requirement to distinguish "gateway endpoint is alive but the target host has no available session" (`session_unavailable`).
+- Corrected semantics: `active_sessions > 0` is `ready`; a confirmed inventory with `active_sessions == 0` is `failed` with a short non-secret remediation; an inventory that cannot be enumerated remains `unavailable`. Empty and non-empty-but-no-live inventories are both `failed`.
+- The stage status uses `failed` (determinate answer) rather than `unavailable` (answer could not be determined), so a reachable endpoint with no serviceable session is not reported as healthy. No session ID, path, command, or credential is included in the detail or remediation.
