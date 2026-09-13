@@ -575,3 +575,82 @@ git diff --check                                     # PASS
 
 No commit or push was performed. No shell was available to capture `git status`;
 existing worktree changes were left untouched.
+
+## Pass 10 — OpenCode delegation explicit `--fork` (2026-09-13)
+
+### Issue addressed
+
+`issues/open/20260910-opencode-delegation-backend.md`. The issue's Status records
+"persistent/session lifecycle implementation not started" and the remaining work as
+"persistent server/session lifecycle, automatic resume, fork, and attach". This pass
+implements the bounded **`--fork`** slice, mirroring the already-landed explicit
+`--session` resume slice. It does not add persistent server/session lifecycle,
+`--continue`, `--attach`, or automatic resume.
+
+### Files changed
+
+- `src/delegation/mod.rs`
+- `src/delegation/opencode.rs`
+- `docs/usage.md`
+- `docs/usage.ja.md`
+- `docs/evaluations/opencode-session-resume-20260912.md`
+- `issues/open/20260910-opencode-delegation-backend.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- `Options` gains `fork: bool` (default `false`); all four `Options` construction
+  sites set it.
+- `delegate --backend opencode ... --session <id> --fork` is parsed. `--fork` is
+  OpenCode-only: Codex rejects it alongside `--variant`/`--session`, and OpenCode
+  rejects `--fork` without `--session`. The OpenCode adapter's `validate_options`
+  enforces the same `--fork requires --session` rule.
+- `build_opencode_command` appends exactly one `--fork` immediately after
+  `--session <id>` and before the `--` prompt separator. No other argv, environment,
+  artifact, or report behavior changes.
+- The existing fail-closed `opencode session list --format json` directory preflight
+  is reused unchanged for the parent session before any artifact or `run` child is
+  created.
+- `docs/usage.md`/`docs/usage.ja.md` now document `--fork` (requires `--session`,
+  inherits the parent session's context, same directory preflight) and list only
+  `--continue`/`--attach` as unsupported.
+- Added three deterministic tests: `fork_requires_session_and_is_opencode_only`,
+  `fork_command_places_fork_after_session_before_prompt`, and
+  `fork_preflight_uses_parent_session_and_launches_new_session`. The frozen parent
+  JSON shape fixture is untouched, and Codex compatibility is unaffected.
+
+### What was intentionally not changed
+
+- No persistent OpenCode server/session lifecycle, no `--continue`, no `--attach`,
+  and no automatic resume from previously observed thread IDs.
+- No change to executable resolution, environment allowlist, bounded artifact
+  capture, report normalization, or the parent result shape.
+- No provider credentials, network calls, or live OpenCode execution.
+
+### Checks
+
+Post-agent verification was completed by the coordinator through the Temote session; the OpenCode coding environment itself exposes no shell/command-execution tool. The following repository-local checks passed:
+
+```text
+cargo fetch --locked                                       # PASS
+cargo test delegation --locked                             # PASS: 88 passed / 0 failed
+cargo fmt --all -- --check                                 # PASS (one formatting diff was found, applied with `cargo fmt`, then check PASS)
+cargo check --all-targets --locked                         # PASS
+cargo check --no-default-features --all-targets --locked   # PASS (existing dead_code warnings only)
+cargo clippy --all-targets --all-features -- -D warnings   # PASS (macOS)
+npm test --prefix gateway                                  # PASS: 67 passed / 0 failed
+```
+
+Full `cargo test` attempts inside the Temote sandbox are not valid CI reproductions: nested runtime/socket/Seatbelt operations fail with `Operation not permitted`. This report does not claim full CI green.
+
+### Remaining blockers
+
+- Persistent OpenCode server/session lifecycle, `--continue`, and `--attach` remain
+  unimplemented.
+- A live fork was not executed; the upstream `--session <id> --fork` behavior is
+  recorded in `docs/evaluations/opencode-session-resume-spike-20260912.md` (E5).
+
+### Git status
+
+No commit or push was performed. No shell was available to capture `git status`;
+existing worktree changes were left untouched.

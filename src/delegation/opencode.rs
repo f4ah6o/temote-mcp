@@ -747,6 +747,9 @@ pub(super) fn validate_options(options: &Options) -> Result<(), String> {
     if let Some(session) = &options.session {
         validate_session_id(session)?;
     }
+    if options.fork && options.session.is_none() {
+        return Err("--fork requires --session for the opencode backend".to_owned());
+    }
     opencode_effective_prompt(options)?;
     Ok(())
 }
@@ -948,6 +951,9 @@ where
     }
     if let Some(session) = &options.session {
         command.arg("--session").arg(session);
+        if options.fork {
+            command.arg("--fork");
+        }
     }
     command.arg("--").arg(effective_prompt);
     configure_opencode_environment(&mut command, environment);
@@ -1614,6 +1620,99 @@ esac
         }
         assert!(validate_session_id(&"s".repeat(MAX_SESSION_ID_BYTES + 1)).is_err());
         assert!(validate_session_id("ses_resume-1").is_ok());
+    }
+
+    #[test]
+    fn fork_requires_session_and_is_opencode_only() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "opencode",
+            "--model",
+            "opencode-go/test-model",
+            "--session",
+            "ses_resume",
+            "--fork",
+            "--prompt",
+            "task",
+        ]))
+        .unwrap();
+        assert_eq!(options.backend, DelegationBackend::OpenCode);
+        assert_eq!(options.session.as_deref(), Some("ses_resume"));
+        assert!(options.fork);
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--reasoning-effort",
+            "high",
+            "--fork",
+            "--prompt",
+            "task",
+        ]));
+        assert!(options.is_err(), "codex must reject --fork");
+
+        let options = parse_generic_args(&args(&[
+            "--backend",
+            "opencode",
+            "--model",
+            "opencode-go/test-model",
+            "--fork",
+            "--prompt",
+            "task",
+        ]));
+        assert!(
+            options.is_err(),
+            "opencode --fork without --session must fail"
+        );
+    }
+
+    #[test]
+    fn fork_command_places_fork_after_session_before_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "session_ok", None);
+        options.session = Some("ses_resume".to_owned());
+        options.fork = true;
+        let cwd = std::env::current_dir().unwrap();
+        let args =
+            build_opencode_command(&options, &cwd, "prompt", Vec::<(OsString, OsString)>::new())
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+        assert_eq!(
+            &args[8..12],
+            &[
+                "--session".to_owned(),
+                "ses_resume".to_owned(),
+                "--fork".to_owned(),
+                "--".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fork_preflight_uses_parent_session_and_launches_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = opencode_options(root.path(), "session_ok", None);
+        options.session = Some("ses_resume".to_owned());
+        options.fork = true;
+        let result = run_with_options(options).unwrap();
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(result.evidence.thread_id.as_deref(), Some("ses_test"));
+        let stderr = fs::read_to_string(&result.artifacts.stderr).unwrap();
+        assert!(
+            stderr.contains("<--session><ses_resume><--fork>"),
+            "unexpected argv: {stderr}"
+        );
+        fs::remove_dir_all(&result.artifacts.directory).unwrap();
     }
 
     #[test]

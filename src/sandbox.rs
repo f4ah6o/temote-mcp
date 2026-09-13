@@ -313,16 +313,7 @@ pub async fn run_local_agent(
     )?;
 
     #[cfg(target_os = "linux")]
-    let mut process = linux::local_agent_command(
-        command,
-        &cwd,
-        scope.writable_roots,
-        scope.temporary_roots,
-        scope.read_only_paths,
-        scope.read_only_roots,
-        scope.read_only_symlinks,
-        scope.hidden_roots,
-    )?;
+    let mut process = linux::local_agent_command(command, &cwd, &scope)?;
 
     #[cfg(target_os = "macos")]
     let mut process = macos::command(&spec, command)?;

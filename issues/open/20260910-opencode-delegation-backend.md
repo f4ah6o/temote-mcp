@@ -1,6 +1,6 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN` and explicit same-directory session resume landed; persistent/session lifecycle implementation not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN`, explicit same-directory session resume, and bounded `--fork` landed; persistent/session lifecycle implementation not started
 - Date: 2026-09-10 (Asia/Tokyo)
 - Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
@@ -619,7 +619,7 @@ Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-
 - Verified on OpenCode 1.18.30: explicit `--session <id>` preserves the session ID and context, works with a different `--model`, and is unaffected by `--pure`. A session created in directory A and resumed with `--dir B` resolves to directory A and then hangs without emitting a final event, so a mismatched resume both ignores the caller's canonical cwd and fails to terminate.
 - `--continue` implicitly selects the most recent project session and silently creates a new session when the project has no history; `--fork` creates a new session with inherited context; `--attach` requires a server lifecycle and auth.
 - Recommended first slice: explicit caller-supplied `--session <id>` only, with a fail-closed bounded `opencode session list --format json` preflight requiring the session's canonical `directory` to equal the canonical cwd; no `--continue`, no `--fork`, no `--attach`, no server lifecycle, and no automatic resume from previously observed thread IDs.
-- Explicit resume is now implemented as a bounded, fail-closed slice: `--session <id>` is OpenCode-only; a read-only `session list --format json` preflight requires one exact ID and a canonical directory match before artifacts or `run` are started. `--continue`, `--fork`, and `--attach` remain unsupported.
+- Explicit resume is now implemented as a bounded, fail-closed slice: `--session <id>` is OpenCode-only; a read-only `session list --format json` preflight requires one exact ID and a canonical directory match before artifacts or `run` are started. `--continue` and `--attach` remain unsupported; `--fork` is implemented as the bounded follow-up below.
 
 ## OpenCode executable override status (2026-09-12)
 
@@ -656,3 +656,14 @@ Local-agent-only policy; must not become the delegation contract:
 - `prepare`/`run`/`revalidate` approvals, job ownership, and `LocalAgentScope` sandbox semantics stay in `local_agent`.
 - There is no existing version-probing helper; delegation diagnostics must add one for the pinned OpenCode version.
 - `local_agent_run` fixtures are local-agent-shaped; delegation fixtures stay separate unless the exact pinned output is identical.
+
+## Explicit fork status (2026-09-13)
+
+The bounded `--fork` follow-up landed locally. It extends the explicit resume slice without adding server/session lifecycle state:
+
+- `--fork` is OpenCode-only and requires `--session`; argument parsing rejects `--fork` for Codex and rejects it without a session. The same rule is enforced again in the OpenCode adapter's option validation.
+- The existing fail-closed `opencode session list --format json` preflight is reused unchanged against the named parent session, so a missing/ambiguous/mismatched/oversized/failed probe still fails before any artifact or `run` child is created.
+- `opencode run` argv gains exactly one `--fork` immediately after `--session <id>` and before `-- <prompt>`; all other argv, environment filtering, artifact bounds, report normalization, and the frozen parent result shape are unchanged.
+- `evidence.thread_id` remains the observed session ID from OpenCode events; for a fork that observed value is the new forked session, not the requested parent.
+- Deterministic coverage: `fork_requires_session_and_is_opencode_only`, `fork_command_places_fork_after_session_before_prompt`, and `fork_preflight_uses_parent_session_and_launches_new_session` in `src/delegation/opencode.rs`. No live fork was executed (an installed, authenticated OpenCode runtime is not a repository-local gate); the upstream fork behavior is recorded in the resume spike (E5).
+- `--continue` and `--attach` remain unsupported. Persistent OpenCode server/session lifecycle and automatic resume remain the outstanding work in this issue.

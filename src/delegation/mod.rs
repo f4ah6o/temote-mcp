@@ -103,6 +103,7 @@ pub(crate) struct Options {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) variant: Option<String>,
     pub(crate) session: Option<String>,
+    pub(crate) fork: bool,
     pub(crate) codex_binary: PathBuf,
     pub(crate) opencode_binary: PathBuf,
     pub(crate) timeout: Option<Duration>,
@@ -118,6 +119,7 @@ impl Options {
             reasoning_effort: Some(reasoning_effort.to_owned()),
             variant: None,
             session: None,
+            fork: false,
             codex_binary,
             opencode_binary: opencode::default_binary(),
             timeout: None,
@@ -138,6 +140,7 @@ impl Options {
             reasoning_effort: None,
             variant: variant.map(str::to_owned),
             session: None,
+            fork: false,
             codex_binary: codex::default_binary(),
             opencode_binary,
             timeout: None,
@@ -307,13 +310,16 @@ Usage:
   temote-mcp delegate --backend codex --model <MODEL> --reasoning-effort <EFFORT> --prompt-file <PATH>
   temote-mcp delegate --backend opencode --model <provider/model> [--variant <VARIANT>] --prompt <PROMPT>
   temote-mcp delegate --backend opencode --model <provider/model> [--variant <VARIANT>] --prompt-file <PATH>
-  temote-mcp delegate --backend opencode --model <provider/model> --session <ID> [--variant <VARIANT>] --prompt <PROMPT>
+  temote-mcp delegate --backend opencode --model <provider/model> --session <ID> [--fork] [--variant <VARIANT>] --prompt <PROMPT>
   temote-mcp delegate diagnose --backend opencode [--model <provider/model>]
 
 Each request runs one bounded, non-interactive delegation process and prints
 one bounded JSON result. The legacy `temote-mcp codex delegate ...` command
-always uses the Codex backend. Diagnostics are read-only and never log in,
-change credentials, download models, or run a delegation task.
+always uses the Codex backend. OpenCode `--session <ID>` resumes an existing
+session after a fail-closed directory preflight; `--fork` additionally requires
+`--session` and starts a new session with the parent's context. Diagnostics are
+read-only and never log in, change credentials, download models, or run a
+delegation task.
 "#
     .to_owned()
 }
@@ -459,6 +465,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         reasoning_effort: Some(reasoning_effort),
         variant: None,
         session: None,
+        fork: false,
         codex_binary: codex::default_binary(),
         opencode_binary: opencode::default_binary(),
         timeout: None,
@@ -471,6 +478,7 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
     let mut reasoning_effort = None;
     let mut variant = None;
     let mut session = None;
+    let mut fork = false;
     let mut prompt = None;
     let mut prompt_file = None;
     let mut index = 0;
@@ -491,6 +499,7 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
             }
             "--variant" => variant = Some(argument_value(args, &mut index, flag)?),
             "--session" => session = Some(argument_value(args, &mut index, flag)?),
+            "--fork" => fork = true,
             "--prompt" => prompt = Some(argument_value(args, &mut index, flag)?),
             "--prompt-file" => prompt_file = Some(argument_value(args, &mut index, flag)?),
             _ => {
@@ -516,9 +525,9 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
 
     let reasoning_effort = match backend {
         DelegationBackend::Codex => {
-            if variant.is_some() || session.is_some() {
+            if variant.is_some() || session.is_some() || fork {
                 return Err(format!(
-                    "--variant and --session are only supported by the opencode backend\n\n{}",
+                    "--variant, --session, and --fork are only supported by the opencode backend\n\n{}",
                     generic_usage()
                 ));
             }
@@ -533,6 +542,12 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
             if reasoning_effort.is_some() {
                 return Err(format!(
                     "--reasoning-effort is only supported by the codex backend; use --variant for opencode\n\n{}",
+                    generic_usage()
+                ));
+            }
+            if fork && session.is_none() {
+                return Err(format!(
+                    "--fork requires --session for the opencode backend\n\n{}",
                     generic_usage()
                 ));
             }
@@ -555,6 +570,7 @@ fn parse_generic_args(args: &[String]) -> Result<Options, String> {
         reasoning_effort,
         variant,
         session,
+        fork,
         codex_binary: codex::default_binary(),
         opencode_binary,
         timeout: None,

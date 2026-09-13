@@ -43,22 +43,17 @@ pub fn developer_tool_command(
 pub fn local_agent_command(
     command: &[String],
     cwd: &Path,
-    writable_roots: &[PathBuf],
-    temporary_roots: &[PathBuf],
-    read_only_paths: &[PathBuf],
-    read_only_roots: &[PathBuf],
-    read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
-    hidden_roots: &[PathBuf],
+    scope: &crate::sandbox::LocalAgentScope<'_>,
 ) -> Result<Command> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let policy = LinuxSandboxPolicy::for_local_agent(
         cwd,
-        writable_roots,
-        temporary_roots,
-        read_only_paths,
-        read_only_roots,
-        read_only_symlinks,
-        hidden_roots,
+        scope.writable_roots,
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.read_only_symlinks,
+        scope.hidden_roots,
     )?;
     let executable = helper_executable()?;
     let args = helper::command_args(&policy, command)?;
