@@ -654,3 +654,123 @@ Full `cargo test` attempts inside the Temote sandbox are not valid CI reproducti
 
 No commit or push was performed. No shell was available to capture `git status`;
 existing worktree changes were left untouched.
+
+## Pass 11 — client-safe upgrade persisted apply admission (2026-09-13)
+
+### Issue addressed
+
+`issues/open/20260908-07-client-safe-upgrade-reconnect.md` (suggested implementation
+order step 7: duplicate/idempotency/stale-transaction handling). The issue's coordinator
+state machine and response-flush barrier are already implemented (Pass 9). This pass adds
+the repository-local admission decision over the complete persisted transaction set, so a
+future remote `upgrade_apply` can recognize a duplicate or conflicting request before any
+coordinator is started. It does not add an OS process wrapper, transport wiring, remote
+tools, or transaction-state writes.
+
+### Files changed
+
+- `src/upgrade_transaction.rs`
+- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- Added `load_transactions`, which reads the durable transactions bounded by
+  `MAX_UPGRADE_TRANSACTIONS` through the existing `list_transaction_ids` scan. It
+  fails admission closed on conflicting durable state: only a record that actually
+  disappeared concurrently (`read_transaction_if_present` returns `None`) is
+  skipped, while an existing malformed, unsafe, or otherwise unreadable record
+  propagates an error instead of being silently ignored. This corrects an initial
+  version of the slice that ignored every read error and could classify a new apply
+  as `StartNew` despite conflicting on-disk state.
+- Added `admit_apply`, which fails closed when more than one non-terminal transaction
+  exists (only one destructive transaction may own the runtime) and otherwise delegates to
+  the existing `classify_apply`: `ExistingActive` for a same-target retry,
+  `ConflictActive` for a different active target, `AlreadyCompleted` for a completed
+  same-target request, `StartNew` when no durable owner exists.
+- Added `classify_persisted_apply`, the read-only persisted-state entry point. It performs
+  no transaction-state mutation and fails admission on any read error.
+- Added deterministic tests: no-owner `StartNew`, same-target idempotency, conflicting
+  active target, completed same-target no-op, fail-closed multiple-active state,
+  inclusion of a written transaction in the bounded `load_transactions` scan,
+  fail-closed malformed and unsafe (non-owner-only) existing records, and tolerant
+  skipping of a missing/concurrently removed record. All tests use in-memory
+  transaction values or a uniquely identified written transaction, and the
+  shared-state scan tests are serialized so one test's deliberately invalid record
+  cannot make another test's scan report a spurious failure.
+
+### What was intentionally not changed
+
+- No prepared-transaction creation, no cross-process admission lock, and no
+  `upgrade-coordinator` process; those belong to the `upgrade_apply` mutation path and the
+  coordinator/remote-tool slices.
+- No remote `upgrade_preflight`/`upgrade_apply`/`upgrade_status` MCP tools, no transport
+  commit wiring, no credential use, and no Cloudflare/ingress change.
+
+### Checks
+
+Verification completed in the Temote session:
+
+```text
+PASS git diff --check
+PASS cargo fmt --all -- --check
+PASS cargo check --all-targets --locked
+PASS cargo check --no-default-features --all-targets --locked
+PASS cargo clippy --all-targets -- -D warnings
+PASS cargo clippy --all-targets --all-features -- -D warnings
+PASS cargo test --no-run --locked
+PASS cargo test upgrade_transaction --all-features --locked
+     with HOME=/Volumes/DevSSD/Developer/local-mcp/target/temote-ci-home
+          while preserving the host Rust toolchain homes
+     result: 36 passed / 0 failed
+PASS (cd gateway && npm test)
+     result: 67 passed / 0 failed
+```
+
+The full CI-equivalent Rust test command was also run inside Temote:
+
+```text
+FAIL cargo test --all-targets --all-features --locked
+     result: 638 passed / 74 failed / 1 ignored
+```
+
+Those 74 failures are not treated as a passing full suite. The captured failure details are
+dominated by nested runtime/sandbox/socket tests that fail while trying to create or listen
+on `/tmp/temote-mcp-501/*.sock` (or equivalent nested sandbox operations) with
+`Operation not permitted (os error 1)`. The upgrade-transaction tests themselves pass in
+the repo-local HOME configuration above.
+
+Repository CI (`.github/workflows/ci.yaml`) runs the full Rust suite on GitHub-hosted
+Ubuntu and macOS, outside this nested Temote sandbox. The current checked-out HEAD
+`8d3e432c67bb45780dd3166af6d3fa50e00ff797` has GitHub Actions CI run 316 completed
+successfully on both Rust jobs and the gateway job. This persisted-admission slice is still
+uncommitted and therefore is not part of that green CI run; do not describe this slice as
+CI-green until a commit containing it is actually exercised by CI.
+
+Review correction (2026-09-13): the initial slice ignored every
+`read_transaction_if_present` error, so a malformed/unsafe/unreadable existing record was
+indistinguishable from a concurrently removed one and could let a new apply be admitted as
+`StartNew`. `load_transactions` now skips only the `None` (genuinely disappeared) case and
+propagates every other error, and the new fail-closed tests cover that. Those focused tests
+now pass with the repo-local HOME configuration recorded above.
+
+### Remaining blockers
+
+- The one-shot `upgrade-coordinator` process and concrete executor, response-flush
+  transport wiring, remote `upgrade_preflight`/`upgrade_apply`/`upgrade_status` tools, and
+  macOS/Linux deliberate-disconnect E2E remain unimplemented.
+- The persisted admission decision is read-only; it does not yet create or serialize the
+  prepared transaction under a cross-process admission lock.
+- Admission now fails closed on any malformed/unsafe/unreadable existing transaction
+  record. No automatic repair or garbage-collection path for such records exists yet, so an
+  operator must repair or remove an invalid record before further applies are admitted;
+  explicit stale/incomplete reporting remains available through
+  `incomplete_upgrade_transactions()`.
+- Live Cloudflare route/Access/lease evidence remains credential/deployment dependent.
+
+### Git status
+
+No commit or push was performed. The modified tracked files are this report,
+`issues/open/20260908-07-client-safe-upgrade-reconnect.md`, and
+`src/upgrade_transaction.rs`. Existing untracked `.tmp/` and `.worktrees/` were preserved
+and left untouched.

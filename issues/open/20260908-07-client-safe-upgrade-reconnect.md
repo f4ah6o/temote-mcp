@@ -106,6 +106,35 @@ Still unimplemented: the one-shot `upgrade-coordinator` OS process and its concr
 executor, transport commit wiring, remote `upgrade_preflight` / `upgrade_apply` /
 `upgrade_status` tools, and the deliberate-disconnect process E2E.
 
+## Implementation status (2026-09-13, persisted apply admission)
+
+The repository-local duplicate/idempotency admission decision over the complete
+persisted transaction set (suggested implementation order step 7) is implemented,
+still without writing transaction state or starting a coordinator:
+
+- `load_transactions` reads the durable transactions bounded by
+  `MAX_UPGRADE_TRANSACTIONS`. Admission fails closed on conflicting durable
+  state: only a record that actually disappeared concurrently
+  (`read_transaction_if_present` returns `None`) is skipped, while an existing
+  malformed, unsafe, or unreadable record returns an error and blocks admission
+  rather than being silently ignored.
+- `admit_apply` decides a requested remote upgrade against that full set. It fails
+  closed whenever more than one non-terminal transaction exists, because only one
+  destructive transaction may own the local runtime at a time, and otherwise
+  delegates to `classify_apply`: a same-target retry is `ExistingActive`, a
+  different active target is `ConflictActive`, an already-completed target is
+  `AlreadyCompleted`, and no durable owner is `StartNew`.
+- `classify_persisted_apply` is the read-only persisted-state entry point; it
+  performs no transaction-state mutation and fails admission on a read error.
+- Deterministic tests cover no-owner `StartNew`, same-target idempotency,
+  conflicting active target, a completed same-target no-op, fail-closed
+  multiple-active state, inclusion of a written transaction in the bounded
+  `load_transactions` scan, fail-closed malformed/unsafe existing records, and
+  tolerant skipping of a missing record.
+
+Not implemented in this slice: creating/persisting the prepared transaction or the
+cross-process admission lock, which belong to the `upgrade_apply` mutation path.
+
 ## Implementation status (2026-09-11)
 
 Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.

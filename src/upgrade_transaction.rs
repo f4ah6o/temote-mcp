@@ -342,12 +342,28 @@ pub fn write_transaction(transaction: &UpgradeTransaction) -> Result<PathBuf> {
 }
 
 pub fn read_transaction(transaction_id: &str) -> Result<UpgradeTransaction> {
+    read_transaction_if_present(transaction_id)?
+        .with_context(|| format!("upgrade transaction {transaction_id} is not present"))
+}
+
+/// Reads one transaction, returning `None` when no record file exists.
+///
+/// A missing record is a legitimate concurrent-removal outcome for a bounded
+/// scan, while a malformed or unsafe existing record still fails closed.
+fn read_transaction_if_present(transaction_id: &str) -> Result<Option<UpgradeTransaction>> {
     let path = transaction_path(transaction_id)?;
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .with_context(|| format!("cannot open upgrade transaction {}", path.display()))?;
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot open upgrade transaction {}", path.display()));
+        }
+    };
     let metadata = file.metadata()?;
     anyhow::ensure!(
         metadata.is_file(),
@@ -377,7 +393,7 @@ pub fn read_transaction(transaction_id: &str) -> Result<UpgradeTransaction> {
         transaction.transaction_id == transaction_id,
         "upgrade transaction ID does not match its file name"
     );
-    Ok(transaction)
+    Ok(Some(transaction))
 }
 
 pub fn remove_transaction(transaction_id: &str) -> Result<()> {
@@ -674,6 +690,60 @@ pub fn classify_apply(
     UpgradeApplyDisposition::StartNew
 }
 
+/// Decides how a new remote apply request relates to the complete durable
+/// transaction set.
+///
+/// This is the admission decision the remote `upgrade_apply` surface must make
+/// before any coordinator is started. It fails closed whenever more than one
+/// non-terminal transaction exists, because only one destructive transaction may
+/// own the local runtime at a time, then defers to [`classify_apply`] so a
+/// same-target retry stays idempotent, a different active target conflicts, and
+/// an already-completed target is a no-op.
+pub fn admit_apply(
+    transactions: &[UpgradeTransaction],
+    target_version: &str,
+) -> Result<UpgradeApplyDisposition> {
+    let active = active_transactions(transactions);
+    anyhow::ensure!(
+        active.len() <= 1,
+        "{} active upgrade transactions already own the local runtime",
+        active.len()
+    );
+    let owner = active.first().copied();
+    let latest_completed = latest_completed_transaction(transactions);
+    Ok(classify_apply(owner, latest_completed, target_version))
+}
+
+/// Loads the durable transactions, bounded by [`MAX_UPGRADE_TRANSACTIONS`]
+/// through [`list_transaction_ids`].
+///
+/// Admission must fail closed: only a record that actually disappeared
+/// concurrently (that is, [`read_transaction_if_present`] returns `None`) is
+/// skipped as a benign race. Any existing record that is malformed, unsafe, or
+/// otherwise unreadable is conflicting durable state and its error propagates to
+/// block admission instead of being silently ignored.
+pub fn load_transactions() -> Result<Vec<UpgradeTransaction>> {
+    let mut transactions = Vec::new();
+    for id in list_transaction_ids()? {
+        if let Some(transaction) = read_transaction_if_present(&id)? {
+            transactions.push(transaction);
+        }
+    }
+    Ok(transactions)
+}
+
+/// Admission decision over the persisted transaction set.
+///
+/// This performs no transaction-state mutation: it only reads durable records
+/// and classifies the request so a duplicate or conflicting remote apply is
+/// recognized before any coordinator is started. A read that reaches malformed,
+/// unsafe, or unreadable durable state fails the whole admission rather than
+/// starting a new coordinator.
+pub fn classify_persisted_apply(target_version: &str) -> Result<UpgradeApplyDisposition> {
+    let transactions = load_transactions()?;
+    admit_apply(&transactions, target_version)
+}
+
 /// Read-only best-effort lookup of the most recent transaction identifier.
 ///
 /// This never creates state directories and never fails health reporting: on any
@@ -886,6 +956,19 @@ pub async fn run_upgrade_coordinator<E: UpgradeCoordinatorExecutor>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes tests that scan the shared state directory with tests that
+    /// temporarily install a malformed or unsafe transaction record. Without this,
+    /// a fail-closed `load_transactions` scan could observe another test's
+    /// deliberately invalid record and report a spurious failure.
+    fn state_scan_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct Fixture {
         transaction: UpgradeTransaction,
     }
@@ -972,6 +1055,7 @@ mod tests {
 
     #[test]
     fn unknown_state_and_schema_are_rejected() {
+        let _guard = state_scan_test_lock();
         let fixture = Fixture::new();
         write_transaction(&fixture.transaction).unwrap();
         let path = transaction_path(&fixture.transaction.transaction_id).unwrap();
@@ -1038,6 +1122,7 @@ mod tests {
     fn read_rejects_symlinks_public_modes_and_oversized_files() {
         use std::os::unix::fs::symlink;
 
+        let _guard = state_scan_test_lock();
         let fixture = Fixture::new();
         let path = transaction_path(&fixture.transaction.transaction_id).unwrap();
         let target = path.with_extension("target");
@@ -1217,6 +1302,111 @@ mod tests {
         assert_eq!(
             classify_apply(None, None, "2026.10.0"),
             UpgradeApplyDisposition::StartNew
+        );
+    }
+
+    #[test]
+    fn admit_apply_starts_new_with_no_durable_transactions() {
+        assert_eq!(
+            admit_apply(&[], "2026.10.0").unwrap(),
+            UpgradeApplyDisposition::StartNew
+        );
+    }
+
+    #[test]
+    fn admit_apply_is_idempotent_for_the_same_active_target() {
+        let mut active = Fixture::new().transaction.clone();
+        active.target_version = "2026.10.0".to_owned();
+        active.state = UpgradeTransactionState::Committed;
+        let transactions = vec![active.clone()];
+        assert_eq!(
+            admit_apply(&transactions, "2026.10.0").unwrap(),
+            UpgradeApplyDisposition::ExistingActive(active.transaction_id.clone())
+        );
+        assert_eq!(
+            admit_apply(&transactions, "2026.11.0").unwrap(),
+            UpgradeApplyDisposition::ConflictActive(active.transaction_id.clone())
+        );
+    }
+
+    #[test]
+    fn admit_apply_fails_closed_when_multiple_transactions_are_active() {
+        let first = Fixture::new().transaction.clone();
+        let second = Fixture::new().transaction.clone();
+        let error = admit_apply(&[first, second], "2026.10.0").unwrap_err();
+        assert!(
+            error.to_string().contains("active upgrade transactions"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn admit_apply_treats_a_completed_same_target_as_a_no_op() {
+        let mut completed = Fixture::new().transaction.clone();
+        completed.target_version = "2026.10.0".to_owned();
+        completed.state = UpgradeTransactionState::Completed;
+        assert_eq!(
+            admit_apply(&[completed.clone()], "2026.10.0").unwrap(),
+            UpgradeApplyDisposition::AlreadyCompleted(completed.transaction_id.clone())
+        );
+        assert_eq!(
+            admit_apply(&[completed], "2026.11.0").unwrap(),
+            UpgradeApplyDisposition::StartNew
+        );
+    }
+
+    #[test]
+    fn load_transactions_includes_a_written_transaction() {
+        let _guard = state_scan_test_lock();
+        let fixture = Fixture::new();
+        let transaction_id = fixture.transaction.transaction_id.clone();
+        write_transaction(&fixture.transaction).unwrap();
+        let transactions = load_transactions().unwrap();
+        assert!(
+            transactions
+                .iter()
+                .any(|transaction| transaction.transaction_id == transaction_id)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_transactions_fails_closed_on_a_malformed_existing_record() {
+        let _guard = state_scan_test_lock();
+        let fixture = Fixture::new();
+        let path = transaction_path(&fixture.transaction.transaction_id).unwrap();
+        write_transaction(&fixture.transaction).unwrap();
+        std::fs::write(&path, b"{ not a valid upgrade transaction").unwrap();
+        let error = load_transactions().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid upgrade transaction"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_transactions_fails_closed_on_an_unsafe_existing_record() {
+        let _guard = state_scan_test_lock();
+        let fixture = Fixture::new();
+        let path = transaction_path(&fixture.transaction.transaction_id).unwrap();
+        write_transaction(&fixture.transaction).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = load_transactions().unwrap_err();
+        assert!(format!("{error:#}").contains("owner-only"), "{error:#}");
+    }
+
+    #[test]
+    fn read_transaction_if_present_tolerates_a_missing_record() {
+        let fixture = Fixture::new();
+        let transaction_id = fixture.transaction.transaction_id.clone();
+        write_transaction(&fixture.transaction).unwrap();
+        remove_transaction(&transaction_id).unwrap();
+        assert!(
+            read_transaction_if_present(&transaction_id)
+                .unwrap()
+                .is_none(),
+            "a concurrently removed record must be reported as absent, not as an error"
         );
     }
 
