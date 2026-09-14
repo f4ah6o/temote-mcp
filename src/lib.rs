@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod sandbox;
 
 #[cfg(test)]
