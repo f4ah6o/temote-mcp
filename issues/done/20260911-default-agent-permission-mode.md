@@ -1,6 +1,13 @@
 # Default `agent` permission mode — sandboxed, approval-free agent operation
 
-## Status
+Status: done
+Closed by triage: 2026-09-14
+Model: unknown
+Created: 2026-09-11
+Updated: 2026-09-14
+Branch: main
+
+## Resolution
 
 Implemented. Slices A-D are complete: new local managed and authenticated public sessions default to `agent`, approval policy is centralized on `(PermissionMode, operation class)`, `session permission <id> ask|agent|yolo` is available, and mode preservation across restart/restore/automatic restart/upgrade handoff is covered by tests. See `docs/evaluations/agent-mode-release-readiness-20260912.md` for the verification record.
 
@@ -256,4 +263,48 @@ Keep each slice independently reviewable. Do not combine the default change with
 
 ## Recommended next implementation slice
 
-Both issues' remaining scope is documentation/live-acceptance upkeep; no further implementation slice is required for the agent-mode contract itself.
+No further implementation slice is required for the agent-mode contract itself. Credential-dependent live evidence remains separately tracked in `issues/open/20260908-live-acceptance-matrix.md`.
+
+## 注記
+
+- 2026-09-14: Slices A-D, the listed tests, and the release-readiness evidence were reviewed against `main`; the implementation issue is complete. `CHANGES.md` was not changed during triage because the user-facing behavior is already documented in the usage, managed-session, public HTTP, gateway, and integration documents.
+
+## 概要
+
+`ask | agent | yolo` の permission mode を導入し、sandboxed approval-free の `agent` を新規 session の既定値にする。
+
+## 背景
+
+通常の sandbox 境界を保ったまま、validated structured operation の Temote-local approval を省略できる明示的な mode が必要だった。
+
+## 問題
+
+既存の `ask` は approval console に依存し、`yolo` は必要以上に広い権限を与えるため、通常の開発 workflow に適した中間 mode がなかった。
+
+## 目標
+
+`agent` の default、approval policy、local permission transition、restart/restore/handoff の mode preservation を実装する。
+
+## 対象外
+
+`agent` に filesystem escape、network 拡張、force push、public yolo、unrestricted host execution を与えない。
+
+## 提案する方針
+
+`PermissionMode` を source of truth とし、operation class との policy で approval と capability を分離する。
+
+## 受け入れ条件
+
+上記 Resolution と Implementation status、および release-readiness report に記録した mode/default/approval/lifecycle acceptance を満たす。
+
+## テスト計画
+
+mode round-trip、session defaults、public boundary、approval policy、sandbox、Git、local-agent、restart/restore/handoff、full CI を確認する。
+
+## リスク
+
+approval-free を sandbox-free と誤解させないよう、各 operation の capability validation と public yolo 拒否を維持する。
+
+## 変更履歴
+
+2026-09-14: repository-local implementation を完了として `done` に移動し、credential-dependent live evidence は live acceptance matrix に分離した。

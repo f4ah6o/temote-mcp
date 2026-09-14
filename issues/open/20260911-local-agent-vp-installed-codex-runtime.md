@@ -8,8 +8,8 @@ Related:
 - `src/sandbox.rs`
 - `src/sandbox/macos.rs`
 - `src/sandbox/linux/`
-- `issues/open/20260910-developer-execution-broker.md`
-- `issues/open/20260911-default-agent-permission-mode.md`
+- `issues/done/20260910-developer-execution-broker.md`
+- `issues/done/20260911-default-agent-permission-mode.md`
 
 ## Observed behavior
 

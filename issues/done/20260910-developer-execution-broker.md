@@ -1,6 +1,13 @@
 # Developer Execution Broker — Cargo / Vite+ / local AI agent delegation
 
-## Status
+Status: done
+Closed by triage: 2026-09-14
+Model: unknown
+Created: 2026-09-10
+Updated: 2026-09-14
+Branch: main
+
+## Resolution
 
 Implemented. `local_agent_run` for Codex/OpenCode landed in PR #13, and the remaining `dev_tool_run` work (Slices B-E) is complete:
 
@@ -25,13 +32,7 @@ The merged local-agent broker already provides the important shape this issue pr
 - dedicated local-agent sandbox profiles rather than whole-session yolo;
 - public HTTP/gateway contract coverage and operator documentation.
 
-Still missing from this issue:
-
-- `dev_tool_run` MCP surface;
-- Cargo operation classification and execution;
-- Vite+ operation classification and execution;
-- dependency/network and arbitrary-code-sensitive policy for those tools;
-- deterministic tests proving that selecting `cargo` or `vp` cannot become generic host execution.
+The `dev_tool_run` surface, Cargo/Vite+ classification and execution, scoped offline/network profiles, rejection of arbitrary-code-sensitive and self-mutation operations, and deterministic containment tests are now present on `main`.
 
 ## Background
 
@@ -302,4 +303,52 @@ Each slice should be independently reviewable and testable by a local implementa
 
 ## Recommended next implementation slice
 
-None required for the broker contract. Future work would be live Vite+ acceptance on a host with `vp` installed and any further capability classes the product explicitly approves.
+None required for the broker contract. Future work is live Vite+ acceptance on a host with `vp` installed and any further capability classes the product explicitly approves.
+
+## Remaining live evidence
+
+Live Vite+ acceptance is external, requires an installed `vp`, and is tracked by the developer broker checklist in [the live acceptance matrix](../open/20260908-live-acceptance-matrix.md); it does not leave a repository-local broker implementation slice open.
+
+## 注記
+
+- 2026-09-14: the implementation status, release-readiness report, focused developer-tool tests, and gateway parity suite were reviewed against `main`; the implementation issue is complete. `CHANGES.md` was not changed during triage because the final surface and safety boundaries are documented in the operator and Agent Skill documents.
+
+## 概要
+
+Cargo/Vite+ の構造化された開発ツール実行境界と、既存の Codex/OpenCode 委譲境界を完成させる。
+
+## 背景
+
+通常 session の sandbox と network 制限を維持したまま、開発ツールに必要な限定 capability を提供する必要があった。
+
+## 問題
+
+実行ファイルや raw argv を受け取る汎用 host execution へ拡張せずに、Cargo/Vite+ の operation を分類・実行する必要があった。
+
+## 目標
+
+validated request、限定された filesystem/cache scope、明示的な network class、permission-mode policy を持つ broker を提供する。
+
+## 対象外
+
+未承認の arbitrary command、`vp run|exec|dlx`、self-mutation、public yolo、無制限 HOME 書込みは対象外とする。
+
+## 提案する方針
+
+operation classifier と固定 argv、developer sandbox、default-deny environment、既存 approval policy を組み合わせる。
+
+## 受け入れ条件
+
+上記 Resolution と Implementation status、および release-readiness report に記録した repository-local acceptance を満たす。
+
+## テスト計画
+
+developer-tool classifier/argv/sandbox、permission policy、gateway parity、format、clippy、no-default-features、全体テストを確認する。
+
+## リスク
+
+Cargo/Vite+ は project code を実行し得るため、tool 名の allow-list だけでなく filesystem、network、environment、argv を個別に制限する。
+
+## 変更履歴
+
+2026-09-14: repository-local implementation を完了として `done` に移動し、Vite+ live evidence は live acceptance matrix に分離した。

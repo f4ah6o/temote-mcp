@@ -1,6 +1,13 @@
 # Session lifecycle cleanup — safely forget stale / terminal session metadata
 
-## Status
+Status: done
+Closed by triage: 2026-09-14
+Model: unknown
+Created: 2026-09-11
+Updated: 2026-09-14
+Branch: main
+
+## Resolution
 
 First implementation slice landed on main: `temote-mcp session forget <id>` is parsed, routed through `ControlRequest::Forget`, serialized by the supervisor with lifecycle transitions, and removes terminal session metadata, lifecycle state, and a confirmed-stale socket entry with symlink/special-file rejection. Live sessions are refused by an unconditional runtime socket probe. Retention policy is unchanged.
 
@@ -185,3 +192,47 @@ The implementation should reuse existing session validation, socket probing, lif
 ## Done when
 
 An operator can safely remove a known obsolete Temote session with one supported command, including when its old worktree no longer exists, while a live session remains impossible to forget accidentally.
+
+## 注記
+
+- 2026-09-14: CLI/control routing, supervisor serialization, stale-artifact cleanup, liveness refusal, missing-cwd handling, symlink/special-file rejection, list/info disappearance, and the focused 12-test suite were reviewed on `main`; the implementation issue is complete. `CHANGES.md` was not changed during triage because the command is documented in the existing usage guides.
+
+## 概要
+
+terminal または orphaned な session の Temote-owned durable metadata を、安全に forget できる local lifecycle command を追加する。
+
+## 背景
+
+停止済み・crashed session の metadata は retention のため保持されるが、不要になった1件を安全に削除する操作が必要だった。
+
+## 問題
+
+手動削除は live runtime の誤削除、symlink/special-file の追従、workspace 破壊につながるため、supervisor 管理の操作が必要だった。
+
+## 目標
+
+`session forget <id>` を control protocol と supervisor lifecycle lock の下で実行し、terminal state のみを deterministic に削除する。
+
+## 対象外
+
+live session の implicit stop、workspace/worktree の削除、任意 state directory の purge、public HTTP への公開は対象外とする。
+
+## 提案する方針
+
+validated session ID、unconditional runtime socket probe、owner-only artifact cleanup、symlink/special-file 拒否、lifecycle serialization を組み合わせる。
+
+## 受け入れ条件
+
+上記 Resolution、実装 notes、および focused test suite に記録した terminal cleanup、live refusal、filesystem safety、concurrency acceptance を満たす。
+
+## テスト計画
+
+stopped/crashed/orphaned、missing cwd、live refusal、stale socket、symlink/special-file、concurrent lifecycle、list/info disappearance を確認する。
+
+## リスク
+
+metadata の状態だけを信頼すると live runtime を誤って忘れるため、socket probe と共有 lifecycle lock を削除処理と runtime establishment の両方に適用する。
+
+## 変更履歴
+
+2026-09-14: repository-local implementation を完了として `done` に移動した。retention policy は変更していない。

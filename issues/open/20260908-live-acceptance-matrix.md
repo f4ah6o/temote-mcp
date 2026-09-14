@@ -59,6 +59,11 @@ The source issues are archived under `issues/done/` after this consolidation.
 - [ ] Host disconnect/reconnect advances generation and stale agents cannot receive or submit work.
 - [ ] Host-local sandbox and approval behavior remains unchanged on all tested hosts.
 
+### Developer broker / installed runtime
+
+- [ ] On a host with Vite+ `vp` installed, a rebuilt Temote normal (`yolo=false`) session completes representative `dev_tool_run` `vp check`, `vp test`, and `vp build` operations without whole-session yolo or broad HOME exposure; record the installed version, operation class, and non-secret result.
+- [ ] On a macOS host with a Vite+-managed Codex installation, a rebuilt Temote `local_agent_run(agent=codex)` completes after authorization with the verified bounded launcher dependency closure; record only non-secret launcher/runtime evidence and the result.
+
 ## Evidence requirements
 
 For each checked item record enough evidence to identify:

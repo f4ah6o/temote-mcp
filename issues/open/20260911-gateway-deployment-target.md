@@ -1,8 +1,18 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open / Slice A landed on main; Slice B implemented in the current worktree and awaiting review/commit; live acceptance not started
+Status: open
+Model: unknown
 Created: 2026-09-11
-Updated: 2026-09-12
+Updated: 2026-09-14
+Branch: main
+
+## Resolution
+
+Slices A and B are implemented on `main`. The English/Japanese operator guides define the custom-domain versus existing-DNS Worker-route choice, `workers_dev = false`, `--keep-vars`, secret boundaries, deploy verification, and rollback. The deterministic preflight distinguishes `target_missing`, `target_mismatch`, and `remote_unknown` when called as a library function, rejects unsafe workers.dev configuration, and performs no Cloudflare mutation. The command-line parser still requires a target flag before the evaluator can report `target_missing`, so the issue remains open until that CLI path and its regression test are fixed.
+
+## 提案する方針
+
+Gateway target の選択と local preflight を repository-local に限定し、Cloudflare route/domain の mutation と live verification は別の acceptance matrix で管理する。
 Priority: P1 operational correctness
 
 ## 概要
@@ -140,7 +150,7 @@ Live acceptance（実装完了の repository-local gate とは分離）:
 
 ## Recommended next slice
 
-**Slice B implemented in the current worktree.** 実 Cloudflare mutation を伴わず、local target selection を preflight で検査する。review/commit 後に main へ landed と記録する。
+Fix the CLI argument path so a valid hostname/configuration with neither `--route` nor `--custom-domain` reaches the evaluator and reports `target_missing`; add a command-level regression test. Keep Cloudflare route/domain verification as external live evidence in the live acceptance matrix.
 
 ## Implementation notes (2026-09-11)
 
@@ -161,3 +171,7 @@ Slice B implemented in the current worktree (not yet committed):
 - `npm run deploy:preflight -- --hostname <host> --route '<host>/*'` is documented in both gateway operator guides.
 
 Cloudflare route/domain verification remains Slice C live acceptance.
+
+## Triage note
+
+- 2026-09-14: The S04 review found that `node gateway/scripts/deployment-preflight.mjs --hostname example.com --config gateway/wrangler.toml` exits with usage code 2 before `target_missing` can be emitted, while the existing five tests call `evaluateDeploymentPreflight` directly. The prior triage move to `done/` was therefore reverted to `open/`; the CLI fix and command-level regression test are required before completion. `CHANGES.md` remains unchanged during this triage because the repository-local implementation is not complete.

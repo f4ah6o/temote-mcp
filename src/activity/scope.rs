@@ -677,6 +677,25 @@ mod tests {
     }
 
     #[test]
+    fn normal_constructor_uses_fresh_identity_and_clones_share_it() {
+        let first_emitter = Arc::new(RecordingEmitter::default());
+        let first = ActivityScope::new(ActivityOperation::ReadFile, Arc::clone(&first_emitter));
+        let first_clone = first.clone();
+        let second_emitter = Arc::new(RecordingEmitter::default());
+        let second = ActivityScope::new(ActivityOperation::ReadFile, Arc::clone(&second_emitter));
+
+        assert_ne!(first.operation_id(), second.operation_id());
+        assert_eq!(first_clone.operation_id(), first.operation_id());
+        assert_eq!(first_clone.started_at(), first.started_at());
+        assert_eq!(first.started_emission(), ActivityEmission::Accepted);
+        assert_eq!(second.started_emission(), ActivityEmission::Accepted);
+        assert_eq!(first_emitter.attempts().len(), 1);
+        assert_eq!(second_emitter.attempts().len(), 1);
+        assert_eq!(first_emitter.attempts()[0].state(), ActivityState::Started);
+        assert_eq!(second_emitter.attempts()[0].state(), ActivityState::Started);
+    }
+
+    #[test]
     fn normal_and_short_terminal_paths_have_typed_states_and_durations() {
         let emitter = Arc::new(RecordingEmitter::default());
         let clock = Arc::new(FixedClock::new(Instant::now()));
@@ -852,6 +871,13 @@ mod tests {
             terminal_rejected.finish(ActivityState::Cancelled, ActivitySummary::empty()),
             Err(ScopeError::AlreadyTerminal)
         );
+        assert_eq!(emitter.attempts().len(), attempts.len());
+        assert!(
+            !emitter
+                .accepted()
+                .iter()
+                .any(|event| event.state() == ActivityState::Failed)
+        );
     }
 
     fn terminal_race_order_is_controlled_for_both_winners(
@@ -946,6 +972,92 @@ mod tests {
         ));
         assert_eq!(finishing_result, Ok(ActivityEmission::Accepted));
         let attempts = emitter.attempts();
+        let terminal_index = attempts
+            .iter()
+            .position(|event| event.state() == ActivityState::Cancelled)
+            .unwrap();
+        assert!(
+            attempts[terminal_index + 1..]
+                .iter()
+                .all(|event| is_terminal(event.state()))
+        );
+    }
+
+    #[test]
+    fn controlled_nonterminal_and_terminal_order_is_serialized_in_both_directions() {
+        let waiting_first_emitter = Arc::new(RecordingEmitter::default());
+        let waiting_first_scope = Arc::new(make_scope(
+            Arc::clone(&waiting_first_emitter),
+            Arc::new(FixedClock::new(Instant::now())),
+        ));
+        waiting_first_scope.running().unwrap();
+        let (waiting_entered, waiting_release) =
+            waiting_first_emitter.gate(ActivityState::WaitingApproval);
+        let waiting_scope = Arc::clone(&waiting_first_scope);
+        let waiting_handle = thread::spawn(move || waiting_scope.waiting_approval());
+        waiting_entered.recv().unwrap();
+        let terminal_scope = Arc::clone(&waiting_first_scope);
+        let (terminal_started_sender, terminal_started_receiver) = mpsc::channel();
+        let terminal_handle = thread::spawn(move || {
+            terminal_started_sender.send(()).unwrap();
+            terminal_scope.cancel()
+        });
+        terminal_started_receiver.recv().unwrap();
+        waiting_release.send(()).unwrap();
+        assert_eq!(
+            waiting_handle.join().unwrap(),
+            Ok(ActivityEmission::Accepted)
+        );
+        assert_eq!(
+            terminal_handle.join().unwrap(),
+            Ok(ActivityEmission::Accepted)
+        );
+        assert_eq!(
+            states(&waiting_first_emitter.attempts()),
+            [
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::WaitingApproval,
+                ActivityState::Cancelled
+            ]
+        );
+
+        let terminal_first_emitter = Arc::new(RecordingEmitter::default());
+        let terminal_first_scope = Arc::new(make_scope(
+            Arc::clone(&terminal_first_emitter),
+            Arc::new(FixedClock::new(Instant::now())),
+        ));
+        terminal_first_scope.running().unwrap();
+        let (terminal_entered, terminal_release) =
+            terminal_first_emitter.gate(ActivityState::Cancelled);
+        let terminal_scope = Arc::clone(&terminal_first_scope);
+        let terminal_handle = thread::spawn(move || terminal_scope.cancel());
+        terminal_entered.recv().unwrap();
+        let waiting_scope = Arc::clone(&terminal_first_scope);
+        let (waiting_started_sender, waiting_started_receiver) = mpsc::channel();
+        let waiting_handle = thread::spawn(move || {
+            waiting_started_sender.send(()).unwrap();
+            waiting_scope.waiting_approval()
+        });
+        waiting_started_receiver.recv().unwrap();
+        terminal_release.send(()).unwrap();
+        assert_eq!(
+            terminal_handle.join().unwrap(),
+            Ok(ActivityEmission::Accepted)
+        );
+        assert_eq!(
+            waiting_handle.join().unwrap(),
+            Err(ScopeError::AlreadyTerminal)
+        );
+        let attempts = terminal_first_emitter.attempts();
+        assert_eq!(
+            states(&attempts),
+            [
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Cancelled
+            ]
+        );
         let terminal_index = attempts
             .iter()
             .position(|event| event.state() == ActivityState::Cancelled)

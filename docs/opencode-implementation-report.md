@@ -4,14 +4,14 @@ Date: 2026-09-12
 
 ## Issues addressed
 
-The selected issue slice in this pass is the repository-local deployment preflight from `issues/open/20260911-gateway-deployment-target.md` (Slice B). It follows the already-landed documentation slice and does not perform Cloudflare mutation or require credentials. The open issues were inspected against the current source and their implementation notes:
+The selected issue slice in this pass is the repository-local deployment preflight from `issues/open/20260911-gateway-deployment-target.md` (Slice B). It follows the already-landed documentation slice and does not perform Cloudflare mutation or require credentials. The implementation issues were inspected against the current source and their implementation notes:
 
-- `issues/open/20260911-session-forget-stale-metadata.md`: implemented, including supervisor serialization, stale-artifact cleanup, liveness refusal, and filesystem-safety tests.
-- `issues/open/20260910-developer-execution-broker.md`: implemented; `dev_tool_run` classification, Cargo/Vite+ execution profiles, tests, and docs are present.
-- `issues/open/20260911-default-agent-permission-mode.md`: implemented; permission defaults, centralized approval policy, lifecycle persistence, tests, and docs are present.
+- `issues/done/20260911-session-forget-stale-metadata.md`: implemented, including supervisor serialization, stale-artifact cleanup, liveness refusal, and filesystem-safety tests.
+- `issues/done/20260910-developer-execution-broker.md`: implemented; `dev_tool_run` classification, Cargo/Vite+ execution profiles, tests, and docs are present.
+- `issues/done/20260911-default-agent-permission-mode.md`: implemented; permission defaults, centralized approval policy, lifecycle persistence, tests, and docs are present.
 - `issues/open/20260911-local-agent-vp-installed-codex-runtime.md`: bounded Vite+ launcher dependency closure is implemented; verification is the remaining issue work.
-- `issues/open/20260911-gateway-deployment-target.md`: Slice A documentation/checks and Slice B credential-free target preflight are implemented. Cloudflare deployment verification remains live-only.
-- `issues/open/20260911-gateway-doctor-readiness.md`: local staged diagnostics and the read-only remote endpoint, Access, and host-registration checks are implemented. Session availability remains intentionally `not_checked`, and live Cloudflare verification is pending.
+- `issues/open/20260911-gateway-deployment-target.md`: Slice A documentation/checks and the evaluator portion of Slice B are implemented; the command-level `target_missing` path still needs a fix and regression test. Cloudflare deployment verification remains live-only.
+- `issues/done/20260911-gateway-doctor-readiness.md`: local staged diagnostics and the read-only remote endpoint, Access, host-registration, and session-availability checks are implemented. Live Cloudflare verification remains pending.
 - `issues/open/20260910-opencode-delegation-backend.md`: backend extraction, one-shot OpenCode execution, diagnostics, explicit resume preflight, binary override, and report hardening are implemented. Persistent server/session lifecycle, fork, and attach remain deferred.
 - `issues/open/20260908-07-client-safe-upgrade-reconnect.md`: only the explicitly ordered durable transaction-storage slice is implemented; remote coordinator/reconnect work remains a separate, substantial feature.
 - `issues/open/20260908-08-codex-delegation-dogfood-and-app-server.md`: implementation and fake transport are present; real app-server dogfood and comparative measurement require an appropriately configured host.
@@ -67,13 +67,13 @@ The Slice B change is isolated to gateway JavaScript/docs/issue tracking, so no 
 
 ### Issue addressed
 
-`issues/open/20260911-gateway-doctor-readiness.md` (Slice C remainder, repository-local). This pass did not add a remote protocol or perform Cloudflare work; it tightened the classification of the already-implemented read-only `POST /v1/hosts/status` probe.
+`issues/done/20260911-gateway-doctor-readiness.md` (Slice C remainder, repository-local). This pass did not add a remote protocol or perform Cloudflare work; it tightened the classification of the already-implemented read-only `POST /v1/hosts/status` probe.
 
 ### Files changed
 
 - `src/doctor.rs`
 - `gateway/test/protocol.test.mjs`
-- `issues/open/20260911-gateway-doctor-readiness.md`
+- `issues/done/20260911-gateway-doctor-readiness.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -118,7 +118,7 @@ No commit or push was performed. Existing uncommitted work was preserved.
 
 ### Issue addressed
 
-`issues/open/20260911-gateway-doctor-readiness.md` (the explicitly recorded `generation_replaced` classification residue). This pass stayed repository-local: no remote protocol change, no Cloudflare call, and no credentials.
+`issues/done/20260911-gateway-doctor-readiness.md` (the explicitly recorded `generation_replaced` classification residue). This pass stayed repository-local: no remote protocol change, no Cloudflare call, and no credentials.
 
 ### Files changed
 
@@ -126,7 +126,7 @@ No commit or push was performed. Existing uncommitted work was preserved.
 - `src/doctor.rs`
 - `docs/gateway.md`
 - `docs/gateway.ja.md`
-- `issues/open/20260911-gateway-doctor-readiness.md`
+- `issues/done/20260911-gateway-doctor-readiness.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -317,7 +317,7 @@ No commit or push was performed. All existing worktree changes were preserved.
 
 ### Issue addressed
 
-`issues/open/20260911-gateway-doctor-readiness.md`. This pass completes the last
+`issues/done/20260911-gateway-doctor-readiness.md`. This pass completes the last
 recorded repository-local residue: the `session_availability` stage previously stayed
 `not_checked` in every case.
 
@@ -326,7 +326,7 @@ recorded repository-local residue: the `session_availability` stage previously s
 - `src/doctor.rs`
 - `docs/gateway.md`
 - `docs/gateway.ja.md`
-- `issues/open/20260911-gateway-doctor-readiness.md`
+- `issues/done/20260911-gateway-doctor-readiness.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -386,7 +386,7 @@ No commit or push was performed. All existing worktree changes were preserved.
 
 ### Issue addressed
 
-`issues/open/20260911-gateway-doctor-readiness.md`. This pass repairs a defect in Pass 6:
+`issues/done/20260911-gateway-doctor-readiness.md`. This pass repairs a defect in Pass 6:
 `classify_session_availability` returned `ready` whenever it could enumerate the inventory,
 including an empty inventory (`active_sessions=0`). That contradicted the issue's requirement
 to distinguish "gateway endpoint is alive but the target host has no available session".
@@ -396,7 +396,7 @@ to distinguish "gateway endpoint is alive but the target host has no available s
 - `src/doctor.rs`
 - `docs/gateway.md`
 - `docs/gateway.ja.md`
-- `issues/open/20260911-gateway-doctor-readiness.md`
+- `issues/done/20260911-gateway-doctor-readiness.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -779,7 +779,7 @@ and left untouched.
 
 ### Issue addressed
 
-`issues/open/20260911-gateway-doctor-readiness.md` (the explicitly recorded Slice C residue:
+`issues/done/20260911-gateway-doctor-readiness.md` (the explicitly recorded Slice C residue:
 "the `session_availability` value is not yet exposed through the remote `/v1/hosts/status`
 payload"). This pass stays repository-local and read-only: the host-level `gateway-agent`
 reports a bounded non-secret availability value on its normal poll, and the authenticated
@@ -793,7 +793,7 @@ mutation, or MCP tool dispatch is added.
 - `gateway/test/protocol.test.mjs`
 - `docs/gateway.md`
 - `docs/gateway.ja.md`
-- `issues/open/20260911-gateway-doctor-readiness.md`
+- `issues/done/20260911-gateway-doctor-readiness.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed

@@ -8,7 +8,7 @@
 - Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
 - Related:
   - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
-  - [Developer Execution Broker](20260910-developer-execution-broker.md)
+  - [Developer Execution Broker](../done/20260910-developer-execution-broker.md)
   - `src/codex.rs`
   - `src/delegation/mod.rs`
   - `src/delegation/codex.rs`

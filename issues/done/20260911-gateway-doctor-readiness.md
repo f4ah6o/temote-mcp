@@ -1,6 +1,17 @@
 # Gateway federation の end-to-end readiness 診断を追加する
 
-Status: partially implemented / Slice A and the read-only remote endpoint, Access, and host-registration probe are implemented, including explicit `not_registered`/`lease_expired`/`generation_replaced` classification; `session_availability` is reported from the local supervisor's read-only session inventory, with a confirmed zero-live-session inventory classified as `session_unavailable` rather than `ready`, and the host-level `gateway-agent` now reports a bounded non-secret value on poll that the authenticated `/v1/hosts/status` payload returns; live Cloudflare acceptance is pending
+Status: done
+Closed by triage: 2026-09-14
+Model: unknown
+Branch: main
+
+## Resolution
+
+Repository-local Slices A-D are implemented on `main`: staged local readiness, read-only endpoint and Access classification, host registration and generation classification, session availability, bounded non-secret gateway-agent reporting, synchronized English/Japanese docs, and deterministic Rust/Worker tests. The doctor never treats unavailable or unverified remote state as ready and performs no session or lease mutation.
+
+## 提案する方針
+
+診断 stage を local と remote に分離し、明示的な identity/readiness、bounded non-secret status、read-only session inventory に基づいて fail-closed に分類する。
 Created: 2026-09-11
 Updated: 2026-09-14
 Priority: P1 operator diagnostics
@@ -15,7 +26,7 @@ Cloudflare Worker/Durable Objects gateway を利用する前に、host 側設定
 
 Gateway の設定要件は [`docs/gateway.md`](../../docs/gateway.md) と [`docs/gateway.ja.md`](../../docs/gateway.ja.md) に記録されている。現行の `temote-mcp doctor` は `TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合に、host ID、gateway URL、host token の存在、Access service-token の組み合わせ、local supervisor の control protocol、named-root 数を確認する。
 
-既存の [`issues/open/20260908-live-acceptance-matrix.md`](20260908-live-acceptance-matrix.md) は実 Cloudflare 環境での multi-host acceptance を追跡するが、設定ミスを起動前に切り分ける operator-facing preflight とは目的が異なる。
+既存の [`issues/open/20260908-live-acceptance-matrix.md`](../open/20260908-live-acceptance-matrix.md) は実 Cloudflare 環境での multi-host acceptance を追跡するが、設定ミスを起動前に切り分ける operator-facing preflight とは目的が異なる。
 
 ## 問題
 
@@ -230,6 +241,10 @@ The first remote read-only slice is implemented:
 - The local Rust `doctor` stage is unchanged and remains authoritative on the host; the remote value is additive for remote operators. Remote `unavailable`/`not_checked` is never conflated with `ready`.
 - Deterministic coverage: `host_session_availability_classifies_live_inventory_without_paths` and `host_poll_request_serializes_bounded_session_availability` in `src/gateway.rs`, plus the gateway Worker protocol test `host status exposes bounded session availability reported on poll` (absent → `not_checked`, reported value surfaced, invalid value rejected). No live OpenCode, Cloudflare, or credentials are required.
 
-## Remote exposure residue
+## Remaining live evidence
 
 - Live Cloudflare route, Access, and lease verification remains in `20260908-live-acceptance-matrix.md`.
+
+## Triage note
+
+- 2026-09-14: the 26 focused doctor tests and the 68-test gateway suite passed on `main`; the implementation issue is complete. Credential-dependent Cloudflare evidence remains in the live acceptance matrix. `CHANGES.md` was not changed during triage because the operator contract is already recorded in the gateway guides.
