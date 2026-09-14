@@ -1,8 +1,8 @@
 # Gateway federation の end-to-end readiness 診断を追加する
 
-Status: partially implemented / Slice A and the read-only remote endpoint, Access, and host-registration probe are implemented, including explicit `not_registered`/`lease_expired`/`generation_replaced` classification; `session_availability` is now reported from the local supervisor's read-only session inventory, with a confirmed zero-live-session inventory classified as `failed` (`session_unavailable`) rather than `ready`; live Cloudflare acceptance is pending
+Status: partially implemented / Slice A and the read-only remote endpoint, Access, and host-registration probe are implemented, including explicit `not_registered`/`lease_expired`/`generation_replaced` classification; `session_availability` is reported from the local supervisor's read-only session inventory, with a confirmed zero-live-session inventory classified as `session_unavailable` rather than `ready`, and the host-level `gateway-agent` now reports a bounded non-secret value on poll that the authenticated `/v1/hosts/status` payload returns; live Cloudflare acceptance is pending
 Created: 2026-09-11
-Updated: 2026-09-12
+Updated: 2026-09-14
 Priority: P1 operator diagnostics
 
 ## 概要
@@ -221,3 +221,15 @@ The first remote read-only slice is implemented:
 - The initial `session_availability` slice incorrectly classified an empty inventory (or any inventory with no live session) as `ready` because it counted sessions but did not gate readiness on a live session. That contradicted the issue's requirement to distinguish "gateway endpoint is alive but the target host has no available session" (`session_unavailable`).
 - Corrected semantics: `active_sessions > 0` is `ready`; a confirmed inventory with `active_sessions == 0` is `failed` with a short non-secret remediation; an inventory that cannot be enumerated remains `unavailable`. Empty and non-empty-but-no-live inventories are both `failed`.
 - The stage status uses `failed` (determinate answer) rather than `unavailable` (answer could not be determined), so a reachable endpoint with no serviceable session is not reported as healthy. No session ID, path, command, or credential is included in the detail or remediation.
+
+## Implementation notes (2026-09-14 remote session_availability exposure)
+
+- The Slice C residue "`session_availability` is not yet exposed through the remote `/v1/hosts/status` payload" is implemented. The host-level `gateway-agent` now reports a bounded, non-secret `session_availability` string on its read-only `/v1/hosts/poll` renewal: `ready` when the local supervisor inventory has a live (`active`/`starting`) session, `session_unavailable` when a confirmed inventory has none, and `unavailable` when the inventory cannot be enumerated. It carries no session ID, path, command, or credential.
+- The gateway Worker Durable Object validates the reported value against a fixed allowlist, rejects an unknown value on a host route with `invalid_session_availability` (400), stores the last reported value on the host record, and returns it from the authenticated read-only `/v1/hosts/status` response. An agent that does not report the field (including legacy session routes) still yields `not_checked`; the value is never promoted to `ready` without a report.
+- The status endpoint remains read-only: it only reads Durable Object storage and does not renew a lease, dispatch an MCP tool, connect an agent, or mutate a session. The agent's inventory read reuses the existing read-only supervisor control protocol, and the poll lease renewal is the agent's normal operation, not a diagnostic side effect.
+- The local Rust `doctor` stage is unchanged and remains authoritative on the host; the remote value is additive for remote operators. Remote `unavailable`/`not_checked` is never conflated with `ready`.
+- Deterministic coverage: `host_session_availability_classifies_live_inventory_without_paths` and `host_poll_request_serializes_bounded_session_availability` in `src/gateway.rs`, plus the gateway Worker protocol test `host status exposes bounded session availability reported on poll` (absent → `not_checked`, reported value surfaced, invalid value rejected). No live OpenCode, Cloudflare, or credentials are required.
+
+## Remote exposure residue
+
+- Live Cloudflare route, Access, and lease verification remains in `20260908-live-acceptance-matrix.md`.

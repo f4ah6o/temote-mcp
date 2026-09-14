@@ -774,3 +774,85 @@ No commit or push was performed. The modified tracked files are this report,
 `issues/open/20260908-07-client-safe-upgrade-reconnect.md`, and
 `src/upgrade_transaction.rs`. Existing untracked `.tmp/` and `.worktrees/` were preserved
 and left untouched.
+
+## Pass 12 — gateway remote session_availability exposure (2026-09-14)
+
+### Issue addressed
+
+`issues/open/20260911-gateway-doctor-readiness.md` (the explicitly recorded Slice C residue:
+"the `session_availability` value is not yet exposed through the remote `/v1/hosts/status`
+payload"). This pass stays repository-local and read-only: the host-level `gateway-agent`
+reports a bounded non-secret availability value on its normal poll, and the authenticated
+status endpoint returns the last reported value. No Cloudflare call, credential, lease
+mutation, or MCP tool dispatch is added.
+
+### Files changed
+
+- `src/gateway.rs`
+- `gateway/src/index.js`
+- `gateway/test/protocol.test.mjs`
+- `docs/gateway.md`
+- `docs/gateway.ja.md`
+- `issues/open/20260911-gateway-doctor-readiness.md`
+- `docs/opencode-implementation-report.md` (this report)
+
+### What changed
+
+- Added `HostSessionAvailability` (`ready`/`session_unavailable`/`unavailable`),
+  `classify_host_session_availability`, and `current_host_session_availability` in
+  `src/gateway.rs`. The host agent computes it read-only from
+  `session_control::request_session_views()`; enumeration failure maps to `unavailable`,
+  never `ready`.
+- Host poll now sends a dedicated `HostPollRequest` carrying the bounded string; the shared
+  `HostGenerationRequest` used by disconnect is unchanged, and the field is omitted when
+  absent so legacy flows and old gateways are unaffected.
+- `gateway/src/index.js` validates the reported value against a fixed allowlist
+  (`normalizeSessionAvailability`), rejects an unknown value on a host route with
+  `invalid_session_availability` (400), stores it on the host record, and returns it from the
+  read-only `status()` payload. An absent value (old agent or legacy session route) still
+  yields `not_checked`; the endpoint never reads or mutates a lease/session to derive it.
+  Because the same host record is upserted into the gateway registry, `host_list` also carries
+  the bounded non-secret value; routing and lease semantics are unchanged.
+- Added deterministic tests: two Rust unit tests for classification and request serialization,
+  and the gateway protocol test `host status exposes bounded session availability reported on
+  poll` (absent → `not_checked`, reported value surfaced, invalid value rejected, direct
+  `normalizeSessionAvailability` cases). Updated the English/Japanese operator guides and the
+  issue notes.
+
+### What was intentionally not changed
+
+- The local Rust `doctor` stage remains authoritative and unchanged; the remote value is
+  additive for remote operators, and remote `unavailable`/`not_checked` is never treated as
+  `ready`.
+- No new remote protocol endpoint, no Cloudflare route/Access/lease call, no credential use,
+  no session/lease mutation by the diagnostic endpoint, and no upgrade-coordinator or OpenCode
+  persistent-lifecycle work.
+
+### Checks
+
+- `cargo fmt --all -- --check`: PASS after applying `cargo fmt --all` to normalize the new
+  Rust test assertions.
+- `cargo test gateway`: PASS. The gateway-filtered Rust run completed with 32 passing tests
+  in `src/main.rs` plus the gateway deployment docs test; no failures were reported.
+- `cargo check --no-default-features --all-targets`: PASS. It reports the repository's
+  existing dead-code warnings in `approvals.rs`, `profile.rs`, and `session_control.rs`.
+- `cargo clippy --no-default-features --all-targets`: PASS with the same existing dead-code
+  warnings.
+- `cargo clippy --no-default-features --all-targets -- -D warnings`: FAIL because those
+  existing dead-code warnings are promoted to errors. The reported locations are outside
+  this pass's changed files; they were not modified as part of this issue slice.
+- `(cd gateway && npm test)`: PASS, 68/68 tests.
+- `git diff --check`: PASS.
+
+### Remaining blockers
+
+- Live Cloudflare route, Access, host-agent lease, and multi-host evidence remain
+  credential/deployment dependent (`20260908-live-acceptance-matrix.md`).
+- The one-shot upgrade coordinator, response-flush transport wiring, remote upgrade tools,
+  and macOS/Linux deliberate-disconnect E2E remain unimplemented.
+
+### Git status
+
+No commit or push was performed. The tracked modifications for this pass are the seven files
+listed above. Existing untracked `.tmp/` and `.worktrees/` directories were preserved and
+left untouched.

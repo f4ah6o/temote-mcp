@@ -141,6 +141,61 @@ struct HostGenerationRequest<'a> {
     generation: u64,
 }
 
+#[derive(Serialize)]
+struct HostPollRequest<'a> {
+    host_id: &'a str,
+    instance_id: &'a str,
+    generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_availability: Option<&'a str>,
+}
+
+/// Bounded, non-secret session availability the host agent reports to the
+/// gateway so a read-only `/v1/hosts/status` read can distinguish a reachable
+/// endpoint with no serviceable session from a healthy one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostSessionAvailability {
+    Ready,
+    SessionUnavailable,
+    Unavailable,
+}
+
+impl HostSessionAvailability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::SessionUnavailable => "session_unavailable",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+fn classify_host_session_availability(statuses: &[&str]) -> HostSessionAvailability {
+    let has_live_session = statuses
+        .iter()
+        .any(|status| matches!(*status, "active" | "starting"));
+    if has_live_session {
+        HostSessionAvailability::Ready
+    } else {
+        HostSessionAvailability::SessionUnavailable
+    }
+}
+
+/// Reads the local supervisor's session inventory read-only. Enumeration
+/// failure is reported as `unavailable`; it is never presented as ready.
+async fn current_host_session_availability() -> HostSessionAvailability {
+    match session_control::request_session_views().await {
+        Ok(views) => {
+            let statuses = views
+                .iter()
+                .map(|view| view.status.as_str())
+                .collect::<Vec<_>>();
+            classify_host_session_availability(&statuses)
+        }
+        Err(_) => HostSessionAvailability::Unavailable,
+    }
+}
+
 #[derive(Deserialize)]
 struct PollEnvelope {
     request_id: String,
@@ -708,12 +763,14 @@ async fn run_host_generation(
         }
 
         let poll_started = Instant::now();
+        let session_availability = current_host_session_availability().await;
         let response = gateway
             .request(Method::POST, "/v1/hosts/poll", Some(host_id))
-            .json(&HostGenerationRequest {
+            .json(&HostPollRequest {
                 host_id,
                 instance_id,
                 generation,
+                session_availability: Some(session_availability.as_str()),
             })
             .send()
             .await
@@ -1290,6 +1347,51 @@ mod tests {
         );
         assert!(status_named_roots(&json!({"named_roots": ["/tmp"]})).is_err());
         assert!(status_named_roots(&json!({})).is_err());
+    }
+
+    #[test]
+    fn host_session_availability_classifies_live_inventory_without_paths() {
+        let ready = HostSessionAvailability::Ready;
+        let no_live = HostSessionAvailability::SessionUnavailable;
+        assert_eq!(classify_host_session_availability(&["active"]), ready);
+        assert_eq!(
+            classify_host_session_availability(&["stopped", "starting"]),
+            ready
+        );
+        assert_eq!(
+            classify_host_session_availability(&["stopped", "failed"]),
+            no_live
+        );
+        assert_eq!(classify_host_session_availability(&[]), no_live);
+        assert_eq!(HostSessionAvailability::Ready.as_str(), "ready");
+        assert_eq!(
+            HostSessionAvailability::SessionUnavailable.as_str(),
+            "session_unavailable"
+        );
+        assert_eq!(HostSessionAvailability::Unavailable.as_str(), "unavailable");
+    }
+
+    #[test]
+    fn host_poll_request_serializes_bounded_session_availability() {
+        let payload = serde_json::to_value(HostPollRequest {
+            host_id: "mac-main",
+            instance_id: "instance-a",
+            generation: 2,
+            session_availability: Some("session_unavailable"),
+        })
+        .unwrap();
+        assert_eq!(payload["session_availability"], "session_unavailable");
+        assert_eq!(payload["generation"], 2);
+        assert_eq!(payload["host_id"], "mac-main");
+
+        let omitted = serde_json::to_value(HostPollRequest {
+            host_id: "mac-main",
+            instance_id: "instance-a",
+            generation: 2,
+            session_availability: None,
+        })
+        .unwrap();
+        assert!(omitted.get("session_availability").is_none());
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, federatedHostToken, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, federatedHostToken, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, normalizeSessionAvailability, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
 import {
   LEGACY_PROTOCOL_VERSION,
   MODERN_PROTOCOL_VERSION,
@@ -627,6 +627,66 @@ test("host status is read-only and reports bounded registration metadata", async
     session_availability: "not_checked",
   });
   assert.equal((await session.fetch(post("status", { host_id: "mac-main" }))).status, 200);
+});
+
+test("host status exposes bounded session availability reported on poll", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const identity = {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  };
+  await session.fetch(post("connect", identity));
+
+  const initial = await body(await session.fetch(post("status", { host_id: "mac-main" })));
+  assert.equal(initial.session_availability, "not_checked");
+
+  const dispatched = session.fetch(post("dispatch", {
+    request: { jsonrpc: "2.0", id: 1, method: "ping" },
+  }));
+  const polled = await session.fetch(post("poll", {
+    ...identity,
+    generation: 1,
+    session_availability: "session_unavailable",
+  }));
+  assert.equal(polled.status, 200);
+  const envelope = await polled.json();
+  assert.equal(envelope.request.id, 1);
+
+  const updated = await body(await session.fetch(post("status", { host_id: "mac-main" })));
+  assert.equal(updated.session_availability, "session_unavailable");
+  assert.equal(updated.host_id, "mac-main");
+
+  const responded = await session.fetch(post("respond", {
+    ...identity,
+    generation: 1,
+    request_id: envelope.request_id,
+    response: { jsonrpc: "2.0", id: 1, result: {} },
+  }));
+  assert.equal(responded.status, 204);
+  await dispatched;
+
+  const invalid = await session.fetch(post("poll", {
+    ...identity,
+    generation: 1,
+    session_availability: "all_good",
+  }));
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(await invalid.json(), { error: "invalid_session_availability" });
+
+  assert.equal(normalizeSessionAvailability(undefined), undefined);
+  assert.equal(normalizeSessionAvailability("ready"), "ready");
+  assert.equal(normalizeSessionAvailability("unavailable"), "unavailable");
+  assert.equal(normalizeSessionAvailability("all_good"), null);
+  assert.equal(normalizeSessionAvailability(1), null);
 });
 
 test("registry upsert failure makes connect fail closed and leaves no active route", async () => {
