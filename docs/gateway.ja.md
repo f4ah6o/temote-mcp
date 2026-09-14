@@ -45,14 +45,60 @@ npx wrangler secret put HOST_TOKENS_JSON
 
 ```sh
 npm test
-npx wrangler deploy --dry-run
-npx wrangler deploy
+npx wrangler deploy --dry-run --keep-vars
+npx wrangler deploy --keep-vars
 ```
 
-5. custom domain を self-hosted Cloudflare Access application で保護し、利用する MCP client 向けに Managed OAuth を有効化します。`workers_dev = false` を維持します。
-6. host agent は Access service-token policy で許可します。Access service token と Temote host bearer token は独立した credential です。
+5. deploy 前に公開 target を1つ選びます。`gateway/wrangler.toml` は `workers_dev = false` を維持するため、target を指定しない deploy は version を upload しても公開されません。[Deployment target](#deployment-target) を参照してください。
+6. 公開 hostname 全体を self-hosted Cloudflare Access application で保護し、利用する MCP client 向けに Managed OAuth を有効化します。
+7. host agent は Access service-token policy で許可します。Access service token と Temote host bearer token は独立した credential です。
 
 公開 MCP URL は `https://<gateway-host>/mcp` です。
+
+## Deployment target
+
+`workers_dev = false` では route または custom domain を指定しない deploy が Worker を公開せず、`No targets deployed` を表示することがあります。command が exit 0 でもこの出力は失敗として扱い、次のどちらか一方の target を明示します。
+
+Wrangler を実行する前に、意図した target を repository-local preflight で確認します。
+
+```sh
+cd gateway
+npm run deploy:preflight -- --hostname gateway.example.com --route 'gateway.example.com/*'
+```
+
+preflight は `target_missing`、`target_mismatch`、`remote_unknown` を区別して返します。`remote_unknown` は Cloudflare credential を使わないこの local check が、deploy 済み route や custom domain の存在を成功と偽装しないための状態です。non-zero 結果は target を修正し、下記の deploy 後 read-only verification が成功するまで停止として扱います。
+
+| Option | 使う条件 | target の設定 | Access | 確認 |
+| --- | --- | --- | --- | --- |
+| A. Custom domain | Worker に専用 hostname を割り当てる場合、または DNS record がまだ無い場合。 | hostname を Worker custom domain として宣言します。例: `gateway/wrangler.toml` の `routes = [{ pattern = "<gateway-host>", custom_domain = true }]`、または Cloudflare dashboard で作成します。 | hostname 全体を Cloudflare Access application で保護します。 | `npx wrangler deployments status --name temote-mcp-gateway` と `curl -sSf https://<gateway-host>/healthz`。 |
+| B. Existing DNS + Worker route | 既存 DNS record を削除できない場合。 | deploy 時に exact pattern を渡します。例: `npx wrangler deploy --keep-vars --routes '<gateway-host>/*'`。 | hostname 全体を Cloudflare Access application で保護します。 | A と同じ。さらに Cloudflare dashboard で route pattern が `temote-mcp-gateway` を指すことを確認します。 |
+
+どちらの方式でも次を守ります。
+
+- `workers_dev = false` を維持し、`*.workers.dev` route を有効化しません。
+- 既存 DNS record を削除しません。Worker route は一致する request で優先されますが、record は残るため direct origin へ戻せます。
+- dashboard-managed の non-secret variable を保持する deploy では `--keep-vars` を使います。Worker secret は `wrangler secret` に残り、`wrangler.toml`、docs、issue tracker に値を書きません。
+- Access service-token credential と gateway host token は別 credential として扱います。
+- upload の成功を deploy の成功とみなしません。deploy 後は毎回 target を確認します。
+
+### Deploy の確認（read-only）
+
+```sh
+npx wrangler deployments status --name temote-mcp-gateway
+curl -sSf https://<gateway-host>/healthz
+```
+
+`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway"}`）。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。Access 経由の MCP 疎通は、この local check とは別に確認します。
+
+### Rollback
+
+rollback では追加した exact な Worker route または custom domain だけを外します。
+
+1. Cloudflare dashboard で `<gateway-host>` の exact な route pattern または custom-domain binding を削除するか、`gateway/wrangler.toml` を戻して以前の target 構成を deploy します。
+2. DNS record、Access application、Tunnel はそのまま残し、direct origin を維持します。
+3. `curl -sSf https://<gateway-host>/healthz` と dashboard で hostname が Worker を指していないことを確認し、必要なら intended direct-origin 構成へ戻します。
+
+gateway の rollback で無関係な route、DNS record、Access policy を削除・書き換えしないでください。
 
 ## 各 Temote host の設定
 
@@ -80,7 +126,7 @@ temote-mcp supervisor
 temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
-`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は federation readiness を表示します。supervisor compatibility と named-root 数を確認しますが、root path や token 値は表示しません。
+`--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は gateway readiness を stage 別に表示します。`local_config` の各項目（host ID、gateway URL origin、host token の存在、Access service-token の組）と `local_supervisor` の control protocol が個別の結果になります。network-enabled build では read-only の `/healthz` identity check と認証付き `/v1/hosts/status` probe も実行し、remote endpoint、Access 認証、この host の active lease を分類します。doctor は `session_availability` も local supervisor の read-only な session inventory から `listed_sessions`/`active_sessions` の件数として報告します。これは supervisor control protocol を再利用し、MCP tool を dispatch せず、session や lease を変更しません。live（`active`/`starting`）な session が 1 件もないと確定した inventory は `ready` ではなく `failed` とし、inventory を列挙できない場合は `unavailable` とします。local の host-level `gateway-agent` generation が記録されている場合、doctor は認証済み gateway の `generation` と比較し、remote の generation が新しいときは `generation_replaced` として報告するため、置き換えられた古い local agent を healthy と誤認しません。host-level `gateway-agent` は bounded で non-secret な `session_availability`（`ready`、`session_unavailable`、`unavailable`）を poll ごとに報告し、認証付き `/v1/hosts/status` は最新の報告値を返します。未報告の値は `ready` として扱わず `not_checked` のままにします。この remote 値は supervisor inventory から read-only で導出され、session ID、path、credential を含みません。root path や token 値は表示しません。
 
 ## MCP workflow
 

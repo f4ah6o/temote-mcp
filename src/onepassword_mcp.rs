@@ -305,11 +305,13 @@ pub async fn call_tool(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !read_only
-        && !approvals::request(
-            &session.id,
+        && !approvals::ensure_local_approval(
+            session,
+            approvals::ApprovalClass::Integration,
             "onepassword_mcp_call",
             safe_call_summary(tool_name, &arguments),
             session.cwd.clone(),
+            Default::default(),
         )
         .await?
     {
@@ -529,7 +531,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
         assert!(
             enforce_path_boundary(
@@ -608,7 +610,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
 
         test_support::run(0x4f50_4d4f_554e_5401, 512, |ctx| {

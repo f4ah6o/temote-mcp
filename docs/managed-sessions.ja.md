@@ -41,6 +41,7 @@ temote-mcp session permission mitsumori status
 temote-mcp session permission mitsumori allow /path/to/extra-root
 temote-mcp session permission mitsumori revoke /path/to/extra-root
 temote-mcp session permission mitsumori ask
+temote-mcp session permission mitsumori agent
 temote-mcp session permission mitsumori yolo
 temote-mcp session restart-policy mitsumori on-failure
 temote-mcp session stop mitsumori

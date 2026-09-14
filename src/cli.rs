@@ -96,6 +96,9 @@ pub enum SessionCommand {
     Stop {
         session_id: String,
     },
+    Forget {
+        session_id: String,
+    },
     Restart {
         session_id: String,
     },
@@ -113,6 +116,7 @@ pub enum SessionCommand {
 pub enum SessionPermissionCommand {
     Status,
     Ask,
+    Agent,
     Yolo,
     Allow { path: PathBuf },
     Revoke { path: PathBuf },
@@ -127,6 +131,9 @@ pub fn parse_env() -> Result<ParseOutcome, String> {
     let raw = std::env::args().collect::<Vec<_>>();
     if raw.get(1).map(String::as_str) == Some("codex") {
         return codex::run(&raw[2..]).map(ParseOutcome::Print);
+    }
+    if raw.get(1).map(String::as_str) == Some("delegate") {
+        return codex::run_delegate(&raw[2..]).map(ParseOutcome::Print);
     }
     parse(raw.into_iter())
 }
@@ -245,6 +252,13 @@ where
     {
         return Ok(ParseOutcome::Print(codex::usage()));
     }
+    if noargs::cmd("delegate")
+        .doc("Run one bounded non-interactive delegation request")
+        .take(&mut args)
+        .is_present()
+    {
+        return Ok(ParseOutcome::Print(codex::delegate_usage()));
+    }
     #[cfg(feature = "network")]
     if noargs::cmd("serve")
         .doc("Run the MCP server over HTTP using the selected authentication profile")
@@ -354,6 +368,17 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
             .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
         return Ok(SessionCommand::Stop { session_id });
     }
+    if noargs::cmd("forget")
+        .doc("Remove durable metadata for one terminal, non-live session (stop keeps metadata)")
+        .take(args)
+        .is_present()
+    {
+        let session_id = noargs::arg("<SESSION_ID>")
+            .doc("Session ID")
+            .take(args)
+            .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+        return Ok(SessionCommand::Forget { session_id });
+    }
     if noargs::cmd("restart")
         .doc("Restart a stopped, crashed, or active supervisor-owned session")
         .take(args)
@@ -407,6 +432,12 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
             .is_present()
         {
             SessionPermissionCommand::Ask
+        } else if noargs::cmd("agent")
+            .doc("Use the sandboxed, approval-free agent policy")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Agent
         } else if noargs::cmd("yolo")
             .doc("Explicitly use unrestricted local execution for this session")
             .take(args)
@@ -438,7 +469,7 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
         } else {
             return Err(noargs::Error::other(
                 args,
-                "permission command is not specified (expected status, ask, yolo, allow, or revoke)",
+                "permission command is not specified (expected status, ask, agent, yolo, allow, or revoke)",
             ));
         };
         return Ok(SessionCommand::Permission {
@@ -458,7 +489,7 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
     }
     Err(noargs::Error::other(
         args,
-        "session command is not specified (expected start, list, info, stop, restart, restart-policy, permission, or console)",
+        "session command is not specified (expected start, list, info, stop, forget, restart, restart-policy, permission, or console)",
     ))
 }
 
@@ -885,6 +916,22 @@ mod tests {
     }
 
     #[test]
+    fn session_forget_is_available_and_distinct_from_stop() {
+        assert!(matches!(
+            command(&["temote-mcp", "session", "forget", "my-session"]),
+            Command::Session {
+                command: SessionCommand::Forget { session_id },
+            } if session_id == "my-session"
+        ));
+        let ParseOutcome::Print(help) = parse(argv(&["temote-mcp", "session", "--help"])).unwrap()
+        else {
+            panic!("expected forget help");
+        };
+        assert!(help.contains("forget"));
+        assert!(help.contains("stop keeps metadata"));
+    }
+
+    #[test]
     fn root_help_and_version_are_generated() {
         let ParseOutcome::Print(help) = parse(argv(&["temote-mcp", "--help"])).unwrap() else {
             panic!("expected help");
@@ -987,6 +1034,15 @@ mod tests {
                     command: SessionPermissionCommand::Allow { path },
                 }
             } if session_id == "work" && path == std::path::Path::new("/tmp/example")
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "session", "permission", "work", "agent"]),
+            Command::Session {
+                command: SessionCommand::Permission {
+                    session_id,
+                    command: SessionPermissionCommand::Agent,
+                }
+            } if session_id == "work"
         ));
         assert!(matches!(
             command(&["temote-mcp", "session", "permission", "work", "yolo"]),

@@ -1,6 +1,6 @@
 # Managed sessions and named roots
 
-Temote has one session-lifecycle owner: `temote-mcp supervisor`. It owns every `RuntimeHandle`, the durable lifecycle state, and the reconnectable local approval broker.
+Temote has one session-lifecycle owner: `temote-mcp supervisor`. It owns every `RuntimeHandle`, the durable lifecycle state, and the reconnectable local approval broker used by `ask` and child-approval flows.
 
 `temote-mcp serve` / `temote-mcp up` are authenticated HTTP/ingress processes only. They connect to the existing local supervisor through the same-user `0600` Unix control socket for public `session_start` / `session_stop`. Tailscale local-OAuth approvals are proxied through that socket to `temote-mcp session console`; the public HTTP endpoint never exposes approval attachment.
 
@@ -41,6 +41,7 @@ temote-mcp session permission mitsumori status
 temote-mcp session permission mitsumori allow /path/to/extra-root
 temote-mcp session permission mitsumori revoke /path/to/extra-root
 temote-mcp session permission mitsumori ask
+temote-mcp session permission mitsumori agent
 temote-mcp session permission mitsumori yolo
 temote-mcp session restart-policy mitsumori on-failure
 temote-mcp session stop mitsumori
@@ -53,7 +54,7 @@ temote-mcp session restart mitsumori
 
 For compatibility, `temote-mcp start <id>` remains available. It asks the running local supervisor to start the current directory instead of owning the runtime itself. `--yolo` remains a local-only option. The public MCP `session_start` contract still cannot request yolo mode.
 
-Detached permission management is local-only and travels over the same owner-only supervisor Unix socket. `permission allow/revoke` keeps the existing canonical-path and symlink containment rules; the session cwd cannot be revoked. `permission ask/yolo` is explicit, and none of these mutations restart the runtime or discard runtime state. Persisted permitted roots are restored when that same session/cwd is explicitly restarted.
+Detached permission management is local-only and travels over the same owner-only supervisor Unix socket. `permission allow/revoke` keeps the existing canonical-path and symlink containment rules; the session cwd cannot be revoked. `permission ask/agent/yolo` is explicit, and none of these mutations restart the runtime or discard runtime state. Persisted permitted roots are restored when that same session/cwd is explicitly restarted.
 
 ## Approval console attachment
 
@@ -107,7 +108,7 @@ session_info(session_id="my-project")
 session_stop(session_id="my-project")
 ```
 
-HTTP managed sessions are always `yolo=false`. Existing approval-gated host operations remain approval-gated. The lifecycle supervisor marks HTTP-created runtimes in memory; public `session_stop` accepts only that set and cannot stop local CLI/yolo sessions. HTTP ownership is intentionally not a permission persisted into session metadata.
+HTTP managed sessions are always `yolo=false` and default to `agent`, so the normal structured development workflow runs without a local approval console while sandbox/path/network boundaries stay in force. `ask` remains available as an explicit stricter local transition. Existing approval-gated host operations keep their tool-specific validation and capability rules in every mode. The lifecycle supervisor marks HTTP-created runtimes in memory; public `session_stop` accepts only that set and cannot stop local CLI/yolo sessions. HTTP ownership is intentionally not a permission persisted into session metadata.
 
 `session_list` and `session_info` expose durable stopped/crashed state as well as active sessions. Other session-bound MCP tools still require a live runtime socket.
 

@@ -1,14 +1,43 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Draft proposal / implementation not started
+- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN`, explicit same-directory session resume, and bounded `--fork` landed; persistent/session lifecycle implementation not started
 - Date: 2026-09-10 (Asia/Tokyo)
+- Updated: 2026-09-12 (Asia/Tokyo)
 - Priority: P1
-- Baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
+- Original baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
 - Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
 - Related:
   - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
+  - [Developer Execution Broker](20260910-developer-execution-broker.md)
   - `src/codex.rs`
-  - `src/codex_delegation.rs`
+  - `src/delegation/mod.rs`
+  - `src/delegation/codex.rs`
+  - `src/delegation/opencode.rs`
+  - `src/local_agent.rs`
+
+## Current `main` boundary (2026-09-11)
+
+PR #13 already added a structured `local_agent_run` broker for both Codex and OpenCode. That broker is a one-shot development execution capability with canonical session-root cwd checks, a fixed adapter-owned argv, bounded task/output, isolated environment/state, and a dedicated local-agent sandbox profile.
+
+This issue does **not** reimplement that broker. Its remaining product goal is narrower and different:
+
+> make the existing schema-validated `codex delegate` workflow backend-neutral, so OpenCode can participate in the same bounded delegation report/evidence contract and generic `temote-mcp delegate --backend ...` CLI.
+
+The two surfaces may share low-level OpenCode command/fixture knowledge where safe, but they have different contracts:
+
+- `local_agent_run`: structured host-side development worker execution;
+- `delegate`: bounded delegated-task report/evidence protocol with requested-vs-observed model/usage semantics and compatibility with the existing `codex delegate` workflow.
+
+Do not add a second generic local-agent executor while implementing this issue. Do not make `local_agent_run` depend on the delegation report schema merely to reuse code.
+
+## Recommended next implementation slice
+
+Start with **Phase 1 + a boundary inventory only**:
+
+1. freeze current `codex delegate` behavior with compatibility fixtures/tests;
+2. document which OpenCode launch/parsing helpers in `src/local_agent.rs` are reusable without importing local-agent authorization/sandbox semantics into delegation;
+3. introduce backend-neutral internal result/evidence types without changing CLI output or launching OpenCode;
+4. stop before the first OpenCode child process is added, so the extraction is independently reviewable.
 
 ## Motivation
 
@@ -28,8 +57,6 @@ Existing compatibility surface should remain available during migration:
 ```text
 temote-mcp codex delegate ...
 ```
-
-This proposal only defines the architecture, migration, diagnostics, tests, and acceptance criteria. It does not authorize production implementation in this task.
 
 A motivating live configuration is OpenCode with OpenCode Go and DeepSeek V4 Flash. The model/provider string must not be hard-coded. OpenCode documents model selection as `provider/model`, provides `opencode models` for discovery, and currently documents DeepSeek V4 Flash in OpenCode Go. The implementation must still discover or verify the effective provider/model ID on the target installation instead of assuming a stale identifier.
 
@@ -54,7 +81,7 @@ These are discovery inputs, not a frozen protocol contract. Before implementatio
 
 ## Current Temote state and invariants
 
-The inspected `src/codex_delegation.rs` already contains important behavior that must survive backend extraction:
+The inspected delegation module (then `src/codex_delegation.rs`, now split under `src/delegation/`) already contains important behavior that must survive backend extraction:
 
 - prompt input is bounded (`MAX_PROMPT_BYTES`, currently 1 MiB), with regular-file and non-symlink checks for `--prompt-file`;
 - stdout/event and stderr artifacts are bounded (currently 8 MiB each capture path) and excess output is drained rather than accumulated in memory;
@@ -70,6 +97,8 @@ The inspected `src/codex_delegation.rs` already contains important behavior that
 The current Codex command construction is backend-specific: `codex exec`, Codex sandbox/config flags, `--json`, `--output-schema`, `--output-last-message`, Codex environment keys, and Codex event field interpretation. These pieces should move behind an adapter boundary rather than forcing OpenCode to emulate Codex.
 
 `src/codex.rs` also contains Codex plugin integration responsibilities such as install/uninstall/status/diagnose. Those are not delegation-generic and must remain separate from the backend abstraction.
+
+`src/local_agent.rs` now contains a separate OpenCode one-shot execution adapter. Reuse only narrowly compatible command-discovery/fixture knowledge; its host-execution authorization and sandbox contract are not automatically the delegation contract.
 
 ## Proposed architecture
 
@@ -209,7 +238,7 @@ opencode run \
   <prompt>
 ```
 
-Exact argument ordering and any needed isolation/config flags must be verified against the pinned CLI version during implementation.
+Exact argument ordering and any needed isolation/config flags must be verified against the pinned CLI version during implementation. The already-merged `local_agent_run` adapter is useful evidence for the installed CLI contract, but delegation must independently verify the pinned version/arguments it relies on.
 
 The prompt may be supplied as one argument if the CLI contract and current prompt-size bound make that safe. If a later OpenCode version gains a safer file/stdin contract, evaluate it separately. Do not write secrets into argv or temporary prompt files as a workaround.
 
@@ -295,7 +324,7 @@ The following existing Codex plugin integration must remain Codex-specific and c
 - status;
 - diagnose.
 
-Do not genericize all of `src/codex.rs`. Extract only the delegation concerns currently concentrated in `src/codex_delegation.rs` and adjacent CLI dispatch.
+Do not genericize all of `src/codex.rs`. Extract only the delegation concerns then concentrated in `src/codex_delegation.rs` and adjacent CLI dispatch (landed in Phase 2 as `src/delegation/{mod,codex,opencode}.rs`).
 
 The legacy command:
 
@@ -396,7 +425,7 @@ Use a fake `opencode` executable selected through test-only configuration or `TE
 - missing final message;
 - executable-not-found behavior.
 
-Fixtures should be checked into the test suite and named with the OpenCode CLI version/protocol assumptions they represent.
+Fixtures should be checked into the test suite and named with the OpenCode CLI version/protocol assumptions they represent. Reuse fixture facts from `local_agent_run` only when the exact pinned CLI output is identical; otherwise keep delegation fixtures separate.
 
 ### Codex preservation tests
 
@@ -427,10 +456,11 @@ For the motivating case, discover the current OpenCode Go DeepSeek V4 Flash iden
 
 ## Migration strategy
 
-### Phase 1: freeze current Codex behavior
+### Phase 1: freeze current Codex behavior and broker boundary
 
 - add preservation tests around current `codex delegate` command, process construction, environment, bounded artifacts, report validation, and evidence;
-- record current parent-facing JSON examples as compatibility fixtures where useful.
+- record current parent-facing JSON examples as compatibility fixtures where useful;
+- inventory `src/local_agent.rs` OpenCode helpers and explicitly classify them as reusable implementation detail vs local-agent-only policy.
 
 ### Phase 2: extract backend boundary
 
@@ -445,7 +475,8 @@ For the motivating case, discover the current OpenCode Go DeepSeek V4 Flash iden
 - implement `opencode run --format json` adapter;
 - add fake CLI fixtures and deterministic tests;
 - add binary override and diagnostics;
-- keep provider/model configurable.
+- keep provider/model configurable;
+- reuse local-agent implementation only where it does not import the wrong authorization/report contract.
 
 ### Phase 4: optional live OpenCode acceptance
 
@@ -463,7 +494,7 @@ For the motivating case, discover the current OpenCode Go DeepSeek V4 Flash iden
 
 ## Non-goals
 
-This proposal does not include:
+This issue does not include:
 
 - providing or installing OpenCode itself;
 - managing OpenCode provider accounts or tokens;
@@ -475,7 +506,7 @@ This proposal does not include:
 - OpenCode UI integration;
 - OpenCode MCP configuration management;
 - agent/session federation changes;
-- production implementation as part of this proposal-writing task.
+- replacing or broadening the already-merged `local_agent_run` broker.
 
 ## Acceptance criteria
 
@@ -492,7 +523,8 @@ Implementation of this proposal is acceptable only when all of the following are
 - Codex plugin install/uninstall/status/diagnose continue to behave independently of the new backend layer;
 - fake OpenCode CLI tests are deterministic and cover success, failure, malformed/huge output, mismatch, and interruption;
 - the generic layer does not depend on OpenCode-specific event names or session features;
-- one-shot `opencode run` is sufficient for the first shipped OpenCode backend; persistent session/server features remain optional future work.
+- one-shot `opencode run` is sufficient for the first shipped OpenCode backend; persistent session/server features remain optional future work;
+- `local_agent_run` behavior, authorization, and sandboxing do not regress or become coupled to delegation schema requirements.
 
 ## Implementation-review questions
 
@@ -505,3 +537,133 @@ Resolve these from a pinned OpenCode CLI and fixtures before merging production 
 - What is the cleanest compatibility mapping between Codex `reasoning_effort` and OpenCode provider-specific `--variant` without making either concept falsely universal?
 
 Until these are answered, unknown fields remain unknown; they are not inferred from requested values.
+
+## Phase 3 status (2026-09-11)
+
+One-shot OpenCode backend landed on main:
+
+- `DelegationBackend::{Codex, OpenCode}`; `temote-mcp delegate --backend codex|opencode ...` selects the backend (explicit `--backend`, then `TEMOTE_DELEGATION_BACKEND`, then Codex). Legacy `temote-mcp codex delegate ...` always forces Codex and is not redirected by the environment variable.
+- OpenCode adapter: `opencode` is resolved from PATH and callers cannot inject an executable path; the child runs `opencode run --pure --format json --dir <canonical cwd> --model <provider/model> [--variant <variant>] -- <wrapped prompt>` with argv only and no shell.
+- The prompt wrapper embeds the strict final-report contract; JSON events are normalized into the existing backend-neutral parent result (last assistant message text parts for the report, `step_finish` tokens for usage, `sessionID` for bounded evidence). Requested and observed model/variant stay distinct.
+- The child environment is rebuilt from a small OpenCode allowlist (no host-wide passthrough), and a bounded run timeout kills the child and returns `process_timeout`.
+- Tests cover backend selection and flag validation, argv construction, cwd canonicalization, missing executable, success normalization, non-zero exit, timeout, bounded stdout, secret sentinel filtering, and Codex compatibility.
+- Live smoke on 2026-09-11: OpenCode CLI `1.18.30`, `--model opencode/mimo-v2.5-free`, read-only task; parent `status=success` with a schema-valid report and mapped usage; no files created or changed.
+
+Not implemented: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume behavior.
+
+## Phase 2 adapter extraction status (2026-09-11)
+
+Backend adapter extraction landed on main without changing external behavior:
+
+- `src/codex_delegation.rs` was split into `src/delegation/{mod,codex,opencode}.rs`; the delegation module path and all caller-facing functions are unchanged.
+- Shared layer (`mod.rs`) keeps `DelegationBackend`, options/result/evidence/report types, CLI parsing and backend selection, artifact creation and permissions, bounded artifact capture, the shared process wait/capture helper, report validation, and parent serialization.
+- `codex.rs` owns the Codex adapter: `build_codex_command` (including `--output-schema`), the Codex environment allowlist, Codex JSONL evidence/usage extraction, and Codex option validation.
+- `opencode.rs` owns the OpenCode adapter: `opencode run` argv, `--pure`/`--format json`/`--dir`/`--model`/`--variant`, event/report extraction, session/usage mapping, option validation, and the read-only diagnostics probes (`--version`, `models --pure`) with their parsing/classification.
+- Environment filtering and the two wait/capture paths are shared helpers with backend-specific allowlists/labels; no generic "arbitrary executable + argv" helper is exposed.
+- All 37 delegation tests moved with their modules and pass unchanged; the frozen parent JSON fixture, Codex argv/environment tests, OpenCode argv/normalization tests, and diagnostics tests keep their assertions.
+- Smoke on 2026-09-11: `delegate diagnose --backend opencode` unchanged; one-shot `delegate --backend opencode --model opencode/mimo-v2.5-free` completed with `status=success` and no files created or changed.
+
+Remaining work after this slice: persistent server/session lifecycle, automatic resume, fork, and attach.
+
+## Explicit resume status (2026-09-12)
+
+The recommended explicit-resume slice landed locally:
+
+- `--session <id>` is accepted only by the OpenCode backend and is passed as one fixed argv value.
+- Before artifacts or `opencode run` are created, Temote runs bounded `opencode session list --format json` and requires exactly one matching ID whose canonical `directory` equals the canonical delegation cwd.
+- Invalid IDs, missing or ambiguous sessions, directory mismatch, non-zero/timeout/oversized/malformed probes, and incomplete metadata fail closed without launching the delegated task.
+- Deterministic fake-CLI coverage covers validation, argv ordering, matching-directory success, and preflight failures. The frozen parent result shape is unchanged.
+
+Remaining work is persistent server/session lifecycle and the explicitly deferred `--continue`, `--fork`, and `--attach` behavior.
+
+## Phase 3 diagnostics status (2026-09-11)
+
+Read-only OpenCode CLI diagnostics landed on main:
+
+- `temote-mcp delegate diagnose --backend opencode [--model <provider/model>]` prints one bounded JSON document with `executable` (`available`/`unavailable`, `resolved`), `version` (`ready`/`unavailable`/`failed`/`timeout` plus a bounded value), `models` (`ready`/`unavailable`/`unsupported`/`failed`/`timeout` plus a bounded count and truncation flag), and `requested_model` (`present`/`absent`/`unknown`/`not_checked`).
+- The backend selector honors explicit `--backend`, then `TEMOTE_DELEGATION_BACKEND`. Diagnostics currently implement only OpenCode and fail closed for Codex instead of reporting a false ready state.
+- Probes are `opencode --version` and `opencode models --pure`, run through the existing bounded artifact/timeout subprocess helper with the same OpenCode child-environment allowlist. There are no login, auth, credential, config, model-download, session, or delegation side effects; child stdout/stderr is never echoed and only bounded identifiers/version values are reported.
+- `opencode models` line output is treated as stable structured CLI output: lines are recognized only when they look like `provider/model` identifiers. Empty, failed, timed-out, or truncated listings map `requested_model` to `unknown` rather than reporting a false `absent`.
+- Deterministic fake-CLI tests cover missing binary, version success/failure/timeout/oversized/malformed, model listing success/empty/mixed/failure/unsupported/timeout/oversized, requested-model present/absent/unknown, environment allowlist filtering, and secret/output non-leakage.
+- Read-only smoke on 2026-09-11 with OpenCode CLI `1.18.30`: `executable=available`, `version=1.18.30`, `models=ready count=64`, `requested_model=opencode-go/deepseek-v4-flash present`; no credential mutation and no delegation execution.
+
+Remaining work after this slice: persistent server/session/resume.
+
+## Live comparative measurement status (2026-09-12)
+
+Live comparison landed on main. Evidence: [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
+
+- 3 read-only tasks (repository comprehension, targeted review, implementation planning) × Codex/OpenCode × 3 runs = 18 delegation runs at baseline `0f8a795`, with fixed prompts: Codex `gpt-5.6-luna` (`high`) and OpenCode `opencode-go/deepseek-v4-flash` (`1.18.30`).
+- Delivered normalized results: Codex 9/9; OpenCode 1/9 (`invalid_json` ×2 from raw newlines in strings, `invalid_report_schema` ×6 from summaries over the 1200-character bound). Blind content scores were close; the practical difference is report deliverability.
+- Median wall-clock: Codex 176.3 s vs OpenCode 87.3 s across all tasks, with high variance in Codex's review task (180–446 s). Usage units are not comparable between backends; no cost conclusion.
+- Recommendation in this sample: keep Codex as the default delegation backend; treat OpenCode as an interactive/session backend or a fallback only after report delivery is enforced. More evidence (more runs, second OpenCode model, report-contract fix) is needed before changing defaults.
+- Observed issues are recorded in the evidence file only; no production changes were made in this slice.
+
+Remaining work after this slice: persistent server/session/resume.
+
+## OpenCode normalized-report delivery fix status (2026-09-12)
+
+Follow-up fix landed on main. Report: [`docs/evaluations/opencode-normalized-report-fix-20260912.md`](../../docs/evaluations/opencode-normalized-report-fix-20260912.md); before/after detail appended to [`docs/evaluations/codex-vs-opencode-live-20260912.md`](../../docs/evaluations/codex-vs-opencode-live-20260912.md).
+
+- Root cause: report delivery depended on the model emitting strict JSON within every schema bound; the adapter had no bounded repair or normalization. Raw newlines in strings caused `invalid_json`; summaries of 1380–2989 chars caused `invalid_report_schema`; requested values were read back from model output (double-quoted); `artifacts.report` was never written; per-step `step_finish` usage was dropped except for the last step.
+- Fix: bounded report extraction (balanced-object scan with raw control-character sanitization), adapter-side normalization (canonical requested values, UTF-8-safe summary truncation with a ` …[truncated]` marker, bounded arrays/scalars), canonical report persisted to `artifacts.report` through one normalization path, accumulated per-step usage, and a valid prompt-contract example. The Codex adapter is unchanged.
+- Verification: 19 new deterministic tests (44 OpenCode adapter tests), delegation 52, Codex 112, full cargo test 607 bin + 40 lib, gateway 60/60, fmt/clippy/check/diff green.
+- Post-fix live recheck with the same frozen prompts: OpenCode normalized success went from 1/9 to 9/9 (`invalid_json` 2→0, `invalid_report_schema` 6→0). Remaining limitation: the 1200-char summary bound truncates long answers (marker visible), and the model rarely uses `checks`/`unresolved` for detail.
+- Follow-up review fixes (2026-09-12): normalized reports now fail closed on oversized arrays/items/scalars and on unexpected top-level fields instead of silently truncating or accepting them, and early OpenCode launch failures clean up temporary artifacts. Report: [`docs/evaluations/opencode-review-fixes-20260912.md`](../../docs/evaluations/opencode-review-fixes-20260912.md).
+- Observed evidence trust-boundary fix (2026-09-12): canonical report `observed_model`/`observed_effort` are now sourced only from adapter event evidence and never from model self-report, so parent and canonical observed values cannot disagree; top-level `providerID`+`modelID` events compose `provider/model` like the part shape. Report: [`docs/evaluations/opencode-observed-evidence-fix-20260912.md`](../../docs/evaluations/opencode-observed-evidence-fix-20260912.md).
+
+## Session/resume spike status (2026-09-12)
+
+Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-spike-20260912.md`](../../docs/evaluations/opencode-session-resume-spike-20260912.md). The explicit, caller-supplied session resume slice is now implemented; persistent lifecycle behavior remains out of scope.
+
+- Verified on OpenCode 1.18.30: explicit `--session <id>` preserves the session ID and context, works with a different `--model`, and is unaffected by `--pure`. A session created in directory A and resumed with `--dir B` resolves to directory A and then hangs without emitting a final event, so a mismatched resume both ignores the caller's canonical cwd and fails to terminate.
+- `--continue` implicitly selects the most recent project session and silently creates a new session when the project has no history; `--fork` creates a new session with inherited context; `--attach` requires a server lifecycle and auth.
+- Recommended first slice: explicit caller-supplied `--session <id>` only, with a fail-closed bounded `opencode session list --format json` preflight requiring the session's canonical `directory` to equal the canonical cwd; no `--continue`, no `--fork`, no `--attach`, no server lifecycle, and no automatic resume from previously observed thread IDs.
+- Explicit resume is now implemented as a bounded, fail-closed slice: `--session <id>` is OpenCode-only; a read-only `session list --format json` preflight requires one exact ID and a canonical directory match before artifacts or `run` are started. `--continue` and `--attach` remain unsupported; `--fork` is implemented as the bounded follow-up below.
+
+## OpenCode executable override status (2026-09-12)
+
+`TEMOTE_OPENCODE_BIN` landed on main. Report: [`docs/evaluations/opencode-bin-override-20260912.md`](../../docs/evaluations/opencode-bin-override-20260912.md).
+
+- Contract: optional absolute path to an existing executable regular file; symlinks are canonicalized; takes precedence over PATH. An explicit but invalid override (empty, relative, missing, not a regular file, not executable, invalid value, or over the path-length bound) fails closed with a bounded error and does not fall back to PATH.
+- One resolver (`resolve_opencode_executable`) is shared by delegation (`delegate --backend opencode`) and diagnostics (`delegate diagnose --backend opencode`). Delegation resolves at argument parsing before any child or artifact is created; diagnostics reports `available`/`unavailable`, the source (`env_override`/`path`/`invalid_override`), and a bounded reason for invalid overrides.
+- The resolved physical path is never printed in diagnostics, results, or errors; the environment value is read only by the parent and is not passed to the OpenCode child. Codex delegation and the legacy `codex delegate` path are unaffected even when the override is invalid.
+- Verification: 8 new adapter tests + 3 shared delegation tests (52 OpenCode adapter tests), including precedence, unset fallback, empty/relative/missing/directory/non-executable/NUL/overlong rejection, symlink canonicalization, invalid-override diagnostics, source labeling, error-path non-disclosure, and child-environment filtering.
+- Smoke: valid override diagnosed `source=env_override`, `status=available`, `version=1.18.30`, requested model `present`; unset override diagnosed `source=path`; invalid override diagnosed `source=invalid_override` with `not_absolute`/`not_found` and delegation exited non-zero without producing a result; one-shot read-only delegation through the override returned `status=success` and left the disposable directory unchanged.
+
+Remaining work after this slice: persistent server/session lifecycle, automatic resume, fork, and attach.
+
+## Phase 1 status (2026-09-11)
+
+Phase 1 (freeze Codex behavior + boundary inventory + backend-neutral internal types) landed on main without launching OpenCode and without changing CLI output:
+
+- `src/delegation/mod.rs` now exposes `DelegationBackend::{Codex}` with explicit `parse`/`name`, plus internal `NormalizedResult`/`NormalizedEvidence` types. `result_to_json` converts through `DelegationResult::normalize()` and `normalized_to_json()`.
+- Compatibility is frozen by `parent_result_json_shape_is_frozen_for_compatibility` (exact parent JSON fixture), `normalized_result_keeps_requested_and_observed_distinct`, and the existing command/environment/report classification tests.
+- No OpenCode process is launched; the generic CLI, `--format json` parsing, diagnostics, and binary override remain Phase 3.
+
+### Boundary inventory: `src/local_agent.rs`
+
+Reusable as implementation detail (copy or extract, do not import local-agent authorization):
+
+- `Agent::parse`/`as_str`/`executable_name` naming conventions and the OpenCode binary name `opencode`.
+- Command-shape knowledge recorded by `build_opencode_command` (`run`, `--pure`, `--format json`, `--dir`, optional `--model`, task delivery), subject to re-verification against a pinned delegation CLI version.
+- `opencode_config` permission JSON shape as an input to a delegation-specific config if one is required.
+
+Local-agent-only policy; must not become the delegation contract:
+
+- `resolve_executable_details`/`resolve_explicit_executable` enforce session-root exclusion and are coupled to local-agent executable resolution; delegation needs its own executable policy and diagnostics.
+- `AgentState` auth import, HOME/XDG isolation, and `--pure`/config injection are local-agent sandbox behavior.
+- `prepare`/`run`/`revalidate` approvals, job ownership, and `LocalAgentScope` sandbox semantics stay in `local_agent`.
+- There is no existing version-probing helper; delegation diagnostics must add one for the pinned OpenCode version.
+- `local_agent_run` fixtures are local-agent-shaped; delegation fixtures stay separate unless the exact pinned output is identical.
+
+## Explicit fork status (2026-09-13)
+
+The bounded `--fork` follow-up landed locally. It extends the explicit resume slice without adding server/session lifecycle state:
+
+- `--fork` is OpenCode-only and requires `--session`; argument parsing rejects `--fork` for Codex and rejects it without a session. The same rule is enforced again in the OpenCode adapter's option validation.
+- The existing fail-closed `opencode session list --format json` preflight is reused unchanged against the named parent session, so a missing/ambiguous/mismatched/oversized/failed probe still fails before any artifact or `run` child is created.
+- `opencode run` argv gains exactly one `--fork` immediately after `--session <id>` and before `-- <prompt>`; all other argv, environment filtering, artifact bounds, report normalization, and the frozen parent result shape are unchanged.
+- `evidence.thread_id` remains the observed session ID from OpenCode events; for a fork that observed value is the new forked session, not the requested parent.
+- Deterministic coverage: `fork_requires_session_and_is_opencode_only`, `fork_command_places_fork_after_session_before_prompt`, and `fork_preflight_uses_parent_session_and_launches_new_session` in `src/delegation/opencode.rs`. No live fork was executed (an installed, authenticated OpenCode runtime is not a repository-local gate); the upstream fork behavior is recorded in the resume spike (E5).
+- `--continue` and `--attach` remain unsupported. Persistent OpenCode server/session lifecycle and automatic resume remain the outstanding work in this issue.

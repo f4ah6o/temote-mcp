@@ -14,8 +14,8 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    apply_patch, approvals, checkpoints, child_env, codex_app_server, config, evidence, friction,
-    local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
+    apply_patch, approvals, checkpoints, child_env, codex_app_server, config, dev_tool, evidence,
+    friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
     session_control::SessionBackend, work_handoff,
 };
 
@@ -47,6 +47,7 @@ const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
 pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the local session supervisor has no session for the required project, create one with session_start using a configured named-root path, then call session_info before normal tools. Existing tools require session_id except session_list and session_start.";
+const PROCESS_IDENTITY_META_KEY: &str = "io.temote/processIdentity";
 
 #[derive(Clone)]
 enum CachedJobResult {
@@ -243,14 +244,22 @@ async fn dispatch_with_mode(
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        "initialize" => Ok(json!({
-            "protocolVersion": negotiate_protocol_version(request),
-            "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": "temote-mcp", "title": "Temote MCP", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Call session_list first. On the public serve endpoint, use session_start with a configured named-root path when the required project session is absent, then call session_info before normal tools. Managed sessions are always normal sandboxed sessions; remote clients cannot create yolo sessions or self-approve host operations. A CLI session started locally with `temote-mcp start <session-id> --yolo` remains a separate local choice. The session mode does not control confirmation or authorization enforced by the MCP client."
-        })),
+        "initialize" => {
+            let mut result = json!({
+                "protocolVersion": negotiate_protocol_version(request),
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "temote-mcp", "title": "Temote MCP", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "Call session_list first. On the public serve endpoint, use session_start with a configured named-root path when the required project session is absent, then call session_info before normal tools. Managed sessions are always normal sandboxed sessions; remote clients cannot create yolo sessions or self-approve host operations. A CLI session started locally with `temote-mcp start <session-id> --yolo` remains a separate local choice. The session mode does not control confirmation or authorization enforced by the MCP client."
+            });
+            result["_meta"] = process_identity_meta();
+            Ok(result)
+        }
         "server/discover" => Ok(discover_result()),
-        "ping" => Ok(json!({})),
+        "ping" => {
+            let mut result = json!({});
+            result["_meta"] = process_identity_meta();
+            Ok(result)
+        }
         "tools/list" => Ok(json!({"tools": tools(public, sessions.is_some())})),
         "tools/call" => {
             call_tool(
@@ -362,6 +371,23 @@ fn validate_modern_request(request: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Bounded, non-secret process identity that a reconnecting MCP client can use to
+/// confirm it reached the intended host, version, and boot generation. It is not a
+/// credential and is never derived from session or environment secret material.
+fn process_identity() -> Value {
+    json!({
+        "host_id": crate::host_identity::resolve().unwrap_or_else(|_| "unknown".to_owned()),
+        "version": env!("CARGO_PKG_VERSION"),
+        "boot_generation": crate::boot_identity::generation(),
+    })
+}
+
+fn process_identity_meta() -> Value {
+    let mut meta = serde_json::Map::new();
+    meta.insert(PROCESS_IDENTITY_META_KEY.to_owned(), process_identity());
+    Value::Object(meta)
+}
+
 fn server_info() -> Value {
     json!({
         "name": "temote-mcp",
@@ -371,6 +397,12 @@ fn server_info() -> Value {
 }
 
 fn discover_result() -> Value {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "io.modelcontextprotocol/serverInfo".to_owned(),
+        server_info(),
+    );
+    meta.insert(PROCESS_IDENTITY_META_KEY.to_owned(), process_identity());
     json!({
         "resultType": "complete",
         "supportedVersions": [MODERN_PROTOCOL_VERSION],
@@ -378,7 +410,7 @@ fn discover_result() -> Value {
         "instructions": SERVER_INSTRUCTIONS,
         "ttlMs": 0,
         "cacheScope": "private",
-        "_meta": {"io.modelcontextprotocol/serverInfo": server_info()}
+        "_meta": Value::Object(meta)
     })
 }
 
@@ -390,9 +422,15 @@ fn modernize_result(method: &str, mut result: Value) -> Value {
         return result;
     };
     object.insert("resultType".to_owned(), json!("complete"));
-    object.insert(
-        "_meta".to_owned(),
-        json!({"io.modelcontextprotocol/serverInfo": server_info()}),
+    let meta = object
+        .entry("_meta".to_owned())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    meta.as_object_mut().unwrap().insert(
+        "io.modelcontextprotocol/serverInfo".to_owned(),
+        server_info(),
     );
     if method == "tools/list" {
         object.insert("ttlMs".to_owned(), json!(0));
@@ -502,9 +540,24 @@ fn local_agent_input_schema() -> Value {
     })
 }
 
+fn dev_tool_input_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "session_id":{"type":"string"},
+            "tool":{"type":"string","enum":["cargo","vp"]},
+            "operation":{"type":"string","minLength":1,"maxLength":dev_tool::MAX_DEV_TOOL_OPERATION_BYTES},
+            "args":{"type":"array","items":{"type":"string","maxLength":dev_tool::MAX_DEV_TOOL_ARGUMENT_BYTES},"maxItems":dev_tool::MAX_DEV_TOOL_ARGUMENTS},
+            "cwd":{"type":"string"}
+        },
+        "required":["session_id","tool","operation"],
+        "additionalProperties":false
+    })
+}
+
 fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
-        {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and whether each session is in yolo mode.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and permission mode (ask/agent/yolo).","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
@@ -516,6 +569,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
+        {"name":"dev_tool_run","title":"Run a structured developer tool operation","description":"Run a validated Cargo or Vite+ operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. The caller selects a tool and operation, never an executable or raw host command.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":dev_tool_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 regular file using the selected session permission mode. Existing special-file targets are rejected. Normal sessions are restricted to permitted roots and use the temote-mcp sandbox; yolo sessions may write anywhere the local user can.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
@@ -707,7 +761,7 @@ async fn call_tool_with_local_agent_executable(
     }
     let session = config::load_session(&session_id).await?;
     anyhow::ensure!(
-        !public || !session.yolo,
+        !public || !session.yolo(),
         "yolo sessions are unavailable on the public MCP endpoint"
     );
     match name {
@@ -749,6 +803,7 @@ async fn call_tool_with_local_agent_executable(
             )?)
         }
         "local_agent_run" => local_agent_run(&args, &session, local_agent_executable).await,
+        "dev_tool_run" => dev_tool_run(&args, &session).await,
         "list_directory" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = list_directory(&path).await;
@@ -779,11 +834,13 @@ async fn call_tool_with_local_agent_executable(
             let request = checkpoints::parse_save_request(&args)?;
             anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
             let approval_detail = checkpoints::approval_detail(&request.checkpoint);
-            let approved = approvals::request(
-                &session.id,
+            let approved = approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::LocalStructured,
                 "checkpoint_save",
                 approval_detail,
                 session.cwd.clone(),
+                BTreeMap::new(),
             )
             .await?;
             let store = checkpoints::Store::default_store()?;
@@ -839,17 +896,15 @@ async fn call_tool_with_local_agent_executable(
                 .map(Uuid::parse_str)
                 .transpose()
                 .context("retry_group must be a UUID")?;
-            let approved = if session.yolo {
-                true
-            } else {
-                approvals::request(
-                    &session.id,
-                    "recall_feedback",
-                    "signal: no_hit; query/content: not persisted".to_owned(),
-                    session.cwd.clone(),
-                )
-                .await?
-            };
+            let approved = approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::LocalStructured,
+                "recall_feedback",
+                "signal: no_hit; query/content: not persisted".to_owned(),
+                session.cwd.clone(),
+                BTreeMap::new(),
+            )
+            .await?;
             anyhow::ensure!(approved, "user denied recall feedback persistence");
             let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
             text_result(serde_json::to_string_pretty(&event)?)
@@ -896,11 +951,13 @@ async fn call_tool_with_local_agent_executable(
                 })
                 .transpose()?;
             let request = onepassword_cli::ItemGetRequest::new(items, vault, account)?;
-            if !approvals::request(
-                &session.id,
+            if !approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::Integration,
                 "onepassword_item_get",
                 request.approval_summary(),
                 session.cwd.clone(),
+                BTreeMap::new(),
             )
             .await?
             {
@@ -930,11 +987,13 @@ async fn call_tool_with_local_agent_executable(
                 .to_owned();
             let references = required_string_array(&args, "references")?;
             let request = onepassword_sdk::ResolveRequest::new(account, references)?;
-            if !approvals::request(
-                &session.id,
+            if !approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::Integration,
                 "onepassword_secret_resolve",
                 request.approval_summary(),
                 session.cwd.clone(),
+                BTreeMap::new(),
             )
             .await?
             {
@@ -1013,11 +1072,13 @@ async fn call_tool_with_local_agent_executable(
                 &environment,
                 &allowed_locators,
             )?;
-            if !approvals::request(
-                &session.id,
+            if !approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::Integration,
                 "onepassword_service_account_run",
                 detail,
                 cwd.clone(),
+                BTreeMap::new(),
             )
             .await?
             {
@@ -1058,11 +1119,13 @@ async fn call_tool_with_local_agent_executable(
                     .any(|tool| tool["name"].as_str() == Some(tool_name))
             });
             anyhow::ensure!(known, "unknown kintone MCP tool: {tool_name}");
-            if !approvals::request(
-                &session.id,
+            if !approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::Integration,
                 "kintone_mcp_call",
                 safe_child_call_summary(tool_name, &arguments),
                 session.cwd.clone(),
+                BTreeMap::new(),
             )
             .await?
             {
@@ -1107,11 +1170,13 @@ async fn call_tool_with_local_agent_executable(
                     bounded_path(value, "stdout_path")
                 })
                 .transpose()?;
-            if !approvals::request(
-                &session.id,
+            if !approvals::ensure_local_approval(
+                &session,
+                approvals::ApprovalClass::Integration,
                 "kintone_cli_run",
                 safe_kintone_cli_summary(&arguments, stdout_path.as_deref()),
                 cwd.clone(),
+                BTreeMap::new(),
             )
             .await?
             {
@@ -1209,11 +1274,9 @@ async fn authorize_codex_operation(
     detail: String,
     metadata: BTreeMap<String, String>,
 ) -> Result<()> {
-    if session.yolo {
-        return Ok(());
-    }
-    let approved = approvals::request_with_metadata(
-        &session.id,
+    let approved = approvals::ensure_local_approval(
+        session,
+        approvals::ApprovalClass::CodexAppServer,
         action,
         detail,
         session.cwd.clone(),
@@ -1681,7 +1744,7 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         "temote-mcp-write".to_owned(),
         absolute.display().to_string(),
     ];
-    let result = if session.yolo {
+    let result = if session.yolo() {
         tokio::fs::write(&absolute, content)
             .await
             .with_context(|| format!("failed to write {}", absolute.display()))
@@ -1882,11 +1945,13 @@ async fn run_approved_git_command(
     let repository_root = sandbox::git_worktree_root(&cwd)?;
     config::ensure_permitted(session, &repository_root)
         .context("Git repository root must be inside a permitted session root")?;
-    if !approvals::request(
-        &session.id,
+    if !approvals::ensure_local_approval(
+        session,
+        approvals::ApprovalClass::GitNetwork,
         operation,
         format!("argv: {command:?}"),
         repository_root.clone(),
+        BTreeMap::new(),
     )
     .await?
     {
@@ -2002,7 +2067,7 @@ async fn run_git_and_report(
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
-    let output = if session.yolo {
+    let output = if session.yolo() {
         sandbox::run_unrestricted(&command, &cwd, None).await
     } else {
         let git_roots = sandbox::git_metadata_roots(&cwd)?;
@@ -2072,17 +2137,24 @@ async fn local_agent_run(
         Some(executable) => local_agent::prepare_with_executable(args, session, executable)?,
         None => local_agent::prepare(args, session)?,
     };
-    let detail = prepared.approval_detail();
-    approvals::ensure_approval_detail_fits(&detail)?;
-    let approved = approvals::request_user_approval_for_instance(
-        session,
-        "local_agent_run",
-        detail,
-        prepared.cwd.clone(),
-        prepared.approval_metadata(),
-    )
-    .await?;
-    anyhow::ensure!(approved, "user denied local_agent_run");
+    if approvals::local_approval(
+        session.permission_mode,
+        approvals::ApprovalClass::LocalAgent,
+    ) != approvals::LocalApproval::Skip
+    {
+        let detail = prepared.approval_detail();
+        approvals::ensure_approval_detail_fits(&detail)?;
+        let approved = approvals::ensure_local_approval(
+            session,
+            approvals::ApprovalClass::LocalAgent,
+            "local_agent_run",
+            detail,
+            prepared.cwd.clone(),
+            prepared.approval_metadata(),
+        )
+        .await?;
+        anyhow::ensure!(approved, "user denied local_agent_run");
+    }
 
     let current_session = config::load_session(&session.id).await?;
     anyhow::ensure!(
@@ -2158,6 +2230,102 @@ async fn spawn_local_agent(
     Ok((description, handle, completion))
 }
 
+async fn dev_tool_run(args: &Value, session: &config::Session) -> Result<Value> {
+    dev_tool_run_with_executable(args, session, None).await
+}
+
+async fn dev_tool_run_with_executable(
+    args: &Value,
+    session: &config::Session,
+    executable: Option<&Path>,
+) -> Result<Value> {
+    let prepared = match executable {
+        Some(executable) => dev_tool::prepare_with_executable(args, session, Some(executable))?,
+        None => dev_tool::prepare(args, session)?,
+    };
+    let detail = prepared.approval_detail();
+    approvals::ensure_approval_detail_fits(&detail)?;
+    let approved = approvals::ensure_local_approval(
+        session,
+        approvals::ApprovalClass::DeveloperTool,
+        "dev_tool_run",
+        detail,
+        prepared.cwd().to_path_buf(),
+        BTreeMap::new(),
+    )
+    .await?;
+    anyhow::ensure!(approved, "user denied dev_tool_run");
+
+    let current_session = config::load_session(&session.id).await?;
+    anyhow::ensure!(
+        current_session.started_at == session.started_at
+            && current_session.process_id == session.process_id,
+        "session instance changed while developer-tool approval was pending"
+    );
+    prepared.revalidate(&current_session)?;
+    let (description, mut handle, completion) = spawn_dev_tool(prepared, &current_session).await?;
+    match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
+        Ok(joined) => {
+            joined.context("developer tool task failed")?;
+            let result = completion
+                .lock()
+                .unwrap()
+                .result
+                .clone()
+                .context("developer tool task completed without a cached result")?;
+            cached_job_result(result, OutputPolicy::default())
+        }
+        Err(_) => {
+            store_job(
+                session,
+                description,
+                handle,
+                completion,
+                OutputPolicy::default(),
+                "Backgrounded",
+            )
+            .await
+        }
+    }
+}
+
+async fn spawn_dev_tool(
+    prepared: dev_tool::PreparedDevToolRun,
+    session: &config::Session,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    let slot = reserve_job_slot(&session.id)?;
+    let description = prepared.activity_label();
+    approvals::activity(&session.id, format!("Running {description}"), None).await;
+    let session_id = session.id.clone();
+    let evidence_scope = session.cwd.clone();
+    let activity_label = description.clone();
+    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let task_completion = Arc::clone(&completion);
+    let handle = tokio::spawn(async move {
+        let result = tokio::select! {
+            result = dev_tool::run(prepared) => {
+                result.and_then(render_output)
+            }
+            _ = wait_for_session_stop(session_id.clone()) => {
+                Err(anyhow::anyhow!("session stopped; developer tool job cancelled"))
+            }
+            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
+                Err(anyhow::anyhow!("developer tool job exceeded the two-hour lifetime limit"))
+            }
+        };
+        let cached = cache_job_result(&result, &session_id, &evidence_scope);
+        {
+            let mut completion = task_completion.lock().unwrap();
+            completion.result = Some(cached);
+            completion.completed_at = Some(Instant::now());
+        }
+        drop(slot);
+        reap_jobs();
+        report_local_agent_finished(session_id, activity_label, &result).await;
+    });
+    Ok((description, handle, completion))
+}
+
 async fn spawn_sandboxed_command(
     args: &Value,
     session: &config::Session,
@@ -2165,7 +2333,7 @@ async fn spawn_sandboxed_command(
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
-    let yolo = session.yolo;
+    let yolo = session.yolo();
     let slot = reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
@@ -2723,11 +2891,13 @@ fn validate_command_budget(command: &[String]) -> Result<()> {
 async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
-    if !approvals::request(
-        &session.id,
+    if !approvals::ensure_local_approval(
+        session,
+        approvals::ApprovalClass::HostUnrestricted,
         "without_sandbox",
         format!("argv: {command:?}"),
         cwd.clone(),
+        BTreeMap::new(),
     )
     .await?
     {
@@ -3705,6 +3875,111 @@ mod tests {
         assert_eq!(result["protocolVersion"], LATEST_LEGACY_PROTOCOL_VERSION);
     }
 
+    #[tokio::test]
+    async fn handshake_exposes_non_secret_process_identity() {
+        let initialize = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        let identity = &initialize["_meta"][PROCESS_IDENTITY_META_KEY];
+        let version = &identity["version"];
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        let boot_generation = &identity["boot_generation"];
+        assert_eq!(boot_generation, crate::boot_identity::generation());
+        assert!(identity["host_id"].is_string());
+        assert!(!identity["host_id"].as_str().unwrap().is_empty());
+
+        let ping = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        let ping_identity = &ping["_meta"][PROCESS_IDENTITY_META_KEY];
+        let initialize_identity = &initialize["_meta"][PROCESS_IDENTITY_META_KEY];
+        assert_eq!(ping_identity, initialize_identity);
+
+        let discover = dispatch(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .await
+        .unwrap();
+        let discovered = &discover["_meta"][PROCESS_IDENTITY_META_KEY]["boot_generation"];
+        assert_eq!(discovered, crate::boot_identity::generation());
+
+        let encoded = serde_json::to_string(&initialize["_meta"])
+            .unwrap()
+            .to_ascii_lowercase();
+        for forbidden in ["token", "secret", "password", "authorization", "cookie"] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_initialize_keeps_server_info_and_process_identity() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "modern-init",
+            "method": "initialize",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        let server_name = &result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"];
+        assert_eq!(server_name, "temote-mcp");
+        let identity = &result["_meta"][PROCESS_IDENTITY_META_KEY];
+        let boot_generation = &identity["boot_generation"];
+        assert_eq!(boot_generation, crate::boot_identity::generation());
+    }
+
+    #[tokio::test]
+    async fn modern_ping_keeps_server_info_and_process_identity() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "modern-ping",
+            "method": "ping",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let result = dispatch(&request).await.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "temote-mcp"
+        );
+        let identity = &result["_meta"][PROCESS_IDENTITY_META_KEY];
+        assert_eq!(identity["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            identity["boot_generation"],
+            crate::boot_identity::generation()
+        );
+        assert!(identity["host_id"].is_string());
+        assert!(result.get(PROCESS_IDENTITY_META_KEY).is_none());
+    }
+
     #[test]
     fn generated_legacy_protocol_negotiation_matches_supported_set() -> noprop::TestResult {
         test_support::run(0x4d43_504c_4547_4143, 512, |ctx| {
@@ -3935,7 +4210,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 45);
+        assert_eq!(tools.len(), 46);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -4064,7 +4339,7 @@ mod tests {
             permitted_directories: vec![cwd],
             started_at: 1,
             process_id: 1,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
         config::save_session(&session).await.unwrap();
 
@@ -4168,7 +4443,7 @@ mod tests {
             permitted_directories: vec![root.clone()],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
 
         test_support::run(0x4749_5450_4154_4801, 512, |ctx| {
@@ -4344,7 +4619,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let other = config::Session {
                 id: other_id,
@@ -4352,7 +4627,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion {
@@ -4400,7 +4675,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let other = config::Session {
                 id: other_id,
@@ -4408,7 +4683,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -4451,7 +4726,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -4528,7 +4803,7 @@ mod tests {
                 permitted_directories: Vec::new(),
                 started_at: 0,
                 process_id: 0,
-                yolo: true,
+                permission_mode: config::PermissionMode::Yolo,
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -4586,7 +4861,7 @@ mod tests {
             permitted_directories: vec![config::canonical_directory(cwd.path()).unwrap()],
             started_at: 1,
             process_id: 2,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         };
         let marker = "denied-secret-sentinel";
         let request = checkpoints::parse_save_request(&json!({
@@ -4839,7 +5114,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         assert!(job_list(&json!({"session_id":session.id,"limit":1}), &session).is_ok());
         assert!(job_list(&json!({"session_id":session.id,"limit":128}), &session).is_ok());
@@ -4947,7 +5222,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         let job_id = Uuid::new_v4();
         let completion = Arc::new(Mutex::new(JobCompletion {
@@ -4984,7 +5259,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         let job_id = Uuid::new_v4();
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
@@ -5018,7 +5293,7 @@ mod tests {
             permitted_directories: Vec::new(),
             started_at: 0,
             process_id: 0,
-            yolo: true,
+            permission_mode: config::PermissionMode::Yolo,
         };
         let job_id = Uuid::new_v4();
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
@@ -5241,5 +5516,130 @@ mod tests {
         reap_jobs();
 
         assert!(!jobs().lock().unwrap().jobs.contains_key(&job_id));
+    }
+
+    fn run_git_fixture(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+    }
+
+    #[tokio::test]
+    async fn agent_git_fetch_skips_the_local_console() {
+        let repo = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        run_git_fixture(remote.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(repo.path(), &["init", "--quiet"]);
+        run_git_fixture(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        let cwd = config::canonical_directory(repo.path()).unwrap();
+        let session = config::Session {
+            id: "agent-git-fetch".to_owned(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let result = git_fetch(
+            &json!({"session_id": "agent-git-fetch", "cwd": cwd}),
+            &session,
+        )
+        .await
+        .expect("agent git_fetch must not require a local approval console");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"exit_code\":0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ask_git_fetch_still_fails_closed_without_a_console() {
+        let repo = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        run_git_fixture(remote.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(repo.path(), &["init", "--quiet"]);
+        run_git_fixture(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        let cwd = config::canonical_directory(repo.path()).unwrap();
+        let session = config::Session {
+            id: format!("ask-git-fetch-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Ask,
+        };
+        let error = git_fetch(&json!({"session_id": session.id, "cwd": cwd}), &session)
+            .await
+            .expect_err("ask git_fetch must fail closed without a running console");
+        assert!(
+            error.to_string().contains("not running"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn agent_dev_tool_run_executes_without_a_local_console() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake = fake_dir.path().join("fake-cargo");
+        std::fs::write(&fake, "#!/bin/sh\nprintf 'devtool-ok %s\\n' \"$*\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("dev-tool-agent-{}", Uuid::new_v4());
+        let (sender, _receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime_with_logical_path_and_environment(
+            workspace.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+        let args = json!({
+            "session_id": id,
+            "tool": "cargo",
+            "operation": "check",
+            "args": ["--workspace"]
+        });
+        let result = dev_tool_run_with_executable(&args, &session, Some(&fake))
+            .await
+            .expect("agent dev_tool_run must not require a local approval console");
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(
+            encoded.contains("devtool-ok check --workspace"),
+            "{encoded}"
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn agent_mode_command_remains_sandboxed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = PathBuf::from(format!("/var/tmp/temote-agent-marker-{}", Uuid::new_v4()));
+        let command = vec!["/usr/bin/touch".to_owned(), marker.display().to_string()];
+        let output = run_session_command(
+            &command,
+            workspace.path(),
+            &[workspace.path().to_path_buf()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_ne!(output.status, 0, "sandbox must deny writes outside roots");
+        assert!(!marker.exists());
+        let _ = std::fs::remove_file(&marker);
     }
 }

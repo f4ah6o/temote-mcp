@@ -32,6 +32,8 @@ const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_IMPORTED_AUTH_BYTES: u64 = 1024 * 1024;
 const MAX_LAUNCHER_SYMLINK_HOPS: usize = 16;
 const MAX_LAUNCHER_PATH_STEPS: usize = 256;
+const MAX_PACKAGE_INSTALL_ENTRIES: usize = 64;
+const MAX_PACKAGE_METADATA_BYTES: u64 = 1024 * 1024;
 const AGENT_STATE_DIRECTORY_PREFIX: &str = "temote-mcp-local-agent-";
 const CODEX_PERMISSION_PROFILE_NAME: &str = "temote_local_agent";
 
@@ -412,6 +414,8 @@ pub(crate) struct PreparedRun {
     executable_target: PathBuf,
     dependency_symlinks: Vec<sandbox::LocalAgentSymlink>,
     dependency_directories: Vec<PathBuf>,
+    dependency_roots: Vec<PathBuf>,
+    dependency_files: Vec<PathBuf>,
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
     task: String,
@@ -496,12 +500,20 @@ impl PreparedRun {
             "local agent executable target changed while approval was pending"
         );
         anyhow::ensure!(
+            executable.dependency_roots == self.dependency_roots,
+            "local agent launcher dependency roots changed while approval was pending"
+        );
+        anyhow::ensure!(
             executable.symlinks == self.dependency_symlinks,
             "local agent launcher symlinks changed while approval was pending"
         );
         anyhow::ensure!(
             executable.directories == self.dependency_directories,
             "local agent launcher directories changed while approval was pending"
+        );
+        anyhow::ensure!(
+            executable.files == self.dependency_files,
+            "local agent launcher files changed while approval was pending"
         );
         let current_roots = canonical_session_roots(session)?;
         anyhow::ensure!(
@@ -576,6 +588,9 @@ where
 
     let mut environment = filtered_environment()?;
     let executable = resolve(agent, &environment, session)?;
+    for (name, value) in &executable.environment {
+        environment.insert(name.clone(), value.clone());
+    }
     let source_home = environment
         .get("HOME")
         .map(PathBuf::from)
@@ -643,6 +658,8 @@ where
         executable_target,
         dependency_symlinks: executable.symlinks,
         dependency_directories: executable.directories,
+        dependency_roots: executable.dependency_roots,
+        dependency_files: executable.files,
         environment,
         session_roots: canonical_session_roots(session)?,
         task: task.to_owned(),
@@ -681,6 +698,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
             read_only_roots: &read_only_roots,
             read_only_symlinks: &prepared.dependency_symlinks,
             read_only_scaffold_directories: &prepared.dependency_directories,
+            read_only_files: &prepared.dependency_files,
             hidden_roots: prepared.state.hidden_roots(),
         },
         stdin,
@@ -701,7 +719,7 @@ fn executable_read_only_roots(prepared: &PreparedRun) -> Result<Vec<PathBuf>> {
         .executable_target
         .parent()
         .context("local agent executable target has no parent")?;
-    [runtime_parent, target_parent]
+    let mut roots = [runtime_parent, target_parent]
         .into_iter()
         .map(|path| {
             fs::canonicalize(path).with_context(|| {
@@ -711,7 +729,9 @@ fn executable_read_only_roots(prepared: &PreparedRun) -> Result<Vec<PathBuf>> {
                 )
             })
         })
-        .collect::<Result<Vec<_>>>()
+        .collect::<Result<Vec<_>>>()?;
+    roots.extend(prepared.dependency_roots.iter().cloned());
+    Ok(roots)
 }
 
 fn required_string<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
@@ -772,7 +792,7 @@ fn validate_text_argument(value: &str, name: &str, maximum: usize) -> Result<()>
     Ok(())
 }
 
-fn resolve_cwd(session: &config::Session, path: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn resolve_cwd(session: &config::Session, path: Option<&Path>) -> Result<PathBuf> {
     let candidate = path
         .map(|path| {
             if path.is_absolute() {
@@ -862,7 +882,7 @@ fn is_protected_metadata_location(path: &Path) -> bool {
     })
 }
 
-fn filtered_environment() -> Result<HashMap<String, String>> {
+pub(crate) fn filtered_environment() -> Result<HashMap<String, String>> {
     let captured = approvals::CapturedStartEnvironment::capture();
     captured.validate()?;
     filtered_environment_values(captured.values())
@@ -911,14 +931,20 @@ fn filtered_environment_values(
 struct ResolvedExecutable {
     runtime: PathBuf,
     canonical: PathBuf,
+    dependency_roots: Vec<PathBuf>,
     symlinks: Vec<sandbox::LocalAgentSymlink>,
     directories: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    environment: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
 struct LauncherDependencyClosure {
+    dependency_roots: Vec<PathBuf>,
     symlinks: Vec<sandbox::LocalAgentSymlink>,
     directories: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    environment: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -972,8 +998,11 @@ fn resolve_executable_details(
         return Ok(ResolvedExecutable {
             runtime: candidate,
             canonical,
+            dependency_roots: closure.dependency_roots,
             symlinks: closure.symlinks,
             directories: closure.directories,
+            files: closure.files,
+            environment: closure.environment,
         });
     }
     anyhow::bail!(
@@ -1037,12 +1066,15 @@ fn resolve_explicit_executable(
     Ok(ResolvedExecutable {
         runtime: executable.to_owned(),
         canonical,
+        dependency_roots: closure.dependency_roots,
         symlinks: closure.symlinks,
         directories: closure.directories,
+        files: closure.files,
+        environment: closure.environment,
     })
 }
 
-fn launcher_dependency_closure(
+fn launcher_path_graph(
     runtime: &Path,
     canonical: &Path,
     session_roots: &[PathBuf],
@@ -1117,8 +1149,11 @@ fn launcher_dependency_closure(
     directories.sort();
     directories.dedup();
     Ok(LauncherDependencyClosure {
+        dependency_roots: Vec::new(),
         symlinks,
         directories,
+        files: Vec::new(),
+        environment: Vec::new(),
     })
 }
 
@@ -1277,8 +1312,11 @@ fn launcher_symlink_chain(runtime: &Path, canonical: &Path) -> Result<LauncherDe
         symlinks.push(sandbox::LocalAgentSymlink { link, target });
     }
     Ok(LauncherDependencyClosure {
+        dependency_roots: Vec::new(),
         symlinks,
         directories,
+        files: Vec::new(),
+        environment: Vec::new(),
     })
 }
 
@@ -1290,8 +1328,366 @@ fn launcher_symlink_chain(runtime: &Path, canonical: &Path) -> Result<LauncherDe
         runtime.display()
     );
     Ok(LauncherDependencyClosure {
+        dependency_roots: Vec::new(),
         symlinks: Vec::new(),
         directories: Vec::new(),
+        files: Vec::new(),
+        environment: Vec::new(),
+    })
+}
+
+fn launcher_dependency_closure(
+    runtime: &Path,
+    canonical: &Path,
+    session_roots: &[PathBuf],
+) -> Result<LauncherDependencyClosure> {
+    let metadata = fs::symlink_metadata(runtime).with_context(|| {
+        format!(
+            "could not inspect local agent launcher {}",
+            runtime.display()
+        )
+    })?;
+    let graph = launcher_path_graph(runtime, canonical, session_roots)?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(graph);
+    }
+
+    let mut current = runtime.to_owned();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut hop_parents = Vec::new();
+    for _ in 0..MAX_LAUNCHER_SYMLINK_HOPS {
+        if !seen.insert(current.clone()) {
+            anyhow::bail!(
+                "local agent launcher dependency cycle at {}",
+                current.display()
+            );
+        }
+        let metadata = fs::symlink_metadata(&current).with_context(|| {
+            format!(
+                "could not inspect local agent launcher hop {}",
+                current.display()
+            )
+        })?;
+        if !metadata.file_type().is_symlink() {
+            break;
+        }
+        let parent = current
+            .parent()
+            .context("local agent launcher symlink has no parent")?;
+        hop_parents.push(parent.to_owned());
+        let target = fs::read_link(&current).with_context(|| {
+            format!(
+                "could not read local agent launcher symlink {}",
+                current.display()
+            )
+        })?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            parent.join(target)
+        };
+    }
+    anyhow::ensure!(
+        seen.len() < MAX_LAUNCHER_SYMLINK_HOPS,
+        "local agent launcher dependency chain exceeds {} symlink hops",
+        MAX_LAUNCHER_SYMLINK_HOPS
+    );
+
+    // Vite+ resolves its managed command from the parent of the PATH bin
+    // directory. Require the complete, bounded Codex layout before exposing it.
+    let Some(bin) = runtime.parent() else {
+        return Ok(graph);
+    };
+    let Some(vite_home) = bin.parent() else {
+        return Ok(graph);
+    };
+    let Ok(canonical_home) = fs::canonicalize(vite_home) else {
+        return Ok(graph);
+    };
+    if !hop_parents.iter().any(|parent| parent == bin) || !canonical.starts_with(&canonical_home) {
+        return Ok(graph);
+    }
+    let metadata_path = vite_home.join("packages/@openai/codex.json");
+    let package_root = vite_home.join("packages/@openai/codex");
+    let managed_runtime = vite_home.join("js_runtime");
+    if !metadata_path.exists() && !package_root.exists() && !managed_runtime.exists() {
+        return Ok(graph);
+    }
+    let metadata = fs::symlink_metadata(&metadata_path).with_context(|| {
+        format!(
+            "Vite+ Codex launcher metadata is missing: {}",
+            metadata_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "Vite+ Codex launcher metadata is not a regular file: {}",
+        metadata_path.display()
+    );
+    anyhow::ensure!(
+        fs::metadata(&metadata_path)?.len() <= MAX_PACKAGE_METADATA_BYTES,
+        "Vite+ Codex launcher metadata exceeds {MAX_PACKAGE_METADATA_BYTES} bytes: {}",
+        metadata_path.display()
+    );
+    let canonical_metadata_path = fs::canonicalize(&metadata_path).with_context(|| {
+        format!(
+            "could not resolve Vite+ Codex launcher metadata {}",
+            metadata_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_metadata_path.starts_with(&canonical_home),
+        "Vite+ Codex launcher metadata resolves outside VP_HOME: {}",
+        canonical_metadata_path.display()
+    );
+    let mut files = vec![canonical_metadata_path];
+    let bin_metadata_path = vite_home.join("bins/codex.json");
+    match fs::symlink_metadata(&bin_metadata_path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "Vite+ Codex binary metadata is not a regular file: {}",
+                bin_metadata_path.display()
+            );
+            anyhow::ensure!(
+                metadata.len() <= MAX_PACKAGE_METADATA_BYTES,
+                "Vite+ Codex binary metadata exceeds {MAX_PACKAGE_METADATA_BYTES} bytes: {}",
+                bin_metadata_path.display()
+            );
+            let canonical_bin_metadata =
+                fs::canonicalize(&bin_metadata_path).with_context(|| {
+                    format!(
+                        "could not resolve Vite+ Codex binary metadata {}",
+                        bin_metadata_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                canonical_bin_metadata.starts_with(&canonical_home),
+                "Vite+ Codex binary metadata resolves outside VP_HOME: {}",
+                canonical_bin_metadata.display()
+            );
+            files.push(canonical_bin_metadata);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect Vite+ Codex binary metadata {}",
+                    bin_metadata_path.display()
+                )
+            });
+        }
+    }
+    anyhow::ensure!(
+        package_root.is_dir(),
+        "Vite+ Codex package store is missing: {}",
+        package_root.display()
+    );
+    anyhow::ensure!(
+        managed_runtime.is_dir(),
+        "Vite+ managed runtime is missing: {}",
+        managed_runtime.display()
+    );
+
+    let canonical_package_root = fs::canonicalize(&package_root).with_context(|| {
+        format!(
+            "could not resolve Vite+ Codex package store {}",
+            package_root.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_package_root.starts_with(&canonical_home),
+        "Vite+ Codex package store resolves outside VP_HOME: {}",
+        canonical_package_root.display()
+    );
+
+    // Vite+ has used both an install-id directory below the package store and
+    // a flattened package root. Recognize only the two bounded layouts; do
+    // not treat arbitrary package-store directories as dependencies.
+    let direct_package_runtime = package_root.join("lib/node_modules/@openai/codex/bin/codex.js");
+    let direct_layout = fs::symlink_metadata(&direct_package_runtime)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false);
+    let install = if direct_layout {
+        let mut entry_count = 0usize;
+        let mut has_bin = false;
+        let mut has_lib = false;
+        for entry in fs::read_dir(&package_root).with_context(|| {
+            format!(
+                "could not inspect Vite+ Codex package store {}",
+                package_root.display()
+            )
+        })? {
+            entry_count = entry_count
+                .checked_add(1)
+                .context("Vite+ Codex package store entry count overflow")?;
+            anyhow::ensure!(
+                entry_count <= MAX_PACKAGE_INSTALL_ENTRIES,
+                "Vite+ Codex package store has too many entries"
+            );
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            match entry.file_name().to_str() {
+                Some("bin") => has_bin = true,
+                Some("lib") => has_lib = true,
+                _ => anyhow::bail!(
+                    "Vite+ Codex flat package store has an unexpected directory: {}",
+                    entry.path().display()
+                ),
+            }
+        }
+        anyhow::ensure!(
+            has_bin && has_lib,
+            "Vite+ Codex flat package store is missing bin or lib"
+        );
+        for directory in [package_root.join("bin"), package_root.join("lib")] {
+            let metadata = fs::symlink_metadata(&directory)?;
+            anyhow::ensure!(
+                metadata.file_type().is_dir(),
+                "Vite+ Codex flat package store directory is not a normal directory: {}",
+                directory.display()
+            );
+            anyhow::ensure!(
+                fs::canonicalize(&directory)?.starts_with(&canonical_package_root),
+                "Vite+ Codex flat package store directory escapes its root: {}",
+                directory.display()
+            );
+        }
+        canonical_package_root.clone()
+    } else {
+        let mut installs = Vec::new();
+        for entry in fs::read_dir(&package_root).with_context(|| {
+            format!(
+                "could not inspect Vite+ Codex package store {}",
+                package_root.display()
+            )
+        })? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if installs.len() >= MAX_PACKAGE_INSTALL_ENTRIES {
+                anyhow::bail!("Vite+ Codex package store has too many installs");
+            }
+            installs.push(entry.path());
+        }
+        anyhow::ensure!(
+            installs.len() == 1,
+            "Vite+ Codex package store must contain exactly one verified install"
+        );
+        fs::canonicalize(&installs[0]).with_context(|| {
+            format!(
+                "could not resolve Vite+ Codex install {}",
+                installs[0].display()
+            )
+        })?
+    };
+    anyhow::ensure!(
+        install.starts_with(&canonical_package_root),
+        "Vite+ Codex install resolves outside its package store: {}",
+        install.display()
+    );
+    let canonical_runtime = fs::canonicalize(&managed_runtime).with_context(|| {
+        format!(
+            "could not resolve Vite+ managed runtime {}",
+            managed_runtime.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_runtime.starts_with(&canonical_home),
+        "Vite+ managed runtime resolves outside VP_HOME: {}",
+        canonical_runtime.display()
+    );
+    let package_runtime = install.join("lib/node_modules/@openai/codex/bin/codex.js");
+    anyhow::ensure!(
+        fs::symlink_metadata(&package_runtime)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false),
+        "Vite+ Codex package runtime is missing or not a regular file: {}",
+        package_runtime.display()
+    );
+    let canonical_package_runtime = fs::canonicalize(&package_runtime).with_context(|| {
+        format!(
+            "could not resolve Vite+ Codex package runtime {}",
+            package_runtime.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_package_runtime.starts_with(&install),
+        "Vite+ Codex package runtime resolves outside its install: {}",
+        canonical_package_runtime.display()
+    );
+
+    // Do not expose all of VP_HOME: only the launcher directory, selected
+    // package install, and managed runtime are needed by the verified layout.
+    let launcher_parent = fs::canonicalize(
+        runtime
+            .parent()
+            .context("local agent launcher has no parent")?,
+    )?;
+    let roots = vec![
+        launcher_parent,
+        canonical_package_root,
+        install,
+        canonical_runtime,
+    ];
+    for root in &roots {
+        anyhow::ensure!(
+            !session_roots
+                .iter()
+                .any(|session| *root == *session || root.starts_with(session)),
+            "local agent launcher dependency is inside a permitted session root: {}",
+            root.display()
+        );
+    }
+    for file in &files {
+        anyhow::ensure!(
+            !session_roots
+                .iter()
+                .any(|session| *file == *session || file.starts_with(session)),
+            "local agent launcher metadata is inside a permitted session root: {}",
+            file.display()
+        );
+    }
+    files.sort();
+    files.dedup();
+    // Vite+ launchers resolve through a bounded `current` symlink that lives
+    // beside the exposed `bin` directory. Recreate only the intermediate
+    // symlinks that are not already carried by a dependency root, and only
+    // when their verified target stays inside VP_HOME.
+    let mut symlinks = graph.symlinks;
+    let mut directories = graph.directories;
+    symlinks.retain(|symlink| !roots.iter().any(|root| symlink.link.starts_with(root)));
+    directories.retain(|directory| {
+        !roots
+            .iter()
+            .any(|root| directory.starts_with(root) || root.starts_with(directory))
+    });
+    for symlink in &symlinks {
+        anyhow::ensure!(
+            symlink.target.starts_with(&canonical_home),
+            "local agent launcher symlink resolves outside VP_HOME: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            !session_roots
+                .iter()
+                .any(|session| symlink.target == *session || symlink.target.starts_with(session)),
+            "local agent launcher symlink target is inside a permitted session root: {}",
+            symlink.target.display()
+        );
+    }
+    Ok(LauncherDependencyClosure {
+        dependency_roots: roots,
+        symlinks,
+        directories,
+        files,
+        environment: vec![(
+            "VP_HOME".to_owned(),
+            canonical_home.to_string_lossy().into_owned(),
+        )],
     })
 }
 
@@ -1566,7 +1962,7 @@ mod tests {
             permitted_directories: vec![root],
             started_at: 0,
             process_id: 0,
-            yolo: false,
+            permission_mode: config::PermissionMode::Ask,
         }
     }
 
@@ -1599,7 +1995,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let mut session = session(root.path());
-        session.yolo = true;
+        session.permission_mode = config::PermissionMode::Yolo;
         let mut value = args("codex", "workspace_write");
         value["cwd"] = Value::String(outside.path().to_string_lossy().into_owned());
         assert!(resolve_cwd(&session, Some(Path::new(value["cwd"].as_str().unwrap()))).is_err());
@@ -1675,6 +2071,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn codex_task_is_delivered_exactly_over_stdin() -> Result<()> {
+        #[cfg(target_os = "macos")]
+        if running_inside_non_nestable_macos_sandbox() {
+            return Ok(());
+        }
         let root = tempfile::tempdir().unwrap();
         let state = AgentState::create(Agent::Codex, &[]).unwrap();
         let task = "x".repeat(MAX_TASK_BYTES);
@@ -1685,11 +2085,14 @@ mod tests {
             cwd: root.path().canonicalize().unwrap(),
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "wc -c".to_owned()],
             executable_target: PathBuf::from("/bin/sh"),
+            dependency_roots: Vec::new(),
             dependency_symlinks: Vec::new(),
             dependency_directories: Vec::new(),
+            dependency_files: Vec::new(),
             environment: {
                 let mut environment = HashMap::new();
                 state.apply_to_environment(Agent::Codex, &mut environment);
+                environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
                 environment
             },
             session_roots: Vec::new(),
@@ -1833,8 +2236,10 @@ mod tests {
             cwd: PathBuf::from("/workspace"),
             command: vec!["/usr/bin/codex".to_owned()],
             executable_target: PathBuf::from("/usr/bin/codex"),
+            dependency_roots: Vec::new(),
             dependency_symlinks: Vec::new(),
             dependency_directories: Vec::new(),
+            dependency_files: Vec::new(),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             session_roots: Vec::new(),
             task: String::new(),
@@ -2037,8 +2442,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn output_uses_the_shared_bounded_capture() {
+        #[cfg(target_os = "macos")]
+        if running_inside_non_nestable_macos_sandbox() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let state = AgentState::create(Agent::Codex, &[]).unwrap();
+        let output_fixture = root.path().join("output-fixture");
+        fs::write(
+            &output_fixture,
+            vec![b'x'; sandbox::MAX_COMMAND_OUTPUT_BYTES + 1],
+        )
+        .unwrap();
         let prepared = PreparedRun {
             agent: Agent::Codex,
             access: Access::ReadOnly,
@@ -2047,7 +2462,7 @@ mod tests {
                 "/usr/bin/head".to_owned(),
                 "-c".to_owned(),
                 (sandbox::MAX_COMMAND_OUTPUT_BYTES + 1).to_string(),
-                "/dev/zero".to_owned(),
+                output_fixture.to_string_lossy().into_owned(),
             ],
             environment: HashMap::from([
                 (
@@ -2057,8 +2472,10 @@ mod tests {
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ]),
             executable_target: PathBuf::from("/usr/bin/head"),
+            dependency_roots: Vec::new(),
             dependency_symlinks: Vec::new(),
             dependency_directories: Vec::new(),
+            dependency_files: Vec::new(),
             session_roots: Vec::new(),
             task: String::new(),
             task_bytes: 0,
@@ -2075,9 +2492,7 @@ mod tests {
     #[tokio::test]
     async fn local_agent_workspace_visibility_and_write_scope_is_limited_to_selected_cwd() {
         #[cfg(target_os = "macos")]
-        if std::env::var_os("NIX_BUILD_TOP").is_some()
-            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
-        {
+        if running_inside_non_nestable_macos_sandbox() {
             return;
         }
         let fixture_parent_path = std::env::var_os("HOME")
@@ -2146,8 +2561,10 @@ mod tests {
                 access,
                 cwd: selected.canonicalize().unwrap(),
                 executable_target: executable.canonicalize().unwrap(),
+                dependency_roots: Vec::new(),
                 dependency_symlinks: Vec::new(),
                 dependency_directories: Vec::new(),
+                dependency_files: Vec::new(),
                 environment,
                 session_roots: vec![
                     root_a.path().canonicalize().unwrap(),
@@ -2230,8 +2647,10 @@ mod tests {
             cwd: workspace.canonicalize()?,
             command: vec![bin.join("codex").to_string_lossy().into_owned()],
             executable_target: target,
+            dependency_roots: Vec::new(),
             dependency_symlinks,
             dependency_directories: Vec::new(),
+            dependency_files: Vec::new(),
             environment,
             session_roots: Vec::new(),
             task: "test".to_owned(),
@@ -2301,8 +2720,10 @@ mod tests {
             cwd: workspace.canonicalize()?,
             command: vec![bin.join("codex").to_string_lossy().into_owned()],
             executable_target: target,
+            dependency_roots: Vec::new(),
             dependency_symlinks,
             dependency_directories: closure.directories,
+            dependency_files: closure.files,
             environment,
             session_roots: Vec::new(),
             task: "test".to_owned(),
@@ -2435,6 +2856,60 @@ mod tests {
         assert!(error.to_string().contains("launcher symlinks changed"));
     }
 
+    struct VitePlusFixture {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        workspace: PathBuf,
+        candidate: PathBuf,
+        target: PathBuf,
+        package_store: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn vite_plus_shaped_fixture() -> VitePlusFixture {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let bin = home.join("bin");
+        let version_bin = home.join("0.2.9/bin");
+        let package_store = home.join("packages/@openai/codex/install");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&version_bin).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(package_store.join("bin")).unwrap();
+        fs::create_dir_all(package_store.join("lib/node_modules/@openai/codex/bin")).unwrap();
+        fs::create_dir_all(home.join("js_runtime")).unwrap();
+        fs::create_dir_all(home.join("bins")).unwrap();
+
+        let target = version_bin.join("vp");
+        make_executable_with_contents(&target, "#!/bin/sh\nexit 0\n");
+        symlink(Path::new("../current/bin/vp"), bin.join("codex")).unwrap();
+        symlink(Path::new("0.2.9"), home.join("current")).unwrap();
+        symlink(
+            Path::new("../lib/node_modules/@openai/codex/bin/codex.js"),
+            package_store.join("bin/codex"),
+        )
+        .unwrap();
+        fs::write(
+            package_store.join("lib/node_modules/@openai/codex/bin/codex.js"),
+            b"// package runtime\n",
+        )
+        .unwrap();
+        fs::write(home.join("packages/@openai/codex.json"), b"{}\n").unwrap();
+        fs::write(home.join("bins/codex.json"), b"{}\n").unwrap();
+
+        VitePlusFixture {
+            _root: root,
+            home,
+            workspace,
+            candidate: bin.join("codex"),
+            target,
+            package_store,
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn approval_revalidation_rejects_a_changed_launcher_directory_graph() {
@@ -2490,6 +2965,68 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn vite_plus_shaped_launcher_resolves_through_current_symlink() {
+        let fixture = vite_plus_shaped_fixture();
+        let session = session(&fixture.workspace);
+        let environment = HashMap::from([
+            (
+                "HOME".to_owned(),
+                fixture.home.to_string_lossy().into_owned(),
+            ),
+            (
+                "PATH".to_owned(),
+                fixture.home.join("bin").to_string_lossy().into_owned(),
+            ),
+        ]);
+
+        let resolved = resolve_executable_details(Agent::Codex, &environment, &session).unwrap();
+        assert_eq!(resolved.runtime, fixture.candidate);
+        assert_eq!(
+            resolved.canonical,
+            fs::canonicalize(&fixture.target).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_flat_package_layout_is_verified() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = vite_plus_shaped_fixture();
+        let package_root = fixture.home.join("packages/@openai/codex");
+        fs::remove_dir_all(&package_root).unwrap();
+        fs::create_dir_all(package_root.join("bin")).unwrap();
+        fs::create_dir_all(package_root.join("lib/node_modules/@openai/codex/bin")).unwrap();
+        symlink(
+            Path::new("../lib/node_modules/@openai/codex/bin/codex.js"),
+            package_root.join("bin/codex"),
+        )
+        .unwrap();
+        fs::write(
+            package_root.join("lib/node_modules/@openai/codex/bin/codex.js"),
+            b"// package runtime\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.canonical,
+            fs::canonicalize(&fixture.target).unwrap()
+        );
+        assert!(
+            resolved
+                .dependency_roots
+                .contains(&fs::canonicalize(fixture.home.join("packages/@openai/codex")).unwrap())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn launcher_dependency_walk_allows_revisiting_a_directory_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -2516,6 +3053,47 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn vite_plus_launcher_reports_missing_managed_dependency() {
+        let fixture = vite_plus_shaped_fixture();
+        fs::remove_file(fixture.home.join("packages/@openai/codex.json")).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("launcher metadata is missing"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_launcher_reports_missing_package_runtime_and_managed_runtime() {
+        let fixture = vite_plus_shaped_fixture();
+        let package_runtime = fixture
+            .package_store
+            .join("lib/node_modules/@openai/codex/bin/codex.js");
+        fs::remove_file(&package_runtime).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("package runtime is missing"));
+
+        let fixture = vite_plus_shaped_fixture();
+        fs::remove_dir(fixture.home.join("js_runtime")).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("managed runtime is missing"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn launcher_dependency_walk_rejects_cycles_and_excessive_hops() {
         use std::os::unix::fs::symlink;
 
@@ -2537,5 +3115,179 @@ mod tests {
         symlink(fixture.path().join("hop-0"), &first).unwrap();
         let error = launcher_dependency_closure(&first, Path::new("/tmp/target"), &[]).unwrap_err();
         assert!(error.to_string().contains("exceeds 16 symlink hops"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_launcher_rejects_dependency_paths_outside_vp_home() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = vite_plus_shaped_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let package_root = fixture.home.join("packages/@openai/codex");
+        fs::remove_dir_all(&package_root).unwrap();
+        fs::create_dir_all(
+            outside
+                .path()
+                .join("install/lib/node_modules/@openai/codex/bin"),
+        )
+        .unwrap();
+        fs::write(
+            outside
+                .path()
+                .join("install/lib/node_modules/@openai/codex/bin/codex.js"),
+            b"// outside package runtime\n",
+        )
+        .unwrap();
+        symlink(outside.path(), &package_root).unwrap();
+        let error = resolve_explicit_executable(
+            Agent::Codex,
+            &fixture.candidate,
+            &session(&fixture.workspace),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("resolves outside VP_HOME"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_shaped_launcher_exposes_verified_dependency_closure() {
+        let fixture = vite_plus_shaped_fixture();
+        let session = session(&fixture.workspace);
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &fixture.candidate)
+                .unwrap();
+
+        let roots = executable_read_only_roots(&prepared).unwrap();
+        let canonical_bin = fs::canonicalize(fixture.home.join("bin")).unwrap();
+        let canonical_version_bin = fs::canonicalize(fixture.home.join("0.2.9/bin")).unwrap();
+        assert!(roots.contains(&canonical_bin));
+        assert!(roots.contains(&canonical_version_bin));
+        assert!(
+            roots.contains(&fs::canonicalize(fixture.home.join("packages/@openai/codex")).unwrap())
+        );
+        assert!(roots.contains(&fs::canonicalize(fixture.home.join("js_runtime")).unwrap()));
+        assert!(prepared.environment.contains_key("VP_HOME"));
+        assert!(prepared.dependency_files.contains(
+            &fs::canonicalize(fixture.home.join("packages/@openai/codex.json")).unwrap()
+        ));
+        assert!(
+            prepared
+                .dependency_files
+                .contains(&fs::canonicalize(fixture.home.join("bins/codex.json")).unwrap())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_shaped_launcher_exposes_only_the_verified_symlink_chain() {
+        let fixture = vite_plus_shaped_fixture();
+        let canonical_home = fs::canonicalize(&fixture.home).unwrap();
+        // Unrelated package-manager state exists before resolution and must
+        // never enter the symlink closure.
+        let unrelated = fixture.home.join("node_modules/unrelated");
+        fs::create_dir_all(&unrelated).unwrap();
+
+        let session = session(&fixture.workspace);
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &fixture.candidate)
+                .unwrap();
+
+        let expected = sandbox::LocalAgentSymlink {
+            link: canonical_home.join("current"),
+            target: fs::canonicalize(fixture.home.join("0.2.9")).unwrap(),
+        };
+        assert_eq!(prepared.dependency_symlinks, vec![expected]);
+        // The launcher symlink itself is already carried by the bound `bin`
+        // directory, so it must not be recreated separately.
+        assert!(
+            !prepared
+                .dependency_symlinks
+                .iter()
+                .any(|symlink| symlink.link == fixture.candidate)
+        );
+        let exposes_unrelated = prepared.dependency_symlinks.iter().any(|symlink| {
+            symlink
+                .link
+                .starts_with(canonical_home.join("node_modules"))
+        });
+        assert!(!exposes_unrelated);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn vite_plus_launcher_reads_verified_inputs_in_local_agent_sandbox() {
+        #[cfg(target_os = "macos")]
+        if running_inside_non_nestable_macos_sandbox() {
+            return;
+        }
+        let fixture = vite_plus_shaped_fixture();
+        let store_file = fixture
+            .package_store
+            .join("lib/node_modules/@openai/codex/bin/codex.js");
+        let binary_metadata_file = fixture.home.join("bins/codex.json");
+        let unrelated_metadata_file = fixture.home.join("bins/unrelated.json");
+        fs::write(&unrelated_metadata_file, b"must remain hidden\n").unwrap();
+        let managed_runtime_file = fixture.home.join("js_runtime/runtime");
+        fs::write(&managed_runtime_file, b"managed runtime\n").unwrap();
+        let script = format!(
+            "#!/bin/sh\nset -eu\nif [ ! -r \"{}\" ]; then\n  echo 'package store is not visible' >&2\n  exit 1\nfi\nif [ ! -r \"{}\" ]; then\n  echo 'binary metadata is not visible' >&2\n  exit 1\nfi\nif [ -e \"{}\" ]; then\n  echo 'unrelated metadata is visible' >&2\n  exit 1\nfi\nif [ ! -r \"{}\" ]; then\n  echo 'managed runtime is not visible' >&2\n  exit 1\nfi\nexit 0\n",
+            store_file.display(),
+            binary_metadata_file.display(),
+            unrelated_metadata_file.display(),
+            managed_runtime_file.display()
+        );
+        make_executable_with_contents(&fixture.target, &script);
+
+        let session = session(&fixture.workspace);
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &fixture.candidate)
+                .unwrap();
+        let output = run(prepared).await.unwrap();
+        assert_eq!(
+            output.status, 0,
+            "expected the launcher to read its package store through the sandbox: {}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vite_plus_launcher_does_not_expose_unrelated_package_manager_state() {
+        let fixture = vite_plus_shaped_fixture();
+        let unrelated = fixture.home.join("node_modules/unrelated/package.json");
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&unrelated, b"hidden\n").unwrap();
+
+        let prepared = prepare_with_executable(
+            &args("codex", "read_only"),
+            &session(&fixture.workspace),
+            &fixture.candidate,
+        )
+        .unwrap();
+        let roots = executable_read_only_roots(&prepared).unwrap();
+        let unrelated = fs::canonicalize(unrelated.parent().unwrap()).unwrap();
+        assert!(
+            !roots
+                .iter()
+                .any(|root| unrelated == *root || unrelated.starts_with(root))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running_inside_non_nestable_macos_sandbox() -> bool {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
+        {
+            return true;
+        }
+
+        // A developer broker may sandbox the test process already. macOS
+        // rejects a nested Seatbelt launch with status 71 in that case.
+        std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1) (allow default)", "--", "/usr/bin/true"])
+            .status()
+            .map(|status| status.code() == Some(71))
+            .unwrap_or(false)
     }
 }

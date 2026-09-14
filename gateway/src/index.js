@@ -45,6 +45,7 @@ const MAX_LOG_FIELD_CHARS = 256;
 const MAX_RPC_METHOD_BYTES = 256;
 const MAX_RPC_ID_BYTES = 256;
 const MAX_RPC_TOOL_NAME_BYTES = 256;
+const SESSION_AVAILABILITY_VALUES = ["ready", "session_unavailable", "unavailable"];
 const jwksCache = new Map();
 
 export default {
@@ -62,7 +63,12 @@ async function handleRequest(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return withCors(new Response(null, { status: 204 }));
   if (url.pathname === "/healthz") {
-    return withCors(jsonResponse({ status: "ok", service: "temote-mcp-gateway" }));
+    return withCors(jsonResponse({
+      status: "ok",
+      service: "temote-mcp-gateway",
+      readiness: "ready",
+      identity: "temote-mcp-gateway",
+    }));
   }
   if (url.pathname === "/mcp") {
     const identity = await authorizeClient(request, env);
@@ -524,7 +530,7 @@ async function resolveUnqualifiedSession(env, sessionId) {
 
 async function handleHostApi(request, env, action) {
   if (request.method !== "POST") return withCors(new Response(null, { status: 405 }));
-  if (!["connect", "poll", "respond", "disconnect"].includes(action)) {
+  if (!["connect", "poll", "respond", "disconnect", "status"].includes(action)) {
     return withCors(jsonResponse({ error: "not_found" }, 404));
   }
 
@@ -597,12 +603,20 @@ export class GatewaySession {
 
   async status() {
     const host = await this.currentHost();
-    if (!host) return new Response(null, { status: 404 });
+    if (!host) return jsonResponse({ status: "not_registered" }, 404);
     if (!Number.isSafeInteger(host.expires_at) || host.expires_at <= Date.now()) {
       await this.clearHost(host, "host_lease_expired");
-      return new Response(null, { status: 404 });
+      return jsonResponse({ status: "lease_expired" }, 404);
     }
-    return new Response(null, { status: 204 });
+    return jsonResponse({
+      status: "registered",
+      host_id: host.host_id,
+      generation: host.generation,
+      lease: "active",
+      session_availability: SESSION_AVAILABILITY_VALUES.includes(host.session_availability)
+        ? host.session_availability
+        : "not_checked",
+    });
   }
 
   async connect(body) {
@@ -664,9 +678,15 @@ export class GatewaySession {
     const mismatch = verifyGeneration(host, body);
     if (mismatch) return mismatch;
 
+    const availability = normalizeSessionAvailability(body.session_availability);
+    if (availability === null || (availability !== undefined && !host.host_id)) {
+      return jsonResponse({ error: "invalid_session_availability" }, 400);
+    }
+
     const now = Date.now();
     host.last_seen = now;
     host.expires_at = now + HOST_LEASE_MS;
+    if (availability !== undefined) host.session_availability = availability;
     await this.state.storage.put("host", host);
     const registry = await this.upsertRegistry(host);
     if (!registry.ok) {
@@ -980,6 +1000,14 @@ export function validRpcId(value) {
 
 export function validRpcToolName(value) {
   return typeof value === "string" && value.length > 0 && utf8Within(value, MAX_RPC_TOOL_NAME_BYTES);
+}
+
+// Normalizes an optional host-reported session availability value.
+// `undefined` means the field was absent (old agent); `null` means invalid.
+export function normalizeSessionAvailability(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !SESSION_AVAILABILITY_VALUES.includes(value)) return null;
+  return value;
 }
 
 export function validRpcRequestShape(request) {

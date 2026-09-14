@@ -171,6 +171,13 @@ fn build_bwrap_args(
             .filter_map(|symlink| symlink.link.parent().map(Path::to_owned))
             .collect::<Vec<_>>(),
     );
+    symlink_scaffold_paths.extend(
+        policy
+            .read_only_files
+            .iter()
+            .filter_map(|file| file.parent().map(Path::to_owned))
+            .collect::<Vec<_>>(),
+    );
     for symlink in &hidden_symlinks {
         let target = if std::fs::metadata(&symlink.target)
             .map(|metadata| metadata.is_dir())
@@ -197,6 +204,9 @@ fn build_bwrap_args(
     }
     for root in &policy.read_only_roots {
         append_pair(&mut args, "--ro-bind", root, root)?;
+    }
+    for file in &policy.read_only_files {
+        append_pair(&mut args, "--ro-bind", file, file)?;
     }
 
     let mut masked_paths = Vec::new();
@@ -613,16 +623,18 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&temp).unwrap();
         let hidden = root.path().to_path_buf();
-        let scope = crate::sandbox::LocalAgentScope {
-            writable_roots: &[],
-            temporary_roots: std::slice::from_ref(&temp),
-            read_only_paths: &[],
-            read_only_roots: std::slice::from_ref(&workspace),
-            read_only_symlinks: &[],
-            read_only_scaffold_directories: &[],
-            hidden_roots: std::slice::from_ref(&hidden),
-        };
-        let policy = LinuxSandboxPolicy::for_local_agent(&workspace, &scope).unwrap();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            &workspace,
+            &[],
+            std::slice::from_ref(&temp),
+            &[],
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
         let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
 
         assert!(!args.iter().any(|arg| arg == "--unshare-net"));
@@ -664,10 +676,15 @@ mod tests {
         let version = hidden.join("0.3.1");
         let scratch = hidden.join("scratch");
         let current = hidden.join("current");
+        let metadata_file = hidden.join("bins/codex.json");
+        let unrelated_file = hidden.join("bins/unrelated.json");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(version.join("bin")).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir(&scratch).unwrap();
+        std::fs::create_dir_all(metadata_file.parent().unwrap()).unwrap();
+        std::fs::write(&metadata_file, b"verified").unwrap();
+        std::fs::write(&unrelated_file, b"must not be mounted").unwrap();
         std::fs::write(scratch.join("secret"), b"must not be mounted").unwrap();
         std::fs::write(version.join("bin/vp"), b"#!/bin/sh\n").unwrap();
         symlink(Path::new("../current/bin/vp"), bin.join("codex")).unwrap();
@@ -679,16 +696,19 @@ mod tests {
             link: hidden.join("current"),
             target: canonical_version.clone(),
         }];
-        let scope = crate::sandbox::LocalAgentScope {
-            writable_roots: &[],
-            temporary_roots: &[],
-            read_only_paths: &[],
-            read_only_roots: std::slice::from_ref(&bin),
-            read_only_symlinks: &symlinks,
-            read_only_scaffold_directories: std::slice::from_ref(&scratch),
-            hidden_roots: std::slice::from_ref(&hidden),
-        };
-        let policy = LinuxSandboxPolicy::for_local_agent(&workspace, &scope).unwrap();
+        let hidden = std::fs::canonicalize(&hidden).unwrap();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            &workspace,
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&bin),
+            &symlinks,
+            std::slice::from_ref(&scratch),
+            std::slice::from_ref(&metadata_file),
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
         let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
 
         assert!(args.windows(3).any(|window| {
@@ -716,6 +736,19 @@ mod tests {
                 ]
         }));
         assert!(!args.iter().any(|argument| argument == "secret"));
+        assert!(args.windows(3).any(|window| {
+            window
+                == [
+                    "--ro-bind",
+                    metadata_file.to_str().unwrap(),
+                    metadata_file.to_str().unwrap(),
+                ]
+        }));
+        assert!(
+            !args
+                .iter()
+                .any(|argument| argument == unrelated_file.to_str().unwrap())
+        );
         assert!(
             !args
                 .iter()

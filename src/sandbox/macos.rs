@@ -119,6 +119,23 @@ fn build_read_policy(spec: &SandboxSpec) -> Result<(String, Vec<(String, PathBuf
         ));
     }
 
+    for (index, file) in spec.read_only_files().iter().enumerate() {
+        if !spec
+            .hidden_roots()
+            .iter()
+            .any(|hidden| file.starts_with(hidden))
+        {
+            continue;
+        }
+        ensure_utf8(file)?;
+        let key = format!("READ_ONLY_FILE_{index}");
+        definitions.push((key.clone(), file.clone()));
+        clauses.push(format!("(allow file-read* (literal (param \"{key}\")))"));
+        clauses.push(format!(
+            "(allow file-read-metadata (path-ancestors (param \"{key}\")))"
+        ));
+    }
+
     Ok((clauses.join("\n"), definitions))
 }
 
@@ -256,16 +273,18 @@ mod tests {
         std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
 
         let workspace = std::fs::canonicalize(workspace).unwrap();
-        let scope = crate::sandbox::LocalAgentScope {
-            writable_roots: std::slice::from_ref(&workspace),
-            temporary_roots: &[],
-            read_only_paths: &[],
-            read_only_roots: &[],
-            read_only_symlinks: &[],
-            read_only_scaffold_directories: &[],
-            hidden_roots: &[],
-        };
-        let spec = SandboxSpec::local_agent(&workspace, &scope).unwrap();
+        let spec = SandboxSpec::local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
         let (policy, definitions) = build_write_policy(&spec).unwrap();
         let defined_paths = definitions
             .iter()
@@ -298,22 +317,65 @@ mod tests {
         let hidden = std::fs::canonicalize(hidden).unwrap();
         let selected = std::fs::canonicalize(selected).unwrap();
 
-        let scope = crate::sandbox::LocalAgentScope {
-            writable_roots: std::slice::from_ref(&selected),
-            temporary_roots: &[],
-            read_only_paths: &[],
-            read_only_roots: &[],
-            read_only_symlinks: &[],
-            read_only_scaffold_directories: &[],
-            hidden_roots: std::slice::from_ref(&hidden),
-        };
-        let spec = SandboxSpec::local_agent(&selected, &scope).unwrap();
+        let spec = SandboxSpec::local_agent(
+            &selected,
+            std::slice::from_ref(&selected),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
         let (policy, definitions) = build_read_policy(&spec).unwrap();
 
         assert!(definitions.iter().any(|(_, path)| path == &hidden));
         assert!(definitions.iter().any(|(_, path)| path == &selected));
         assert!(policy.contains("(allow file-read-metadata (path-ancestors"));
         assert!(policy.contains("(allow file-read* (subpath"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generated_read_policy_allows_verified_symlink_literals_below_hidden_roots() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let hidden = fixture.path().join("hidden");
+        let home = hidden.join("home");
+        let version = home.join("0.2.9");
+        std::fs::create_dir_all(version.join("bin")).unwrap();
+        symlink(Path::new("0.2.9"), home.join("current")).unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let hidden = std::fs::canonicalize(hidden).unwrap();
+        let current = hidden.join("home/current");
+        let target = std::fs::canonicalize(version).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+
+        let spec = SandboxSpec::local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[crate::sandbox::LocalAgentSymlink {
+                link: current.clone(),
+                target,
+            }],
+            &[],
+            &[],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+        let (policy, definitions) = build_read_policy(&spec).unwrap();
+
+        assert!(definitions.iter().any(|(_, path)| path == &current));
+        assert!(policy.contains("(allow file-read* (literal (param \"READ_ONLY_SYMLINK_0\")))"));
+        assert!(policy.contains("READ_ONLY_SYMLINK_0"));
     }
 
     #[test]

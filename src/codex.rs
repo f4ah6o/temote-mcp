@@ -13,7 +13,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-#[path = "codex_delegation.rs"]
+#[path = "delegation/mod.rs"]
 mod delegation;
 
 const PLUGIN_NAME: &str = "temote-mcp";
@@ -55,6 +55,17 @@ The installed plugin is a thin local router. It pins the exact temote-mcp binary
 that performed the install and does not own session lifecycle, sandbox, approval,\n\
 OAuth, or ingress policy.\n"
         .to_owned()
+}
+
+pub fn run_delegate(args: &[String]) -> Result<String, String> {
+    match args {
+        [command, rest @ ..] if command == "diagnose" => delegation::run_diagnose_cli(rest),
+        _ => delegation::run_generic_cli(args),
+    }
+}
+
+pub fn delegate_usage() -> String {
+    delegation::generic_usage()
 }
 
 fn install_current() -> Result<String, String> {

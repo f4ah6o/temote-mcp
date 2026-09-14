@@ -1,3 +1,7 @@
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,6 +25,9 @@ const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MIN_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_AGENT_PROTOCOL_VERSION: u64 = 1;
 const HOST_CAPABILITIES: &[&str] = &["session_lifecycle", "session_tools", "named_roots"];
+const HOST_AGENT_RECORD_SCHEMA_VERSION: u64 = 1;
+const MAX_HOST_AGENT_RECORD_BYTES: usize = 4096;
+const HOST_AGENT_RECORD_DIRECTORY: &str = "gateway-agents";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -132,6 +139,61 @@ struct HostGenerationRequest<'a> {
     host_id: &'a str,
     instance_id: &'a str,
     generation: u64,
+}
+
+#[derive(Serialize)]
+struct HostPollRequest<'a> {
+    host_id: &'a str,
+    instance_id: &'a str,
+    generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_availability: Option<&'a str>,
+}
+
+/// Bounded, non-secret session availability the host agent reports to the
+/// gateway so a read-only `/v1/hosts/status` read can distinguish a reachable
+/// endpoint with no serviceable session from a healthy one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostSessionAvailability {
+    Ready,
+    SessionUnavailable,
+    Unavailable,
+}
+
+impl HostSessionAvailability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::SessionUnavailable => "session_unavailable",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+fn classify_host_session_availability(statuses: &[&str]) -> HostSessionAvailability {
+    let has_live_session = statuses
+        .iter()
+        .any(|status| matches!(*status, "active" | "starting"));
+    if has_live_session {
+        HostSessionAvailability::Ready
+    } else {
+        HostSessionAvailability::SessionUnavailable
+    }
+}
+
+/// Reads the local supervisor's session inventory read-only. Enumeration
+/// failure is reported as `unavailable`; it is never presented as ready.
+async fn current_host_session_availability() -> HostSessionAvailability {
+    match session_control::request_session_views().await {
+        Ok(views) => {
+            let statuses = views
+                .iter()
+                .map(|view| view.status.as_str())
+                .collect::<Vec<_>>();
+            classify_host_session_availability(&statuses)
+        }
+        Err(_) => HostSessionAvailability::Unavailable,
+    }
 }
 
 #[derive(Deserialize)]
@@ -371,6 +433,12 @@ async fn run_host_agent(
                 metadata.named_roots.join(",")
             }
         );
+        let connection_record =
+            HostAgentConnectionRecordFile::create(&host_id, connection.generation);
+        if let Err(error) = &connection_record {
+            eprintln!("gateway agent connection record unavailable: {error:#}");
+        }
+        let _connection_record = connection_record.ok();
 
         let outcome = tokio::select! {
             result = run_host_generation(
@@ -434,6 +502,133 @@ where
             Ok(true)
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HostAgentConnectionRecord {
+    schema: u64,
+    host_id: String,
+    generation: u64,
+    updated_at: u64,
+}
+
+fn host_agent_record_directory() -> Result<PathBuf> {
+    Ok(config::state_dir()?.join(HOST_AGENT_RECORD_DIRECTORY))
+}
+
+fn host_agent_record_path_in(directory: &Path, host_id: &str) -> Result<PathBuf> {
+    host_identity::validate(host_id)?;
+    Ok(directory.join(format!("{host_id}.json")))
+}
+
+/// Owns the non-secret local record of the active host-level gateway agent
+/// generation. The record lets a local `doctor` distinguish a replaced agent
+/// generation from a healthy one without a remote protocol change. It contains
+/// no credential and is removed when the owning generation ends.
+struct HostAgentConnectionRecordFile {
+    path: PathBuf,
+}
+
+impl HostAgentConnectionRecordFile {
+    fn create(host_id: &str, generation: u64) -> Result<Self> {
+        Self::create_in(&host_agent_record_directory()?, host_id, generation)
+    }
+
+    fn create_in(directory: &Path, host_id: &str, generation: u64) -> Result<Self> {
+        let path = host_agent_record_path_in(directory, host_id)?;
+        std::fs::create_dir_all(directory).with_context(|| {
+            format!(
+                "cannot create gateway agent record directory {}",
+                directory.display()
+            )
+        })?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+        let record = HostAgentConnectionRecord {
+            schema: HOST_AGENT_RECORD_SCHEMA_VERSION,
+            host_id: host_id.to_owned(),
+            generation,
+            updated_at: config::unix_time(),
+        };
+        let bytes = serde_json::to_vec(&record)?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_HOST_AGENT_RECORD_BYTES,
+            "gateway agent record is oversized"
+        );
+        let temporary = directory.join(format!(".{host_id}.{}.tmp", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)
+                .with_context(|| {
+                    format!("cannot create gateway agent record {}", temporary.display())
+                })?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &path).with_context(|| {
+                format!("cannot replace gateway agent record {}", path.display())
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for HostAgentConnectionRecordFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Reads the non-secret generation recorded by the local host-level gateway
+/// agent, if a trusted record exists. Any unsafe or malformed record is treated
+/// as absent rather than as a diagnostic failure.
+pub fn read_host_agent_generation(host_id: &str) -> Option<u64> {
+    let directory = host_agent_record_directory().ok()?;
+    read_host_agent_generation_in(&directory, host_id)
+}
+
+fn read_host_agent_generation_in(directory: &Path, host_id: &str) -> Option<u64> {
+    let path = host_agent_record_path_in(directory, host_id).ok()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    if metadata.len() > MAX_HOST_AGENT_RECORD_BYTES as u64 {
+        return None;
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_HOST_AGENT_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_HOST_AGENT_RECORD_BYTES {
+        return None;
+    }
+    let record: HostAgentConnectionRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.schema != HOST_AGENT_RECORD_SCHEMA_VERSION
+        || record.host_id != host_id
+        || record.generation == 0
+        || record.updated_at == 0
+    {
+        return None;
+    }
+    Some(record.generation)
 }
 
 async fn connect_legacy(
@@ -568,12 +763,14 @@ async fn run_host_generation(
         }
 
         let poll_started = Instant::now();
+        let session_availability = current_host_session_availability().await;
         let response = gateway
             .request(Method::POST, "/v1/hosts/poll", Some(host_id))
-            .json(&HostGenerationRequest {
+            .json(&HostPollRequest {
                 host_id,
                 instance_id,
                 generation,
+                session_availability: Some(session_availability.as_str()),
             })
             .send()
             .await
@@ -887,7 +1084,7 @@ fn append_bounded_body_chunk(
     Ok(())
 }
 
-fn normalize_gateway_url(value: &str) -> Result<String> {
+pub(crate) fn normalize_gateway_url(value: &str) -> Result<String> {
     let parsed = Url::parse(value.trim()).context("gateway URL is invalid")?;
     anyhow::ensure!(
         parsed.username().is_empty()
@@ -1152,6 +1349,51 @@ mod tests {
         assert!(status_named_roots(&json!({})).is_err());
     }
 
+    #[test]
+    fn host_session_availability_classifies_live_inventory_without_paths() {
+        let ready = HostSessionAvailability::Ready;
+        let no_live = HostSessionAvailability::SessionUnavailable;
+        assert_eq!(classify_host_session_availability(&["active"]), ready);
+        assert_eq!(
+            classify_host_session_availability(&["stopped", "starting"]),
+            ready
+        );
+        assert_eq!(
+            classify_host_session_availability(&["stopped", "failed"]),
+            no_live
+        );
+        assert_eq!(classify_host_session_availability(&[]), no_live);
+        assert_eq!(HostSessionAvailability::Ready.as_str(), "ready");
+        assert_eq!(
+            HostSessionAvailability::SessionUnavailable.as_str(),
+            "session_unavailable"
+        );
+        assert_eq!(HostSessionAvailability::Unavailable.as_str(), "unavailable");
+    }
+
+    #[test]
+    fn host_poll_request_serializes_bounded_session_availability() {
+        let payload = serde_json::to_value(HostPollRequest {
+            host_id: "mac-main",
+            instance_id: "instance-a",
+            generation: 2,
+            session_availability: Some("session_unavailable"),
+        })
+        .unwrap();
+        assert_eq!(payload["session_availability"], "session_unavailable");
+        assert_eq!(payload["generation"], 2);
+        assert_eq!(payload["host_id"], "mac-main");
+
+        let omitted = serde_json::to_value(HostPollRequest {
+            host_id: "mac-main",
+            instance_id: "instance-a",
+            generation: 2,
+            session_availability: None,
+        })
+        .unwrap();
+        assert!(omitted.get("session_availability").is_none());
+    }
+
     #[tokio::test]
     async fn gateway_dispatch_preserves_json_rpc_ids_and_errors() {
         let request = json!({
@@ -1162,5 +1404,58 @@ mod tests {
         let response = dispatch_response(&request).await;
         assert_eq!(response["id"], "request-1");
         assert_eq!(response["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn host_agent_connection_record_round_trips_and_is_removed_on_drop() {
+        let state = tempfile::tempdir().unwrap();
+        let host_id = format!("record-{}", Uuid::new_v4().simple());
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+
+        let record = HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 7).unwrap();
+        assert_eq!(
+            read_host_agent_generation_in(state.path(), &host_id),
+            Some(7)
+        );
+        let path = host_agent_record_path_in(state.path(), &host_id).unwrap();
+        assert!(path.is_file());
+
+        drop(record);
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_agent_connection_record_read_rejects_public_mode_and_symlink() {
+        use std::os::unix::fs::symlink;
+
+        fn set_mode(path: &std::path::Path, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let host_id = format!("record-{}", Uuid::new_v4().simple());
+        let record = HostAgentConnectionRecordFile::create_in(state.path(), &host_id, 3).unwrap();
+        let path = host_agent_record_path_in(state.path(), &host_id).unwrap();
+
+        set_mode(&path, 0o644);
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+
+        set_mode(&path, 0o600);
+        drop(record);
+
+        let target = path.with_extension("target");
+        std::fs::write(
+            &target,
+            b"{\"schema\":1,\"host_id\":\"other\",\"generation\":1,\"updated_at\":0}",
+        )
+        .unwrap();
+        set_mode(&target, 0o600);
+        symlink(&target, &path).unwrap();
+        assert_eq!(read_host_agent_generation_in(state.path(), &host_id), None);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&target).unwrap();
     }
 }

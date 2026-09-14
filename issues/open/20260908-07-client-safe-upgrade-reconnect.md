@@ -2,6 +2,143 @@
 
 Date: 2026-09-08
 
+## Implementation status (2026-09-12)
+
+The repository-local boot identity slice is implemented: each Temote process now
+generates one UUID-shaped, non-secret `boot_generation`, and the existing
+`/healthz` response reports it together with the effective `host_id`. This is
+an identity primitive for later reconnect verification only; remote upgrade
+tools, response-flush commit barriers, coordinator ownership, and live
+reconnect acceptance remain unimplemented.
+
+## Implementation status (2026-09-12, coordinator-safe transaction primitives)
+
+The repository-local coordinator/observation core is implemented on top of the
+step-1 schema:
+
+- `upgrade_transaction` exposes a bounded, non-secret `UpgradeTransactionStatus`
+  view (`terminal` flag, versions, host, timestamps, restart/reconnect flags,
+  failure summary) for a reconnect-safe status response.
+- Deterministic selection helpers (`recent_transaction`,
+  `latest_completed_transaction`, `active_transactions`) and
+  `classify_apply` implement retry idempotency (`ExistingActive`),
+  conflicting-active-target rejection (`ConflictActive`), and
+  completed-target no-op (`AlreadyCompleted`).
+- `transaction_lock_is_held` probes the existing owner lock read-only without
+  creating files, and `incomplete_upgrade_transactions` classifies non-terminal
+  transactions with no live owner as stale/incomplete rather than success.
+- `/healthz` now reports `last_upgrade_transaction` (bounded, non-secret,
+  best-effort) in addition to `host_id` and `boot_generation`.
+
+Still unimplemented: the one-shot `upgrade-coordinator` process, the transport
+response-flush commit barrier, the remote `upgrade_preflight` / `upgrade_apply`
+/ `upgrade_status` tools, and the deliberate-disconnect process E2E on macOS and
+Linux.
+
+## Implementation status (2026-09-13, reconnect identity metadata)
+
+The MCP handshake now exposes the same bounded, non-secret process identity that
+`/healthz` already reports, so a reconnecting MCP client can verify the intended
+host, version, and boot generation without an out-of-band health probe:
+
+- `initialize`, `ping`, and `server/discover` include
+  `_meta["io.temote/processIdentity"] = {host_id, version, boot_generation}`.
+- `host_id` is the validated stable host identity (OS-hostname fallback),
+  `version` is the running package version, and `boot_generation` is the existing
+  per-process UUID. All three are non-secret.
+- `modernize_result` now merges the modern `serverInfo` entry into an existing
+  `_meta` object instead of replacing it, so modern `initialize`/`ping` retain the
+  identity field alongside the existing server metadata.
+- This completes the "health/initialize/ping identity metadata" item of the endpoint
+  generation-identity contract. The coordinator process, response-flush commit
+  barrier, remote upgrade tools, and both-platform deliberate-disconnect E2E remain.
+
+## Implementation status (2026-09-13, coordinator-safe transition primitives)
+
+The next repository-local slice adds the coordinator-safe primitives the one-shot
+coordinator will drive:
+
+- `UpgradeTransactionState::can_transition_to` plus an enforcing `set_state`
+  make coordinator progress monotonic (`prepared -> committed ->
+  supervisor_handoff -> sessions_verifying -> ingress_restarting ->
+  endpoint_verifying -> plugin_reconciling -> completed`) while still allowing
+  optional stages to be skipped. Terminal states never transition again.
+- `UpgradeTransaction::mark_failed` / `mark_rolled_back` record deterministic
+  terminal outcomes with the same bounded, NUL-free failure-summary rules as
+  persisted transactions.
+- `UpgradeTransaction::coordinator_phases` derives the ordered post-commit
+  phases from `supervisor_handoff_required` / `ingress_restart_required`.
+- `UpgradeCommitBarrier` / `UpgradeCommitWaiter` replace timing-based ordering:
+  the transport commits only after the `accepted` response is written and
+  flushed, aborts on delivery failure, and a dropped sender fails closed to
+  `Aborted`. Concurrent cloned senders are serialized inside the watch update,
+  so exactly one `commit`/`abort` decision can win. The waiter resolves without
+  any wall-clock sleep.
+
+Remaining: the one-shot upgrade-coordinator process, the response-flush barrier
+wired into the HTTP/MCP transport, the remote upgrade tools, and both-platform
+deliberate-disconnect E2E. The new primitives are not yet wired into the local
+`session_control` upgrade path, so no runtime behavior changes in this slice.
+
+## Implementation status (2026-09-13, coordinator state machine)
+
+The repository-local coordinator state machine is implemented on top of the durable
+transaction schema, still without an OS process wrapper, transport wiring, or remote
+tools:
+
+- `UpgradeCoordinatorExecutor` plus `run_upgrade_coordinator` drive one `prepared`
+  transaction through `coordinator_phases()`.
+- The driver holds the exclusive transaction lock for the whole run, so a second live
+  coordinator fails closed. It refuses a transaction that is not `prepared`.
+- It awaits the existing response-flush `UpgradeCommitBarrier` before any destructive
+  phase. An aborted or lost transport records a terminal `failed` transaction and runs
+  no phase (no timing heuristic).
+- Each phase is persisted before the next begins. A phase may report `Continue`,
+  `Rollback` (terminal `rolled_back`), or an error (terminal `failed` with a bounded
+  non-secret summary), so a crash or failed phase leaves a deterministic non-success
+  state that `incomplete_upgrade_transactions()` reports after reconnect.
+- Deterministic coverage: lost-transport abort with zero phases, ordered completion
+  of every required phase, rollback short-circuit, bounded phase failure,
+  second-owner / non-prepared refusal, and concurrent commit/abort one-shot
+  enforcement.
+
+Still unimplemented: the one-shot `upgrade-coordinator` OS process and its concrete
+executor, transport commit wiring, remote `upgrade_preflight` / `upgrade_apply` /
+`upgrade_status` tools, and the deliberate-disconnect process E2E.
+
+## Implementation status (2026-09-13, persisted apply admission)
+
+The repository-local duplicate/idempotency admission decision over the complete
+persisted transaction set (suggested implementation order step 7) is implemented,
+still without writing transaction state or starting a coordinator:
+
+- `load_transactions` reads the durable transactions bounded by
+  `MAX_UPGRADE_TRANSACTIONS`. Admission fails closed on conflicting durable
+  state: only a record that actually disappeared concurrently
+  (`read_transaction_if_present` returns `None`) is skipped, while an existing
+  malformed, unsafe, or unreadable record returns an error and blocks admission
+  rather than being silently ignored.
+- `admit_apply` decides a requested remote upgrade against that full set. It fails
+  closed whenever more than one non-terminal transaction exists, because only one
+  destructive transaction may own the local runtime at a time, and otherwise
+  delegates to `classify_apply`: a same-target retry is `ExistingActive`, a
+  different active target is `ConflictActive`, an already-completed target is
+  `AlreadyCompleted`, and no durable owner is `StartNew`.
+- `classify_persisted_apply` is the read-only persisted-state entry point; it
+  performs no transaction-state mutation and fails admission on a read error.
+- Deterministic tests cover no-owner `StartNew`, same-target idempotency,
+  conflicting active target, a completed same-target no-op, fail-closed
+  multiple-active state, inclusion of a written transaction in the bounded
+  `load_transactions` scan, fail-closed malformed/unsafe existing records, and
+  tolerant skipping of a missing record.
+
+Not implemented in this slice: creating/persisting the prepared transaction or the
+cross-process admission lock, which belong to the `upgrade_apply` mutation path.
+
+## Implementation status (2026-09-11)
+
+Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.
+
 ## Background
 
 Temote already has a strong local upgrade path from `issues/open/20260902-zero-downtime-supervisor-upgrade.md`:

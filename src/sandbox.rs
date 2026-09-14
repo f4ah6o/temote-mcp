@@ -257,7 +257,19 @@ pub struct LocalAgentScope<'a> {
     /// verified launcher path. Linux recreates these as empty directories;
     /// their host contents are never mounted.
     pub read_only_scaffold_directories: &'a [PathBuf],
+    /// Verified regular files that are needed by a launcher but do not fit
+    /// inside one of its read-only directory roots.
+    pub read_only_files: &'a [PathBuf],
     pub hidden_roots: &'a [PathBuf],
+}
+
+/// Filesystem/network scope for the structured developer-tool broker
+/// (Cargo / Vite+). Writes stay limited to the caller-selected workspace
+/// (implicitly the cwd) plus narrowly scoped tool cache/state roots; the
+/// operation class decides whether outbound network is enabled.
+pub struct DeveloperToolScope<'a> {
+    pub writable_roots: &'a [PathBuf],
+    pub network_access: bool,
 }
 
 pub async fn run(
@@ -289,16 +301,28 @@ pub async fn run_local_agent(
         .with_context(|| format!("cannot resolve local agent cwd {}", cwd.display()))?;
     validate_writable_scope(&cwd, scope.writable_roots)?;
     validate_local_agent_scope(
+        scope.writable_roots,
         scope.temporary_roots,
         scope.read_only_paths,
         scope.read_only_roots,
         scope.read_only_symlinks,
         scope.read_only_scaffold_directories,
+        scope.read_only_files,
         scope.hidden_roots,
     )?;
 
     #[cfg(target_os = "macos")]
-    let spec = policy::SandboxSpec::local_agent(&cwd, &scope)?;
+    let spec = policy::SandboxSpec::local_agent(
+        &cwd,
+        scope.writable_roots,
+        scope.temporary_roots,
+        scope.read_only_paths,
+        scope.read_only_roots,
+        scope.read_only_symlinks,
+        scope.read_only_scaffold_directories,
+        scope.read_only_files,
+        scope.hidden_roots,
+    )?;
 
     #[cfg(target_os = "linux")]
     let mut process = linux::local_agent_command(command, &cwd, &scope)?;
@@ -328,6 +352,60 @@ pub async fn run_local_agent(
     let child = process
         .spawn()
         .context("failed to start bounded local-agent command")?;
+    wait_with_limited_output(child, stdin).await
+}
+
+/// Runs the structured developer-tool profile for Cargo / Vite+ operations.
+///
+/// Writes are limited to the canonical cwd plus the caller-provided tool
+/// cache/state roots; top-level protected metadata stays read-only. The
+/// operation class decides whether outbound network is enabled. This is a
+/// fixed profile; callers cannot select an arbitrary sandbox escape.
+pub async fn run_developer_tool(
+    command: &[String],
+    cwd: &Path,
+    scope: DeveloperToolScope<'_>,
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+) -> Result<Output> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve developer-tool cwd {}", cwd.display()))?;
+    validate_writable_scope(&cwd, scope.writable_roots)?;
+
+    #[cfg(target_os = "macos")]
+    let spec =
+        policy::SandboxSpec::developer_tool(&cwd, scope.writable_roots, scope.network_access)?;
+
+    #[cfg(target_os = "linux")]
+    let mut process =
+        linux::developer_tool_command(command, &cwd, scope.writable_roots, scope.network_access)?;
+
+    #[cfg(target_os = "macos")]
+    let mut process = macos::command(&spec, command)?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut process = {
+        anyhow::bail!(
+            "bounded developer-tool execution is currently implemented for Linux and macOS only"
+        )
+    };
+
+    process
+        .kill_on_drop(true)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(developer_tool_environment(environment))
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process
+        .spawn()
+        .context("failed to start bounded developer-tool command")?;
     wait_with_limited_output(child, stdin).await
 }
 
@@ -639,12 +717,15 @@ fn validate_writable_scope(cwd: &Path, writable_roots: &[PathBuf]) -> Result<()>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_local_agent_scope(
+    writable_roots: &[PathBuf],
     temporary_roots: &[PathBuf],
     read_only_paths: &[PathBuf],
     read_only_roots: &[PathBuf],
     read_only_symlinks: &[LocalAgentSymlink],
     read_only_scaffold_directories: &[PathBuf],
+    read_only_files: &[PathBuf],
     hidden_roots: &[PathBuf],
 ) -> Result<()> {
     for root in temporary_roots {
@@ -731,6 +812,67 @@ fn validate_local_agent_scope(
             })? == *directory,
             "local agent scaffold directory is not canonical: {}",
             directory.display()
+        );
+    }
+    for file in read_only_files {
+        anyhow::ensure!(
+            is_absolute_clean_path(file),
+            "local agent read-only file is not a normalized absolute path: {}",
+            file.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(file),
+            "local agent read-only file must not be inside protected metadata: {}",
+            file.display()
+        );
+        let metadata = std::fs::symlink_metadata(file).with_context(|| {
+            format!(
+                "cannot inspect local agent read-only file {}",
+                file.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "local agent read-only path is not a regular file: {}",
+            file.display()
+        );
+        anyhow::ensure!(
+            std::fs::canonicalize(file).with_context(|| {
+                format!(
+                    "cannot resolve local agent read-only file {}",
+                    file.display()
+                )
+            })? == *file,
+            "local agent read-only file is not canonical: {}",
+            file.display()
+        );
+        let parent = file
+            .parent()
+            .context("local agent read-only file has no parent")?;
+        let parent_metadata = std::fs::symlink_metadata(parent).with_context(|| {
+            format!(
+                "cannot inspect local agent read-only file parent {}",
+                parent.display()
+            )
+        })?;
+        anyhow::ensure!(
+            parent_metadata.file_type().is_dir(),
+            "local agent read-only file parent is not a normal directory: {}",
+            parent.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(parent),
+            "local agent read-only file parent must not be inside protected metadata: {}",
+            parent.display()
+        );
+        anyhow::ensure!(
+            !writable_roots
+                .iter()
+                .chain(temporary_roots.iter())
+                .chain(read_only_roots.iter())
+                .any(|root| file.starts_with(root)),
+            "local agent read-only file overlaps another sandbox root: {}",
+            file.display()
         );
     }
     for symlink in read_only_symlinks {
@@ -1118,6 +1260,18 @@ fn reserve_bytes(remaining: &AtomicUsize, maximum: usize) -> usize {
     }
 }
 
+/// Environment for a developer-tool child.
+///
+/// The caller-provided environment is already validated and filtered, so it is
+/// preserved verbatim. The sandbox marker is then forced so a nested
+/// Temote-aware tool always observes that it is running inside the bounded
+/// developer-tool profile, matching ordinary sandboxed execution.
+fn developer_tool_environment(environment: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut environment = environment.clone();
+    environment.insert("TEMOTE_MCP_SANDBOX".to_owned(), "1".to_owned());
+    environment
+}
+
 fn safe_environment() -> HashMap<String, String> {
     let mut environment = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "HOME"]
         .into_iter()
@@ -1272,6 +1426,46 @@ mod generic_tests {
                 .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn developer_tool_environment_forces_the_sandbox_marker() {
+        let caller = HashMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("HOME".to_owned(), "/home/tester".to_owned()),
+            // filtered_environment strips TEMOTE_MCP_* names, but force the
+            // marker even if a caller supplies its own value.
+            ("TEMOTE_MCP_SANDBOX".to_owned(), "caller".to_owned()),
+        ]);
+        let environment = developer_tool_environment(&caller);
+        assert_eq!(
+            environment.get("TEMOTE_MCP_SANDBOX").map(String::as_str),
+            Some("1"),
+            "developer-tool children must always carry the sandbox marker"
+        );
+        assert_eq!(
+            environment.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin"),
+            "the filtered caller environment must be preserved"
+        );
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/home/tester")
+        );
+        assert_eq!(
+            environment.len(),
+            caller.len(),
+            "the marker must not add or drop unrelated entries"
+        );
+
+        let mut without_marker = caller.clone();
+        without_marker.remove("TEMOTE_MCP_SANDBOX");
+        let environment = developer_tool_environment(&without_marker);
+        assert_eq!(
+            environment.get("TEMOTE_MCP_SANDBOX").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(environment.len(), caller.len());
     }
 
     #[cfg(target_os = "linux")]
@@ -2464,6 +2658,7 @@ done
                 read_only_roots: std::slice::from_ref(&workspace),
                 read_only_symlinks: &[],
                 read_only_scaffold_directories: &[],
+                read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2532,6 +2727,7 @@ done
                 read_only_roots: &[],
                 read_only_symlinks: &[],
                 read_only_scaffold_directories: &[],
+                read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2566,6 +2762,7 @@ done
                 read_only_roots: std::slice::from_ref(&workspace),
                 read_only_symlinks: &[],
                 read_only_scaffold_directories: &[],
+                read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2595,6 +2792,7 @@ done
                 read_only_roots: std::slice::from_ref(&workspace),
                 read_only_symlinks: &[],
                 read_only_scaffold_directories: &[],
+                read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2633,6 +2831,7 @@ done
                 read_only_roots: std::slice::from_ref(&workspace),
                 read_only_symlinks: &[],
                 read_only_scaffold_directories: &[],
+                read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,

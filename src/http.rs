@@ -120,7 +120,15 @@ async fn shutdown_signal() {
 }
 
 async fn healthz() -> Response {
-    Json(json!({"status": "ok", "service": "temote-mcp"})).into_response()
+    let host_id = crate::host_identity::resolve().unwrap_or_else(|_| "unknown".to_owned());
+    Json(json!({
+        "status": "ok",
+        "service": "temote-mcp",
+        "host_id": host_id,
+        "boot_generation": crate::boot_identity::generation(),
+        "last_upgrade_transaction": crate::upgrade_transaction::latest_transaction_id(),
+    }))
+    .into_response()
 }
 
 async fn oauth_protected_resource(State(runtime): State<Runtime>) -> Response {
@@ -563,6 +571,20 @@ mod tests {
     async fn body_json(response: Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn healthz_exposes_non_secret_process_identity() {
+        let value = body_json(super::healthz().await).await;
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["service"], "temote-mcp");
+        assert!(value["host_id"].as_str().is_some());
+        let generation = value["boot_generation"].as_str().unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(generation).unwrap().to_string(),
+            generation
+        );
+        assert!(value.get("last_upgrade_transaction").is_some());
     }
 
     #[test]
@@ -1126,6 +1148,7 @@ mod tests {
         let first_info: Value = serde_json::from_str(tool_text(&first)).unwrap();
         assert_eq!(first_info["status"], "active");
         assert_eq!(first_info["yolo"], false);
+        assert_eq!(first_info["permission_mode"], "agent");
         assert_eq!(
             first_info["cwd"],
             std::fs::canonicalize(volume.join("repo-a"))
@@ -1162,6 +1185,7 @@ mod tests {
             call_public_tool(&runtime, "session_info", json!({"session_id": first_id})).await;
         let info: Value = serde_json::from_str(tool_text(&info)).unwrap();
         assert_eq!(info["yolo"], false);
+        assert_eq!(info["permission_mode"], "agent");
 
         let read = call_public_tool(
             &runtime,
@@ -1191,6 +1215,7 @@ mod tests {
         let restarted: Value = serde_json::from_str(tool_text(&restarted)).unwrap();
         assert_eq!(restarted["status"], "active");
         assert_eq!(restarted["yolo"], false);
+        assert_eq!(restarted["permission_mode"], "agent");
         let reread = call_public_tool(
             &runtime,
             "read_file",

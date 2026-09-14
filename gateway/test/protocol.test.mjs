@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, federatedHostToken, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
+import worker, { GatewayRegistry, GatewaySession, accessEmailAllowed, accessKidAllowed, boundedLogField, federatedHostToken, gatewaySessionBodyLimit, hostApiBodyLimit, nextGatewayGeneration, normalizeAccessTeamDomain, normalizeSessionAvailability, pruneExpiredRegistrySessions, readBoundedBytes, shouldReplaceRegistrySession, validHostRpcResponse, validRpcId, validRpcRequestShape, validRpcToolName, validateAccessJwtShape } from "../src/index.js";
 import {
   LEGACY_PROTOCOL_VERSION,
   MODERN_PROTOCOL_VERSION,
@@ -114,11 +114,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 47);
+  assert.equal(names.length, 48);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "local_agent_run"]) {
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "local_agent_run", "dev_tool_run"]) {
     assert.equal(names.includes(required), true, required);
   }
   assert.deepEqual(
@@ -195,6 +195,17 @@ test("gateway identity comes only from deployment version metadata", () => {
   ]) {
     assert.throws(() => gatewayVersion(env), /version metadata binding/);
   }
+});
+
+test("healthz exposes explicit gateway identity and readiness without credentials", async () => {
+  const response = await worker.fetch(new Request("https://gateway.example.test/healthz"), {});
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    status: "ok",
+    service: "temote-mcp-gateway",
+    readiness: "ready",
+    identity: "temote-mcp-gateway",
+  });
 });
 
 test("Access email allowlist is fail-closed and case-insensitive", () => {
@@ -590,6 +601,94 @@ test("host-level reconnect fences the stale agent generation", async () => {
   assert.equal((await stale.json()).error, "stale_generation");
 });
 
+test("host status is read-only and reports bounded registration metadata", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  await session.fetch(post("connect", {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  }));
+
+  const response = await session.fetch(post("status", { host_id: "mac-main" }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    status: "registered",
+    host_id: "mac-main",
+    generation: 1,
+    lease: "active",
+    session_availability: "not_checked",
+  });
+  assert.equal((await session.fetch(post("status", { host_id: "mac-main" }))).status, 200);
+});
+
+test("host status exposes bounded session availability reported on poll", async () => {
+  const session = new GatewaySession(
+    { storage: new MemoryStorage() },
+    { GATEWAY_REGISTRY: noOpRegistry() },
+  );
+  const identity = {
+    host_id: "mac-main",
+    instance_id: "instance-a",
+    platform: "macos",
+    agent_protocol: 1,
+    runtime_version: "2026.9.0",
+    control_protocol: 2,
+    capabilities: ["session_lifecycle", "session_tools", "named_roots"],
+    named_roots: ["src"],
+  };
+  await session.fetch(post("connect", identity));
+
+  const initial = await body(await session.fetch(post("status", { host_id: "mac-main" })));
+  assert.equal(initial.session_availability, "not_checked");
+
+  const dispatched = session.fetch(post("dispatch", {
+    request: { jsonrpc: "2.0", id: 1, method: "ping" },
+  }));
+  const polled = await session.fetch(post("poll", {
+    ...identity,
+    generation: 1,
+    session_availability: "session_unavailable",
+  }));
+  assert.equal(polled.status, 200);
+  const envelope = await polled.json();
+  assert.equal(envelope.request.id, 1);
+
+  const updated = await body(await session.fetch(post("status", { host_id: "mac-main" })));
+  assert.equal(updated.session_availability, "session_unavailable");
+  assert.equal(updated.host_id, "mac-main");
+
+  const responded = await session.fetch(post("respond", {
+    ...identity,
+    generation: 1,
+    request_id: envelope.request_id,
+    response: { jsonrpc: "2.0", id: 1, result: {} },
+  }));
+  assert.equal(responded.status, 204);
+  await dispatched;
+
+  const invalid = await session.fetch(post("poll", {
+    ...identity,
+    generation: 1,
+    session_availability: "all_good",
+  }));
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(await invalid.json(), { error: "invalid_session_availability" });
+
+  assert.equal(normalizeSessionAvailability(undefined), undefined);
+  assert.equal(normalizeSessionAvailability("ready"), "ready");
+  assert.equal(normalizeSessionAvailability("unavailable"), "unavailable");
+  assert.equal(normalizeSessionAvailability("all_good"), null);
+  assert.equal(normalizeSessionAvailability(1), null);
+});
+
 test("registry upsert failure makes connect fail closed and leaves no active route", async () => {
   const storage = new MemoryStorage();
   const actions = [];
@@ -766,7 +865,12 @@ test("same session_id on two hosts is addressable explicitly and ambiguous when 
   };
   const hostStub = (routeName) => ({
     fetch: async (url, init) => {
-      if (new URL(url).pathname === "/status") return new Response(null, { status: 204 });
+      if (new URL(url).pathname === "/status") {
+        return new Response(JSON.stringify({ status: "registered" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
       const request = JSON.parse(init.body).request;
       if (request.params.name === "session_list") {
         return new Response(JSON.stringify({
@@ -835,7 +939,10 @@ test("unavailable federated host status fails unqualified ownership while explic
           const path = new URL(url).pathname;
           if (path === "/status") {
             if (name === "host:mac-main") throw new Error("transient status failure");
-            return new Response(null, { status: 204 });
+            return new Response(JSON.stringify({ status: "registered" }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
           }
           const request = JSON.parse(init.body).request;
           if (request.params.name === "session_list") {
@@ -902,7 +1009,10 @@ test("unavailable legacy status blocks read and mutating unqualified routing wit
           const path = new URL(url).pathname;
           if (path === "/status") {
             if (name === "same") throw new Error("legacy status unavailable");
-            return new Response(null, { status: 204 });
+            return new Response(JSON.stringify({ status: "registered" }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
           }
           const request = JSON.parse(init.body).request;
           if (request.params.name === "session_list") {
@@ -1373,24 +1483,28 @@ test("session status reflects the current host lease", async () => {
     { storage },
     { GATEWAY_REGISTRY: noOpRegistry() },
   );
-  const connected = await session.fetch(post("connect", {
+  const connectedResponse = await session.fetch(post("connect", {
     session_id: "status-check",
     instance_id: "instance-status",
     platform: "macos",
   }));
-  assert.equal(connected.status, 200);
-  assert.equal(
-    (await session.fetch(new Request("https://session.internal/status"))).status,
-    204,
-  );
+  assert.equal(connectedResponse.status, 200);
+  const connected = await connectedResponse.json();
+  const activeStatus = await session.fetch(new Request("https://session.internal/status"));
+  assert.equal(activeStatus.status, 200);
+  assert.deepEqual(await activeStatus.json(), {
+    status: "registered",
+    generation: connected.generation,
+    lease: "active",
+    session_availability: "not_checked",
+  });
 
   const host = await storage.get("host");
   host.expires_at = Date.now() - 1;
   await storage.put("host", host);
-  assert.equal(
-    (await session.fetch(new Request("https://session.internal/status"))).status,
-    404,
-  );
+  const expiredStatus = await session.fetch(new Request("https://session.internal/status"));
+  assert.equal(expiredStatus.status, 404);
+  assert.deepEqual(await expiredStatus.json(), { status: "lease_expired" });
   assert.equal(await storage.get("host"), undefined);
 });
 
@@ -1553,7 +1667,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 47);
+  assert.equal(rpc.result.tools.length, 48);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

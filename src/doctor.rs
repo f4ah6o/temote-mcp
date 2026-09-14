@@ -5,6 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 #[cfg(feature = "network")]
 use serde::Deserialize;
+#[cfg(feature = "network")]
+use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -39,7 +41,6 @@ pub struct Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
     Pass,
-    #[cfg(any(target_os = "linux", feature = "network"))]
     Warn,
     Fail,
 }
@@ -61,7 +62,6 @@ impl Check {
         }
     }
 
-    #[cfg(any(target_os = "linux", feature = "network"))]
     fn warn(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             level: Level::Warn,
@@ -70,7 +70,6 @@ impl Check {
             hint: Some(hint.into()),
         }
     }
-
     fn fail(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             level: Level::Fail,
@@ -87,7 +86,6 @@ impl Check {
     fn print(&self) {
         let label = match self.level {
             Level::Pass => "PASS",
-            #[cfg(any(target_os = "linux", feature = "network"))]
             Level::Warn => "WARN",
             Level::Fail => "FAIL",
         };
@@ -123,14 +121,11 @@ impl Report {
             .iter()
             .filter(|check| check.is_failure())
             .count();
-        #[cfg(any(target_os = "linux", feature = "network"))]
         let warnings = self
             .checks
             .iter()
             .filter(|check| matches!(check.level, Level::Warn))
             .count();
-        #[cfg(not(any(target_os = "linux", feature = "network")))]
-        let warnings = 0;
         println!();
         println!(
             "doctor summary: {} failure(s), {} warning(s)",
@@ -271,87 +266,727 @@ pub async fn run(options: Options) -> Result<()> {
     report.finish()
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayStage {
+    LocalConfig,
+    LocalSupervisor,
+    RemoteEndpoint,
+    AccessAuth,
+    HostRegistration,
+    SessionAvailability,
+}
+
+impl GatewayStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LocalConfig => "local_config",
+            Self::LocalSupervisor => "local_supervisor",
+            Self::RemoteEndpoint => "remote_endpoint",
+            Self::AccessAuth => "access_auth",
+            Self::HostRegistration => "host_registration",
+            Self::SessionAvailability => "session_availability",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayStageStatus {
+    Ready,
+    Failed,
+    Unavailable,
+    NotChecked,
+}
+
+impl GatewayStageStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+            Self::NotChecked => "not_checked",
+        }
+    }
+
+    fn level(self) -> Level {
+        match self {
+            Self::Ready => Level::Pass,
+            Self::Failed | Self::Unavailable => Level::Fail,
+            Self::NotChecked => Level::Warn,
+        }
+    }
+}
+
+struct GatewayStageResult {
+    stage: GatewayStage,
+    item: &'static str,
+    status: GatewayStageStatus,
+    detail: String,
+    hint: Option<String>,
+}
+
+impl GatewayStageResult {
+    fn ready(stage: GatewayStage, item: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::Ready,
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
+    fn failed(
+        stage: GatewayStage,
+        item: &'static str,
+        detail: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::Failed,
+            detail: detail.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    fn unavailable(
+        stage: GatewayStage,
+        item: &'static str,
+        detail: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::Unavailable,
+            detail: detail.into(),
+            hint: Some(hint.into()),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn not_checked(stage: GatewayStage, item: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            item,
+            status: GatewayStageStatus::NotChecked,
+            detail: detail.into(),
+            hint: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn render(&self) -> String {
+        format!(
+            "[{}] gateway {}: {} ({})",
+            match self.status.level() {
+                Level::Pass => "PASS",
+                Level::Warn => "WARN",
+                Level::Fail => "FAIL",
+            },
+            self.stage.label(),
+            self.item,
+            self.detail
+        )
+    }
+
+    fn into_check(self) -> Check {
+        let name = format!("gateway {}: {}", self.stage.label(), self.item);
+        let detail = format!("{} ({})", self.status.label(), self.detail);
+        match self.status.level() {
+            Level::Pass => Check::pass(name, detail),
+            Level::Warn => Check::warn(
+                name,
+                detail,
+                self.hint.unwrap_or_else(|| {
+                    "Remote verification was not performed; do not treat this stage as ready."
+                        .to_owned()
+                }),
+            ),
+            Level::Fail => Check::fail(
+                name,
+                detail,
+                self.hint.unwrap_or_else(|| {
+                    "Fix the reported local or supervisor condition, then rerun doctor.".to_owned()
+                }),
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GatewayLocalConfig {
+    host_id: Option<String>,
+    gateway_url: Option<String>,
+    host_token: Option<String>,
+    access_client_id: Option<String>,
+    access_client_secret: Option<String>,
+}
+
+impl GatewayLocalConfig {
+    fn from_env() -> Option<Self> {
+        let host_id = std::env::var("TEMOTE_MCP_GATEWAY_HOST_ID").ok()?;
+        Some(Self {
+            host_id: Some(host_id),
+            gateway_url: std::env::var("TEMOTE_MCP_GATEWAY_URL").ok(),
+            host_token: std::env::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").ok(),
+            access_client_id: std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID").ok(),
+            access_client_secret: std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET").ok(),
+        })
+    }
+
+    fn validated_host_id(&self) -> Option<String> {
+        self.host_id
+            .as_deref()
+            .and_then(|value| host_identity::validate(value).ok())
+    }
+}
+
+fn nonempty(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn evaluate_gateway_local_config(config: &GatewayLocalConfig) -> Vec<GatewayStageResult> {
+    let mut results = Vec::new();
+
+    match config.host_id.as_deref() {
+        Some(raw) => match host_identity::validate(raw) {
+            Ok(value) => results.push(GatewayStageResult::ready(
+                GatewayStage::LocalConfig,
+                "host_id",
+                format!("host_id={value}"),
+            )),
+            Err(error) => results.push(GatewayStageResult::failed(
+                GatewayStage::LocalConfig,
+                "host_id",
+                format!("invalid host_id: {error}"),
+                "Configure a stable diagnostic-safe TEMOTE_MCP_GATEWAY_HOST_ID before starting the host-level gateway agent.",
+            )),
+        },
+        None => results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "host_id",
+            "missing",
+            "Set TEMOTE_MCP_GATEWAY_HOST_ID before starting the host-level gateway agent.",
+        )),
+    }
+
+    let gateway_url = config.gateway_url.as_deref().unwrap_or_default();
+    if gateway_url.trim().is_empty() {
+        results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "gateway_url",
+            "missing",
+            "Set TEMOTE_MCP_GATEWAY_URL to the HTTPS gateway origin.",
+        ));
+    } else {
+        #[cfg(feature = "network")]
+        {
+            if crate::gateway::normalize_gateway_url(gateway_url).is_ok() {
+                results.push(GatewayStageResult::ready(
+                    GatewayStage::LocalConfig,
+                    "gateway_url",
+                    "configured",
+                ));
+            } else {
+                results.push(GatewayStageResult::failed(
+                    GatewayStage::LocalConfig,
+                    "gateway_url",
+                    "invalid",
+                    "TEMOTE_MCP_GATEWAY_URL must be an HTTPS origin without credentials, path, query, or fragment.",
+                ));
+            }
+        }
+        #[cfg(not(feature = "network"))]
+        {
+            results.push(GatewayStageResult::not_checked(
+                GatewayStage::LocalConfig,
+                "gateway_url",
+                "configured; origin validation requires the network feature",
+            ));
+        }
+    }
+
+    if nonempty(&config.host_token) {
+        results.push(GatewayStageResult::ready(
+            GatewayStage::LocalConfig,
+            "host_token",
+            "configured",
+        ));
+    } else {
+        results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "host_token",
+            "missing",
+            "Set TEMOTE_MCP_GATEWAY_HOST_TOKEN; the value is never printed.",
+        ));
+    }
+
+    match (
+        nonempty(&config.access_client_id),
+        nonempty(&config.access_client_secret),
+    ) {
+        (false, false) => results.push(GatewayStageResult::ready(
+            GatewayStage::LocalConfig,
+            "access_service_token",
+            "not configured",
+        )),
+        (true, true) => results.push(GatewayStageResult::ready(
+            GatewayStage::LocalConfig,
+            "access_service_token",
+            "configured",
+        )),
+        _ => results.push(GatewayStageResult::failed(
+            GatewayStage::LocalConfig,
+            "access_service_token",
+            "incomplete",
+            "Provide both TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID and TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET together; values are never printed.",
+        )),
+    }
+
+    results
+}
+
+fn gateway_supervisor_detail(status: &serde_json::Value) -> String {
+    let roots = status
+        .get("named_roots")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let protocol = status
+        .get("control_protocol")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let supervisor = status
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    format!("supervisor={supervisor}, control_protocol={protocol}, named_roots={roots}")
+}
+
+async fn check_gateway_supervisor(report: &mut Report, host_id: &str) {
+    let result = match crate::session_control::SessionBackend::local_control().await {
+        Ok(sessions) => match sessions.status().await {
+            Ok(status) => GatewayStageResult::ready(
+                GatewayStage::LocalSupervisor,
+                "control",
+                format!("host_id={host_id}, {}", gateway_supervisor_detail(&status)),
+            ),
+            Err(error) => GatewayStageResult::failed(
+                GatewayStage::LocalSupervisor,
+                "control",
+                format!("host_id={host_id}, supervisor status failed: {error}"),
+                "Restart the Temote supervisor with the current binary before starting the host-level gateway agent.",
+            ),
+        },
+        Err(error) => GatewayStageResult::unavailable(
+            GatewayStage::LocalSupervisor,
+            "control",
+            format!("host_id={host_id}, supervisor unavailable: {error}"),
+            "Start or upgrade the Temote supervisor before starting the host-level gateway agent.",
+        ),
+    };
+    report.add(result.into_check());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SessionAvailabilitySummary {
+    listed: usize,
+    active: usize,
+}
+
+fn session_status_is_live(status: &str) -> bool {
+    matches!(status, "active" | "starting")
+}
+
+/// Counts the local supervisor session inventory without exposing session IDs,
+/// paths, or any credential. The gateway ultimately serves this host's
+/// supervisor, so this local read-only inventory is the authoritative source.
+fn summarize_session_availability(statuses: &[&str]) -> SessionAvailabilitySummary {
+    let mut summary = SessionAvailabilitySummary::default();
+    for status in statuses {
+        summary.listed += 1;
+        if session_status_is_live(status) {
+            summary.active += 1;
+        }
+    }
+    summary
+}
+
+fn classify_session_availability(
+    host_id: &str,
+    summary: SessionAvailabilitySummary,
+) -> GatewayStageResult {
+    let detail = format!(
+        "host_id={host_id}, listed_sessions={}, active_sessions={}",
+        summary.listed, summary.active
+    );
+    if summary.active == 0 {
+        return GatewayStageResult::failed(
+            GatewayStage::SessionAvailability,
+            "sessions",
+            format!("{detail}, session_unavailable"),
+            "Start or reconnect a Temote session for this host before relying on the gateway endpoint.",
+        );
+    }
+    GatewayStageResult::ready(GatewayStage::SessionAvailability, "sessions", detail)
+}
+
+/// Reports whether this host can currently serve sessions through the gateway.
+///
+/// The check reuses the existing read-only supervisor control protocol; it does
+/// not dispatch an MCP tool, create a session, or mutate lease/approval state.
+/// Counts are bounded by the supervisor list response and no path is printed.
+async fn check_gateway_session_availability(report: &mut Report, host_id: &str) {
+    let result = match crate::session_control::request_session_views().await {
+        Ok(sessions) => {
+            let statuses = sessions
+                .iter()
+                .map(|session| session.status.as_str())
+                .collect::<Vec<_>>();
+            classify_session_availability(host_id, summarize_session_availability(&statuses))
+        }
+        Err(_) => GatewayStageResult::unavailable(
+            GatewayStage::SessionAvailability,
+            "sessions",
+            format!("host_id={host_id}, session inventory could not be determined"),
+            "Confirm the local supervisor can enumerate sessions (for example with `temote-mcp session list`) before relying on the gateway endpoint.",
+        ),
+    };
+    report.add(result.into_check());
+}
+
 async fn check_federation_readiness(report: &mut Report) {
-    let Ok(configured_host_id) = std::env::var("TEMOTE_MCP_GATEWAY_HOST_ID") else {
+    let Some(config) = GatewayLocalConfig::from_env() else {
         return;
     };
-    let configured_host_id = match host_identity::validate(&configured_host_id) {
-        Ok(value) => value,
+    let results = evaluate_gateway_local_config(&config);
+    let failed = results
+        .iter()
+        .any(|result| result.status == GatewayStageStatus::Failed);
+    for result in results {
+        report.add(result.into_check());
+    }
+    if failed {
+        return;
+    }
+    let Some(host_id) = config.validated_host_id() else {
+        return;
+    };
+    check_gateway_supervisor(report, &host_id).await;
+    #[cfg(feature = "network")]
+    check_gateway_remote(report, &config, &host_id).await;
+    check_gateway_session_availability(report, &host_id).await;
+}
+
+#[cfg(feature = "network")]
+fn gateway_health_identity_ok(success: bool, body: Option<&Value>) -> bool {
+    success
+        && body
+            .and_then(|value| value.get("identity"))
+            .and_then(Value::as_str)
+            == Some("temote-mcp-gateway")
+        && body
+            .and_then(|value| value.get("readiness"))
+            .and_then(Value::as_str)
+            == Some("ready")
+}
+
+#[cfg(feature = "network")]
+fn gateway_host_registration_result(
+    body: Option<&Value>,
+    host_id: &str,
+    expected_generation: Option<u64>,
+) -> GatewayStageResult {
+    let registered = body
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("registered")
+        && body
+            .and_then(|value| value.get("host_id"))
+            .and_then(Value::as_str)
+            == Some(host_id);
+    if !registered {
+        return GatewayStageResult::failed(
+            GatewayStage::HostRegistration,
+            "host",
+            "gateway returned an invalid host registration status",
+            "Restart the host-level gateway agent and verify the configured host identity.",
+        );
+    }
+    let generation = body
+        .and_then(|value| value.get("generation"))
+        .and_then(Value::as_u64);
+    if let (Some(expected), Some(remote)) = (expected_generation, generation) {
+        if remote > expected {
+            return GatewayStageResult::failed(
+                GatewayStage::HostRegistration,
+                "host",
+                format!(
+                    "gateway agent generation was replaced (local generation={expected}, gateway generation={remote})"
+                ),
+                "Restart the local host-level gateway agent so it reconnects to the current generation.",
+            );
+        }
+        if remote < expected {
+            return GatewayStageResult::unavailable(
+                GatewayStage::HostRegistration,
+                "host",
+                format!(
+                    "gateway reports an older generation than the local agent (local generation={expected}, gateway generation={remote})"
+                ),
+                "Treat gateway registration state as unknown and verify the gateway deployment.",
+            );
+        }
+    }
+    let detail = match generation {
+        Some(generation) if expected_generation.is_some() => {
+            format!("host is registered and matches the local agent generation={generation}")
+        }
+        Some(generation) => {
+            format!("host is registered with an active lease (generation={generation})")
+        }
+        None => "host is registered with an active lease".to_owned(),
+    };
+    GatewayStageResult::ready(GatewayStage::HostRegistration, "host", detail)
+}
+
+#[cfg(feature = "network")]
+fn classify_gateway_host_status(
+    status_code: reqwest::StatusCode,
+    body: Option<&Value>,
+    host_id: &str,
+    expected_generation: Option<u64>,
+) -> Vec<GatewayStageResult> {
+    use reqwest::StatusCode;
+    match status_code {
+        StatusCode::OK => vec![
+            GatewayStageResult::ready(
+                GatewayStage::AccessAuth,
+                "service_token",
+                "gateway host status authorization succeeded",
+            ),
+            gateway_host_registration_result(body, host_id, expected_generation),
+        ],
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => vec![
+            GatewayStageResult::failed(
+                GatewayStage::AccessAuth,
+                "service_token",
+                "gateway rejected the host status credentials",
+                "Verify the Access service-token policy and host token configuration; values are never printed.",
+            ),
+            GatewayStageResult::not_checked(
+                GatewayStage::HostRegistration,
+                "host",
+                "host credentials were rejected; registration state cannot be determined",
+            ),
+        ],
+        StatusCode::NOT_FOUND => {
+            let registration = match body
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("not_registered") => GatewayStageResult::failed(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "host is not registered",
+                    "Start or reconnect the host-level gateway agent for this host ID.",
+                ),
+                Some("lease_expired") => GatewayStageResult::failed(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "host lease has expired",
+                    "Start or reconnect the host-level gateway agent for this host ID.",
+                ),
+                _ => GatewayStageResult::failed(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "host is not registered or its lease has expired",
+                    "Start or reconnect the host-level gateway agent for this host ID.",
+                ),
+            };
+            vec![
+                GatewayStageResult::ready(
+                    GatewayStage::AccessAuth,
+                    "service_token",
+                    "gateway host status authorization succeeded",
+                ),
+                registration,
+            ]
+        }
+        _ => vec![
+            GatewayStageResult::unavailable(
+                GatewayStage::AccessAuth,
+                "service_token",
+                format!("gateway status probe returned HTTP {status_code}"),
+                "Treat remote readiness as unknown and inspect the gateway deployment without exposing credentials.",
+            ),
+            GatewayStageResult::not_checked(
+                GatewayStage::HostRegistration,
+                "host",
+                "gateway status probe returned an unexpected response",
+            ),
+        ],
+    }
+}
+
+#[cfg(feature = "network")]
+async fn check_gateway_remote(report: &mut Report, config: &GatewayLocalConfig, host_id: &str) {
+    let Some(gateway_url) = config.gateway_url.as_deref() else {
+        return;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
         Err(error) => {
-            report.add(Check::fail(
-                "federation readiness",
-                format!("invalid TEMOTE_MCP_GATEWAY_HOST_ID: {error}"),
-                "Configure a stable diagnostic-safe host ID before starting gateway-agent in host mode.",
-            ));
+            report.add(
+                GatewayStageResult::unavailable(
+                    GatewayStage::RemoteEndpoint,
+                    "endpoint",
+                    format!("HTTPS client unavailable: {error}"),
+                    "Retry with the standard network-enabled temote-mcp build.",
+                )
+                .into_check(),
+            );
             return;
         }
     };
-    let gateway_url = std::env::var("TEMOTE_MCP_GATEWAY_URL").unwrap_or_default();
-    let host_token_present =
-        std::env::var("TEMOTE_MCP_GATEWAY_HOST_TOKEN").is_ok_and(|value| !value.trim().is_empty());
-    let access_client_id_present = std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID")
-        .is_ok_and(|value| !value.trim().is_empty());
-    let access_client_secret_present = std::env::var("TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET")
-        .is_ok_and(|value| !value.trim().is_empty());
-    if gateway_url.trim().is_empty()
-        || !host_token_present
-        || access_client_id_present != access_client_secret_present
-    {
-        report.add(Check::fail(
-            "federation readiness",
-            format!(
-                "host_id={configured_host_id}, gateway_url={}, host_token={}, access_service_token={}",
-                if gateway_url.trim().is_empty() {
-                    "missing"
-                } else {
-                    "configured"
-                },
-                if host_token_present {
-                    "configured"
-                } else {
-                    "missing"
-                },
-                if access_client_id_present == access_client_secret_present {
-                    if access_client_id_present { "configured" } else { "not configured" }
-                } else {
-                    "incomplete"
-                }
-            ),
-            "Set TEMOTE_MCP_GATEWAY_URL and TEMOTE_MCP_GATEWAY_HOST_TOKEN; provide both Access service-token fields together when Access protects host-agent traffic.",
-        ));
-        return;
+
+    let health = match client.get(format!("{gateway_url}/healthz")).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            report.add(
+                GatewayStageResult::failed(
+                    GatewayStage::RemoteEndpoint,
+                    "endpoint",
+                    format!("gateway health request failed: {error}"),
+                    "Verify DNS, TLS, routing, and that the Worker endpoint is deployed.",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::AccessAuth,
+                    "service_token",
+                    "remote endpoint could not be reached",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "remote endpoint could not be reached",
+                )
+                .into_check(),
+            );
+            return;
+        }
+    };
+    let health_status = health.status();
+    let health_body = match read_bounded_doctor_response(health).await {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
+        Err(_) => None,
+    };
+    if gateway_health_identity_ok(health_status.is_success(), health_body.as_ref()) {
+        report.add(
+            GatewayStageResult::ready(
+                GatewayStage::RemoteEndpoint,
+                "endpoint",
+                "authenticated gateway status endpoint is reachable and identifies the Temote gateway",
+            )
+            .into_check(),
+        );
+    } else {
+        report.add(
+            GatewayStageResult::failed(
+                GatewayStage::RemoteEndpoint,
+                "endpoint",
+                format!("unexpected gateway identity response ({health_status})"),
+                "Verify that the configured origin is the Temote gateway Worker, not a direct origin or unrelated route.",
+            )
+            .into_check(),
+        );
     }
 
-    match crate::session_control::SessionBackend::local_control().await {
-        Ok(sessions) => match sessions.status().await {
-            Ok(status) => {
-                let roots = status
-                    .get("named_roots")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
-                let protocol = status
-                    .get("control_protocol")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                report.add(Check::pass(
-                    "federation readiness",
-                    format!(
-                        "host_id={configured_host_id}, supervisor=active, control_protocol={protocol}, named_roots={roots}, gateway_url=configured, host_token=configured"
-                    ),
-                ));
-            }
-            Err(error) => report.add(Check::fail(
-                "federation readiness",
-                format!("host_id={configured_host_id}, supervisor status failed: {error}"),
-                "Restart the Temote supervisor with the current binary before starting the host-level gateway agent.",
-            )),
-        },
-        Err(error) => report.add(Check::fail(
-            "federation readiness",
-            format!("host_id={configured_host_id}, supervisor unavailable: {error}"),
-            "Start or upgrade the Temote supervisor before starting the host-level gateway agent.",
-        )),
+    let mut status_request = client
+        .post(format!("{gateway_url}/v1/hosts/status"))
+        .bearer_auth(config.host_token.as_deref().unwrap_or_default())
+        .header("x-temote-host-id", host_id);
+    if let (Some(client_id), Some(client_secret)) = (
+        config.access_client_id.as_deref(),
+        config.access_client_secret.as_deref(),
+    ) {
+        status_request = status_request
+            .header("cf-access-client-id", client_id)
+            .header("cf-access-client-secret", client_secret);
     }
+    let status = match status_request
+        .json(&serde_json::json!({ "host_id": host_id }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            report.add(
+                GatewayStageResult::unavailable(
+                    GatewayStage::AccessAuth,
+                    "service_token",
+                    format!("authenticated status probe could not complete: {error}"),
+                    "Verify the Access service-token pair and gateway host token without printing their values.",
+                )
+                .into_check(),
+            );
+            report.add(
+                GatewayStageResult::not_checked(
+                    GatewayStage::HostRegistration,
+                    "host",
+                    "authenticated status probe could not complete",
+                )
+                .into_check(),
+            );
+            return;
+        }
+    };
+    let status_code = status.status();
+    let status_body = read_bounded_doctor_response(status)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let expected_generation = crate::gateway::read_host_agent_generation(host_id);
+    for result in classify_gateway_host_status(
+        status_code,
+        status_body.as_ref(),
+        host_id,
+        expected_generation,
+    ) {
+        report.add(result.into_check());
+    }
+}
+
+#[cfg(feature = "network")]
+async fn read_bounded_doctor_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(length <= 64 * 1024, "doctor response is too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read doctor response")?
+    {
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= 64 * 1024,
+            "doctor response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn check_platform(report: &mut Report) {
@@ -1526,5 +2161,442 @@ mod tests {
         assert!(is_cloudflare_account_id("0123456789abcdef0123456789abcdef"));
         assert!(!is_cloudflare_account_id("not-an-account-id"));
         assert!(!is_cloudflare_account_id("0123456789abcdef0123456789abcde"));
+    }
+
+    fn gateway_config(
+        host_id: Option<&str>,
+        gateway_url: Option<&str>,
+        host_token: Option<&str>,
+        access_client_id: Option<&str>,
+        access_client_secret: Option<&str>,
+    ) -> GatewayLocalConfig {
+        GatewayLocalConfig {
+            host_id: host_id.map(str::to_owned),
+            gateway_url: gateway_url.map(str::to_owned),
+            host_token: host_token.map(str::to_owned),
+            access_client_id: access_client_id.map(str::to_owned),
+            access_client_secret: access_client_secret.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn gateway_local_config_reports_each_item_independently() {
+        let config = gateway_config(Some("host-a"), None, None, Some("access-id"), None);
+        let results = evaluate_gateway_local_config(&config);
+        let statuses = results
+            .iter()
+            .map(|result| (result.item, result.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("host_id", GatewayStageStatus::Ready),
+                ("gateway_url", GatewayStageStatus::Failed),
+                ("host_token", GatewayStageStatus::Failed),
+                ("access_service_token", GatewayStageStatus::Failed),
+            ]
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.stage == GatewayStage::LocalConfig)
+        );
+    }
+
+    #[test]
+    fn gateway_local_config_invalid_host_id_is_its_own_failure() {
+        let config = gateway_config(
+            Some("not a valid host id"),
+            Some("https://gateway.example.test"),
+            Some("host-token"),
+            None,
+            None,
+        );
+        let results = evaluate_gateway_local_config(&config);
+        assert_eq!(results[0].item, "host_id");
+        assert_eq!(results[0].status, GatewayStageStatus::Failed);
+        assert!(results[0].detail.contains("invalid host_id"));
+    }
+
+    #[test]
+    fn gateway_local_config_never_emits_secret_values() {
+        let config = gateway_config(
+            Some("host-a"),
+            Some("https://sentinel-url.example"),
+            Some("sentinel-host-token-value"),
+            Some("sentinel-access-id"),
+            Some("sentinel-access-secret"),
+        );
+        let rendered = evaluate_gateway_local_config(&config)
+            .iter()
+            .map(GatewayStageResult::render)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for sentinel in [
+            "sentinel-host-token-value",
+            "sentinel-access-id",
+            "sentinel-access-secret",
+            "sentinel-url.example",
+        ] {
+            assert!(
+                !rendered.contains(sentinel),
+                "gateway diagnostic leaked {sentinel}: {rendered}"
+            );
+        }
+        assert!(rendered.contains("host_token"));
+        assert!(rendered.contains("access_service_token"));
+    }
+
+    #[test]
+    fn gateway_stage_statuses_never_treat_not_checked_as_ready() {
+        assert_eq!(GatewayStageStatus::Ready.level(), Level::Pass);
+        assert_eq!(GatewayStageStatus::Failed.level(), Level::Fail);
+        assert_eq!(GatewayStageStatus::Unavailable.level(), Level::Fail);
+        assert_eq!(GatewayStageStatus::NotChecked.level(), Level::Warn);
+        assert_ne!(GatewayStageStatus::NotChecked.level(), Level::Pass);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_local_config_accepts_complete_configuration() {
+        let config = gateway_config(
+            Some("host-a"),
+            Some("https://gateway.example.test"),
+            Some("host-token"),
+            Some("access-id"),
+            Some("access-secret"),
+        );
+        let results = evaluate_gateway_local_config(&config);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.status == GatewayStageStatus::Ready)
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_local_config_rejects_invalid_origins() {
+        for invalid in [
+            "http://gateway.example.test",
+            "https://gateway.example.test/mcp",
+            "https://user@gateway.example.test",
+            "not a url",
+        ] {
+            let config = gateway_config(
+                Some("host-a"),
+                Some(invalid),
+                Some("host-token"),
+                None,
+                None,
+            );
+            let results = evaluate_gateway_local_config(&config);
+            let url = results
+                .iter()
+                .find(|result| result.item == "gateway_url")
+                .expect("gateway_url result");
+            assert_eq!(
+                url.status,
+                GatewayStageStatus::Failed,
+                "origin {invalid:?} should fail"
+            );
+            assert!(!url.render().contains(invalid));
+        }
+        let local = gateway_config(
+            Some("host-a"),
+            Some("http://127.0.0.1:8787"),
+            Some("host-token"),
+            None,
+            None,
+        );
+        let results = evaluate_gateway_local_config(&local);
+        assert_eq!(results[1].status, GatewayStageStatus::Ready);
+    }
+
+    #[test]
+    fn gateway_supervisor_detail_counts_named_roots_without_paths() {
+        let status = serde_json::json!({
+            "status": "active",
+            "control_protocol": 2,
+            "named_roots": ["/Users/sentinel/physical-root", "/home/sentinel/other"],
+        });
+        let detail = gateway_supervisor_detail(&status);
+        assert_eq!(
+            detail,
+            "supervisor=active, control_protocol=2, named_roots=2"
+        );
+        assert!(!detail.contains("sentinel"));
+        assert!(!detail.contains("/Users"));
+    }
+
+    #[test]
+    fn gateway_supervisor_detail_handles_missing_fields() {
+        let detail = gateway_supervisor_detail(&serde_json::json!({}));
+        assert_eq!(
+            detail,
+            "supervisor=unknown, control_protocol=0, named_roots=0"
+        );
+    }
+
+    #[test]
+    fn gateway_session_availability_summarizes_listed_and_active_sessions() {
+        let statuses = ["active", "stopped", "crashed", "starting"];
+        let summary = summarize_session_availability(&statuses);
+        assert_eq!(summary.listed, 4);
+        assert_eq!(summary.active, 2);
+
+        let result = classify_session_availability("host-a", summary);
+        assert_eq!(result.stage, GatewayStage::SessionAvailability);
+        assert_eq!(result.status, GatewayStageStatus::Ready);
+        assert!(
+            result.detail.contains("listed_sessions=4"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("active_sessions=2"),
+            "{}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn gateway_session_availability_empty_inventory_is_not_ready() {
+        let statuses: [&str; 0] = [];
+        let summary = summarize_session_availability(&statuses);
+        assert_eq!(summary.listed, 0);
+        assert_eq!(summary.active, 0);
+
+        let result = classify_session_availability("host-a", summary);
+        assert_eq!(result.status, GatewayStageStatus::Failed);
+        assert!(
+            result.detail.contains("listed_sessions=0"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("active_sessions=0"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("session_unavailable"),
+            "{}",
+            result.detail
+        );
+        let check = result.into_check();
+        assert_eq!(check.level, Level::Fail);
+        assert!(
+            check.hint.is_some(),
+            "failed availability needs remediation"
+        );
+    }
+
+    #[test]
+    fn gateway_session_availability_without_live_sessions_is_not_ready() {
+        let statuses = ["stopped", "crashed", "expired"];
+        let summary = summarize_session_availability(&statuses);
+        assert_eq!(summary.listed, 3);
+        assert_eq!(summary.active, 0);
+
+        let result = classify_session_availability("host-a", summary);
+        assert_eq!(result.status, GatewayStageStatus::Failed);
+        assert!(
+            result.detail.contains("listed_sessions=3"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("active_sessions=0"),
+            "{}",
+            result.detail
+        );
+        assert_eq!(result.into_check().level, Level::Fail);
+    }
+
+    #[test]
+    fn gateway_session_availability_detail_is_non_secret() {
+        let cases: [&[&str]; 3] = [&["active"], &["stopped"], &[]];
+        for statuses in cases {
+            let summary = summarize_session_availability(statuses);
+            let result = classify_session_availability("host-a", summary);
+            let rendered = result.render();
+            let hint = result.into_check().hint.unwrap_or_default();
+            for sentinel in ["/Users/sentinel", "/home/sentinel", "token", "secret"] {
+                assert!(
+                    !rendered.contains(sentinel) && !hint.contains(sentinel),
+                    "session availability diagnostic leaked {sentinel}: {rendered} / {hint}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "network")]
+    fn gateway_status(
+        results: &[GatewayStageResult],
+        stage: GatewayStage,
+    ) -> Option<GatewayStageStatus> {
+        results
+            .iter()
+            .find(|result| result.stage == stage)
+            .map(|result| result.status)
+    }
+
+    #[cfg(feature = "network")]
+    fn gateway_detail(results: &[GatewayStageResult], stage: GatewayStage) -> &str {
+        results
+            .iter()
+            .find(|result| result.stage == stage)
+            .map(|result| result.detail.as_str())
+            .unwrap_or("")
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_health_identity_requires_explicit_gateway_metadata() {
+        let ready = serde_json::json!({"identity": "temote-mcp-gateway", "readiness": "ready"});
+        assert!(gateway_health_identity_ok(true, Some(&ready)));
+        assert!(!gateway_health_identity_ok(false, Some(&ready)));
+        let direct = serde_json::json!({"status": "ok", "service": "temote-mcp"});
+        assert!(!gateway_health_identity_ok(true, Some(&direct)));
+        let wrong_readiness =
+            serde_json::json!({"identity": "temote-mcp-gateway", "readiness": "degraded"});
+        assert!(!gateway_health_identity_ok(true, Some(&wrong_readiness)));
+        assert!(!gateway_health_identity_ok(true, None));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_host_status_classifies_registration_states() {
+        use reqwest::StatusCode;
+        let host_id = "mac-main";
+
+        let registered = serde_json::json!({
+            "status": "registered",
+            "host_id": host_id,
+            "generation": 7,
+        });
+        let results =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::AccessAuth),
+            Some(GatewayStageStatus::Ready)
+        );
+        assert_eq!(
+            gateway_status(&results, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Ready)
+        );
+        let registration_detail = gateway_detail(&results, GatewayStage::HostRegistration);
+        assert!(registration_detail.contains("generation=7"));
+
+        let other_host = serde_json::json!({"status": "registered", "host_id": "other-main"});
+        let results =
+            classify_gateway_host_status(StatusCode::OK, Some(&other_host), host_id, None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Failed)
+        );
+
+        for (status, detail) in [
+            ("not_registered", "host is not registered"),
+            ("lease_expired", "host lease has expired"),
+        ] {
+            let body = serde_json::json!({"status": status});
+            let results =
+                classify_gateway_host_status(StatusCode::NOT_FOUND, Some(&body), host_id, None);
+            assert_eq!(
+                gateway_status(&results, GatewayStage::AccessAuth),
+                Some(GatewayStageStatus::Ready)
+            );
+            assert_eq!(
+                gateway_status(&results, GatewayStage::HostRegistration),
+                Some(GatewayStageStatus::Failed)
+            );
+            let registration_detail = gateway_detail(&results, GatewayStage::HostRegistration);
+            assert_eq!(registration_detail, detail);
+        }
+
+        let results = classify_gateway_host_status(StatusCode::NOT_FOUND, None, host_id, None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Failed)
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_host_status_distinguishes_a_replaced_agent_generation() {
+        use reqwest::StatusCode;
+        let host_id = "mac-main";
+        let registered = serde_json::json!({
+            "status": "registered",
+            "host_id": host_id,
+            "generation": 9,
+        });
+
+        let replaced =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, Some(7));
+        assert_eq!(
+            gateway_status(&replaced, GatewayStage::AccessAuth),
+            Some(GatewayStageStatus::Ready)
+        );
+        assert_eq!(
+            gateway_status(&replaced, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Failed)
+        );
+        let detail = gateway_detail(&replaced, GatewayStage::HostRegistration);
+        assert!(detail.contains("replaced"), "{detail}");
+        assert!(detail.contains("local generation=7"), "{detail}");
+        assert!(detail.contains("gateway generation=9"), "{detail}");
+
+        let matched =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, Some(9));
+        assert_eq!(
+            gateway_status(&matched, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Ready)
+        );
+        let detail = gateway_detail(&matched, GatewayStage::HostRegistration);
+        assert!(detail.contains("matches the local agent"), "{detail}");
+
+        let older =
+            classify_gateway_host_status(StatusCode::OK, Some(&registered), host_id, Some(11));
+        assert_eq!(
+            gateway_status(&older, GatewayStage::HostRegistration),
+            Some(GatewayStageStatus::Unavailable)
+        );
+        assert_eq!(
+            gateway_status(&older, GatewayStage::HostRegistration).map(GatewayStageStatus::level),
+            Some(Level::Fail)
+        );
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn gateway_host_status_never_claims_ready_on_auth_or_unexpected_failure() {
+        use reqwest::StatusCode;
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let results = classify_gateway_host_status(status, None, "mac-main", None);
+            assert_eq!(
+                gateway_status(&results, GatewayStage::AccessAuth),
+                Some(GatewayStageStatus::Failed)
+            );
+            assert_eq!(
+                gateway_status(&results, GatewayStage::HostRegistration),
+                Some(GatewayStageStatus::NotChecked)
+            );
+        }
+
+        let results =
+            classify_gateway_host_status(StatusCode::INTERNAL_SERVER_ERROR, None, "mac-main", None);
+        assert_eq!(
+            gateway_status(&results, GatewayStage::AccessAuth),
+            Some(GatewayStageStatus::Unavailable)
+        );
+        let registration = gateway_status(&results, GatewayStage::HostRegistration);
+        assert_eq!(registration, Some(GatewayStageStatus::NotChecked));
+        assert_eq!(
+            registration.map(GatewayStageStatus::level),
+            Some(Level::Warn)
+        );
     }
 }

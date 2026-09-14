@@ -23,6 +23,8 @@ installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp 
 
 session discovery は active-first です。running supervisor が所有する session を bounded な historical metadata より先に返すため、履歴が蓄積しても active session が `session list` / MCP `session_list` から押し出されません。historical な stopped / crashed entry は list budget 内で deterministic な recent-first 順に返します。supervisor startup と periodic maintenance では、安全に terminal と確認できた metadata pair のうち最近512件を保持し、それより古い confirmed stopped / crashed pair だけを prune します。live、曖昧、malformed / orphan、supervisor upgrade restore plan で保護されている metadata は retention で自動削除しません。read-only listing と MCP fallback は cleanup を行いません。
 
+`temote-mcp session forget <id>` は、terminal で non-live な1 session の Temote-owned durable state（metadata、lifecycle state、stale と確認済みの socket entry）を削除します。`stop` は後から `session list` / `session info` で参照できるよう metadata を保持し、`forget` は意図的に削除します。runtime socket probe が live を返した場合は無条件で拒否し、supervisor の lifecycle transition と直列化され、symlink や非 regular file の metadata target を拒否し、workspace、cwd、worktree には触れません。1 session の forget は他 session の retention policy を変更しません。
+
 互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。これは起動中の local supervisor に current directory の session 作成を依頼します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。
 
 相対 path は session の working directory を基準に解決されます。
@@ -106,7 +108,7 @@ Temote 側の agent profile では、選択した canonical `cwd` だけを agen
 他の permitted root は agent に自動公開しません。
 どちらの mode でも agent の state と cache は毎回専用 directory に分離して書き込み可能にし、選択 workspace 以下のすべての `.git`、`.agents`、`.codex`（nested を含む）は保護したままにします。
 
-local agent の request は yolo session からでも local approval boundary を通ります。
+`ask` と `yolo` では local agent の request が local approval boundary を通ります。`agent` では otherwise-valid な構造化 request が Temote 側の local approval prompt だけを省略し、以下の broker contract は変わりません。
 deny の場合は child process を起動せずに終了します。
 Codex の task は 1 MiB まで受け付け、検証済みの `codex exec ... -` contract に従って stdin で渡すため argv には載せません。
 インストール済み OpenCode の `run [message..]` には検証済みの stdin prompt transport がないため、positional message の task は 64 KiB に制限します。
@@ -123,6 +125,27 @@ broker が Codex の strict permission profile と OpenCode の read / external-
 agent の file edit は Git remote 操作の認可を与えません。
 stage、commit、fetch、pull、push には専用の `git_*` tool を使います。
 公開 HTTP はこの構造化 broker だけを公開し、generic な `without_sandbox` tool は引き続き公開しません。
+
+### 構造化 developer tool broker
+
+`dev_tool_run({session_id, tool, operation, args?, cwd?})` は、検証済みの Cargo / Vite+ operation を developer broker 経由で実行します。`tool` は `cargo` と `vp` のみで、caller は executable や raw host command を指定できません。cwd は permitted root 内に canonicalize し、child output は bounded、長時間 operation は通常の `job_id` を返します。
+
+operation class:
+
+- offline development（`cargo fmt|check|clippy|test|build`、`vp check|lint|fmt|format|test|build|pack`）は network 無効の developer sandbox で実行し、workspace write と限定的な tool cache/state write だけを許可します。
+- dependency/network（`cargo fetch|install|update`、`vp install|add|update|outdated|info|rebuild`）は明示的に分類された network profile を使い、write scope は同じです。
+- `vp run|exec|dlx`、`vp upgrade|implode`、その他の未知 operation は offline/safe path に入れず拒否します。
+
+`ask` では検証済み operation に local approval が必要で、`agent` では local approval console なしで実行し、`yolo` は従来の local behavior を維持します。分類と containment の規則はどの mode でも同一です。
+
+### Delegation backend (ローカル CLI)
+
+`temote-mcp delegate --backend codex|opencode ...` は、ローカル CLI から bounded な非対話 delegation を1回実行し、bounded な JSON result を1つ出力します。OpenCode は明示的な `--session <id>` resume も受け付けます。resume 前に bounded な read-only `opencode session list --format json` preflight を行い、session の canonical directory が現在の canonical delegation directory と一致する場合だけ `run` を起動します。metadata の欠落、曖昧さ、不正 JSON、サイズ超過、probe失敗、directory不一致は fail closed で、`run` より前に拒否します。`--fork` を使うには `--session` が必要で、指定した session の context を継承した新しい session を開始します。`run` の前に、同じ fail closed の directory preflight を親 session に対して実行します。`--continue` と `--attach` はサポートしません。OpenCode backend の executable は次の順で解決します。
+
+1. `TEMOTE_OPENCODE_BIN` が設定されている場合、既存の実行可能な regular file への絶対 path でなければなりません。symlink は canonical target に解決します。PATH より優先されます。
+2. 未設定の場合は PATH から `opencode` を解決します。
+
+明示された `TEMOTE_OPENCODE_BIN` が不正（空、相対 path、存在しない、regular file でない、実行可能でない）な場合は fail closed とし、PATH 上の別 executable へ暗黙に fallback しません。設定された path は diagnostics や error に出力しません。`temote-mcp delegate diagnose --backend opencode` が示すのは `available` / `unavailable`、source (`env_override` / `path` / `invalid_override`)、invalid override の bounded な reason だけです。`TEMOTE_OPENCODE_BIN` は parent process が読むだけで、OpenCode child の environment には渡しません。
 
 ## work checkpoint / handoff
 

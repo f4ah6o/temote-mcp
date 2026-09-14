@@ -70,6 +70,9 @@ enum ControlRequest {
         #[serde(default)]
         public: bool,
     },
+    Forget {
+        session_id: String,
+    },
     Restart {
         session_id: String,
         #[serde(default)]
@@ -86,6 +89,9 @@ enum ControlRequest {
     },
     PermissionMode {
         session_id: String,
+        #[serde(default)]
+        permission_mode: Option<config::PermissionMode>,
+        #[serde(default)]
         yolo: bool,
     },
     PermissionAllow {
@@ -123,7 +129,7 @@ pub struct SessionView {
     pub stopped_at: Option<u64>,
     pub exit_reason: Option<String>,
     pub last_error: Option<String>,
-    pub permission_mode: String,
+    pub permission_mode: config::PermissionMode,
     pub yolo: bool,
     pub logical_path: Option<String>,
     pub restart_policy: String,
@@ -457,17 +463,18 @@ pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> 
 pub async fn list() -> Result<()> {
     let result = request(ControlRequest::List).await?;
     let sessions: Vec<SessionView> = serde_json::from_value(result)?;
-    println!("SESSION\tSTATUS\tPID\tCWD");
+    println!("SESSION\tSTATUS\tPID\tPERMISSION\tCWD");
     for session in sessions {
         let pid = session
             .pid
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_owned());
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             session.session_id,
             session.status,
             pid,
+            session.permission_mode.as_str(),
             session.cwd.display()
         );
     }
@@ -485,6 +492,11 @@ pub async fn stop(session_id: String) -> Result<()> {
         public: false,
     })
     .await?;
+    print_json(&result)
+}
+
+pub async fn forget(session_id: String) -> Result<()> {
+    let result = request(ControlRequest::Forget { session_id }).await?;
     print_json(&result)
 }
 
@@ -513,10 +525,17 @@ pub async fn permission(
         }
         crate::cli::SessionPermissionCommand::Ask => ControlRequest::PermissionMode {
             session_id,
+            permission_mode: Some(config::PermissionMode::Ask),
+            yolo: false,
+        },
+        crate::cli::SessionPermissionCommand::Agent => ControlRequest::PermissionMode {
+            session_id,
+            permission_mode: Some(config::PermissionMode::Agent),
             yolo: false,
         },
         crate::cli::SessionPermissionCommand::Yolo => ControlRequest::PermissionMode {
             session_id,
+            permission_mode: Some(config::PermissionMode::Yolo),
             yolo: true,
         },
         crate::cli::SessionPermissionCommand::Allow { path } => {
@@ -729,6 +748,9 @@ async fn dispatch_request(
             }
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::Forget { session_id } => Ok(serde_json::to_value(
+            supervisor.forget_session(&session_id).await?,
+        )?),
         ControlRequest::Restart {
             session_id,
             environment,
@@ -745,8 +767,16 @@ async fn dispatch_request(
         ControlRequest::PermissionStatus { session_id } => {
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
-        ControlRequest::PermissionMode { session_id, yolo } => {
-            supervisor.set_permission_yolo(&session_id, yolo).await?;
+        ControlRequest::PermissionMode {
+            session_id,
+            permission_mode,
+            yolo,
+        } => {
+            let permission_mode =
+                permission_mode.unwrap_or_else(|| config::PermissionMode::from_legacy_yolo(yolo));
+            supervisor
+                .set_permission_mode(&session_id, permission_mode)
+                .await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
         ControlRequest::PermissionAllow { session_id, path } => {
@@ -1490,7 +1520,12 @@ async fn restart_session(
             .context("public managed session has no named-root path")?;
         supervisor.stop_public(session_id).await?;
         supervisor
-            .start_public_with_environment(path, Some(session_id), environment)
+            .start_public_with_mode_with_environment(
+                path,
+                Some(session_id),
+                session.permission_mode,
+                environment,
+            )
             .await?;
     } else {
         crate::codex_app_server::begin_session_shutdown(&session);
@@ -1504,14 +1539,19 @@ async fn restart_session(
             .and_then(|state| state.logical_path.as_deref())
         {
             supervisor
-                .start_with_environment(path, Some(session_id), environment)
+                .start_with_mode_with_environment(
+                    path,
+                    Some(session_id),
+                    session.permission_mode,
+                    environment,
+                )
                 .await?;
         } else {
             supervisor
-                .start_local_with_environment(
+                .start_local_with_mode_with_environment(
                     &session.cwd,
                     Some(session_id),
-                    session.yolo,
+                    session.permission_mode,
                     environment,
                 )
                 .await?;
@@ -1819,6 +1859,8 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
     let pid = matches!(status.as_str(), "starting" | "active" | "stopping")
         .then_some(session.process_id)
         .filter(|pid| *pid != 0);
+    let permission_mode = session.permission_mode;
+    let yolo = session.yolo();
 
     Ok(SessionView {
         host_id: host_identity::resolve()?,
@@ -1833,8 +1875,8 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
         stopped_at: inferred.stopped_at,
         exit_reason: inferred.exit_reason,
         last_error,
-        permission_mode: if session.yolo { "yolo" } else { "ask" }.to_owned(),
-        yolo: session.yolo,
+        permission_mode,
+        yolo,
         logical_path: inferred.logical_path,
         restart_policy: inferred.restart_policy,
         restart_count: inferred.restart_count,
@@ -2040,6 +2082,8 @@ pub(crate) async fn inspect_session_read_only(id: &str) -> Result<SessionView> {
     let pid = matches!(status.as_str(), "starting" | "active" | "stopping")
         .then_some(session.process_id)
         .filter(|pid| *pid != 0);
+    let permission_mode = session.permission_mode;
+    let yolo = session.yolo();
     Ok(SessionView {
         host_id: host_identity::resolve()?,
         id: session.id.clone(),
@@ -2053,8 +2097,8 @@ pub(crate) async fn inspect_session_read_only(id: &str) -> Result<SessionView> {
         stopped_at: inferred.stopped_at,
         exit_reason: inferred.exit_reason,
         last_error,
-        permission_mode: if session.yolo { "yolo" } else { "ask" }.to_owned(),
-        yolo: session.yolo,
+        permission_mode,
+        yolo,
         logical_path: inferred.logical_path,
         restart_policy: inferred.restart_policy,
         restart_count: inferred.restart_count,
@@ -2421,6 +2465,27 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn forgotten_session_disappears_from_list_and_info() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("forget-views-{}", uuid::Uuid::new_v4());
+        supervisor.start("src/repo", Some(&id)).await.unwrap();
+        supervisor.stop(&id).await.unwrap();
+
+        let listed = list_session_views(&supervisor).await.unwrap();
+        assert!(listed.iter().any(|session| session.session_id == id));
+        assert_eq!(inspect_session(&id).await.unwrap().session_id, id);
+
+        supervisor.forget_session(&id).await.unwrap();
+        let listed = list_session_views(&supervisor).await.unwrap();
+        assert!(!listed.iter().any(|session| session.session_id == id));
+        assert!(inspect_session(&id).await.is_err());
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
+    }
+
     #[cfg(unix)]
     #[test]
     fn upgrade_executable_gate_rejects_incompatible_protocol_without_running_handoff() {
@@ -2467,7 +2532,7 @@ mod tests {
                 session_id: session_id.clone(),
                 cwd: std::env::current_dir().unwrap(),
                 permitted_directories: vec![std::env::current_dir().unwrap()],
-                yolo: false,
+                permission_mode: config::PermissionMode::Ask,
                 logical_path: None,
                 restart_policy: "never".to_owned(),
                 public: false,
@@ -2638,6 +2703,7 @@ mod tests {
         let yolo = dispatch_request(
             ControlRequest::PermissionMode {
                 session_id: id.clone(),
+                permission_mode: Some(config::PermissionMode::Yolo),
                 yolo: true,
             },
             &supervisor,
@@ -2665,6 +2731,7 @@ mod tests {
         let ask = dispatch_request(
             ControlRequest::PermissionMode {
                 session_id: id.clone(),
+                permission_mode: Some(config::PermissionMode::Ask),
                 yolo: false,
             },
             &supervisor,
@@ -2676,6 +2743,71 @@ mod tests {
 
         supervisor.shutdown().await.unwrap();
         cleanup(&id).await;
+    }
+
+    #[tokio::test]
+    async fn manual_restart_preserves_agent_and_ask_permission_modes() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let agent_id = format!("restart-agent-{}", uuid::Uuid::new_v4());
+        let ask_id = format!("restart-ask-{}", uuid::Uuid::new_v4());
+
+        supervisor
+            .start_with_mode_with_environment(
+                "src/repo",
+                Some(&agent_id),
+                config::PermissionMode::Agent,
+                CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .start_with_mode_with_environment(
+                "src/repo",
+                Some(&ask_id),
+                config::PermissionMode::Ask,
+                CapturedStartEnvironment::default(),
+            )
+            .await
+            .unwrap();
+
+        restart_session(
+            &supervisor,
+            &agent_id,
+            CapturedStartEnvironment::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        restart_session(
+            &supervisor,
+            &ask_id,
+            CapturedStartEnvironment::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            config::read_session_metadata(&agent_id)
+                .await
+                .unwrap()
+                .permission_mode,
+            config::PermissionMode::Agent,
+            "manual restart must not downgrade agent to ask"
+        );
+        assert_eq!(
+            config::read_session_metadata(&ask_id)
+                .await
+                .unwrap()
+                .permission_mode,
+            config::PermissionMode::Ask,
+            "manual restart must not migrate an explicit ask session"
+        );
+
+        supervisor.shutdown().await.unwrap();
+        cleanup(&agent_id).await;
+        cleanup(&ask_id).await;
     }
 
     #[tokio::test]
@@ -3070,5 +3202,46 @@ mod tests {
         let persisted = config::read_session_lifecycle(&id).await.unwrap().unwrap();
         assert_eq!(persisted.status, LifecycleStatus::Crashed);
         cleanup(&id).await;
+    }
+
+    #[test]
+    fn permission_mode_control_request_accepts_legacy_yolo_and_current_mode() {
+        let legacy: ControlRequest = serde_json::from_str(
+            r#"{"command":"permission_mode","session_id":"legacy","yolo":true}"#,
+        )
+        .unwrap();
+        match legacy {
+            ControlRequest::PermissionMode {
+                permission_mode,
+                yolo,
+                ..
+            } => {
+                assert!(permission_mode.is_none());
+                assert!(yolo);
+            }
+            _ => panic!("unexpected request variant"),
+        }
+
+        let current: ControlRequest = serde_json::from_str(
+            r#"{"command":"permission_mode","session_id":"current","permission_mode":"agent","yolo":false}"#,
+        )
+        .unwrap();
+        match current {
+            ControlRequest::PermissionMode {
+                permission_mode, ..
+            } => {
+                assert_eq!(permission_mode, Some(config::PermissionMode::Agent));
+            }
+            _ => panic!("unexpected request variant"),
+        }
+
+        let encoded = serde_json::to_value(ControlRequest::PermissionMode {
+            session_id: "mirror".to_owned(),
+            permission_mode: Some(config::PermissionMode::Agent),
+            yolo: false,
+        })
+        .unwrap();
+        assert_eq!(encoded["permission_mode"], "agent");
+        assert_eq!(encoded["yolo"], false);
     }
 }

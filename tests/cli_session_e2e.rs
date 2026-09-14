@@ -436,7 +436,7 @@ fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
     assert_cli_success(&info, "session info after upgrade");
     let info: Value = serde_json::from_slice(&info.stdout).expect("invalid session info JSON");
     assert_eq!(info["status"], "active");
-    assert_eq!(info["permission_mode"], "ask");
+    assert_eq!(info["permission_mode"], "agent");
     assert_eq!(info["restart_policy"], "on-failure");
     assert_eq!(
         PathBuf::from(info["cwd"].as_str().expect("session cwd missing")),
@@ -514,7 +514,7 @@ fn supervisor_session_lifecycle_survives_console_eof_and_records_crash() {
     let info = tool_json(&client.tool_call("session_info", json!({"session_id": session_id})));
     assert_eq!(info["id"], session_id);
     assert_eq!(info["status"], "active");
-    assert_eq!(info["permission_mode"], "ask");
+    assert_eq!(info["permission_mode"], "agent");
     assert_eq!(info["restart_policy"], "never");
     assert_eq!(
         PathBuf::from(info["cwd"].as_str().expect("session_info cwd missing")),

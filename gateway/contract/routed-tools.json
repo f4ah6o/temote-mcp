@@ -479,6 +479,55 @@
     },
     {
       "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "items": {
+              "maxLength": 8192,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "operation": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "tool": {
+            "enum": [
+              "cargo",
+              "vp"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "tool",
+          "operation"
+        ],
+        "type": "object"
+      },
+      "name": "dev_tool_run"
+    },
+    {
+      "annotations": {
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,

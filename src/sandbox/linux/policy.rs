@@ -36,8 +36,9 @@ pub enum LinuxNetworkPolicy {
 }
 
 /// A verified intermediate launcher symlink that the helper recreates inside
-/// the sandbox. `link` is the lexical path that must exist and `target` is
-/// its canonical destination.
+/// the sandbox. `link` is the lexical path that must exist and `target` is its
+/// already validated canonical destination; both are re-validated by the helper
+/// before bubblewrap arguments are constructed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinuxReadOnlySymlink {
@@ -61,12 +62,36 @@ pub struct LinuxSandboxPolicy {
     pub read_only_roots: Vec<PathBuf>,
     pub read_only_symlinks: Vec<LinuxReadOnlySymlink>,
     pub read_only_scaffold_directories: Vec<PathBuf>,
+    pub read_only_files: Vec<PathBuf>,
     pub hidden_roots: Vec<PathBuf>,
     pub network: LinuxNetworkPolicy,
 }
 
 impl LinuxSandboxPolicy {
     pub fn for_command(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        git_metadata_roots: &[PathBuf],
+    ) -> Result<Self> {
+        Self::for_scoped_command(cwd, writable_roots, git_metadata_roots)
+    }
+
+    /// Developer-tool profile: the same workspace/state containment as
+    /// `command`, with the operation class selecting whether outbound network
+    /// is enabled (`dependency-network`) or denied (`dev-offline`).
+    pub fn for_developer_tool(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        network_access: bool,
+    ) -> Result<Self> {
+        let mut policy = Self::for_scoped_command(cwd, writable_roots, &[])?;
+        if network_access {
+            policy.network = LinuxNetworkPolicy::LocalAgent;
+        }
+        Ok(policy)
+    }
+
+    fn for_scoped_command(
         cwd: &Path,
         writable_roots: &[PathBuf],
         git_metadata_roots: &[PathBuf],
@@ -136,6 +161,7 @@ impl LinuxSandboxPolicy {
             read_only_roots: Vec::new(),
             read_only_symlinks: Vec::new(),
             read_only_scaffold_directories: Vec::new(),
+            read_only_files: Vec::new(),
             hidden_roots: Vec::new(),
             network: LinuxNetworkPolicy::Restricted,
         };
@@ -143,27 +169,32 @@ impl LinuxSandboxPolicy {
         Ok(policy)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn for_local_agent(
         cwd: &Path,
-        scope: &crate::sandbox::LocalAgentScope<'_>,
+        writable_roots: &[PathBuf],
+        temporary_roots: &[PathBuf],
+        read_only_paths: &[PathBuf],
+        read_only_roots: &[PathBuf],
+        read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
+        read_only_scaffold_directories: &[PathBuf],
+        read_only_files: &[PathBuf],
+        hidden_roots: &[PathBuf],
     ) -> Result<Self> {
         let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
-        let mut writable = scope
-            .writable_roots
+        let mut writable = writable_roots
             .iter()
             .map(|path| canonical_existing_directory(path, "writable root"))
             .collect::<Result<Vec<_>>>()?;
         normalize_paths(&mut writable);
 
-        let mut temporary = scope
-            .temporary_roots
+        let mut temporary = temporary_roots
             .iter()
             .map(|path| canonical_existing_directory(path, "temporary root"))
             .collect::<Result<Vec<_>>>()?;
         normalize_paths(&mut temporary);
 
-        let mut read_only = scope
-            .read_only_paths
+        let mut read_only = read_only_paths
             .iter()
             .map(|path| {
                 std::fs::canonicalize(path)
@@ -175,30 +206,29 @@ impl LinuxSandboxPolicy {
         }
         normalize_paths(&mut read_only);
 
-        let mut visible_roots = scope
-            .read_only_roots
+        let mut visible_roots = read_only_roots
             .iter()
             .map(|path| canonical_existing_directory(path, "read-only root"))
             .collect::<Result<Vec<_>>>()?;
         normalize_paths(&mut visible_roots);
-        let mut hidden = scope
-            .hidden_roots
+        let mut hidden = hidden_roots
             .iter()
             .map(|path| canonical_existing_directory(path, "hidden root"))
             .collect::<Result<Vec<_>>>()?;
         normalize_paths(&mut hidden);
-        let mut visible_symlinks = scope
-            .read_only_symlinks
+        let mut read_only_symlinks = read_only_symlinks
             .iter()
             .map(|symlink| LinuxReadOnlySymlink {
                 link: symlink.link.clone(),
                 target: symlink.target.clone(),
             })
             .collect::<Vec<_>>();
-        visible_symlinks.sort_by(|left, right| left.link.cmp(&right.link));
-        visible_symlinks.dedup();
-        let mut scaffold_directories = scope.read_only_scaffold_directories.to_vec();
+        read_only_symlinks.sort_by_key(|symlink| symlink.link.clone());
+        read_only_symlinks.dedup();
+        let mut scaffold_directories = read_only_scaffold_directories.to_vec();
         normalize_paths(&mut scaffold_directories);
+        let mut files = read_only_files.to_vec();
+        normalize_paths(&mut files);
 
         let policy = Self {
             version: 1,
@@ -207,8 +237,9 @@ impl LinuxSandboxPolicy {
             temporary_roots: temporary,
             read_only_paths: read_only,
             read_only_roots: visible_roots,
-            read_only_symlinks: visible_symlinks,
+            read_only_symlinks,
             read_only_scaffold_directories: scaffold_directories,
+            read_only_files: files,
             hidden_roots: hidden,
             network: LinuxNetworkPolicy::LocalAgent,
         };
@@ -244,6 +275,10 @@ impl LinuxSandboxPolicy {
         anyhow::ensure!(
             self.read_only_scaffold_directories.len() <= MAX_ROOTS,
             "too many read-only scaffold directories"
+        );
+        anyhow::ensure!(
+            self.read_only_files.len() <= MAX_ROOTS,
+            "too many read-only files"
         );
         anyhow::ensure!(
             self.hidden_roots.len() <= MAX_ROOTS,
@@ -391,6 +426,42 @@ impl LinuxSandboxPolicy {
                     .any(|root| directory.starts_with(root)),
                 "read-only scaffold directory is inside a visible root: {}",
                 directory.display()
+            );
+        }
+
+        for file in &self.read_only_files {
+            validate_absolute_clean_path(file, "read-only file")?;
+            anyhow::ensure!(
+                !is_protected_metadata_location(file),
+                "read-only file is inside protected metadata: {}",
+                file.display()
+            );
+            let metadata = std::fs::symlink_metadata(file)
+                .with_context(|| format!("cannot inspect read-only file {}", file.display()))?;
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "read-only path is not a regular file: {}",
+                file.display()
+            );
+            anyhow::ensure!(
+                std::fs::canonicalize(file).with_context(|| {
+                    format!("cannot resolve read-only file {}", file.display())
+                })? == *file,
+                "read-only file is not canonical: {}",
+                file.display()
+            );
+            let parent = file.parent().context("read-only file has no parent")?;
+            validate_existing_directory(parent, "read-only file parent")?;
+            validate_no_symlink_components(parent)?;
+            anyhow::ensure!(
+                !self
+                    .writable_roots
+                    .iter()
+                    .chain(self.temporary_roots.iter())
+                    .chain(self.read_only_roots.iter())
+                    .any(|root| file.starts_with(root)),
+                "read-only file is inside a visible root: {}",
+                file.display()
             );
         }
 
@@ -576,16 +647,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let temp = root.path().join("tmp");
         std::fs::create_dir(&temp).unwrap();
-        let scope = crate::sandbox::LocalAgentScope {
-            writable_roots: &[],
-            temporary_roots: std::slice::from_ref(&temp),
-            read_only_paths: &[],
-            read_only_roots: &[],
-            read_only_symlinks: &[],
-            read_only_scaffold_directories: &[],
-            hidden_roots: &[],
-        };
-        let policy = LinuxSandboxPolicy::for_local_agent(root.path(), &scope).unwrap();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            root.path(),
+            &[],
+            std::slice::from_ref(&temp),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
 
         assert!(!policy.writable_roots.contains(&policy.cwd));
         assert_eq!(policy.network, LinuxNetworkPolicy::LocalAgent);
@@ -604,16 +677,18 @@ mod tests {
         std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
 
         let workspace = std::fs::canonicalize(workspace).unwrap();
-        let scope = crate::sandbox::LocalAgentScope {
-            writable_roots: std::slice::from_ref(&workspace),
-            temporary_roots: &[],
-            read_only_paths: &[],
-            read_only_roots: &[],
-            read_only_symlinks: &[],
-            read_only_scaffold_directories: &[],
-            hidden_roots: &[],
-        };
-        let policy = LinuxSandboxPolicy::for_local_agent(&workspace, &scope).unwrap();
+        let policy = LinuxSandboxPolicy::for_local_agent(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
 
         for expected in [
             workspace.join("nested/.git"),
