@@ -155,7 +155,43 @@ fn build_bwrap_args(
     visible_roots.extend(policy.read_only_roots.iter().cloned());
     visible_roots.sort_by_key(|path| path_depth(path));
     visible_roots.dedup();
-    append_namespace_directory_scaffolding(&mut args, &hidden_roots, &visible_roots)?;
+    let hidden_symlinks = policy
+        .read_only_symlinks
+        .iter()
+        .filter(|symlink| {
+            hidden_roots
+                .iter()
+                .any(|hidden| symlink.link.starts_with(hidden))
+        })
+        .collect::<Vec<_>>();
+    let mut symlink_scaffold_paths = policy.read_only_scaffold_directories.clone();
+    symlink_scaffold_paths.extend(
+        hidden_symlinks
+            .iter()
+            .filter_map(|symlink| symlink.link.parent().map(Path::to_owned))
+            .collect::<Vec<_>>(),
+    );
+    for symlink in &hidden_symlinks {
+        let target = if std::fs::metadata(&symlink.target)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
+        {
+            symlink.target.clone()
+        } else {
+            symlink
+                .target
+                .parent()
+                .context("read-only symlink target has no parent")?
+                .to_owned()
+        };
+        symlink_scaffold_paths.push(target);
+    }
+    append_namespace_directory_scaffolding(
+        &mut args,
+        &hidden_roots,
+        &visible_roots,
+        &symlink_scaffold_paths,
+    )?;
     for root in writable_roots {
         append_pair(&mut args, "--bind", &root, &root)?;
     }
@@ -211,6 +247,14 @@ fn build_bwrap_args(
         }
     }
 
+    // Recreate only verified intermediate launcher symlinks that were hidden
+    // by the tmpfs overlay. Their parents and canonical targets were
+    // scaffolded above, and policy validation prevents unrelated paths from
+    // becoming visible.
+    for symlink in hidden_symlinks {
+        append_pair(&mut args, "--symlink", &symlink.target, &symlink.link)?;
+    }
+
     args.push("--chdir".to_owned());
     args.push(path_to_string(&policy.cwd)?);
     args.push("--".to_owned());
@@ -222,9 +266,10 @@ fn append_namespace_directory_scaffolding(
     args: &mut Vec<String>,
     hidden_roots: &[PathBuf],
     visible_roots: &[PathBuf],
+    extra_paths: &[PathBuf],
 ) -> Result<()> {
     let mut directories = Vec::new();
-    for visible in visible_roots {
+    for visible in visible_roots.iter().chain(extra_paths.iter()) {
         let Some(hidden) = hidden_roots
             .iter()
             .filter(|hidden| visible.starts_with(hidden))
@@ -384,9 +429,11 @@ fn build_seccomp_filter(network: LinuxNetworkPolicy) -> Result<BpfProgram> {
         rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
     } else {
         // The network-enabled local-agent profile has no inherited IPC file
-        // descriptors and does not need Unix-domain sockets. Blocking their
-        // creation prevents a child from reaching host control sockets while
-        // retaining AF_INET/AF_INET6 access to the model service.
+        // descriptors and must not create path-based Unix sockets, which could
+        // reach host control sockets. Rust runtimes do use an unnamed AF_UNIX
+        // socketpair for in-process signal handling. Keep socket(AF_UNIX)
+        // denied, and allow only the exact Tokio-compatible socketpair form:
+        // AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, protocol 0.
         let unix_rule = SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -394,7 +441,34 @@ fn build_seccomp_filter(network: LinuxNetworkPolicy) -> Result<BpfProgram> {
             libc::AF_UNIX as u64,
         )?])?;
         rules.insert(libc::SYS_socket, vec![unix_rule.clone()]);
-        rules.insert(libc::SYS_socketpair, vec![unix_rule]);
+        let allowed_stream_type =
+            (libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u64;
+        let invalid_domain_rule = SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_UNIX as u64,
+        )?])?;
+        let invalid_type_rule = SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            allowed_stream_type,
+        )?])?;
+        let invalid_protocol_rule = SeccompRule::new(vec![SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            0,
+        )?])?;
+        rules.insert(
+            libc::SYS_socketpair,
+            vec![
+                invalid_domain_rule,
+                invalid_type_rule,
+                invalid_protocol_rule,
+            ],
+        );
     }
 
     let architecture = if cfg!(target_arch = "x86_64") {
@@ -539,15 +613,16 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&temp).unwrap();
         let hidden = root.path().to_path_buf();
-        let policy = LinuxSandboxPolicy::for_local_agent(
-            &workspace,
-            &[],
-            std::slice::from_ref(&temp),
-            &[],
-            std::slice::from_ref(&workspace),
-            std::slice::from_ref(&hidden),
-        )
-        .unwrap();
+        let scope = crate::sandbox::LocalAgentScope {
+            writable_roots: &[],
+            temporary_roots: std::slice::from_ref(&temp),
+            read_only_paths: &[],
+            read_only_roots: std::slice::from_ref(&workspace),
+            read_only_symlinks: &[],
+            read_only_scaffold_directories: &[],
+            hidden_roots: std::slice::from_ref(&hidden),
+        };
+        let policy = LinuxSandboxPolicy::for_local_agent(&workspace, &scope).unwrap();
         let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
 
         assert!(!args.iter().any(|arg| arg == "--unshare-net"));
@@ -574,6 +649,77 @@ mod tests {
             !args
                 .windows(3)
                 .any(|window| window == ["--bind", "/tmp", "/tmp"])
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_agent_policy_recreates_only_verified_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let hidden = root.path().join("home");
+        let bin = hidden.join("bin");
+        let version = hidden.join("0.3.1");
+        let scratch = hidden.join("scratch");
+        let current = hidden.join("current");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(version.join("bin")).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("secret"), b"must not be mounted").unwrap();
+        std::fs::write(version.join("bin/vp"), b"#!/bin/sh\n").unwrap();
+        symlink(Path::new("../current/bin/vp"), bin.join("codex")).unwrap();
+        symlink(Path::new("0.3.1"), &current).unwrap();
+        let canonical_version = std::fs::canonicalize(&version).unwrap();
+        let hidden = std::fs::canonicalize(&hidden).unwrap();
+
+        let symlinks = [crate::sandbox::LocalAgentSymlink {
+            link: hidden.join("current"),
+            target: canonical_version.clone(),
+        }];
+        let scope = crate::sandbox::LocalAgentScope {
+            writable_roots: &[],
+            temporary_roots: &[],
+            read_only_paths: &[],
+            read_only_roots: std::slice::from_ref(&bin),
+            read_only_symlinks: &symlinks,
+            read_only_scaffold_directories: std::slice::from_ref(&scratch),
+            hidden_roots: std::slice::from_ref(&hidden),
+        };
+        let policy = LinuxSandboxPolicy::for_local_agent(&workspace, &scope).unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
+
+        assert!(args.windows(3).any(|window| {
+            window
+                == [
+                    "--symlink",
+                    canonical_version.to_str().unwrap(),
+                    hidden.join("current").to_str().unwrap(),
+                ]
+        }));
+        assert!(
+            args.windows(2)
+                .any(|window| { window == ["--dir", hidden.join("0.3.1").to_str().unwrap()] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| { window == ["--dir", scratch.to_str().unwrap()] })
+        );
+        assert!(!args.windows(3).any(|window| {
+            window
+                == [
+                    "--ro-bind",
+                    scratch.to_str().unwrap(),
+                    scratch.to_str().unwrap(),
+                ]
+        }));
+        assert!(!args.iter().any(|argument| argument == "secret"));
+        assert!(
+            !args
+                .iter()
+                .any(|argument| Path::new(argument) == hidden.join("bin/codex"))
         );
     }
 }

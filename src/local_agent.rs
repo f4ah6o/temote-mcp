@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -30,6 +30,8 @@ const MAX_APPROVAL_DETAIL_BYTES: usize = 16 * 1024;
 const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_IMPORTED_AUTH_BYTES: u64 = 1024 * 1024;
+const MAX_LAUNCHER_SYMLINK_HOPS: usize = 16;
+const MAX_LAUNCHER_PATH_STEPS: usize = 256;
 const AGENT_STATE_DIRECTORY_PREFIX: &str = "temote-mcp-local-agent-";
 const CODEX_PERMISSION_PROFILE_NAME: &str = "temote_local_agent";
 
@@ -408,6 +410,8 @@ pub(crate) struct PreparedRun {
     pub(crate) cwd: PathBuf,
     command: Vec<String>,
     executable_target: PathBuf,
+    dependency_symlinks: Vec<sandbox::LocalAgentSymlink>,
+    dependency_directories: Vec<PathBuf>,
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
     task: String,
@@ -490,6 +494,14 @@ impl PreparedRun {
         anyhow::ensure!(
             executable.canonical == self.executable_target,
             "local agent executable target changed while approval was pending"
+        );
+        anyhow::ensure!(
+            executable.symlinks == self.dependency_symlinks,
+            "local agent launcher symlinks changed while approval was pending"
+        );
+        anyhow::ensure!(
+            executable.directories == self.dependency_directories,
+            "local agent launcher directories changed while approval was pending"
         );
         let current_roots = canonical_session_roots(session)?;
         anyhow::ensure!(
@@ -629,6 +641,8 @@ where
         cwd,
         command,
         executable_target,
+        dependency_symlinks: executable.symlinks,
+        dependency_directories: executable.directories,
         environment,
         session_roots: canonical_session_roots(session)?,
         task: task.to_owned(),
@@ -665,6 +679,8 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
             temporary_roots: &temporary_roots,
             read_only_paths: prepared.state.read_only_paths(),
             read_only_roots: &read_only_roots,
+            read_only_symlinks: &prepared.dependency_symlinks,
+            read_only_scaffold_directories: &prepared.dependency_directories,
             hidden_roots: prepared.state.hidden_roots(),
         },
         stdin,
@@ -895,6 +911,14 @@ fn filtered_environment_values(
 struct ResolvedExecutable {
     runtime: PathBuf,
     canonical: PathBuf,
+    symlinks: Vec<sandbox::LocalAgentSymlink>,
+    directories: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct LauncherDependencyClosure {
+    symlinks: Vec<sandbox::LocalAgentSymlink>,
+    directories: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -944,9 +968,12 @@ fn resolve_executable_details(
         {
             continue;
         }
+        let closure = launcher_dependency_closure(&candidate, &canonical, &session_roots)?;
         return Ok(ResolvedExecutable {
             runtime: candidate,
             canonical,
+            symlinks: closure.symlinks,
+            directories: closure.directories,
         });
     }
     anyhow::bail!(
@@ -1006,9 +1033,265 @@ fn resolve_explicit_executable(
         "agent executable path or target is inside a permitted session root: {}",
         executable.display()
     );
+    let closure = launcher_dependency_closure(executable, &canonical, &session_roots)?;
     Ok(ResolvedExecutable {
         runtime: executable.to_owned(),
         canonical,
+        symlinks: closure.symlinks,
+        directories: closure.directories,
+    })
+}
+
+fn launcher_dependency_closure(
+    runtime: &Path,
+    canonical: &Path,
+    session_roots: &[PathBuf],
+) -> Result<LauncherDependencyClosure> {
+    anyhow::ensure!(
+        runtime.is_absolute() && canonical.is_absolute(),
+        "local agent launcher paths must be absolute"
+    );
+    let closure = launcher_symlink_chain(runtime, canonical)?;
+    let runtime_parent = runtime
+        .parent()
+        .context("local agent executable has no parent")?;
+    let target_parent = canonical
+        .parent()
+        .context("canonical local agent executable has no parent")?;
+    for symlink in &closure.symlinks {
+        anyhow::ensure!(
+            !is_protected_metadata_location(&symlink.link)
+                && !is_protected_metadata_location(&symlink.target),
+            "local agent launcher symlink crosses protected metadata: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            !session_roots
+                .iter()
+                .any(|root| symlink.link == *root || symlink.link.starts_with(root))
+                && !session_roots
+                    .iter()
+                    .any(|root| symlink.target == *root || symlink.target.starts_with(root)),
+            "local agent launcher symlink crosses a permitted session root: {}",
+            symlink.link.display()
+        );
+    }
+    let visible_roots = [
+        fs::canonicalize(runtime_parent).with_context(|| {
+            format!(
+                "could not resolve local agent executable directory {}",
+                runtime_parent.display()
+            )
+        })?,
+        fs::canonicalize(target_parent).with_context(|| {
+            format!(
+                "could not resolve local agent executable target directory {}",
+                target_parent.display()
+            )
+        })?,
+    ];
+    let mut symlinks = closure
+        .symlinks
+        .into_iter()
+        .filter(|symlink| {
+            !visible_roots
+                .iter()
+                .any(|root| symlink.link == *root || symlink.link.starts_with(root))
+        })
+        .collect::<Vec<_>>();
+    symlinks.sort_by(|left, right| {
+        left.link
+            .cmp(&right.link)
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    symlinks.dedup();
+    let mut directories = closure
+        .directories
+        .into_iter()
+        .filter(|directory| {
+            !visible_roots
+                .iter()
+                .any(|root| directory.starts_with(root) || root.starts_with(directory))
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories.dedup();
+    Ok(LauncherDependencyClosure {
+        symlinks,
+        directories,
+    })
+}
+
+#[cfg(unix)]
+fn launcher_symlink_chain(runtime: &Path, canonical: &Path) -> Result<LauncherDependencyClosure> {
+    use std::path::Component;
+
+    let mut base = PathBuf::from("/");
+    let mut pending = runtime
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(name.to_owned()),
+            Component::CurDir => Some(std::ffi::OsString::from(".")),
+            Component::ParentDir => Some(std::ffi::OsString::from("..")),
+            Component::Prefix(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut symlink_links = Vec::new();
+    let mut published_symlinks = BTreeSet::new();
+    let mut directories = Vec::new();
+    let mut published_directories = BTreeSet::new();
+    let mut seen_states = BTreeSet::new();
+    let mut symlink_hops = 0usize;
+    let mut path_steps = 0usize;
+
+    while !pending.is_empty() {
+        anyhow::ensure!(
+            pending.len() <= MAX_LAUNCHER_PATH_STEPS,
+            "local agent launcher dependency traversal exceeds {MAX_LAUNCHER_PATH_STEPS} pending path components"
+        );
+        path_steps = path_steps
+            .checked_add(1)
+            .context("local agent launcher path step count overflow")?;
+        anyhow::ensure!(
+            path_steps <= MAX_LAUNCHER_PATH_STEPS,
+            "local agent launcher dependency traversal exceeds {MAX_LAUNCHER_PATH_STEPS} steps"
+        );
+        anyhow::ensure!(
+            seen_states.insert((base.clone(), pending.clone())),
+            "local agent launcher dependency cycle at {}",
+            base.display()
+        );
+        let component = pending.remove(0);
+        match component.to_str() {
+            Some(".") => continue,
+            Some("..") => {
+                anyhow::ensure!(
+                    base != Path::new("/"),
+                    "local agent launcher symlink escapes the filesystem root"
+                );
+                base = base
+                    .parent()
+                    .context("local agent launcher symlink has no parent")?
+                    .to_owned();
+                continue;
+            }
+            _ => {}
+        }
+
+        let candidate = base.join(&component);
+        let metadata = fs::symlink_metadata(&candidate).with_context(|| {
+            format!(
+                "could not inspect local agent launcher path {}",
+                candidate.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            anyhow::ensure!(
+                symlink_hops < MAX_LAUNCHER_SYMLINK_HOPS,
+                "local agent launcher dependency chain exceeds {MAX_LAUNCHER_SYMLINK_HOPS} symlink hops"
+            );
+            let target = fs::read_link(&candidate).with_context(|| {
+                format!(
+                    "could not read local agent launcher symlink {}",
+                    candidate.display()
+                )
+            })?;
+            if published_symlinks.insert(candidate.clone()) {
+                symlink_links.push(candidate.clone());
+            }
+            symlink_hops += 1;
+
+            let parent = candidate
+                .parent()
+                .context("local agent launcher symlink has no parent")?;
+            base = if target.is_absolute() {
+                PathBuf::from("/")
+            } else {
+                parent.to_owned()
+            };
+            let mut expanded = target
+                .components()
+                .filter_map(|component| match component {
+                    Component::RootDir => None,
+                    Component::Normal(name) => Some(name.to_owned()),
+                    Component::CurDir => Some(std::ffi::OsString::from(".")),
+                    Component::ParentDir => Some(std::ffi::OsString::from("..")),
+                    Component::Prefix(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let expanded_len = expanded
+                .len()
+                .checked_add(pending.len())
+                .context("local agent launcher path component count overflow")?;
+            anyhow::ensure!(
+                expanded_len <= MAX_LAUNCHER_PATH_STEPS,
+                "local agent launcher dependency traversal exceeds {MAX_LAUNCHER_PATH_STEPS} path components"
+            );
+            expanded.append(&mut pending);
+            pending = expanded;
+            continue;
+        }
+
+        let is_final = pending.is_empty();
+        anyhow::ensure!(
+            is_final || metadata.file_type().is_dir(),
+            "local agent launcher path component is not a directory: {}",
+            candidate.display()
+        );
+        if !is_final && published_directories.insert(candidate.clone()) {
+            directories.push(candidate.clone());
+        }
+        base = candidate;
+    }
+
+    anyhow::ensure!(
+        base == canonical,
+        "local agent launcher target changed during dependency walk: {}",
+        runtime.display()
+    );
+    let mut symlinks = Vec::with_capacity(symlink_links.len());
+    for link in symlink_links {
+        let metadata = fs::symlink_metadata(&link).with_context(|| {
+            format!(
+                "could not inspect local agent launcher symlink {} after dependency walk",
+                link.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.file_type().is_symlink(),
+            "local agent launcher path is no longer a symlink: {}",
+            link.display()
+        );
+        let target = fs::canonicalize(&link).with_context(|| {
+            format!(
+                "could not resolve local agent launcher symlink {}",
+                link.display()
+            )
+        })?;
+        anyhow::ensure!(
+            target != Path::new("/"),
+            "local agent launcher symlink targets the filesystem root: {}",
+            link.display()
+        );
+        symlinks.push(sandbox::LocalAgentSymlink { link, target });
+    }
+    Ok(LauncherDependencyClosure {
+        symlinks,
+        directories,
+    })
+}
+
+#[cfg(not(unix))]
+fn launcher_symlink_chain(runtime: &Path, canonical: &Path) -> Result<LauncherDependencyClosure> {
+    anyhow::ensure!(
+        fs::canonicalize(runtime)? == canonical,
+        "local agent launcher target changed during dependency walk: {}",
+        runtime.display()
+    );
+    Ok(LauncherDependencyClosure {
+        symlinks: Vec::new(),
+        directories: Vec::new(),
     })
 }
 
@@ -1402,6 +1685,8 @@ mod tests {
             cwd: root.path().canonicalize().unwrap(),
             command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "wc -c".to_owned()],
             executable_target: PathBuf::from("/bin/sh"),
+            dependency_symlinks: Vec::new(),
+            dependency_directories: Vec::new(),
             environment: {
                 let mut environment = HashMap::new();
                 state.apply_to_environment(Agent::Codex, &mut environment);
@@ -1548,6 +1833,8 @@ mod tests {
             cwd: PathBuf::from("/workspace"),
             command: vec!["/usr/bin/codex".to_owned()],
             executable_target: PathBuf::from("/usr/bin/codex"),
+            dependency_symlinks: Vec::new(),
+            dependency_directories: Vec::new(),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             session_roots: Vec::new(),
             task: String::new(),
@@ -1770,6 +2057,8 @@ mod tests {
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ]),
             executable_target: PathBuf::from("/usr/bin/head"),
+            dependency_symlinks: Vec::new(),
+            dependency_directories: Vec::new(),
             session_roots: Vec::new(),
             task: String::new(),
             task_bytes: 0,
@@ -1857,6 +2146,8 @@ mod tests {
                 access,
                 cwd: selected.canonicalize().unwrap(),
                 executable_target: executable.canonicalize().unwrap(),
+                dependency_symlinks: Vec::new(),
+                dependency_directories: Vec::new(),
                 environment,
                 session_roots: vec![
                     root_a.path().canonicalize().unwrap(),
@@ -1886,6 +2177,144 @@ mod tests {
         assert!(!selected_marker.exists());
         assert!(!sibling_marker.exists());
         assert!(!extra_marker.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn vite_plus_relative_symlink_executes_inside_local_agent_sandbox() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture_parent_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let fixture_parent = tempfile::tempdir_in(&fixture_parent_path)?;
+        let home = fixture_parent.path().join(".vite-plus");
+        let workspace = fixture_parent.path().join("workspace");
+        let bin = home.join("bin");
+        let version_bin = home.join("0.3.1/bin");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&version_bin)?;
+        fs::create_dir_all(&workspace)?;
+
+        let target = version_bin.join("vp");
+        let target = fs::canonicalize(&target).unwrap_or(target);
+        make_executable_with_contents(
+            &target,
+            &format!(
+                "#!/bin/sh\n\
+                 test \"$(/usr/bin/readlink -f \"$0\")\" = \"{}\"\n",
+                target.display()
+            ),
+        );
+        symlink(Path::new("../current/bin/vp"), bin.join("codex"))?;
+        symlink(Path::new("0.3.1"), home.join("current"))?;
+
+        let state =
+            AgentState::create_with_source_home(Agent::Codex, &[], Some(fixture_parent.path()))?;
+        let mut environment = HashMap::new();
+        state.apply_to_environment(Agent::Codex, &mut environment);
+        environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        let dependency_symlinks =
+            launcher_dependency_closure(&bin.join("codex"), &target, &[])?.symlinks;
+        assert_eq!(
+            dependency_symlinks,
+            vec![sandbox::LocalAgentSymlink {
+                link: home.join("current"),
+                target: home.join("0.3.1"),
+            }]
+        );
+        let prepared = PreparedRun {
+            agent: Agent::Codex,
+            access: Access::ReadOnly,
+            cwd: workspace.canonicalize()?,
+            command: vec![bin.join("codex").to_string_lossy().into_owned()],
+            executable_target: target,
+            dependency_symlinks,
+            dependency_directories: Vec::new(),
+            environment,
+            session_roots: Vec::new(),
+            task: "test".to_owned(),
+            task_bytes: 4,
+            task_sha256: task_sha256(b"test"),
+            task_preview: task_preview("test"),
+            state,
+        };
+
+        let output = run(prepared).await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn relative_symlink_dotdot_requires_scaffolded_directory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let fixture_parent_path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let fixture_parent = tempfile::tempdir_in(&fixture_parent_path)?;
+        let home = fixture_parent.path().join(".vite-plus");
+        let workspace = fixture_parent.path().join("workspace");
+        let bin = home.join("bin");
+        let scratch = home.join("scratch");
+        let current_bin = home.join("current/bin");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&scratch)?;
+        fs::create_dir_all(&current_bin)?;
+        fs::create_dir_all(&workspace)?;
+
+        let target = current_bin.join("vp");
+        let target = fs::canonicalize(&target).unwrap_or(target);
+        let scratch_secret = scratch.join("secret");
+        let scratch_sibling = scratch.join("unrelated");
+        fs::write(&scratch_secret, b"must remain hidden")?;
+        fs::write(&scratch_sibling, b"must remain hidden")?;
+        make_executable_with_contents(
+            &target,
+            &format!(
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 test \"$(/usr/bin/readlink -f \"$0\")\" = \"{}\"\n\
+                 test ! -e \"{}\"\n\
+                 test ! -e \"{}\"\n",
+                target.display(),
+                scratch_secret.display(),
+                scratch_sibling.display()
+            ),
+        );
+        symlink(Path::new("../scratch/../current/bin/vp"), bin.join("codex"))?;
+
+        let state =
+            AgentState::create_with_source_home(Agent::Codex, &[], Some(fixture_parent.path()))?;
+        let mut environment = HashMap::new();
+        state.apply_to_environment(Agent::Codex, &mut environment);
+        environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+        let closure = launcher_dependency_closure(&bin.join("codex"), &target, &[])?;
+        let dependency_symlinks = closure.symlinks;
+        assert_eq!(closure.directories, vec![scratch.clone()]);
+        let prepared = PreparedRun {
+            agent: Agent::Codex,
+            access: Access::ReadOnly,
+            cwd: workspace.canonicalize()?,
+            command: vec![bin.join("codex").to_string_lossy().into_owned()],
+            executable_target: target,
+            dependency_symlinks,
+            dependency_directories: closure.directories,
+            environment,
+            session_roots: Vec::new(),
+            task: "test".to_owned(),
+            task_bytes: 4,
+            task_sha256: task_sha256(b"test"),
+            task_preview: task_preview("test"),
+            state,
+        };
+
+        let output = run(prepared).await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        Ok(())
     }
 
     #[test]
@@ -1974,5 +2403,139 @@ mod tests {
             .revalidate_with_executable(&session, &candidate)
             .unwrap_err();
         assert!(error.to_string().contains("target changed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approval_revalidation_rejects_a_changed_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        let version = safe.path().join("version");
+        let alternate = safe.path().join("alternate");
+        fs::create_dir_all(version.join("bin")).unwrap();
+        make_executable(&version.join("bin/vp"));
+        symlink(&version, &alternate).unwrap();
+
+        let candidate = safe.path().join("bin/codex");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        symlink(Path::new("../current/bin/vp"), &candidate).unwrap();
+        symlink("version", safe.path().join("current")).unwrap();
+
+        let session = session(root.path());
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &candidate).unwrap();
+        fs::remove_file(safe.path().join("current")).unwrap();
+        symlink("alternate", safe.path().join("current")).unwrap();
+
+        let error = prepared
+            .revalidate_with_executable(&session, &candidate)
+            .unwrap_err();
+        assert!(error.to_string().contains("launcher symlinks changed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approval_revalidation_rejects_a_changed_launcher_directory_graph() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let safe = tempfile::tempdir().unwrap();
+        let current_bin = safe.path().join("current/bin");
+        let scratch = safe.path().join("scratch");
+        fs::create_dir_all(&current_bin).unwrap();
+        fs::create_dir(&scratch).unwrap();
+        make_executable(&current_bin.join("vp"));
+
+        let candidate = safe.path().join("bin/codex");
+        fs::create_dir(candidate.parent().unwrap()).unwrap();
+        symlink(Path::new("../scratch/../current/bin/vp"), &candidate).unwrap();
+
+        let session = session(root.path());
+        let prepared =
+            prepare_with_executable(&args("codex", "read_only"), &session, &candidate).unwrap();
+        std::fs::remove_file(&candidate).unwrap();
+        symlink(Path::new("../current/bin/vp"), &candidate).unwrap();
+
+        let error = prepared
+            .revalidate_with_executable(&session, &candidate)
+            .unwrap_err();
+        assert!(error.to_string().contains("launcher directories changed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launcher_dependency_walk_handles_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let real = fixture.path().join("real/bin");
+        let alias = fixture.path().join("alias");
+        fs::create_dir_all(&real).unwrap();
+        make_executable(&real.join("codex"));
+        symlink("real", &alias).unwrap();
+
+        let runtime = alias.join("bin/codex");
+        let canonical = fs::canonicalize(&runtime).unwrap();
+        let closure = launcher_dependency_closure(&runtime, &canonical, &[]).unwrap();
+        assert_eq!(
+            closure.symlinks,
+            vec![sandbox::LocalAgentSymlink {
+                link: alias,
+                target: fixture.path().join("real"),
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launcher_dependency_walk_allows_revisiting_a_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let real = fixture.path().join("real");
+        let alias = fixture.path().join("alias");
+        fs::create_dir_all(real.join("bin")).unwrap();
+        make_executable(&real.join("bin/vp"));
+        symlink("real", &alias).unwrap();
+        symlink(alias.join("bin/vp"), real.join("bin/codex")).unwrap();
+
+        let runtime = alias.join("bin/codex");
+        let canonical = fs::canonicalize(&runtime).unwrap();
+        let closure = launcher_dependency_closure(&runtime, &canonical, &[]).unwrap();
+
+        assert_eq!(
+            closure.symlinks,
+            vec![sandbox::LocalAgentSymlink {
+                link: alias,
+                target: real,
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launcher_dependency_walk_rejects_cycles_and_excessive_hops() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("codex");
+        let second = fixture.path().join("next");
+        symlink(&second, &first).unwrap();
+        symlink(&first, &second).unwrap();
+        let error = launcher_dependency_closure(&first, Path::new("/tmp/target"), &[]).unwrap_err();
+        assert!(error.to_string().contains("dependency cycle"));
+
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("codex");
+        for index in 0..=MAX_LAUNCHER_SYMLINK_HOPS {
+            let current = fixture.path().join(format!("hop-{index}"));
+            let next = fixture.path().join(format!("hop-{}", index + 1));
+            symlink(&next, &current).unwrap();
+        }
+        symlink(fixture.path().join("hop-0"), &first).unwrap();
+        let error = launcher_dependency_closure(&first, Path::new("/tmp/target"), &[]).unwrap_err();
+        assert!(error.to_string().contains("exceeds 16 symlink hops"));
     }
 }

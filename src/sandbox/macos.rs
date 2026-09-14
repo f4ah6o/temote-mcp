@@ -80,6 +80,45 @@ fn build_read_policy(spec: &SandboxSpec) -> Result<(String, Vec<(String, PathBuf
         ));
     }
 
+    // Seatbelt may match a symlink lookup on its lexical path rather than
+    // only the resolved target. Re-allow exactly the verified intermediate
+    // launcher links below hidden roots.
+    for (index, link) in spec.read_only_symlinks().iter().enumerate() {
+        if !spec
+            .hidden_roots()
+            .iter()
+            .any(|hidden| link.starts_with(hidden))
+        {
+            continue;
+        }
+        ensure_utf8(link)?;
+        let key = format!("READ_ONLY_SYMLINK_{index}");
+        definitions.push((key.clone(), link.clone()));
+        clauses.push(format!("(allow file-read* (literal (param \"{key}\")))"));
+        clauses.push(format!(
+            "(allow file-read-metadata (path-ancestors (param \"{key}\")))"
+        ));
+    }
+
+    for (index, directory) in spec.read_only_scaffold_directories().iter().enumerate() {
+        if !spec
+            .hidden_roots()
+            .iter()
+            .any(|hidden| directory.starts_with(hidden))
+        {
+            continue;
+        }
+        ensure_utf8(directory)?;
+        let key = format!("READ_ONLY_SCAFFOLD_DIRECTORY_{index}");
+        definitions.push((key.clone(), directory.clone()));
+        clauses.push(format!(
+            "(allow file-read-metadata (literal (param \"{key}\")))"
+        ));
+        clauses.push(format!(
+            "(allow file-read-metadata (path-ancestors (param \"{key}\")))"
+        ));
+    }
+
     Ok((clauses.join("\n"), definitions))
 }
 
@@ -217,15 +256,16 @@ mod tests {
         std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
 
         let workspace = std::fs::canonicalize(workspace).unwrap();
-        let spec = SandboxSpec::local_agent(
-            &workspace,
-            std::slice::from_ref(&workspace),
-            &[],
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
+        let scope = crate::sandbox::LocalAgentScope {
+            writable_roots: std::slice::from_ref(&workspace),
+            temporary_roots: &[],
+            read_only_paths: &[],
+            read_only_roots: &[],
+            read_only_symlinks: &[],
+            read_only_scaffold_directories: &[],
+            hidden_roots: &[],
+        };
+        let spec = SandboxSpec::local_agent(&workspace, &scope).unwrap();
         let (policy, definitions) = build_write_policy(&spec).unwrap();
         let defined_paths = definitions
             .iter()
@@ -258,15 +298,16 @@ mod tests {
         let hidden = std::fs::canonicalize(hidden).unwrap();
         let selected = std::fs::canonicalize(selected).unwrap();
 
-        let spec = SandboxSpec::local_agent(
-            &selected,
-            std::slice::from_ref(&selected),
-            &[],
-            &[],
-            &[],
-            std::slice::from_ref(&hidden),
-        )
-        .unwrap();
+        let scope = crate::sandbox::LocalAgentScope {
+            writable_roots: std::slice::from_ref(&selected),
+            temporary_roots: &[],
+            read_only_paths: &[],
+            read_only_roots: &[],
+            read_only_symlinks: &[],
+            read_only_scaffold_directories: &[],
+            hidden_roots: std::slice::from_ref(&hidden),
+        };
+        let spec = SandboxSpec::local_agent(&selected, &scope).unwrap();
         let (policy, definitions) = build_read_policy(&spec).unwrap();
 
         assert!(definitions.iter().any(|(_, path)| path == &hidden));

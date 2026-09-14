@@ -24,6 +24,8 @@ pub(super) struct SandboxSpec {
     writable_roots: Vec<PathBuf>,
     read_only_overrides: Vec<PathBuf>,
     read_only_roots: Vec<PathBuf>,
+    read_only_symlinks: Vec<PathBuf>,
+    read_only_scaffold_directories: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     discovered_protected_metadata_paths: Vec<PathBuf>,
     network_access: bool,
@@ -47,6 +49,8 @@ impl SandboxSpec {
             writable_roots: roots,
             read_only_overrides: Vec::new(),
             read_only_roots: Vec::new(),
+            read_only_symlinks: Vec::new(),
+            read_only_scaffold_directories: Vec::new(),
             hidden_roots: Vec::new(),
             discovered_protected_metadata_paths: Vec::new(),
             network_access: false,
@@ -55,30 +59,29 @@ impl SandboxSpec {
 
     pub(super) fn local_agent(
         cwd: &Path,
-        writable_roots: &[PathBuf],
-        temporary_roots: &[PathBuf],
-        read_only_paths: &[PathBuf],
-        read_only_roots: &[PathBuf],
-        hidden_roots: &[PathBuf],
+        scope: &crate::sandbox::LocalAgentScope<'_>,
     ) -> Result<Self> {
         let _cwd = canonical_existing_root(cwd)?;
-        let mut writable = writable_roots
+        let mut writable = scope
+            .writable_roots
             .iter()
             .map(|root| canonical_existing_root(root))
             .collect::<Result<Vec<_>>>()?;
         normalize_roots(&mut writable);
         let discovered_protected_metadata_paths =
             discover_local_agent_metadata_for_roots(&writable)?;
-        let mut roots = Vec::with_capacity(writable.len() + temporary_roots.len());
+        let mut roots = Vec::with_capacity(writable.len() + scope.temporary_roots.len());
         roots.extend(writable);
         roots.extend(
-            temporary_roots
+            scope
+                .temporary_roots
                 .iter()
                 .map(|root| canonical_existing_root(root))
                 .collect::<Result<Vec<_>>>()?,
         );
         normalize_roots(&mut roots);
-        let mut read_only_overrides = read_only_paths
+        let mut read_only_overrides = scope
+            .read_only_paths
             .iter()
             .map(|path| {
                 std::fs::canonicalize(path)
@@ -86,16 +89,26 @@ impl SandboxSpec {
             })
             .collect::<Result<Vec<_>>>()?;
         normalize_paths(&mut read_only_overrides);
-        let mut visible_roots = read_only_roots
+        let mut visible_roots = scope
+            .read_only_roots
             .iter()
             .map(|root| canonical_existing_root(root))
             .collect::<Result<Vec<_>>>()?;
         normalize_roots(&mut visible_roots);
-        let mut hidden = hidden_roots
+        let mut hidden = scope
+            .hidden_roots
             .iter()
             .map(|root| canonical_existing_root(root))
             .collect::<Result<Vec<_>>>()?;
         normalize_roots(&mut hidden);
+        let mut visible_symlinks = scope
+            .read_only_symlinks
+            .iter()
+            .map(|symlink| symlink.link.clone())
+            .collect::<Vec<_>>();
+        normalize_paths(&mut visible_symlinks);
+        let mut scaffold_directories = scope.read_only_scaffold_directories.to_vec();
+        normalize_paths(&mut scaffold_directories);
         for root in &visible_roots {
             anyhow::ensure!(
                 !roots.iter().any(|writable| writable == root),
@@ -120,6 +133,8 @@ impl SandboxSpec {
             writable_roots: roots,
             read_only_overrides,
             read_only_roots: visible_roots,
+            read_only_symlinks: visible_symlinks,
+            read_only_scaffold_directories: scaffold_directories,
             hidden_roots: hidden,
             discovered_protected_metadata_paths,
             network_access: true,
@@ -160,6 +175,14 @@ impl SandboxSpec {
 
     pub(super) fn read_only_roots(&self) -> &[PathBuf] {
         &self.read_only_roots
+    }
+
+    pub(super) fn read_only_symlinks(&self) -> &[PathBuf] {
+        &self.read_only_symlinks
+    }
+
+    pub(super) fn read_only_scaffold_directories(&self) -> &[PathBuf] {
+        &self.read_only_scaffold_directories
     }
 
     pub(super) fn hidden_roots(&self) -> &[PathBuf] {

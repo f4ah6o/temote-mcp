@@ -28,21 +28,10 @@ pub fn command(
 pub fn local_agent_command(
     command: &[String],
     cwd: &Path,
-    writable_roots: &[PathBuf],
-    temporary_roots: &[PathBuf],
-    read_only_paths: &[PathBuf],
-    read_only_roots: &[PathBuf],
-    hidden_roots: &[PathBuf],
+    scope: &crate::sandbox::LocalAgentScope<'_>,
 ) -> Result<Command> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
-    let policy = LinuxSandboxPolicy::for_local_agent(
-        cwd,
-        writable_roots,
-        temporary_roots,
-        read_only_paths,
-        read_only_roots,
-        hidden_roots,
-    )?;
+    let policy = LinuxSandboxPolicy::for_local_agent(cwd, scope)?;
     let executable = helper_executable()?;
     let args = helper::command_args(&policy, command)?;
     let mut process = Command::new(executable);

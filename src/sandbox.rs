@@ -233,12 +233,30 @@ pub struct Output {
     pub truncated: bool,
 }
 
+/// A verified intermediate symlink that must be visible for a bounded
+/// executable path graph to resolve inside the local-agent sandbox.
+///
+/// `link` is the lexical path that must exist in the sandbox and `target` is
+/// its canonical host target. The parent constructs these values from the
+/// fixed agent selected by the broker; the platform-specific sandbox backend
+/// validates them again before exposing anything.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalAgentSymlink {
+    pub link: PathBuf,
+    pub target: PathBuf,
+}
+
 /// Canonical filesystem scope for a local-agent invocation.
 pub struct LocalAgentScope<'a> {
     pub writable_roots: &'a [PathBuf],
     pub temporary_roots: &'a [PathBuf],
     pub read_only_paths: &'a [PathBuf],
     pub read_only_roots: &'a [PathBuf],
+    pub read_only_symlinks: &'a [LocalAgentSymlink],
+    /// Existing normal directories that are needed only to resolve a
+    /// verified launcher path. Linux recreates these as empty directories;
+    /// their host contents are never mounted.
+    pub read_only_scaffold_directories: &'a [PathBuf],
     pub hidden_roots: &'a [PathBuf],
 }
 
@@ -274,29 +292,16 @@ pub async fn run_local_agent(
         scope.temporary_roots,
         scope.read_only_paths,
         scope.read_only_roots,
+        scope.read_only_symlinks,
+        scope.read_only_scaffold_directories,
         scope.hidden_roots,
     )?;
 
     #[cfg(target_os = "macos")]
-    let spec = policy::SandboxSpec::local_agent(
-        &cwd,
-        scope.writable_roots,
-        scope.temporary_roots,
-        scope.read_only_paths,
-        scope.read_only_roots,
-        scope.hidden_roots,
-    )?;
+    let spec = policy::SandboxSpec::local_agent(&cwd, &scope)?;
 
     #[cfg(target_os = "linux")]
-    let mut process = linux::local_agent_command(
-        command,
-        &cwd,
-        scope.writable_roots,
-        scope.temporary_roots,
-        scope.read_only_paths,
-        scope.read_only_roots,
-        scope.hidden_roots,
-    )?;
+    let mut process = linux::local_agent_command(command, &cwd, &scope)?;
 
     #[cfg(target_os = "macos")]
     let mut process = macos::command(&spec, command)?;
@@ -638,6 +643,8 @@ fn validate_local_agent_scope(
     temporary_roots: &[PathBuf],
     read_only_paths: &[PathBuf],
     read_only_roots: &[PathBuf],
+    read_only_symlinks: &[LocalAgentSymlink],
+    read_only_scaffold_directories: &[PathBuf],
     hidden_roots: &[PathBuf],
 ) -> Result<()> {
     for root in temporary_roots {
@@ -689,6 +696,91 @@ fn validate_local_agent_scope(
             canonical.display()
         );
     }
+    for directory in read_only_scaffold_directories {
+        anyhow::ensure!(
+            is_absolute_clean_path(directory),
+            "local agent scaffold directory is not a normalized absolute path: {}",
+            directory.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(directory),
+            "local agent scaffold directory must not be inside protected metadata: {}",
+            directory.display()
+        );
+        anyhow::ensure!(
+            directory != Path::new("/"),
+            "local agent scaffold directory must not be the filesystem root"
+        );
+        let metadata = std::fs::symlink_metadata(directory).with_context(|| {
+            format!(
+                "cannot inspect local agent scaffold directory {}",
+                directory.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "local agent scaffold path is not a directory: {}",
+            directory.display()
+        );
+        anyhow::ensure!(
+            std::fs::canonicalize(directory).with_context(|| {
+                format!(
+                    "cannot resolve local agent scaffold directory {}",
+                    directory.display()
+                )
+            })? == *directory,
+            "local agent scaffold directory is not canonical: {}",
+            directory.display()
+        );
+    }
+    for symlink in read_only_symlinks {
+        anyhow::ensure!(
+            is_absolute_clean_path(&symlink.link),
+            "local agent read-only symlink link is not a normalized absolute path: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&symlink.link),
+            "local agent read-only symlink must not be inside protected metadata: {}",
+            symlink.link.display()
+        );
+        anyhow::ensure!(
+            is_absolute_clean_path(&symlink.target),
+            "local agent read-only symlink target is not a normalized absolute path: {}",
+            symlink.target.display()
+        );
+        anyhow::ensure!(
+            !is_protected_metadata_location(&symlink.target),
+            "local agent read-only symlink target must not be inside protected metadata: {}",
+            symlink.target.display()
+        );
+        anyhow::ensure!(
+            symlink.target != Path::new("/"),
+            "local agent read-only symlink target must not be the filesystem root"
+        );
+        let metadata = std::fs::symlink_metadata(&symlink.link).with_context(|| {
+            format!(
+                "cannot inspect local agent read-only symlink {}",
+                symlink.link.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.file_type().is_symlink(),
+            "local agent read-only path is no longer a symlink: {}",
+            symlink.link.display()
+        );
+        let canonical = std::fs::canonicalize(&symlink.link).with_context(|| {
+            format!(
+                "cannot resolve local agent read-only symlink {}",
+                symlink.link.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical == symlink.target,
+            "local agent read-only symlink target changed: {}",
+            symlink.link.display()
+        );
+    }
     for root in hidden_roots {
         let canonical = std::fs::canonicalize(root).with_context(|| {
             format!("cannot resolve local agent hidden root {}", root.display())
@@ -709,6 +801,16 @@ fn validate_local_agent_scope(
         );
     }
     Ok(())
+}
+
+fn is_absolute_clean_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 fn is_protected_metadata_location(path: &Path) -> bool {
@@ -1583,6 +1685,9 @@ mod generic_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use uuid::Uuid;
 
     fn test_root() -> tempfile::TempDir {
@@ -1593,6 +1698,196 @@ mod linux_tests {
         std::iter::once(program.to_owned())
             .chain(args.iter().map(|arg| (*arg).to_owned()))
             .collect()
+    }
+
+    fn unix_socket_address(
+        name: &[u8],
+        abstract_namespace: bool,
+    ) -> Result<(libc::sockaddr_un, libc::socklen_t)> {
+        anyhow::ensure!(!name.is_empty(), "Unix socket name must not be empty");
+        let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let start = usize::from(abstract_namespace);
+        anyhow::ensure!(
+            name.len() + start < address.sun_path.len(),
+            "Unix socket name is too long for the test address"
+        );
+        // SAFETY: `address` is zero-initialized, `sun_path` has enough room
+        // for the requested bytes, and both source and destination do not
+        // overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                address.sun_path.as_mut_ptr().cast::<u8>().add(start),
+                name.len(),
+            );
+        }
+        let length = std::mem::offset_of!(libc::sockaddr_un, sun_path)
+            + start
+            + name.len()
+            + usize::from(!abstract_namespace);
+        Ok((address, length as libc::socklen_t))
+    }
+
+    fn bind_abstract_listener(name: &[u8]) -> Result<OwnedFd> {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        anyhow::ensure!(
+            fd >= 0,
+            "failed to create dummy abstract Unix listener: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` is a newly-created, owned file descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let (address, length) = unix_socket_address(name, true)?;
+        // SAFETY: `address` remains alive for the duration of the syscall and
+        // `length` describes the initialized abstract socket address.
+        let result = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                length,
+            )
+        };
+        anyhow::ensure!(
+            result == 0,
+            "failed to bind dummy abstract Unix listener: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` is a valid stream socket owned by this test.
+        let result = unsafe { libc::listen(fd.as_raw_fd(), 1) };
+        anyhow::ensure!(
+            result == 0,
+            "failed to listen on dummy abstract Unix socket: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` is valid and owned by this test; changing its status
+        // flags does not transfer ownership or create an alias.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        anyhow::ensure!(
+            flags >= 0,
+            "failed to inspect dummy abstract Unix listener flags: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` is valid and the flags were obtained immediately above.
+        let result =
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        anyhow::ensure!(
+            result == 0,
+            "failed to make dummy abstract Unix listener nonblocking: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(fd)
+    }
+
+    fn allowed_stream_socketpair() -> Result<(OwnedFd, OwnedFd)> {
+        let mut fds = [-1; 2];
+        let result = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        anyhow::ensure!(
+            result == 0,
+            "required stream socketpair was denied: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: a successful socketpair call initialized two distinct,
+        // owned file descriptors in `fds`.
+        let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: see the ownership argument for `first`; `fds[1]` is the
+        // other descriptor returned by the same successful call.
+        let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((first, second))
+    }
+
+    fn assert_socket_denied(socket_type: i32) -> Result<()> {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+        anyhow::ensure!(
+            fd == -1,
+            "AF_UNIX socket unexpectedly succeeded for type {socket_type:#x}"
+        );
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.raw_os_error() == Some(libc::EPERM),
+            "AF_UNIX socket failed with an unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    fn assert_socketpair_denied(domain: i32, socket_type: i32, protocol: i32) -> Result<()> {
+        let mut fds = [-1; 2];
+        let result = unsafe { libc::socketpair(domain, socket_type, protocol, fds.as_mut_ptr()) };
+        anyhow::ensure!(
+            result == -1,
+            "socketpair unexpectedly succeeded for domain {domain} type {socket_type:#x} protocol {protocol}"
+        );
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.raw_os_error() == Some(libc::EPERM),
+            "socketpair failed with an unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    fn assert_socketpair_cannot_connect(
+        address: &libc::sockaddr_un,
+        length: libc::socklen_t,
+        label: &str,
+    ) -> Result<()> {
+        let (first, _second) = allowed_stream_socketpair()?;
+        // SAFETY: `address` is initialized by `unix_socket_address` and lives
+        // through this syscall; `first` is a valid connected stream socket.
+        let result = unsafe {
+            libc::connect(
+                first.as_raw_fd(),
+                (address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                length,
+            )
+        };
+        anyhow::ensure!(
+            result == -1,
+            "allowed stream socketpair connected to {label}"
+        );
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.raw_os_error() == Some(libc::EISCONN),
+            "connecting an already-connected stream socketpair to {label} returned an unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    fn assert_no_path_listener_connection(listener: &UnixListener) -> Result<()> {
+        match listener.accept() {
+            Ok(_) => anyhow::bail!("sandbox unexpectedly reached the pathname Unix socket"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn assert_no_abstract_listener_connection(listener: &OwnedFd) -> Result<()> {
+        // SAFETY: `listener` is a valid nonblocking listening socket and null
+        // address arguments intentionally discard any accepted peer address.
+        let fd = unsafe {
+            libc::accept4(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            )
+        };
+        anyhow::ensure!(
+            fd == -1,
+            "sandbox unexpectedly reached the abstract Unix socket"
+        );
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.kind() == std::io::ErrorKind::WouldBlock,
+            "abstract Unix listener returned an unexpected error: {error}"
+        );
+        Ok(())
     }
 
     fn host_git(cwd: &Path, args: &[&str]) -> Result<()> {
@@ -2074,6 +2369,114 @@ done
     }
 
     #[tokio::test]
+    async fn linux_local_agent_seccomp_allows_runtime_stream_pair_only() -> Result<()> {
+        const ROLE: &str = "TEMOTE_TEST_LOCAL_AGENT_SOCKETPAIR_ROLE";
+        const PATH_SOCKET: &str = "TEMOTE_TEST_LOCAL_AGENT_PATH_SOCKET";
+        const ABSTRACT_SOCKET: &str = "TEMOTE_TEST_LOCAL_AGENT_ABSTRACT_SOCKET";
+        const TEST_NAME: &str =
+            "sandbox::linux_tests::linux_local_agent_seccomp_allows_runtime_stream_pair_only";
+        const STREAM_TYPE: i32 = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+
+        if std::env::var(ROLE).as_deref() == Ok("fixture") {
+            let pathname = PathBuf::from(
+                std::env::var(PATH_SOCKET).context("pathname Unix socket path is missing")?,
+            );
+            let abstract_name =
+                std::env::var(ABSTRACT_SOCKET).context("abstract Unix socket name is missing")?;
+
+            let (_first, _second) = allowed_stream_socketpair()?;
+            assert_socket_denied(STREAM_TYPE)?;
+            assert_socket_denied(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)?;
+            assert_socketpair_denied(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )?;
+            assert_socketpair_denied(libc::AF_UNIX, STREAM_TYPE & !libc::SOCK_NONBLOCK, 0)?;
+            assert_socketpair_denied(libc::AF_UNIX, STREAM_TYPE, 1)?;
+            assert_socketpair_denied(libc::AF_INET, STREAM_TYPE, 0)?;
+
+            if UnixStream::connect(&pathname).is_ok() {
+                anyhow::bail!("pathname Unix socket creation unexpectedly succeeded");
+            }
+
+            let (pathname_address, pathname_length) =
+                unix_socket_address(pathname.as_os_str().as_bytes(), false)?;
+            assert_socketpair_cannot_connect(
+                &pathname_address,
+                pathname_length,
+                "the pathname Unix socket",
+            )?;
+            let (abstract_address, abstract_length) =
+                unix_socket_address(abstract_name.as_bytes(), true)?;
+            assert_socketpair_cannot_connect(
+                &abstract_address,
+                abstract_length,
+                "the abstract Unix socket",
+            )?;
+            return Ok(());
+        }
+
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        let state = root.path().join("state");
+        let state_tmp = state.join("tmp");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&state_tmp)?;
+
+        // Keep both dummy receivers outside the hidden policy root. If a
+        // broader socket rule accidentally permits a path-based connection,
+        // these listeners observe it without touching a host service.
+        let listener_root = test_root();
+        let pathname = listener_root.path().join("host-only.sock");
+        let pathname_listener = UnixListener::bind(&pathname)?;
+        pathname_listener.set_nonblocking(true)?;
+        let abstract_name = format!("temote-test-{}", Uuid::new_v4());
+        let abstract_listener = bind_abstract_listener(abstract_name.as_bytes())?;
+
+        let current_exe = std::env::current_exe()?;
+        let current_exe = current_exe
+            .to_str()
+            .context("current test executable path is not UTF-8")?;
+        let child_command = command(current_exe, &["--exact", TEST_NAME, "--nocapture"]);
+        let environment = HashMap::from([
+            (ROLE.to_owned(), "fixture".to_owned()),
+            (
+                PATH_SOCKET.to_owned(),
+                pathname.to_string_lossy().into_owned(),
+            ),
+            (ABSTRACT_SOCKET.to_owned(), abstract_name),
+            ("HOME".to_owned(), state.to_string_lossy().into_owned()),
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            (
+                "TMPDIR".to_owned(),
+                state_tmp.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let hidden_root = root.path().to_path_buf();
+        let output = run_local_agent(
+            &child_command,
+            &workspace,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&state),
+                temporary_roots: std::slice::from_ref(&state_tmp),
+                read_only_paths: &[],
+                read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
+                read_only_scaffold_directories: &[],
+                hidden_roots: std::slice::from_ref(&hidden_root),
+            },
+            None,
+            &environment,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_no_path_listener_connection(&pathname_listener)?;
+        assert_no_abstract_listener_connection(&abstract_listener)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn linux_local_agent_profile_bounds_workspace_writes() -> Result<()> {
         let root = test_root();
         let workspace = root.path().join("workspace");
@@ -2127,6 +2530,8 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: &[],
+                read_only_symlinks: &[],
+                read_only_scaffold_directories: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2159,6 +2564,8 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
+                read_only_scaffold_directories: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2186,6 +2593,8 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
+                read_only_scaffold_directories: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
@@ -2222,6 +2631,8 @@ done
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
                 read_only_roots: std::slice::from_ref(&workspace),
+                read_only_symlinks: &[],
+                read_only_scaffold_directories: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
             },
             None,
