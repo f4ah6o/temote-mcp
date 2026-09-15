@@ -21,6 +21,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::activity::broker::{ActivityBroker, BrokerError};
+use crate::activity::contract::{ActivityUpdate, ContractError, decode_update, encode_update};
 use crate::config::{self, Session};
 use crate::{friction, kintone_cli, kintone_mcp, sandbox, secret_broker};
 
@@ -42,6 +44,9 @@ const MAX_SERVICE_ACCOUNT_ALLOWED_LOCATORS: usize = 128;
 const REDACTED_TRUNCATED_SECRET_OUTPUT: &str = "[REDACTED_TRUNCATED_SECRET_OUTPUT]";
 const MAX_ACTIVITY_TITLE_BYTES: usize = 512;
 const MAX_ACTIVITY_DETAIL_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_ACTIVITY_ACK_BYTES: usize = 128;
+const ACTIVITY_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_ACTIVITY_ACKS: usize = 64;
 const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
@@ -348,6 +353,7 @@ pub struct Request {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct ExpectedSessionInstance {
     id: String,
     started_at: u64,
@@ -370,8 +376,137 @@ impl ExpectedSessionInstance {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActivityIngressError {
+    Unknown,
+    UnknownSchema,
+    InvalidInput,
+    StaleInstance,
+    RetiredSink,
+    TooLarge,
+    Busy,
+    SequenceExhausted,
+    Closed,
+    InvariantViolation,
+}
+
+impl ActivityIngressError {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::UnknownSchema => "unknown_schema",
+            Self::InvalidInput => "invalid_input",
+            Self::StaleInstance => "stale_instance",
+            Self::RetiredSink => "retired_sink",
+            Self::TooLarge => "too_large",
+            Self::Busy => "activity_busy",
+            Self::SequenceExhausted => "sequence_exhausted",
+            Self::Closed => "activity_closed",
+            Self::InvariantViolation => "invariant_violation",
+        }
+    }
+}
+
+impl fmt::Display for ActivityIngressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for ActivityIngressError {}
+
+/// A broker sink bound to one complete runtime instance.
+///
+/// The active flag is shared with the runtime handle. Retiring the handle
+/// therefore fences an already-created sink before a same-ID replacement can
+/// publish into the supervisor's broker. The sink performs no I/O and does
+/// not consult approval or session-control state.
+#[derive(Clone)]
+pub(crate) struct ActivitySink {
+    broker: Arc<ActivityBroker>,
+    expected_session: ExpectedSessionInstance,
+    session_instance: Uuid,
+    active: Arc<std::sync::Mutex<bool>>,
+}
+
+impl ActivitySink {
+    fn new(session: &Session, broker: Arc<ActivityBroker>) -> Self {
+        Self {
+            broker,
+            expected_session: ExpectedSessionInstance::from_session(session),
+            session_instance: Uuid::new_v4(),
+            active: Arc::new(std::sync::Mutex::new(true)),
+        }
+    }
+
+    fn retire(&self) {
+        match self.active.lock() {
+            Ok(mut active) => *active = false,
+            Err(poisoned) => *poisoned.into_inner() = false,
+        }
+    }
+
+    #[cfg(test)]
+    fn expected_session(&self) -> ExpectedSessionInstance {
+        self.expected_session.clone()
+    }
+
+    fn publish(
+        &self,
+        expected_session: &ExpectedSessionInstance,
+        update: ActivityUpdate,
+    ) -> Result<(), ActivityIngressError> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| ActivityIngressError::InvariantViolation)?;
+        if !*active {
+            return Err(ActivityIngressError::RetiredSink);
+        }
+        if expected_session != &self.expected_session {
+            return Err(ActivityIngressError::StaleInstance);
+        }
+
+        encode_update(&update)
+            .map_err(map_activity_contract_error)
+            .map(|_| ())?;
+        self.broker
+            .publish(
+                update,
+                Some(&self.expected_session.id),
+                Some(self.session_instance),
+            )
+            .map(|_| ())
+            .map_err(map_activity_broker_error)
+    }
+}
+
+fn map_activity_contract_error(error: ContractError) -> ActivityIngressError {
+    match error {
+        ContractError::UnknownSchema => ActivityIngressError::UnknownSchema,
+        ContractError::TooLarge => ActivityIngressError::TooLarge,
+        ContractError::InvalidValue
+        | ContractError::InvalidSummary
+        | ContractError::InvalidJson => ActivityIngressError::InvalidInput,
+    }
+}
+
+fn map_activity_broker_error(error: BrokerError) -> ActivityIngressError {
+    match error {
+        BrokerError::InvalidInput => ActivityIngressError::InvalidInput,
+        BrokerError::EventTooLarge => ActivityIngressError::TooLarge,
+        BrokerError::Busy => ActivityIngressError::Busy,
+        BrokerError::SequenceExhausted => ActivityIngressError::SequenceExhausted,
+        BrokerError::Closed => ActivityIngressError::Closed,
+        BrokerError::InvalidCapacity | BrokerError::InvariantViolation => {
+            ActivityIngressError::InvariantViolation
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 enum Message {
     Probe,
     Approval {
@@ -384,6 +519,12 @@ enum Message {
     Activity {
         title: String,
         detail: Option<String>,
+    },
+    ActivityUpdate {
+        #[serde(default)]
+        expected_session: Option<ExpectedSessionInstance>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        update: Option<Value>,
     },
     OnePasswordServiceAccount {
         request: ServiceAccountRequest,
@@ -926,6 +1067,7 @@ pub struct RuntimeHandle {
     id: String,
     cwd: PathBuf,
     session: Session,
+    activity_sink: Option<ActivitySink>,
     commands: mpsc::Sender<RuntimeCommand>,
     join: JoinHandle<Result<()>>,
 }
@@ -941,6 +1083,12 @@ impl RuntimeHandle {
 
     pub(crate) fn session_metadata(&self) -> Session {
         self.session.clone()
+    }
+
+    fn retire_activity_sink(&self) {
+        if let Some(sink) = &self.activity_sink {
+            sink.retire();
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1007,6 +1155,7 @@ impl RuntimeHandle {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        self.retire_activity_sink();
         crate::codex_app_server::begin_session_shutdown(&self.session);
         if config::read_session_lifecycle(&self.id)
             .await
@@ -1047,6 +1196,7 @@ impl RuntimeHandle {
     }
 
     pub async fn wait(self) -> Result<()> {
+        self.retire_activity_sink();
         crate::codex_app_server::begin_session_shutdown(&self.session);
         self.join
             .await
@@ -1080,6 +1230,48 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     approval_sender: ApprovalSender,
     logical_path: Option<String>,
     environment: CapturedStartEnvironment,
+) -> Result<RuntimeHandle> {
+    spawn_runtime_with_optional_activity_broker(
+        cwd,
+        session_id,
+        permission_mode,
+        approval_sender,
+        logical_path,
+        environment,
+        None,
+    )
+    .await
+}
+
+pub async fn spawn_runtime_with_logical_path_and_environment_and_activity_broker(
+    cwd: &Path,
+    session_id: Option<&str>,
+    permission_mode: config::PermissionMode,
+    approval_sender: ApprovalSender,
+    logical_path: Option<String>,
+    environment: CapturedStartEnvironment,
+    activity_broker: Arc<ActivityBroker>,
+) -> Result<RuntimeHandle> {
+    spawn_runtime_with_optional_activity_broker(
+        cwd,
+        session_id,
+        permission_mode,
+        approval_sender,
+        logical_path,
+        environment,
+        Some(activity_broker),
+    )
+    .await
+}
+
+async fn spawn_runtime_with_optional_activity_broker(
+    cwd: &Path,
+    session_id: Option<&str>,
+    permission_mode: config::PermissionMode,
+    approval_sender: ApprovalSender,
+    logical_path: Option<String>,
+    environment: CapturedStartEnvironment,
+    activity_broker: Option<Arc<ActivityBroker>>,
 ) -> Result<RuntimeHandle> {
     environment.validate()?;
     let service_account_token = environment
@@ -1175,6 +1367,8 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     let id_for_handle = session.id.clone();
     let cwd_for_handle = session.cwd.clone();
     let session_for_handle = session.clone();
+    let activity_sink = activity_broker.map(|broker| ActivitySink::new(&session, broker));
+    let activity_sink_for_runtime = activity_sink.clone();
     let fallback_session = session.clone();
     let final_path = path.clone();
     let (commands, command_receiver) = mpsc::channel(MAX_PENDING_RUNTIME_COMMANDS);
@@ -1187,6 +1381,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
             service_account_token.as_deref(),
             kintone_bridge,
             kintone_cli_bridge,
+            activity_sink_for_runtime,
         )
         .await;
         (session, result)
@@ -1244,6 +1439,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         id: id_for_handle,
         cwd: cwd_for_handle,
         session: session_for_handle,
+        activity_sink,
         commands,
         join,
     })
@@ -1312,12 +1508,93 @@ async fn receive_session_message(
     };
     let message: Message = match serde_json::from_str(&line) {
         Ok(message) => message,
-        Err(error) => {
-            eprintln!("[session {session_id}] ignoring invalid session message: {error}");
+        Err(_) => {
+            if is_activity_update_message(&line) {
+                write_activity_ack(stream, ActivityAck::Rejected(ActivityIngressError::InvalidInput))
+                    .await;
+            } else {
+                eprintln!("[session {session_id}] ignoring invalid session message");
+            }
             return;
         }
     };
     let _ = queue_incoming_session_message(&sender, stream, message, permit);
+}
+
+fn is_activity_update_message(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|message_type| message_type == "activity_update")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityAck {
+    Accepted,
+    Rejected(ActivityIngressError),
+}
+
+fn activity_ack_bytes(ack: ActivityAck) -> &'static [u8] {
+    let bytes = match ack {
+        ActivityAck::Accepted => b"{\"ok\":true}\n",
+        ActivityAck::Rejected(error) => match error {
+            ActivityIngressError::Unknown => b"{\"ok\":false,\"error\":\"unknown\"}\n",
+            ActivityIngressError::UnknownSchema => {
+                b"{\"ok\":false,\"error\":\"unknown_schema\"}\n"
+            }
+            ActivityIngressError::InvalidInput => {
+                b"{\"ok\":false,\"error\":\"invalid_input\"}\n"
+            }
+            ActivityIngressError::StaleInstance => {
+                b"{\"ok\":false,\"error\":\"stale_instance\"}\n"
+            }
+            ActivityIngressError::RetiredSink => {
+                b"{\"ok\":false,\"error\":\"retired_sink\"}\n"
+            }
+            ActivityIngressError::TooLarge => b"{\"ok\":false,\"error\":\"too_large\"}\n",
+            ActivityIngressError::Busy => b"{\"ok\":false,\"error\":\"activity_busy\"}\n",
+            ActivityIngressError::SequenceExhausted => {
+                b"{\"ok\":false,\"error\":\"sequence_exhausted\"}\n"
+            }
+            ActivityIngressError::Closed => {
+                b"{\"ok\":false,\"error\":\"activity_closed\"}\n"
+            }
+            ActivityIngressError::InvariantViolation => {
+                b"{\"ok\":false,\"error\":\"invariant_violation\"}\n"
+            }
+        },
+    };
+    debug_assert!(bytes.len() <= MAX_ACTIVITY_ACK_BYTES);
+    bytes
+}
+
+async fn write_activity_ack(mut stream: UnixStream, ack: ActivityAck) {
+    let bytes = activity_ack_bytes(ack);
+    let _ = tokio::time::timeout(ACTIVITY_ACK_WRITE_TIMEOUT, async {
+        if stream.write_all(bytes).await.is_ok() {
+            let _ = stream.shutdown().await;
+        }
+    })
+    .await;
+}
+
+fn queue_activity_ack(
+    stream: UnixStream,
+    ack: ActivityAck,
+    ack_slots: &Arc<Semaphore>,
+) {
+    let Ok(permit) = Arc::clone(ack_slots).try_acquire_owned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        write_activity_ack(stream, ack).await;
+    });
+}
+
+fn decode_activity_update(value: Value) -> Result<ActivityUpdate, ActivityIngressError> {
+    let bytes = serde_json::to_vec(&value).map_err(|_| ActivityIngressError::InvalidInput)?;
+    decode_update(&bytes).map_err(map_activity_contract_error)
 }
 
 struct ActiveOperationGuard {
@@ -1345,11 +1622,13 @@ async fn run_runtime(
     service_account_token: Option<&str>,
     kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
     kintone_cli_bridge: Arc<kintone_cli::Bridge>,
+    activity_sink: Option<ActivitySink>,
 ) -> Result<()> {
     let (approval_lifetime, _) = watch::channel(false);
     let (incoming_sender, mut incoming_receiver) = mpsc::channel(MAX_PENDING_SESSION_READS);
     let read_slots = Arc::new(Semaphore::new(MAX_PENDING_SESSION_READS));
     let approval_slots = Arc::new(Semaphore::new(MAX_PENDING_APPROVALS));
+    let activity_ack_slots = Arc::new(Semaphore::new(MAX_PENDING_ACTIVITY_ACKS));
     let active_operations = Arc::new(AtomicUsize::new(0));
     let mut upgrade_quiesced = false;
     loop {
@@ -1372,7 +1651,12 @@ async fn run_runtime(
             incoming = incoming_receiver.recv() => {
                 let Some(IncomingSessionMessage { mut stream, message, _permit }) = incoming else { continue };
                 drop(_permit);
-                if upgrade_quiesced && !matches!(&message, Message::Probe | Message::Activity { .. }) {
+                if upgrade_quiesced
+                    && !matches!(
+                        &message,
+                        Message::Probe | Message::Activity { .. } | Message::ActivityUpdate { .. }
+                    )
+                {
                     match &message {
                         Message::Approval { .. } => {
                             let _ = stream.write_all(b"deny\n").await;
@@ -1398,7 +1682,9 @@ async fn run_runtime(
                             );
                             let _ = stream.write_all(&bytes).await;
                         }
-                        Message::Probe | Message::Activity { .. } => unreachable!(),
+                        Message::Probe
+                        | Message::Activity { .. }
+                        | Message::ActivityUpdate { .. } => unreachable!(),
                     }
                     let _ = stream.shutdown().await;
                     continue;
@@ -1411,6 +1697,24 @@ async fn run_runtime(
                     }
                     Message::Activity { title, detail } => {
                         show_activity_for_session(&session.id, &title, detail.as_deref());
+                    }
+                    Message::ActivityUpdate {
+                        expected_session,
+                        update,
+                    } => {
+                        let result = match (activity_sink.as_ref(), expected_session, update) {
+                            (Some(sink), Some(expected_session), Some(update)) => {
+                                decode_activity_update(update).and_then(|update| {
+                                    sink.publish(&expected_session, update)
+                                })
+                            }
+                            _ => Err(ActivityIngressError::Unknown),
+                        };
+                        let ack = match result {
+                            Ok(()) => ActivityAck::Accepted,
+                            Err(error) => ActivityAck::Rejected(error),
+                        };
+                        queue_activity_ack(stream, ack, &activity_ack_slots);
                     }
                     Message::OnePasswordServiceAccount { request } => {
                         let session = session.clone();
@@ -2375,6 +2679,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
 
+    use crate::activity::contract::ActivityState;
+
     use super::*;
     use crate::test_support;
 
@@ -2388,6 +2694,74 @@ mod tests {
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
         }
+    }
+
+    const ACTIVITY_OPERATION_ID: Uuid =
+        Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0011);
+    const ACTIVITY_GENERATION: Uuid =
+        Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0012);
+
+    fn activity_broker_fixture() -> Arc<ActivityBroker> {
+        Arc::new(ActivityBroker::new(
+            || 1_780_000_000_000,
+            ACTIVITY_GENERATION,
+        ))
+    }
+
+    fn activity_update_fixture(state: crate::activity::contract::ActivityState) -> ActivityUpdate {
+        let duration_ms = match state {
+            crate::activity::contract::ActivityState::Completed
+            | crate::activity::contract::ActivityState::Failed
+            | crate::activity::contract::ActivityState::Cancelled => Some(12),
+            _ => None,
+        };
+        ActivityUpdate::new(
+            ACTIVITY_OPERATION_ID,
+            crate::activity::contract::ActivityOperation::ReadFile,
+            state,
+            duration_ms,
+            crate::activity::contract::ActivitySummary::empty(),
+        )
+        .unwrap()
+    }
+
+    fn activity_update_value(update: &ActivityUpdate) -> Value {
+        serde_json::from_slice(&encode_update(update).unwrap()).unwrap()
+    }
+
+    fn activity_message_value(
+        expected_session: Option<&ExpectedSessionInstance>,
+        update: Option<Value>,
+    ) -> Value {
+        json!({
+            "type": "activity_update",
+            "expected_session": expected_session,
+            "update": update,
+        })
+    }
+
+    fn activity_message_bytes(
+        expected_session: Option<&ExpectedSessionInstance>,
+        update: Option<Value>,
+    ) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&activity_message_value(expected_session, update)).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    async fn send_activity_message(path: &Path, bytes: Vec<u8>) -> Value {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            BufReader::new(stream).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        serde_json::from_str(line.trim()).unwrap()
     }
 
     #[cfg(target_os = "linux")]
@@ -3275,6 +3649,188 @@ esac
         let snapshot = handle.snapshot().await.unwrap();
         assert_eq!(snapshot.id, id);
         assert_eq!(snapshot.permission_mode, config::PermissionMode::Ask);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn activity_ingress_sink_fences_stale_and_retired_instances() {
+        let session = Session {
+            id: "activity-sink".to_owned(),
+            cwd: PathBuf::from("/tmp/activity-sink"),
+            permitted_directories: Vec::new(),
+            started_at: 41,
+            process_id: 4242,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let broker = activity_broker_fixture();
+        let sink = ActivitySink::new(&session, Arc::clone(&broker));
+        let expected = sink.expected_session();
+        let mut stale = expected.clone();
+        stale.started_at += 1;
+
+        assert_eq!(
+            sink.publish(&stale, activity_update_fixture(ActivityState::Started)),
+            Err(ActivityIngressError::StaleInstance)
+        );
+        assert_eq!(broker.current_sequence().unwrap(), 0);
+
+        sink.publish(
+            &expected,
+            activity_update_fixture(ActivityState::Started),
+        )
+        .unwrap();
+        assert_eq!(broker.current_sequence().unwrap(), 1);
+        sink.retire();
+        assert_eq!(
+            sink.publish(&expected, activity_update_fixture(ActivityState::Running)),
+            Err(ActivityIngressError::RetiredSink)
+        );
+        assert_eq!(broker.current_sequence().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_socket_accepts_current_and_rejects_invalid_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("activity-ingress-{}", Uuid::new_v4());
+        let broker = activity_broker_fixture();
+        let mut subscription = broker.subscribe_snapshot(None, 0).unwrap();
+        let (approval_sender, mut approval_receiver) = approval_channel();
+        let handle =
+            spawn_runtime_with_logical_path_and_environment_and_activity_broker(
+                root.path(),
+                Some(&id),
+                config::PermissionMode::Ask,
+                approval_sender,
+                None,
+                CapturedStartEnvironment::default(),
+                Arc::clone(&broker),
+            )
+            .await
+            .unwrap();
+        let path = config::socket_path(&id).unwrap();
+        let expected = ExpectedSessionInstance::from_session(&handle.session_metadata());
+
+        let accepted = send_activity_message(
+            &path,
+            activity_message_bytes(
+                Some(&expected),
+                Some(activity_update_value(&activity_update_fixture(ActivityState::Started))),
+            ),
+        )
+        .await;
+        assert_eq!(accepted["ok"], true);
+        assert!(
+            accepted.to_string().len() < MAX_ACTIVITY_ACK_BYTES,
+            "activity ACK exceeded its fixed bound"
+        );
+        let event = match tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            crate::activity::broker::ActivityDelivery::Event(event) => event,
+            other => panic!("unexpected activity delivery: {other:?}"),
+        };
+        assert_eq!(event.sequence(), 1);
+        assert_eq!(event.session_id(), Some(id.as_str()));
+        assert!(event.session_instance().is_some());
+
+        let mut stale = expected.clone();
+        stale.process_id += 1;
+        let rejected = send_activity_message(
+            &path,
+            activity_message_bytes(
+                Some(&stale),
+                Some(activity_update_value(&activity_update_fixture(ActivityState::Running))),
+            ),
+        )
+        .await;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "stale_instance");
+
+        let mut unknown_schema = activity_update_value(&activity_update_fixture(ActivityState::Running));
+        unknown_schema["schema_version"] = json!(2);
+        let rejected = send_activity_message(
+            &path,
+            activity_message_bytes(Some(&expected), Some(unknown_schema)),
+        )
+        .await;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "unknown_schema");
+
+        let rejected = send_activity_message(
+            &path,
+            activity_message_bytes(
+                Some(&expected),
+                Some(json!("x".repeat(crate::activity::contract::MAX_ACTIVITY_EVENT_BYTES + 1))),
+            ),
+        )
+        .await;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "too_large");
+
+        let mut additional_field = activity_update_value(&activity_update_fixture(ActivityState::Running));
+        additional_field["unexpected"] = json!("ignored");
+        let rejected = send_activity_message(
+            &path,
+            activity_message_bytes(Some(&expected), Some(additional_field)),
+        )
+        .await;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "invalid_input");
+
+        let rejected = send_activity_message(
+            &path,
+            activity_message_bytes(None, Some(activity_update_value(&activity_update_fixture(
+                ActivityState::Running,
+            )))),
+        )
+        .await;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"], "unknown");
+
+        assert_eq!(broker.current_sequence().unwrap(), 1);
+        assert!(approval_receiver.try_recv().is_err());
+        assert!(config::session_is_active(&id).await.unwrap());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_ack_failure_does_not_stop_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let id = format!("activity-ack-failure-{}", Uuid::new_v4());
+        let broker = activity_broker_fixture();
+        let (approval_sender, _approval_receiver) = approval_channel();
+        let handle =
+            spawn_runtime_with_logical_path_and_environment_and_activity_broker(
+                root.path(),
+                Some(&id),
+                config::PermissionMode::Ask,
+                approval_sender,
+                None,
+                CapturedStartEnvironment::default(),
+                broker,
+            )
+            .await
+            .unwrap();
+        let path = config::socket_path(&id).unwrap();
+        let expected = ExpectedSessionInstance::from_session(&handle.session_metadata());
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream
+            .write_all(&activity_message_bytes(
+                Some(&expected),
+                Some(activity_update_value(&activity_update_fixture(ActivityState::Started))),
+            ))
+            .await
+            .unwrap();
+        drop(stream);
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), handle.snapshot())
+            .await
+            .expect("ACK failure blocked runtime control")
+            .unwrap();
+        assert_eq!(snapshot.id, id);
+        assert!(config::session_is_active(&id).await.unwrap());
         handle.shutdown().await.unwrap();
     }
 
