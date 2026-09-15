@@ -4261,11 +4261,20 @@ esac
                     }));
                 }
 
+                let mut prompts = Vec::with_capacity(count);
                 for _ in 0..count {
-                    tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-                        .await
-                        .expect("pending approval was not delivered")
-                        .expect("approval channel closed unexpectedly");
+                    prompts.push(
+                        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                            .await
+                            .expect("pending approval was not delivered")
+                            .expect("approval channel closed unexpectedly"),
+                    );
+                }
+                for request in &requests {
+                    assert!(
+                        !request.is_finished(),
+                        "approval resolved before runtime shutdown"
+                    );
                 }
 
                 // Prompt delivery proves every shutdown watcher is installed.
@@ -4280,6 +4289,7 @@ esac
                 })
                 .await
                 .expect("pending approvals did not all resolve after shutdown");
+                drop(prompts);
                 assert!(!config::session_is_active(&id).await.unwrap());
             });
             Ok(())
