@@ -213,7 +213,8 @@ and OAuth reconnect:
 The same exact Linux E2E passed again at merged integration commit `8ebaf59` in
 117.92 seconds. That run observed a successful 7.666-second preflight and
 27.681-second apply and repeated the same atomic replacement, coordinator,
-reconnect, identity, restored-session, terminal-status, and no-orphan assertions.
+reconnect, identity, restored-session, and terminal-status assertions. A
+separate post-run namespace scan found no remaining fixture processes.
 
 The Linux result does not establish macOS behavior. The required macOS
 process-boundary reconnect E2E remains pending, so this issue stays open and no
