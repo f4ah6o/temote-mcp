@@ -1,6 +1,8 @@
 # Completion evaluation results (2026-09-15, Asia/Tokyo)
 
-Status: execution in progress. Task definitions are frozen in [`completion-evaluation-manifest-20260915.md`](completion-evaluation-manifest-20260915.md).
+Status: **historical activity-branch snapshot; current residual work is blocked**. Task definitions remain frozen in [`completion-evaluation-manifest-20260915.md`](completion-evaluation-manifest-20260915.md). The authoritative detailed evaluation ledger is on branch `codex/20260915-completion-evaluation`, found at `cf9d1ffe69638a27af3f39c6b19a1b5ac704ae50` at resume, with a subsequent qualification update. Earlier `running` rows below are historical observations, not current job state. See [the resumed candidate validation](completion-residual-validation-20260915.md) for the current blocked reviewer/runtime and candidate-only gate results.
+
+An `Applied` resume receipt acknowledges reconciliation, not successful continuation or task completion. The previously recorded stopped-child qualification returned `Applied` with `Interrupted`; it did not directly record a replacement-process PID or demonstrate completion after resume. No new live resume evidence was collected in this attempt. This qualification is also stated in English/Japanese usage and the Agent Skill.
 
 ## Runtime qualification
 
