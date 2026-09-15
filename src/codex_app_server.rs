@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::{approvals, config, evidence};
@@ -1523,6 +1523,8 @@ fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
 struct RpcClient {
     tx: mpsc::Sender<ClientCommand>,
     actor: Arc<Mutex<Option<JoinHandle<()>>>>,
+    actor_id: Uuid,
+    stopped: watch::Receiver<bool>,
 }
 
 enum ClientCommand {
@@ -1544,6 +1546,19 @@ struct ServerResponse {
 }
 
 impl RpcClient {
+    fn is_stopped(&self) -> bool {
+        *self.stopped.borrow()
+    }
+
+    async fn wait_stopped(&self) {
+        let mut stopped = self.stopped.clone();
+        while !*stopped.borrow_and_update() {
+            if stopped.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
     fn try_request(
         &self,
         method: &'static str,
@@ -1600,7 +1615,24 @@ impl RpcClient {
         let actor = self.actor.lock().unwrap().take();
         if let Some(actor) = actor {
             let _ = actor.await;
+        } else {
+            self.wait_stopped().await;
         }
+    }
+}
+
+fn tracked_rpc_client(tx: mpsc::Sender<ClientCommand>, worker: JoinHandle<()>) -> RpcClient {
+    let actor_id = Uuid::new_v4();
+    let (stopped_tx, stopped) = watch::channel(false);
+    let actor = tokio::spawn(async move {
+        let _ = worker.await;
+        let _ = stopped_tx.send(true);
+    });
+    RpcClient {
+        tx,
+        actor: Arc::new(Mutex::new(Some(actor))),
+        actor_id,
+        stopped,
     }
 }
 
@@ -1711,6 +1743,7 @@ async fn notify_codex(
 #[derive(Clone)]
 struct RuntimeHandle {
     client: RpcClient,
+    actor_id: Uuid,
     owner: SessionInstance,
     scope: PathBuf,
     started_at: Instant,
@@ -1734,6 +1767,9 @@ fn runtime_for(session: &config::Session, task_id: Uuid) -> Option<RuntimeHandle
     }
     let state = runtimes().lock().unwrap();
     let runtime = state.get(&task_id)?;
+    if runtime.client.is_stopped() {
+        return None;
+    }
     if Instant::now().saturating_duration_since(runtime.started_at) >= CHILD_LIFETIME {
         return None;
     }
@@ -1747,7 +1783,32 @@ fn runtime_matches_record(record: &TaskRecord) -> bool {
         .lock()
         .unwrap()
         .get(&record.task_id)
-        .is_some_and(|runtime| runtime.owner == record.owner && runtime.scope == record.scope_cwd)
+        .is_some_and(|runtime| {
+            !runtime.client.is_stopped()
+                && runtime.owner == record.owner
+                && runtime.scope == record.scope_cwd
+        })
+}
+
+fn take_runtime_if_matches(
+    task_id: Uuid,
+    owner: &SessionInstance,
+    scope: &Path,
+    actor_id: Uuid,
+) -> Option<RuntimeHandle> {
+    let _guard = store_lock().lock().unwrap();
+    let mut state = runtimes().lock().unwrap();
+    let matches = state.get(&task_id).is_some_and(|runtime| {
+        runtime.actor_id == actor_id && runtime.owner == *owner && runtime.scope == scope
+    });
+    matches.then(|| state.remove(&task_id)).flatten()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeWatchEvent {
+    ActorStopped,
+    LifetimeElapsed,
+    SessionStopped,
 }
 
 async fn insert_runtime(
@@ -1771,12 +1832,15 @@ fn insert_runtime_unchecked(
     lease: Arc<TaskRuntimeLease>,
 ) -> Result<()> {
     let owner = owner.clone();
+    let session = session.clone();
     let store = store.clone();
     let scope = config::canonical_directory(&session.cwd)?;
+    let actor_id = client.actor_id;
     let runtime = RuntimeHandle {
         client: client.clone(),
+        actor_id,
         owner: owner.clone(),
-        scope,
+        scope: scope.clone(),
         started_at: Instant::now(),
         _lease: lease,
     };
@@ -1798,32 +1862,43 @@ fn insert_runtime_unchecked(
         state.insert(task_id, runtime);
     }
     tokio::spawn(async move {
-        let session_stopped = tokio::select! {
-            _ = tokio::time::sleep(CHILD_LIFETIME) => false,
-            _ = wait_for_session_stop(owner.clone()) => true,
+        let event = tokio::select! {
+            _ = client.wait_stopped() => RuntimeWatchEvent::ActorStopped,
+            _ = tokio::time::sleep(CHILD_LIFETIME) => RuntimeWatchEvent::LifetimeElapsed,
+            _ = wait_for_session_stop(owner.clone()) => RuntimeWatchEvent::SessionStopped,
         };
-        let client = {
-            let _guard = store_lock().lock().unwrap();
-            runtimes()
-                .lock()
-                .unwrap()
-                .get(&task_id)
-                .filter(|runtime| runtime.owner == owner)
-                .map(|runtime| runtime.client.clone())
-        };
-        if let Some(client) = client {
+        if event != RuntimeWatchEvent::ActorStopped {
             client.shutdown().await;
         }
-        {
-            let _guard = store_lock().lock().unwrap();
-            let mut state = runtimes().lock().unwrap();
-            if state
-                .get(&task_id)
-                .is_some_and(|runtime| runtime.owner == owner)
-            {
-                state.remove(&task_id);
+        let Some(runtime) = take_runtime_if_matches(task_id, &owner, &scope, actor_id) else {
+            return;
+        };
+        let session_stopped =
+            event == RuntimeWatchEvent::SessionStopped || session_instance_is_closing(&owner);
+        if !session_stopped {
+            let result = store.update_if_instance_live(&session, task_id, &owner, |record| {
+                if !record.status.is_terminal()
+                    && !matches!(
+                        record.status,
+                        TaskStatus::Unknown | TaskStatus::ReconciliationRequired
+                    )
+                {
+                    record.status = TaskStatus::Unknown;
+                    record.revision = record.revision.saturating_add(1);
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!(
+                    "failed to preserve recoverable Codex task {} after app-server exit: {error:#}",
+                    task_id
+                );
             }
         }
+        // RuntimeHandle retains the final registry-owned lease while the
+        // recoverable state is persisted. Dropping it now allows a same- or
+        // cross-process caller to acquire ownership and explicitly reconcile.
+        drop(runtime);
         if session_stopped {
             let result = async {
                 wait_for_session_inflight_drain(&owner, SESSION_CODEX_DRAIN_TIMEOUT).await?;
@@ -2140,7 +2215,7 @@ fn spawn_client_with_binary_unchecked(
         .take()
         .context("Codex app-server stdout unavailable")?;
     let (tx, rx) = mpsc::channel(64);
-    let actor = tokio::spawn(run_actor(
+    let worker = tokio::spawn(run_actor(
         child,
         stdin,
         stdout,
@@ -2149,10 +2224,7 @@ fn spawn_client_with_binary_unchecked(
         rx,
         runtime_lease,
     ));
-    Ok(RpcClient {
-        tx,
-        actor: Arc::new(Mutex::new(Some(actor))),
-    })
+    Ok(tracked_rpc_client(tx, worker))
 }
 
 fn filtered_codex_environment<I>(environment: I) -> Vec<(OsString, OsString)>
@@ -2183,6 +2255,7 @@ async fn run_actor(
 ) {
     let mut reader = BufReader::new(stdout);
     let (server_tx, mut server_rx) = mpsc::channel::<ServerResponse>(16);
+    let mut server_tasks = JoinSet::new();
     let mut next_id = 1u64;
     let mut pending = HashMap::<u64, oneshot::Sender<std::result::Result<Value, String>>>::new();
     let terminal_error = loop {
@@ -2234,7 +2307,7 @@ async fn run_actor(
                                 let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
                                 let tx = server_tx.clone();
                                 let session = session.clone();
-                                tokio::spawn(async move {
+                                server_tasks.spawn(async move {
                                     let payload = handle_server_request(&session, task_id, &method, params).await;
                                     let _ = tx.send(ServerResponse { id, payload }).await;
                                 });
@@ -2263,12 +2336,16 @@ async fn run_actor(
                     Err(error) => format!("Codex app-server wait failed: {error}"),
                 };
             }
+            completed = server_tasks.join_next(), if !server_tasks.is_empty() => {
+                let _ = completed;
+            }
         }
     };
 
     for (_, reply) in pending {
         let _ = reply.send(Err(terminal_error.clone()));
     }
+    server_tasks.shutdown().await;
     let _ = child.kill().await;
     drop(runtime_lease_guard);
 }
@@ -3745,6 +3822,8 @@ for raw in sys.stdin:
             continue
         result = {'thread':{'id':thread_id}}
     elif method == 'thread/read':
+        if mode == 'exit-on-read':
+            sys.exit(17)
         result = {'thread':{'id':thread_id,'status':{'type':'idle'},'tokenUsage':{'inputTokens':4,'cachedInputTokens':1,'outputTokens':2,'reasoningOutputTokens':1,'totalTokens':6},'turns':[{'id':turn_id,'status':'completed','items':[{'type':'agentMessage','id':'m','text':'secret transcript marker'}]}]}}
     elif method == 'turn/steer':
         result = {'turnId':turn_id}
@@ -3922,10 +4001,7 @@ for raw in sys.stdin:
                 }
             }
         });
-        RpcClient {
-            tx: commands,
-            actor: Arc::new(Mutex::new(Some(actor))),
-        }
+        tracked_rpc_client(commands, actor)
     }
 
     fn blocking_shutdown_client(entered: PathBuf, release: PathBuf) -> RpcClient {
@@ -3970,10 +4046,7 @@ for raw in sys.stdin:
                 }
             }
         });
-        RpcClient {
-            tx: commands,
-            actor: Arc::new(Mutex::new(Some(actor))),
-        }
+        tracked_rpc_client(commands, actor)
     }
 
     fn task_record(
@@ -4152,19 +4225,15 @@ for raw in sys.stdin:
                 let _ = old_stopped.send(());
             }
         });
-        let old_client = RpcClient {
-            tx: old_commands,
-            actor: Arc::new(Mutex::new(Some(old_actor))),
-        };
+        let old_client = tracked_rpc_client(old_commands, old_actor);
+        let old_actor_id = old_client.actor_id;
 
         let (replacement_commands, mut replacement_receiver) = tokio::sync::mpsc::channel(1);
         let replacement_actor = tokio::spawn(async move {
             let _ = replacement_receiver.recv().await;
         });
-        let replacement_client = RpcClient {
-            tx: replacement_commands,
-            actor: Arc::new(Mutex::new(Some(replacement_actor))),
-        };
+        let replacement_client = tracked_rpc_client(replacement_commands, replacement_actor);
+        let replacement_actor_id = replacement_client.actor_id;
         let old_lease = test_runtime_lease(root.path(), old_task);
         let replacement_lease = test_runtime_lease(root.path(), replacement_task);
 
@@ -4172,6 +4241,7 @@ for raw in sys.stdin:
             old_task,
             RuntimeHandle {
                 client: old_client,
+                actor_id: old_actor_id,
                 owner: SessionInstance::from_session(&old),
                 scope: old.cwd.clone(),
                 started_at: Instant::now(),
@@ -4182,6 +4252,7 @@ for raw in sys.stdin:
             replacement_task,
             RuntimeHandle {
                 client: replacement_client,
+                actor_id: replacement_actor_id,
                 owner: SessionInstance::from_session(&replacement),
                 scope: replacement.cwd.clone(),
                 started_at: Instant::now(),
@@ -4471,6 +4542,7 @@ for raw in sys.stdin:
             task_id,
             RuntimeHandle {
                 client: client.clone(),
+                actor_id: client.actor_id,
                 owner: owner_instance.clone(),
                 scope: owner.cwd.clone(),
                 started_at: Instant::now(),
@@ -4895,13 +4967,12 @@ for raw in sys.stdin:
             }
         });
         let runtime_lease = test_runtime_lease(root.path(), task_id);
+        let client = tracked_rpc_client(commands, actor);
         runtimes().lock().unwrap().insert(
             task_id,
             RuntimeHandle {
-                client: RpcClient {
-                    tx: commands,
-                    actor: Arc::new(Mutex::new(Some(actor))),
-                },
+                actor_id: client.actor_id,
+                client,
                 owner: SessionInstance::from_session(&owner),
                 scope: owner.cwd.clone(),
                 started_at: Instant::now(),
@@ -5134,13 +5205,12 @@ for raw in sys.stdin:
             }
         });
         let runtime_lease = test_runtime_lease(root.path(), task_id);
+        let client = tracked_rpc_client(commands, actor);
         runtimes().lock().unwrap().insert(
             task_id,
             RuntimeHandle {
-                client: RpcClient {
-                    tx: commands,
-                    actor: Arc::new(Mutex::new(Some(actor))),
-                },
+                actor_id: client.actor_id,
+                client,
                 owner: SessionInstance::from_session(&old_session),
                 scope: old_session.cwd.clone(),
                 started_at: Instant::now(),
@@ -5333,10 +5403,7 @@ for raw in sys.stdin:
                             }
                         }
                     });
-                    let client = RpcClient {
-                        tx: commands,
-                        actor: Arc::new(Mutex::new(Some(actor))),
-                    };
+                    let client = tracked_rpc_client(commands, actor);
                     insert_runtime(&owner, task_id, &store, client.clone(), lease)
                         .await
                         .unwrap();
@@ -6011,13 +6078,12 @@ for raw in sys.stdin:
             }
         });
         let runtime_lease = test_runtime_lease(root.path(), runtime_task_id);
+        let client = tracked_rpc_client(commands, actor);
         runtimes().lock().unwrap().insert(
             runtime_task_id,
             RuntimeHandle {
-                client: RpcClient {
-                    tx: commands,
-                    actor: Arc::new(Mutex::new(Some(actor))),
-                },
+                actor_id: client.actor_id,
+                client,
                 owner: SessionInstance::from_session(&owner),
                 scope: owner.cwd.clone(),
                 started_at: Instant::now(),
@@ -6256,6 +6322,121 @@ for raw in sys.stdin:
 
         remove_session_with_store(&owner, &store).await.unwrap();
         session_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_actor_becomes_recoverable_and_explicit_resume_starts_a_fresh_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (session_handle, owner) =
+            active_test_session(root.path(), "same-owner-resume", true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let start_operation_id = Uuid::new_v4();
+        let started = task_start_with_store_and_binary_fenced(
+            &json!({
+                "operation_id": start_operation_id,
+                "task": "remain recoverable after actor exit",
+                "model": "gpt-5.6-luna",
+                "effort": "max"
+            }),
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "exit-on-read"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["status"], "running");
+        let task_id = Uuid::parse_str(started["task_id"].as_str().unwrap()).unwrap();
+        let stopped_actor_id = runtime_for(&owner, task_id).unwrap().actor_id;
+
+        let failed_read = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &owner,
+            &store,
+            &root.path().join("must-not-start-while-runtime-is-local"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed_read["status"], "unknown");
+        let unknown = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let record = store.load(&owner, task_id).unwrap();
+                let lease_released = store.try_acquire_runtime_lease(task_id).unwrap().is_some();
+                if record.status == TaskStatus::Unknown
+                    && runtime_for(&owner, task_id).is_none()
+                    && lease_released
+                {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stopped actor did not become explicitly recoverable");
+
+        let resume_operation_id = Uuid::new_v4();
+        let resumed = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": resume_operation_id,
+                "action": "resume"
+            }),
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "ok"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed["status"], "completed");
+        assert!(resumed["revision"].as_u64().unwrap() >= unknown.revision + 2);
+        assert_eq!(resumed["generation"], unknown.generation);
+        let replacement = runtime_for(&owner, task_id).unwrap();
+        assert_ne!(replacement.actor_id, stopped_actor_id);
+        let record = store.load(&owner, task_id).unwrap();
+        let receipt = record
+            .operations
+            .iter()
+            .find(|receipt| receipt.operation_id == resume_operation_id)
+            .unwrap();
+        assert_eq!(receipt.action, "resume");
+        assert_eq!(receipt.phase, OperationPhase::Applied);
+        drop(replacement);
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+        session_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_actor_cleanup_cannot_remove_same_owner_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = session(root.path(), "stale-actor", true);
+        let owner_instance = SessionInstance::from_session(&owner);
+        let task_id = Uuid::new_v4();
+        let replacement = recording_client(Arc::new(Mutex::new(Vec::new())));
+        let replacement_actor_id = replacement.actor_id;
+        let runtime = RuntimeHandle {
+            client: replacement.clone(),
+            actor_id: replacement_actor_id,
+            owner: owner_instance.clone(),
+            scope: owner.cwd.clone(),
+            started_at: Instant::now(),
+            _lease: test_runtime_lease(root.path(), task_id),
+        };
+        runtimes().lock().unwrap().insert(task_id, runtime);
+
+        assert!(
+            take_runtime_if_matches(task_id, &owner_instance, &owner.cwd, Uuid::new_v4()).is_none()
+        );
+        assert_eq!(
+            runtimes().lock().unwrap().get(&task_id).unwrap().actor_id,
+            replacement_actor_id
+        );
+
+        let removed =
+            take_runtime_if_matches(task_id, &owner_instance, &owner.cwd, replacement_actor_id)
+                .unwrap();
+        drop(removed);
+        replacement.shutdown().await;
     }
 
     #[tokio::test]
