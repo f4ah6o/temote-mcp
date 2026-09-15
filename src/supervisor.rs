@@ -12,7 +12,11 @@ use uuid::Uuid;
 use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
-use temote_mcp::activity::broker::ActivityBroker;
+use temote_mcp::activity::broker::{ActivityBroker, BrokerError};
+use temote_mcp::activity::contract::{
+    ActivityErrorKind, ActivityOperation, ActivitySummary, ActivityUpdate,
+};
+use temote_mcp::activity::scope::{ActivityEmitError, ActivityEmitter, ActivityScope};
 
 const MAX_MANAGED_SESSIONS: usize = 64;
 const MAX_AUTOMATIC_RESTARTS: u32 = 5;
@@ -24,6 +28,37 @@ fn activity_now_ms() -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+struct SupervisorActivityEmitter {
+    broker: Arc<ActivityBroker>,
+    session_id: String,
+}
+
+impl ActivityEmitter for SupervisorActivityEmitter {
+    fn try_emit(&self, update: ActivityUpdate) -> Result<(), ActivityEmitError> {
+        self.broker
+            .publish(update, Some(&self.session_id), None)
+            .map(|_| ())
+            .map_err(|error| match error {
+                BrokerError::Busy => ActivityEmitError::Full,
+                BrokerError::InvalidInput | BrokerError::EventTooLarge => {
+                    ActivityEmitError::InvalidInput
+                }
+                BrokerError::Closed => ActivityEmitError::Closed,
+                BrokerError::InvalidCapacity
+                | BrokerError::SequenceExhausted
+                | BrokerError::InvariantViolation => ActivityEmitError::InvariantViolation,
+            })
+    }
+}
+
+fn finish_supervisor_activity<T>(activity: &ActivityScope, result: &Result<T>) {
+    let _ = if result.is_ok() {
+        activity.complete()
+    } else {
+        activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed))
+    };
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,6 +227,16 @@ impl SessionSupervisor {
         Arc::clone(&self.activity_broker)
     }
 
+    fn activity_scope(&self, operation: ActivityOperation, session_id: String) -> ActivityScope {
+        ActivityScope::new(
+            operation,
+            SupervisorActivityEmitter {
+                broker: Arc::clone(&self.activity_broker),
+                session_id,
+            },
+        )
+    }
+
     fn ensure_mutations_allowed(&self) -> Result<()> {
         anyhow::ensure!(
             !self.upgrade_fenced.load(Ordering::Acquire),
@@ -307,14 +352,15 @@ impl SessionSupervisor {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
-        anyhow::ensure!(
-            self.roots_configured(),
-            "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
-        );
-        let cwd = self.roots.resolve(logical_path)?;
         let id = config::session_id(session_id)?;
-        let info = self
-            .start_resolved(
+        let activity = self.activity_scope(ActivityOperation::SessionStart, id.clone());
+        let result = async {
+            anyhow::ensure!(
+                self.roots_configured(),
+                "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
+            );
+            let cwd = self.roots.resolve(logical_path)?;
+            self.start_resolved(
                 cwd,
                 id.clone(),
                 permission_mode,
@@ -322,8 +368,11 @@ impl SessionSupervisor {
                 environment,
                 public,
             )
-            .await?;
-        Ok(info)
+            .await
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn start_local_with_environment(
@@ -352,10 +401,16 @@ impl SessionSupervisor {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
-        let cwd = config::canonical_directory(cwd)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, permission_mode, None, environment, false)
-            .await
+        let activity = self.activity_scope(ActivityOperation::SessionStart, id.clone());
+        let result = async {
+            let cwd = config::canonical_directory(cwd)?;
+            self.start_resolved(cwd, id, permission_mode, None, environment, false)
+                .await
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     async fn start_resolved(
@@ -630,6 +685,13 @@ impl SessionSupervisor {
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
+        let activity = self.activity_scope(ActivityOperation::SessionStop, session_id.to_owned());
+        let result = self.stop_owned_validated(session_id, public_only).await;
+        finish_supervisor_activity(&activity, &result);
+        result
+    }
+
+    async fn stop_owned_validated(&self, session_id: &str, public_only: bool) -> Result<()> {
         if public_only && !self.public_sessions.lock().await.contains(session_id) {
             anyhow::bail!(
                 "session {session_id} was not created through the public HTTP supervisor"
@@ -1320,6 +1382,78 @@ mod tests {
         );
         cleanup_session(&first_id).await;
         cleanup_session(&second_id).await;
+    }
+
+    #[tokio::test]
+    async fn activity_lifecycle_start_and_stop_are_emitted_only_by_supervisor() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = format!("activity-lifecycle-{}", Uuid::new_v4());
+
+        supervisor
+            .start("src/repo-a", Some(&session_id))
+            .await
+            .unwrap();
+        assert!(
+            supervisor
+                .start("src/repo-a", Some(&session_id))
+                .await
+                .is_err()
+        );
+        supervisor.stop(&session_id).await.unwrap();
+
+        let subscription = supervisor
+            .activity_broker()
+            .subscribe_snapshot(Some(&session_id), 10)
+            .unwrap();
+        let events = subscription.snapshot();
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.operation(), event.state()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Started
+                ),
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Completed
+                ),
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Started
+                ),
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Failed
+                ),
+                (
+                    ActivityOperation::SessionStop,
+                    temote_mcp::activity::contract::ActivityState::Started
+                ),
+                (
+                    ActivityOperation::SessionStop,
+                    temote_mcp::activity::contract::ActivityState::Completed
+                ),
+            ]
+        );
+        let operation_ids = events
+            .chunks_exact(2)
+            .map(|pair| {
+                assert_eq!(pair[0].operation_id(), pair[1].operation_id());
+                pair[0].operation_id()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(operation_ids.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.session_instance().is_none())
+        );
+        cleanup_session(&session_id).await;
     }
 
     #[tokio::test]

@@ -14,10 +14,12 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    apply_patch, approvals, checkpoints, child_env, codex_app_server, config, dev_tool, evidence,
-    friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
-    session_control::SessionBackend, work_handoff,
+    activity_runtime, apply_patch, approvals, checkpoints, child_env, codex_app_server, config,
+    dev_tool, evidence, friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk,
+    recall, sandbox, session_control::SessionBackend, work_handoff,
 };
+use temote_mcp::activity::contract::{ActivityErrorKind, ActivityOperation, ActivitySummary};
+use temote_mcp::activity::scope::ActivityScope;
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_JOBS_PER_SESSION: usize = 8;
@@ -776,7 +778,12 @@ async fn call_tool_with_local_agent_executable(
             .await;
             result
         }
-        "read_file" => read_file_tool(&args, &session).await,
+        "read_file" => {
+            let activity = file_activity_scope(&session, ActivityOperation::ReadFile);
+            let result = read_file_tool(&args, &session).await;
+            finish_file_activity(activity.as_ref(), &result);
+            result
+        }
         "evidence_read" => evidence_read_tool(&args, &session),
         "codex_status" => {
             let (detail, metadata) = codex_status_approval();
@@ -815,7 +822,12 @@ async fn call_tool_with_local_agent_executable(
             .await;
             text_result(result?)
         }
-        "write_file" => write_file(&args, &session).await,
+        "write_file" => {
+            let activity = file_activity_scope(&session, ActivityOperation::WriteFile);
+            let result = write_file(&args, &session, activity.as_ref()).await;
+            finish_file_activity(activity.as_ref(), &result);
+            result
+        }
         "apply_patch" => {
             let request = apply_patch::parse_request(&args)?;
             let outcome = apply_patch::apply(&session, request).await?;
@@ -1383,6 +1395,26 @@ fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
 }
 
+fn file_activity_scope(
+    session: &config::Session,
+    operation: ActivityOperation,
+) -> Option<ActivityScope> {
+    activity_runtime::emitter(session)
+        .ok()
+        .map(|emitter| ActivityScope::new(operation, emitter))
+}
+
+fn finish_file_activity(activity: Option<&ActivityScope>, result: &Result<Value>) {
+    let Some(activity) = activity else {
+        return;
+    };
+    let _ = if result.is_ok() {
+        activity.complete()
+    } else {
+        activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed))
+    };
+}
+
 async fn read_file_tool(args: &Value, session: &config::Session) -> Result<Value> {
     let path = config::resolve_existing_path(session, &required_path(args, "path")?)?;
     let result = read_text_file(&path).await;
@@ -1729,7 +1761,11 @@ fn push_directory_listing_entry(
     Ok(())
 }
 
-async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
+async fn write_file(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let absolute = config::resolve_write_path(session, &required_path(args, "path")?)?;
     ensure_regular_write_target(&absolute).await?;
     let parent = absolute.parent().context("file has no parent directory")?;
@@ -1747,6 +1783,9 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         "temote-mcp-write".to_owned(),
         absolute.display().to_string(),
     ];
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let result = if session.yolo() {
         tokio::fs::write(&absolute, content)
             .await
