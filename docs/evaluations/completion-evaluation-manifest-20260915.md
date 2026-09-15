@@ -8,7 +8,7 @@ This manifest defines the completion evaluation authorized for the 2026-09-15 Te
 
 The repository-wide starting baseline is `0ee1db7e2e81a54faca6a4eb8d741e33702376d4`. The independently reviewed HTTP fix `232b5f1` was accepted before this evaluation lane began and is recorded as prerequisite evidence, not as an evaluated answer visible to this lane before T01 was frozen.
 
-The evaluation does not test or add an OpenCode persistent server, attach mode, automatic resume, or background lifecycle. It does not change a production deployment, installed host runtime, global agent configuration, or host authentication file.
+The evaluation does not test or add an OpenCode persistent server, attach mode, automatic resume, or background lifecycle. Its isolated arms do not change a production deployment, installed host runtime, global agent configuration, or host authentication file. A separate upgrade-process test did stop the original ingress; the user later approved ending 23 sessions and restarting the host supervisor and ingress. That incident and recovery are outside the evaluated arm outcomes and are recorded in the results document without changing the frozen task criteria.
 
 ## Execution arms
 
@@ -56,25 +56,25 @@ Initial common base: `0ee1db7e2e81a54faca6a4eb8d741e33702376d4`.
 
 Add instance-bound activity update ingress using the existing S03 boundary. Accept a valid update for the current instance. Reject stale, retired, unknown, and oversized updates. Keep the acknowledgement bounded. The ingress must not trigger approval decisions or session operations. Add deterministic contract tests.
 
-Common base requirement: the accepted S03 prerequisite only; record its exact commit before arm 1.
+Common base requirement: the accepted S03 prerequisite only. Frozen common base before arm 1: `0ee1db7e2e81a54faca6a4eb8d741e33702376d4`.
 
 ### T06 — Process-wide activity producer
 
 Add a typed process-wide producer with a queue capacity of 256 and ordered sequential delivery. The combined connect, write, and acknowledgement sequence has one shared one-second deadline. Do not retry, block caller I/O on delivery, or let delivery failure alter the originating operation. Add deterministic ordering, capacity, timeout, and failure-isolation tests.
 
-Common base requirement: the accepted T05/S05 prerequisite; record its exact commit before arm 1.
+Common base requirement: the accepted T05/S05 prerequisite. Frozen common base before arm 1: `523435b42ad0ccd6c2ccaade5374ac4871f25433`.
 
 ### T07 — Job terminal-race tests
 
 Add meaningful deterministic tests to the implemented job-scope path for both natural-finish-first and stop-first races. Each path must emit exactly one terminal activity state while preserving the existing job response and evidence. Do not use scheduler sleeps as synchronization and do not alter unrelated job behavior.
 
-Common base requirement: the accepted S12 job-scope implementation; record its exact commit before arm 1.
+Common base requirement: the accepted S12 job-scope implementation. Frozen common base before arm 1: `a24a40029e48204718803843181e2a1684b23ea0` (reviewed with no remaining findings and merged unchanged into the integration line at `82b3bf3`).
 
 ### T08 — Upgrade response-flush transport tests
 
 Add real transport-boundary tests to the implemented upgrade path for a fully flushed accepted response and for write, reset, and peer-drop failures. A disconnect after a proven flush may commit; an incomplete response or an observed write/reset failure before flush must never permit the destructive commit point. Use deterministic synchronization with no arbitrary sleeps and preserve existing upgrade behavior.
 
-Common base requirement: the accepted upgrade implementation; record its exact commit before arm 1.
+Common base requirement: the accepted upgrade implementation. Frozen common base before arm 1: `8ebaf598d61704447ecd73e4c4cfdd6e50f37b2d` (merged unchanged into the current integration line at `40cda15`).
 
 ### T09 — English activity operator documentation
 
