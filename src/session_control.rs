@@ -728,13 +728,15 @@ async fn handle_control_connection(
             handle_upgrade_request(
                 stream,
                 supervisor,
-                executable,
-                installed_locator,
-                target_version,
-                environment,
-                dry_run,
-                force,
-                expected_sessions,
+                UpgradeControlRequest {
+                    executable,
+                    installed_locator,
+                    target_version,
+                    environment,
+                    dry_run,
+                    force,
+                    expected_sessions,
+                },
             )
             .await
         }
@@ -991,9 +993,7 @@ async fn write_control_error(stream: &mut UnixStream, error: &anyhow::Error) -> 
     Ok(())
 }
 
-async fn handle_upgrade_request(
-    mut stream: UnixStream,
-    supervisor: Arc<SessionSupervisor>,
+struct UpgradeControlRequest {
     executable: PathBuf,
     installed_locator: Option<PathBuf>,
     target_version: String,
@@ -1001,7 +1001,22 @@ async fn handle_upgrade_request(
     dry_run: bool,
     force: bool,
     expected_sessions: Option<Vec<crate::upgrade_transaction::UpgradePlannedSession>>,
+}
+
+async fn handle_upgrade_request(
+    mut stream: UnixStream,
+    supervisor: Arc<SessionSupervisor>,
+    request: UpgradeControlRequest,
 ) -> Result<()> {
+    let UpgradeControlRequest {
+        executable,
+        installed_locator,
+        target_version,
+        environment,
+        dry_run,
+        force,
+        expected_sessions,
+    } = request;
     let executable_preflight = (|| -> Result<(PathBuf, SupervisorCapabilities)> {
         environment.validate()?;
         validate_upgrade_executable(&executable, &target_version)
@@ -1040,12 +1055,14 @@ async fn handle_upgrade_request(
     let preflight: Result<SupervisorUpgradePlan> = async {
         let plan = supervisor
             .build_upgrade_plan_with_expected(
-                &target_version,
-                capabilities.control_protocol,
-                capabilities.lifecycle_schema,
-                &environment,
+                crate::supervisor::SupervisorUpgradePlanRequest::new(
+                    &target_version,
+                    capabilities.control_protocol,
+                    capabilities.lifecycle_schema,
+                    &environment,
+                    force,
+                ),
                 true,
-                force,
                 expected_sessions.as_deref(),
             )
             .await?;
@@ -3218,7 +3235,7 @@ mod tests {
         let active = crate::upgrade_transaction::UpgradeTransaction::new(
             "2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true,
         );
-        assert!(ensure_no_remote_upgrade_owns_runtime(&[active.clone()]).is_err());
+        assert!(ensure_no_remote_upgrade_owns_runtime(std::slice::from_ref(&active)).is_err());
 
         let mut completed = active;
         completed.state = crate::upgrade_transaction::UpgradeTransactionState::Completed;

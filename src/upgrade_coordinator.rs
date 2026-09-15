@@ -389,113 +389,6 @@ fn validate_approved_candidate_identity(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn preflight(supervisor_handoff_required: bool) -> RemoteUpgradePreflight {
-        RemoteUpgradePreflight {
-            source_version: "2026.8.0".to_owned(),
-            target_version: "2026.9.0".to_owned(),
-            compatible: true,
-            supervisor_handoff_required,
-            planned_session_count: 1,
-            blocked_session_count: 0,
-            blocker_reasons: Vec::new(),
-            direct_ingress_action: if supervisor_handoff_required {
-                "restart".to_owned()
-            } else {
-                "untouched".to_owned()
-            },
-            direct_ingress_blocked: false,
-            reconnect_expected: supervisor_handoff_required,
-            plugin_reconciliation_required: true,
-            client_restart_required_if_plugin_replaced: true,
-            planned_sessions: vec![upgrade_transaction::UpgradePlannedSession {
-                session_id: "session-a".to_owned(),
-                source_process_id: 100,
-                source_started_at: 10,
-            }],
-        }
-    }
-
-    #[test]
-    fn same_version_candidate_swap_is_rejected_by_approved_digest() {
-        let mut transaction =
-            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
-        transaction.approved_executable_sha256 = Some("a".repeat(64));
-
-        let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"b".repeat(64))
-            .unwrap_err();
-        assert!(error.to_string().contains("changed after approval"));
-    }
-
-    #[test]
-    fn opened_executable_identity_survives_path_replacement() {
-        use sha2::{Digest, Sha256};
-
-        let directory = tempfile::tempdir().unwrap();
-        let installed = directory.path().join("temote-mcp");
-        let replacement = directory.path().join("replacement");
-        std::fs::write(&installed, b"approved image").unwrap();
-        std::fs::write(&replacement, b"different image").unwrap();
-        let mut approved = std::fs::File::open(&installed).unwrap();
-        std::fs::rename(&replacement, &installed).unwrap();
-
-        let open_digest = bounded_file_digest_hex(&mut approved).unwrap();
-        let installed_digest = format!("{:x}", Sha256::digest(std::fs::read(&installed).unwrap()));
-        assert_ne!(open_digest, installed_digest);
-        assert_eq!(
-            open_digest,
-            format!("{:x}", Sha256::digest(b"approved image"))
-        );
-    }
-
-    #[test]
-    fn old_transaction_without_approved_digest_fails_closed_for_execution() {
-        let transaction =
-            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
-        let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"a".repeat(64))
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no approved executable identity")
-        );
-    }
-
-    #[test]
-    fn historical_completion_does_not_override_fresh_required_work() {
-        let mut completed =
-            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
-        completed.approved_executable_sha256 = Some("a".repeat(64));
-        assert!(
-            !completed_upgrade_is_current(&completed, &preflight(true), &"a".repeat(64)).unwrap()
-        );
-        assert!(
-            completed_upgrade_is_current(&completed, &preflight(false), &"a".repeat(64)).unwrap()
-        );
-    }
-
-    #[test]
-    fn no_handoff_preflight_persists_exact_session_count_and_identity() {
-        let transaction = prepared_transaction_from_approved(
-            preflight(false),
-            "2026.9.0".to_owned(),
-            "a".repeat(64),
-            "host-a".to_owned(),
-            "boot-a".to_owned(),
-            1,
-        );
-        upgrade_transaction::write_transaction(&transaction).unwrap();
-        let restored = upgrade_transaction::read_transaction(&transaction.transaction_id).unwrap();
-        assert_eq!(restored.planned_session_count, 1);
-        assert_eq!(restored.planned_sessions.len(), 1);
-        assert_eq!(restored.planned_sessions[0].session_id, "session-a");
-        upgrade_transaction::remove_transaction(&transaction.transaction_id).unwrap();
-    }
-}
-
 struct ConcreteExecutor {
     transaction: UpgradeTransaction,
     executable: InstalledUpgradeExecutable,
@@ -614,4 +507,111 @@ pub fn status(transaction_id: &str) -> Result<UpgradeTransactionStatus> {
     status.coordinator_alive = alive;
     status.incomplete = alive == Some(false);
     Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preflight(supervisor_handoff_required: bool) -> RemoteUpgradePreflight {
+        RemoteUpgradePreflight {
+            source_version: "2026.8.0".to_owned(),
+            target_version: "2026.9.0".to_owned(),
+            compatible: true,
+            supervisor_handoff_required,
+            planned_session_count: 1,
+            blocked_session_count: 0,
+            blocker_reasons: Vec::new(),
+            direct_ingress_action: if supervisor_handoff_required {
+                "restart".to_owned()
+            } else {
+                "untouched".to_owned()
+            },
+            direct_ingress_blocked: false,
+            reconnect_expected: supervisor_handoff_required,
+            plugin_reconciliation_required: true,
+            client_restart_required_if_plugin_replaced: true,
+            planned_sessions: vec![upgrade_transaction::UpgradePlannedSession {
+                session_id: "session-a".to_owned(),
+                source_process_id: 100,
+                source_started_at: 10,
+            }],
+        }
+    }
+
+    #[test]
+    fn same_version_candidate_swap_is_rejected_by_approved_digest() {
+        let mut transaction =
+            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
+        transaction.approved_executable_sha256 = Some("a".repeat(64));
+
+        let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"b".repeat(64))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after approval"));
+    }
+
+    #[test]
+    fn opened_executable_identity_survives_path_replacement() {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("temote-mcp");
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&installed, b"approved image").unwrap();
+        std::fs::write(&replacement, b"different image").unwrap();
+        let mut approved = std::fs::File::open(&installed).unwrap();
+        std::fs::rename(&replacement, &installed).unwrap();
+
+        let open_digest = bounded_file_digest_hex(&mut approved).unwrap();
+        let installed_digest = format!("{:x}", Sha256::digest(std::fs::read(&installed).unwrap()));
+        assert_ne!(open_digest, installed_digest);
+        assert_eq!(
+            open_digest,
+            format!("{:x}", Sha256::digest(b"approved image"))
+        );
+    }
+
+    #[test]
+    fn old_transaction_without_approved_digest_fails_closed_for_execution() {
+        let transaction =
+            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
+        let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"a".repeat(64))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no approved executable identity")
+        );
+    }
+
+    #[test]
+    fn historical_completion_does_not_override_fresh_required_work() {
+        let mut completed =
+            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
+        completed.approved_executable_sha256 = Some("a".repeat(64));
+        assert!(
+            !completed_upgrade_is_current(&completed, &preflight(true), &"a".repeat(64)).unwrap()
+        );
+        assert!(
+            completed_upgrade_is_current(&completed, &preflight(false), &"a".repeat(64)).unwrap()
+        );
+    }
+
+    #[test]
+    fn no_handoff_preflight_persists_exact_session_count_and_identity() {
+        let transaction = prepared_transaction_from_approved(
+            preflight(false),
+            "2026.9.0".to_owned(),
+            "a".repeat(64),
+            "host-a".to_owned(),
+            "boot-a".to_owned(),
+            1,
+        );
+        upgrade_transaction::write_transaction(&transaction).unwrap();
+        let restored = upgrade_transaction::read_transaction(&transaction.transaction_id).unwrap();
+        assert_eq!(restored.planned_session_count, 1);
+        assert_eq!(restored.planned_sessions.len(), 1);
+        assert_eq!(restored.planned_sessions[0].session_id, "session-a");
+        upgrade_transaction::remove_transaction(&transaction.transaction_id).unwrap();
+    }
 }

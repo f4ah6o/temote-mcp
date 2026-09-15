@@ -117,6 +117,32 @@ struct UpgradePlanOptions {
     collect_blockers: bool,
 }
 
+pub(crate) struct SupervisorUpgradePlanRequest<'a> {
+    target_version: &'a str,
+    control_protocol: u64,
+    lifecycle_schema: u64,
+    available_environment: &'a approvals::CapturedStartEnvironment,
+    force: bool,
+}
+
+impl<'a> SupervisorUpgradePlanRequest<'a> {
+    pub(crate) fn new(
+        target_version: &'a str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &'a approvals::CapturedStartEnvironment,
+        force: bool,
+    ) -> Self {
+        Self {
+            target_version,
+            control_protocol,
+            lifecycle_schema,
+            available_environment,
+            force,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RestartSpec {
     cwd: PathBuf,
@@ -703,12 +729,14 @@ impl SessionSupervisor {
         force: bool,
     ) -> Result<SupervisorUpgradePlan> {
         self.build_upgrade_plan_with_expected(
-            target_version,
-            control_protocol,
-            lifecycle_schema,
-            available_environment,
+            SupervisorUpgradePlanRequest::new(
+                target_version,
+                control_protocol,
+                lifecycle_schema,
+                available_environment,
+                force,
+            ),
             fence,
-            force,
             None,
         )
         .await
@@ -716,23 +744,19 @@ impl SessionSupervisor {
 
     pub async fn build_upgrade_plan_with_expected(
         &self,
-        target_version: &str,
-        control_protocol: u64,
-        lifecycle_schema: u64,
-        available_environment: &approvals::CapturedStartEnvironment,
+        request: SupervisorUpgradePlanRequest<'_>,
         fence: bool,
-        force: bool,
         expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
     ) -> Result<SupervisorUpgradePlan> {
         let preview = self
             .prepare_upgrade_plan(
-                target_version,
-                control_protocol,
-                lifecycle_schema,
-                available_environment,
+                request.target_version,
+                request.control_protocol,
+                request.lifecycle_schema,
+                request.available_environment,
                 UpgradePlanOptions {
                     fence,
-                    force,
+                    force: request.force,
                     collect_blockers: false,
                 },
                 expected_sessions,
@@ -2087,12 +2111,8 @@ mod tests {
         }];
         let error = supervisor
             .build_upgrade_plan_with_expected(
-                "different-version",
-                1,
-                1,
-                &environment,
+                SupervisorUpgradePlanRequest::new("different-version", 1, 1, &environment, false),
                 true,
-                false,
                 Some(&expected),
             )
             .await

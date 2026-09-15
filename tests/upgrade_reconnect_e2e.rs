@@ -208,8 +208,7 @@ fn process_has_environment_marker(pid: u32, environment: &IsolatedEnv) -> bool {
     let namespace = format!("TEMOTE_MCP_SOCKET_NAMESPACE={}", environment.namespace);
     let state = format!("XDG_STATE_HOME={}", environment.state.display());
     let entries = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
-    entries.iter().any(|entry| *entry == namespace.as_bytes())
-        && entries.iter().any(|entry| *entry == state.as_bytes())
+    entries.contains(&namespace.as_bytes()) && entries.contains(&state.as_bytes())
 }
 
 fn process_matches_kind(pid: u32, kind: ScopedProcessKind) -> bool {
