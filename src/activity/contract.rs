@@ -47,6 +47,8 @@ pub enum ActivityOperation {
     Execute,
     StartCommand,
     StopJob,
+    LocalAgentRun,
+    DevToolRun,
 }
 
 impl<'de> Deserialize<'de> for ActivityOperation {
@@ -68,6 +70,8 @@ impl<'de> Deserialize<'de> for ActivityOperation {
             "execute" => Ok(Self::Execute),
             "start_command" => Ok(Self::StartCommand),
             "stop_job" => Ok(Self::StopJob),
+            "local_agent_run" => Ok(Self::LocalAgentRun),
+            "dev_tool_run" => Ok(Self::DevToolRun),
             _ => Err(serde_invalid_json()),
         }
     }
@@ -1137,6 +1141,8 @@ mod tests {
             (ActivityOperation::Execute, "execute"),
             (ActivityOperation::StartCommand, "start_command"),
             (ActivityOperation::StopJob, "stop_job"),
+            (ActivityOperation::LocalAgentRun, "local_agent_run"),
+            (ActivityOperation::DevToolRun, "dev_tool_run"),
         ];
         for (operation, expected) in operations {
             let encoded = encode_update(&update(

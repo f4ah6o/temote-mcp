@@ -75,6 +75,8 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::Execute => "execute",
         ActivityOperation::StartCommand => "start_command",
         ActivityOperation::StopJob => "stop_job",
+        ActivityOperation::LocalAgentRun => "local_agent_run",
+        ActivityOperation::DevToolRun => "dev_tool_run",
     }
 }
 
