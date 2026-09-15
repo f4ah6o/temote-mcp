@@ -5401,6 +5401,10 @@ for raw in sys.stdin:
                     .env(READY, ready)
                     .env(RELEASE, release)
                     .env(STOPPED, stopped)
+                    .env(
+                        crate::test_support::PRIVATE_PROCESS_ROOT_ENV,
+                        crate::test_support::private_process_root().unwrap(),
+                    )
                     .spawn()
                     .unwrap(),
             )

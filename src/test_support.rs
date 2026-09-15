@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub const DEFAULT_CASES: usize = 1024;
+pub const PRIVATE_PROCESS_ROOT_ENV: &str = "TEMOTE_TEST_PRIVATE_PROCESS_ROOT";
 const DEFAULT_SEED: u64 = 0x5445_4D4F_5445_0001;
 
 /// Return a process-private root for unit tests that exercise production path defaults.
@@ -10,13 +11,17 @@ const DEFAULT_SEED: u64 = 0x5445_4D4F_5445_0001;
 /// Cargo runs the library and binary unit suites in separate processes, so the PID and
 /// random suffix isolate concurrent test executables without mutating process-wide
 /// environment variables. The short `/tmp` name also leaves enough room for the Unix
-/// socket path limit when a maximum-length session ID is appended.
+/// socket path limit when a maximum-length session ID is appended. Intentional re-exec
+/// fixtures may pass `PRIVATE_PROCESS_ROOT_ENV` to their child with `Command::env`.
 pub fn private_process_root() -> Result<PathBuf, String> {
     static ROOT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     ROOT.get_or_init(create_private_process_root).clone()
 }
 
 fn create_private_process_root() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(PRIVATE_PROCESS_ROOT_ENV) {
+        return validate_private_process_root(PathBuf::from(path));
+    }
     for _ in 0..16 {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let path = PathBuf::from(format!("/tmp/tm{:x}-{}", std::process::id(), &nonce[..6]));
@@ -62,6 +67,50 @@ fn create_private_process_root() -> Result<PathBuf, String> {
     Err("failed to allocate a unique private test root".to_owned())
 }
 
+fn validate_private_process_root(path: PathBuf) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "shared private test root must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "failed to inspect shared private test root {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "shared private test root is not a directory: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "shared private test root is not owned by the current user: {}",
+                path.display()
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(format!(
+                "shared private test root {} has mode {mode:04o}, expected 0700",
+                path.display()
+            ));
+        }
+    }
+    std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "failed to resolve shared private test root {}: {error}",
+            path.display()
+        )
+    })
+}
+
 #[test]
 fn test_isolation_process_root_is_stable_private_and_short() {
     let root = private_process_root().unwrap();
@@ -78,6 +127,29 @@ fn test_isolation_process_root_is_stable_private_and_short() {
             std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+}
+
+#[test]
+fn shared_process_root_validation_rejects_relative_public_and_symlink_paths() {
+    assert!(validate_private_process_root(PathBuf::from("relative")).is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let public = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(public.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_private_process_root(public.path().to_owned()).is_err());
+
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            validate_private_process_root(private.path().to_owned()).unwrap(),
+            private.path()
+        );
+        let link = public.path().join("private-link");
+        symlink(private.path(), &link).unwrap();
+        assert!(validate_private_process_root(link).is_err());
     }
 }
 
