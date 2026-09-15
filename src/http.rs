@@ -1642,6 +1642,18 @@ mod tests {
             serde_json::from_str::<Value>(tool_text(&stopped)).unwrap()["status"],
             "stopped"
         );
+
+        let listed = call_public_tool(&runtime, "session_list", json!({})).await;
+        let sessions: Vec<Value> = serde_json::from_str(tool_text(&listed)).unwrap();
+        assert_eq!(sessions[0]["session_id"], second_id);
+        assert_eq!(sessions[0]["status"], "active");
+        let retained = sessions
+            .iter()
+            .find(|session| session["session_id"] == first_id)
+            .expect("stopped managed session metadata missing");
+        assert_eq!(retained["status"], "stopped");
+        assert!(retained["stopped_at"].is_number());
+
         supervisor.shutdown().await.unwrap();
         assert!(!crate::config::session_is_active(&second_id).await.unwrap());
         assert!(!crate::config::socket_path(&second_id).unwrap().exists());
