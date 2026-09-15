@@ -409,6 +409,35 @@ impl SessionSupervisor {
         self.stop_owned(session_id, true).await
     }
 
+    pub async fn validate_public_upgrade_session(
+        &self,
+        session_id: &str,
+    ) -> Result<config::Session> {
+        config::validate_session_id(session_id)?;
+        anyhow::ensure!(
+            self.public_sessions.lock().await.contains(session_id),
+            "upgrade_apply requires a session managed by this authenticated HTTP server"
+        );
+        anyhow::ensure!(
+            self.sessions.lock().await.contains_key(session_id),
+            "upgrade_apply requires an active managed session"
+        );
+        let lifecycle = config::read_session_lifecycle(session_id)
+            .await?
+            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+        anyhow::ensure!(
+            lifecycle.status == config::LifecycleStatus::Active
+                && config::session_is_active(session_id).await?,
+            "upgrade_apply requires an ACTIVE managed session"
+        );
+        let session = config::read_session_metadata(session_id).await?;
+        anyhow::ensure!(
+            !session.permission_mode.is_yolo(),
+            "upgrade_apply rejects public yolo sessions"
+        );
+        Ok(session)
+    }
+
     pub async fn forget_session(
         &self,
         session_id: &str,

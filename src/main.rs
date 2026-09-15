@@ -47,6 +47,8 @@ mod session_control;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
+#[cfg(all(feature = "network", unix))]
+mod upgrade_coordinator;
 mod upgrade_transaction;
 mod work_handoff;
 
@@ -66,6 +68,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    session_control::initialize_installed_upgrade_locator()?;
     approvals::bootstrap_service_account_process_boundary()?;
     let cli = match cli::parse_env() {
         Ok(cli::ParseOutcome::Run(cli)) => cli,
@@ -112,6 +115,20 @@ async fn main() -> Result<()> {
             }
         }
         cli::Command::Upgrade { dry_run, force } => session_control::upgrade(dry_run, force).await,
+        cli::Command::UpgradeCoordinator {
+            transaction_id,
+            commit_fd,
+        } => {
+            #[cfg(all(feature = "network", unix))]
+            {
+                upgrade_coordinator::run_child(transaction_id, commit_fd).await
+            }
+            #[cfg(not(all(feature = "network", unix)))]
+            {
+                let _ = (transaction_id, commit_fd);
+                anyhow::bail!("remote upgrade coordinator is unsupported on this platform")
+            }
+        }
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { session_id, path } => {
                 session_control::start_named(session_id, path).await

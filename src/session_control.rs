@@ -3,12 +3,13 @@ use std::io::{Read as _, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -37,6 +38,21 @@ const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
 const UPGRADE_FAILURE_REPORT_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_FAILURE_REPORT_BYTES: usize = 64 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
+const MAX_UPGRADE_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+static INSTALLED_UPGRADE_LOCATOR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn initialize_installed_upgrade_locator() -> Result<()> {
+    let path = std::fs::canonicalize(std::env::current_exe()?)?;
+    if let Some(existing) = INSTALLED_UPGRADE_LOCATOR.get() {
+        anyhow::ensure!(
+            existing == &path,
+            "installed Temote startup locator changed"
+        );
+        return Ok(());
+    }
+    let _ = INSTALLED_UPGRADE_LOCATOR.set(path);
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -101,6 +117,9 @@ enum ControlRequest {
     PermissionRevoke {
         session_id: String,
         path: PathBuf,
+    },
+    ValidatePublicUpgradeSession {
+        session_id: String,
     },
     Upgrade {
         executable: PathBuf,
@@ -293,6 +312,23 @@ impl SessionBackend {
                     public: true,
                 })
                 .await
+            }
+        }
+    }
+
+    pub async fn validate_upgrade_session(&self, session_id: &str) -> Result<config::Session> {
+        config::validate_session_id(session_id)?;
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor.validate_public_upgrade_session(session_id).await
+            }
+            Self::LocalControl => {
+                request(ControlRequest::ValidatePublicUpgradeSession {
+                    session_id: session_id.to_owned(),
+                })
+                .await?;
+                config::read_session_metadata(session_id).await
             }
         }
     }
@@ -787,6 +823,16 @@ async fn dispatch_request(
             supervisor.revoke_directory(&session_id, path).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::ValidatePublicUpgradeSession { session_id } => {
+            let session = supervisor
+                .validate_public_upgrade_session(&session_id)
+                .await?;
+            Ok(json!({
+                "session_id": session.id,
+                "permission_mode": session.permission_mode,
+                "status": "active"
+            }))
+        }
         ControlRequest::Upgrade { .. } => unreachable!("handled before dispatch"),
         ControlRequest::AttachConsole => unreachable!("handled before dispatch"),
     }
@@ -815,6 +861,16 @@ fn validate_upgrade_executable(
     path: &Path,
     claimed_version: &str,
 ) -> Result<(PathBuf, SupervisorCapabilities)> {
+    let (path, capabilities) = inspect_upgrade_executable(path)?;
+    anyhow::ensure!(
+        capabilities.version == claimed_version,
+        "upgrade executable version changed during preflight: expected {claimed_version}, found {}",
+        capabilities.version
+    );
+    Ok((path, capabilities))
+}
+
+fn inspect_upgrade_executable(path: &Path) -> Result<(PathBuf, SupervisorCapabilities)> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve upgrade executable {}", path.display()))?;
     let metadata = std::fs::metadata(&path)
@@ -829,6 +885,19 @@ fn validate_upgrade_executable(
         mode & 0o111 != 0,
         "upgrade executable is not executable: {}",
         path.display()
+    );
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "upgrade executable is not owned by the current user"
+    );
+    anyhow::ensure!(
+        mode & 0o022 == 0,
+        "upgrade executable is group/world writable"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
+        "upgrade executable exceeds bounded identity size"
     );
 
     let output = std::process::Command::new(&path)
@@ -850,11 +919,6 @@ fn validate_upgrade_executable(
     );
     let capabilities: SupervisorCapabilities = serde_json::from_slice(&output.stdout)
         .context("invalid supervisor capability response from upgrade executable")?;
-    anyhow::ensure!(
-        capabilities.version == claimed_version,
-        "upgrade executable version changed during preflight: expected {claimed_version}, found {}",
-        capabilities.version
-    );
     anyhow::ensure!(
         capabilities.control_protocol == CONTROL_PROTOCOL_VERSION,
         "supervisor control protocol {} is incompatible with running protocol {}",
@@ -1339,55 +1403,156 @@ fn remove_upgrade_plan(path: &Path) -> Result<()> {
     }
 }
 
-pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
-    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
-    let target_version = env!("CARGO_PKG_VERSION").to_owned();
+#[derive(Clone, Debug)]
+pub struct InstalledUpgradeExecutable {
+    path: PathBuf,
+    digest: [u8; 32],
+    pub target_version: String,
+}
+
+pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutable> {
+    initialize_installed_upgrade_locator()?;
+    let locator = INSTALLED_UPGRADE_LOCATOR
+        .get()
+        .context("installed Temote startup locator is unavailable")?;
+    let (path, capabilities) = inspect_upgrade_executable(locator)?;
+    let mut file = std::fs::File::open(&path).context("cannot open installed Temote executable")?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
+        "upgrade executable exceeds bounded identity size"
+    );
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied += read as u64;
+        anyhow::ensure!(
+            copied <= MAX_UPGRADE_EXECUTABLE_BYTES,
+            "upgrade executable exceeds bounded identity size"
+        );
+        hasher.update(&buffer[..read]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    let target_version = capabilities.version;
+    Ok(InstalledUpgradeExecutable {
+        path,
+        digest,
+        target_version,
+    })
+}
+
+pub fn revalidate_installed_upgrade_executable(
+    approved: &InstalledUpgradeExecutable,
+) -> Result<PathBuf> {
+    let current = capture_installed_upgrade_executable()?;
+    anyhow::ensure!(
+        current.path == approved.path
+            && current.digest == approved.digest
+            && current.target_version == approved.target_version,
+        "installed Temote executable changed after approval"
+    );
+    Ok(current.path)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteUpgradePreflight {
+    pub source_version: String,
+    pub target_version: String,
+    pub compatible: bool,
+    pub supervisor_handoff_required: bool,
+    pub planned_session_count: usize,
+    pub blocked_session_count: usize,
+    pub blocker_reasons: Vec<&'static str>,
+    pub direct_ingress_action: String,
+    pub direct_ingress_blocked: bool,
+    pub reconnect_expected: bool,
+    pub plugin_reconciliation_required: bool,
+    pub client_restart_required_if_plugin_replaced: bool,
+}
+
+pub async fn remote_upgrade_preflight(
+    executable: &InstalledUpgradeExecutable,
+) -> Result<RemoteUpgradePreflight> {
+    upgrade_preflight_with_force(executable, false).await
+}
+
+async fn upgrade_preflight_with_force(
+    executable: &InstalledUpgradeExecutable,
+    force: bool,
+) -> Result<RemoteUpgradePreflight> {
     let ping = request(ControlRequest::Ping).await?;
     let source_version = ping
         .get("version")
         .and_then(Value::as_str)
-        .context("running supervisor did not report its version; bootstrap by restarting it once with a handoff-capable Temote release")?;
-    let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
-    anyhow::ensure!(
-        ping.get("control_protocol").and_then(Value::as_u64) == Some(CONTROL_PROTOCOL_VERSION),
-        "running supervisor control protocol is incompatible; manual supervisor restart is required"
-    );
-
-    #[cfg(all(feature = "network", unix))]
-    let ingress_upgrade = crate::lifecycle::prepare_direct_ingress_upgrade(&target_version).await?;
-    #[cfg(all(feature = "network", unix))]
-    if !dry_run && let Some(blocker) = ingress_upgrade.blocker() {
-        anyhow::bail!("direct ingress upgrade blocked before supervisor handoff: {blocker}");
-    }
-
-    let result = request(ControlRequest::Upgrade {
-        executable: executable.clone(),
-        target_version: target_version.clone(),
+        .context("running supervisor did not report its version")?
+        .to_owned();
+    let preview_value = request(ControlRequest::Upgrade {
+        executable: executable.path.clone(),
+        target_version: executable.target_version.clone(),
         environment: CapturedStartEnvironment::capture(),
-        dry_run,
+        dry_run: true,
         force,
     })
-    .await
-    .with_context(|| {
-        format!(
-            "running supervisor {source_version} does not support safe handoff or rejected the upgrade; bootstrap with one manual supervisor restart if this is the first handoff-capable release"
-        )
-    })?;
+    .await?;
+    let preview: crate::supervisor::SupervisorUpgradePreview =
+        serde_json::from_value(preview_value).context("invalid supervisor upgrade preview")?;
+    #[cfg(all(feature = "network", unix))]
+    let ingress =
+        crate::lifecycle::prepare_direct_ingress_upgrade(&executable.target_version).await?;
+    #[cfg(all(feature = "network", unix))]
+    let (direct_ingress_action, direct_ingress_blocked, reconnect_expected) = (
+        ingress.plan().action.clone(),
+        ingress.blocker().is_some(),
+        ingress.plan().action == "restart",
+    );
+    #[cfg(not(all(feature = "network", unix)))]
+    let (direct_ingress_action, direct_ingress_blocked, reconnect_expected) =
+        ("unsupported".to_owned(), true, false);
+    Ok(RemoteUpgradePreflight {
+        source_version,
+        target_version: executable.target_version.clone(),
+        compatible: true,
+        supervisor_handoff_required: preview.plan.handoff_required,
+        planned_session_count: preview.plan.sessions.len(),
+        blocked_session_count: preview.blocked_sessions.len(),
+        blocker_reasons: preview
+            .blocked_sessions
+            .iter()
+            .map(|_| "session_not_restorable")
+            .collect(),
+        direct_ingress_action,
+        direct_ingress_blocked,
+        reconnect_expected,
+        plugin_reconciliation_required: true,
+        client_restart_required_if_plugin_replaced: true,
+    })
+}
 
-    if dry_run {
-        #[cfg(all(feature = "network", unix))]
-        let result = serde_json::json!({
-            "supervisor": result,
-            "ingress": ingress_upgrade.plan(),
-            "plugin": {
-                "action": "reconcile_after_success",
-                "client_restart_required_if_replaced": true
-            }
-        });
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
-    }
-
+pub async fn apply_supervisor_upgrade(
+    executable: &Path,
+    target_version: &str,
+    force: bool,
+) -> Result<usize> {
+    let ping = request(ControlRequest::Ping).await?;
+    let source_version = ping
+        .get("version")
+        .and_then(Value::as_str)
+        .context("running supervisor did not report its version")?
+        .to_owned();
+    let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
+    let result = request(ControlRequest::Upgrade {
+        executable: executable.to_owned(),
+        target_version: target_version.to_owned(),
+        environment: CapturedStartEnvironment::capture(),
+        dry_run: false,
+        force,
+    })
+    .await?;
     let plan_value = result
         .get("plan")
         .cloned()
@@ -1397,105 +1562,101 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         .get("restore_plan_path")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    if !plan.handoff_required {
-        println!("supervisor already runs Temote {target_version}; no handoff required");
-    } else {
+    if plan.handoff_required {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            if let Some(restore_plan_path) = restore_plan_path.as_deref()
-                && let Some(report) = read_upgrade_failure_report(restore_plan_path)?
+            if let Some(path) = restore_plan_path.as_deref()
+                && let Some(report) = read_upgrade_failure_report(path)?
             {
                 anyhow::ensure!(
                     report.source_version == source_version
                         && report.target_version == target_version,
-                    "supervisor upgrade failure report identity does not match the requested handoff"
+                    "supervisor upgrade failure report identity mismatch"
                 );
                 anyhow::bail!(format_upgrade_failure_report(&report));
             }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "supervisor handoff did not become healthy within the bounded verification window; source version={source_version} pid={source_pid}, target version={target_version}"
-                );
-            }
-            match request(ControlRequest::Ping).await {
-                Ok(status)
-                    if status.get("version").and_then(Value::as_str)
-                        == Some(target_version.as_str())
-                        && status.get("pid").and_then(Value::as_u64) == Some(source_pid) =>
-                {
-                    let mut healthy = true;
-                    for session in &plan.sessions {
-                        match request(ControlRequest::Info {
-                            session_id: session.session_id.clone(),
-                        })
-                        .await
-                        {
-                            Ok(view)
-                                if view.get("status").and_then(Value::as_str) == Some("active") => {
-                            }
-                            _ => {
-                                healthy = false;
-                                break;
-                            }
-                        }
-                    }
-                    if healthy {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "supervisor handoff verification timed out"
+            );
+            if let Ok(status) = request(ControlRequest::Ping).await
+                && status.get("version").and_then(Value::as_str) == Some(target_version)
+                && status.get("pid").and_then(Value::as_u64) == Some(source_pid)
+            {
+                let mut all_active = true;
+                for session in &plan.sessions {
+                    let active = request(ControlRequest::Info {
+                        session_id: session.session_id.clone(),
+                    })
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                    if active.as_deref() != Some("active") {
+                        all_active = false;
                         break;
                     }
                 }
-                _ => {}
+                if all_active {
+                    return Ok(plan.sessions.len());
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        println!(
-            "supervisor handoff complete: {source_version} -> {target_version}; restored {} session(s); pid={source_pid}",
-            plan.sessions.len()
-        );
     }
+    Ok(plan.sessions.len())
+}
 
-    #[cfg(all(feature = "network", unix))]
-    {
-        let ingress_result =
-            crate::lifecycle::apply_direct_ingress_upgrade(ingress_upgrade, &executable).await?;
-        match ingress_result.action.as_str() {
-            "restarted" => println!(
-                "direct ingress restart complete: profile={} health={}",
-                ingress_result.profile.as_deref().unwrap_or("unknown"),
-                ingress_result.health
-            ),
-            "untouched" => println!(
-                "direct ingress left running: profile={} health={}",
-                ingress_result.profile.as_deref().unwrap_or("unknown"),
-                ingress_result.health
-            ),
-            _ => {}
-        }
-    }
-
-    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
-    match std::process::Command::new(&executable)
+pub fn reconcile_codex_plugin(executable: &Path) -> Result<()> {
+    let output = std::process::Command::new(executable)
         .args(["codex", "plugin", "install"])
         .output()
-    {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if !text.trim().is_empty() {
-                println!("{}", text.trim());
-            }
-        }
-        Ok(output) => {
-            eprintln!(
-                "Codex plugin reconciliation failed (exit {}); run `temote-mcp codex plugin install` manually. An already-running Codex session must be restarted after plugin replacement.\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(error) => {
-            eprintln!(
-                "Codex plugin reconciliation could not start: {error}; run `temote-mcp codex plugin install` manually. An already-running Codex session must be restarted after plugin replacement."
-            );
-        }
+        .context("Codex plugin reconciliation could not start")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Codex plugin reconciliation failed"
+    );
+    Ok(())
+}
+
+pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
+    let executable = capture_installed_upgrade_executable()?;
+    let preflight = upgrade_preflight_with_force(&executable, force).await?;
+    if dry_run {
+        println!("{}", serde_json::to_string_pretty(&preflight)?);
+        return Ok(());
     }
+    anyhow::ensure!(
+        preflight.blocked_session_count == 0,
+        "upgrade is blocked by {} session(s)",
+        preflight.blocked_session_count
+    );
+    anyhow::ensure!(
+        !preflight.direct_ingress_blocked,
+        "direct ingress upgrade is blocked"
+    );
+    let executable_path = revalidate_installed_upgrade_executable(&executable)?;
+    let restored =
+        apply_supervisor_upgrade(&executable_path, &executable.target_version, force).await?;
+    #[cfg(all(feature = "network", unix))]
+    {
+        let executable_path = revalidate_installed_upgrade_executable(&executable)?;
+        let ingress =
+            crate::lifecycle::prepare_direct_ingress_upgrade(&executable.target_version).await?;
+        crate::lifecycle::apply_direct_ingress_upgrade(ingress, &executable_path).await?;
+    }
+    let executable_path = revalidate_installed_upgrade_executable(&executable)?;
+    if let Err(error) = reconcile_codex_plugin(&executable_path) {
+        eprintln!("{error:#}; run `temote-mcp codex plugin install` manually");
+    }
+    println!(
+        "Temote upgrade complete: {} -> {}; restored {restored} session(s)",
+        preflight.source_version, executable.target_version
+    );
     Ok(())
 }
 

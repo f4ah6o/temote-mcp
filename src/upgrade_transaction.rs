@@ -106,6 +106,16 @@ pub struct UpgradeTransaction {
     pub reconnect_expected: bool,
     pub supervisor_handoff_required: bool,
     pub ingress_restart_required: bool,
+    #[serde(default)]
+    pub planned_session_count: usize,
+    #[serde(default)]
+    pub verified_host_id: Option<String>,
+    #[serde(default)]
+    pub verified_version: Option<String>,
+    #[serde(default)]
+    pub verified_boot_generation: Option<String>,
+    #[serde(default)]
+    pub restored_session_count: Option<usize>,
     pub failure_summary: Option<String>,
 }
 
@@ -133,6 +143,11 @@ impl UpgradeTransaction {
             reconnect_expected,
             supervisor_handoff_required,
             ingress_restart_required,
+            planned_session_count: 0,
+            verified_host_id: None,
+            verified_version: None,
+            verified_boot_generation: None,
+            restored_session_count: None,
             failure_summary: None,
         }
     }
@@ -263,6 +278,35 @@ fn lock_path(transaction_id: &str) -> Result<PathBuf> {
     Ok(ensure_directory()?.join(format!("{transaction_id}.lock")))
 }
 
+pub fn acquire_admission_lock() -> Result<UpgradeAdmissionLock> {
+    let path = ensure_directory()?.join("admission.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("cannot open upgrade admission lock {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "upgrade admission lock must be a regular file"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode & 0o077 == 0,
+        "upgrade admission lock must be owner-only (mode {mode:04o})"
+    );
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    anyhow::ensure!(locked == 0, "another upgrade apply is being admitted");
+    Ok(UpgradeAdmissionLock { _file: file })
+}
+
+pub struct UpgradeAdmissionLock {
+    _file: File,
+}
+
 fn validate_transaction(transaction: &UpgradeTransaction) -> Result<()> {
     anyhow::ensure!(
         transaction.schema == UPGRADE_TRANSACTION_SCHEMA_VERSION,
@@ -288,6 +332,28 @@ fn validate_transaction(transaction: &UpgradeTransaction) -> Result<()> {
     }
     crate::host_identity::validate(&transaction.host_id)
         .context("invalid upgrade transaction host_id")?;
+    if let Some(host_id) = &transaction.verified_host_id {
+        crate::host_identity::validate(host_id)
+            .context("invalid verified upgrade transaction host_id")?;
+    }
+    for (name, value) in [
+        ("verified_version", transaction.verified_version.as_ref()),
+        (
+            "verified_boot_generation",
+            transaction.verified_boot_generation.as_ref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            anyhow::ensure!(
+                !value.trim().is_empty() && value.len() <= MAX_UPGRADE_TRANSACTION_STRING_BYTES,
+                "upgrade transaction {name} is empty or oversized"
+            );
+            anyhow::ensure!(
+                !value.contains('\0'),
+                "upgrade transaction {name} must not contain NUL"
+            );
+        }
+    }
     if let Some(summary) = &transaction.failure_summary {
         anyhow::ensure!(
             summary.len() <= MAX_FAILURE_SUMMARY_BYTES,
@@ -598,8 +664,15 @@ pub struct UpgradeTransactionStatus {
     pub reconnect_expected: bool,
     pub supervisor_handoff_required: bool,
     pub ingress_restart_required: bool,
+    pub planned_session_count: usize,
     pub created_at: u64,
     pub updated_at: u64,
+    pub verified_host_id: Option<String>,
+    pub verified_version: Option<String>,
+    pub verified_boot_generation: Option<String>,
+    pub restored_session_count: Option<usize>,
+    pub coordinator_alive: Option<bool>,
+    pub incomplete: bool,
     pub failure_summary: Option<String>,
 }
 
@@ -617,8 +690,15 @@ impl UpgradeTransaction {
             reconnect_expected: self.reconnect_expected,
             supervisor_handoff_required: self.supervisor_handoff_required,
             ingress_restart_required: self.ingress_restart_required,
+            planned_session_count: self.planned_session_count,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            verified_host_id: self.verified_host_id.clone(),
+            verified_version: self.verified_version.clone(),
+            verified_boot_generation: self.verified_boot_generation.clone(),
+            restored_session_count: self.restored_session_count,
+            coordinator_alive: None,
+            incomplete: false,
             failure_summary: self.failure_summary.clone(),
         }
     }
@@ -873,6 +953,21 @@ pub type UpgradeCoordinatorStepFuture<'a> =
 pub trait UpgradeCoordinatorExecutor {
     fn execute_phase(&mut self, phase: UpgradeTransactionState)
     -> UpgradeCoordinatorStepFuture<'_>;
+
+    fn verified_identity(&self) -> Option<UpgradeVerifiedIdentity> {
+        None
+    }
+
+    fn restored_session_count(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradeVerifiedIdentity {
+    pub host_id: String,
+    pub version: String,
+    pub boot_generation: String,
 }
 
 fn bounded_failure_summary(text: &str) -> String {
@@ -901,7 +996,18 @@ pub async fn run_upgrade_coordinator<E: UpgradeCoordinatorExecutor>(
     waiter: UpgradeCommitWaiter,
     executor: &mut E,
 ) -> Result<UpgradeTransactionStatus> {
-    let _lock = acquire_transaction_lock(transaction_id)?;
+    let lock = acquire_transaction_lock(transaction_id)?;
+    run_upgrade_coordinator_with_lock(transaction_id, lock, waiter, executor).await
+}
+
+/// Runs a coordinator after its process has already acquired ownership. This is
+/// used by the detached child so it can announce READY while holding the lock.
+pub async fn run_upgrade_coordinator_with_lock<E: UpgradeCoordinatorExecutor>(
+    transaction_id: &str,
+    _lock: UpgradeTransactionLock,
+    waiter: UpgradeCommitWaiter,
+    executor: &mut E,
+) -> Result<UpgradeTransactionStatus> {
     let mut transaction = read_transaction(transaction_id)?;
     anyhow::ensure!(
         transaction.state == UpgradeTransactionState::Prepared,
@@ -931,6 +1037,16 @@ pub async fn run_upgrade_coordinator<E: UpgradeCoordinatorExecutor>(
         }
         match executor.execute_phase(phase).await {
             Ok(UpgradeCoordinatorStep::Continue) => {
+                if phase == UpgradeTransactionState::SessionsVerifying {
+                    transaction.restored_session_count = executor.restored_session_count();
+                }
+                if phase == UpgradeTransactionState::EndpointVerifying
+                    && let Some(identity) = executor.verified_identity()
+                {
+                    transaction.verified_host_id = Some(identity.host_id);
+                    transaction.verified_version = Some(identity.version);
+                    transaction.verified_boot_generation = Some(identity.boot_generation);
+                }
                 transaction.set_state(phase)?;
                 write_transaction(&transaction)?;
             }
@@ -942,8 +1058,8 @@ pub async fn run_upgrade_coordinator<E: UpgradeCoordinatorExecutor>(
                 write_transaction(&transaction)?;
                 return Ok(transaction.status());
             }
-            Err(error) => {
-                transaction.mark_failed(bounded_failure_summary(&format!("{error:#}")))?;
+            Err(_error) => {
+                transaction.mark_failed(format!("upgrade phase {} failed", phase.as_str()))?;
                 write_transaction(&transaction)?;
                 return Ok(transaction.status());
             }
@@ -1042,11 +1158,16 @@ mod tests {
             "reconnect_expected",
             "supervisor_handoff_required",
             "ingress_restart_required",
+            "planned_session_count",
+            "verified_host_id",
+            "verified_version",
+            "verified_boot_generation",
+            "restored_session_count",
             "failure_summary",
         ] {
             assert!(keys.iter().any(|key| key == expected), "missing {expected}");
         }
-        assert_eq!(keys.len(), 13);
+        assert_eq!(keys.len(), 18);
         let encoded = serde_json::to_string(&fixture.transaction).unwrap();
         for forbidden in ["token", "secret", "authorization", "cookie", "password"] {
             assert!(!encoded.to_ascii_lowercase().contains(forbidden));

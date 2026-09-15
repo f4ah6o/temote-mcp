@@ -1051,6 +1051,8 @@ dependencies = [
  "base64",
  "dotenvy",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "noargs",
  "noprop",

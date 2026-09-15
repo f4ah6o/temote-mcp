@@ -31,6 +31,10 @@ pub enum Command {
         dry_run: bool,
         force: bool,
     },
+    UpgradeCoordinator {
+        transaction_id: String,
+        commit_fd: i32,
+    },
     Session {
         command: SessionCommand,
     },
@@ -229,6 +233,29 @@ where
             .take(&mut args)
             .is_present();
         return finish(args, Command::Upgrade { dry_run, force });
+    }
+    if noargs::cmd("upgrade-coordinator")
+        .doc("Internal: continue one accepted remote upgrade transaction")
+        .take(&mut args)
+        .is_present()
+    {
+        let transaction_id = noargs::opt("transaction")
+            .ty("ID")
+            .take(&mut args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(opt.value().to_owned()))
+            .map_err(format_error)?;
+        let commit_fd = noargs::opt("commit-fd")
+            .ty("FD")
+            .take(&mut args)
+            .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
+            .map_err(format_error)?;
+        return finish(
+            args,
+            Command::UpgradeCoordinator {
+                transaction_id,
+                commit_fd,
+            },
+        );
     }
     if noargs::cmd("session")
         .doc("Manage sessions owned by the local Temote supervisor")
