@@ -1053,11 +1053,14 @@ impl TaskStore {
                         .with_context(|| format!("cannot inspect Codex task {id} during cleanup"));
                 }
             };
-            if record.owner != owner.clone() || record.status.is_terminal() {
+            if record.owner != owner.clone() {
                 continue;
             }
             if self.runtime_lease_held_locked(record.task_id)? {
                 deferred = true;
+                continue;
+            }
+            if record.status.is_terminal() {
                 continue;
             }
 
@@ -3888,7 +3891,10 @@ for raw in sys.stdin:
     }
 
     async fn wait_for_child_release(path: &Path) {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        // The parent can be delayed by the full test binary's other process
+        // fixtures, so keep this bounded without making ordinary loaded runs
+        // release the lease prematurely.
+        tokio::time::timeout(Duration::from_secs(120), async {
             while !path.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -5497,6 +5503,53 @@ for raw in sys.stdin:
             assert_ne!(flags & libc::FD_CLOEXEC, 0);
         }
         drop(released);
+
+        let terminal_task_id = Uuid::new_v4();
+        let terminal_session_id = format!("cross-process-terminal-{}", Uuid::new_v4());
+        let (terminal_handle, terminal_owner) =
+            active_test_session(&workspace, &terminal_session_id, true).await;
+        let terminal_record = task_record(
+            &terminal_owner,
+            terminal_task_id,
+            TaskStatus::Completed,
+            30,
+            Some("terminal-thread"),
+            Some("terminal-turn"),
+        );
+        store.save(&terminal_record).unwrap();
+        let terminal_ready = root.path().join("terminal-ready");
+        let terminal_release = root.path().join("terminal-release");
+        let mut terminal_holder = spawn_child(
+            "holder",
+            terminal_task_id,
+            &terminal_ready,
+            &terminal_release,
+        );
+        wait_for_marker(&terminal_ready).await;
+        terminal_handle.shutdown().await.unwrap();
+        let mut terminal_cleanup = tokio::spawn({
+            let store = store.clone();
+            let terminal_owner = terminal_owner.clone();
+            async move { remove_session_with_store(&terminal_owner, &store).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut terminal_cleanup)
+                .await
+                .is_err(),
+            "session cleanup completed while a terminal task runtime remained remotely leased"
+        );
+        assert!(ensure_session_replacement_allowed(&terminal_owner.id).is_err());
+        std::fs::write(&terminal_release, b"release").unwrap();
+        assert!(terminal_holder.wait().unwrap().success());
+        tokio::time::timeout(Duration::from_secs(5), terminal_cleanup)
+            .await
+            .expect("terminal task cleanup did not resume after runtime lease release")
+            .unwrap()
+            .unwrap();
+        assert!(ensure_session_replacement_allowed(&terminal_owner.id).is_ok());
+        let preserved_terminal = store.load(&terminal_owner, terminal_task_id).unwrap();
+        assert_eq!(preserved_terminal.status, TaskStatus::Completed);
+        assert_eq!(preserved_terminal.revision, 30);
 
         let watched_task_id = Uuid::new_v4();
         let watched_ready = root.path().join("watched-ready");
