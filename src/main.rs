@@ -2,6 +2,7 @@
 
 #[cfg(feature = "network")]
 mod access;
+mod activity_runtime;
 mod apply_patch;
 mod approvals;
 mod boot_identity;
@@ -144,6 +145,11 @@ async fn main() -> Result<()> {
                 anyhow::bail!("remote upgrade coordinator is unsupported on this platform")
             }
         }
+        cli::Command::Activity {
+            session_id,
+            tail,
+            follow,
+        } => session_control::run_activity_command(session_id, tail, follow).await,
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { session_id, path } => {
                 session_control::start_named(session_id, path).await

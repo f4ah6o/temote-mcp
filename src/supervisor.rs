@@ -2,18 +2,29 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
+use temote_mcp::activity::broker::ActivityBroker;
 
 const MAX_MANAGED_SESSIONS: usize = 64;
 const MAX_AUTOMATIC_RESTARTS: u32 = 5;
 const MAX_RESTART_BACKOFF_SECONDS: u64 = 30;
+
+fn activity_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "UpgradeSessionPlanWire", into = "UpgradeSessionPlanWire")]
@@ -171,6 +182,7 @@ pub struct SessionSupervisor {
     closed: AtomicBool,
     upgrade_fenced: AtomicBool,
     max_sessions: usize,
+    activity_broker: Arc<ActivityBroker>,
 }
 
 impl SessionSupervisor {
@@ -180,6 +192,7 @@ impl SessionSupervisor {
 
     fn with_limit(roots: NamedRoots, max_sessions: usize) -> (Arc<Self>, ApprovalReceiver) {
         let (approval_sender, approval_receiver) = approvals::approval_channel();
+        let activity_broker = Arc::new(ActivityBroker::new(activity_now_ms, Uuid::new_v4()));
         (
             Arc::new(Self {
                 roots,
@@ -191,6 +204,7 @@ impl SessionSupervisor {
                 closed: AtomicBool::new(false),
                 upgrade_fenced: AtomicBool::new(false),
                 max_sessions,
+                activity_broker,
             }),
             approval_receiver,
         )
@@ -206,6 +220,11 @@ impl SessionSupervisor {
 
     pub fn approval_sender(&self) -> ApprovalSender {
         self.approval_sender.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn activity_broker(&self) -> Arc<ActivityBroker> {
+        Arc::clone(&self.activity_broker)
     }
 
     fn ensure_mutations_allowed(&self) -> Result<()> {
@@ -411,13 +430,14 @@ impl SessionSupervisor {
             environment: environment.clone(),
             public,
         };
-        let handle = approvals::spawn_runtime_with_logical_path_and_environment(
+        let handle = approvals::spawn_runtime_with_activity(
             &cwd,
             Some(&id),
             permission_mode,
             self.approval_sender.clone(),
             logical_path,
             environment,
+            approvals::RuntimeActivity::new(Arc::clone(&self.activity_broker), Uuid::new_v4()),
         )
         .await
         .with_context(|| format!("failed to start managed session {id}"))?;
@@ -682,6 +702,7 @@ impl SessionSupervisor {
         let handle = {
             let mut sessions = self.sessions.lock().await;
             if let Some(handle) = sessions.get(session_id) {
+                handle.retire_activity();
                 crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
             }
             sessions.remove(session_id)
@@ -1068,6 +1089,7 @@ impl SessionSupervisor {
             let handle = {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(handle) = sessions.get(&id) {
+                    handle.retire_activity();
                     crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
                 }
                 sessions.remove(&id)
@@ -1310,6 +1332,9 @@ impl SessionSupervisor {
         self.closed.store(true, Ordering::Release);
         let handles = {
             let mut sessions = self.sessions.lock().await;
+            for handle in sessions.values() {
+                handle.retire_activity();
+            }
             sessions.drain().collect::<Vec<_>>()
         };
         for (_, handle) in &handles {
