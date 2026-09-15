@@ -47,7 +47,7 @@ Generic layer が lifecycle、安全境界、artifact と report の上限を所
 - [x] Requested と observed の model/effort を分離し、usage が観測不能な場合は推測しない。
 - [x] 明示的 resume は同一 canonical directory の一意な session だけを受け入れる。
 - [x] Fork は明示的 session と組み合わせた bounded follow-up として動作する。
-- [x] Invalid/oversized output、invalid override、directory mismatch は副作用前に fail closed となる。
+- [x] Invalid override、resume mismatch、preflight probe failure は task launch 前に fail closed となる。Invalid/oversized delegated result は bounded error として成功扱いを拒否するが、起動済み child の作業を rollback する契約は持たない。
 - [x] Codex compatibility と host/global authentication/configuration を変更しない。
 
 ## テスト計画
