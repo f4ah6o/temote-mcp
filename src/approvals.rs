@@ -1219,6 +1219,30 @@ pub async fn spawn_runtime(
     .await
 }
 
+#[cfg(test)]
+async fn spawn_runtime_with_session_read_observer(
+    cwd: &Path,
+    session_id: Option<&str>,
+    yolo: bool,
+    approval_sender: ApprovalSender,
+    read_timeout: Duration,
+) -> Result<(RuntimeHandle, mpsc::UnboundedReceiver<()>)> {
+    let (read_started, read_observer) = mpsc::unbounded_channel();
+    let handle = spawn_runtime_inner(
+        cwd,
+        session_id,
+        config::PermissionMode::from_legacy_yolo(yolo),
+        approval_sender,
+        None,
+        CapturedStartEnvironment::capture(),
+        None,
+        read_timeout,
+        Some(read_started),
+    )
+    .await?;
+    Ok((handle, read_observer))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn spawn_runtime_with_logical_path_and_environment(
     cwd: &Path,
@@ -1235,6 +1259,9 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         approval_sender,
         logical_path,
         environment,
+        None,
+        SESSION_MESSAGE_READ_TIMEOUT,
+        #[cfg(test)]
         None,
     )
     .await
@@ -1257,6 +1284,9 @@ pub(crate) async fn spawn_runtime_with_activity(
         logical_path,
         environment,
         Some(activity),
+        SESSION_MESSAGE_READ_TIMEOUT,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -1269,6 +1299,8 @@ async fn spawn_runtime_inner(
     logical_path: Option<String>,
     environment: CapturedStartEnvironment,
     activity: Option<RuntimeActivity>,
+    session_message_read_timeout: Duration,
+    #[cfg(test)] session_read_started: Option<mpsc::UnboundedSender<()>>,
 ) -> Result<RuntimeHandle> {
     environment.validate()?;
     let service_account_token = environment
@@ -1383,6 +1415,9 @@ async fn spawn_runtime_inner(
                 kintone_bridge,
                 kintone_cli_bridge,
                 activity_sink: runtime_activity_sink,
+                session_message_read_timeout,
+                #[cfg(test)]
+                session_read_started,
             },
         )
         .await;
@@ -1493,13 +1528,14 @@ async fn receive_session_message(
     session_id: String,
     sender: mpsc::Sender<IncomingSessionMessage>,
     permit: OwnedSemaphorePermit,
+    read_timeout: Duration,
+    #[cfg(test)] read_started: Option<mpsc::UnboundedSender<()>>,
 ) {
-    let line = match tokio::time::timeout(
-        SESSION_MESSAGE_READ_TIMEOUT,
-        read_session_message(&mut stream),
-    )
-    .await
-    {
+    #[cfg(test)]
+    if let Some(read_started) = read_started {
+        let _ = read_started.send(());
+    }
+    let line = match tokio::time::timeout(read_timeout, read_session_message(&mut stream)).await {
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) => return,
         Ok(Err(error)) => {
@@ -1543,6 +1579,9 @@ struct RuntimeServices {
     kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
     kintone_cli_bridge: Arc<kintone_cli::Bridge>,
     activity_sink: Option<ActivitySink>,
+    session_message_read_timeout: Duration,
+    #[cfg(test)]
+    session_read_started: Option<mpsc::UnboundedSender<()>>,
 }
 
 async fn run_runtime(
@@ -1571,8 +1610,20 @@ async fn run_runtime(
                 };
                 let sender = incoming_sender.clone();
                 let session_id = session.id.clone();
+                let read_timeout = services.session_message_read_timeout;
+                #[cfg(test)]
+                let read_started = services.session_read_started.clone();
                 tokio::spawn(async move {
-                    receive_session_message(stream, session_id, sender, permit).await;
+                    receive_session_message(
+                        stream,
+                        session_id,
+                        sender,
+                        permit,
+                        read_timeout,
+                        #[cfg(test)]
+                        read_started,
+                    )
+                    .await;
                 });
             }
             incoming = incoming_receiver.recv() => {
@@ -4010,27 +4061,45 @@ esac
         let root = tempfile::tempdir().unwrap();
         let id = format!("idle-ipc-{}", Uuid::new_v4());
         let (sender, _receiver) = approval_channel();
-        let handle = spawn_runtime(root.path(), Some(&id), false, sender)
-            .await
-            .unwrap();
+        // Keep the idle reader alive well beyond the outer watchdog. The test
+        // can then pass only if control and probe handling bypass that reader.
+        let (handle, mut read_observer) = spawn_runtime_with_session_read_observer(
+            root.path(),
+            Some(&id),
+            false,
+            sender,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
         let path = config::socket_path(&id).unwrap();
-        let _idle = UnixStream::connect(&path).await.unwrap();
-
-        let snapshot = tokio::time::timeout(Duration::from_millis(500), handle.snapshot())
-            .await
-            .expect("idle IPC client blocked runtime snapshot")
-            .unwrap();
-        assert_eq!(snapshot.id, id);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(500), config::session_is_active(&id))
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let _idle = UnixStream::connect(&path).await.unwrap();
+            read_observer
+                .recv()
                 .await
-                .expect("idle IPC client blocked session probe")
-                .unwrap()
-        );
-        tokio::time::timeout(Duration::from_millis(500), handle.shutdown())
-            .await
-            .expect("idle IPC client blocked runtime shutdown")
-            .unwrap();
+                .expect("session read observer closed before the idle reader started");
+
+            let snapshot = handle.snapshot().await.unwrap();
+            assert_eq!(snapshot.id, id);
+
+            let mut probe = UnixStream::connect(&path).await.unwrap();
+            probe
+                .write_all(&encode_session_json_line(&Message::Probe).unwrap())
+                .await
+                .unwrap();
+            probe.shutdown().await.unwrap();
+            let mut response = String::new();
+            BufReader::new(probe)
+                .read_line(&mut response)
+                .await
+                .unwrap();
+            assert_eq!(response, "active\n");
+
+            handle.shutdown().await.unwrap();
+        })
+        .await
+        .expect("idle IPC reader blocked runtime control or probe");
         assert!(!config::socket_path(&id).unwrap().exists());
     }
 
@@ -4199,15 +4268,18 @@ esac
                         .expect("approval channel closed unexpectedly");
                 }
 
-                handle.shutdown().await.unwrap();
-                for request in requests {
-                    let allowed = tokio::time::timeout(Duration::from_secs(1), request)
-                        .await
-                        .expect("pending approval did not resolve after shutdown")
-                        .unwrap()
-                        .unwrap();
-                    assert!(!allowed, "shutdown allowed a pending approval");
-                }
+                // Prompt delivery proves every shutdown watcher is installed.
+                // Bound their combined completion without imposing a latency
+                // contract on each independently scheduled denial task.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    handle.shutdown().await.unwrap();
+                    for request in requests {
+                        let allowed = request.await.unwrap().unwrap();
+                        assert!(!allowed, "shutdown allowed a pending approval");
+                    }
+                })
+                .await
+                .expect("pending approvals did not all resolve after shutdown");
                 assert!(!config::session_is_active(&id).await.unwrap());
             });
             Ok(())
