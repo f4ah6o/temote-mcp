@@ -1233,11 +1233,13 @@ async fn spawn_runtime_with_session_read_observer(
         session_id,
         config::PermissionMode::from_legacy_yolo(yolo),
         approval_sender,
-        None,
-        CapturedStartEnvironment::capture(),
-        None,
-        read_timeout,
-        Some(read_started),
+        RuntimeSpawnOptions {
+            logical_path: None,
+            environment: CapturedStartEnvironment::capture(),
+            activity: None,
+            session_message_read_timeout: read_timeout,
+            session_read_started: Some(read_started),
+        },
     )
     .await?;
     Ok((handle, read_observer))
@@ -1257,12 +1259,14 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         session_id,
         permission_mode,
         approval_sender,
-        logical_path,
-        environment,
-        None,
-        SESSION_MESSAGE_READ_TIMEOUT,
-        #[cfg(test)]
-        None,
+        RuntimeSpawnOptions {
+            logical_path,
+            environment,
+            activity: None,
+            session_message_read_timeout: SESSION_MESSAGE_READ_TIMEOUT,
+            #[cfg(test)]
+            session_read_started: None,
+        },
     )
     .await
 }
@@ -1281,14 +1285,25 @@ pub(crate) async fn spawn_runtime_with_activity(
         session_id,
         permission_mode,
         approval_sender,
-        logical_path,
-        environment,
-        Some(activity),
-        SESSION_MESSAGE_READ_TIMEOUT,
-        #[cfg(test)]
-        None,
+        RuntimeSpawnOptions {
+            logical_path,
+            environment,
+            activity: Some(activity),
+            session_message_read_timeout: SESSION_MESSAGE_READ_TIMEOUT,
+            #[cfg(test)]
+            session_read_started: None,
+        },
     )
     .await
+}
+
+struct RuntimeSpawnOptions {
+    logical_path: Option<String>,
+    environment: CapturedStartEnvironment,
+    activity: Option<RuntimeActivity>,
+    session_message_read_timeout: Duration,
+    #[cfg(test)]
+    session_read_started: Option<mpsc::UnboundedSender<()>>,
 }
 
 async fn spawn_runtime_inner(
@@ -1296,12 +1311,16 @@ async fn spawn_runtime_inner(
     session_id: Option<&str>,
     permission_mode: config::PermissionMode,
     approval_sender: ApprovalSender,
-    logical_path: Option<String>,
-    environment: CapturedStartEnvironment,
-    activity: Option<RuntimeActivity>,
-    session_message_read_timeout: Duration,
-    #[cfg(test)] session_read_started: Option<mpsc::UnboundedSender<()>>,
+    options: RuntimeSpawnOptions,
 ) -> Result<RuntimeHandle> {
+    let RuntimeSpawnOptions {
+        logical_path,
+        environment,
+        activity,
+        session_message_read_timeout,
+        #[cfg(test)]
+        session_read_started,
+    } = options;
     environment.validate()?;
     let service_account_token = environment
         .values()
