@@ -3613,7 +3613,7 @@ mod tests {
         let session = activity_job_session(cwd.path());
         let (command_scope, command_emitter) = activity_job_scope(ActivityOperation::StartCommand);
         let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
-            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &json!({"command": ["sleep", "30"]}),
             &session,
             Some(command_scope),
             std::future::pending(),
@@ -3750,7 +3750,7 @@ mod tests {
         let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
         let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
         let (_, handle, completion) = spawn_sandboxed_command_with_controls(
-            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &json!({"command": ["sleep", "30"]}),
             &session,
             Some(scope),
             async move {
@@ -3785,7 +3785,7 @@ mod tests {
         let session = activity_job_session(cwd.path());
         let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
         let (_, handle, completion) = spawn_sandboxed_command_with_controls(
-            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &json!({"command": ["sleep", "30"]}),
             &session,
             Some(scope),
             std::future::pending(),
