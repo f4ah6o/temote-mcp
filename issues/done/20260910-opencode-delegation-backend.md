@@ -1,13 +1,15 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN`, explicit same-directory session resume, and bounded `--fork` landed; persistent/session lifecycle implementation not started
-- Date: 2026-09-10 (Asia/Tokyo)
-- Updated: 2026-09-12 (Asia/Tokyo)
-- Priority: P1
-- Original baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
-- Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
-- Related:
-  - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
+Status: done
+Model: GPT-5.6 Sol
+Created: 2026-09-10
+Updated: 2026-09-15
+Branch: codex/20260915-completion-evaluation
+Priority: P1
+Original baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
+Proposal path: `issues/done/20260910-opencode-delegation-backend.md`
+Related:
+  - [TEMOTE-08: Codex delegation dogfood and app server](../open/20260908-08-codex-delegation-dogfood-and-app-server.md)
   - [Developer Execution Broker](../done/20260910-developer-execution-broker.md)
   - `src/codex.rs`
   - `src/delegation/mod.rs`
@@ -15,11 +17,64 @@
   - `src/delegation/opencode.rs`
   - `src/local_agent.rs`
 
+## 概要
+
+OpenCode 1.18.30 の bounded one-shot delegation、診断、backend adapter、正規化された report/evidence、実行ファイル override、同一 directory の明示的 resume、bounded fork を実装し、accepted scope を完了した。
+
+## 背景
+
+既存の Codex 固有 delegation を backend-neutral な契約へ分離し、OpenCode を同じ bounded report/evidence 境界で利用できるようにする必要があった。
+
+## 問題
+
+OpenCode 固有の起動、event parsing、model/usage 観測を generic delegation の安全境界と混在させると、環境 allowlist、artifact 上限、requested/observed の区別が崩れる可能性があった。
+
+## 目標
+
+OpenCode の one-shot 実行を固定 argv、default-deny の環境、bounded artifact、schema 検証済み report で提供し、診断と明示的な同一 directory resume/fork を fail closed で扱う。
+
+## 対象外
+
+Persistent server lifecycle、attach、automatic resume、implicit continue は対象外である。現在の provider entitlement で live call が拒否されたことを、未実装扱いにはしない。
+
+## 提案する方針
+
+Generic layer が lifecycle、安全境界、artifact と report の上限を所有し、OpenCode adapter は固定された CLI 起動と backend 固有 event の正規化だけを所有する。現在の live entitlement は [live acceptance matrix](../open/20260908-live-acceptance-matrix.md) で追跡する。
+
+## 受け入れ条件
+
+- [x] OpenCode 1.18.30 の one-shot delegation と read-only diagnostics が bounded contract を満たす。
+- [x] Requested と observed の model/effort を分離し、usage が観測不能な場合は推測しない。
+- [x] 明示的 resume は同一 canonical directory の一意な session だけを受け入れる。
+- [x] Fork は明示的 session と組み合わせた bounded follow-up として動作する。
+- [x] Invalid/oversized output、invalid override、directory mismatch は副作用前に fail closed となる。
+- [x] Codex compatibility と host/global authentication/configuration を変更しない。
+
+## テスト計画
+
+Pinned OpenCode 1.18.30 で adapter tests、diagnostics、isolated one-shot call を実行し、workspace と host auth/config metadata が不変であることを確認する。Provider 拒否は bounded error として保存し、成功へ読み替えない。
+
+## リスク
+
+Provider の model catalog、地域 opt-in、支払い entitlement は外部状態で変化する。実装完了の判定は deterministic contract と過去の成功済み live evidence を使い、現在の外部拒否は acceptance matrix に残す。
+
+## 変更履歴
+
+- 2026-09-10: issue 作成。
+- 2026-09-11〜13: backend extraction、one-shot、diagnostics、normalization、override、resume、fork を実装・検証。
+- 2026-09-15: 1.18.30 で closure verification を実施し、accepted scope を done へ遷移。
+
+## 注記
+
+2026-09-15 の current live call は地域 opt-in、支払い方法、disabled model という provider entitlement により完了しなかった。2026-09-12 の成功済み one-shot evidence は保持されており、current live failure を成功とは扱っていない。CHANGES への追記は issue status と検証記録だけの変更には不要である。
+
+## Detailed implementation record
+
 ## Current `main` boundary (2026-09-11)
 
 PR #13 already added a structured `local_agent_run` broker for both Codex and OpenCode. That broker is a one-shot development execution capability with canonical session-root cwd checks, a fixed adapter-owned argv, bounded task/output, isolated environment/state, and a dedicated local-agent sandbox profile.
 
-This issue does **not** reimplement that broker. Its remaining product goal is narrower and different:
+This issue does **not** reimplement that broker. Its completed product goal was narrower and different:
 
 > make the existing schema-validated `codex delegate` workflow backend-neutral, so OpenCode can participate in the same bounded delegation report/evidence contract and generic `temote-mcp delegate --backend ...` CLI.
 
@@ -549,7 +604,7 @@ One-shot OpenCode backend landed on main:
 - Tests cover backend selection and flag validation, argv construction, cwd canonicalization, missing executable, success normalization, non-zero exit, timeout, bounded stdout, secret sentinel filtering, and Codex compatibility.
 - Live smoke on 2026-09-11: OpenCode CLI `1.18.30`, `--model opencode/mimo-v2.5-free`, read-only task; parent `status=success` with a schema-valid report and mapped usage; no files created or changed.
 
-Not implemented: `TEMOTE_OPENCODE_BIN` and persistent server/session/resume behavior.
+At this historical Phase 3 checkpoint, `TEMOTE_OPENCODE_BIN` and persistent server/session/resume behavior had not yet been implemented. The executable override and bounded explicit resume were implemented in later slices below; persistent lifecycle remains outside this issue.
 
 ## Phase 2 adapter extraction status (2026-09-11)
 
@@ -563,7 +618,7 @@ Backend adapter extraction landed on main without changing external behavior:
 - All 37 delegation tests moved with their modules and pass unchanged; the frozen parent JSON fixture, Codex argv/environment tests, OpenCode argv/normalization tests, and diagnostics tests keep their assertions.
 - Smoke on 2026-09-11: `delegate diagnose --backend opencode` unchanged; one-shot `delegate --backend opencode --model opencode/mimo-v2.5-free` completed with `status=success` and no files created or changed.
 
-Remaining work after this slice: persistent server/session lifecycle, automatic resume, fork, and attach.
+Historical next work after this slice was the later explicit-resume, fork, and executable-override work recorded below. Persistent server lifecycle, automatic resume, and attach are outside the closed scope.
 
 ## Explicit resume status (2026-09-12)
 
@@ -574,7 +629,7 @@ The recommended explicit-resume slice landed locally:
 - Invalid IDs, missing or ambiguous sessions, directory mismatch, non-zero/timeout/oversized/malformed probes, and incomplete metadata fail closed without launching the delegated task.
 - Deterministic fake-CLI coverage covers validation, argv ordering, matching-directory success, and preflight failures. The frozen parent result shape is unchanged.
 
-Remaining work is persistent server/session lifecycle and the explicitly deferred `--continue`, `--fork`, and `--attach` behavior.
+At this checkpoint `--fork` was still deferred; it was completed in the later bounded fork slice. Persistent lifecycle, implicit `--continue`, and `--attach` are outside the closed scope.
 
 ## Phase 3 diagnostics status (2026-09-11)
 
@@ -587,7 +642,7 @@ Read-only OpenCode CLI diagnostics landed on main:
 - Deterministic fake-CLI tests cover missing binary, version success/failure/timeout/oversized/malformed, model listing success/empty/mixed/failure/unsupported/timeout/oversized, requested-model present/absent/unknown, environment allowlist filtering, and secret/output non-leakage.
 - Read-only smoke on 2026-09-11 with OpenCode CLI `1.18.30`: `executable=available`, `version=1.18.30`, `models=ready count=64`, `requested_model=opencode-go/deepseek-v4-flash present`; no credential mutation and no delegation execution.
 
-Remaining work after this slice: persistent server/session/resume.
+Historical next work after this slice was the bounded explicit-resume and executable-override work recorded below. Persistent server/session lifecycle is outside the closed scope.
 
 ## Live comparative measurement status (2026-09-12)
 
@@ -599,7 +654,7 @@ Live comparison landed on main. Evidence: [`docs/evaluations/codex-vs-opencode-l
 - Recommendation in this sample: keep Codex as the default delegation backend; treat OpenCode as an interactive/session backend or a fallback only after report delivery is enforced. More evidence (more runs, second OpenCode model, report-contract fix) is needed before changing defaults.
 - Observed issues are recorded in the evidence file only; no production changes were made in this slice.
 
-Remaining work after this slice: persistent server/session/resume.
+Historical next work after this slice was the bounded explicit-resume and executable-override work recorded below. Persistent server/session lifecycle is outside the closed scope.
 
 ## OpenCode normalized-report delivery fix status (2026-09-12)
 
@@ -631,7 +686,7 @@ Pre-implementation spike recorded in [`docs/evaluations/opencode-session-resume-
 - Verification: 8 new adapter tests + 3 shared delegation tests (52 OpenCode adapter tests), including precedence, unset fallback, empty/relative/missing/directory/non-executable/NUL/overlong rejection, symlink canonicalization, invalid-override diagnostics, source labeling, error-path non-disclosure, and child-environment filtering.
 - Smoke: valid override diagnosed `source=env_override`, `status=available`, `version=1.18.30`, requested model `present`; unset override diagnosed `source=path`; invalid override diagnosed `source=invalid_override` with `not_absolute`/`not_found` and delegation exited non-zero without producing a result; one-shot read-only delegation through the override returned `status=success` and left the disposable directory unchanged.
 
-Remaining work after this slice: persistent server/session lifecycle, automatic resume, fork, and attach.
+The bounded fork was implemented in the later slice below. Persistent server lifecycle, automatic resume, and attach are outside the closed scope.
 
 ## Phase 1 status (2026-09-11)
 
@@ -666,4 +721,15 @@ The bounded `--fork` follow-up landed locally. It extends the explicit resume sl
 - `opencode run` argv gains exactly one `--fork` immediately after `--session <id>` and before `-- <prompt>`; all other argv, environment filtering, artifact bounds, report normalization, and the frozen parent result shape are unchanged.
 - `evidence.thread_id` remains the observed session ID from OpenCode events; for a fork that observed value is the new forked session, not the requested parent.
 - Deterministic coverage: `fork_requires_session_and_is_opencode_only`, `fork_command_places_fork_after_session_before_prompt`, and `fork_preflight_uses_parent_session_and_launches_new_session` in `src/delegation/opencode.rs`. No live fork was executed (an installed, authenticated OpenCode runtime is not a repository-local gate); the upstream fork behavior is recorded in the resume spike (E5).
-- `--continue` and `--attach` remain unsupported. Persistent OpenCode server/session lifecycle and automatic resume remain the outstanding work in this issue.
+- `--continue` and `--attach` remain unsupported by design. Persistent OpenCode server/session lifecycle and automatic resume are outside this issue rather than incomplete acceptance work.
+
+## Closure verification (2026-09-15)
+
+The accepted one-shot scope was re-verified from baseline `0ee1db7e2e81a54faca6a4eb8d741e33702376d4` with an isolated official `opencode-ai@1.18.30` runtime. The host OpenCode 1.17.10 installation, global configuration, authentication files, and production services were not changed.
+
+- `cargo test --bin temote-mcp 'delegation::opencode::tests'`: 73 passed, 0 failed.
+- `delegate diagnose --backend opencode --model opencode-go/deepseek-v4-flash`: executable available from `TEMOTE_OPENCODE_BIN`, exact version 1.18.30, 96 bounded model identifiers, requested model present, no truncated output.
+- One-shot delegated calls reached the provider and remained bounded with the disposable workspace unchanged. The provider denied the discovered DeepSeek model pending a regional opt-in, denied listed paid OpenCode models because the account has no payment method, and reported the formerly free MiMo model disabled. These are exact current entitlement outcomes, so no successful live completion is claimed.
+- Authentication was reused only through mode-0600 copies in isolated data roots. No authentication contents, tokens, full configuration, or raw credential-bearing output were read into the report.
+
+The 2026-09-12 successful live runs already establish the optional provider-backed one-shot path for the implemented version. Current provider entitlement is tracked as environment-dependent live evidence in the live acceptance matrix and does not keep this implementation issue open. No CHANGES entry is required for this issue-only status correction and verification record. There is no remaining work in the accepted one-shot delegation scope.
