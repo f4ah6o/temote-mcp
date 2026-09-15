@@ -23,7 +23,30 @@ Branch: codex/20260915-complete-open-work
 6. **評価と実機**: T01-A / T06-B review、T05-C、T07-C、T08-C/A、T09/T10をresultsに明示的なblockedとして記録した。過去の試行分母、unknown、T05-Cのpartial commitと最後の観測stateは維持した。既存4 issueには実provider認証、macOS実機、physical multi-host、sandboxを維持したLinux実行環境などの具体的な不足条件を追記し、openを維持した。
 7. **resumeの説明**: `Applied` はreconciliationの受付結果であってtask完了ではない。既存の `Applied + Interrupted`、replacement process PIDの直接記録なし、resume後のcompleted例なしを英日usage、Agent Skill、resultsで一致させた。これはdocumentation-onlyの明確化で、新しいlive成功ではない。
 
-最終commit / push結果は、この追記を含むdocumentation差分の検査後に記録する。独立review、必要な修正・再review、最終integration gateは未完了のため、本issue全体はcloseしない。
+独立review、必要な修正・再review、最終integration gateは未完了のため、本issue全体はcloseしない。
+
+### Commit / push結果
+
+各worktreeの差分review、documentation-onlyスコープ検査、`git diff --check`、stage済み差分検査をPASSした後、専用Git toolで以下をcommitした。commit後も3worktreeがclean、各 `src` treeが再開前と同一であることを確認した。これはdocumentation gateであり、失敗したcandidate runtime testをPASSに変更するものではない。
+
+| Branch | 検査・commit済みHEAD | originへのpush結果 |
+| --- | --- | --- |
+| `codex/20260915-completion-activity` | `112b3cdc1ce941d0542b920c04c52e877d52a61f` | FAIL: JSON-RPC -32000 / Git exit 128 / HTTP 403 |
+| `codex/20260915-completion-evaluation` | `221e2ba26b91ac478c7466306b8b7bd465e3a42c` | FAIL: JSON-RPC -32000 / Git exit 128 / HTTP 403 |
+| `codex/20260915-complete-open-work` | `439661581c9e7f81545f34295430fd8fa557ce64` | FAIL: JSON-RPC -32000 / Git exit 128 / HTTP 403 |
+
+3件とも実際のstderrは次のとおり。credential・remoteを変更する回避策は行っていない。branchとworktreeはすべて保持し、書込権限のある環境からのpushが必要である。
+
+```text
+remote: Permission to f4ah6o/temote-mcp.git denied to fujita-obr.
+fatal: unable to access 'https://github.com/f4ah6o/temote-mcp.git/': The requested URL returned error: 403
+```
+
+このpush結果の記録は上表のintegration commit後のdocumentation-only追記であり、後続commitとして保存する。上表は実際にpushを試行したimmutable commitを示す。
+
+linked worktree専用sessionからの最初のstageは、共有Git管理領域 `/home/hirohito-fujita/src/local-mcp/.git` がsession root外のため拒否された。設定済みnamed root `src` に通常の `agent` / `yolo=false` Git操作用sessionを作成し、専用Git toolに対象worktreeのcwdと絶対file pathを明示してstage/commitした。既存sessionの権限、Git設定、sandbox実装は変更していない。
+
+最終確認時、root mainのHEADは `0ee1db7e2e81a54faca6a4eb8d741e33702376d4` のままだが、`README.md`、`README.ja.md`、`docs/usage.md`、`docs/usage.ja.md`、`src/codex_app_server.rs`、`src/session_control.rs`、`tests/cli_session_e2e.rs` に今回の作業外の変更が存在した。開始時からの `.tmp/`、`.wt/`、`issues/done/20260903-nested-onepassword-secret-resolution.md` とともに一切破棄・退避・stageせず保持した。root mainをcleanとは報告しない。
 
 ## 背景
 
@@ -98,7 +121,7 @@ Codex app-server の停止後 `resume` 検証は、accepted receipt が `Applied
 - [x] T01-A、T06-B、T05-C、T07-C、T08-C/A、T09/T10が完了または明示的なfailed / blockedとしてresultsに反映される。（今回はblockedの記録であり、実行完了ではない。）
 - [x] app-server resumeの意味と観測限界がresults、英日usage、Agent Skillで一致する。（documentationのみ。新しいlive evidenceなし。）
 - [x] 既存4 issueの実 provider / 対応OS / physical host不足が完了するか、具体的な外部条件付きでopenのまま記録される。（今回は具体的な不足条件を記録してopenを維持。）
-- [ ] integration、activity、evaluation branchのpush結果が記録される。
+- [x] integration、activity、evaluation branchのpush結果が記録される。（3 branchともHTTP 403。remote同期は未完了。）
 
 ## テスト計画
 
