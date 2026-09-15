@@ -674,7 +674,7 @@ async fn call_tool_with_local_agent_executable(
             args.as_object().is_some_and(|object| object.is_empty()),
             "session_list takes no arguments"
         );
-        return session_list().await;
+        return session_list(sessions).await;
     }
     if name == "session_start" {
         anyhow::ensure!(
@@ -1198,8 +1198,11 @@ async fn call_tool_with_local_agent_executable(
     }
 }
 
-async fn session_list() -> Result<Value> {
-    let views = crate::session_control::session_views_for_mcp().await?;
+async fn session_list(sessions: Option<&SessionBackend>) -> Result<Value> {
+    let views = match sessions {
+        Some(backend) => backend.list().await?,
+        None => crate::session_control::session_views_for_mcp().await?,
+    };
     let mut sessions = Vec::new();
     let mut session_bytes = 0usize;
     for session in views {
