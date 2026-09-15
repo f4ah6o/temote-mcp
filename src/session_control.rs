@@ -214,6 +214,14 @@ impl SessionBackend {
             .unwrap_or(false))
     }
 
+    pub async fn list(&self) -> Result<Vec<SessionView>> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => list_session_views(supervisor).await,
+            Self::LocalControl => session_views_for_mcp().await,
+        }
+    }
+
     pub async fn start(&self, path: &str, session_id: Option<&str>) -> Result<Value> {
         match self {
             #[cfg(test)]
