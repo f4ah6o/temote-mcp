@@ -402,6 +402,16 @@ fn update_operation_receipt(record: &mut TaskRecord, operation_id: Uuid, phase: 
 #[derive(Clone, Debug)]
 struct TaskStore {
     directory: PathBuf,
+    #[cfg(test)]
+    actor_update_pause: Option<ActorUpdatePause>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ActorUpdatePause {
+    actor_id: Uuid,
+    entered: PathBuf,
+    release: PathBuf,
 }
 
 enum StartAcceptance {
@@ -419,6 +429,20 @@ enum RuntimeAccess {
     Local,
     Acquired(TaskRuntimeLease),
     OwnedElsewhere,
+}
+
+enum ActorMutation {
+    Applied(TaskRecord),
+    Stale(TaskRecord),
+}
+
+impl ActorMutation {
+    fn into_parts(self) -> (TaskRecord, bool) {
+        match self {
+            Self::Applied(record) => (record, true),
+            Self::Stale(record) => (record, false),
+        }
+    }
 }
 
 struct FinalizeOwnerOutcome {
@@ -466,12 +490,32 @@ impl TaskStore {
     fn default_store() -> Result<Self> {
         Ok(Self {
             directory: config::state_dir()?.join("codex-tasks"),
+            #[cfg(test)]
+            actor_update_pause: None,
         })
     }
 
     #[cfg(test)]
     fn new(directory: PathBuf) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            actor_update_pause: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_actor_update_pause(
+        mut self,
+        actor_id: Uuid,
+        entered: PathBuf,
+        release: PathBuf,
+    ) -> Self {
+        self.actor_update_pause = Some(ActorUpdatePause {
+            actor_id,
+            entered,
+            release,
+        });
+        self
     }
 
     fn ensure_directory(&self) -> Result<()> {
@@ -690,6 +734,61 @@ impl TaskStore {
         record.updated_at = config::unix_time();
         self.save_locked(&record)?;
         Ok(record)
+    }
+
+    fn update_if_actor_current<F>(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        owner: &SessionInstance,
+        actor_id: Uuid,
+        f: F,
+    ) -> Result<ActorMutation>
+    where
+        F: FnOnce(&mut TaskRecord) -> Result<bool>,
+    {
+        #[cfg(test)]
+        if let Some(pause) = self
+            .actor_update_pause
+            .as_ref()
+            .filter(|pause| pause.actor_id == actor_id)
+        {
+            std::fs::write(&pause.entered, b"entered")?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !pause.release.exists() {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "timed out waiting to release stale actor update"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let scope = config::canonical_directory(&session.cwd)?;
+        let _guard = self.lock()?;
+        let registry = codex_lifecycle_registry().lock().unwrap();
+        let entry = registry
+            .entries
+            .get(owner)
+            .context("Codex session instance lifecycle state is unavailable")?;
+        anyhow::ensure!(!entry.closing, "Codex session instance is closing");
+        drop(registry);
+        let actor_is_current = runtimes()
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .is_some_and(|runtime| {
+                runtime.actor_id == actor_id && runtime.owner == *owner && runtime.scope == scope
+            });
+        let mut record = self.load_locked(session, task_id)?;
+        if !actor_is_current {
+            return Ok(ActorMutation::Stale(record));
+        }
+        if f(&mut record)? {
+            record.updated_at = config::unix_time();
+            self.save_locked(&record)?;
+        }
+        Ok(ActorMutation::Applied(record))
     }
 
     fn accept_start(
@@ -1507,6 +1606,29 @@ fn apply_control_failure(
     })
 }
 
+fn apply_control_failure_for_actor(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    operation_id: Uuid,
+    owner: &SessionInstance,
+    actor_id: Uuid,
+    shutting_down: bool,
+) -> Result<ActorMutation> {
+    if shutting_down {
+        return apply_control_failure(store, session, task_id, operation_id, true)
+            .map(ActorMutation::Applied);
+    }
+    store.update_if_actor_current(session, task_id, owner, actor_id, |record| {
+        if record.status.is_terminal() {
+            return Ok(false);
+        }
+        record.status = TaskStatus::ReconciliationRequired;
+        record.revision = record.revision.saturating_add(1);
+        Ok(true)
+    })
+}
+
 fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
     json!({
         "task_id": task_id,
@@ -1750,6 +1872,13 @@ struct RuntimeHandle {
     _lease: Arc<TaskRuntimeLease>,
 }
 
+impl RuntimeHandle {
+    fn is_usable(&self) -> bool {
+        !self.client.is_stopped()
+            && Instant::now().saturating_duration_since(self.started_at) < CHILD_LIFETIME
+    }
+}
+
 fn runtimes() -> &'static Mutex<HashMap<Uuid, RuntimeHandle>> {
     static RUNTIMES: OnceLock<Mutex<HashMap<Uuid, RuntimeHandle>>> = OnceLock::new();
     RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1767,10 +1896,7 @@ fn runtime_for(session: &config::Session, task_id: Uuid) -> Option<RuntimeHandle
     }
     let state = runtimes().lock().unwrap();
     let runtime = state.get(&task_id)?;
-    if runtime.client.is_stopped() {
-        return None;
-    }
-    if Instant::now().saturating_duration_since(runtime.started_at) >= CHILD_LIFETIME {
+    if !runtime.is_usable() {
         return None;
     }
     let runtime = runtime.clone();
@@ -1784,7 +1910,7 @@ fn runtime_matches_record(record: &TaskRecord) -> bool {
         .unwrap()
         .get(&record.task_id)
         .is_some_and(|runtime| {
-            !runtime.client.is_stopped()
+            runtime.is_usable()
                 && runtime.owner == record.owner
                 && runtime.scope == record.scope_cwd
         })
@@ -3264,6 +3390,23 @@ pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<
     task_get_with_store_and_binary(args, session, &store, Path::new("codex")).await
 }
 
+fn mark_task_unknown_for_actor(
+    store: &TaskStore,
+    session: &config::Session,
+    task_id: Uuid,
+    owner: &SessionInstance,
+    actor_id: Uuid,
+) -> Result<ActorMutation> {
+    store.update_if_actor_current(session, task_id, owner, actor_id, |record| {
+        if record.status.is_terminal() {
+            return Ok(false);
+        }
+        record.status = TaskStatus::Unknown;
+        record.revision = record.revision.saturating_add(1);
+        Ok(true)
+    })
+}
+
 async fn task_get_with_store_and_binary(
     args: &Value,
     session: &config::Session,
@@ -3339,46 +3482,43 @@ async fn task_get_with_store_and_binary(
         Ok(response) => response,
         Err(_) => {
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
-            let record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TaskStatus::Unknown;
-                    record.revision = record.revision.saturating_add(1);
-                }
-                Ok(())
-            })?;
+            let (record, _) =
+                mark_task_unknown_for_actor(store, session, task_id, &owner, client.actor_id)?
+                    .into_parts();
             drop(apply_permit);
             return Ok(task_view(&record, None));
         }
     };
-    let evidence_permit = ensure_current_active_instance(&owner, session).await?;
-    let evidence_ref = store_evidence_for_instance(&owner, session, &response);
-    drop(evidence_permit);
     let derived = match derive_thread_state(&response, record.turn_id.as_deref()) {
         Ok(derived) => derived,
         Err(_) => {
             let apply_permit = ensure_current_active_instance(&owner, session).await?;
-            record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TaskStatus::Unknown;
-                    record.revision = record.revision.saturating_add(1);
-                }
-                Ok(())
-            })?;
+            let (updated, applied) =
+                mark_task_unknown_for_actor(store, session, task_id, &owner, client.actor_id)?
+                    .into_parts();
+            record = updated;
+            let evidence_ref = applied
+                .then(|| store_evidence_for_instance(&owner, session, &response))
+                .flatten();
             drop(apply_permit);
             return Ok(task_view(&record, evidence_ref.as_ref()));
         }
     };
-    let reconciled_status = reconciled_task_status(record.status, derived.status);
-    let changed = record.status != reconciled_status
-        || record.turn_id != derived.turn_id
-        || (derived.usage.is_some() && record.usage != derived.usage);
-    if changed || (record.generation == 0 && derived.turn_id.is_some()) {
-        let apply_permit = ensure_current_active_instance(&owner, session).await?;
-        record = store.update_if_instance_live(session, task_id, &owner, |record| {
+    let apply_permit = ensure_current_active_instance(&owner, session).await?;
+    let (updated, applied) = store
+        .update_if_actor_current(session, task_id, &owner, client.actor_id, |record| {
             if record.status.is_terminal() {
-                return Ok(());
+                return Ok(false);
             }
-            record.status = reconciled_task_status(record.status, derived.status);
+            let reconciled_status = reconciled_task_status(record.status, derived.status);
+            let changed = record.status != reconciled_status
+                || record.turn_id != derived.turn_id
+                || (derived.usage.is_some() && record.usage != derived.usage)
+                || (record.generation == 0 && derived.turn_id.is_some());
+            if !changed {
+                return Ok(false);
+            }
+            record.status = reconciled_status;
             if derived.turn_id.is_some() {
                 record.turn_id = derived.turn_id.clone();
                 if record.generation == 0 {
@@ -3398,10 +3538,14 @@ async fn task_get_with_store_and_binary(
                 receipt.phase = OperationPhase::Applied;
                 receipt.outcome = outcome;
             }
-            Ok(())
-        })?;
-        drop(apply_permit);
-    }
+            Ok(true)
+        })?
+        .into_parts();
+    record = updated;
+    let evidence_ref = applied
+        .then(|| store_evidence_for_instance(&owner, session, &response))
+        .flatten();
+    drop(apply_permit);
     if after_revision == Some(record.revision) {
         return Ok(json!({
             "task_id": task_id,
@@ -3672,7 +3816,16 @@ async fn task_control_with_store_and_binary(
     };
     if result.is_err() {
         let shutting_down = session_instance_is_closing(&owner);
-        let record = apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
+        let (record, _) = apply_control_failure_for_actor(
+            store,
+            session,
+            task_id,
+            operation_id,
+            &owner,
+            client.actor_id,
+            shutting_down,
+        )?
+        .into_parts();
         return Ok(task_view(&record, None));
     }
 
@@ -3685,8 +3838,16 @@ async fn task_control_with_store_and_binary(
             Ok(state) => Some(state),
             Err(_) => {
                 let shutting_down = session_instance_is_closing(&owner);
-                let record =
-                    apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
+                let (record, _) = apply_control_failure_for_actor(
+                    store,
+                    session,
+                    task_id,
+                    operation_id,
+                    &owner,
+                    client.actor_id,
+                    shutting_down,
+                )?
+                .into_parts();
                 return Ok(task_view(&record, None));
             }
         }
@@ -3694,39 +3855,42 @@ async fn task_control_with_store_and_binary(
         None
     };
     let apply_permit = ensure_current_active_instance(&owner, session).await?;
-    record = store.update_if_instance_live(session, task_id, &owner, |record| {
-        if record.status.is_terminal() {
-            return Ok(());
-        }
-        if let Some(resumed) = resumed.as_ref() {
-            record.status = reconciled_task_status(record.status, resumed.status);
-            if resumed.turn_id.is_some() {
-                record.turn_id = resumed.turn_id.clone();
-                record.generation = record.generation.max(1);
+    let (updated, _) = store
+        .update_if_actor_current(session, task_id, &owner, client.actor_id, |record| {
+            if record.status.is_terminal() {
+                return Ok(false);
             }
-            if resumed.usage.is_some() {
-                record.usage = resumed.usage.clone();
-            }
-        } else if !record.status.is_terminal() {
-            record.generation = record.generation.saturating_add(1);
-            record.status = if action == "interrupt" {
-                TaskStatus::Interrupted
+            if let Some(resumed) = resumed.as_ref() {
+                record.status = reconciled_task_status(record.status, resumed.status);
+                if resumed.turn_id.is_some() {
+                    record.turn_id = resumed.turn_id.clone();
+                    record.generation = record.generation.max(1);
+                }
+                if resumed.usage.is_some() {
+                    record.usage = resumed.usage.clone();
+                }
             } else {
-                TaskStatus::Running
-            };
-        }
-        record.revision = record.revision.saturating_add(1);
-        let outcome = record.outcome();
-        if let Some(receipt) = record
-            .operations
-            .iter_mut()
-            .find(|receipt| receipt.operation_id == operation_id)
-        {
-            receipt.phase = OperationPhase::Applied;
-            receipt.outcome = outcome;
-        }
-        Ok(())
-    })?;
+                record.generation = record.generation.saturating_add(1);
+                record.status = if action == "interrupt" {
+                    TaskStatus::Interrupted
+                } else {
+                    TaskStatus::Running
+                };
+            }
+            record.revision = record.revision.saturating_add(1);
+            let outcome = record.outcome();
+            if let Some(receipt) = record
+                .operations
+                .iter_mut()
+                .find(|receipt| receipt.operation_id == operation_id)
+            {
+                receipt.phase = OperationPhase::Applied;
+                receipt.outcome = outcome;
+            }
+            Ok(true)
+        })?
+        .into_parts();
+    record = updated;
     drop(apply_permit);
     Ok(task_view(&record, None))
 }
@@ -3824,7 +3988,8 @@ for raw in sys.stdin:
     elif method == 'thread/read':
         if mode == 'exit-on-read':
             sys.exit(17)
-        result = {'thread':{'id':thread_id,'status':{'type':'idle'},'tokenUsage':{'inputTokens':4,'cachedInputTokens':1,'outputTokens':2,'reasoningOutputTokens':1,'totalTokens':6},'turns':[{'id':turn_id,'status':'completed','items':[{'type':'agentMessage','id':'m','text':'secret transcript marker'}]}]}}
+        running = mode in ('running', 'reply-running-and-exit')
+        result = {'thread':{'id':thread_id,'status':{'type':'active' if running else 'idle'},'tokenUsage':{'inputTokens':4,'cachedInputTokens':1,'outputTokens':2,'reasoningOutputTokens':1,'totalTokens':6},'turns':[{'id':turn_id,'status':'inProgress' if running else 'completed','items':[{'type':'agentMessage','id':'m','text':'secret transcript marker'}]}]}}
     elif method == 'turn/steer':
         result = {'turnId':turn_id}
     elif method == 'turn/interrupt':
@@ -3833,6 +3998,8 @@ for raw in sys.stdin:
         print(json.dumps({'id':i,'error':{'code':-32601,'message':'unsupported'}}), flush=True)
         continue
     print(json.dumps({'id':i,'result':result}), flush=True)
+    if mode == 'reply-running-and-exit' and method == 'thread/read':
+        sys.exit(17)
 "##;
         let script = script.replace("__CLIENT_VERSION__", APP_SERVER_CLIENT_VERSION);
         std::fs::write(&path, script).unwrap();
@@ -3956,6 +4123,14 @@ for raw in sys.stdin:
                 let _ = child.kill();
                 let _ = child.wait();
             }
+        }
+    }
+
+    struct ReleaseMarker(PathBuf);
+
+    impl Drop for ReleaseMarker {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
         }
     }
 
@@ -6402,6 +6577,113 @@ for raw in sys.stdin:
         assert_eq!(receipt.phase, OperationPhase::Applied);
         drop(replacement);
 
+        remove_session_with_store(&owner, &store).await.unwrap();
+        session_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_public_read_cannot_overwrite_a_running_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (session_handle, owner) =
+            active_test_session(root.path(), "stale-public-read", true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let started = task_start_with_store_and_binary_fenced(
+            &json!({
+                "operation_id": Uuid::new_v4(),
+                "task": "keep replacement state after an old read wakes",
+                "model": "gpt-5.6-luna",
+                "effort": "max"
+            }),
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "reply-running-and-exit"),
+        )
+        .await
+        .unwrap();
+        let task_id = Uuid::parse_str(started["task_id"].as_str().unwrap()).unwrap();
+        let old_actor_id = runtime_for(&owner, task_id).unwrap().actor_id;
+        let old_update_entered = root.path().join("old-update-entered");
+        let old_update_release = root.path().join("old-update-release");
+        let _release_on_drop = ReleaseMarker(old_update_release.clone());
+        let paused_store = store.clone().with_actor_update_pause(
+            old_actor_id,
+            old_update_entered.clone(),
+            old_update_release.clone(),
+        );
+        let old_read = tokio::spawn({
+            let owner = owner.clone();
+            let missing_binary = root.path().join("old-read-must-use-registered-runtime");
+            async move {
+                task_get_with_store_and_binary(
+                    &json!({"task_id": task_id}),
+                    &owner,
+                    &paused_store,
+                    &missing_binary,
+                )
+                .await
+            }
+        });
+
+        wait_for_marker(&old_update_entered).await;
+        let unknown = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let record = store.load(&owner, task_id).unwrap();
+                let lease_released = store.try_acquire_runtime_lease(task_id).unwrap().is_some();
+                if record.status == TaskStatus::Unknown
+                    && runtime_for(&owner, task_id).is_none()
+                    && lease_released
+                {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("old actor did not release ownership while its caller was paused");
+
+        let resume_operation_id = Uuid::new_v4();
+        let resumed = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": resume_operation_id,
+                "action": "resume"
+            }),
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "running"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed["status"], "running");
+        assert!(resumed["revision"].as_u64().unwrap() >= unknown.revision + 2);
+        let replacement = runtime_for(&owner, task_id).unwrap();
+        assert_ne!(replacement.actor_id, old_actor_id);
+        let replacement_record = store.load(&owner, task_id).unwrap();
+        let receipt = replacement_record
+            .operations
+            .iter()
+            .find(|receipt| receipt.operation_id == resume_operation_id)
+            .unwrap();
+        assert_eq!(receipt.phase, OperationPhase::Applied);
+        assert_eq!(receipt.outcome.status, TaskStatus::Running);
+
+        std::fs::write(&old_update_release, b"release").unwrap();
+        let old_view = tokio::time::timeout(Duration::from_secs(5), old_read)
+            .await
+            .expect("stale public read did not finish after its barrier was released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_view["status"], "running");
+        assert_eq!(old_view["revision"], replacement_record.revision);
+        assert_eq!(old_view["generation"], replacement_record.generation);
+        assert_eq!(
+            old_view["turn_id"].as_str(),
+            replacement_record.turn_id.as_deref()
+        );
+        assert_eq!(store.load(&owner, task_id).unwrap(), replacement_record);
+
+        drop(replacement);
         remove_session_with_store(&owner, &store).await.unwrap();
         session_handle.shutdown().await.unwrap();
     }
