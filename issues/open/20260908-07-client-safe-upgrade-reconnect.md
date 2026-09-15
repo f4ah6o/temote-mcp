@@ -2,16 +2,26 @@
 
 Date: 2026-09-08
 
-## Implementation status (2026-09-12)
+## Current implementation status (2026-09-15)
+
+The authenticated direct HTTP coordinator, response-delivery commit barrier,
+remote preflight/apply/status tools, durable reconnect verification, and Linux
+process-boundary reconnect E2E are implemented. The required macOS
+process-boundary E2E remains pending, so this issue stays open. The dated
+sections before the 2026-09-15 implementation report are retained as historical
+snapshots of the incremental work; their remaining-work statements describe
+those earlier slices rather than the current repository state.
+
+## Historical implementation snapshot (2026-09-12, boot identity)
 
 The repository-local boot identity slice is implemented: each Temote process now
 generates one UUID-shaped, non-secret `boot_generation`, and the existing
 `/healthz` response reports it together with the effective `host_id`. This is
-an identity primitive for later reconnect verification only; remote upgrade
-tools, response-flush commit barriers, coordinator ownership, and live
-reconnect acceptance remain unimplemented.
+an identity primitive for later reconnect verification only. At this historical
+slice, remote upgrade tools, response-flush commit barriers, coordinator
+ownership, and live reconnect acceptance remained unimplemented.
 
-## Implementation status (2026-09-12, coordinator-safe transaction primitives)
+## Historical implementation snapshot (2026-09-12, coordinator-safe transaction primitives)
 
 The repository-local coordinator/observation core is implemented on top of the
 step-1 schema:
@@ -30,12 +40,12 @@ step-1 schema:
 - `/healthz` now reports `last_upgrade_transaction` (bounded, non-secret,
   best-effort) in addition to `host_id` and `boot_generation`.
 
-Still unimplemented: the one-shot `upgrade-coordinator` process, the transport
-response-flush commit barrier, the remote `upgrade_preflight` / `upgrade_apply`
-/ `upgrade_status` tools, and the deliberate-disconnect process E2E on macOS and
-Linux.
+At this historical slice, the one-shot `upgrade-coordinator` process, the
+transport response-flush commit barrier, the remote `upgrade_preflight` /
+`upgrade_apply` / `upgrade_status` tools, and the deliberate-disconnect process
+E2E on macOS and Linux were still unimplemented.
 
-## Implementation status (2026-09-13, reconnect identity metadata)
+## Historical implementation snapshot (2026-09-13, reconnect identity metadata)
 
 The MCP handshake now exposes the same bounded, non-secret process identity that
 `/healthz` already reports, so a reconnecting MCP client can verify the intended
@@ -49,11 +59,12 @@ host, version, and boot generation without an out-of-band health probe:
 - `modernize_result` now merges the modern `serverInfo` entry into an existing
   `_meta` object instead of replacing it, so modern `initialize`/`ping` retain the
   identity field alongside the existing server metadata.
-- This completes the "health/initialize/ping identity metadata" item of the endpoint
-  generation-identity contract. The coordinator process, response-flush commit
-  barrier, remote upgrade tools, and both-platform deliberate-disconnect E2E remain.
+- This completed the "health/initialize/ping identity metadata" item of the endpoint
+  generation-identity contract. At this historical slice, the coordinator process,
+  response-flush commit barrier, remote upgrade tools, and both-platform
+  deliberate-disconnect E2E remained.
 
-## Implementation status (2026-09-13, coordinator-safe transition primitives)
+## Historical implementation snapshot (2026-09-13, coordinator-safe transition primitives)
 
 The next repository-local slice adds the coordinator-safe primitives the one-shot
 coordinator will drive:
@@ -75,12 +86,13 @@ coordinator will drive:
   so exactly one `commit`/`abort` decision can win. The waiter resolves without
   any wall-clock sleep.
 
-Remaining: the one-shot upgrade-coordinator process, the response-flush barrier
-wired into the HTTP/MCP transport, the remote upgrade tools, and both-platform
-deliberate-disconnect E2E. The new primitives are not yet wired into the local
-`session_control` upgrade path, so no runtime behavior changes in this slice.
+At this historical slice, the one-shot upgrade-coordinator process, the
+response-flush barrier wired into the HTTP/MCP transport, the remote upgrade
+tools, and both-platform deliberate-disconnect E2E remained. The new primitives
+were not yet wired into the local `session_control` upgrade path, so this slice
+did not change runtime behavior.
 
-## Implementation status (2026-09-13, coordinator state machine)
+## Historical implementation snapshot (2026-09-13, coordinator state machine)
 
 The repository-local coordinator state machine is implemented on top of the durable
 transaction schema, still without an OS process wrapper, transport wiring, or remote
@@ -102,11 +114,12 @@ tools:
   second-owner / non-prepared refusal, and concurrent commit/abort one-shot
   enforcement.
 
-Still unimplemented: the one-shot `upgrade-coordinator` OS process and its concrete
-executor, transport commit wiring, remote `upgrade_preflight` / `upgrade_apply` /
-`upgrade_status` tools, and the deliberate-disconnect process E2E.
+At this historical slice, the one-shot `upgrade-coordinator` OS process and its
+concrete executor, transport commit wiring, remote `upgrade_preflight` /
+`upgrade_apply` / `upgrade_status` tools, and the deliberate-disconnect process
+E2E were still unimplemented.
 
-## Implementation status (2026-09-13, persisted apply admission)
+## Historical implementation snapshot (2026-09-13, persisted apply admission)
 
 The repository-local duplicate/idempotency admission decision over the complete
 persisted transaction set (suggested implementation order step 7) is implemented,
@@ -132,12 +145,13 @@ still without writing transaction state or starting a coordinator:
   `load_transactions` scan, fail-closed malformed/unsafe existing records, and
   tolerant skipping of a missing record.
 
-Not implemented in this slice: creating/persisting the prepared transaction or the
-cross-process admission lock, which belong to the `upgrade_apply` mutation path.
+This historical slice did not yet create or persist the prepared transaction or
+the cross-process admission lock, which belong to the `upgrade_apply` mutation
+path.
 
-## Implementation status (2026-09-11)
+## Historical implementation snapshot (2026-09-11, durable transaction schema)
 
-Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.
+Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. At this historical slice, the remote tools, coordinator, response-flush barrier, and reconnect contract remained unimplemented.
 
 ## Implementation status (2026-09-15, direct HTTP coordinator and Linux reconnect proof)
 
@@ -195,6 +209,11 @@ and OAuth reconnect:
 - both restored sessions were active with their approved logical paths and
   `agent` permission mode, the execution snapshot was removed, all fixture
   processes shut down, and no process retaining the private namespace remained.
+
+The same exact Linux E2E passed again at merged integration commit `8ebaf59` in
+117.92 seconds. That run observed a successful 7.666-second preflight and
+27.681-second apply and repeated the same atomic replacement, coordinator,
+reconnect, identity, restored-session, terminal-status, and no-orphan assertions.
 
 The Linux result does not establish macOS behavior. The required macOS
 process-boundary reconnect E2E remains pending, so this issue stays open and no
@@ -266,7 +285,7 @@ Expose a deliberately small lifecycle API, for example:
 
 ```text
 upgrade_preflight()
-upgrade_apply(expected_version?)
+upgrade_apply(session_id, expected_version?)
 upgrade_status(transaction_id)
 ```
 
@@ -541,22 +560,22 @@ If remote package acquisition is designed later, it requires a separate issue an
 
 ## Acceptance criteria
 
-- [ ] an authenticated remote MCP client can request application of the canonical already-installed Temote target without supplying an executable path
-- [ ] destructive upgrade work is owned outside the lifetime of the direct ingress being replaced
-- [ ] the initiating response is flushed successfully before the destructive transaction is committed
-- [ ] no fixed-delay sleep is used as the correctness mechanism for response-before-restart ordering
-- [ ] transaction state survives loss of the initiating MCP connection
-- [ ] reconnecting to the same endpoint can verify stable host identity, target version, and replacement boot generation
-- [ ] `upgrade_status(transaction_id)` deterministically reports terminal success/failure after reconnect
-- [ ] successful status requires existing session-restore checks plus replacement endpoint health/identity checks
-- [ ] duplicate/retried remote requests cannot create concurrent destructive upgrades
-- [ ] transaction persistence follows Temote owner-only, bounded, no-symlink, non-secret state rules
-- [ ] no credential value, token, auth header, cookie, arbitrary command, or client-controlled executable path is persisted or executed
-- [ ] existing sandbox/yolo/approval/public-HTTP boundaries are unchanged
-- [ ] direct-ingress restart remains fail-closed when its restart recipe cannot safely reacquire required credentials
-- [ ] local CLI upgrade remains supported and shares primitives rather than growing a divergent implementation
+- [x] an authenticated remote MCP client can request application of the canonical already-installed Temote target without supplying an executable path
+- [x] destructive upgrade work is owned outside the lifetime of the direct ingress being replaced
+- [x] the initiating response is flushed successfully before the destructive transaction is committed
+- [x] no fixed-delay sleep is used as the correctness mechanism for response-before-restart ordering
+- [x] transaction state survives loss of the initiating MCP connection
+- [x] reconnecting to the same endpoint can verify stable host identity, target version, and replacement boot generation
+- [x] `upgrade_status(transaction_id)` deterministically reports terminal success/failure after reconnect
+- [x] successful status requires existing session-restore checks plus replacement endpoint health/identity checks
+- [x] duplicate/retried remote requests cannot create concurrent destructive upgrades
+- [x] transaction persistence follows Temote owner-only, bounded, no-symlink, non-secret state rules
+- [x] no credential value, token, auth header, cookie, arbitrary command, or client-controlled executable path is persisted or executed
+- [x] existing sandbox/yolo/approval/public-HTTP boundaries are unchanged
+- [x] direct-ingress restart remains fail-closed when its restart recipe cannot safely reacquire required credentials
+- [x] local CLI upgrade remains supported and shares primitives rather than growing a divergent implementation
 - [ ] process-boundary E2E covers deliberate connection loss and later reconnect on both macOS and Linux
-- [ ] English/Japanese operator and Agent Skill documentation clearly state the reconnect contract and the limit that Temote cannot force reconnect behavior in an arbitrary MCP client
+- [x] English/Japanese operator and Agent Skill documentation clearly state the reconnect contract and the limit that Temote cannot force reconnect behavior in an arbitrary MCP client
 
 ## Suggested implementation order
 
