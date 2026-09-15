@@ -20,6 +20,8 @@ use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::host_identity;
 use crate::named_roots::NamedRoots;
 use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
+use temote_mcp::activity::broker::{ActivityBroker, ActivityDelivery};
+use temote_mcp::activity::contract::{ACTIVITY_SCHEMA_VERSION, encode_event};
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_SESSION_LIST_ENTRIES: usize = 256;
@@ -29,6 +31,7 @@ const MAX_SESSION_CONTROL_LIST_BYTES: usize = 56 * 1024;
 const TERMINAL_SESSION_RETENTION: usize = 512;
 const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
 pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
@@ -113,6 +116,16 @@ enum ControlRequest {
         force: bool,
     },
     AttachConsole,
+    AttachActivity(AttachActivityRequest),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachActivityRequest {
+    schema_version: u64,
+    session_id: Option<String>,
+    tail: usize,
+    follow: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,18 +653,21 @@ async fn handle_control_connection(
     supervisor: Arc<SessionSupervisor>,
     console_registration: mpsc::Sender<mpsc::Sender<ApprovalPrompt>>,
 ) -> Result<()> {
-    let line = tokio::time::timeout(
-        CONTROL_READ_TIMEOUT,
-        read_stream_line(&mut stream, "supervisor control request"),
-    )
-    .await
-    .context("timed out waiting for supervisor control request")??;
-    let request: ControlRequest =
-        serde_json::from_str(line.trim()).context("invalid control request")?;
+    let (line, buffered_input) =
+        tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_request(&mut stream))
+            .await
+            .context("timed out waiting for supervisor control request")??;
+    let request: ControlRequest = serde_json::from_str(line.trim())
+        .map_err(|_| anyhow::anyhow!("invalid control request"))?;
 
     match request {
         ControlRequest::AttachConsole => {
             handle_console_attachment(stream, console_registration).await
+        }
+        ControlRequest::AttachActivity(_) if buffered_input => Ok(()),
+        ControlRequest::AttachActivity(request) => {
+            let broker = supervisor.activity_broker();
+            handle_activity_attachment(stream, broker, request).await
         }
         ControlRequest::Upgrade {
             executable,
@@ -797,6 +813,123 @@ async fn dispatch_request(
         }
         ControlRequest::Upgrade { .. } => unreachable!("handled before dispatch"),
         ControlRequest::AttachConsole => unreachable!("handled before dispatch"),
+        ControlRequest::AttachActivity(_) => unreachable!("handled before dispatch"),
+    }
+}
+
+async fn handle_activity_attachment(
+    stream: UnixStream,
+    broker: Arc<ActivityBroker>,
+    request: AttachActivityRequest,
+) -> Result<()> {
+    if request.schema_version != ACTIVITY_SCHEMA_VERSION {
+        return write_activity_attach_error(stream, "unsupported activity schema").await;
+    }
+    let mut subscription =
+        match broker.subscribe_snapshot(request.session_id.as_deref(), request.tail) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                return write_activity_attach_error(
+                    stream,
+                    &format!("activity attachment unavailable: {error}"),
+                )
+                .await;
+            }
+        };
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let response = encode_line(&json!({
+        "ok": true,
+        "result": {
+            "control_protocol": CONTROL_PROTOCOL_VERSION,
+            "activity_schema": ACTIVITY_SCHEMA_VERSION,
+            "generation": subscription.generation(),
+            "snapshot_sequence": subscription.cutoff(),
+            "replayed": subscription.replayed(),
+            "history_truncated": subscription.history_truncated(),
+        },
+        "error": Value::Null,
+    }))?;
+    if !write_activity_bytes(&mut reader, &mut writer, &response).await? {
+        return Ok(());
+    }
+
+    for event in subscription.snapshot() {
+        let mut line = encode_event(event)?;
+        line.push(b'\n');
+        if !write_activity_bytes(&mut reader, &mut writer, &line).await? {
+            return Ok(());
+        }
+    }
+    let end = encode_line(&json!({
+        "type": "activity_end",
+        "snapshot_sequence": subscription.cutoff(),
+        "history_truncated": subscription.history_truncated(),
+    }))?;
+    if !write_activity_bytes(&mut reader, &mut writer, &end).await? || !request.follow {
+        let _ = writer.shutdown().await;
+        return Ok(());
+    }
+
+    loop {
+        let mut byte = [0_u8; 1];
+        let delivery = tokio::select! {
+            biased;
+            input = reader.read(&mut byte) => {
+                input.context("failed to monitor activity attachment input")?;
+                return Ok(());
+            }
+            delivery = subscription.recv() => delivery?,
+        };
+        let line = match delivery {
+            ActivityDelivery::Event(event) => {
+                let mut line = encode_event(&event)?;
+                line.push(b'\n');
+                line
+            }
+            ActivityDelivery::Gap(gap) => encode_line(&json!({
+                "type": "activity_gap",
+                "scope": "all_sessions",
+                "after_sequence": gap.after_sequence(),
+                "through_sequence": gap.through_sequence(),
+                "dropped": gap.dropped(),
+            }))?,
+        };
+        if !write_activity_bytes(&mut reader, &mut writer, &line).await? {
+            return Ok(());
+        }
+    }
+}
+
+async fn write_activity_attach_error(stream: UnixStream, message: &str) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let response = encode_line(&json!({
+        "ok": false,
+        "result": Value::Null,
+        "error": message,
+    }))?;
+    let _ = write_activity_bytes(&mut reader, &mut writer, &response).await?;
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+async fn write_activity_bytes<R, W>(reader: &mut R, writer: &mut W, bytes: &[u8]) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut byte = [0_u8; 1];
+    tokio::select! {
+        biased;
+        input = reader.read(&mut byte) => {
+            input.context("failed to monitor activity attachment input")?;
+            Ok(false)
+        }
+        written = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, writer.write_all(bytes)) => {
+            written.context("timed out writing activity attachment")??;
+            Ok(true)
+        }
     }
 }
 
@@ -2339,19 +2472,23 @@ fn encode_line<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn read_stream_line(stream: &mut UnixStream, label: &str) -> Result<String> {
+async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool)> {
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let read = BufReader::new(stream)
+    let read = (&mut reader)
         .take((MAX_CONTROL_MESSAGE_BYTES + 1) as u64)
         .read_line(&mut line)
         .await
-        .with_context(|| format!("failed to read {label}"))?;
-    anyhow::ensure!(read > 0, "{label} closed before a message");
+        .context("failed to read supervisor control request")?;
+    anyhow::ensure!(
+        read > 0,
+        "supervisor control request closed before a message"
+    );
     anyhow::ensure!(
         read <= MAX_CONTROL_MESSAGE_BYTES,
-        "{label} exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
+        "supervisor control request exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
     );
-    Ok(line)
+    Ok((line, !reader.buffer().is_empty()))
 }
 
 async fn read_line_limited<R>(reader: &mut R, label: &str) -> Result<String>
@@ -2386,6 +2523,54 @@ mod tests {
     use super::*;
     use crate::approvals;
     use crate::test_support;
+    use temote_mcp::activity::contract::{
+        ActivityOperation, ActivityState, ActivitySummary, ActivityUpdate,
+    };
+    use temote_mcp::activity::history::{ActivityHistory, MAX_ACTIVITY_HISTORY_BYTES};
+    use uuid::Uuid;
+
+    const ACTIVITY_TEST_GENERATION: Uuid =
+        Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0701);
+    const ACTIVITY_TEST_INSTANCE: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0702);
+
+    fn activity_test_broker(broadcast_capacity: usize) -> Arc<ActivityBroker> {
+        Arc::new(
+            ActivityBroker::with_limits(
+                ActivityHistory::with_limits(32, MAX_ACTIVITY_HISTORY_BYTES).unwrap(),
+                broadcast_capacity,
+                16,
+                || 1_780_000_000_000,
+                ACTIVITY_TEST_GENERATION,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn activity_test_update(operation_id: u128) -> ActivityUpdate {
+        ActivityUpdate::new(
+            Uuid::from_u128(operation_id),
+            ActivityOperation::ReadFile,
+            ActivityState::Started,
+            None,
+            ActivitySummary::empty(),
+        )
+        .unwrap()
+    }
+
+    async fn read_activity_test_json<R>(reader: &mut R) -> Value
+    where
+        R: AsyncBufReadExt + Unpin,
+    {
+        let line = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_line_limited(reader, "activity test response"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!line.is_empty(), "activity response closed unexpectedly");
+        serde_json::from_str(line.trim()).unwrap()
+    }
 
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
@@ -2470,6 +2655,344 @@ mod tests {
         assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
         assert_eq!(result["upgrade_plan_schema"], UPGRADE_PLAN_SCHEMA_VERSION);
         assert_eq!(result["roots_configured"], true);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_replays_filtered_tail_and_sends_one_end_marker() {
+        let broker = activity_test_broker(8);
+        broker
+            .publish(
+                activity_test_update(0x7001),
+                Some("other"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        broker
+            .publish(
+                activity_test_update(0x7002),
+                Some("target"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_activity_attachment(
+            server,
+            Arc::clone(&broker),
+            AttachActivityRequest {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                session_id: Some("target".to_owned()),
+                tail: 100,
+                follow: false,
+            },
+        ));
+        let mut reader = BufReader::new(client);
+
+        let response = read_activity_test_json(&mut reader).await;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["control_protocol"], 2);
+        assert_eq!(response["result"]["activity_schema"], 1);
+        assert_eq!(
+            response["result"]["generation"],
+            ACTIVITY_TEST_GENERATION.to_string()
+        );
+        assert_eq!(response["result"]["snapshot_sequence"], 2);
+        assert_eq!(response["result"]["replayed"], 1);
+        assert_eq!(response["result"]["history_truncated"], false);
+        let event = read_activity_test_json(&mut reader).await;
+        assert_eq!(event["type"], "activity");
+        assert_eq!(event["event"]["sequence"], 2);
+        assert_eq!(event["event"]["session_id"], "target");
+        let end = read_activity_test_json(&mut reader).await;
+        assert_eq!(
+            end,
+            json!({
+                "type": "activity_end",
+                "snapshot_sequence": 2,
+                "history_truncated": false,
+            })
+        );
+        assert_eq!(
+            read_line_limited(&mut reader, "activity eof")
+                .await
+                .unwrap(),
+            ""
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_follows_live_events_and_any_input_detaches_only_viewer() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let broker = supervisor.activity_broker();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(
+                &encode_line(&ControlRequest::AttachActivity(AttachActivityRequest {
+                    schema_version: ACTIVITY_SCHEMA_VERSION,
+                    session_id: None,
+                    tail: 0,
+                    follow: true,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_activity_test_json(&mut reader).await["ok"], true);
+        assert_eq!(
+            read_activity_test_json(&mut reader).await["type"],
+            "activity_end"
+        );
+
+        broker
+            .publish(
+                activity_test_update(0x7010),
+                Some("target"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        let event = read_activity_test_json(&mut reader).await;
+        assert_eq!(event["event"]["sequence"], 1);
+
+        writer
+            .write_all(b"{\"command\":\"stop\",\"session_id\":\"target\"}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_line_limited(&mut reader, "activity eof")
+                .await
+                .unwrap(),
+            ""
+        );
+        assert_eq!(broker.subscribe_snapshot(None, 0).unwrap().cutoff(), 1);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_reports_global_broadcast_gap_before_next_event() {
+        let broker = activity_test_broker(2);
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_activity_attachment(
+            server,
+            Arc::clone(&broker),
+            AttachActivityRequest {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                session_id: None,
+                tail: 0,
+                follow: true,
+            },
+        ));
+        let (reader, writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_activity_test_json(&mut reader).await["ok"], true);
+        assert_eq!(
+            read_activity_test_json(&mut reader).await["type"],
+            "activity_end"
+        );
+
+        for operation_id in 0x7020..0x7024 {
+            broker
+                .publish(
+                    activity_test_update(operation_id),
+                    Some("target"),
+                    Some(ACTIVITY_TEST_INSTANCE),
+                )
+                .unwrap();
+        }
+        let gap = read_activity_test_json(&mut reader).await;
+        assert_eq!(
+            gap,
+            json!({
+                "type": "activity_gap",
+                "scope": "all_sessions",
+                "after_sequence": 0,
+                "through_sequence": 2,
+                "dropped": 2,
+            })
+        );
+        assert_eq!(
+            read_activity_test_json(&mut reader).await["event"]["sequence"],
+            3
+        );
+        drop(writer);
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn activity_attachment_request_is_strict_without_changing_legacy_variants() {
+        let request: ControlRequest = serde_json::from_str(
+            r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":100,"follow":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(request, ControlRequest::AttachActivity(_)));
+        assert!(
+            serde_json::from_str::<ControlRequest>(
+                r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":100,"follow":true,"extra":false}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ControlRequest>(
+                r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":100,"tail":101,"follow":true}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ControlRequest>(r#"{"command":"list","extra":true}"#).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_parse_errors_never_echo_values_or_unknown_keys() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let (registration, _registrations) = mpsc::channel(2);
+        for request in [
+            r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":"value-sentinel","follow":true}"#,
+            r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":0,"follow":true,"key-sentinel":"value-sentinel"}"#,
+        ] {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let error =
+                handle_control_connection(server, Arc::clone(&supervisor), registration.clone())
+                    .await
+                    .unwrap_err();
+            let logged = format!("{error:#}");
+            assert_eq!(logged, "invalid control request");
+            assert!(!logged.contains("sentinel"));
+        }
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_rejects_unknown_schema_with_bounded_response() {
+        let broker = activity_test_broker(8);
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_activity_attachment(
+            server,
+            broker,
+            AttachActivityRequest {
+                schema_version: ACTIVITY_SCHEMA_VERSION + 1,
+                session_id: None,
+                tail: 0,
+                follow: false,
+            },
+        ));
+        let mut reader = BufReader::new(client);
+        let response = read_activity_test_json(&mut reader).await;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["result"], Value::Null);
+        assert_eq!(response["error"], "unsupported activity schema");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_old_peer_close_is_observable_without_hanging() {
+        let (old_peer, mut client) = UnixStream::pair().unwrap();
+        let old_peer_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(old_peer);
+            let line = read_line_limited(&mut reader, "legacy request")
+                .await
+                .unwrap();
+            assert!(line.contains("attach_activity"));
+        });
+        let request = ControlRequest::AttachActivity(AttachActivityRequest {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            session_id: None,
+            tail: 100,
+            follow: true,
+        });
+        client
+            .write_all(&encode_line(&request).unwrap())
+            .await
+            .unwrap();
+        let mut response = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        old_peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_pipelined_input_is_not_dispatched_or_buffered() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+        client
+            .write_all(
+                b"{\"command\":\"attach_activity\",\"schema_version\":1,\"session_id\":null,\"tail\":0,\"follow\":true}\n{\"allow\":true}\n",
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            supervisor
+                .activity_broker()
+                .subscribe_snapshot(None, 0)
+                .unwrap()
+                .cutoff(),
+            0
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_initial_request_timeout_does_not_dispatch() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("timed out waiting for supervisor control request")
+        );
+        drop(client);
         supervisor.shutdown().await.unwrap();
     }
 
