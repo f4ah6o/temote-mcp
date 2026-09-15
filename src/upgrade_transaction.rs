@@ -121,6 +121,8 @@ pub struct UpgradeTransaction {
     #[serde(default)]
     pub planned_sessions: Vec<UpgradePlannedSession>,
     #[serde(default)]
+    pub activity_session: Option<UpgradePlannedSession>,
+    #[serde(default)]
     pub approved_executable_sha256: Option<String>,
     #[serde(default)]
     pub verified_host_id: Option<String>,
@@ -160,6 +162,7 @@ impl UpgradeTransaction {
             ingress_restart_required,
             planned_session_count: 0,
             planned_sessions: Vec::new(),
+            activity_session: None,
             approved_executable_sha256: None,
             verified_host_id: None,
             verified_version: None,
@@ -349,6 +352,14 @@ fn validate_transaction(transaction: &UpgradeTransaction) -> Result<()> {
     }
     crate::host_identity::validate(&transaction.host_id)
         .context("invalid upgrade transaction host_id")?;
+    if let Some(session) = transaction.activity_session.as_ref() {
+        config::validate_session_id(&session.session_id)
+            .context("invalid upgrade activity session ID")?;
+        anyhow::ensure!(
+            session.source_process_id > 0 && session.source_started_at > 0,
+            "upgrade activity session identity is incomplete"
+        );
+    }
     anyhow::ensure!(
         transaction.planned_sessions.len() <= MAX_PLANNED_SESSIONS,
         "upgrade transaction contains too many planned sessions"
@@ -1038,6 +1049,10 @@ pub trait UpgradeCoordinatorExecutor {
     fn restored_session_count(&self) -> Option<usize> {
         None
     }
+
+    /// Receives a notification only after the new transaction state is durable.
+    /// Implementations must be non-blocking and best effort.
+    fn activity_state_persisted(&mut self, _transaction: &UpgradeTransaction) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1099,17 +1114,20 @@ pub async fn run_upgrade_coordinator_with_lock<E: UpgradeCoordinatorExecutor>(
             transaction
                 .mark_failed("upgrade response was not delivered; destructive phase aborted")?;
             write_transaction(&transaction)?;
+            executor.activity_state_persisted(&transaction);
             return Ok(transaction.status());
         }
     }
 
     transaction.set_state(UpgradeTransactionState::Committed)?;
     write_transaction(&transaction)?;
+    executor.activity_state_persisted(&transaction);
 
     for phase in transaction.coordinator_phases() {
         if phase == UpgradeTransactionState::Completed {
             transaction.set_state(UpgradeTransactionState::Completed)?;
             write_transaction(&transaction)?;
+            executor.activity_state_persisted(&transaction);
             break;
         }
         match executor.execute_phase(phase).await {
@@ -1126,6 +1144,7 @@ pub async fn run_upgrade_coordinator_with_lock<E: UpgradeCoordinatorExecutor>(
                 }
                 transaction.set_state(phase)?;
                 write_transaction(&transaction)?;
+                executor.activity_state_persisted(&transaction);
             }
             Ok(UpgradeCoordinatorStep::Rollback) => {
                 transaction.mark_rolled_back(Some(format!(
@@ -1133,11 +1152,13 @@ pub async fn run_upgrade_coordinator_with_lock<E: UpgradeCoordinatorExecutor>(
                     phase.as_str()
                 )))?;
                 write_transaction(&transaction)?;
+                executor.activity_state_persisted(&transaction);
                 return Ok(transaction.status());
             }
             Err(_error) => {
                 transaction.mark_failed(format!("upgrade phase {} failed", phase.as_str()))?;
                 write_transaction(&transaction)?;
+                executor.activity_state_persisted(&transaction);
                 return Ok(transaction.status());
             }
         }
@@ -1238,6 +1259,7 @@ mod tests {
             "ingress_restart_required",
             "planned_session_count",
             "planned_sessions",
+            "activity_session",
             "approved_executable_sha256",
             "verified_host_id",
             "verified_version",
@@ -1247,7 +1269,7 @@ mod tests {
         ] {
             assert!(keys.iter().any(|key| key == expected), "missing {expected}");
         }
-        assert_eq!(keys.len(), 21);
+        assert_eq!(keys.len(), 22);
         let encoded = serde_json::to_string(&fixture.transaction).unwrap();
         for forbidden in ["token", "secret", "authorization", "cookie", "password"] {
             assert!(!encoded.to_ascii_lowercase().contains(forbidden));
@@ -1262,6 +1284,7 @@ mod tests {
         let path = transaction_path(&fixture.transaction.transaction_id).unwrap();
         let mut value = serde_json::to_value(&fixture.transaction).unwrap();
         value.as_object_mut().unwrap().remove("planned_sessions");
+        value.as_object_mut().unwrap().remove("activity_session");
         value
             .as_object_mut()
             .unwrap()
@@ -1269,6 +1292,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let loaded = read_transaction(&fixture.transaction.transaction_id).unwrap();
         assert!(loaded.planned_sessions.is_empty());
+        assert!(loaded.activity_session.is_none());
         assert!(loaded.approved_executable_sha256.is_none());
     }
 
@@ -1876,6 +1900,7 @@ mod tests {
 
     struct RecordingExecutor {
         steps: Vec<UpgradeTransactionState>,
+        persisted_activity_states: Vec<UpgradeTransactionState>,
         outcome: UpgradeCoordinatorStep,
         fail_at: Option<UpgradeTransactionState>,
     }
@@ -1884,6 +1909,7 @@ mod tests {
         fn new(outcome: UpgradeCoordinatorStep) -> Self {
             Self {
                 steps: Vec::new(),
+                persisted_activity_states: Vec::new(),
                 outcome,
                 fail_at: None,
             }
@@ -1902,6 +1928,15 @@ mod tests {
                 }
                 Ok(self.outcome)
             })
+        }
+
+        fn activity_state_persisted(&mut self, transaction: &UpgradeTransaction) {
+            assert_eq!(
+                read_transaction(&transaction.transaction_id).unwrap().state,
+                transaction.state,
+                "activity hook ran before the transaction state was durable"
+            );
+            self.persisted_activity_states.push(transaction.state);
         }
     }
 
@@ -1929,6 +1964,10 @@ mod tests {
         assert!(
             executor.steps.is_empty(),
             "destructive phases must not run before the transport commits"
+        );
+        assert_eq!(
+            executor.persisted_activity_states,
+            [UpgradeTransactionState::Failed]
         );
         assert_eq!(
             read_transaction(&fixture.transaction.transaction_id)
@@ -1960,6 +1999,18 @@ mod tests {
             .filter(|phase| *phase != UpgradeTransactionState::Completed)
             .collect::<Vec<_>>();
         assert_eq!(executor.steps, expected);
+        assert_eq!(
+            executor.persisted_activity_states,
+            [
+                UpgradeTransactionState::Committed,
+                UpgradeTransactionState::SupervisorHandoff,
+                UpgradeTransactionState::SessionsVerifying,
+                UpgradeTransactionState::IngressRestarting,
+                UpgradeTransactionState::EndpointVerifying,
+                UpgradeTransactionState::PluginReconciling,
+                UpgradeTransactionState::Completed,
+            ]
+        );
         assert_eq!(
             read_transaction(&fixture.transaction.transaction_id)
                 .unwrap()

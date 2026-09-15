@@ -52,6 +52,7 @@ const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
 const ACTIVITY_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const ACTIVITY_ACK_ACCEPTED: &[u8] = b"accepted\n";
 pub(crate) const ACTIVITY_ACK_DISCARDED: &[u8] = b"discarded\n";
+pub(crate) const MAX_ACTIVITY_BIND_RESPONSE_BYTES: usize = 80;
 #[cfg(test)]
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
@@ -382,22 +383,32 @@ pub(crate) struct ActivityExpectedSession {
     id: String,
     started_at: u64,
     process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_instance: Option<Uuid>,
 }
 
 impl ActivityExpectedSession {
-    pub(crate) fn from_session(session: &Session) -> Self {
+    pub(crate) fn from_session(session: &Session, session_instance: Uuid) -> Self {
         Self {
             id: session.id.clone(),
             started_at: session.started_at,
             process_id: session.process_id,
+            session_instance: Some(session_instance),
         }
     }
 
-    fn matches(&self, expected: &ExpectedSessionInstance) -> bool {
+    fn matches(&self, expected: &ExpectedSessionInstance, session_instance: Uuid) -> bool {
         self.id == expected.id
             && self.started_at == expected.started_at
             && self.process_id == expected.process_id
+            && self.session_instance == Some(session_instance)
     }
+}
+
+pub(crate) fn encode_activity_bind_message(session: &Session) -> Result<Vec<u8>> {
+    encode_session_json_line(&Message::ActivityBind {
+        expected_session: ExpectedSessionInstance::from_session(session),
+    })
 }
 
 pub(crate) fn encode_activity_update_message(
@@ -446,7 +457,11 @@ impl ActivitySink {
         let Ok(state) = self.state.try_lock() else {
             return false;
         };
-        if state.retired || !ingress.expected_session.matches(&state.expected_session) {
+        if state.retired
+            || !ingress
+                .expected_session
+                .matches(&state.expected_session, self.session_instance)
+        {
             return false;
         }
         self.broker
@@ -493,6 +508,9 @@ enum Message {
     Activity {
         title: String,
         detail: Option<String>,
+    },
+    ActivityBind {
+        expected_session: ExpectedSessionInstance,
     },
     ActivityUpdate(ActivityIngress),
     OnePasswordServiceAccount {
@@ -1083,6 +1101,12 @@ impl RuntimeHandle {
         }
     }
 
+    pub(crate) fn activity_session_instance(&self) -> Option<Uuid> {
+        self.activity_sink
+            .as_ref()
+            .map(|sink| sink.session_instance)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn set_permission_mode(&self, mode: config::PermissionMode) -> Result<()> {
         let (response, receiver) = oneshot::channel();
@@ -1648,6 +1672,26 @@ async fn run_runtime(
             incoming = incoming_receiver.recv() => {
                 let Some(IncomingSessionMessage { mut stream, message, _permit }) = incoming else { continue };
                 let message = match message {
+                    Message::ActivityBind { expected_session } => {
+                        let session_instance = services.activity_sink.as_ref().and_then(|sink| {
+                            let state = sink.state.try_lock().ok()?;
+                            (!state.retired && expected_session.matches(session))
+                                .then_some(sink.session_instance)
+                        });
+                        tokio::spawn(async move {
+                            let _permit = _permit;
+                            let response = session_instance
+                                .map(|value| format!("{value}\n"))
+                                .unwrap_or_else(|| "discarded\n".to_owned());
+                            let _ = tokio::time::timeout(
+                                ACTIVITY_ACK_WRITE_TIMEOUT,
+                                stream.write_all(response.as_bytes()),
+                            )
+                            .await;
+                            let _ = stream.shutdown().await;
+                        });
+                        continue;
+                    }
                     Message::ActivityUpdate(ingress) => {
                         let accepted = services.activity_sink
                             .as_ref()
@@ -1671,7 +1715,12 @@ async fn run_runtime(
                     message => message,
                 };
                 drop(_permit);
-                if upgrade_quiesced && !matches!(&message, Message::Probe | Message::Activity { .. }) {
+                if upgrade_quiesced
+                    && !matches!(
+                        &message,
+                        Message::Probe | Message::Activity { .. } | Message::ActivityBind { .. }
+                    )
+                {
                     match &message {
                         Message::Approval { .. } => {
                             let _ = stream.write_all(b"deny\n").await;
@@ -1697,7 +1746,10 @@ async fn run_runtime(
                             );
                             let _ = stream.write_all(&bytes).await;
                         }
-                        Message::Probe | Message::Activity { .. } | Message::ActivityUpdate(_) => unreachable!(),
+                        Message::Probe
+                        | Message::Activity { .. }
+                        | Message::ActivityBind { .. }
+                        | Message::ActivityUpdate(_) => unreachable!(),
                     }
                     let _ = stream.shutdown().await;
                     continue;
@@ -1711,6 +1763,7 @@ async fn run_runtime(
                     Message::Activity { title, detail } => {
                         show_activity_for_session(&session.id, &title, detail.as_deref());
                     }
+                    Message::ActivityBind { .. } => unreachable!("handled before quiesce dispatch"),
                     Message::ActivityUpdate(_) => unreachable!("handled before quiesce dispatch"),
                     Message::OnePasswordServiceAccount { request } => {
                         let session = session.clone();
@@ -2713,13 +2766,36 @@ mod tests {
         response
     }
 
-    fn activity_frame(session: &Session, update: &ActivityUpdate) -> Vec<u8> {
+    async fn bind_activity(path: &Path, session: &Session) -> String {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        stream
+            .write_all(&encode_activity_bind_message(session).unwrap())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            BufReader::new(stream).read_line(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        response
+    }
+
+    fn activity_frame(
+        session: &Session,
+        session_instance: Uuid,
+        update: &ActivityUpdate,
+    ) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "type": "activity_update",
             "expected_session": {
                 "id": session.id,
                 "started_at": session.started_at,
                 "process_id": session.process_id,
+                "session_instance": session_instance,
             },
             "update": update,
         }))
@@ -3617,7 +3693,15 @@ esac
         .await
         .unwrap();
         let session = handle.session_metadata();
-        let frame = activity_frame(&session, &activity_test_update());
+        assert_eq!(
+            bind_activity(&config::socket_path(&id).unwrap(), &session).await,
+            format!("{instance}\n")
+        );
+        let frame = activity_frame(
+            &session,
+            handle.activity_session_instance().unwrap(),
+            &activity_test_update(),
+        );
 
         let response = write_activity_frame(&config::socket_path(&id).unwrap(), &frame).await;
         assert_eq!(response.as_bytes(), ACTIVITY_ACK_ACCEPTED);
@@ -3647,13 +3731,63 @@ esac
         .unwrap();
         let mut session = handle.session_metadata();
         session.started_at += 1;
-        let frame = activity_frame(&session, &activity_test_update());
+        let frame = activity_frame(
+            &session,
+            handle.activity_session_instance().unwrap(),
+            &activity_test_update(),
+        );
 
         let response = write_activity_frame(&config::socket_path(&id).unwrap(), &frame).await;
         assert_eq!(response.as_bytes(), ACTIVITY_ACK_DISCARDED);
         assert_eq!(broker.current_sequence().unwrap(), 0);
         assert_eq!(handle.snapshot().await.unwrap().id, id);
         handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn activity_ingress_nonce_fences_same_tuple_after_forget_and_recreate() {
+        let root = tempfile::tempdir().unwrap();
+        let session = test_session(root.path());
+        let broker = activity_test_broker();
+        let old_instance = Uuid::new_v4();
+        let new_instance = Uuid::new_v4();
+        let old_ingress = ActivityIngress {
+            expected_session: ActivityExpectedSession::from_session(&session, old_instance),
+            update: activity_test_update(),
+        };
+        let recreated = ActivitySink::new(Arc::clone(&broker), &session, new_instance);
+
+        assert!(!recreated.publish(old_ingress));
+        assert_eq!(broker.current_sequence().unwrap(), 0);
+
+        let new_ingress = ActivityIngress {
+            expected_session: ActivityExpectedSession::from_session(&session, new_instance),
+            update: activity_test_update(),
+        };
+        assert!(recreated.publish(new_ingress));
+        let events = broker.subscribe_snapshot(None, 10).unwrap().into_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_instance(), Some(new_instance));
+    }
+
+    #[test]
+    fn activity_ingress_missing_nonce_never_matches_a_tokenized_sink() {
+        let root = tempfile::tempdir().unwrap();
+        let session = test_session(root.path());
+        let broker = activity_test_broker();
+        let sink = ActivitySink::new(Arc::clone(&broker), &session, Uuid::new_v4());
+        let ingress = ActivityIngress {
+            expected_session: ActivityExpectedSession {
+                id: session.id.clone(),
+                started_at: session.started_at,
+                process_id: session.process_id,
+                session_instance: None,
+            },
+            update: activity_test_update(),
+        };
+
+        assert!(!sink.publish(ingress));
+        assert_eq!(broker.current_sequence().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -3675,7 +3809,11 @@ esac
         .unwrap();
         let session = handle.session_metadata();
         handle.activity_sink.as_ref().unwrap().retire();
-        let frame = activity_frame(&session, &activity_test_update());
+        let frame = activity_frame(
+            &session,
+            handle.activity_session_instance().unwrap(),
+            &activity_test_update(),
+        );
 
         let response = write_activity_frame(&config::socket_path(&id).unwrap(), &frame).await;
         assert_eq!(response.as_bytes(), ACTIVITY_ACK_DISCARDED);
@@ -3779,7 +3917,11 @@ esac
         )
         .await
         .unwrap();
-        let frame = activity_frame(&handle.session_metadata(), &activity_test_update());
+        let frame = activity_frame(
+            &handle.session_metadata(),
+            handle.activity_session_instance().unwrap(),
+            &activity_test_update(),
+        );
         let mut stream = UnixStream::connect(config::socket_path(&id).unwrap())
             .await
             .unwrap();

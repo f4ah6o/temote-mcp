@@ -31,6 +31,10 @@ use crate::provider::AuthProvider;
 #[cfg(test)]
 use crate::provider::PublicEndpoint;
 use crate::session_control::SessionBackend;
+use temote_mcp::activity::contract::{
+    ActivityErrorKind, ActivityOperation, ActivityResult, ActivitySummary,
+};
+use temote_mcp::activity::scope::ActivityScope;
 
 const MAX_OAUTH_REGISTER_BODY_BYTES: usize = 128 * 1024;
 const MAX_OAUTH_TOKEN_BODY_BYTES: usize = 64 * 1024;
@@ -475,12 +479,41 @@ async fn dispatch_direct_upgrade(
                 .sessions
                 .validate_upgrade_session(session_id)
                 .await?;
-            let (executable, preflight) = crate::upgrade_coordinator::preflight()
+            let operation_id = uuid::Uuid::new_v4();
+            let activity = crate::activity_runtime::emitter(&session)
                 .await
-                .map_err(|_| anyhow::anyhow!("upgrade preflight failed"))?;
-            if let Some(expected) = expected {
-                anyhow::ensure!(
-                    expected == executable.target_version,
+                .ok()
+                .map(|emitter| {
+                    ActivityScope::with_operation_id(
+                        ActivityOperation::SupervisorUpgrade,
+                        operation_id,
+                        ActivitySummary::empty(),
+                        emitter,
+                    )
+                });
+            let preflight_result = crate::upgrade_coordinator::preflight()
+                .await
+                .map_err(|_| anyhow::anyhow!("upgrade preflight failed"));
+            let (executable, preflight) = match preflight_result {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(activity) = &activity {
+                        let _ = activity.fail_with_summary(ActivitySummary::failure(
+                            ActivityErrorKind::OperationFailed,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(expected) = expected
+                && expected != executable.target_version
+            {
+                if let Some(activity) = &activity {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::InvalidInput,
+                    ));
+                }
+                anyhow::bail!(
                     "installed target version changed: expected {expected}, found {}",
                     executable.target_version
                 );
@@ -506,24 +539,75 @@ async fn dispatch_direct_upgrade(
                     preflight.reconnect_expected.to_string(),
                 ),
             ]);
-            let approved = crate::approvals::ensure_local_approval(
+            let approved = crate::approvals::ensure_local_approval_with_activity(
                 &session,
                 crate::approvals::ApprovalClass::RemoteUpgrade,
                 "upgrade_apply",
                 detail,
                 session.cwd.clone(),
                 metadata,
+                activity.as_ref(),
             )
-            .await?;
-            anyhow::ensure!(approved, "user denied Temote remote upgrade");
-            runtime
-                .sessions
-                .validate_upgrade_session(session_id)
-                .await?;
-            let prepared =
-                crate::upgrade_coordinator::prepare_apply(executable, preflight, expected)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("upgrade apply admission failed"))?;
+            .await;
+            let approved = match approved {
+                Ok(approved) => approved,
+                Err(error) => {
+                    if let Some(activity) = &activity {
+                        let _ = activity.fail_with_summary(ActivitySummary::failure(
+                            ActivityErrorKind::OperationFailed,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if !approved {
+                if let Some(activity) = &activity {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::ApprovalDenied,
+                    ));
+                }
+                anyhow::bail!("user denied Temote remote upgrade");
+            }
+            if let Err(error) = runtime.sessions.validate_upgrade_session(session_id).await {
+                if let Some(activity) = &activity {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::RuntimeUnavailable,
+                    ));
+                }
+                return Err(error);
+            }
+            let prepared = crate::upgrade_coordinator::prepare_apply(
+                executable,
+                preflight,
+                expected,
+                Some(crate::upgrade_coordinator::UpgradeActivityContext {
+                    session: crate::upgrade_transaction::UpgradePlannedSession {
+                        session_id: session.id.clone(),
+                        source_process_id: session.process_id,
+                        source_started_at: session.started_at,
+                    },
+                    operation_id,
+                }),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("upgrade apply admission failed"));
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(activity) = &activity {
+                        let _ = activity.fail_with_summary(ActivitySummary::failure(
+                            ActivityErrorKind::OperationFailed,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if prepared.commit.is_none()
+                && let Some(activity) = &activity
+            {
+                let _ = activity
+                    .complete_with_summary(ActivitySummary::result(ActivityResult::Accepted));
+            }
             let value = json!({
                 "accepted": prepared.accepted_new,
                 "transaction": prepared.status,

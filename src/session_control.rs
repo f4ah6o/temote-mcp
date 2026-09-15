@@ -2464,59 +2464,9 @@ async fn restart_session(
     environment: CapturedStartEnvironment,
     public: bool,
 ) -> Result<()> {
-    config::validate_session_id(session_id)?;
-    supervisor.reap_finished().await;
-    let session = config::read_session_metadata(session_id).await?;
-    let lifecycle = config::read_session_lifecycle(session_id).await?;
-    if public {
-        anyhow::ensure!(
-            config::session_is_active(session_id).await?,
-            "public session_restart requires an active managed session"
-        );
-        let path = lifecycle
-            .as_ref()
-            .and_then(|state| state.logical_path.as_deref())
-            .context("public managed session has no named-root path")?;
-        supervisor.stop_public(session_id).await?;
-        supervisor
-            .start_public_with_mode_with_environment(
-                path,
-                Some(session_id),
-                session.permission_mode,
-                environment,
-            )
-            .await?;
-    } else {
-        crate::codex_app_server::begin_session_shutdown(&session);
-        if config::session_is_active(session_id).await? {
-            supervisor.stop(session_id).await?;
-        } else {
-            crate::codex_app_server::remove_session(&session).await?;
-        }
-        if let Some(path) = lifecycle
-            .as_ref()
-            .and_then(|state| state.logical_path.as_deref())
-        {
-            supervisor
-                .start_with_mode_with_environment(
-                    path,
-                    Some(session_id),
-                    session.permission_mode,
-                    environment,
-                )
-                .await?;
-        } else {
-            supervisor
-                .start_local_with_mode_with_environment(
-                    &session.cwd,
-                    Some(session_id),
-                    session.permission_mode,
-                    environment,
-                )
-                .await?;
-        }
-    }
-    Ok(())
+    supervisor
+        .restart_with_environment(session_id, environment, public)
+        .await
 }
 
 async fn handle_console_attachment(

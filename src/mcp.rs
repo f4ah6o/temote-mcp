@@ -1048,13 +1048,16 @@ async fn call_tool_with_local_agent_executable(
         "yolo sessions are unavailable on the public MCP endpoint"
     );
     let coverage = activity_tool_coverage(name);
-    let activity = coverage.and_then(|coverage| {
+    let activity = if let Some(coverage) = coverage {
         tool_activity_scope(
             &session,
             coverage.operation,
             activity_tool_summary(&args, coverage.operation),
         )
-    });
+        .await
+    } else {
+        None
+    };
     let result = async {
         match name {
             "get_image" => {
@@ -1875,12 +1878,13 @@ fn git_activity_summary(args: &Value, operation: ActivityOperation) -> ActivityS
     }
 }
 
-fn tool_activity_scope(
+async fn tool_activity_scope(
     session: &config::Session,
     operation: ActivityOperation,
     summary: ActivitySummary,
 ) -> Option<ActivityScope> {
     activity_runtime::emitter(session)
+        .await
         .ok()
         .map(|emitter| ActivityScope::with_summary(operation, summary, emitter))
 }

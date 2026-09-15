@@ -37,6 +37,15 @@ impl std::error::Error for ContractError {}
 pub enum ActivityOperation {
     SessionStart,
     SessionStop,
+    SessionRestart,
+    SessionPermissionMode,
+    SessionPermissionAllow,
+    SessionPermissionRevoke,
+    SessionRestartPolicy,
+    SessionForget,
+    SessionCrash,
+    SessionAutoRestart,
+    SupervisorUpgrade,
     ReadFile,
     WriteFile,
     GitAdd,
@@ -97,6 +106,15 @@ impl<'de> Deserialize<'de> for ActivityOperation {
         match value.as_str() {
             "session_start" => Ok(Self::SessionStart),
             "session_stop" => Ok(Self::SessionStop),
+            "session_restart" => Ok(Self::SessionRestart),
+            "session_permission_mode" => Ok(Self::SessionPermissionMode),
+            "session_permission_allow" => Ok(Self::SessionPermissionAllow),
+            "session_permission_revoke" => Ok(Self::SessionPermissionRevoke),
+            "session_restart_policy" => Ok(Self::SessionRestartPolicy),
+            "session_forget" => Ok(Self::SessionForget),
+            "session_crash" => Ok(Self::SessionCrash),
+            "session_auto_restart" => Ok(Self::SessionAutoRestart),
+            "supervisor_upgrade" => Ok(Self::SupervisorUpgrade),
             "read_file" => Ok(Self::ReadFile),
             "write_file" => Ok(Self::WriteFile),
             "git_add" => Ok(Self::GitAdd),
@@ -243,6 +261,41 @@ pub enum ActivityResult {
     Accepted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityUpgradePhase {
+    Committed,
+    SupervisorHandoff,
+    SessionsVerifying,
+    IngressRestarting,
+    EndpointVerifying,
+    PluginReconciling,
+}
+
+impl ActivityUpgradePhase {
+    fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "committed" => Some(Self::Committed),
+            "supervisor_handoff" => Some(Self::SupervisorHandoff),
+            "sessions_verifying" => Some(Self::SessionsVerifying),
+            "ingress_restarting" => Some(Self::IngressRestarting),
+            "endpoint_verifying" => Some(Self::EndpointVerifying),
+            "plugin_reconciling" => Some(Self::PluginReconciling),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityUpgradePhase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_wire_string(deserializer)?;
+        Self::from_wire_name(&value).ok_or_else(serde_invalid_json)
+    }
+}
+
 impl ActivityResult {
     fn from_wire_name(value: &str) -> Option<Self> {
         match value {
@@ -328,6 +381,9 @@ pub enum ActivitySummary {
     Result {
         result: ActivityResult,
     },
+    UpgradePhase {
+        phase: ActivityUpgradePhase,
+    },
 }
 
 impl<'de> Deserialize<'de> for ActivitySummary {
@@ -357,6 +413,7 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
         let mut remote = None;
         let mut reason = None;
         let mut result = None;
+        let mut phase = None;
 
         while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
             match field.as_str() {
@@ -405,6 +462,15 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                             .map_err(|_| serde_invalid_json())?,
                     );
                 }
+                "phase" => {
+                    if phase.is_some() {
+                        return Err(serde_invalid_json());
+                    }
+                    phase = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde_invalid_json())?,
+                    );
+                }
                 _ => return Err(serde_invalid_json()),
             }
         }
@@ -412,12 +478,20 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
         let kind = kind.ok_or_else(serde_invalid_json)?;
         match kind.as_str() {
             "empty"
-                if error.is_none() && remote.is_none() && reason.is_none() && result.is_none() =>
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_none() =>
             {
                 Ok(Self::Value::Empty)
             }
             "failure"
-                if error.is_some() && remote.is_none() && reason.is_none() && result.is_none() =>
+                if error.is_some()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_none() =>
             {
                 let error = error.ok_or_else(serde_invalid_json)?;
                 let kind =
@@ -425,7 +499,11 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                 Ok(Self::Value::Failure { kind })
             }
             "git"
-                if error.is_none() && remote.is_some() && reason.is_none() && result.is_none() =>
+                if error.is_none()
+                    && remote.is_some()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_none() =>
             {
                 let remote = remote.ok_or_else(serde_invalid_json)?;
                 let remote = match remote.as_str() {
@@ -436,7 +514,11 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                 Ok(Self::Value::Git { remote })
             }
             "cancellation"
-                if error.is_none() && remote.is_none() && reason.is_some() && result.is_none() =>
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_some()
+                    && result.is_none()
+                    && phase.is_none() =>
             {
                 let reason = reason.ok_or_else(serde_invalid_json)?;
                 let reason = ActivityCancellationReason::from_wire_name(&reason)
@@ -444,12 +526,28 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                 Ok(Self::Value::Cancellation { reason })
             }
             "result"
-                if error.is_none() && remote.is_none() && reason.is_none() && result.is_some() =>
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_some()
+                    && phase.is_none() =>
             {
                 let result = result.ok_or_else(serde_invalid_json)?;
                 let result =
                     ActivityResult::from_wire_name(&result).ok_or_else(serde_invalid_json)?;
                 Ok(Self::Value::Result { result })
+            }
+            "upgrade_phase"
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_some() =>
+            {
+                let phase = phase.ok_or_else(serde_invalid_json)?;
+                let phase =
+                    ActivityUpgradePhase::from_wire_name(&phase).ok_or_else(serde_invalid_json)?;
+                Ok(Self::Value::UpgradePhase { phase })
             }
             _ => Err(serde_invalid_json()),
         }
@@ -475,6 +573,10 @@ impl ActivitySummary {
 
     pub const fn result(result: ActivityResult) -> Self {
         Self::Result { result }
+    }
+
+    pub const fn upgrade_phase(phase: ActivityUpgradePhase) -> Self {
+        Self::UpgradePhase { phase }
     }
 
     pub fn safe_summary(&self) -> String {
@@ -511,6 +613,24 @@ impl ActivitySummary {
             Self::Result {
                 result: ActivityResult::Accepted,
             } => "result=accepted",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::Committed,
+            } => "phase=committed",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::SupervisorHandoff,
+            } => "phase=supervisor_handoff",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::SessionsVerifying,
+            } => "phase=sessions_verifying",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::IngressRestarting,
+            } => "phase=ingress_restarting",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::EndpointVerifying,
+            } => "phase=endpoint_verifying",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::PluginReconciling,
+            } => "phase=plugin_reconciling",
         }
     }
 }
@@ -1259,6 +1379,30 @@ mod tests {
         let operations = [
             (ActivityOperation::SessionStart, "session_start"),
             (ActivityOperation::SessionStop, "session_stop"),
+            (ActivityOperation::SessionRestart, "session_restart"),
+            (
+                ActivityOperation::SessionPermissionMode,
+                "session_permission_mode",
+            ),
+            (
+                ActivityOperation::SessionPermissionAllow,
+                "session_permission_allow",
+            ),
+            (
+                ActivityOperation::SessionPermissionRevoke,
+                "session_permission_revoke",
+            ),
+            (
+                ActivityOperation::SessionRestartPolicy,
+                "session_restart_policy",
+            ),
+            (ActivityOperation::SessionForget, "session_forget"),
+            (ActivityOperation::SessionCrash, "session_crash"),
+            (
+                ActivityOperation::SessionAutoRestart,
+                "session_auto_restart",
+            ),
+            (ActivityOperation::SupervisorUpgrade, "supervisor_upgrade"),
             (ActivityOperation::ReadFile, "read_file"),
             (ActivityOperation::WriteFile, "write_file"),
             (ActivityOperation::GitAdd, "git_add"),
@@ -1464,6 +1608,52 @@ mod tests {
         assert_eq!(
             ActivitySummary::result(ActivityResult::Accepted).safe_summary(),
             "result=accepted"
+        );
+        for (phase, expected) in [
+            (ActivityUpgradePhase::Committed, "phase=committed"),
+            (
+                ActivityUpgradePhase::SupervisorHandoff,
+                "phase=supervisor_handoff",
+            ),
+            (
+                ActivityUpgradePhase::SessionsVerifying,
+                "phase=sessions_verifying",
+            ),
+            (
+                ActivityUpgradePhase::IngressRestarting,
+                "phase=ingress_restarting",
+            ),
+            (
+                ActivityUpgradePhase::EndpointVerifying,
+                "phase=endpoint_verifying",
+            ),
+            (
+                ActivityUpgradePhase::PluginReconciling,
+                "phase=plugin_reconciling",
+            ),
+        ] {
+            let summary = ActivitySummary::upgrade_phase(phase);
+            assert_eq!(summary.safe_summary(), expected);
+            assert_eq!(
+                serde_json::from_value::<ActivitySummary>(serde_json::to_value(&summary).unwrap())
+                    .unwrap(),
+                summary
+            );
+        }
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "upgrade_phase",
+                "phase": "raw-phase-sentinel"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "upgrade_phase",
+                "phase": "committed",
+                "result": "accepted"
+            }))
+            .is_err()
         );
 
         for reason in [

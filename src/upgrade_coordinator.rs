@@ -15,6 +15,10 @@ use crate::upgrade_transaction::{
     UpgradeCoordinatorStep, UpgradeCoordinatorStepFuture, UpgradeTransaction,
     UpgradeTransactionState, UpgradeTransactionStatus, UpgradeVerifiedIdentity,
 };
+use temote_mcp::activity::contract::{
+    ActivityErrorKind, ActivityOperation, ActivityState, ActivitySummary, ActivityUpdate,
+    ActivityUpgradePhase,
+};
 
 // READY follows a second bounded digest and capability check of an executable
 // that may be as large as MAX_UPGRADE_EXECUTABLE_BYTES. Debug builds and slower
@@ -74,16 +78,23 @@ pub struct PreparedRemoteUpgrade {
     pub accepted_new: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct UpgradeActivityContext {
+    pub session: upgrade_transaction::UpgradePlannedSession,
+    pub operation_id: uuid::Uuid,
+}
+
 pub async fn preflight() -> Result<(InstalledUpgradeExecutable, RemoteUpgradePreflight)> {
     let executable = session_control::capture_installed_upgrade_executable()?;
     let preflight = session_control::remote_upgrade_preflight(&executable).await?;
     Ok((executable, preflight))
 }
 
-pub async fn prepare_apply(
+pub(crate) async fn prepare_apply(
     executable: InstalledUpgradeExecutable,
     preflight: RemoteUpgradePreflight,
     expected_version: Option<&str>,
+    activity: Option<UpgradeActivityContext>,
 ) -> Result<PreparedRemoteUpgrade> {
     if let Some(expected) = expected_version {
         anyhow::ensure!(
@@ -149,6 +160,10 @@ pub async fn prepare_apply(
         crate::boot_identity::generation().to_owned(),
         sequence,
     );
+    if let Some(activity) = activity {
+        transaction.transaction_id = activity.operation_id.to_string();
+        transaction.activity_session = Some(activity.session);
+    }
     upgrade_transaction::write_transaction(&transaction)?;
     let commit = match spawn_coordinator(&executable, &transaction.transaction_id).await {
         Ok(commit) => commit,
@@ -490,12 +505,87 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
         })
     }
 
+    fn activity_state_persisted(&mut self, transaction: &UpgradeTransaction) {
+        if let Some((session_id, update)) = upgrade_activity_update(transaction) {
+            let _ = crate::activity_runtime::try_emit_upgrade(session_id, update);
+        }
+    }
+
     fn verified_identity(&self) -> Option<UpgradeVerifiedIdentity> {
         self.verified.clone()
     }
     fn restored_session_count(&self) -> Option<usize> {
         self.restored
     }
+}
+
+fn upgrade_activity_update(
+    transaction: &UpgradeTransaction,
+) -> Option<(upgrade_transaction::UpgradePlannedSession, ActivityUpdate)> {
+    let session = transaction.activity_session.clone()?;
+    let operation_id = uuid::Uuid::parse_str(&transaction.transaction_id).ok()?;
+    let (state, duration_ms, summary) = match transaction.state {
+        UpgradeTransactionState::Committed => (
+            ActivityState::Running,
+            None,
+            ActivitySummary::upgrade_phase(ActivityUpgradePhase::Committed),
+        ),
+        UpgradeTransactionState::SupervisorHandoff => (
+            ActivityState::Running,
+            None,
+            ActivitySummary::upgrade_phase(ActivityUpgradePhase::SupervisorHandoff),
+        ),
+        UpgradeTransactionState::SessionsVerifying => (
+            ActivityState::Running,
+            None,
+            ActivitySummary::upgrade_phase(ActivityUpgradePhase::SessionsVerifying),
+        ),
+        UpgradeTransactionState::IngressRestarting => (
+            ActivityState::Running,
+            None,
+            ActivitySummary::upgrade_phase(ActivityUpgradePhase::IngressRestarting),
+        ),
+        UpgradeTransactionState::EndpointVerifying => (
+            ActivityState::Running,
+            None,
+            ActivitySummary::upgrade_phase(ActivityUpgradePhase::EndpointVerifying),
+        ),
+        UpgradeTransactionState::PluginReconciling => (
+            ActivityState::Running,
+            None,
+            ActivitySummary::upgrade_phase(ActivityUpgradePhase::PluginReconciling),
+        ),
+        UpgradeTransactionState::Completed => (
+            ActivityState::Completed,
+            Some(
+                transaction
+                    .updated_at
+                    .saturating_sub(transaction.created_at)
+                    .saturating_mul(1_000),
+            ),
+            ActivitySummary::empty(),
+        ),
+        UpgradeTransactionState::Failed | UpgradeTransactionState::RolledBack => (
+            ActivityState::Failed,
+            Some(
+                transaction
+                    .updated_at
+                    .saturating_sub(transaction.created_at)
+                    .saturating_mul(1_000),
+            ),
+            ActivitySummary::failure(ActivityErrorKind::OperationFailed),
+        ),
+        UpgradeTransactionState::Prepared => return None,
+    };
+    let update = ActivityUpdate::new(
+        operation_id,
+        ActivityOperation::SupervisorUpgrade,
+        state,
+        duration_ms,
+        summary,
+    )
+    .ok()?;
+    Some((session, update))
 }
 
 pub fn status(transaction_id: &str) -> Result<UpgradeTransactionStatus> {
@@ -613,5 +703,46 @@ mod tests {
         assert_eq!(restored.planned_sessions.len(), 1);
         assert_eq!(restored.planned_sessions[0].session_id, "session-a");
         upgrade_transaction::remove_transaction(&transaction.transaction_id).unwrap();
+    }
+
+    #[test]
+    fn upgrade_activity_uses_transaction_identity_and_fixed_phase_summaries() {
+        let mut transaction = UpgradeTransaction::new(
+            "source-secret-sentinel",
+            "target-secret-sentinel",
+            "host-a",
+            "boot-a",
+            true,
+            true,
+            true,
+        );
+        transaction.activity_session = Some(upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 42,
+            source_started_at: 10,
+        });
+        transaction.created_at = 10;
+        transaction.updated_at = 12;
+
+        transaction.state = UpgradeTransactionState::Committed;
+        let (session_id, running) = upgrade_activity_update(&transaction).unwrap();
+        assert_eq!(session_id.session_id, "session-a");
+        assert_eq!(
+            running.operation_id().to_string(),
+            transaction.transaction_id
+        );
+        assert_eq!(running.operation(), ActivityOperation::SupervisorUpgrade);
+        assert_eq!(running.state(), ActivityState::Running);
+        assert_eq!(running.summary().as_safe_summary(), "phase=committed");
+
+        transaction.state = UpgradeTransactionState::Completed;
+        let (_, completed) = upgrade_activity_update(&transaction).unwrap();
+        assert_eq!(completed.state(), ActivityState::Completed);
+        assert_eq!(completed.duration_ms(), Some(2_000));
+        let encoded = serde_json::to_string(&completed).unwrap();
+        assert!(!encoded.contains("secret-sentinel"));
+
+        transaction.state = UpgradeTransactionState::Prepared;
+        assert!(upgrade_activity_update(&transaction).is_none());
     }
 }

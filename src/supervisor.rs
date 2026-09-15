@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -33,12 +33,13 @@ fn activity_now_ms() -> u64 {
 struct SupervisorActivityEmitter {
     broker: Arc<ActivityBroker>,
     session_id: String,
+    session_instance: Option<Uuid>,
 }
 
 impl ActivityEmitter for SupervisorActivityEmitter {
     fn try_emit(&self, update: ActivityUpdate) -> Result<(), ActivityEmitError> {
         self.broker
-            .publish(update, Some(&self.session_id), None)
+            .publish(update, Some(&self.session_id), self.session_instance)
             .map(|_| ())
             .map_err(|error| match error {
                 BrokerError::Busy => ActivityEmitError::Full,
@@ -263,12 +264,39 @@ impl SessionSupervisor {
     }
 
     fn activity_scope(&self, operation: ActivityOperation, session_id: String) -> ActivityScope {
+        self.activity_scope_with_instance(operation, session_id, None)
+    }
+
+    fn activity_scope_with_instance(
+        &self,
+        operation: ActivityOperation,
+        session_id: String,
+        session_instance: Option<Uuid>,
+    ) -> ActivityScope {
         ActivityScope::new(
             operation,
             SupervisorActivityEmitter {
                 broker: Arc::clone(&self.activity_broker),
                 session_id,
+                session_instance,
             },
+        )
+    }
+
+    fn crash_activity_scope(
+        &self,
+        session_id: String,
+        session_instance: Option<Uuid>,
+    ) -> ActivityScope {
+        let detected = Instant::now();
+        ActivityScope::with_clock(
+            ActivityOperation::SessionCrash,
+            SupervisorActivityEmitter {
+                broker: Arc::clone(&self.activity_broker),
+                session_id,
+                session_instance,
+            },
+            move || detected,
         )
     }
 
@@ -519,6 +547,70 @@ impl SessionSupervisor {
         self.stop_owned(session_id, true).await
     }
 
+    pub async fn restart_with_environment(
+        &self,
+        session_id: &str,
+        environment: approvals::CapturedStartEnvironment,
+        public: bool,
+    ) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let activity =
+            self.activity_scope(ActivityOperation::SessionRestart, session_id.to_owned());
+        let result = async {
+            let session = config::read_session_metadata(session_id).await?;
+            let lifecycle = config::read_session_lifecycle(session_id).await?;
+            let logical_path = lifecycle
+                .as_ref()
+                .and_then(|state| state.logical_path.clone());
+            if public {
+                anyhow::ensure!(
+                    config::session_is_active(session_id).await?,
+                    "public session_restart requires an active managed session"
+                );
+                anyhow::ensure!(
+                    logical_path.is_some(),
+                    "public managed session has no named-root path"
+                );
+            }
+            crate::codex_app_server::begin_session_shutdown(&session);
+            if config::session_is_active(session_id).await? {
+                self.stop_owned_validated(session_id, public).await?;
+            } else {
+                crate::codex_app_server::remove_session(&session).await?;
+            }
+            if let Some(path) = logical_path {
+                let cwd = self.roots.resolve(&path)?;
+                self.start_resolved(
+                    cwd,
+                    session_id.to_owned(),
+                    session.permission_mode,
+                    Some(path),
+                    environment,
+                    public,
+                )
+                .await?;
+            } else {
+                let cwd = config::canonical_directory(&session.cwd)?;
+                self.start_resolved(
+                    cwd,
+                    session_id.to_owned(),
+                    session.permission_mode,
+                    None,
+                    environment,
+                    false,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
+    }
+
     pub async fn validate_public_upgrade_session(
         &self,
         session_id: &str,
@@ -556,19 +648,25 @@ impl SessionSupervisor {
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
-        anyhow::ensure!(
-            !self.sessions.lock().await.contains_key(session_id),
-            "session {session_id} is managed by this supervisor process; stop it before forgetting it"
-        );
-        anyhow::ensure!(
-            !self.restart_specs.lock().await.contains_key(session_id),
-            "session {session_id} has a pending restart or upgrade context; stop it before forgetting it"
-        );
-        anyhow::ensure!(
-            !self.public_sessions.lock().await.contains(session_id),
-            "session {session_id} is still registered as a public session; stop it before forgetting it"
-        );
-        config::forget_session_artifacts(session_id).await
+        let activity = self.activity_scope(ActivityOperation::SessionForget, session_id.to_owned());
+        let result = async {
+            anyhow::ensure!(
+                !self.sessions.lock().await.contains_key(session_id),
+                "session {session_id} is managed by this supervisor process; stop it before forgetting it"
+            );
+            anyhow::ensure!(
+                !self.restart_specs.lock().await.contains_key(session_id),
+                "session {session_id} has a pending restart or upgrade context; stop it before forgetting it"
+            );
+            anyhow::ensure!(
+                !self.public_sessions.lock().await.contains(session_id),
+                "session {session_id} is still registered as a public session; stop it before forgetting it"
+            );
+            config::forget_session_artifacts(session_id).await
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn set_permission_mode(
@@ -584,12 +682,20 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.set_permission_mode(permission_mode).await?;
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionMode,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.set_permission_mode(permission_mode).await;
         drop(sessions);
-        if let Some(spec) = self.restart_specs.lock().await.get_mut(session_id) {
+        if result.is_ok()
+            && let Some(spec) = self.restart_specs.lock().await.get_mut(session_id)
+        {
             spec.permission_mode = permission_mode;
         }
-        Ok(())
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn allow_directory(&self, session_id: &str, path: std::path::PathBuf) -> Result<()> {
@@ -601,7 +707,14 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.allow_directory(path).await
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionAllow,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.allow_directory(path).await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn revoke_directory(&self, session_id: &str, path: std::path::PathBuf) -> Result<()> {
@@ -613,7 +726,14 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.revoke_directory(path).await
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionRevoke,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.revoke_directory(path).await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn set_restart_policy(&self, session_id: &str, policy: &str) -> Result<()> {
@@ -621,25 +741,41 @@ impl SessionSupervisor {
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
-        anyhow::ensure!(
-            matches!(policy, "never" | "on-failure"),
-            "restart policy must be never or on-failure"
+        let session_instance = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(RuntimeHandle::activity_session_instance);
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionRestartPolicy,
+            session_id.to_owned(),
+            session_instance,
         );
-        let mut lifecycle = config::read_session_lifecycle(session_id)
-            .await?
-            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
-        lifecycle.restart_policy = policy.to_owned();
-        if policy == "never" {
-            lifecycle.next_restart_at = None;
-            lifecycle.restart_limit_reason = None;
-        } else if lifecycle.status == config::LifecycleStatus::Crashed
-            && self.restart_specs.lock().await.contains_key(session_id)
-            && lifecycle.restart_count < MAX_AUTOMATIC_RESTARTS
-        {
-            lifecycle.next_restart_at = Some(config::unix_time() + 1);
-            lifecycle.restart_limit_reason = None;
+        let result = async {
+            anyhow::ensure!(
+                matches!(policy, "never" | "on-failure"),
+                "restart policy must be never or on-failure"
+            );
+            let mut lifecycle = config::read_session_lifecycle(session_id)
+                .await?
+                .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+            lifecycle.restart_policy = policy.to_owned();
+            if policy == "never" {
+                lifecycle.next_restart_at = None;
+                lifecycle.restart_limit_reason = None;
+            } else if lifecycle.status == config::LifecycleStatus::Crashed
+                && self.restart_specs.lock().await.contains_key(session_id)
+                && lifecycle.restart_count < MAX_AUTOMATIC_RESTARTS
+            {
+                lifecycle.next_restart_at = Some(config::unix_time() + 1);
+                lifecycle.restart_limit_reason = None;
+            }
+            config::save_session_lifecycle(session_id, &lifecycle).await
         }
-        config::save_session_lifecycle(session_id, &lifecycle).await
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     async fn schedule_restart(&self, session_id: &str, reason: &str) -> Result<()> {
@@ -692,13 +828,18 @@ impl SessionSupervisor {
             }
             lifecycle.last_restart_at = Some(now);
             lifecycle.next_restart_at = None;
+            let activity = self.activity_scope(ActivityOperation::SessionAutoRestart, id.clone());
             if let Err(error) = config::save_session_lifecycle(&id, &lifecycle).await {
+                let result: Result<()> = Err(anyhow::anyhow!("restart state persistence failed"));
+                finish_supervisor_activity(&activity, &result);
                 eprintln!("failed to persist restart attempt for {id}: {error:#}");
                 continue;
             }
             let old_session = match config::read_session_metadata(&id).await {
                 Ok(session) => session,
                 Err(error) => {
+                    let result: Result<()> = Err(anyhow::anyhow!("old instance inspection failed"));
+                    finish_supervisor_activity(&activity, &result);
                     eprintln!("failed to inspect old session instance for {id}: {error:#}");
                     if let Err(save_error) = self
                         .schedule_restart(
@@ -713,6 +854,8 @@ impl SessionSupervisor {
                 }
             };
             if let Err(error) = crate::codex_app_server::remove_session(&old_session).await {
+                let result: Result<()> = Err(anyhow::anyhow!("old instance cleanup failed"));
+                finish_supervisor_activity(&activity, &result);
                 eprintln!("automatic restart cleanup for session {id} failed: {error:#}");
                 if let Err(save_error) = self
                     .schedule_restart(&id, &format!("automatic restart cleanup failed: {error:#}"))
@@ -733,6 +876,8 @@ impl SessionSupervisor {
                 )
                 .await
             {
+                let result: Result<()> = Err(anyhow::anyhow!("automatic restart failed"));
+                finish_supervisor_activity(&activity, &result);
                 eprintln!("automatic restart for session {id} failed: {error:#}");
                 if let Err(save_error) = self
                     .schedule_restart(&id, &format!("automatic restart attempt failed: {error:#}"))
@@ -740,6 +885,9 @@ impl SessionSupervisor {
                 {
                     eprintln!("failed to schedule another restart for {id}: {save_error:#}");
                 }
+            } else {
+                let result: Result<()> = Ok(());
+                finish_supervisor_activity(&activity, &result);
             }
         }
     }
@@ -1342,7 +1490,14 @@ impl SessionSupervisor {
             };
             if let Some(handle) = handle {
                 let session = handle.session_metadata();
+                let session_instance = handle.activity_session_instance();
                 let wait_result = handle.wait().await;
+                if wait_result.is_err() {
+                    let crash = self.crash_activity_scope(id.clone(), session_instance);
+                    let _ = crash.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::RuntimeUnavailable,
+                    ));
+                }
                 let cleanup_result = crate::codex_app_server::remove_session(&session).await;
                 let cleanup_failed = if let Err(error) = cleanup_result {
                     eprintln!("Codex task cleanup for ended session {id} failed: {error:#}");
@@ -1573,6 +1728,210 @@ mod tests {
                 .iter()
                 .all(|event| event.session_instance().is_none())
         );
+        cleanup_session(&session_id).await;
+    }
+
+    #[tokio::test]
+    async fn activity_lifecycle_mutations_restart_and_forget_have_single_owners() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = format!("act-life-mut-{}", Uuid::new_v4());
+        let extra = _temp.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        supervisor
+            .start("src/repo-a", Some(&session_id))
+            .await
+            .unwrap();
+        let first_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+
+        supervisor
+            .set_permission_mode(&session_id, config::PermissionMode::Agent)
+            .await
+            .unwrap();
+        supervisor
+            .allow_directory(&session_id, extra.clone())
+            .await
+            .unwrap();
+        supervisor
+            .revoke_directory(&session_id, extra)
+            .await
+            .unwrap();
+        supervisor
+            .set_restart_policy(&session_id, "never")
+            .await
+            .unwrap();
+        supervisor
+            .restart_with_environment(
+                &session_id,
+                approvals::CapturedStartEnvironment::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let second_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        assert_ne!(first_instance, second_instance);
+        supervisor.stop(&session_id).await.unwrap();
+        supervisor.forget_session(&session_id).await.unwrap();
+
+        let events = supervisor
+            .activity_broker()
+            .subscribe_snapshot(Some(&session_id), 100)
+            .unwrap()
+            .into_snapshot();
+        let operations = events
+            .chunks_exact(2)
+            .map(|pair| {
+                assert_eq!(
+                    pair[0].state(),
+                    temote_mcp::activity::contract::ActivityState::Started
+                );
+                assert_eq!(
+                    pair[1].state(),
+                    temote_mcp::activity::contract::ActivityState::Completed
+                );
+                assert_eq!(pair[0].operation_id(), pair[1].operation_id());
+                pair[0].operation()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec![
+                ActivityOperation::SessionStart,
+                ActivityOperation::SessionPermissionMode,
+                ActivityOperation::SessionPermissionAllow,
+                ActivityOperation::SessionPermissionRevoke,
+                ActivityOperation::SessionRestartPolicy,
+                ActivityOperation::SessionRestart,
+                ActivityOperation::SessionStop,
+                ActivityOperation::SessionForget,
+            ]
+        );
+        assert!(!operations.contains(&ActivityOperation::SessionAutoRestart));
+        cleanup_session(&session_id).await;
+    }
+
+    #[tokio::test]
+    async fn activity_lifecycle_crash_is_zero_duration_and_auto_restart_is_new_instance() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = format!("act-life-crash-{}", Uuid::new_v4());
+        supervisor
+            .start("src/repo-a", Some(&session_id))
+            .await
+            .unwrap();
+        supervisor
+            .set_restart_policy(&session_id, "on-failure")
+            .await
+            .unwrap();
+        let first_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        supervisor.crash_for_test(&session_id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if config::read_session_lifecycle(&session_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|state| state.status == config::LifecycleStatus::Crashed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                supervisor.reap_finished().await;
+                let current = supervisor
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(RuntimeHandle::activity_session_instance);
+                if current.is_some_and(|instance| instance != first_instance) {
+                    break;
+                }
+                if current.is_none() {
+                    let mut lifecycle = config::read_session_lifecycle(&session_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    lifecycle.next_restart_at = Some(config::unix_time());
+                    config::save_session_lifecycle(&session_id, &lifecycle)
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        assert_ne!(first_instance, second_instance);
+
+        let events = supervisor
+            .activity_broker()
+            .subscribe_snapshot(Some(&session_id), 100)
+            .unwrap()
+            .into_snapshot();
+        let crash = events
+            .iter()
+            .filter(|event| event.operation() == ActivityOperation::SessionCrash)
+            .collect::<Vec<_>>();
+        assert_eq!(crash.len(), 2);
+        assert_eq!(
+            crash[0].state(),
+            temote_mcp::activity::contract::ActivityState::Started
+        );
+        assert_eq!(
+            crash[1].state(),
+            temote_mcp::activity::contract::ActivityState::Failed
+        );
+        assert_eq!(crash[1].duration_ms(), Some(0));
+        assert_eq!(crash[0].session_instance(), Some(first_instance));
+        let automatic = events
+            .iter()
+            .filter(|event| event.operation() == ActivityOperation::SessionAutoRestart)
+            .collect::<Vec<_>>();
+        assert_eq!(automatic.len(), 2);
+        assert_eq!(
+            automatic[0].state(),
+            temote_mcp::activity::contract::ActivityState::Started
+        );
+        assert_eq!(
+            automatic[1].state(),
+            temote_mcp::activity::contract::ActivityState::Completed
+        );
+
+        supervisor.stop(&session_id).await.unwrap();
         cleanup_session(&session_id).await;
     }
 
