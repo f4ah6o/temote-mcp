@@ -11,6 +11,20 @@ Branch: codex/20260915-complete-open-work
 2026-09-15 の completion work は実装候補と大部分の repository-local gate まで完了したが、独立 review、比較評価、実 provider / 対応 OS の確認が残っている。
 本イシューは利用枠による停止後の再開点を一か所に保持し、未確認の項目を完了扱いしないための residual tracker である。
 
+## 今回の再開結果（2026-09-15）
+
+状態は **open / blocked**。再開時のintegration HEADは `b02bafe0f6a4e0c9ee8c3d7788fe92beb08fede3`、activityは `8a6efff690963a0334757b161ad9729f6cd52db0`、evaluationは `cf9d1ffe69638a27af3f39c6b19a1b5ac704ae50` だった。下記の初回停止時点のSHAは履歴として保持する。既存worktreeと未コミット変更は破棄せず、credential・remote・installed runtimeは変更していない。
+
+1. **session**: 指定の `temo` は存在せず、既存 `temote` は `crashed` / `session was active when its owning supervisor stopped`。設定済みnamed root `src` から `temo` と各completion worktree専用sessionを作成した。いずれもLinux host `ms-01-alpha` の `active` / `permission_mode=agent` / `yolo=false` を確認した。
+2. **独立review**: S15/S16のread-only Codex reviewerは起動失敗。JSON-RPC `-32000`、exit 1、`bwrap: execvp /home/hirohito-fujita/.cargo/bin/codex: No such file or directory`。job listは空だった。別途 `codex_status` も `CODEX_APP_SERVER_INCOMPATIBLE: expected 0.153.4, got temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; 2026.9.7)` で失敗した。S15/S16は未承認であり、activity codeはintegrationへ取り込んでいない。
+3. **親の部分静的review**: detached upgradeは旧session tuple（ID・開始時刻・PID）の比較後に現在runtimeのnonceを取得する。同一tuple・異なるnonceでの再作成をupgrade経路でも拒否できるか、独立reviewと決定的テストが必要。通常のbound updateは元のnonceを保持する。liveで誤帰属を再現したとは扱わない。新しくawaitするactivity bindとnonblocking要件の整合も未判定。詳細はactivity branchの `docs/evaluations/completion-residual-validation-20260915.md` に記録した。
+4. **candidate gate**: private HOME/CODEX_HOME/XDG/TMPDIR/socket namespace、offline Cargo、clone-local targetでS16 HEADを検査した。fmt、strict all-target Clippy、no-default check、diff checkはPASS。lib testsは99 PASS / 8 FAILで複数の失敗が `/var/tmp` read-only（OS error 30）。producerは3 PASS / 4 FAIL、ingressは3 PASS / 6 FAIL、lifecycleは0 PASS / 3 FAIL、gatewayはexit 1（返却されたtop-level集計は1 PASS / 1 FAIL）。後者の個別原因は未確定。full unfiltered test、最終integration gate、明示process-boundary E2Eは未実行。過去のcandidate 954 PASS / gateway 70 PASSを今回の成功と読み替えない。
+5. **実際のjob状態**: `a87f2986-9884-4cd6-a2e6-9eb866397ebd` はpollでexit 1、後続job listで `failed`。activity sessionは `active`。追加source確認とfailure-log確認の2 tool callは `リクエストの安全性を確認できなかったため、このツールの呼び出しは OpenAI によってブロックされました。` と返された。当該操作は別経路で再試行せず、session全体の停止とは扱っていない。
+6. **評価と実機**: T01-A / T06-B review、T05-C、T07-C、T08-C/A、T09/T10をresultsに明示的なblockedとして記録した。過去の試行分母、unknown、T05-Cのpartial commitと最後の観測stateは維持した。既存4 issueには実provider認証、macOS実機、physical multi-host、sandboxを維持したLinux実行環境などの具体的な不足条件を追記し、openを維持した。
+7. **resumeの説明**: `Applied` はreconciliationの受付結果であってtask完了ではない。既存の `Applied + Interrupted`、replacement process PIDの直接記録なし、resume後のcompleted例なしを英日usage、Agent Skill、resultsで一致させた。これはdocumentation-onlyの明確化で、新しいlive成功ではない。
+
+最終commit / push結果は、この追記を含むdocumentation差分の検査後に記録する。独立review、必要な修正・再review、最終integration gateは未完了のため、本issue全体はcloseしない。
+
 ## 背景
 
 - integration branch `codex/20260915-complete-open-work` は `62d836cdc428c53a9370e3964b88d3f111ae5f64`。
@@ -81,9 +95,9 @@ Codex app-server の停止後 `resume` 検証は、accepted receipt が `Applied
 
 - [ ] S15 / S16 の独立 review結果とexact commit/hashがrepositoryに記録される。
 - [ ] activityを含む最終integration treeで通常gateと指定process-boundary E2Eが成功する。
-- [ ] T01-A、T06-B、T05-C、T07-C、T08-C/A、T09/T10が完了または明示的なfailed / blockedとしてresultsに反映される。
-- [ ] app-server resumeの意味と観測限界がresults、英日usage、Agent Skillで一致する。
-- [ ] 既存4 issueの実 provider / 対応OS / physical host不足が完了するか、具体的な外部条件付きでopenのまま記録される。
+- [x] T01-A、T06-B、T05-C、T07-C、T08-C/A、T09/T10が完了または明示的なfailed / blockedとしてresultsに反映される。（今回はblockedの記録であり、実行完了ではない。）
+- [x] app-server resumeの意味と観測限界がresults、英日usage、Agent Skillで一致する。（documentationのみ。新しいlive evidenceなし。）
+- [x] 既存4 issueの実 provider / 対応OS / physical host不足が完了するか、具体的な外部条件付きでopenのまま記録される。（今回は具体的な不足条件を記録してopenを維持。）
 - [ ] integration、activity、evaluation branchのpush結果が記録される。
 
 ## テスト計画

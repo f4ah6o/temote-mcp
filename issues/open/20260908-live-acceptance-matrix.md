@@ -5,6 +5,12 @@
 - Priority: P2
 - Type: validation / deployment tracking
 
+## Resumed validation (2026-09-15)
+
+Status remains **Open**. The current connector returned active, sandboxed `agent` sessions on Linux host `ms-01-alpha`; this alone does not identify or qualify the Cloudflare/OpenAI provider path, an installed-runtime migration, or physical multi-host behavior. No new authenticated provider, macOS, Windows/WSL2, or multi-host acceptance run was performed during this resume. The earlier read-only provider evidence below remains historical evidence, not a newly passed matrix.
+
+Concrete remaining conditions are an authenticated external client for each selected provider, the required gateway configuration/secret and published-target evidence, and independently addressable physical macOS/Linux/Windows-WSL2 hosts for the collision/reconnect checks below. Missing provider capability or credentials must be provisioned through its authorized owner; do not fabricate a fixture result or change credentials merely to complete this tracker. Installed migration requires a disposable or explicitly approved host and process-identity-safe evidence. See [completion residual validation](20260915-completion-residual-validation.md) for the current connector and candidate-gate limitations.
+
 ## Purpose
 
 Keep external, credential-dependent, destructive, and physical multi-host acceptance work out of otherwise-complete implementation issues.

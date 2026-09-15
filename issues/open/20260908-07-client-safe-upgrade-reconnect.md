@@ -12,6 +12,12 @@ sections before the 2026-09-15 implementation report are retained as historical
 snapshots of the incremental work; their remaining-work statements describe
 those earlier slices rather than the current repository state.
 
+## Resumed validation boundary (2026-09-15)
+
+This issue remains **open** for actual macOS process-boundary reconnect evidence. The resumed connector was observed only on Linux; no macOS host was qualified and no new upgrade/reconnect process E2E was run. S15/S16 activity remain independently unapproved and were not integrated, so their earlier candidate-only success is not a final integration-tree gate.
+
+The required external condition is an available supported macOS host with a disposable/private supervisor, HOME/CODEX_HOME/XDG/runtime directories, and short socket namespace, using this issue's existing explicit process-boundary tests. Preserve host/provider identity and non-secret results, and verify the intended session restoration and reconnect boundary without touching the live connector's ingress or unrelated sessions. The current Linux sandbox's failed candidate checks do not invalidate the earlier Linux-host evidence, but cannot replace macOS evidence. See [the residual tracker](20260915-completion-residual-validation.md).
+
 ## Historical implementation snapshot (2026-09-12, boot identity)
 
 The repository-local boot identity slice is implemented: each Temote process now

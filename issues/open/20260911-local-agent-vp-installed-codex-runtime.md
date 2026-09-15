@@ -12,6 +12,12 @@ Related:
 - `issues/done/20260910-developer-execution-broker.md`
 - `issues/done/20260911-default-agent-permission-mode.md`
 
+## Resumed connector qualification (2026-09-15)
+
+Status remains **open**. On the current Linux connector, a normal `agent` / `yolo=false` session attempted a read-only Codex review. `local_agent_run` returned exit 1 with `bwrap: execvp /home/hirohito-fujita/.cargo/bin/codex: No such file or directory`; no review result or retained job was created. The selected-path failure was observed, but its underlying cause was not determined. Do not equate it with the historical Vite+ missing-package or nested-user-namespace failures without further evidence.
+
+Neither a new Linux allowed-write/protected-write qualification nor a macOS Vite+ qualification was completed. The earlier Linux model smoke and host-policy evidence remain separately recorded. Completion requires the actual Vite+-managed launcher on a supported macOS host, and a Linux environment that permits the required nested execution while retaining imported-auth denial and workspace containment. First prove an allowed canary read/write succeeds, then verify protected metadata and sibling writes are denied; failure of all writes is not a passing boundary test. No launcher installation, host policy, credential, or global configuration was changed in this attempt. See [completion residual validation](20260915-completion-residual-validation.md).
+
 ## Observed behavior
 
 Codex is installed/managed through Vite+ (`vp`).

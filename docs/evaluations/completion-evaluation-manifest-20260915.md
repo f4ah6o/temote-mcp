@@ -1,6 +1,6 @@
 # Completion evaluation manifest (2026-09-15, Asia/Tokyo)
 
-Status: frozen before evaluated solutions were inspected; execution in progress.
+Status: frozen before evaluated solutions were inspected; the current connector qualification is blocked. Task definitions and denominator rules are unchanged. This integration copy is a historical execution snapshot; consult the results' current residual disposition and the authoritative evaluation branch rather than interpreting earlier execution notes as current job state.
 
 ## Purpose and immutable boundary
 

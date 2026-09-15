@@ -1,6 +1,16 @@
 # Completion evaluation results (2026-09-15, Asia/Tokyo)
 
-Status: execution in progress. Task definitions are frozen in [`completion-evaluation-manifest-20260915.md`](completion-evaluation-manifest-20260915.md).
+Status: **blocked; integration snapshot, not a live job ledger**. Task definitions remain frozen in [`completion-evaluation-manifest-20260915.md`](completion-evaluation-manifest-20260915.md). The detailed authoritative evaluation history is maintained on branch `codex/20260915-completion-evaluation`, found at `cf9d1ffe69638a27af3f39c6b19a1b5ac704ae50` at resume, with a subsequent documentation-only qualification update. The older ledger below is retained as an integration snapshot: its `running` rows must not be interpreted as currently running jobs.
+
+## Current residual disposition (2026-09-15)
+
+T01-A and T06-B independent reviews are **blocked** because the current scoped Codex reviewer cannot launch. T05-C is **blocked**, with its prior incomplete r2 commit `0054b969ba9229b4a772793321f05c98c4074785` and original last-observed state preserved. T07-C, T08-C, and T08-A are **blocked/unattempted** under the current runtime qualification and frozen dispatch-order requirements. All T09/T10 arms are **blocked/unattempted** because no independently accepted S15 base has been declared. No new evaluated arm started, and the attempted-arm denominators, failures, and unknown usage/model/cost observations are unchanged. Adoption remains **HOLD**.
+
+The current `local_agent_run` reviewer failed before producing a review, with exit 1 and `bwrap: execvp /home/hirohito-fujita/.cargo/bin/codex: No such file or directory`. Separate `codex_status` qualification failed with `CODEX_APP_SERVER_INCOMPATIBLE`. These are connector qualification failures, not evaluated-arm model outcomes. No installed runtime, credentials, remote, or host security policy was changed. See the [residual tracker](../../issues/open/20260915-completion-residual-validation.md) for exact tool responses, candidate-only failed tests, and external provider/OS conditions.
+
+An `Applied` resume receipt acknowledges reconciliation, not successful continuation or task completion. The previously recorded stopped-child qualification returned `Applied` with `Interrupted`; it did not directly record a replacement-process PID or demonstrate completion after resume. No new live resume qualification was collected during this attempt. The English/Japanese usage and Agent Skill carry the same qualification.
+
+## Historical integration snapshot
 
 ## Runtime qualification
 

@@ -13,6 +13,16 @@
   - [TEMOTE-07: client-safe upgrade / reconnect](20260908-07-client-safe-upgrade-reconnect.md)
   - [`docs/evaluations/codex-delegation.md`](../../docs/evaluations/codex-delegation.md)
 
+## 再開時の確認（2026-09-15）
+
+状態は **open / current connector qualification blocked / adoption HOLD**。以下の2026-09-13の記載は履歴として保持する。2026-09-15の実行済み比較と過去のlive evidenceは `codex/20260915-completion-evaluation` branchのmanifest/resultsを正本とし、今回のconnector検査を比較armの新しい試行には数えない。
+
+今回の独立review用 `local_agent_run` はexit 1で `bwrap: execvp /home/hirohito-fujita/.cargo/bin/codex: No such file or directory` を返し、review結果もjobも作成されなかった。続く `codex_status` は `CODEX_APP_SERVER_INCOMPATIBLE: expected 0.153.4, got temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; 2026.9.7)` を返した。互換性検査後のtask start、installed runtime変更、credential変更は行っていない。
+
+T01-A / T06-Bの独立review、T05-Cの完了、T07-C / T08-C/A / T09/T10はblockedとして残す。再開には、既定のsandboxと認証保護を維持した実行可能なreviewer、およびfrozen model/effort・driver・base・prompt・順序を維持した評価環境が必要。親による実装や別runtimeを同等の評価armとして代用しない。未知のusage / observed model / costを推定で埋めず、採用判断は保留する。
+
+resume receiptの `Applied` はreconciliationの受付結果であり、実行再開やtask完了の証明ではない。既存の停止後検証は `Applied + Interrupted` で、replacement process PIDの直接記録とresume後の完了確認はない。[残存検証](20260915-completion-residual-validation.md)を参照する。
+
 ## 現在の状態（2026-09-13）
 
 この issue の実装部分はすでに `main` に入っている。`codex delegate` の bounded structured report、scoped evidence、experimental app-server task controls、gateway contract、fake-transport/権限/失敗系テストが実装済みである。
