@@ -29,7 +29,7 @@ function parseArgs(argv) {
     if (flag === "--custom-domain") options.customDomain = value;
   }
 
-  if (!options.hostname || (options.route !== undefined) === (options.customDomain !== undefined)) {
+  if (!options.hostname || (options.route !== undefined && options.customDomain !== undefined)) {
     throw new Error(usage());
   }
   return options;

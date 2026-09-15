@@ -1,14 +1,14 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open
-Model: unknown
+Status: done
+Model: gpt-5.6-sol
 Created: 2026-09-11
-Updated: 2026-09-14
-Branch: main
+Updated: 2026-09-15
+Branch: codex/20260915-completion-baseline
 
 ## Resolution
 
-Slices A and B are implemented on `main`. The English/Japanese operator guides define the custom-domain versus existing-DNS Worker-route choice, `workers_dev = false`, `--keep-vars`, secret boundaries, deploy verification, and rollback. The deterministic preflight distinguishes `target_missing`, `target_mismatch`, and `remote_unknown` when called as a library function, rejects unsafe workers.dev configuration, and performs no Cloudflare mutation. The command-line parser still requires a target flag before the evaluator can report `target_missing`, so the issue remains open until that CLI path and its regression test are fixed.
+Repository-local Slices A and B are complete. The English/Japanese operator guides define the custom-domain versus existing-DNS Worker-route choice, `workers_dev = false`, `--keep-vars`, secret boundaries, deploy verification, and rollback. The deterministic preflight and its CLI distinguish `target_missing`, `target_mismatch`, and `remote_unknown`, reject unsafe workers.dev configuration and simultaneous route/custom-domain flags, and perform no Cloudflare mutation. Credential-dependent live deployment evidence remains in `20260908-live-acceptance-matrix.md`.
 
 ## 提案する方針
 
@@ -109,13 +109,13 @@ Slice A の後、手作業だけでは target 欠落を十分検出できない�
 
 ## 受け入れ条件
 
-- [ ] custom domain と既存 DNS + Worker route の違い、選択条件、必要な Access 設定が英日 docs に記載される。
-- [ ] `workers_dev = false` で target 未設定の場合に、deploy 手順または preflight が `No targets deployed` を見逃さない。
-- [ ] 既存 DNS record を削除せずに route を割り当てる実行例と、deploy 後の route/domain verification が記載される。
-- [ ] `--keep-vars`、Worker secrets、Access service token、host token の管理境界が混同されない。
-- [ ] 意図しない workers.dev 公開を有効化しない。
-- [ ] docs または tooling の変更に対する決定論的な test/check が追加される。
-- [ ] 実環境でしか確認できない項目は `20260908-live-acceptance-matrix.md` に evidence として分離される。
+- [x] custom domain と既存 DNS + Worker route の違い、選択条件、必要な Access 設定が英日 docs に記載される。
+- [x] `workers_dev = false` で target 未設定の場合に、deploy 手順または preflight が `No targets deployed` を見逃さない。
+- [x] 既存 DNS record を削除せずに route を割り当てる実行例と、deploy 後の route/domain verification が記載される。
+- [x] `--keep-vars`、Worker secrets、Access service token、host token の管理境界が混同されない。
+- [x] 意図しない workers.dev 公開を有効化しない。
+- [x] docs または tooling の変更に対する決定論的な test/check が追加される。
+- [x] 実環境でしか確認できない項目は `20260908-live-acceptance-matrix.md` に evidence として分離される。
 
 ## テスト計画
 
@@ -147,10 +147,13 @@ Live acceptance（実装完了の repository-local gate とは分離）:
 
 - 2026-09-11: `localmcp.obr-grp.com/*` への Worker route は direct Temote 復旧のため削除した。DNS record、Access application、Tunnel は削除していない。
 - 2026-09-11: `workers_dev = false` の route/domain 未設定 deploy で `No targets deployed` が発生したため、再発防止の issue として記録した。
+- 2026-09-15: CLI completion slice is fully specified and implemented; advance through the repository state workflow before recording completion.
+- 2026-09-15: Verified implementation commit and review evidence are being recorded for completion.
+- 2026-09-15: Repository-local deployment-target CLI acceptance is complete in 04ddd76; deterministic and full gates passed, Astra approved, and live Cloudflare evidence remains in the acceptance matrix.
 
-## Recommended next slice
+## Remaining external evidence
 
-Fix the CLI argument path so a valid hostname/configuration with neither `--route` nor `--custom-domain` reaches the evaluator and reports `target_missing`; add a command-level regression test. Keep Cloudflare route/domain verification as external live evidence in the live acceptance matrix.
+Cloudflare route/domain verification is credential-dependent live acceptance and remains in `issues/open/20260908-live-acceptance-matrix.md`. It does not block this repository-local implementation issue.
 
 ## Implementation notes (2026-09-11)
 
@@ -163,7 +166,7 @@ No Cloudflare route, DNS, Access, or Tunnel state was changed.
 
 ## Implementation notes (2026-09-12)
 
-Slice B implemented in the current worktree (not yet committed):
+Slice B implemented:
 
 - `gateway/scripts/deployment-preflight.mjs` checks local `workers_dev = false` configuration and an explicitly supplied route or custom-domain target.
 - It distinguishes `target_missing`, `target_mismatch`, and `remote_unknown`; it never uses Cloudflare credentials or claims remote readiness.
@@ -171,6 +174,15 @@ Slice B implemented in the current worktree (not yet committed):
 - `npm run deploy:preflight -- --hostname <host> --route '<host>/*'` is documented in both gateway operator guides.
 
 Cloudflare route/domain verification remains Slice C live acceptance.
+
+## Completion notes (2026-09-15)
+
+- Commit `04ddd76` fixes the command-line parser so `--hostname` remains required, simultaneous `--route` and `--custom-domain` remains a usage error with exit code 2, and omitting both target flags reaches the evaluator and returns `target_missing` with exit code 1.
+- The command-level regression starts the actual Node subprocess and verifies exit code 1, parseable `target_missing` JSON on stdout, and empty stderr. A second subprocess assertion preserves the simultaneous-target usage error.
+- Verification passed: focused deployment-preflight tests 7/7, gateway tests 70/70, full `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets`, `cargo fmt --all -- --check`, and `git diff --check`. The no-default-features check emitted five pre-existing dead-code warnings and completed successfully.
+- `gpt-6-astra` reviewed immutable commit `04ddd76`, reran all seven deployment-preflight tests, and approved with no findings.
+- `CHANGES.md` impact is yes because the operator-facing preflight now reports the intended missing-target status from the CLI. This repository contains no `CHANGES.md` file at the verified commit, and the authorized completion-baseline scope excludes creating or editing shared changelog documentation.
+- No Cloudflare route, custom domain, DNS record, Access policy, Tunnel, or credential was changed. Live route/domain verification remains exclusively in `issues/open/20260908-live-acceptance-matrix.md`; no repository-local implementation work remains in this issue.
 
 ## Triage note
 

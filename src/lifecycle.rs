@@ -948,6 +948,18 @@ fn runtime_directory() -> Result<PathBuf> {
     if let Some(path) = env_path("TEMOTE_MCP_RUNTIME_DIR") {
         return Ok(path.join("temote-mcp"));
     }
+    default_runtime_directory()
+}
+
+#[cfg(test)]
+fn default_runtime_directory() -> Result<PathBuf> {
+    crate::test_support::private_process_root()
+        .map(|root| root.join("runtime").join("temote-mcp"))
+        .map_err(anyhow::Error::msg)
+}
+
+#[cfg(not(test))]
+fn default_runtime_directory() -> Result<PathBuf> {
     if let Some(path) = env_path("XDG_RUNTIME_DIR") {
         return Ok(path.join("temote-mcp"));
     }
@@ -1143,6 +1155,19 @@ fn send_signal(pid: i32, signal: libc::c_int) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn test_isolation_runtime_default_is_process_private() {
+        let root = test_support::private_process_root().unwrap();
+        let runtime = default_runtime_directory().unwrap();
+        assert_eq!(runtime, root.join("runtime/temote-mcp"));
+        if let Some(xdg_runtime) = env_path("XDG_RUNTIME_DIR") {
+            assert_ne!(runtime, xdg_runtime.join("temote-mcp"));
+        }
+        if let Some(home) = crate::platform_paths::home_dir() {
+            assert_ne!(runtime, home.join(".cache/temote-mcp"));
+        }
+    }
 
     #[test]
     fn parses_only_exact_legacy_pid_pairs() {

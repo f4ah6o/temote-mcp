@@ -122,6 +122,12 @@ fn render_status(status: &Status, as_json: bool) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
+fn resolve_codex_home() -> Result<PathBuf, String> {
+    crate::test_support::private_process_root().map(|root| root.join("codex-home"))
+}
+
+#[cfg(not(test))]
 fn resolve_codex_home() -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
@@ -1346,6 +1352,19 @@ fn read_mcp_command(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_isolation_codex_home_default_is_process_private() {
+        let root = crate::test_support::private_process_root().unwrap();
+        let resolved = resolve_codex_home().unwrap();
+        assert_eq!(resolved, root.join("codex-home"));
+        if let Some(inherited) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+            assert_ne!(resolved, PathBuf::from(inherited));
+        }
+        if let Some(home) = crate::platform_paths::home_dir() {
+            assert_ne!(resolved, home.join(".codex"));
+        }
+    }
 
     fn dummy_binary(root: &Path) -> PathBuf {
         let path = root.join("temote-mcp-test-bin");
