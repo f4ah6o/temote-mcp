@@ -822,8 +822,19 @@ async fn call_tool_with_local_agent_executable(
                 &codex_app_server::task_control(&args, &session).await?,
             )?)
         }
-        "local_agent_run" => local_agent_run(&args, &session, local_agent_executable).await,
-        "dev_tool_run" => dev_tool_run(&args, &session).await,
+        "local_agent_run" => {
+            let activity = file_activity_scope(&session, ActivityOperation::LocalAgentRun);
+            let result =
+                local_agent_run(&args, &session, local_agent_executable, activity.clone()).await;
+            finish_tool_activity_on_error(activity.as_ref(), &result);
+            result
+        }
+        "dev_tool_run" => {
+            let activity = file_activity_scope(&session, ActivityOperation::DevToolRun);
+            let result = dev_tool_run(&args, &session, activity.clone()).await;
+            finish_tool_activity_on_error(activity.as_ref(), &result);
+            result
+        }
         "list_directory" => {
             let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
             let result = list_directory(&path).await;
@@ -2328,6 +2339,7 @@ async fn local_agent_run(
     args: &Value,
     session: &config::Session,
     executable: Option<&Path>,
+    activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let prepared = match executable {
         Some(executable) => local_agent::prepare_with_executable(args, session, executable)?,
@@ -2340,16 +2352,23 @@ async fn local_agent_run(
     {
         let detail = prepared.approval_detail();
         approvals::ensure_approval_detail_fits(&detail)?;
-        let approved = approvals::ensure_local_approval(
+        let approved = approvals::ensure_local_approval_with_activity(
             session,
             approvals::ApprovalClass::LocalAgent,
             "local_agent_run",
             detail,
             prepared.cwd.clone(),
             prepared.approval_metadata(),
+            activity.as_ref(),
         )
         .await?;
-        anyhow::ensure!(approved, "user denied local_agent_run");
+        if !approved {
+            if let Some(activity) = &activity {
+                let _ = activity
+                    .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+            }
+            anyhow::bail!("user denied local_agent_run");
+        }
     }
 
     let current_session = config::load_session(&session.id).await?;
@@ -2363,7 +2382,7 @@ async fn local_agent_run(
         None => prepared.revalidate(&current_session)?,
     }
     let (description, mut handle, completion) =
-        spawn_local_agent(prepared, &current_session).await?;
+        spawn_local_agent(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             joined.context("local agent task failed")?;
@@ -2392,33 +2411,68 @@ async fn local_agent_run(
 async fn spawn_local_agent(
     prepared: local_agent::PreparedRun,
     session: &config::Session,
+    activity: Option<ActivityScope>,
 ) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    spawn_local_agent_with_controls(
+        prepared,
+        session,
+        activity,
+        wait_for_session_stop(session.id.clone()),
+        MAX_JOB_LIFETIME,
+    )
+    .await
+}
+
+async fn spawn_local_agent_with_controls<F>(
+    prepared: local_agent::PreparedRun,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+    session_stop: F,
+    max_lifetime: Duration,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let slot = reserve_job_slot(&session.id)?;
     let description = prepared.activity_label();
     approvals::activity(&session.id, format!("Running {description}"), None).await;
+    if let Some(activity) = &activity {
+        let _ = activity.running();
+    }
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let activity_label = description.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let completion = Arc::new(Mutex::new(JobCompletion {
+        activity,
+        ..JobCompletion::default()
+    }));
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
-        let result = tokio::select! {
+        let (result, outcome) = tokio::select! {
             result = local_agent::run(prepared) => {
-                result.and_then(render_output)
+                let result = result.and_then(render_output);
+                let outcome = if result.is_ok() {
+                    JobActivityOutcome::Completed
+                } else {
+                    JobActivityOutcome::Failed
+                };
+                (result, outcome)
             }
-            _ = wait_for_session_stop(session_id.clone()) => {
-                Err(anyhow::anyhow!("session stopped; local agent job cancelled"))
+            _ = session_stop => {
+                (
+                    Err(anyhow::anyhow!("session stopped; local agent job cancelled")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
+                )
             }
-            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                Err(anyhow::anyhow!("local agent job exceeded the two-hour lifetime limit"))
+            _ = tokio::time::sleep(max_lifetime) => {
+                (
+                    Err(anyhow::anyhow!("local agent job exceeded the two-hour lifetime limit")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
+                )
             }
         };
         let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        {
-            let mut completion = task_completion.lock().unwrap();
-            completion.result = Some(cached);
-            completion.completed_at = Some(Instant::now());
-        }
+        finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
         report_local_agent_finished(session_id, activity_label, &result).await;
@@ -2426,14 +2480,19 @@ async fn spawn_local_agent(
     Ok((description, handle, completion))
 }
 
-async fn dev_tool_run(args: &Value, session: &config::Session) -> Result<Value> {
-    dev_tool_run_with_executable(args, session, None).await
+async fn dev_tool_run(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+) -> Result<Value> {
+    dev_tool_run_with_executable(args, session, None, activity).await
 }
 
 async fn dev_tool_run_with_executable(
     args: &Value,
     session: &config::Session,
     executable: Option<&Path>,
+    activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let prepared = match executable {
         Some(executable) => dev_tool::prepare_with_executable(args, session, Some(executable))?,
@@ -2441,16 +2500,23 @@ async fn dev_tool_run_with_executable(
     };
     let detail = prepared.approval_detail();
     approvals::ensure_approval_detail_fits(&detail)?;
-    let approved = approvals::ensure_local_approval(
+    let approved = approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::DeveloperTool,
         "dev_tool_run",
         detail,
         prepared.cwd().to_path_buf(),
         BTreeMap::new(),
+        activity.as_ref(),
     )
     .await?;
-    anyhow::ensure!(approved, "user denied dev_tool_run");
+    if !approved {
+        if let Some(activity) = &activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+        anyhow::bail!("user denied dev_tool_run");
+    }
 
     let current_session = config::load_session(&session.id).await?;
     anyhow::ensure!(
@@ -2459,7 +2525,8 @@ async fn dev_tool_run_with_executable(
         "session instance changed while developer-tool approval was pending"
     );
     prepared.revalidate(&current_session)?;
-    let (description, mut handle, completion) = spawn_dev_tool(prepared, &current_session).await?;
+    let (description, mut handle, completion) =
+        spawn_dev_tool(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             joined.context("developer tool task failed")?;
@@ -2488,33 +2555,68 @@ async fn dev_tool_run_with_executable(
 async fn spawn_dev_tool(
     prepared: dev_tool::PreparedDevToolRun,
     session: &config::Session,
+    activity: Option<ActivityScope>,
 ) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    spawn_dev_tool_with_controls(
+        prepared,
+        session,
+        activity,
+        wait_for_session_stop(session.id.clone()),
+        MAX_JOB_LIFETIME,
+    )
+    .await
+}
+
+async fn spawn_dev_tool_with_controls<F>(
+    prepared: dev_tool::PreparedDevToolRun,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+    session_stop: F,
+    max_lifetime: Duration,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let slot = reserve_job_slot(&session.id)?;
     let description = prepared.activity_label();
     approvals::activity(&session.id, format!("Running {description}"), None).await;
+    if let Some(activity) = &activity {
+        let _ = activity.running();
+    }
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let activity_label = description.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let completion = Arc::new(Mutex::new(JobCompletion {
+        activity,
+        ..JobCompletion::default()
+    }));
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
-        let result = tokio::select! {
+        let (result, outcome) = tokio::select! {
             result = dev_tool::run(prepared) => {
-                result.and_then(render_output)
+                let result = result.and_then(render_output);
+                let outcome = if result.is_ok() {
+                    JobActivityOutcome::Completed
+                } else {
+                    JobActivityOutcome::Failed
+                };
+                (result, outcome)
             }
-            _ = wait_for_session_stop(session_id.clone()) => {
-                Err(anyhow::anyhow!("session stopped; developer tool job cancelled"))
+            _ = session_stop => {
+                (
+                    Err(anyhow::anyhow!("session stopped; developer tool job cancelled")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
+                )
             }
-            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                Err(anyhow::anyhow!("developer tool job exceeded the two-hour lifetime limit"))
+            _ = tokio::time::sleep(max_lifetime) => {
+                (
+                    Err(anyhow::anyhow!("developer tool job exceeded the two-hour lifetime limit")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
+                )
             }
         };
         let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        {
-            let mut completion = task_completion.lock().unwrap();
-            completion.result = Some(cached);
-            completion.completed_at = Some(Instant::now());
-        }
+        finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
         report_local_agent_finished(session_id, activity_label, &result).await;
@@ -3806,6 +3908,401 @@ mod tests {
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].state(), ActivityState::Cancelled);
         assert_eq!(terminal[0].summary().as_safe_summary(), "reason=timeout");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_job_executable(directory: &Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_local_args(session_id: &str, task: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "agent": "codex",
+            "task": task,
+            "access": "read_only"
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_dev_args(session_id: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "tool": "cargo",
+            "operation": "check",
+            "args": ["--workspace"]
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn activity_delegated_job_wait(handle: JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("delegated worker did not finish")
+            .expect("delegated worker task failed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_job_assert_terminal(
+        emitter: &RecordingActivityEmitter,
+        state: ActivityState,
+        summary: &str,
+    ) {
+        let terminal = activity_job_terminal_updates(emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state(), state);
+        assert_eq!(terminal[0].summary().as_safe_summary(), summary);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_success_is_terminal_and_omits_prompt_and_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let prompt_sentinel = "delegated-prompt-secret-sentinel";
+        let agent_output_sentinel = "delegated-agent-output-secret-sentinel";
+        let dev_output_sentinel = "delegated-dev-output-secret-sentinel";
+        let fake_agent = activity_delegated_job_executable(
+            fake_dir.path(),
+            "codex",
+            &format!("#!/bin/sh\nprintf '{agent_output_sentinel}\\n'\n"),
+        );
+        let fake_dev = activity_delegated_job_executable(
+            fake_dir.path(),
+            "cargo",
+            &format!("#!/bin/sh\nprintf '{dev_output_sentinel}\\n'\n"),
+        );
+        let id = format!("activity-delegated-success-{}", Uuid::new_v4());
+        let (sender, _receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            workspace.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let agent_result = local_agent_run(
+            &activity_delegated_local_args(&id, prompt_sentinel),
+            &session,
+            Some(&fake_agent),
+            Some(agent_scope),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_string(&agent_result)
+                .unwrap()
+                .contains(agent_output_sentinel)
+        );
+        assert_eq!(
+            agent_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let dev_result = dev_tool_run_with_executable(
+            &activity_delegated_dev_args(&id),
+            &session,
+            Some(&fake_dev),
+            Some(dev_scope),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_string(&dev_result)
+                .unwrap()
+                .contains(dev_output_sentinel)
+        );
+        assert_eq!(
+            dev_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+
+        let updates =
+            serde_json::to_string(&(agent_emitter.updates(), dev_emitter.updates())).unwrap();
+        for sentinel in [prompt_sentinel, agent_output_sentinel, dev_output_sentinel] {
+            assert!(!updates.contains(sentinel), "activity leaked {sentinel}");
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_denial_never_reaches_running() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake_agent =
+            activity_delegated_job_executable(fake_dir.path(), "codex", "#!/bin/sh\nexit 99\n");
+        let fake_dev =
+            activity_delegated_job_executable(fake_dir.path(), "cargo", "#!/bin/sh\nexit 99\n");
+        let id = format!("activity-delegated-deny-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            workspace.path(),
+            Some(&id),
+            config::PermissionMode::Ask,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let agent_session = session.clone();
+        let agent_id = id.clone();
+        let agent_task = tokio::spawn(async move {
+            local_agent_run(
+                &activity_delegated_local_args(&agent_id, "denied-prompt-sentinel"),
+                &agent_session,
+                Some(&fake_agent),
+                Some(agent_scope),
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.request.operation, "local_agent_run");
+        prompt.respond(false);
+        assert!(agent_task.await.unwrap().is_err());
+        assert_eq!(
+            agent_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed
+            ]
+        );
+        activity_delegated_job_assert_terminal(
+            &agent_emitter,
+            ActivityState::Failed,
+            "error=approval_denied",
+        );
+
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let dev_session = session.clone();
+        let dev_id = id.clone();
+        let dev_task = tokio::spawn(async move {
+            dev_tool_run_with_executable(
+                &activity_delegated_dev_args(&dev_id),
+                &dev_session,
+                Some(&fake_dev),
+                Some(dev_scope),
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.request.operation, "dev_tool_run");
+        prompt.respond(false);
+        assert!(dev_task.await.unwrap().is_err());
+        assert_eq!(
+            dev_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed
+            ]
+        );
+        activity_delegated_job_assert_terminal(
+            &dev_emitter,
+            ActivityState::Failed,
+            "error=approval_denied",
+        );
+        let denial_updates =
+            serde_json::to_string(&(agent_emitter.updates(), dev_emitter.updates())).unwrap();
+        assert!(!denial_updates.contains("denied-prompt-sentinel"));
+        assert!(snapshot_jobs_for_session(&id, 50).jobs.is_empty());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_timeout_uses_fixed_reason_for_both_workers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let sleeper = "#!/bin/sh\nexec /bin/sleep 30\n";
+        let fake_agent = activity_delegated_job_executable(fake_dir.path(), "codex", sleeper);
+        let fake_dev = activity_delegated_job_executable(fake_dir.path(), "cargo", sleeper);
+        let session = activity_job_session(workspace.path());
+
+        let prepared_agent = local_agent::prepare_with_executable(
+            &activity_delegated_local_args(&session.id, "timeout-prompt-sentinel"),
+            &session,
+            &fake_agent,
+        )
+        .unwrap();
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let (_, agent_handle, agent_completion) = spawn_local_agent_with_controls(
+            prepared_agent,
+            &session,
+            Some(agent_scope),
+            std::future::pending(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_wait(agent_handle).await;
+        assert!(matches!(
+            agent_completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        activity_delegated_job_assert_terminal(
+            &agent_emitter,
+            ActivityState::Cancelled,
+            "reason=timeout",
+        );
+
+        let prepared_dev = dev_tool::prepare_with_executable(
+            &activity_delegated_dev_args(&session.id),
+            &session,
+            Some(&fake_dev),
+        )
+        .unwrap();
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let (_, dev_handle, dev_completion) = spawn_dev_tool_with_controls(
+            prepared_dev,
+            &session,
+            Some(dev_scope),
+            std::future::pending(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_wait(dev_handle).await;
+        assert!(matches!(
+            dev_completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        activity_delegated_job_assert_terminal(
+            &dev_emitter,
+            ActivityState::Cancelled,
+            "reason=timeout",
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_stop_cancels_both_workers_before_abort() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let sleeper = "#!/bin/sh\nexec /bin/sleep 30\n";
+        let fake_agent = activity_delegated_job_executable(fake_dir.path(), "codex", sleeper);
+        let fake_dev = activity_delegated_job_executable(fake_dir.path(), "cargo", sleeper);
+        let session = activity_job_session(workspace.path());
+
+        let prepared_agent = local_agent::prepare_with_executable(
+            &activity_delegated_local_args(&session.id, "stop-prompt-sentinel"),
+            &session,
+            &fake_agent,
+        )
+        .unwrap();
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let (description, handle, completion) = spawn_local_agent_with_controls(
+            prepared_agent,
+            &session,
+            Some(agent_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let started = store_job(
+            &session,
+            description,
+            handle,
+            completion,
+            OutputPolicy::default(),
+            "Backgrounded",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agent_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Running]
+        );
+        let started: Value =
+            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
+        stop_job(
+            &json!({"job_id": started["job_id"].as_str().unwrap()}),
+            &session,
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_assert_terminal(
+            &agent_emitter,
+            ActivityState::Cancelled,
+            "reason=stop_requested",
+        );
+
+        let prepared_dev = dev_tool::prepare_with_executable(
+            &activity_delegated_dev_args(&session.id),
+            &session,
+            Some(&fake_dev),
+        )
+        .unwrap();
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let (description, handle, completion) = spawn_dev_tool_with_controls(
+            prepared_dev,
+            &session,
+            Some(dev_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let started = store_job(
+            &session,
+            description,
+            handle,
+            completion,
+            OutputPolicy::default(),
+            "Backgrounded",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dev_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Running]
+        );
+        let started: Value =
+            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
+        stop_job(
+            &json!({"job_id": started["job_id"].as_str().unwrap()}),
+            &session,
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_assert_terminal(
+            &dev_emitter,
+            ActivityState::Cancelled,
+            "reason=stop_requested",
+        );
     }
 
     #[test]
@@ -6628,7 +7125,7 @@ mod tests {
             "operation": "check",
             "args": ["--workspace"]
         });
-        let result = dev_tool_run_with_executable(&args, &session, Some(&fake))
+        let result = dev_tool_run_with_executable(&args, &session, Some(&fake), None)
             .await
             .expect("agent dev_tool_run must not require a local approval console");
         let encoded = serde_json::to_string(&result).unwrap();
