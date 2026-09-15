@@ -4,13 +4,15 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -404,13 +406,55 @@ struct TaskStore {
 
 enum StartAcceptance {
     Existing(TaskRecord),
-    Accepted(TaskRecord),
+    Accepted(TaskRecord, TaskRuntimeLease),
 }
 
 #[derive(Debug)]
 enum ControlAcceptance {
     Replay(Value),
-    Accepted(Box<TaskRecord>),
+    Accepted(Box<TaskRecord>, Option<TaskRuntimeLease>),
+}
+
+enum RuntimeAccess {
+    Local,
+    Acquired(TaskRuntimeLease),
+    OwnedElsewhere,
+}
+
+struct FinalizeOwnerOutcome {
+    finalized: usize,
+    deferred: bool,
+}
+
+#[derive(Debug)]
+struct TaskStoreGuard {
+    _process: MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for TaskStoreGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: file remains open for the lifetime of the lock.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TaskRuntimeLease {
+    file: File,
+}
+
+impl Drop for TaskRuntimeLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: file remains open for the lifetime of the lease.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 fn store_lock() -> &'static Mutex<()> {
@@ -437,9 +481,7 @@ impl TaskStore {
         match std::fs::symlink_metadata(&self.directory) {
             Ok(metadata) => validate_store_directory(&self.directory, &metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&self.directory)?;
-                #[cfg(unix)]
-                std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700))?;
+                create_private_directory(&self.directory)?;
                 let metadata = std::fs::symlink_metadata(&self.directory)?;
                 validate_store_directory(&self.directory, &metadata)
             }
@@ -447,13 +489,119 @@ impl TaskStore {
         }
     }
 
+    fn lock(&self) -> Result<TaskStoreGuard> {
+        let process = store_lock().lock().unwrap();
+        self.ensure_directory()?;
+        let path = self.directory.join(".store.lock");
+        let file = open_private_lock_file(&path)?;
+        #[cfg(unix)]
+        {
+            // SAFETY: flock is called with a valid open descriptor. The guard
+            // keeps it open until the critical section ends.
+            let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if status != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("cannot lock Codex task store");
+            }
+        }
+        Ok(TaskStoreGuard {
+            _process: process,
+            file,
+        })
+    }
+
+    fn runtime_lock_directory(&self) -> PathBuf {
+        self.directory.join("runtime-locks")
+    }
+
+    fn runtime_lock_path(&self, task_id: Uuid) -> PathBuf {
+        self.runtime_lock_directory()
+            .join(format!("{task_id}.lock"))
+    }
+
+    fn try_acquire_runtime_lease(&self, task_id: Uuid) -> Result<Option<TaskRuntimeLease>> {
+        let _guard = self.lock()?;
+        self.try_acquire_runtime_lease_locked(task_id)
+    }
+
+    fn try_acquire_runtime_lease_locked(&self, task_id: Uuid) -> Result<Option<TaskRuntimeLease>> {
+        ensure_private_directory(&self.runtime_lock_directory())?;
+        let file = open_private_lock_file(&self.runtime_lock_path(task_id))?;
+        #[cfg(unix)]
+        {
+            // SAFETY: flock is called with a valid open descriptor. A
+            // successful descriptor is retained by TaskRuntimeLease.
+            let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if status != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || error.raw_os_error() == Some(libc::EAGAIN)
+                {
+                    return Ok(None);
+                }
+                return Err(error).context("cannot lock Codex task runtime");
+            }
+        }
+        Ok(Some(TaskRuntimeLease { file }))
+    }
+
+    fn runtime_lease_held_locked(&self, task_id: Uuid) -> Result<bool> {
+        let path = self.runtime_lock_path(task_id);
+        let file = match open_existing_private_lock_file(&path) {
+            Ok(file) => file,
+            Err(error) if is_not_found(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        {
+            // SAFETY: flock is called with a valid open descriptor and is
+            // immediately released when this inspection returns.
+            let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if status == 0 {
+                let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                return Ok(false);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || error.raw_os_error() == Some(libc::EAGAIN)
+            {
+                return Ok(true);
+            }
+            Err(error).context("cannot inspect Codex task runtime lock")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(false)
+        }
+    }
+
     fn path(&self, task_id: Uuid) -> PathBuf {
         self.directory.join(format!("{task_id}.json"))
     }
 
+    #[cfg(test)]
     fn load(&self, session: &config::Session, task_id: Uuid) -> Result<TaskRecord> {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         self.load_locked(session, task_id)
+    }
+
+    fn load_for_reconciliation(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+    ) -> Result<(TaskRecord, RuntimeAccess)> {
+        let _guard = self.lock()?;
+        let record = self.load_locked(session, task_id)?;
+        let access = if runtime_matches_record(&record) {
+            RuntimeAccess::Local
+        } else {
+            match self.try_acquire_runtime_lease_locked(task_id)? {
+                Some(lease) => RuntimeAccess::Acquired(lease),
+                None => RuntimeAccess::OwnedElsewhere,
+            }
+        };
+        Ok((record, access))
     }
 
     fn load_locked(&self, session: &config::Session, task_id: Uuid) -> Result<TaskRecord> {
@@ -470,7 +618,7 @@ impl TaskStore {
 
     #[cfg(test)]
     fn save(&self, record: &TaskRecord) -> Result<()> {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         self.save_locked(record)
     }
 
@@ -512,7 +660,7 @@ impl TaskStore {
     where
         F: FnOnce(&mut TaskRecord) -> Result<()>,
     {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         let mut record = self.load_locked(session, task_id)?;
         f(&mut record)?;
         record.updated_at = config::unix_time();
@@ -530,7 +678,7 @@ impl TaskStore {
     where
         F: FnOnce(&mut TaskRecord) -> Result<()>,
     {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         let registry = codex_lifecycle_registry().lock().unwrap();
         let entry = registry
             .entries
@@ -549,7 +697,7 @@ impl TaskStore {
         session: &config::Session,
         record: TaskRecord,
     ) -> Result<StartAcceptance> {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         self.accept_start_locked(session, record)
     }
 
@@ -559,7 +707,7 @@ impl TaskStore {
         record: TaskRecord,
         owner: &SessionInstance,
     ) -> Result<StartAcceptance> {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         let registry = codex_lifecycle_registry().lock().unwrap();
         let entry = registry
             .entries
@@ -593,6 +741,9 @@ impl TaskStore {
                             && existing.thread_id.is_none()
                     });
                 if retryable {
+                    let lease = self
+                        .try_acquire_runtime_lease_locked(existing.task_id)?
+                        .context("CODEX_TASK_RUNTIME_OWNED: task runtime belongs to another Temote process")?;
                     existing.status = TaskStatus::Accepted;
                     existing.revision = existing.revision.saturating_add(1);
                     update_operation_receipt(
@@ -602,14 +753,32 @@ impl TaskStore {
                     );
                     existing.updated_at = config::unix_time();
                     self.save_locked(&existing)?;
-                    Ok(StartAcceptance::Accepted(existing))
+                    Ok(StartAcceptance::Accepted(existing, lease))
                 } else {
                     Ok(StartAcceptance::Existing(existing))
                 }
             }
             Err(error) if is_not_found(&error) => {
-                self.save_locked(&record)?;
-                Ok(StartAcceptance::Accepted(record))
+                let lease = self
+                    .try_acquire_runtime_lease_locked(record.task_id)?
+                    .context(
+                        "CODEX_TASK_RUNTIME_OWNED: task runtime belongs to another Temote process",
+                    )?;
+                if let Err(error) = self.save_locked(&record) {
+                    drop(lease);
+                    match std::fs::remove_file(self.runtime_lock_path(record.task_id)) {
+                        Ok(()) => {}
+                        Err(cleanup_error)
+                            if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(cleanup_error) => {
+                            return Err(error).context(format!(
+                                "cannot remove unused Codex runtime lock: {cleanup_error}"
+                            ));
+                        }
+                    }
+                    return Err(error);
+                }
+                Ok(StartAcceptance::Accepted(record, lease))
             }
             Err(error) => Err(error),
         }
@@ -624,7 +793,7 @@ impl TaskStore {
         request_fingerprint: Uuid,
         action: &str,
     ) -> Result<ControlAcceptance> {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         self.accept_control_locked(session, task_id, operation_id, request_fingerprint, action)
     }
 
@@ -635,13 +804,13 @@ impl TaskStore {
         operation_id: Uuid,
         request_fingerprint: Uuid,
         action: &str,
-        owner: &SessionInstance,
     ) -> Result<ControlAcceptance> {
-        let _guard = store_lock().lock().unwrap();
+        let _guard = self.lock()?;
         let registry = codex_lifecycle_registry().lock().unwrap();
+        let owner = SessionInstance::from_session(session);
         let entry = registry
             .entries
-            .get(owner)
+            .get(&owner)
             .context("Codex session instance lifecycle state is unavailable")?;
         anyhow::ensure!(!entry.closing, "Codex session instance is closing");
         self.accept_control_locked(session, task_id, operation_id, request_fingerprint, action)
@@ -717,6 +886,14 @@ impl TaskStore {
             );
         }
 
+        let runtime_lease = if runtime_matches_record(&record) {
+            None
+        } else {
+            Some(self.try_acquire_runtime_lease_locked(task_id)?.context(
+                "CODEX_TASK_RUNTIME_OWNED: task runtime belongs to another Temote process",
+            )?)
+        };
+
         record.revision = record.revision.saturating_add(1);
         let accepted_outcome = record.outcome();
         if record.operations.len() >= MAX_OPERATION_HISTORY {
@@ -734,7 +911,7 @@ impl TaskStore {
             outcome: accepted_outcome,
         });
         self.save_locked(&record)?;
-        Ok(ControlAcceptance::Accepted(Box::new(record)))
+        Ok(ControlAcceptance::Accepted(Box::new(record), runtime_lease))
     }
 
     fn read_record(&self, task_id: Uuid) -> Result<TaskRecord> {
@@ -794,11 +971,20 @@ impl TaskStore {
                 continue;
             };
             let expired = now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS;
-            let runtime_backed = runtime_matches_record(&record);
+            let runtime_backed = runtime_matches_record(&record)
+                || self.runtime_lease_held_locked(record.task_id)?;
             let terminal = record.status.is_terminal();
             if expired && terminal && !runtime_backed && id != current.task_id {
                 std::fs::remove_file(entry.path())
                     .with_context(|| format!("cannot prune expired Codex task {id}"))?;
+                match std::fs::remove_file(self.runtime_lock_path(id)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("cannot prune Codex runtime lock {id}"));
+                    }
+                }
                 continue;
             }
             if record.owner == current.owner && record.scope_cwd == current.scope_cwd {
@@ -815,22 +1001,33 @@ impl TaskStore {
         Ok(())
     }
 
-    fn finalize_owner(&self, owner: &SessionInstance) -> Result<usize> {
-        let _guard = store_lock().lock().unwrap();
+    fn finalize_owner(&self, owner: &SessionInstance) -> Result<FinalizeOwnerOutcome> {
+        let _guard = self.lock()?;
         let metadata = match std::fs::symlink_metadata(&self.directory) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FinalizeOwnerOutcome {
+                    finalized: 0,
+                    deferred: false,
+                });
+            }
             Err(error) => return Err(error).context("cannot inspect Codex task store"),
         };
         validate_store_directory(&self.directory, &metadata)?;
         let entries = match std::fs::read_dir(&self.directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FinalizeOwnerOutcome {
+                    finalized: 0,
+                    deferred: false,
+                });
+            }
             Err(error) => return Err(error).context("cannot list Codex task store"),
         };
         let now = config::unix_time();
         let mut count = 0usize;
         let mut finalized = 0usize;
+        let mut deferred = false;
         for entry in entries {
             count += 1;
             anyhow::ensure!(
@@ -856,7 +1053,14 @@ impl TaskStore {
                         .with_context(|| format!("cannot inspect Codex task {id} during cleanup"));
                 }
             };
-            if record.owner != owner.clone() || record.status.is_terminal() {
+            if record.owner != owner.clone() {
+                continue;
+            }
+            if self.runtime_lease_held_locked(record.task_id)? {
+                deferred = true;
+                continue;
+            }
+            if record.status.is_terminal() {
                 continue;
             }
 
@@ -873,7 +1077,10 @@ impl TaskStore {
             self.save_locked(&record)?;
             finalized += 1;
         }
-        Ok(finalized)
+        Ok(FinalizeOwnerOutcome {
+            finalized,
+            deferred,
+        })
     }
 }
 
@@ -915,6 +1122,63 @@ fn validate_store_directory(path: &Path, metadata: &std::fs::Metadata) -> Result
         );
     }
     Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_store_directory(path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_directory(path)?;
+            let metadata = std::fs::symlink_metadata(path)?;
+            validate_store_directory(path, &metadata)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect private directory {}", path.display())),
+    }
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot create private directory {}", path.display())),
+    }
+}
+
+fn open_private_lock_file(path: &Path) -> Result<File> {
+    reject_symlink_target(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot open private lock file {}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    validate_private_regular_file(path, &metadata)?;
+    Ok(file)
+}
+
+fn open_existing_private_lock_file(path: &Path) -> Result<File> {
+    reject_symlink_target(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot open private lock file {}", path.display()))?;
+    let metadata = file.metadata()?;
+    validate_private_regular_file(path, &metadata)?;
+    Ok(file)
 }
 
 fn validate_private_regular_file(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
@@ -1067,6 +1331,24 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "evidence": evidence_ref,
         "retention_seconds": TASK_RETENTION_SECONDS,
     })
+}
+
+fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Value {
+    if after_revision == Some(record.revision) {
+        return json!({
+            "task_id": record.task_id,
+            "status": "not_modified",
+            "revision": record.revision,
+            "last_updated_at": record.updated_at,
+            "reconciliation_deferred": true,
+        });
+    }
+    let mut view = task_view(record, None);
+    if let Some(object) = view.as_object_mut() {
+        object.insert("last_updated_at".to_owned(), json!(record.updated_at));
+        object.insert("reconciliation_deferred".to_owned(), json!(true));
+    }
+    view
 }
 
 fn store_evidence_for_instance(
@@ -1432,6 +1714,7 @@ struct RuntimeHandle {
     owner: SessionInstance,
     scope: PathBuf,
     started_at: Instant,
+    _lease: Arc<TaskRuntimeLease>,
 }
 
 fn runtimes() -> &'static Mutex<HashMap<Uuid, RuntimeHandle>> {
@@ -1467,25 +1750,35 @@ fn runtime_matches_record(record: &TaskRecord) -> bool {
         .is_some_and(|runtime| runtime.owner == record.owner && runtime.scope == record.scope_cwd)
 }
 
-async fn insert_runtime(session: &config::Session, task_id: Uuid, client: RpcClient) -> Result<()> {
+async fn insert_runtime(
+    session: &config::Session,
+    task_id: Uuid,
+    store: &TaskStore,
+    client: RpcClient,
+    lease: Arc<TaskRuntimeLease>,
+) -> Result<()> {
     let owner = SessionInstance::from_session(session);
     let _permit = ensure_current_active_instance(&owner, session).await?;
-    insert_runtime_unchecked(session, task_id, client, &owner)
+    insert_runtime_unchecked(session, task_id, store, client, &owner, lease)
 }
 
 fn insert_runtime_unchecked(
     session: &config::Session,
     task_id: Uuid,
+    store: &TaskStore,
     client: RpcClient,
     owner: &SessionInstance,
+    lease: Arc<TaskRuntimeLease>,
 ) -> Result<()> {
     let owner = owner.clone();
+    let store = store.clone();
     let scope = config::canonical_directory(&session.cwd)?;
     let runtime = RuntimeHandle {
         client: client.clone(),
         owner: owner.clone(),
         scope,
         started_at: Instant::now(),
+        _lease: lease,
     };
     {
         let _guard = store_lock().lock().unwrap();
@@ -1531,8 +1824,18 @@ fn insert_runtime_unchecked(
                 state.remove(&task_id);
             }
         }
-        if session_stopped && !active_session_exists(&owner.id).await {
-            evidence::remove_session(&owner.id);
+        if session_stopped {
+            let result = async {
+                wait_for_session_inflight_drain(&owner, SESSION_CODEX_DRAIN_TIMEOUT).await?;
+                finalize_session_tasks(&owner, &store).await
+            }
+            .await;
+            if let Err(error) = result {
+                eprintln!(
+                    "failed to finalize Codex tasks after session {} stopped: {error:#}",
+                    owner.id
+                );
+            }
         }
     });
     Ok(())
@@ -1591,15 +1894,23 @@ async fn remove_session_evidence(owner: &SessionInstance) {
 }
 
 async fn finalize_session_tasks(owner: &SessionInstance, store: &TaskStore) -> Result<()> {
-    let result = store
-        .finalize_owner(owner)
-        .context("failed to finalize Codex tasks for ended session instance")
-        .map(|_| ());
-    remove_session_evidence(owner).await;
-    if result.is_ok() {
-        finish_session_shutdown(owner)?;
+    let deadline = Instant::now() + SESSION_CODEX_DRAIN_TIMEOUT;
+    loop {
+        let outcome = store
+            .finalize_owner(owner)
+            .context("failed to finalize Codex tasks for ended session instance")?;
+        if !outcome.deferred {
+            let _ = outcome.finalized;
+            remove_session_evidence(owner).await;
+            finish_session_shutdown(owner)?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for a remotely owned Codex task runtime to stop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    result
 }
 
 #[cfg(test)]
@@ -1646,7 +1957,7 @@ async fn spawn_initialized_client_with_binary(
     task_id: Option<Uuid>,
     binary: &Path,
 ) -> Result<(RpcClient, Value)> {
-    spawn_initialized_client_with_binary_mode(session, task_id, binary, true).await
+    spawn_initialized_client_with_binary_mode(session, task_id, binary, true, None).await
 }
 
 async fn spawn_initialized_client_with_binary_mode(
@@ -1654,6 +1965,7 @@ async fn spawn_initialized_client_with_binary_mode(
     task_id: Option<Uuid>,
     binary: &Path,
     fence: bool,
+    runtime_lease: Option<Arc<TaskRuntimeLease>>,
 ) -> Result<(RpcClient, Value)> {
     let owner = SessionInstance::from_session(session);
     let spawn_permit = if fence {
@@ -1662,9 +1974,9 @@ async fn spawn_initialized_client_with_binary_mode(
         None
     };
     let client = if fence {
-        spawn_client_if_instance_live(session.clone(), task_id, binary, &owner)?
+        spawn_client_if_instance_live(session.clone(), task_id, binary, &owner, runtime_lease)?
     } else {
-        spawn_client_with_binary_unchecked(session.clone(), task_id, binary)?
+        spawn_client_with_binary_unchecked(session.clone(), task_id, binary, runtime_lease)?
     };
     let initialized = async {
         let initialize_params = json!({
@@ -1784,6 +2096,7 @@ fn spawn_client_if_instance_live(
     task_id: Option<Uuid>,
     binary: &Path,
     owner: &SessionInstance,
+    runtime_lease: Option<Arc<TaskRuntimeLease>>,
 ) -> Result<RpcClient> {
     let registry = codex_lifecycle_registry().lock().unwrap();
     let entry = registry
@@ -1791,13 +2104,14 @@ fn spawn_client_if_instance_live(
         .get(owner)
         .context("Codex session instance lifecycle state is unavailable")?;
     anyhow::ensure!(!entry.closing, "Codex session instance is closing");
-    spawn_client_with_binary_unchecked(session, task_id, binary)
+    spawn_client_with_binary_unchecked(session, task_id, binary, runtime_lease)
 }
 
 fn spawn_client_with_binary_unchecked(
     session: config::Session,
     task_id: Option<Uuid>,
     binary: &Path,
+    runtime_lease: Option<Arc<TaskRuntimeLease>>,
 ) -> Result<RpcClient> {
     let mut command = Command::new(binary);
     command
@@ -1826,7 +2140,15 @@ fn spawn_client_with_binary_unchecked(
         .take()
         .context("Codex app-server stdout unavailable")?;
     let (tx, rx) = mpsc::channel(64);
-    let actor = tokio::spawn(run_actor(child, stdin, stdout, session, task_id, rx));
+    let actor = tokio::spawn(run_actor(
+        child,
+        stdin,
+        stdout,
+        session,
+        task_id,
+        rx,
+        runtime_lease,
+    ));
     Ok(RpcClient {
         tx,
         actor: Arc::new(Mutex::new(Some(actor))),
@@ -1857,6 +2179,7 @@ async fn run_actor(
     session: config::Session,
     task_id: Option<Uuid>,
     mut commands: mpsc::Receiver<ClientCommand>,
+    runtime_lease_guard: Option<Arc<TaskRuntimeLease>>,
 ) {
     let mut reader = BufReader::new(stdout);
     let (server_tx, mut server_rx) = mpsc::channel::<ServerResponse>(16);
@@ -1947,6 +2270,7 @@ async fn run_actor(
         let _ = reply.send(Err(terminal_error.clone()));
     }
     let _ = child.kill().await;
+    drop(runtime_lease_guard);
 }
 
 async fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
@@ -2589,20 +2913,27 @@ async fn task_start_with_store_and_binary_inner(
         store.accept_start(session, record)?
     };
     drop(acceptance_permit);
-    let mut record = match acceptance {
+    let (mut record, runtime_lease) = match acceptance {
         StartAcceptance::Existing(existing) => {
             return replay_operation(&existing, operation_id, request_fingerprint);
         }
-        StartAcceptance::Accepted(record) => record,
+        StartAcceptance::Accepted(record, lease) => (record, lease),
     };
+    let runtime_lease = Arc::new(runtime_lease);
     let _operation_permit = if fence {
         Some(ensure_current_active_instance(&owner, session).await?)
     } else {
         None
     };
 
-    let client_result =
-        spawn_initialized_client_with_binary_mode(session, Some(task_id), binary, fence).await;
+    let client_result = spawn_initialized_client_with_binary_mode(
+        session,
+        Some(task_id),
+        binary,
+        fence,
+        Some(Arc::clone(&runtime_lease)),
+    )
+    .await;
     let (client, _) = match client_result {
         Ok(client) => client,
         Err(_) => {
@@ -2800,9 +3131,16 @@ async fn task_start_with_store_and_binary_inner(
     }
 
     let insert_result = if fence {
-        insert_runtime(session, task_id, client.clone()).await
+        insert_runtime(session, task_id, store, client.clone(), runtime_lease).await
     } else {
-        insert_runtime_unchecked(session, task_id, client.clone(), &owner)
+        insert_runtime_unchecked(
+            session,
+            task_id,
+            store,
+            client.clone(),
+            &owner,
+            runtime_lease,
+        )
     };
     if let Err(error) = insert_result {
         client.shutdown().await;
@@ -2859,8 +3197,15 @@ async fn task_get_with_store_and_binary(
     let after_revision = optional_u64(args, "after_revision")?;
     let owner = SessionInstance::from_session(session);
     let load_permit = ensure_current_active_instance(&owner, session).await?;
-    let mut record = store.load(session, task_id)?;
+    let (mut record, runtime_access) = store.load_for_reconciliation(session, task_id)?;
     drop(load_permit);
+    let acquired_lease = match runtime_access {
+        RuntimeAccess::Local => None,
+        RuntimeAccess::Acquired(lease) => Some(lease),
+        RuntimeAccess::OwnedElsewhere => {
+            return Ok(task_view_at_revision(&record, after_revision));
+        }
+    };
     if record.thread_id.is_none() {
         if record.status == TaskStatus::Accepted {
             let start_operation_id = record
@@ -2885,21 +3230,25 @@ async fn task_get_with_store_and_binary(
         return Ok(task_view(&record, None));
     }
 
-    let client = match ensure_runtime_with_binary(session, &record, binary).await {
-        Ok(client) => client,
-        Err(_) => {
-            let apply_permit = ensure_current_active_instance(&owner, session).await?;
-            record = store.update_if_instance_live(session, task_id, &owner, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TaskStatus::Unknown;
-                    record.revision = record.revision.saturating_add(1);
-                }
-                Ok(())
-            })?;
-            drop(apply_permit);
-            return Ok(task_view(&record, None));
-        }
-    };
+    let client =
+        match ensure_runtime_with_binary(session, &record, store, binary, acquired_lease).await {
+            Ok(EnsuredRuntime::Local(client)) => client,
+            Ok(EnsuredRuntime::OwnedElsewhere) => {
+                return Ok(task_view_at_revision(&record, after_revision));
+            }
+            Err(_) => {
+                let apply_permit = ensure_current_active_instance(&owner, session).await?;
+                record = store.update_if_instance_live(session, task_id, &owner, |record| {
+                    if !record.status.is_terminal() {
+                        record.status = TaskStatus::Unknown;
+                        record.revision = record.revision.saturating_add(1);
+                    }
+                    Ok(())
+                })?;
+                drop(apply_permit);
+                return Ok(task_view(&record, None));
+            }
+        };
     let thread_id = record.thread_id.clone().unwrap();
     let response = request_for_instance(
         &client,
@@ -3071,18 +3420,38 @@ fn extract_usage_from_turn(turn: &Value) -> Option<BTreeMap<String, u64>> {
         .and_then(extract_usage)
 }
 
+enum EnsuredRuntime {
+    Local(RpcClient),
+    OwnedElsewhere,
+}
+
 async fn ensure_runtime_with_binary(
     session: &config::Session,
     record: &TaskRecord,
+    store: &TaskStore,
     binary: &Path,
-) -> Result<RpcClient> {
+    acquired_lease: Option<TaskRuntimeLease>,
+) -> Result<EnsuredRuntime> {
     let owner = SessionInstance::from_session(session);
     if let Some(runtime) = runtime_for(session, record.task_id) {
-        return Ok(runtime.client);
+        return Ok(EnsuredRuntime::Local(runtime.client));
     }
+    let lease = match acquired_lease {
+        Some(lease) => Arc::new(lease),
+        None => match store.try_acquire_runtime_lease(record.task_id)? {
+            Some(lease) => Arc::new(lease),
+            None => return Ok(EnsuredRuntime::OwnedElsewhere),
+        },
+    };
     let _operation_permit = ensure_current_active_instance(&owner, session).await?;
-    let (client, _) =
-        spawn_initialized_client_with_binary(session, Some(record.task_id), binary).await?;
+    let (client, _) = spawn_initialized_client_with_binary_mode(
+        session,
+        Some(record.task_id),
+        binary,
+        true,
+        Some(Arc::clone(&lease)),
+    )
+    .await?;
     let thread_id = record
         .thread_id
         .as_deref()
@@ -3108,11 +3477,12 @@ async fn ensure_runtime_with_binary(
         client.shutdown().await;
         return Err(error).context("Codex task could not resume its retained thread");
     }
-    if let Err(error) = insert_runtime(session, record.task_id, client.clone()).await {
+    if let Err(error) = insert_runtime(session, record.task_id, store, client.clone(), lease).await
+    {
         client.shutdown().await;
         return Err(error);
     }
-    Ok(client)
+    Ok(EnsuredRuntime::Local(client))
 }
 
 pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Result<Value> {
@@ -3150,16 +3520,15 @@ async fn task_control_with_store_and_binary(
     }))?;
     let owner = SessionInstance::from_session(session);
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
-    let mut record = match store.accept_control_if_instance_live(
+    let (mut record, acquired_lease) = match store.accept_control_if_instance_live(
         session,
         task_id,
         operation_id,
         request_fingerprint,
         action,
-        &owner,
     )? {
         ControlAcceptance::Replay(result) => return Ok(result),
-        ControlAcceptance::Accepted(record) => *record,
+        ControlAcceptance::Accepted(record, lease) => (*record, lease),
     };
     drop(acceptance_permit);
     let thread_id = record
@@ -3168,15 +3537,22 @@ async fn task_control_with_store_and_binary(
         .context("Codex task requires reconciliation before control")?;
     let turn_id = record.turn_id.clone();
 
-    let client = match ensure_runtime_with_binary(session, &record, binary).await {
-        Ok(client) => client,
-        Err(_) => {
-            let shutting_down = session_instance_is_closing(&owner);
-            let record =
-                apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
-            return Ok(task_view(&record, None));
-        }
-    };
+    let client =
+        match ensure_runtime_with_binary(session, &record, store, binary, acquired_lease).await {
+            Ok(EnsuredRuntime::Local(client)) => client,
+            Ok(EnsuredRuntime::OwnedElsewhere) => {
+                let shutting_down = session_instance_is_closing(&owner);
+                let record =
+                    apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
+                return Ok(task_view(&record, None));
+            }
+            Err(_) => {
+                let shutting_down = session_instance_is_closing(&owner);
+                let record =
+                    apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
+                return Ok(task_view(&record, None));
+            }
+        };
     let result = match action {
         "steer" => {
             request_for_instance(
@@ -3469,6 +3845,41 @@ for raw in sys.stdin:
         (handle, session)
     }
 
+    fn test_runtime_lease(root: &Path, task_id: Uuid) -> Arc<TaskRuntimeLease> {
+        let store = TaskStore::new(root.join("test-runtime-locks"));
+        Arc::new(
+            store
+                .try_acquire_runtime_lease(task_id)
+                .unwrap()
+                .expect("test task runtime lease is unavailable"),
+        )
+    }
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl ChildGuard {
+        fn new(child: std::process::Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            let status = self.0.as_mut().unwrap().wait();
+            if status.is_ok() {
+                self.0.take();
+            }
+            status
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     async fn wait_for_marker(path: &Path) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while !path.exists() {
@@ -3477,6 +3888,19 @@ for raw in sys.stdin:
         })
         .await
         .expect("fake app-server did not reach its barrier");
+    }
+
+    async fn wait_for_child_release(path: &Path) {
+        // The parent can be delayed by the full test binary's other process
+        // fixtures, so keep this bounded without making ordinary loaded runs
+        // release the lease prematurely.
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cross-process test child did not receive its release marker");
     }
 
     fn recording_client(methods: Arc<Mutex<Vec<String>>>) -> RpcClient {
@@ -3741,6 +4165,8 @@ for raw in sys.stdin:
             tx: replacement_commands,
             actor: Arc::new(Mutex::new(Some(replacement_actor))),
         };
+        let old_lease = test_runtime_lease(root.path(), old_task);
+        let replacement_lease = test_runtime_lease(root.path(), replacement_task);
 
         runtimes().lock().unwrap().insert(
             old_task,
@@ -3749,6 +4175,7 @@ for raw in sys.stdin:
                 owner: SessionInstance::from_session(&old),
                 scope: old.cwd.clone(),
                 started_at: Instant::now(),
+                _lease: old_lease,
             },
         );
         runtimes().lock().unwrap().insert(
@@ -3758,6 +4185,7 @@ for raw in sys.stdin:
                 owner: SessionInstance::from_session(&replacement),
                 scope: replacement.cwd.clone(),
                 started_at: Instant::now(),
+                _lease: replacement_lease,
             },
         );
 
@@ -4036,6 +4464,8 @@ for raw in sys.stdin:
         let release = root.path().join("registered-release");
         let client = blocking_shutdown_client(entered.clone(), release.clone());
         let task_id = Uuid::new_v4();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let runtime_lease = store.try_acquire_runtime_lease(task_id).unwrap().unwrap();
         let owner_instance = SessionInstance::from_session(&owner);
         runtimes().lock().unwrap().insert(
             task_id,
@@ -4044,6 +4474,7 @@ for raw in sys.stdin:
                 owner: owner_instance.clone(),
                 scope: owner.cwd.clone(),
                 started_at: Instant::now(),
+                _lease: Arc::new(runtime_lease),
             },
         );
         let operation = tokio::spawn({
@@ -4057,10 +4488,11 @@ for raw in sys.stdin:
         });
         wait_for_marker(&entered).await;
         handle.shutdown().await.unwrap();
-        let store = TaskStore::new(store_root.path().join("tasks"));
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_none());
+        let removal_store = store.clone();
         let mut removal = tokio::spawn({
             let owner = owner.clone();
-            async move { remove_session_with_store(&owner, &store).await }
+            async move { remove_session_with_store(&owner, &removal_store).await }
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut removal)
@@ -4082,6 +4514,7 @@ for raw in sys.stdin:
             .unwrap()
             .unwrap();
         assert!(runtime_for(&owner, task_id).is_none());
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -4273,9 +4706,20 @@ for raw in sys.stdin:
 
         handle.shutdown().await.unwrap();
         remove_session_with_store(&owner, &store).await.unwrap();
-        let error = insert_runtime(&owner, task_id, client.clone())
-            .await
-            .unwrap_err();
+        let runtime_store = TaskStore::new(store_root.path().join("runtime-locks"));
+        let lease = runtime_store
+            .try_acquire_runtime_lease(task_id)
+            .unwrap()
+            .unwrap();
+        let error = insert_runtime(
+            &owner,
+            task_id,
+            &runtime_store,
+            client.clone(),
+            Arc::new(lease),
+        )
+        .await
+        .unwrap_err();
         assert!(
             error.to_string().contains("no longer current")
                 || error.to_string().contains("not active")
@@ -4450,6 +4894,7 @@ for raw in sys.stdin:
                 let _ = stopped.send(());
             }
         });
+        let runtime_lease = test_runtime_lease(root.path(), task_id);
         runtimes().lock().unwrap().insert(
             task_id,
             RuntimeHandle {
@@ -4460,6 +4905,7 @@ for raw in sys.stdin:
                 owner: SessionInstance::from_session(&owner),
                 scope: owner.cwd.clone(),
                 started_at: Instant::now(),
+                _lease: runtime_lease,
             },
         );
 
@@ -4687,6 +5133,7 @@ for raw in sys.stdin:
                 let _ = stopped.send(());
             }
         });
+        let runtime_lease = test_runtime_lease(root.path(), task_id);
         runtimes().lock().unwrap().insert(
             task_id,
             RuntimeHandle {
@@ -4697,6 +5144,7 @@ for raw in sys.stdin:
                 owner: SessionInstance::from_session(&old_session),
                 scope: old_session.cwd.clone(),
                 started_at: Instant::now(),
+                _lease: runtime_lease,
             },
         );
 
@@ -4793,7 +5241,7 @@ for raw in sys.stdin:
                     barrier.wait();
                     let accepted = matches!(
                         store.accept_start(&owner, candidate).unwrap(),
-                        StartAcceptance::Accepted(_)
+                        StartAcceptance::Accepted(..)
                     );
                     sender.send(accepted).unwrap();
                 });
@@ -4807,6 +5255,343 @@ for raw in sys.stdin:
         assert_eq!(results.iter().filter(|accepted| **accepted).count(), 1);
         let persisted = store.load(&owner, task_id).unwrap();
         assert_eq!(persisted.operations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_process_store_and_runtime_ownership_are_fenced() {
+        const TEST_NAME: &str =
+            "codex_app_server::tests::cross_process_store_and_runtime_ownership_are_fenced";
+        const ROLE: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_ROLE";
+        const STORE: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_STORE";
+        const WORKSPACE: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_WORKSPACE";
+        const TASK_ID: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_TASK_ID";
+        const READY: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_READY";
+        const RELEASE: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_RELEASE";
+        const STOPPED: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_STOPPED";
+
+        if let Some(role) = std::env::var_os(ROLE) {
+            let store = TaskStore::new(PathBuf::from(std::env::var_os(STORE).unwrap()));
+            let workspace = PathBuf::from(std::env::var_os(WORKSPACE).unwrap());
+            let task_id = Uuid::parse_str(&std::env::var(TASK_ID).unwrap()).unwrap();
+            let ready = PathBuf::from(std::env::var_os(READY).unwrap());
+            let release = PathBuf::from(std::env::var_os(RELEASE).unwrap());
+            let stopped = PathBuf::from(std::env::var_os(STOPPED).unwrap());
+            match role.to_str().unwrap() {
+                "holder" => {
+                    let _lease = store
+                        .try_acquire_runtime_lease(task_id)
+                        .unwrap()
+                        .expect("child could not acquire task runtime lease");
+                    std::fs::write(&ready, b"ready").unwrap();
+                    wait_for_child_release(&release).await;
+                }
+                "updater" => {
+                    std::fs::write(&ready, b"ready").unwrap();
+                    wait_for_child_release(&release).await;
+                    let owner = session(&workspace, "cross-process-owner", true);
+                    store
+                        .update(&owner, task_id, |record| {
+                            std::thread::sleep(Duration::from_millis(75));
+                            record.revision = record.revision.saturating_add(1);
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                "runtime-holder" => {
+                    let (session_handle, owner) =
+                        active_test_session(&workspace, "cross-process-live-owner", true).await;
+                    store
+                        .save(&task_record(
+                            &owner,
+                            task_id,
+                            TaskStatus::Running,
+                            20,
+                            Some("thread"),
+                            Some("turn"),
+                        ))
+                        .unwrap();
+                    let lease = Arc::new(
+                        store
+                            .try_acquire_runtime_lease(task_id)
+                            .unwrap()
+                            .expect("child could not acquire watched task runtime lease"),
+                    );
+                    let (commands, mut receiver) = tokio::sync::mpsc::channel(4);
+                    let actor = tokio::spawn(async move {
+                        let mut pending = Vec::new();
+                        while let Some(command) = receiver.recv().await {
+                            match command {
+                                ClientCommand::Request { reply, .. } => {
+                                    pending.push(reply);
+                                    std::fs::write(&ready, b"ready").unwrap();
+                                }
+                                ClientCommand::Shutdown => {
+                                    std::fs::write(&stopped, b"stopped").unwrap();
+                                    break;
+                                }
+                                ClientCommand::Notify { .. } => {}
+                            }
+                        }
+                    });
+                    let client = RpcClient {
+                        tx: commands,
+                        actor: Arc::new(Mutex::new(Some(actor))),
+                    };
+                    insert_runtime(&owner, task_id, &store, client.clone(), lease)
+                        .await
+                        .unwrap();
+                    let request_client = client.clone();
+                    let request_owner = SessionInstance::from_session(&owner);
+                    let request_session = owner.clone();
+                    let request = tokio::spawn(async move {
+                        request_for_instance(
+                            &request_client,
+                            &request_owner,
+                            &request_session,
+                            "thread/read",
+                            json!({"threadId":"thread","includeTurns":true}),
+                        )
+                        .await
+                    });
+                    wait_for_child_release(&release).await;
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if ensure_session_replacement_allowed(&owner.id).is_ok() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("runtime owner lifecycle remained stuck after request drain");
+                    assert!(request.await.unwrap().is_err());
+                    session_handle.shutdown().await.unwrap();
+                }
+                other => panic!("unknown cross-process test role {other}"),
+            }
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(root.path().join("tasks"));
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let owner = session(&workspace, "cross-process-owner", true);
+        let task_id = Uuid::new_v4();
+        let record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            10,
+            Some("thread"),
+            Some("turn"),
+        );
+        store.save(&record).unwrap();
+
+        let current_exe = std::env::current_exe().unwrap();
+        let spawn_child = |role: &str, child_task_id: Uuid, ready: &Path, release: &Path| {
+            let stopped = ready.with_extension("stopped");
+            ChildGuard::new(
+                std::process::Command::new(&current_exe)
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env(ROLE, role)
+                    .env(STORE, &store.directory)
+                    .env(WORKSPACE, &workspace)
+                    .env(TASK_ID, child_task_id.to_string())
+                    .env(READY, ready)
+                    .env(RELEASE, release)
+                    .env(STOPPED, stopped)
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+
+        let holder_ready = root.path().join("holder-ready");
+        let holder_release = root.path().join("holder-release");
+        let mut holder = spawn_child("holder", task_id, &holder_ready, &holder_release);
+        wait_for_marker(&holder_ready).await;
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_none());
+
+        let cached = task_view_at_revision(&record, None);
+        assert_eq!(cached["status"], "running");
+        assert_eq!(cached["revision"], 10);
+        assert_eq!(cached["last_updated_at"], record.updated_at);
+        assert_eq!(cached["reconciliation_deferred"], true);
+        let not_modified = task_view_at_revision(&record, Some(10));
+        assert_eq!(not_modified["status"], "not_modified");
+        assert_eq!(not_modified["reconciliation_deferred"], true);
+
+        let control_error = store
+            .accept_control(
+                &owner,
+                task_id,
+                Uuid::new_v4(),
+                fingerprint(&json!({"operation":"remote-control"})).unwrap(),
+                "interrupt",
+            )
+            .unwrap_err();
+        assert!(
+            control_error
+                .to_string()
+                .contains("CODEX_TASK_RUNTIME_OWNED")
+        );
+        assert!(store.load(&owner, task_id).unwrap().operations.is_empty());
+
+        let expired_task_id = Uuid::new_v4();
+        let mut expired = task_record(
+            &owner,
+            expired_task_id,
+            TaskStatus::Completed,
+            1,
+            Some("expired-thread"),
+            Some("expired-turn"),
+        );
+        expired.updated_at = 0;
+        store.save(&expired).unwrap();
+        let expired_ready = root.path().join("expired-ready");
+        let expired_release = root.path().join("expired-release");
+        let mut expired_holder =
+            spawn_child("holder", expired_task_id, &expired_ready, &expired_release);
+        wait_for_marker(&expired_ready).await;
+        store.save(&record).unwrap();
+        assert!(store.path(expired_task_id).exists());
+        std::fs::write(&expired_release, b"release").unwrap();
+        assert!(expired_holder.wait().unwrap().success());
+        store.save(&record).unwrap();
+        assert!(!store.path(expired_task_id).exists());
+        assert!(!store.runtime_lock_path(expired_task_id).exists());
+
+        let update_release = root.path().join("update-release");
+        let mut updaters = Vec::new();
+        let mut updater_ready = Vec::new();
+        for index in 0..4 {
+            let ready = root.path().join(format!("updater-{index}-ready"));
+            updaters.push(spawn_child("updater", task_id, &ready, &update_release));
+            updater_ready.push(ready);
+        }
+        for ready in &updater_ready {
+            wait_for_marker(ready).await;
+        }
+        std::fs::write(&update_release, b"release").unwrap();
+        for updater in &mut updaters {
+            assert!(updater.wait().unwrap().success());
+        }
+        assert_eq!(store.load(&owner, task_id).unwrap().revision, 14);
+        let deferred = store.finalize_owner(&record.owner).unwrap();
+        assert_eq!(deferred.finalized, 0);
+        assert!(deferred.deferred);
+        let remotely_running = store.load(&owner, task_id).unwrap();
+        assert_eq!(remotely_running.status, TaskStatus::Running);
+        assert_eq!(remotely_running.revision, 14);
+
+        std::fs::write(&holder_release, b"release").unwrap();
+        assert!(holder.wait().unwrap().success());
+        let completed = store.finalize_owner(&record.owner).unwrap();
+        assert_eq!(completed.finalized, 1);
+        assert!(!completed.deferred);
+        let finalized = store.load(&owner, task_id).unwrap();
+        assert_eq!(finalized.status, TaskStatus::Interrupted);
+        assert_eq!(finalized.revision, 15);
+        let released = store
+            .try_acquire_runtime_lease(task_id)
+            .unwrap()
+            .expect("runtime lease stayed locked after owner exit");
+        #[cfg(unix)]
+        {
+            // SAFETY: the lease owns this valid descriptor.
+            let flags = unsafe { libc::fcntl(released.file.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        drop(released);
+
+        let terminal_task_id = Uuid::new_v4();
+        let terminal_session_id = format!("cross-process-terminal-{}", Uuid::new_v4());
+        let (terminal_handle, terminal_owner) =
+            active_test_session(&workspace, &terminal_session_id, true).await;
+        let terminal_record = task_record(
+            &terminal_owner,
+            terminal_task_id,
+            TaskStatus::Completed,
+            30,
+            Some("terminal-thread"),
+            Some("terminal-turn"),
+        );
+        store.save(&terminal_record).unwrap();
+        let terminal_ready = root.path().join("terminal-ready");
+        let terminal_release = root.path().join("terminal-release");
+        let mut terminal_holder = spawn_child(
+            "holder",
+            terminal_task_id,
+            &terminal_ready,
+            &terminal_release,
+        );
+        wait_for_marker(&terminal_ready).await;
+        terminal_handle.shutdown().await.unwrap();
+        let mut terminal_cleanup = tokio::spawn({
+            let store = store.clone();
+            let terminal_owner = terminal_owner.clone();
+            async move { remove_session_with_store(&terminal_owner, &store).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut terminal_cleanup)
+                .await
+                .is_err(),
+            "session cleanup completed while a terminal task runtime remained remotely leased"
+        );
+        assert!(ensure_session_replacement_allowed(&terminal_owner.id).is_err());
+        std::fs::write(&terminal_release, b"release").unwrap();
+        assert!(terminal_holder.wait().unwrap().success());
+        tokio::time::timeout(Duration::from_secs(5), terminal_cleanup)
+            .await
+            .expect("terminal task cleanup did not resume after runtime lease release")
+            .unwrap()
+            .unwrap();
+        assert!(ensure_session_replacement_allowed(&terminal_owner.id).is_ok());
+        let preserved_terminal = store.load(&terminal_owner, terminal_task_id).unwrap();
+        assert_eq!(preserved_terminal.status, TaskStatus::Completed);
+        assert_eq!(preserved_terminal.revision, 30);
+
+        let watched_task_id = Uuid::new_v4();
+        let watched_ready = root.path().join("watched-ready");
+        let watched_stopped = watched_ready.with_extension("stopped");
+        let watched_release = root.path().join("watched-release");
+        let mut watched = spawn_child(
+            "runtime-holder",
+            watched_task_id,
+            &watched_ready,
+            &watched_release,
+        );
+        wait_for_marker(&watched_ready).await;
+        assert!(
+            store
+                .try_acquire_runtime_lease(watched_task_id)
+                .unwrap()
+                .is_none()
+        );
+        let watched_owner = config::read_session_metadata("cross-process-live-owner")
+            .await
+            .unwrap();
+        std::fs::remove_file(config::socket_path(&watched_owner.id).unwrap()).unwrap();
+        wait_for_marker(&watched_stopped).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let persisted = store.load(&watched_owner, watched_task_id).unwrap();
+                if persisted.status == TaskStatus::Interrupted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("runtime owner did not finalize task after external session stop");
+        assert!(
+            store
+                .try_acquire_runtime_lease(watched_task_id)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(&watched_release, b"release").unwrap();
+        assert!(watched.wait().unwrap().success());
     }
 
     #[test]
@@ -4859,7 +5644,7 @@ for raw in sys.stdin:
                                 "interrupt",
                             )
                             .unwrap(),
-                        ControlAcceptance::Accepted(_)
+                        ControlAcceptance::Accepted(..)
                     );
                     sender.send(accepted).unwrap();
                 });
@@ -4938,7 +5723,7 @@ for raw in sys.stdin:
                     request_fingerprint,
                     "interrupt",
                 ) {
-                    Ok(ControlAcceptance::Accepted(_)) => true,
+                    Ok(ControlAcceptance::Accepted(..)) => true,
                     Ok(ControlAcceptance::Replay(_)) | Err(_) => false,
                 };
                 control_sender.send(("control", accepted)).unwrap();
@@ -5166,17 +5951,25 @@ for raw in sys.stdin:
         }
 
         let missing_binary = root.path().join("never-spawned");
-        let new_args = json!({
-            "operation_id": Uuid::new_v4(),
-            "task": "must be rejected at capacity",
-            "model": "gpt-5.6-luna",
-            "effort": "max"
-        });
-        let capacity_error =
-            task_start_with_store_and_binary(&new_args, &owner, &store, &missing_binary)
-                .await
-                .unwrap_err();
-        assert!(capacity_error.to_string().contains("retention limit"));
+        for _ in 0..8 {
+            let new_args = json!({
+                "operation_id": Uuid::new_v4(),
+                "task": "must be rejected at capacity",
+                "model": "gpt-5.6-luna",
+                "effort": "max"
+            });
+            let capacity_error =
+                task_start_with_store_and_binary(&new_args, &owner, &store, &missing_binary)
+                    .await
+                    .unwrap_err();
+            assert!(capacity_error.to_string().contains("retention limit"));
+        }
+        assert_eq!(
+            std::fs::read_dir(store.runtime_lock_directory())
+                .unwrap()
+                .count(),
+            0
+        );
 
         let replay = task_start_with_store_and_binary(&args, &owner, &store, &missing_binary)
             .await
@@ -5213,6 +6006,7 @@ for raw in sys.stdin:
                 let _ = stopped.send(());
             }
         });
+        let runtime_lease = test_runtime_lease(root.path(), runtime_task_id);
         runtimes().lock().unwrap().insert(
             runtime_task_id,
             RuntimeHandle {
@@ -5223,6 +6017,7 @@ for raw in sys.stdin:
                 owner: SessionInstance::from_session(&owner),
                 scope: owner.cwd.clone(),
                 started_at: Instant::now(),
+                _lease: runtime_lease,
             },
         );
 
@@ -5295,7 +6090,7 @@ for raw in sys.stdin:
                     "interrupt",
                 )
                 .unwrap();
-            assert!(matches!(accepted, ControlAcceptance::Accepted(_)));
+            assert!(matches!(accepted, ControlAcceptance::Accepted(..)));
         }
         let persisted = store.load(&owner, task_id).unwrap();
         let (old_operation_id, old_fingerprint) = first_control.unwrap();
@@ -5385,6 +6180,103 @@ for raw in sys.stdin:
         assert_ne!(result["status"], "not_modified");
         remove_session(&owner).await.unwrap();
         session_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_get_defers_to_live_runtime_owner_and_resumes_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (approval_sender, _approval_receiver) = approvals::approval_channel();
+        let session_handle = approvals::spawn_runtime(
+            root.path(),
+            Some("runtime-owner-get"),
+            true,
+            approval_sender,
+        )
+        .await
+        .unwrap();
+        let owner = config::read_session_metadata("runtime-owner-get")
+            .await
+            .unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+            Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"),
+        );
+        store.save(&record).unwrap();
+        let lease = store.try_acquire_runtime_lease(task_id).unwrap().unwrap();
+
+        let missing_binary = root.path().join("must-not-start");
+        let deferred = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &owner,
+            &store,
+            &missing_binary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deferred["status"], "running");
+        assert_eq!(deferred["revision"], 7);
+        assert_eq!(deferred["reconciliation_deferred"], true);
+        assert_eq!(deferred["last_updated_at"], record.updated_at);
+        assert_eq!(store.load(&owner, task_id).unwrap(), record);
+
+        let not_modified = task_get_with_store_and_binary(
+            &json!({"task_id": task_id, "after_revision": 7}),
+            &owner,
+            &store,
+            &missing_binary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(not_modified["status"], "not_modified");
+        assert_eq!(not_modified["reconciliation_deferred"], true);
+        assert_eq!(store.load(&owner, task_id).unwrap(), record);
+
+        drop(lease);
+        let reconciled = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "ok"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reconciled["status"], "completed");
+        assert!(reconciled["revision"].as_u64().unwrap() > 7);
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+        session_handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawned_actor_holds_runtime_lease_until_child_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(root.path().join("tasks"));
+        let owner = session(root.path(), "actor-lease", true);
+        let task_id = Uuid::new_v4();
+        let lease = Arc::new(store.try_acquire_runtime_lease(task_id).unwrap().unwrap());
+        let lease_observer = Arc::downgrade(&lease);
+        let client = spawn_client_with_binary_unchecked(
+            owner,
+            Some(task_id),
+            &fake_app_server(root.path(), "ok"),
+            Some(Arc::clone(&lease)),
+        )
+        .unwrap();
+
+        drop(lease);
+        assert!(lease_observer.upgrade().is_some());
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_none());
+
+        client.shutdown().await;
+        assert!(lease_observer.upgrade().is_none());
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -5712,10 +6604,15 @@ for raw in sys.stdin:
         let session = session(root.path(), "fake", true);
         let binary = fake_app_server(root.path(), "ok");
         let task_id = Uuid::new_v4();
-        let (client, initialized) =
-            spawn_initialized_client_with_binary_mode(&session, Some(task_id), &binary, false)
-                .await
-                .unwrap();
+        let (client, initialized) = spawn_initialized_client_with_binary_mode(
+            &session,
+            Some(task_id),
+            &binary,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(initialized["platformOs"], "linux");
         let models = client
             .request("model/list", json!({"includeHidden":true}))
@@ -5779,10 +6676,11 @@ for raw in sys.stdin:
             .replace("__CLIENT_VERSION__", APP_SERVER_CLIENT_VERSION);
         std::fs::write(&incompatible, incompatible_script).unwrap();
         std::fs::set_permissions(&incompatible, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = spawn_initialized_client_with_binary_mode(&session, None, &incompatible, false)
-            .await
-            .err()
-            .unwrap();
+        let error =
+            spawn_initialized_client_with_binary_mode(&session, None, &incompatible, false, None)
+                .await
+                .err()
+                .unwrap();
         assert!(error.to_string().contains("CODEX_APP_SERVER_INCOMPATIBLE"));
 
         let oversized = root.path().join("fake-app-server-oversized");
@@ -5792,10 +6690,11 @@ for raw in sys.stdin:
         )
         .unwrap();
         std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = spawn_initialized_client_with_binary_mode(&session, None, &oversized, false)
-            .await
-            .err()
-            .unwrap();
+        let error =
+            spawn_initialized_client_with_binary_mode(&session, None, &oversized, false, None)
+                .await
+                .err()
+                .unwrap();
         assert!(error.to_string().contains("message exceeds"));
     }
 
