@@ -18,6 +18,7 @@ This file is the single tracking issue for live evidence that cannot be establis
 - `20260823-ingress-auth-provider-profiles.md`
 - `20260823-installed-runtime-migration.md`
 - `20260908-multi-host-federation.md`
+- [`20260910-opencode-delegation-backend.md`](../done/20260910-opencode-delegation-backend.md) (current provider entitlement evidence only; implementation scope is complete)
 
 The source issues are archived under `issues/done/` after this consolidation.
 
@@ -63,6 +64,10 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 - [ ] On a host with Vite+ `vp` installed, a rebuilt Temote normal (`yolo=false`) session completes representative `dev_tool_run` `vp check`, `vp test`, and `vp build` operations without whole-session yolo or broad HOME exposure; record the installed version, operation class, and non-secret result.
 - [ ] On a macOS host with a Vite+-managed Codex installation, a rebuilt Temote `local_agent_run(agent=codex)` completes after authorization with the verified bounded launcher dependency closure; record only non-secret launcher/runtime evidence and the result.
+
+### OpenCode provider entitlement
+
+- [ ] Re-run a bounded OpenCode 1.18.30 one-shot delegation when an already-configured listed model is entitled. On 2026-09-15 the discovered DeepSeek model required regional opt-in, listed paid models required a payment method, and the formerly free MiMo model was disabled. These are failed current live attempts; they do not reopen the completed adapter implementation scope.
 
 ## Evidence requirements
 
