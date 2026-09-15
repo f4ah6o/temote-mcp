@@ -21,7 +21,7 @@ use crate::{
 };
 use temote_mcp::activity::contract::{
     ActivityCancellationReason, ActivityErrorKind, ActivityOperation, ActivityRemote,
-    ActivitySummary,
+    ActivityResult, ActivitySummary,
 };
 use temote_mcp::activity::scope::ActivityScope;
 
@@ -54,6 +54,269 @@ pub(crate) const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the local session supervisor has no session for the required project, create one with session_start using a configured named-root path, then call session_info before normal tools. Existing tools require session_id except session_list and session_start.";
 const PROCESS_IDENTITY_META_KEY: &str = "io.temote/processIdentity";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityOwner {
+    McpCall,
+    JobWorker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivitySuccess {
+    Completed,
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivityToolCoverage {
+    name: &'static str,
+    operation: ActivityOperation,
+    owner: ActivityOwner,
+    success: ActivitySuccess,
+    fixture: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityNonDispatchOwner {
+    Supervisor,
+    Excluded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivityNonDispatchCoverage {
+    name: &'static str,
+    owner: ActivityNonDispatchOwner,
+    fixture: &'static str,
+}
+
+const ACTIVITY_NON_DISPATCH_COVERAGE: &[ActivityNonDispatchCoverage] = &[
+    ActivityNonDispatchCoverage {
+        name: "session_list",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_start",
+        owner: ActivityNonDispatchOwner::Supervisor,
+        fixture: "activity lifecycle",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_stop",
+        owner: ActivityNonDispatchOwner::Supervisor,
+        fixture: "activity lifecycle",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_restart",
+        owner: ActivityNonDispatchOwner::Supervisor,
+        fixture: "activity lifecycle",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_info",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
+];
+
+const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
+    activity_tool("read_file", ActivityOperation::ReadFile, "file read"),
+    activity_tool(
+        "evidence_read",
+        ActivityOperation::EvidenceRead,
+        "evidence read",
+    ),
+    activity_tool(
+        "codex_status",
+        ActivityOperation::CodexStatus,
+        "Codex status",
+    ),
+    activity_tool_accepted(
+        "codex_task_start",
+        ActivityOperation::CodexTaskStart,
+        "Codex start acceptance",
+    ),
+    activity_tool(
+        "codex_task_get",
+        ActivityOperation::CodexTaskGet,
+        "Codex get",
+    ),
+    activity_tool_accepted(
+        "codex_task_control",
+        ActivityOperation::CodexTaskControl,
+        "Codex control acceptance",
+    ),
+    activity_job_tool(
+        "local_agent_run",
+        ActivityOperation::LocalAgentRun,
+        "fake local agent worker",
+    ),
+    activity_job_tool(
+        "dev_tool_run",
+        ActivityOperation::DevToolRun,
+        "fake developer tool worker",
+    ),
+    activity_tool("get_image", ActivityOperation::GetImage, "image read"),
+    activity_tool(
+        "list_directory",
+        ActivityOperation::ListDirectory,
+        "directory listing",
+    ),
+    activity_tool("write_file", ActivityOperation::WriteFile, "file write"),
+    activity_tool("apply_patch", ActivityOperation::ApplyPatch, "patch apply"),
+    activity_tool("git_add", ActivityOperation::GitAdd, "Git local"),
+    activity_tool("git_commit", ActivityOperation::GitCommit, "Git local"),
+    activity_tool("git_fetch", ActivityOperation::GitFetch, "Git network"),
+    activity_tool("git_pull", ActivityOperation::GitPull, "Git network"),
+    activity_tool("git_push", ActivityOperation::GitPush, "Git network"),
+    activity_job_tool(
+        "execute",
+        ActivityOperation::Execute,
+        "sandbox command worker",
+    ),
+    activity_job_tool(
+        "start_command",
+        ActivityOperation::StartCommand,
+        "sandbox command worker",
+    ),
+    activity_tool("poll_job", ActivityOperation::PollJob, "job poll"),
+    activity_tool("job_list", ActivityOperation::JobList, "job list"),
+    activity_tool(
+        "checkpoint_save",
+        ActivityOperation::CheckpointSave,
+        "checkpoint save",
+    ),
+    activity_tool(
+        "checkpoint_load",
+        ActivityOperation::CheckpointLoad,
+        "checkpoint load",
+    ),
+    activity_tool(
+        "work_handoff",
+        ActivityOperation::WorkHandoff,
+        "work handoff",
+    ),
+    activity_tool(
+        "friction_summary",
+        ActivityOperation::FrictionSummary,
+        "friction summary",
+    ),
+    activity_tool(
+        "learning_candidate_list",
+        ActivityOperation::LearningCandidateList,
+        "learning candidates",
+    ),
+    activity_tool("recall", ActivityOperation::Recall, "learning recall"),
+    activity_tool(
+        "recall_feedback",
+        ActivityOperation::RecallFeedback,
+        "recall feedback",
+    ),
+    activity_tool(
+        "stop_job",
+        ActivityOperation::StopJob,
+        "job cancellation request",
+    ),
+    activity_tool(
+        "onepassword_mcp_discover",
+        ActivityOperation::OnePasswordMcpDiscover,
+        "1Password MCP discovery",
+    ),
+    activity_tool(
+        "onepassword_mcp_read_resource",
+        ActivityOperation::OnePasswordMcpReadResource,
+        "1Password MCP resource",
+    ),
+    activity_tool(
+        "onepassword_mcp_call",
+        ActivityOperation::OnePasswordMcpCall,
+        "1Password MCP outer call",
+    ),
+    activity_tool(
+        "onepassword_item_get",
+        ActivityOperation::OnePasswordItemGet,
+        "1Password item outer call",
+    ),
+    activity_tool(
+        "onepassword_secret_resolve",
+        ActivityOperation::OnePasswordSecretResolve,
+        "1Password SDK outer call",
+    ),
+    activity_tool(
+        "onepassword_service_account_status",
+        ActivityOperation::OnePasswordServiceAccountStatus,
+        "1Password service-account status",
+    ),
+    activity_tool(
+        "onepassword_service_account_run",
+        ActivityOperation::OnePasswordServiceAccountRun,
+        "1Password service-account outer call",
+    ),
+    activity_tool(
+        "kintone_mcp_status",
+        ActivityOperation::KintoneMcpStatus,
+        "kintone MCP status",
+    ),
+    activity_tool(
+        "kintone_mcp_discover",
+        ActivityOperation::KintoneMcpDiscover,
+        "kintone MCP discovery",
+    ),
+    activity_tool(
+        "kintone_mcp_call",
+        ActivityOperation::KintoneMcpCall,
+        "kintone MCP outer call",
+    ),
+    activity_tool(
+        "kintone_cli_status",
+        ActivityOperation::KintoneCliStatus,
+        "cli-kintone status",
+    ),
+    activity_tool(
+        "kintone_cli_run",
+        ActivityOperation::KintoneCliRun,
+        "cli-kintone outer call",
+    ),
+    activity_tool(
+        "without_sandbox",
+        ActivityOperation::WithoutSandbox,
+        "host command",
+    ),
+];
+
+const fn activity_tool(
+    name: &'static str,
+    operation: ActivityOperation,
+    fixture: &'static str,
+) -> ActivityToolCoverage {
+    ActivityToolCoverage {
+        name,
+        operation,
+        owner: ActivityOwner::McpCall,
+        success: ActivitySuccess::Completed,
+        fixture,
+    }
+}
+
+const fn activity_tool_accepted(
+    name: &'static str,
+    operation: ActivityOperation,
+    fixture: &'static str,
+) -> ActivityToolCoverage {
+    ActivityToolCoverage {
+        success: ActivitySuccess::Accepted,
+        ..activity_tool(name, operation, fixture)
+    }
+}
+
+const fn activity_job_tool(
+    name: &'static str,
+    operation: ActivityOperation,
+    fixture: &'static str,
+) -> ActivityToolCoverage {
+    ActivityToolCoverage {
+        owner: ActivityOwner::JobWorker,
+        ..activity_tool(name, operation, fixture)
+    }
+}
 
 #[derive(Clone)]
 enum CachedJobResult {
@@ -685,6 +948,7 @@ async fn call_tool_with_local_agent_executable(
         .unwrap_or_else(|| json!({}));
     reap_jobs();
     if name == "session_list" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Excluded);
         anyhow::ensure!(
             args.as_object().is_some_and(|object| object.is_empty()),
             "session_list takes no arguments"
@@ -692,6 +956,7 @@ async fn call_tool_with_local_agent_executable(
         return session_list(sessions).await;
     }
     if name == "session_start" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Supervisor);
         anyhow::ensure!(
             public,
             "session_start is available only from temote-mcp serve"
@@ -719,6 +984,7 @@ async fn call_tool_with_local_agent_executable(
         return text_result(serde_json::to_string_pretty(&info)?);
     }
     if name == "session_restart" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Supervisor);
         anyhow::ensure!(
             public,
             "session_restart is available only from temote-mcp serve"
@@ -740,6 +1006,7 @@ async fn call_tool_with_local_agent_executable(
         return text_result(serde_json::to_string_pretty(&info)?);
     }
     if name == "session_stop" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Supervisor);
         anyhow::ensure!(
             public,
             "session_stop is available only from temote-mcp serve"
@@ -768,6 +1035,7 @@ async fn call_tool_with_local_agent_executable(
     );
     let session_id = required_session_id(&args)?;
     if name == "session_info" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Excluded);
         let view = crate::session_control::inspect_session(&session_id).await?;
         if matches!(view.status.as_str(), "starting" | "active" | "stopping") {
             approvals::activity(&view.session_id, "Read session info", None).await;
@@ -779,485 +1047,519 @@ async fn call_tool_with_local_agent_executable(
         !public || !session.yolo(),
         "yolo sessions are unavailable on the public MCP endpoint"
     );
-    match name {
-        "get_image" => {
-            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
-            let result = get_image(&path).await;
-            report_result(
-                &session.id,
-                format!("Read image {}", display_path(&path, &session.cwd)),
-                &result,
-            )
-            .await;
-            result
-        }
-        "read_file" => {
-            let activity = file_activity_scope(&session, ActivityOperation::ReadFile);
-            let result = read_file_tool(&args, &session).await;
-            finish_tool_activity(activity.as_ref(), &result);
-            result
-        }
-        "evidence_read" => evidence_read_tool(&args, &session),
-        "codex_status" => {
-            let (detail, metadata) = codex_status_approval();
-            authorize_codex_operation(&session, "codex_status", detail, metadata).await?;
-            text_result(serde_json::to_string_pretty(
-                &codex_app_server::status(&session).await?,
-            )?)
-        }
-        "codex_task_start" => {
-            let (detail, metadata) = codex_task_start_approval(&args);
-            authorize_codex_operation(&session, "codex_task_start", detail, metadata).await?;
-            text_result(serde_json::to_string_pretty(
-                &codex_app_server::task_start(&args, &session).await?,
-            )?)
-        }
-        "codex_task_get" => text_result(serde_json::to_string_pretty(
-            &codex_app_server::task_get(&args, &session).await?,
-        )?),
-        "codex_task_control" => {
-            let (detail, metadata) = codex_task_control_approval(&args);
-            authorize_codex_operation(&session, "codex_task_control", detail, metadata).await?;
-            text_result(serde_json::to_string_pretty(
-                &codex_app_server::task_control(&args, &session).await?,
-            )?)
-        }
-        "local_agent_run" => {
-            let activity = file_activity_scope(&session, ActivityOperation::LocalAgentRun);
-            let result =
-                local_agent_run(&args, &session, local_agent_executable, activity.clone()).await;
-            finish_tool_activity_on_error(activity.as_ref(), &result);
-            result
-        }
-        "dev_tool_run" => {
-            let activity = file_activity_scope(&session, ActivityOperation::DevToolRun);
-            let result = dev_tool_run(&args, &session, activity.clone()).await;
-            finish_tool_activity_on_error(activity.as_ref(), &result);
-            result
-        }
-        "list_directory" => {
-            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
-            let result = list_directory(&path).await;
-            report_result(
-                &session.id,
-                format!("Listed {}", display_path(&path, &session.cwd)),
-                &result,
-            )
-            .await;
-            text_result(result?)
-        }
-        "write_file" => {
-            let activity = file_activity_scope(&session, ActivityOperation::WriteFile);
-            let result = write_file(&args, &session, activity.as_ref()).await;
-            finish_tool_activity(activity.as_ref(), &result);
-            result
-        }
-        "apply_patch" => {
-            let request = apply_patch::parse_request(&args)?;
-            let outcome = apply_patch::apply(&session, request).await?;
-            text_result(serde_json::to_string_pretty(&outcome)?)
-        }
-        name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push") => {
-            let operation = git_activity_operation(name).expect("matched Git activity operation");
-            let activity = git_activity_scope(&session, &args, operation);
-            let result = match operation {
-                ActivityOperation::GitAdd => git_add(&args, &session, activity.as_ref()).await,
-                ActivityOperation::GitCommit => {
-                    git_commit(&args, &session, activity.as_ref()).await
-                }
-                ActivityOperation::GitFetch => git_fetch(&args, &session, activity.as_ref()).await,
-                ActivityOperation::GitPull => git_pull(&args, &session, activity.as_ref()).await,
-                ActivityOperation::GitPush => git_push(&args, &session, activity.as_ref()).await,
-                _ => unreachable!("Git operation mapping returned a non-Git variant"),
-            };
-            finish_tool_activity(activity.as_ref(), &result);
-            result
-        }
-        "execute" => {
-            let activity = file_activity_scope(&session, ActivityOperation::Execute);
-            let result = execute(&args, &session, activity.clone()).await;
-            finish_tool_activity_on_error(activity.as_ref(), &result);
-            result
-        }
-        "start_command" => {
-            let activity = file_activity_scope(&session, ActivityOperation::StartCommand);
-            let result = start_command(&args, &session, activity.clone()).await;
-            finish_tool_activity_on_error(activity.as_ref(), &result);
-            result
-        }
-        "poll_job" => poll_job(&args, &session).await,
-        "job_list" => job_list(&args, &session),
-        "checkpoint_save" => {
-            let request = checkpoints::parse_save_request(&args)?;
-            anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
-            let approval_detail = checkpoints::approval_detail(&request.checkpoint);
-            let approved = approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::LocalStructured,
-                "checkpoint_save",
-                approval_detail,
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?;
-            let store = checkpoints::Store::default_store()?;
-            let (saved, activity_detail) =
-                save_checkpoint_after_approval(&session, request, &store, approved)?;
-            approvals::activity(
-                &session.id,
-                "Saved client-reported checkpoint",
-                Some(activity_detail),
-            )
-            .await;
-            text_result(serde_json::to_string_pretty(&saved)?)
-        }
-        "checkpoint_load" => {
-            let request = checkpoints::parse_load_request(&args)?;
-            anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
-            let loaded = checkpoints::load(&session, request.checkpoint_id)?;
-            approvals::activity(&session.id, "Loaded client-reported checkpoint", None).await;
-            text_result(serde_json::to_string_pretty(&loaded)?)
-        }
-        "work_handoff" => {
-            let request = work_handoff::parse_request(&args)?;
-            text_result(work_handoff::render(&session, request)?)
-        }
-        "friction_summary" => {
-            let store = friction::Store::default_store()?;
-            let summary = store.summary(&session)?;
-            text_result(serde_json::to_string_pretty(&summary)?)
-        }
-        "learning_candidate_list" => {
-            let store = friction::Store::default_store()?;
-            let candidates = store.candidates(&session)?;
-            text_result(serde_json::to_string_pretty(&candidates)?)
-        }
-        "recall" => {
-            let query = args
-                .get("query")
-                .and_then(Value::as_str)
-                .context("missing query")?;
-            let knowledge_root = args.get("knowledge_root").and_then(Value::as_str);
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
-            let response = recall::search(&session, query, knowledge_root, limit)?;
-            text_result(serde_json::to_string_pretty(&response)?)
-        }
-        "recall_feedback" => {
-            anyhow::ensure!(
-                args.get("outcome").and_then(Value::as_str) == Some("no_hit"),
-                "recall_feedback outcome must be no_hit"
-            );
-            let retry_group = args
-                .get("retry_group")
-                .and_then(Value::as_str)
-                .map(Uuid::parse_str)
-                .transpose()
-                .context("retry_group must be a UUID")?;
-            let approved = approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::LocalStructured,
-                "recall_feedback",
-                "signal: no_hit; query/content: not persisted".to_owned(),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?;
-            anyhow::ensure!(approved, "user denied recall feedback persistence");
-            let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
-            text_result(serde_json::to_string_pretty(&event)?)
-        }
-        "stop_job" => {
-            let activity = file_activity_scope(&session, ActivityOperation::StopJob);
-            let result = stop_job_with_activity(&args, &session, activity.as_ref()).await;
-            finish_tool_activity(activity.as_ref(), &result);
-            result
-        }
-        "onepassword_mcp_discover" => {
-            let result = onepassword_mcp::discover(&session).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "onepassword_mcp_read_resource" => {
-            let uri = args
-                .get("uri")
-                .and_then(Value::as_str)
-                .context("missing uri")?;
-            let result = onepassword_mcp::read_resource(&session, uri).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "onepassword_mcp_call" => {
-            let tool_name = args
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .context("missing tool_name")?;
-            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            onepassword_mcp::call_tool(&session, tool_name, arguments).await
-        }
-        "onepassword_item_get" => {
-            let items = required_string_array(&args, "items")?;
-            let vault = args
-                .get("vault")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("vault must be a string")
-                })
-                .transpose()?;
-            let account = args
-                .get("account")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("account must be a string")
-                })
-                .transpose()?;
-            let request = onepassword_cli::ItemGetRequest::new(items, vault, account)?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "onepassword_item_get",
-                request.approval_summary(),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied 1Password item read")
+    let coverage = activity_tool_coverage(name);
+    let activity = coverage.and_then(|coverage| {
+        tool_activity_scope(
+            &session,
+            coverage.operation,
+            activity_tool_summary(&args, coverage.operation),
+        )
+    });
+    let result = async {
+        match name {
+            "get_image" => {
+                let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
+                let result = get_image(&path).await;
+                report_result(
+                    &session.id,
+                    format!("Read image {}", display_path(&path, &session.cwd)),
+                    &result,
+                )
+                .await;
+                result
             }
-            match onepassword_cli::item_get_coalesced(&session, &request).await {
-                Ok(items) => {
-                    approvals::activity(
-                        &session.id,
-                        format!("Read {} 1Password item(s)", items.len()),
-                        None,
-                    )
-                    .await;
-                    text_result(serde_json::to_string_pretty(&items)?)
+            "read_file" => read_file_tool(&args, &session).await,
+            "evidence_read" => evidence_read_tool(&args, &session),
+            "codex_status" => {
+                let (detail, metadata) = codex_status_approval();
+                authorize_codex_operation(
+                    &session,
+                    "codex_status",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &codex_app_server::status(&session).await?,
+                )?)
+            }
+            "codex_task_start" => {
+                let (detail, metadata) = codex_task_start_approval(&args);
+                authorize_codex_operation(
+                    &session,
+                    "codex_task_start",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &codex_app_server::task_start(&args, &session).await?,
+                )?)
+            }
+            "codex_task_get" => text_result(serde_json::to_string_pretty(
+                &codex_app_server::task_get(&args, &session).await?,
+            )?),
+            "codex_task_control" => {
+                let (detail, metadata) = codex_task_control_approval(&args);
+                authorize_codex_operation(
+                    &session,
+                    "codex_task_control",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &codex_app_server::task_control(&args, &session).await?,
+                )?)
+            }
+            "local_agent_run" => {
+                local_agent_run(&args, &session, local_agent_executable, activity.clone()).await
+            }
+            "dev_tool_run" => dev_tool_run(&args, &session, activity.clone()).await,
+            "list_directory" => {
+                let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
+                let result = list_directory(&path).await;
+                report_result(
+                    &session.id,
+                    format!("Listed {}", display_path(&path, &session.cwd)),
+                    &result,
+                )
+                .await;
+                text_result(result?)
+            }
+            "write_file" => write_file(&args, &session, activity.as_ref()).await,
+            "apply_patch" => {
+                let request = apply_patch::parse_request(&args)?;
+                let outcome =
+                    apply_patch::apply_with_activity(&session, request, activity.as_ref()).await?;
+                if outcome.status == "partial_failure"
+                    && let Some(activity) = activity.as_ref()
+                {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::OperationFailed,
+                    ));
                 }
-                Err(error) => {
-                    approvals::activity(&session.id, "1Password item read failed", None).await;
-                    Err(error)
+                text_result(serde_json::to_string_pretty(&outcome)?)
+            }
+            name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push") => {
+                let operation =
+                    git_activity_operation(name).expect("matched Git activity operation");
+                match operation {
+                    ActivityOperation::GitAdd => git_add(&args, &session, activity.as_ref()).await,
+                    ActivityOperation::GitCommit => {
+                        git_commit(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitFetch => {
+                        git_fetch(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitPull => {
+                        git_pull(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitPush => {
+                        git_push(&args, &session, activity.as_ref()).await
+                    }
+                    _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
             }
-        }
-        "onepassword_secret_resolve" => {
-            let account = args
-                .get("account")
-                .and_then(Value::as_str)
-                .context("missing account")?
-                .to_owned();
-            let references = required_string_array(&args, "references")?;
-            let request = onepassword_sdk::ResolveRequest::new(account, references)?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "onepassword_secret_resolve",
-                request.approval_summary(),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied 1Password secret resolution")
+            "execute" => execute(&args, &session, activity.clone()).await,
+            "start_command" => start_command(&args, &session, activity.clone()).await,
+            "poll_job" => poll_job(&args, &session).await,
+            "job_list" => job_list(&args, &session),
+            "checkpoint_save" => {
+                let request = checkpoints::parse_save_request(&args)?;
+                anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+                let approval_detail = checkpoints::approval_detail(&request.checkpoint);
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::LocalStructured,
+                        operation: "checkpoint_save",
+                        detail: approval_detail,
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied checkpoint save",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let store = checkpoints::Store::default_store()?;
+                let (saved, activity_detail) =
+                    save_checkpoint_after_approval(&session, request, &store, true)?;
+                approvals::activity(
+                    &session.id,
+                    "Saved client-reported checkpoint",
+                    Some(activity_detail),
+                )
+                .await;
+                text_result(serde_json::to_string_pretty(&saved)?)
             }
-            match onepassword_sdk::resolve(&session, &request).await {
-                Ok(values) => {
-                    approvals::activity(
-                        &session.id,
-                        format!("Resolved {} 1Password secret(s)", values.len()),
-                        None,
-                    )
-                    .await;
-                    text_result(serde_json::to_string_pretty(&values)?)
-                }
-                Err(error) => {
-                    approvals::activity(&session.id, "1Password secret resolution failed", None)
+            "checkpoint_load" => {
+                let request = checkpoints::parse_load_request(&args)?;
+                anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+                let loaded = checkpoints::load(&session, request.checkpoint_id)?;
+                approvals::activity(&session.id, "Loaded client-reported checkpoint", None).await;
+                text_result(serde_json::to_string_pretty(&loaded)?)
+            }
+            "work_handoff" => {
+                let request = work_handoff::parse_request(&args)?;
+                text_result(work_handoff::render(&session, request)?)
+            }
+            "friction_summary" => {
+                let store = friction::Store::default_store()?;
+                let summary = store.summary(&session)?;
+                text_result(serde_json::to_string_pretty(&summary)?)
+            }
+            "learning_candidate_list" => {
+                let store = friction::Store::default_store()?;
+                let candidates = store.candidates(&session)?;
+                text_result(serde_json::to_string_pretty(&candidates)?)
+            }
+            "recall" => {
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .context("missing query")?;
+                let knowledge_root = args.get("knowledge_root").and_then(Value::as_str);
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
+                let response = recall::search(&session, query, knowledge_root, limit)?;
+                text_result(serde_json::to_string_pretty(&response)?)
+            }
+            "recall_feedback" => {
+                anyhow::ensure!(
+                    args.get("outcome").and_then(Value::as_str) == Some("no_hit"),
+                    "recall_feedback outcome must be no_hit"
+                );
+                let retry_group = args
+                    .get("retry_group")
+                    .and_then(Value::as_str)
+                    .map(Uuid::parse_str)
+                    .transpose()
+                    .context("retry_group must be a UUID")?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::LocalStructured,
+                        operation: "recall_feedback",
+                        detail: "signal: no_hit; query/content: not persisted".to_owned(),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied recall feedback persistence",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
+                text_result(serde_json::to_string_pretty(&event)?)
+            }
+            "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
+            "onepassword_mcp_discover" => {
+                let result = onepassword_mcp::discover(&session).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "onepassword_mcp_read_resource" => {
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .context("missing uri")?;
+                let result = onepassword_mcp::read_resource(&session, uri).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "onepassword_mcp_call" => {
+                let tool_name = args
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .context("missing tool_name")?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                onepassword_mcp::call_tool_with_activity(
+                    &session,
+                    tool_name,
+                    arguments,
+                    activity.as_ref(),
+                )
+                .await
+            }
+            "onepassword_item_get" => {
+                let items = required_string_array(&args, "items")?;
+                let vault = args
+                    .get("vault")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("vault must be a string")
+                    })
+                    .transpose()?;
+                let account = args
+                    .get("account")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("account must be a string")
+                    })
+                    .transpose()?;
+                let request = onepassword_cli::ItemGetRequest::new(items, vault, account)?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "onepassword_item_get",
+                        detail: request.approval_summary(),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied 1Password item read",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                match onepassword_cli::item_get_coalesced(&session, &request).await {
+                    Ok(items) => {
+                        approvals::activity(
+                            &session.id,
+                            format!("Read {} 1Password item(s)", items.len()),
+                            None,
+                        )
                         .await;
-                    Err(error)
+                        text_result(serde_json::to_string_pretty(&items)?)
+                    }
+                    Err(error) => {
+                        approvals::activity(&session.id, "1Password item read failed", None).await;
+                        Err(error)
+                    }
                 }
             }
-        }
-        "onepassword_service_account_status" => {
-            let result = approvals::onepassword_service_account_status(&session.id).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "onepassword_service_account_run" => {
-            let command = required_command(&args)?;
-            let cwd = cwd(&args, &session)?;
-            let env_files = args
-                .get("env_files")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| {
-                            let value =
-                                item.as_str().context("env_files entries must be strings")?;
-                            bounded_path(value, "env_files entry")
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let environment = args
-                .get("environment")
-                .map(|value| {
-                    value
-                        .as_object()
-                        .context("environment must be an object")?
-                        .iter()
-                        .map(|(name, value)| {
-                            value
-                                .as_str()
-                                .map(|value| (name.clone(), value.to_owned()))
-                                .context("environment values must be strings")
-                        })
-                        .collect::<Result<std::collections::BTreeMap<_, _>>>()
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let allowed_locators = args
-                .get("allowed_locators")
-                .map(|_| required_string_array(&args, "allowed_locators"))
-                .transpose()?
-                .unwrap_or_default();
-            approvals::validate_service_account_run_input(
-                &command,
-                &env_files,
-                &environment,
-                &allowed_locators,
-            )?;
-            let detail = service_account_approval_detail(
-                &command,
-                &env_files,
-                &environment,
-                &allowed_locators,
-            )?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "onepassword_service_account_run",
-                detail,
-                cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied 1Password service-account command")
+            "onepassword_secret_resolve" => {
+                let account = args
+                    .get("account")
+                    .and_then(Value::as_str)
+                    .context("missing account")?
+                    .to_owned();
+                let references = required_string_array(&args, "references")?;
+                let request = onepassword_sdk::ResolveRequest::new(account, references)?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "onepassword_secret_resolve",
+                        detail: request.approval_summary(),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied 1Password secret resolution",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                match onepassword_sdk::resolve(&session, &request).await {
+                    Ok(values) => {
+                        approvals::activity(
+                            &session.id,
+                            format!("Resolved {} 1Password secret(s)", values.len()),
+                            None,
+                        )
+                        .await;
+                        text_result(serde_json::to_string_pretty(&values)?)
+                    }
+                    Err(error) => {
+                        approvals::activity(
+                            &session.id,
+                            "1Password secret resolution failed",
+                            None,
+                        )
+                        .await;
+                        Err(error)
+                    }
+                }
             }
-            let result = approvals::onepassword_service_account_run(
-                &session.id,
-                cwd,
-                command,
-                env_files,
-                environment,
-                allowed_locators,
-            )
-            .await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_mcp_status" => {
-            let result = approvals::kintone_mcp_status(&session.id).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_mcp_discover" => {
-            let result = approvals::kintone_mcp_discover(&session.id).await?;
-            approvals::activity(&session.id, "Discovered kintone MCP capabilities", None).await;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_mcp_call" => {
-            let tool_name = args
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .context("missing tool_name")?;
-            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            validate_child_tool_call(tool_name, &arguments)
-                .context("invalid kintone MCP tool call")?;
-            let listed = approvals::kintone_mcp_discover(&session.id).await?;
-            let known = listed["tools"].as_array().is_some_and(|tools| {
-                tools
+            "onepassword_service_account_status" => {
+                let result = approvals::onepassword_service_account_status(&session.id).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "onepassword_service_account_run" => {
+                let command = required_command(&args)?;
+                let cwd = cwd(&args, &session)?;
+                let env_files = args
+                    .get("env_files")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| {
+                                let value =
+                                    item.as_str().context("env_files entries must be strings")?;
+                                bounded_path(value, "env_files entry")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let environment = args
+                    .get("environment")
+                    .map(|value| {
+                        value
+                            .as_object()
+                            .context("environment must be an object")?
+                            .iter()
+                            .map(|(name, value)| {
+                                value
+                                    .as_str()
+                                    .map(|value| (name.clone(), value.to_owned()))
+                                    .context("environment values must be strings")
+                            })
+                            .collect::<Result<std::collections::BTreeMap<_, _>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let allowed_locators = args
+                    .get("allowed_locators")
+                    .map(|_| required_string_array(&args, "allowed_locators"))
+                    .transpose()?
+                    .unwrap_or_default();
+                approvals::validate_service_account_run_input(
+                    &command,
+                    &env_files,
+                    &environment,
+                    &allowed_locators,
+                )?;
+                let detail = service_account_approval_detail(
+                    &command,
+                    &env_files,
+                    &environment,
+                    &allowed_locators,
+                )?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "onepassword_service_account_run",
+                        detail,
+                        cwd: cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied 1Password service-account command",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let result = approvals::onepassword_service_account_run(
+                    &session.id,
+                    cwd,
+                    command,
+                    env_files,
+                    environment,
+                    allowed_locators,
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_mcp_status" => {
+                let result = approvals::kintone_mcp_status(&session.id).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_mcp_discover" => {
+                let result = approvals::kintone_mcp_discover(&session.id).await?;
+                approvals::activity(&session.id, "Discovered kintone MCP capabilities", None).await;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_mcp_call" => {
+                let tool_name = args
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .context("missing tool_name")?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                validate_child_tool_call(tool_name, &arguments)
+                    .context("invalid kintone MCP tool call")?;
+                let listed = approvals::kintone_mcp_discover(&session.id).await?;
+                let known = listed["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["name"].as_str() == Some(tool_name))
+                });
+                anyhow::ensure!(known, "unknown kintone MCP tool: {tool_name}");
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "kintone_mcp_call",
+                        detail: safe_child_call_summary(tool_name, &arguments),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied kintone MCP tool call",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let result = approvals::kintone_mcp_call(&session.id, tool_name, arguments).await?;
+                approvals::activity(
+                    &session.id,
+                    format!("Called kintone MCP tool {tool_name}"),
+                    None,
+                )
+                .await;
+                Ok(result)
+            }
+            "kintone_cli_status" => {
+                let result = approvals::kintone_cli_status(&session.id).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_cli_run" => {
+                let arguments = args
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .context("missing arguments")?
                     .iter()
-                    .any(|tool| tool["name"].as_str() == Some(tool_name))
-            });
-            anyhow::ensure!(known, "unknown kintone MCP tool: {tool_name}");
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "kintone_mcp_call",
-                safe_child_call_summary(tool_name, &arguments),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied kintone MCP tool call")
+                    .map(|argument| {
+                        argument
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("arguments entries must be strings")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    arguments.len() >= 2,
+                    "kintone_cli_run requires a cli-kintone command pair"
+                );
+                validate_command_budget(&arguments)?;
+                let cwd = cwd(&args, &session)?;
+                let stdout_path = args
+                    .get("stdout_path")
+                    .map(|value| {
+                        let value = value.as_str().context("stdout_path must be a string")?;
+                        bounded_path(value, "stdout_path")
+                    })
+                    .transpose()?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "kintone_cli_run",
+                        detail: safe_kintone_cli_summary(&arguments, stdout_path.as_deref()),
+                        cwd: cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied cli-kintone command",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let result =
+                    approvals::kintone_cli_run(&session.id, cwd, arguments.clone(), stdout_path)
+                        .await?;
+                approvals::activity(
+                    &session.id,
+                    format!("Ran cli-kintone {} {}", arguments[0], arguments[1]),
+                    None,
+                )
+                .await;
+                text_result(serde_json::to_string_pretty(&result)?)
             }
-            let result = approvals::kintone_mcp_call(&session.id, tool_name, arguments).await?;
-            approvals::activity(
-                &session.id,
-                format!("Called kintone MCP tool {tool_name}"),
-                None,
-            )
-            .await;
-            Ok(result)
+            "without_sandbox" => without_sandbox(&args, &session, activity.as_ref()).await,
+            _ => anyhow::bail!("unknown tool: {name}"),
         }
-        "kintone_cli_status" => {
-            let result = approvals::kintone_cli_status(&session.id).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_cli_run" => {
-            let arguments = args
-                .get("arguments")
-                .and_then(Value::as_array)
-                .context("missing arguments")?
-                .iter()
-                .map(|argument| {
-                    argument
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("arguments entries must be strings")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            anyhow::ensure!(
-                arguments.len() >= 2,
-                "kintone_cli_run requires a cli-kintone command pair"
-            );
-            validate_command_budget(&arguments)?;
-            let cwd = cwd(&args, &session)?;
-            let stdout_path = args
-                .get("stdout_path")
-                .map(|value| {
-                    let value = value.as_str().context("stdout_path must be a string")?;
-                    bounded_path(value, "stdout_path")
-                })
-                .transpose()?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "kintone_cli_run",
-                safe_kintone_cli_summary(&arguments, stdout_path.as_deref()),
-                cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied cli-kintone command")
-            }
-            let result =
-                approvals::kintone_cli_run(&session.id, cwd, arguments.clone(), stdout_path)
-                    .await?;
-            approvals::activity(
-                &session.id,
-                format!("Ran cli-kintone {} {}", arguments[0], arguments[1]),
-                None,
-            )
-            .await;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "without_sandbox" => without_sandbox(&args, &session).await,
-        _ => anyhow::bail!("unknown tool: {name}"),
     }
+    .await;
+    finish_covered_tool_activity(coverage, activity.as_ref(), &result);
+    result
 }
 
 async fn session_list(sessions: Option<&SessionBackend>) -> Result<Value> {
@@ -1338,18 +1640,81 @@ async fn authorize_codex_operation(
     action: &str,
     detail: String,
     metadata: BTreeMap<String, String>,
+    activity: Option<&ActivityScope>,
 ) -> Result<()> {
-    let approved = approvals::ensure_local_approval(
+    let approved = approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::CodexAppServer,
         action,
         detail,
         session.cwd.clone(),
         metadata,
+        activity,
     )
     .await?;
-    anyhow::ensure!(approved, "user denied Codex operation");
+    finish_activity_approval(approved, activity, "user denied Codex operation")?;
     Ok(())
+}
+
+fn finish_activity_approval(
+    approved: bool,
+    activity: Option<&ActivityScope>,
+    denial: &'static str,
+) -> Result<()> {
+    if !approved {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+        anyhow::bail!(denial);
+    }
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    Ok(())
+}
+
+struct ActivityApprovalRequest<'a> {
+    class: approvals::ApprovalClass,
+    operation: &'a str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+    denial: &'static str,
+}
+
+async fn request_activity_approval(
+    session: &config::Session,
+    request: ActivityApprovalRequest<'_>,
+    activity: Option<&ActivityScope>,
+) -> Result<()> {
+    let ActivityApprovalRequest {
+        class,
+        operation,
+        detail,
+        cwd,
+        metadata,
+        denial,
+    } = request;
+    let approved = match activity {
+        Some(activity) => {
+            approvals::ensure_local_approval_with_activity(
+                session,
+                class,
+                operation,
+                detail,
+                cwd,
+                metadata,
+                Some(activity),
+            )
+            .await?
+        }
+        None => {
+            approvals::ensure_local_approval(session, class, operation, detail, cwd, metadata)
+                .await?
+        }
+    };
+    finish_activity_approval(approved, activity, denial)
 }
 
 fn codex_status_approval() -> (String, BTreeMap<String, String>) {
@@ -1445,19 +1810,23 @@ fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
 }
 
-fn file_activity_scope(
-    session: &config::Session,
-    operation: ActivityOperation,
-) -> Option<ActivityScope> {
-    tool_activity_scope(session, operation, ActivitySummary::empty())
+fn activity_tool_coverage(name: &str) -> Option<&'static ActivityToolCoverage> {
+    ACTIVITY_TOOL_COVERAGE
+        .iter()
+        .find(|coverage| coverage.name == name)
 }
 
-fn git_activity_scope(
-    session: &config::Session,
-    args: &Value,
-    operation: ActivityOperation,
-) -> Option<ActivityScope> {
-    tool_activity_scope(session, operation, git_activity_summary(args, operation))
+fn assert_non_dispatch_activity_owner(name: &str, owner: ActivityNonDispatchOwner) {
+    let coverage = ACTIVITY_NON_DISPATCH_COVERAGE
+        .iter()
+        .find(|coverage| coverage.name == name)
+        .expect("known non-dispatch tool must have activity coverage");
+    assert_eq!(coverage.owner, owner);
+    assert!(!coverage.fixture.is_empty());
+}
+
+fn activity_tool_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
+    git_activity_summary(args, operation)
 }
 
 fn git_activity_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
@@ -1495,6 +1864,7 @@ fn tool_activity_scope(
         .map(|emitter| ActivityScope::with_summary(operation, summary, emitter))
 }
 
+#[cfg(test)]
 fn finish_tool_activity(activity: Option<&ActivityScope>, result: &Result<Value>) {
     let Some(activity) = activity else {
         return;
@@ -1513,6 +1883,29 @@ fn finish_tool_activity_on_error(activity: Option<&ActivityScope>, result: &Resu
         let _ = activity
             .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed));
     }
+}
+
+fn finish_covered_tool_activity(
+    coverage: Option<&ActivityToolCoverage>,
+    activity: Option<&ActivityScope>,
+    result: &Result<Value>,
+) {
+    let (Some(coverage), Some(activity)) = (coverage, activity) else {
+        return;
+    };
+    if result.is_err() {
+        finish_tool_activity_on_error(Some(activity), result);
+        return;
+    }
+    if coverage.owner == ActivityOwner::JobWorker {
+        return;
+    }
+    let _ = match coverage.success {
+        ActivitySuccess::Completed => activity.complete(),
+        ActivitySuccess::Accepted => {
+            activity.complete_with_summary(ActivitySummary::result(ActivityResult::Accepted))
+        }
+    };
 }
 
 async fn read_file_tool(args: &Value, session: &config::Session) -> Result<Value> {
@@ -3298,21 +3691,26 @@ fn validate_command_budget(command: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
+async fn without_sandbox(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
-    if !approvals::ensure_local_approval(
+    request_activity_approval(
         session,
-        approvals::ApprovalClass::HostUnrestricted,
-        "without_sandbox",
-        format!("argv: {command:?}"),
-        cwd.clone(),
-        BTreeMap::new(),
+        ActivityApprovalRequest {
+            class: approvals::ApprovalClass::HostUnrestricted,
+            operation: "without_sandbox",
+            detail: format!("argv: {command:?}"),
+            cwd: cwd.clone(),
+            metadata: BTreeMap::new(),
+            denial: "user denied without_sandbox",
+        },
+        activity,
     )
-    .await?
-    {
-        anyhow::bail!("user denied without_sandbox")
-    }
+    .await?;
     run_and_report(session.id.clone(), command, cwd, true, &[]).await
 }
 
@@ -3632,6 +4030,243 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn activity_coverage_classifies_every_advertised_session_tool_once() {
+        let advertised_tools = tools(false, true);
+        let advertised = advertised_tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let covered = ACTIVITY_TOOL_COVERAGE
+            .iter()
+            .map(|coverage| coverage.name)
+            .chain(
+                ACTIVITY_NON_DISPATCH_COVERAGE
+                    .iter()
+                    .map(|coverage| coverage.name),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            ACTIVITY_TOOL_COVERAGE.len() + ACTIVITY_NON_DISPATCH_COVERAGE.len(),
+            covered.len()
+        );
+        assert_eq!(advertised, covered);
+        assert!(
+            ACTIVITY_TOOL_COVERAGE
+                .iter()
+                .all(|coverage| !coverage.fixture.is_empty())
+        );
+        assert!(
+            ACTIVITY_NON_DISPATCH_COVERAGE
+                .iter()
+                .all(|coverage| !coverage.fixture.is_empty())
+        );
+        assert_eq!(
+            ACTIVITY_NON_DISPATCH_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.owner == ActivityNonDispatchOwner::Supervisor)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["session_restart", "session_start", "session_stop"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            ACTIVITY_NON_DISPATCH_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.owner == ActivityNonDispatchOwner::Excluded)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["session_info", "session_list"].into_iter().collect()
+        );
+        assert_eq!(
+            ACTIVITY_TOOL_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.owner == ActivityOwner::JobWorker)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "dev_tool_run",
+                "execute",
+                "local_agent_run",
+                "start_command",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            ACTIVITY_TOOL_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.success == ActivitySuccess::Accepted)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["codex_task_control", "codex_task_start"]
+                .into_iter()
+                .collect()
+        );
+
+        for coverage in ACTIVITY_TOOL_COVERAGE {
+            let (scope, emitter) = activity_job_scope(coverage.operation);
+            finish_covered_tool_activity(
+                Some(coverage),
+                Some(&scope),
+                &text_result("fixture result".to_owned()),
+            );
+            let updates = emitter.updates();
+            assert!(
+                updates
+                    .iter()
+                    .all(|update| update.operation() == coverage.operation),
+                "operation mismatch for {}",
+                coverage.name
+            );
+            match coverage.owner {
+                ActivityOwner::McpCall => {
+                    assert_eq!(
+                        updates
+                            .iter()
+                            .map(ActivityUpdate::state)
+                            .collect::<Vec<_>>(),
+                        vec![ActivityState::Started, ActivityState::Completed],
+                        "terminal mismatch for {}",
+                        coverage.name
+                    );
+                    let expected = match coverage.success {
+                        ActivitySuccess::Completed => ActivitySummary::empty(),
+                        ActivitySuccess::Accepted => {
+                            ActivitySummary::result(ActivityResult::Accepted)
+                        }
+                    };
+                    assert_eq!(updates.last().unwrap().summary(), &expected);
+                }
+                ActivityOwner::JobWorker => assert_eq!(
+                    updates
+                        .iter()
+                        .map(ActivityUpdate::state)
+                        .collect::<Vec<_>>(),
+                    vec![ActivityState::Started],
+                    "dispatcher finalized worker-owned {}",
+                    coverage.name
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn activity_coverage_finalizes_call_worker_accepted_and_failure_paths() {
+        let (completed_scope, completed_emitter) =
+            activity_job_scope(ActivityOperation::EvidenceRead);
+        finish_covered_tool_activity(
+            activity_tool_coverage("evidence_read"),
+            Some(&completed_scope),
+            &text_result("ok".to_owned()),
+        );
+        assert_eq!(
+            completed_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Completed]
+        );
+
+        let (accepted_scope, accepted_emitter) =
+            activity_job_scope(ActivityOperation::CodexTaskStart);
+        finish_covered_tool_activity(
+            activity_tool_coverage("codex_task_start"),
+            Some(&accepted_scope),
+            &text_result("accepted".to_owned()),
+        );
+        let accepted = accepted_emitter.updates();
+        assert_eq!(
+            accepted
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![ActivityState::Started, ActivityState::Completed]
+        );
+        assert_eq!(
+            accepted.last().unwrap().summary(),
+            &ActivitySummary::result(ActivityResult::Accepted)
+        );
+
+        let (worker_scope, worker_emitter) = activity_job_scope(ActivityOperation::Execute);
+        finish_covered_tool_activity(
+            activity_tool_coverage("execute"),
+            Some(&worker_scope),
+            &text_result("backgrounded".to_owned()),
+        );
+        assert_eq!(worker_emitter.states(), vec![ActivityState::Started]);
+
+        let (failure_scope, failure_emitter) =
+            activity_job_scope(ActivityOperation::KintoneMcpStatus);
+        let failed: Result<Value> = Err(anyhow::anyhow!("raw-secret-sentinel"));
+        finish_covered_tool_activity(
+            activity_tool_coverage("kintone_mcp_status"),
+            Some(&failure_scope),
+            &failed,
+        );
+        let failed = failure_emitter.updates();
+        assert_eq!(
+            failed.iter().map(ActivityUpdate::state).collect::<Vec<_>>(),
+            vec![ActivityState::Started, ActivityState::Failed]
+        );
+        assert_eq!(
+            failed.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::OperationFailed)
+        );
+        assert!(
+            failed
+                .iter()
+                .all(|update| !update.summary().safe_summary().contains("sentinel"))
+        );
+    }
+
+    #[test]
+    fn activity_coverage_explicit_approval_result_is_ordered_and_terminal_once() {
+        let (allowed_scope, allowed_emitter) =
+            activity_job_scope(ActivityOperation::CheckpointSave);
+        allowed_scope.waiting_approval().unwrap();
+        finish_activity_approval(true, Some(&allowed_scope), "denied").unwrap();
+        finish_covered_tool_activity(
+            activity_tool_coverage("checkpoint_save"),
+            Some(&allowed_scope),
+            &text_result("saved".to_owned()),
+        );
+        assert_eq!(
+            allowed_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+
+        let (denied_scope, denied_emitter) = activity_job_scope(ActivityOperation::CheckpointSave);
+        denied_scope.waiting_approval().unwrap();
+        let denied = finish_activity_approval(false, Some(&denied_scope), "denied");
+        assert!(denied.is_err());
+        let outer_failure: Result<Value> = Err(anyhow::anyhow!("denied"));
+        finish_covered_tool_activity(
+            activity_tool_coverage("checkpoint_save"),
+            Some(&denied_scope),
+            &outer_failure,
+        );
+        let denied = denied_emitter.updates();
+        assert_eq!(
+            denied.iter().map(ActivityUpdate::state).collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed,
+            ]
+        );
+        assert_eq!(
+            denied.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::ApprovalDenied)
+        );
     }
 
     #[tokio::test]
