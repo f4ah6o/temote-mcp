@@ -31,18 +31,18 @@ Branch: codex/20260915-complete-open-work
 
 | Branch | 検査・commit済みHEAD | originへのpush結果 |
 | --- | --- | --- |
-| `codex/20260915-completion-activity` | `112b3cdc1ce941d0542b920c04c52e877d52a61f` | FAIL: JSON-RPC -32000 / Git exit 128 / HTTP 403 |
-| `codex/20260915-completion-evaluation` | `221e2ba26b91ac478c7466306b8b7bd465e3a42c` | FAIL: JSON-RPC -32000 / Git exit 128 / HTTP 403 |
-| `codex/20260915-complete-open-work` | `439661581c9e7f81545f34295430fd8fa557ce64` | FAIL: JSON-RPC -32000 / Git exit 128 / HTTP 403 |
+| `codex/20260915-completion-activity` | `112b3cdc1ce941d0542b920c04c52e877d52a61f` | PASS: `8a6efff..112b3cd` を origin へ push |
+| `codex/20260915-completion-evaluation` | `221e2ba26b91ac478c7466306b8b7bd465e3a42c` | PASS: `cf9d1ff..221e2ba` を origin へ push |
+| `codex/20260915-complete-open-work` | `20a415100a19eec00ec81b97f251e9f162972a3e` | PASS: `b02bafe..20a4151` を origin へ push。下記の結果更新commitを追加予定 |
 
-3件とも実際のstderrは次のとおり。credential・remoteを変更する回避策は行っていない。branchとworktreeはすべて保持し、書込権限のある環境からのpushが必要である。
+初回pushは3件とも下記HTTP 403で失敗したが、credential・remoteを変更せず再試行したところ、2026-09-15 16:55 JST時点で3 branchともpushに成功した。初回失敗も履歴として保持する。
 
 ```text
 remote: Permission to f4ah6o/temote-mcp.git denied to fujita-obr.
 fatal: unable to access 'https://github.com/f4ah6o/temote-mcp.git/': The requested URL returned error: 403
 ```
 
-このpush結果の記録は上表のintegration commit後のdocumentation-only追記であり、後続commitとして保存する。上表は実際にpushを試行したimmutable commitを示す。
+この結果更新はdocumentation-onlyの後続commitとして保存し、同じintegration branchへpushする。
 
 linked worktree専用sessionからの最初のstageは、共有Git管理領域 `/home/hirohito-fujita/src/local-mcp/.git` がsession root外のため拒否された。設定済みnamed root `src` に通常の `agent` / `yolo=false` Git操作用sessionを作成し、専用Git toolに対象worktreeのcwdと絶対file pathを明示してstage/commitした。既存sessionの権限、Git設定、sandbox実装は変更していない。
 
@@ -121,7 +121,7 @@ Codex app-server の停止後 `resume` 検証は、accepted receipt が `Applied
 - [x] T01-A、T06-B、T05-C、T07-C、T08-C/A、T09/T10が完了または明示的なfailed / blockedとしてresultsに反映される。（今回はblockedの記録であり、実行完了ではない。）
 - [x] app-server resumeの意味と観測限界がresults、英日usage、Agent Skillで一致する。（documentationのみ。新しいlive evidenceなし。）
 - [x] 既存4 issueの実 provider / 対応OS / physical host不足が完了するか、具体的な外部条件付きでopenのまま記録される。（今回は具体的な不足条件を記録してopenを維持。）
-- [x] integration、activity、evaluation branchのpush結果が記録される。（3 branchともHTTP 403。remote同期は未完了。）
+- [x] integration、activity、evaluation branchのpush結果が記録される。（初回HTTP 403後に再試行し、3 branchともorigin同期に成功。）
 
 ## テスト計画
 
