@@ -698,6 +698,162 @@ struct ActivityEventWire<'a> {
     safe_summary: &'a str,
 }
 
+struct ActivityEventWireOwned {
+    schema_version: u64,
+    sequence: u64,
+    operation_id: Uuid,
+    timestamp_ms: u64,
+    session_id: Option<String>,
+    session_instance: Option<Uuid>,
+    operation: ActivityOperation,
+    state: ActivityState,
+    duration_ms: Option<u64>,
+    safe_summary: String,
+}
+
+struct ActivityEventWireVisitor;
+
+impl<'de> Visitor<'de> for ActivityEventWireVisitor {
+    type Value = ActivityEventWireOwned;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an activity event object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut schema_version = None;
+        let mut sequence = None;
+        let mut operation_id = None;
+        let mut timestamp_ms = None;
+        let mut session_id = None;
+        let mut session_id_seen = false;
+        let mut session_instance = None;
+        let mut session_instance_seen = false;
+        let mut operation = None;
+        let mut state = None;
+        let mut duration_ms = None;
+        let mut duration_seen = false;
+        let mut safe_summary = None;
+
+        while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
+            match field.as_str() {
+                "schema_version" => set_once(&mut schema_version, map.next_value())?,
+                "sequence" => set_once(&mut sequence, map.next_value())?,
+                "operation_id" => set_once(&mut operation_id, map.next_value())?,
+                "timestamp_ms" => set_once(&mut timestamp_ms, map.next_value())?,
+                "session_id" => {
+                    if session_id_seen {
+                        return Err(serde_invalid_json());
+                    }
+                    session_id_seen = true;
+                    session_id = map.next_value().map_err(|_| serde_invalid_json())?;
+                }
+                "session_instance" => {
+                    if session_instance_seen {
+                        return Err(serde_invalid_json());
+                    }
+                    session_instance_seen = true;
+                    session_instance = map.next_value().map_err(|_| serde_invalid_json())?;
+                }
+                "operation" => set_once(&mut operation, map.next_value())?,
+                "state" => set_once(&mut state, map.next_value())?,
+                "duration_ms" => {
+                    if duration_seen {
+                        return Err(serde_invalid_json());
+                    }
+                    duration_seen = true;
+                    duration_ms = map.next_value().map_err(|_| serde_invalid_json())?;
+                }
+                "safe_summary" => set_once(&mut safe_summary, map.next_value())?,
+                _ => return Err(serde_invalid_json()),
+            }
+        }
+
+        if !session_id_seen || !session_instance_seen || !duration_seen {
+            return Err(serde_invalid_json());
+        }
+        Ok(ActivityEventWireOwned {
+            schema_version: schema_version.ok_or_else(serde_invalid_json)?,
+            sequence: sequence.ok_or_else(serde_invalid_json)?,
+            operation_id: operation_id.ok_or_else(serde_invalid_json)?,
+            timestamp_ms: timestamp_ms.ok_or_else(serde_invalid_json)?,
+            session_id,
+            session_instance,
+            operation: operation.ok_or_else(serde_invalid_json)?,
+            state: state.ok_or_else(serde_invalid_json)?,
+            duration_ms,
+            safe_summary: safe_summary.ok_or_else(serde_invalid_json)?,
+        })
+    }
+}
+
+fn set_once<T, E>(slot: &mut Option<T>, value: Result<T, E>) -> Result<(), E>
+where
+    E: SerdeError,
+{
+    if slot.is_some() {
+        return Err(serde_invalid_json());
+    }
+    *slot = Some(value.map_err(|_| serde_invalid_json())?);
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for ActivityEventWireOwned {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ActivityEventWireVisitor)
+    }
+}
+
+struct ActivityEnvelopeOwned {
+    event: ActivityEventWireOwned,
+}
+
+struct ActivityEnvelopeVisitor;
+
+impl<'de> Visitor<'de> for ActivityEnvelopeVisitor {
+    type Value = ActivityEnvelopeOwned;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an activity envelope")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut event_type: Option<String> = None;
+        let mut event = None;
+        while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
+            match field.as_str() {
+                "type" => set_once(&mut event_type, map.next_value())?,
+                "event" => set_once(&mut event, map.next_value())?,
+                _ => return Err(serde_invalid_json()),
+            }
+        }
+        if event_type.as_deref() != Some("activity") {
+            return Err(serde_invalid_json());
+        }
+        Ok(ActivityEnvelopeOwned {
+            event: event.ok_or_else(serde_invalid_json)?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityEnvelopeOwned {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ActivityEnvelopeVisitor)
+    }
+}
+
 impl<'a> From<&'a ActivityEvent> for ActivityEventWire<'a> {
     fn from(event: &'a ActivityEvent) -> Self {
         Self {
@@ -755,6 +911,29 @@ pub fn encode_event(event: &ActivityEvent) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::TooLarge);
     }
     Ok(bytes)
+}
+
+pub fn decode_event(bytes: &[u8]) -> Result<ActivityEvent, ContractError> {
+    if bytes.len() > MAX_ACTIVITY_EVENT_BYTES {
+        return Err(ContractError::TooLarge);
+    }
+    let wire: ActivityEnvelopeOwned =
+        serde_json::from_slice(bytes).map_err(|_| ContractError::InvalidJson)?;
+    let wire = wire.event;
+    let event = ActivityEvent {
+        schema_version: wire.schema_version,
+        sequence: wire.sequence,
+        operation_id: wire.operation_id,
+        timestamp_ms: wire.timestamp_ms,
+        session_id: wire.session_id,
+        session_instance: wire.session_instance,
+        operation: wire.operation,
+        state: wire.state,
+        duration_ms: wire.duration_ms,
+        safe_summary: wire.safe_summary,
+    };
+    event.validate()?;
+    Ok(event)
 }
 
 fn validate_update(update: &ActivityUpdate) -> Result<(), ContractError> {
@@ -1040,6 +1219,7 @@ mod tests {
         assert_eq!(event.safe_summary(), "remote=origin");
         let encoded = encode_event(&event).unwrap();
         assert!(!encoded.ends_with(b"\n"));
+        assert_eq!(decode_event(&encoded), Ok(event.clone()));
         let actual: Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(
             actual,
@@ -1094,15 +1274,46 @@ mod tests {
         .unwrap();
         let mut value: Value = serde_json::from_slice(&encode_event(&event).unwrap()).unwrap();
         let event = value
-            .get_mut("event")
-            .and_then(Value::as_object_mut)
-            .unwrap();
+            .get("event")
+            .and_then(Value::as_object)
+            .unwrap()
+            .clone();
 
         for field in ["session_id", "session_instance", "duration_ms"] {
             let mut missing = event.clone();
             missing.remove(field);
             assert_ne!(missing.get(field), Some(&Value::Null));
+            value["event"] = Value::Object(missing);
+            assert_eq!(
+                decode_event(&serde_json::to_vec(&value).unwrap()),
+                Err(ContractError::InvalidJson)
+            );
         }
+    }
+
+    #[test]
+    fn decode_event_rejects_duplicate_unknown_and_semantically_invalid_fields() {
+        let valid = br#"{"type":"activity","event":{"schema_version":1,"sequence":1,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":"00000000-0000-4000-8000-000000000003","operation":"git_pull","state":"completed","duration_ms":1832,"safe_summary":"remote=origin"}}"#;
+        assert!(decode_event(valid).is_ok());
+        for invalid in [
+            br#"{"type":"activity","type":"activity","event":{"schema_version":1,"sequence":1,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":null,"operation":"git_pull","state":"completed","duration_ms":1,"safe_summary":""}}"#.as_slice(),
+            br#"{"type":"activity","event":{"schema_version":1,"sequence":1,"sequence":2,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":null,"operation":"git_pull","state":"completed","duration_ms":1,"safe_summary":""}}"#.as_slice(),
+            br#"{"type":"activity","event":{"schema_version":1,"sequence":1,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":null,"operation":"git_pull","state":"completed","duration_ms":1,"safe_summary":"","extra":true}}"#.as_slice(),
+        ] {
+            assert_eq!(decode_event(invalid), Err(ContractError::InvalidJson));
+        }
+
+        let unknown_schema = std::str::from_utf8(valid).unwrap().replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":2",
+            1,
+        );
+        assert_eq!(
+            decode_event(unknown_schema.as_bytes()),
+            Err(ContractError::UnknownSchema)
+        );
+        let oversized = vec![b' '; MAX_ACTIVITY_EVENT_BYTES + 1];
+        assert_eq!(decode_event(&oversized), Err(ContractError::TooLarge));
     }
 
     #[test]

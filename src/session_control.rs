@@ -21,7 +21,10 @@ use crate::host_identity;
 use crate::named_roots::NamedRoots;
 use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
 use temote_mcp::activity::broker::{ActivityBroker, ActivityDelivery};
-use temote_mcp::activity::contract::{ACTIVITY_SCHEMA_VERSION, encode_event};
+use temote_mcp::activity::contract::{
+    ACTIVITY_SCHEMA_VERSION, ActivityEvent, decode_event, encode_event,
+};
+use uuid::Uuid;
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_SESSION_LIST_ENTRIES: usize = 256;
@@ -324,6 +327,105 @@ struct ControlResponse {
     ok: bool,
     result: Option<Value>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityAttachResult {
+    control_protocol: u64,
+    activity_schema: u64,
+    generation: Uuid,
+    snapshot_sequence: u64,
+    replayed: usize,
+    history_truncated: bool,
+}
+
+#[derive(Debug)]
+struct ActivityAttachResponse {
+    ok: bool,
+    result: Option<ActivityAttachResult>,
+    error: Option<String>,
+}
+
+struct ActivityAttachResponseVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ActivityAttachResponseVisitor {
+    type Value = ActivityAttachResponse;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an activity attach response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut ok = None;
+        let mut result = None;
+        let mut result_seen = false;
+        let mut error = None;
+        let mut error_seen = false;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "ok" => {
+                    if ok.is_some() {
+                        return Err(serde::de::Error::custom("invalid activity attach response"));
+                    }
+                    ok = Some(map.next_value()?);
+                }
+                "result" => {
+                    if result_seen {
+                        return Err(serde::de::Error::custom("invalid activity attach response"));
+                    }
+                    result_seen = true;
+                    result = map.next_value()?;
+                }
+                "error" => {
+                    if error_seen {
+                        return Err(serde::de::Error::custom("invalid activity attach response"));
+                    }
+                    error_seen = true;
+                    error = map.next_value()?;
+                }
+                _ => return Err(serde::de::Error::custom("invalid activity attach response")),
+            }
+        }
+        if !result_seen || !error_seen {
+            return Err(serde::de::Error::custom("invalid activity attach response"));
+        }
+        Ok(ActivityAttachResponse {
+            ok: ok.ok_or_else(|| serde::de::Error::custom("invalid activity attach response"))?,
+            result,
+            error,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityAttachResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ActivityAttachResponseVisitor)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityEndFrame {
+    #[serde(rename = "type")]
+    frame_type: String,
+    snapshot_sequence: u64,
+    history_truncated: bool,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ActivityReplay {
+    pub(crate) generation: Uuid,
+    pub(crate) snapshot_sequence: u64,
+    pub(crate) history_truncated: bool,
+    pub(crate) events: Vec<ActivityEvent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1798,6 +1900,130 @@ async fn request(request: ControlRequest) -> Result<Value> {
     ensure_response_ok(response)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn activity_replay(
+    session_id: Option<String>,
+    tail: usize,
+) -> Result<ActivityReplay> {
+    let stream = tokio::time::timeout(CONTROL_READ_TIMEOUT, connect_supervisor())
+        .await
+        .context("timed out connecting to session supervisor")??;
+    activity_replay_on_stream(stream, session_id, tail).await
+}
+
+async fn activity_replay_on_stream(
+    stream: UnixStream,
+    session_id: Option<String>,
+    tail: usize,
+) -> Result<ActivityReplay> {
+    anyhow::ensure!(tail <= 1024, "activity tail exceeds 1024 events");
+    let (reader, mut writer) = stream.into_split();
+    let request = encode_line(&ControlRequest::AttachActivity(AttachActivityRequest {
+        schema_version: ACTIVITY_SCHEMA_VERSION,
+        session_id: session_id.clone(),
+        tail,
+        follow: false,
+    }))?;
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, writer.write_all(&request))
+        .await
+        .context("timed out writing activity attach request")??;
+    let mut reader = BufReader::new(reader);
+    let response = read_activity_client_line(&mut reader, "activity attach response").await?;
+    let response: ActivityAttachResponse = serde_json::from_str(response.trim_end_matches('\n'))
+        .map_err(|_| anyhow::anyhow!("invalid activity attach response"))?;
+    if !response.ok {
+        anyhow::ensure!(
+            response.result.is_none() && response.error.is_some(),
+            "invalid activity attach response"
+        );
+        return Err(anyhow::anyhow!("activity attachment rejected"));
+    }
+    anyhow::ensure!(response.error.is_none(), "invalid activity attach response");
+    let attach = response
+        .result
+        .context("invalid activity attach response")?;
+    anyhow::ensure!(
+        attach.control_protocol == CONTROL_PROTOCOL_VERSION,
+        "unsupported supervisor control protocol"
+    );
+    anyhow::ensure!(
+        attach.activity_schema == ACTIVITY_SCHEMA_VERSION,
+        "unsupported activity schema"
+    );
+    anyhow::ensure!(attach.replayed <= tail, "invalid activity replay count");
+
+    let mut events = Vec::with_capacity(attach.replayed);
+    loop {
+        let line = read_activity_client_line(&mut reader, "activity replay frame").await?;
+        anyhow::ensure!(
+            !line.is_empty(),
+            "activity stream ended before activity_end"
+        );
+        let frame = line
+            .strip_suffix('\n')
+            .context("activity frame is missing newline terminator")?;
+        anyhow::ensure!(!frame.ends_with('\r'), "invalid activity frame terminator");
+        match decode_event(frame.as_bytes()) {
+            Ok(event) => {
+                anyhow::ensure!(
+                    events.last().is_none_or(|previous: &ActivityEvent| {
+                        previous.sequence() < event.sequence()
+                    }),
+                    "activity replay sequence is not increasing"
+                );
+                anyhow::ensure!(
+                    event.sequence() <= attach.snapshot_sequence,
+                    "activity replay exceeds snapshot boundary"
+                );
+                anyhow::ensure!(
+                    session_id
+                        .as_deref()
+                        .is_none_or(|expected| event.session_id() == Some(expected)),
+                    "activity replay does not match requested session"
+                );
+                events.push(event);
+                anyhow::ensure!(
+                    events.len() <= attach.replayed,
+                    "too many activity replay events"
+                );
+            }
+            Err(_) => {
+                let end: ActivityEndFrame = serde_json::from_str(frame)
+                    .map_err(|_| anyhow::anyhow!("invalid activity replay frame"))?;
+                anyhow::ensure!(
+                    end.frame_type == "activity_end",
+                    "invalid activity replay frame"
+                );
+                anyhow::ensure!(
+                    end.snapshot_sequence == attach.snapshot_sequence
+                        && end.history_truncated == attach.history_truncated,
+                    "activity_end does not match attachment"
+                );
+                anyhow::ensure!(
+                    events.len() == attach.replayed,
+                    "activity replay count mismatch"
+                );
+                drop(writer);
+                return Ok(ActivityReplay {
+                    generation: attach.generation,
+                    snapshot_sequence: attach.snapshot_sequence,
+                    history_truncated: attach.history_truncated,
+                    events,
+                });
+            }
+        }
+    }
+}
+
+async fn read_activity_client_line<R>(reader: &mut R, label: &str) -> Result<String>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, read_line_limited(reader, label))
+        .await
+        .with_context(|| format!("timed out waiting for {label}"))?
+}
+
 fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
     if response.ok {
         Ok(response.result.unwrap_or(Value::Null))
@@ -2901,6 +3127,213 @@ mod tests {
         assert_eq!(response["result"], Value::Null);
         assert_eq!(response["error"], "unsupported activity schema");
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_no_follow_keeps_write_half_until_valid_replay_end() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        supervisor
+            .activity_broker()
+            .publish(
+                activity_test_update(0x7080),
+                Some("target"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+
+        let replay = activity_replay_on_stream(client, Some("target".to_owned()), 1)
+            .await
+            .unwrap();
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.events[0].sequence(), 1);
+        assert_eq!(replay.snapshot_sequence, 1);
+        assert!(!replay.history_truncated);
+        assert_eq!(
+            replay.generation,
+            supervisor
+                .activity_broker()
+                .subscribe_snapshot(None, 0)
+                .unwrap()
+                .generation()
+        );
+        task.await.unwrap().unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_rejects_eof_before_replay_end() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            assert!(
+                read_line_limited(&mut reader, "activity request")
+                    .await
+                    .unwrap()
+                    .contains("attach_activity")
+            );
+            writer
+                .write_all(
+                    &encode_line(&json!({
+                        "ok": true,
+                        "result": {
+                            "control_protocol": 2,
+                            "activity_schema": 1,
+                            "generation": ACTIVITY_TEST_GENERATION,
+                            "snapshot_sequence": 0,
+                            "replayed": 0,
+                            "history_truncated": false,
+                        },
+                        "error": Value::Null,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let error = activity_replay_on_stream(client, None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "activity stream ended before activity_end"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_rejects_incompatible_metadata_before_frames() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            let _ = read_line_limited(&mut reader, "activity request")
+                .await
+                .unwrap();
+            writer
+                .write_all(
+                    &encode_line(&json!({
+                        "ok": true,
+                        "result": {
+                            "control_protocol": 2,
+                            "activity_schema": 2,
+                            "generation": ACTIVITY_TEST_GENERATION,
+                            "snapshot_sequence": 0,
+                            "replayed": 0,
+                            "history_truncated": false,
+                        },
+                        "error": Value::Null,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let error = activity_replay_on_stream(client, None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unsupported activity schema");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_strict_handshake_never_echoes_peer_errors() {
+        let duplicate_metadata = concat!(
+            "{\"ok\":true,\"result\":{",
+            "\"control_protocol\":2,\"control_protocol\":2,\"activity_schema\":1,",
+            "\"generation\":\"00000000-0000-4000-8000-000000000701\",",
+            "\"snapshot_sequence\":0,\"replayed\":0,\"history_truncated\":false},",
+            "\"error\":null}\n"
+        );
+        let malicious_error =
+            "{\"ok\":false,\"result\":null,\"error\":\"secret-sentinel\\u001b[31m\"}\n";
+        let missing_error = concat!(
+            "{\"ok\":true,\"result\":{",
+            "\"control_protocol\":2,\"activity_schema\":1,",
+            "\"generation\":\"00000000-0000-4000-8000-000000000701\",",
+            "\"snapshot_sequence\":0,\"replayed\":0,\"history_truncated\":false}}\n"
+        );
+        let missing_result = "{\"ok\":false,\"error\":\"unavailable\"}\n";
+        for (response, expected) in [
+            (duplicate_metadata, "invalid activity attach response"),
+            (malicious_error, "activity attachment rejected"),
+            (missing_error, "invalid activity attach response"),
+            (missing_result, "invalid activity attach response"),
+        ] {
+            let (server, client) = UnixStream::pair().unwrap();
+            let response = response.as_bytes().to_vec();
+            let server_task = tokio::spawn(async move {
+                let (reader, mut writer) = server.into_split();
+                let mut reader = BufReader::new(reader);
+                let _ = read_line_limited(&mut reader, "activity request")
+                    .await
+                    .unwrap();
+                writer.write_all(&response).await.unwrap();
+            });
+            let error = activity_replay_on_stream(client, None, 0)
+                .await
+                .unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert_eq!(diagnostic, expected);
+            assert!(!diagnostic.contains("sentinel"));
+            assert!(!diagnostic.contains('\u{1b}'));
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_client_uses_strict_event_decoder() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            let _ = read_line_limited(&mut reader, "activity request")
+                .await
+                .unwrap();
+            writer
+                .write_all(
+                    &encode_line(&json!({
+                        "ok": true,
+                        "result": {
+                            "control_protocol": 2,
+                            "activity_schema": 1,
+                            "generation": ACTIVITY_TEST_GENERATION,
+                            "snapshot_sequence": 1,
+                            "replayed": 1,
+                            "history_truncated": false,
+                        },
+                        "error": Value::Null,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let duplicate_sequence = concat!(
+                "{\"type\":\"activity\",\"event\":{",
+                "\"schema_version\":1,\"sequence\":1,\"sequence\":1,",
+                "\"operation_id\":\"00000000-0000-4000-8000-000000007080\",",
+                "\"timestamp_ms\":1780000000000,\"session_id\":null,",
+                "\"session_instance\":null,\"operation\":\"read_file\",",
+                "\"state\":\"started\",\"duration_ms\":null,\"safe_summary\":\"\"}}\n"
+            );
+            writer
+                .write_all(duplicate_sequence.as_bytes())
+                .await
+                .unwrap();
+        });
+        let error = activity_replay_on_stream(client, None, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid activity replay frame");
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
