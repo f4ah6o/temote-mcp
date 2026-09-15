@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read as _, Write};
+use std::io::{IsTerminal as _, Read as _, Write};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -24,6 +26,7 @@ use temote_mcp::activity::broker::{ActivityBroker, ActivityDelivery};
 use temote_mcp::activity::contract::{
     ACTIVITY_SCHEMA_VERSION, ActivityEvent, decode_event, encode_event,
 };
+use temote_mcp::activity::render::render_event;
 use uuid::Uuid;
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
@@ -35,6 +38,9 @@ const TERMINAL_SESSION_RETENTION: usize = 512;
 const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACTIVITY_OUTPUT_QUEUE: usize = 256;
+const MAX_ACTIVITY_DIAGNOSTIC_QUEUE: usize = 64;
+const ACTIVITY_OUTPUT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONSOLE_QUEUE: usize = 1;
 pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
@@ -417,6 +423,186 @@ struct ActivityEndFrame {
     frame_type: String,
     snapshot_sequence: u64,
     history_truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityGapFrame {
+    #[serde(rename = "type")]
+    frame_type: String,
+    scope: String,
+    after_sequence: u64,
+    through_sequence: u64,
+    dropped: u64,
+}
+
+#[derive(Debug)]
+enum ActivityClientFrame {
+    Event(ActivityEvent),
+    End,
+    Gap {
+        after_sequence: u64,
+        through_sequence: u64,
+        dropped: u64,
+    },
+}
+
+struct ActivityStreamState {
+    attach: ActivityAttachResult,
+    session_id: Option<String>,
+    replayed: usize,
+    last_event_sequence: u64,
+    live_cursor: u64,
+    ended: bool,
+}
+
+struct ActivityClientConnection {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    _writer: tokio::net::unix::OwnedWriteHalf,
+    follow: bool,
+    state: ActivityStreamState,
+}
+
+impl ActivityClientConnection {
+    async fn attach(
+        stream: UnixStream,
+        session_id: Option<String>,
+        tail: usize,
+        follow: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(tail <= 1024, "activity tail exceeds 1024 events");
+        let (reader, mut writer) = stream.into_split();
+        let request = encode_line(&ControlRequest::AttachActivity(AttachActivityRequest {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            tail,
+            follow,
+        }))?;
+        tokio::time::timeout(CONTROL_READ_TIMEOUT, writer.write_all(&request))
+            .await
+            .context("timed out writing activity attach request")??;
+        let mut reader = BufReader::new(reader);
+        let response = read_activity_client_line(&mut reader, "activity attach response").await?;
+        let attach = decode_activity_attach_response(&response, tail)?;
+        Ok(Self {
+            reader,
+            _writer: writer,
+            follow,
+            state: ActivityStreamState::new(attach, session_id),
+        })
+    }
+
+    async fn next_frame(&mut self) -> Result<Option<ActivityClientFrame>> {
+        let line = if activity_frame_read_has_timeout(self.follow, self.state.ended) {
+            read_activity_client_line(&mut self.reader, "activity stream frame").await?
+        } else {
+            read_line_limited(&mut self.reader, "activity stream frame").await?
+        };
+        if line.is_empty() {
+            return Ok(None);
+        }
+        self.state.decode_line(&line).map(Some)
+    }
+}
+
+fn activity_frame_read_has_timeout(follow: bool, replay_ended: bool) -> bool {
+    !follow || !replay_ended
+}
+
+impl ActivityStreamState {
+    fn new(attach: ActivityAttachResult, session_id: Option<String>) -> Self {
+        let live_cursor = attach.snapshot_sequence;
+        Self {
+            attach,
+            session_id,
+            replayed: 0,
+            last_event_sequence: 0,
+            live_cursor,
+            ended: false,
+        }
+    }
+
+    fn decode_line(&mut self, line: &str) -> Result<ActivityClientFrame> {
+        let frame = line
+            .strip_suffix('\n')
+            .context("activity frame is missing newline terminator")?;
+        anyhow::ensure!(!frame.ends_with('\r'), "invalid activity frame terminator");
+        if let Ok(event) = decode_event(frame.as_bytes()) {
+            anyhow::ensure!(
+                self.last_event_sequence < event.sequence(),
+                "activity event sequence is not increasing"
+            );
+            anyhow::ensure!(
+                self.session_id
+                    .as_deref()
+                    .is_none_or(|expected| event.session_id() == Some(expected)),
+                "activity event does not match requested session"
+            );
+            if self.ended {
+                let advances_stream = if self.session_id.is_some() {
+                    event.sequence() > self.live_cursor
+                } else {
+                    self.live_cursor
+                        .checked_add(1)
+                        .is_some_and(|next| event.sequence() == next)
+                };
+                anyhow::ensure!(advances_stream, "invalid live activity sequence");
+                self.live_cursor = event.sequence();
+            } else {
+                anyhow::ensure!(
+                    event.sequence() <= self.attach.snapshot_sequence,
+                    "activity replay exceeds snapshot boundary"
+                );
+                self.replayed += 1;
+                anyhow::ensure!(
+                    self.replayed <= self.attach.replayed,
+                    "too many activity replay events"
+                );
+            }
+            self.last_event_sequence = event.sequence();
+            return Ok(ActivityClientFrame::Event(event));
+        }
+        if let Ok(end) = serde_json::from_str::<ActivityEndFrame>(frame) {
+            anyhow::ensure!(
+                !self.ended && end.frame_type == "activity_end",
+                "invalid activity replay frame"
+            );
+            anyhow::ensure!(
+                end.snapshot_sequence == self.attach.snapshot_sequence
+                    && end.history_truncated == self.attach.history_truncated,
+                "activity_end does not match attachment"
+            );
+            anyhow::ensure!(
+                self.replayed == self.attach.replayed,
+                "activity replay count mismatch"
+            );
+            self.ended = true;
+            return Ok(ActivityClientFrame::End);
+        }
+        if let Ok(gap) = serde_json::from_str::<ActivityGapFrame>(frame) {
+            anyhow::ensure!(
+                self.ended && gap.frame_type == "activity_gap" && gap.scope == "all_sessions",
+                "invalid activity gap frame"
+            );
+            anyhow::ensure!(
+                gap.after_sequence < gap.through_sequence
+                    && gap.through_sequence - gap.after_sequence == gap.dropped
+                    && if self.session_id.is_some() {
+                        gap.after_sequence >= self.live_cursor
+                    } else {
+                        gap.after_sequence == self.live_cursor
+                    },
+                "invalid activity gap range"
+            );
+            self.live_cursor = gap.through_sequence;
+            return Ok(ActivityClientFrame::Gap {
+                after_sequence: gap.after_sequence,
+                through_sequence: gap.through_sequence,
+                dropped: gap.dropped,
+            });
+        }
+        Err(anyhow::anyhow!("invalid activity replay frame"))
+    }
 }
 
 #[derive(Debug)]
@@ -1911,24 +2097,553 @@ pub(crate) async fn activity_replay(
     activity_replay_on_stream(stream, session_id, tail).await
 }
 
+pub async fn run_activity_command(
+    session_id: Option<String>,
+    tail: usize,
+    follow: bool,
+) -> Result<()> {
+    match run_activity(session_id, tail, follow).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            report_activity_command_error(&error.to_string()).await;
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn report_activity_command_error(error: &str) {
+    let Ok((sender, mut result)) =
+        spawn_activity_writer(libc::STDERR_FILENO, 1, "temote-activity-final-error")
+    else {
+        return;
+    };
+    if queue_activity_line(&sender, format!("Error: {error}"), "activity diagnostics").is_err() {
+        return;
+    }
+    drop(sender);
+    let _ = tokio::time::timeout(Duration::from_millis(100), &mut result).await;
+}
+
+async fn run_activity(session_id: Option<String>, tail: usize, follow: bool) -> Result<()> {
+    if let Some(session_id) = session_id.as_deref() {
+        config::validate_session_id(session_id)?;
+    }
+    let stream = tokio::time::timeout(CONTROL_READ_TIMEOUT, connect_supervisor())
+        .await
+        .context("timed out connecting to session supervisor")??;
+    let mut connection = ActivityClientConnection::attach(stream, session_id, tail, follow).await?;
+    let (output, mut output_result) = spawn_activity_writer(
+        libc::STDOUT_FILENO,
+        MAX_ACTIVITY_OUTPUT_QUEUE,
+        "temote-activity-output",
+    )?;
+    let (diagnostics, diagnostics_result) = spawn_activity_writer(
+        libc::STDERR_FILENO,
+        MAX_ACTIVITY_DIAGNOSTIC_QUEUE,
+        "temote-activity-diagnostics",
+    )?;
+    let mut diagnostics = Some(diagnostics);
+    let mut diagnostics_result = Some(diagnostics_result);
+    queue_activity_diagnostic(
+        &diagnostics,
+        "Attached to best-effort recent activity; this view does not guarantee current state.",
+    )?;
+    if connection.state.attach.history_truncated {
+        queue_activity_diagnostic(
+            &diagnostics,
+            "Retained activity history was truncated before this replay.",
+        )?;
+    }
+    let stdin_monitor = if follow {
+        ActivityStdinMonitor::start()?
+    } else {
+        None
+    };
+    let mut stdin_eof = stdin_monitor.as_ref().map(ActivityStdinMonitor::subscribe);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut cancelled = false;
+    loop {
+        enum ActivityLoopEvent {
+            Cancelled,
+            Stdin(Result<()>),
+            Output(Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>),
+            Diagnostics(Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>),
+            Frame(Result<Option<ActivityClientFrame>>),
+        }
+        let event = if follow {
+            tokio::select! {
+                biased;
+                signal = &mut ctrl_c => {
+                    signal.context("failed to receive Ctrl-C")?;
+                    ActivityLoopEvent::Cancelled
+                }
+                stdin = wait_for_tty_eof(&mut stdin_eof) => ActivityLoopEvent::Stdin(stdin),
+                status = &mut output_result => ActivityLoopEvent::Output(status),
+                status = wait_for_activity_diagnostics(&mut diagnostics_result) => ActivityLoopEvent::Diagnostics(status),
+                frame = connection.next_frame() => ActivityLoopEvent::Frame(frame),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                signal = &mut ctrl_c => {
+                    signal.context("failed to receive Ctrl-C")?;
+                    ActivityLoopEvent::Cancelled
+                }
+                status = &mut output_result => ActivityLoopEvent::Output(status),
+                status = wait_for_activity_diagnostics(&mut diagnostics_result) => ActivityLoopEvent::Diagnostics(status),
+                frame = connection.next_frame() => ActivityLoopEvent::Frame(frame),
+            }
+        };
+        let frame = match event {
+            ActivityLoopEvent::Cancelled => {
+                cancelled = true;
+                break;
+            }
+            ActivityLoopEvent::Stdin(status) => {
+                status?;
+                cancelled = true;
+                break;
+            }
+            ActivityLoopEvent::Output(status) => return finish_early_activity_output(status),
+            ActivityLoopEvent::Diagnostics(status) => match status {
+                Ok(ActivityOutputStatus::Complete | ActivityOutputStatus::BrokenPipe) => {
+                    diagnostics = None;
+                    diagnostics_result = None;
+                    continue;
+                }
+                Ok(ActivityOutputStatus::Failed) | Err(_) => {
+                    return Err(anyhow::anyhow!("activity diagnostics failed"));
+                }
+            },
+            ActivityLoopEvent::Frame(frame) => frame?,
+        };
+        let Some(frame) = frame else {
+            if follow {
+                queue_activity_diagnostic(
+                    &diagnostics,
+                    "Activity stream disconnected; rerun `temote-mcp activity` to reconnect.",
+                )?;
+                break;
+            }
+            return Err(anyhow::anyhow!("activity stream ended before activity_end"));
+        };
+        match frame {
+            ActivityClientFrame::Event(event) => {
+                let timestamp = format_local_activity_timestamp(event.timestamp_ms())?;
+                let line = render_event(&event, &timestamp)?;
+                match output.try_send(line) {
+                    Ok(()) => {}
+                    Err(std_mpsc::TrySendError::Full(_)) => {
+                        return Err(anyhow::anyhow!("activity output queue is full"));
+                    }
+                    Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                        return finish_early_activity_output((&mut output_result).await);
+                    }
+                }
+            }
+            ActivityClientFrame::End => {
+                if connection.state.attach.replayed == 0 {
+                    queue_activity_diagnostic(
+                        &diagnostics,
+                        "No matching recent activity was retained.",
+                    )?;
+                }
+                if !follow {
+                    break;
+                }
+            }
+            ActivityClientFrame::Gap {
+                after_sequence,
+                through_sequence,
+                dropped,
+            } => queue_activity_diagnostic(
+                &diagnostics,
+                &format!(
+                    "Activity gap across all sessions after sequence {after_sequence} through {through_sequence} ({dropped} events); rerun to replay retained history."
+                ),
+            )?,
+        }
+    }
+    drop(stdin_monitor);
+    drop(output);
+    drop(diagnostics);
+    let drain = tokio::time::timeout(ACTIVITY_OUTPUT_TIMEOUT, async {
+        let output = (&mut output_result).await;
+        let diagnostics = match diagnostics_result.as_mut() {
+            Some(receiver) => Some(receiver.await),
+            None => None,
+        };
+        (output, diagnostics)
+    });
+    tokio::pin!(drain);
+    if cancelled {
+        let _ = (&mut drain).await;
+        return Ok(());
+    }
+    let drained = tokio::select! {
+        biased;
+        signal = &mut ctrl_c => {
+            signal.context("failed to receive Ctrl-C")?;
+            cancelled = true;
+            None
+        }
+        drained = &mut drain => Some(drained),
+    };
+    if cancelled {
+        return Ok(());
+    }
+    match drained.expect("activity drain result missing without cancellation") {
+        Ok((output_status, diagnostics_status)) => {
+            let output_status = normalize_activity_output_status(output_status)?;
+            if output_status == ActivityOutputStatus::BrokenPipe {
+                return Ok(());
+            }
+            if let Some(status) = diagnostics_status {
+                match normalize_activity_output_status(status)? {
+                    ActivityOutputStatus::Complete | ActivityOutputStatus::BrokenPipe => {}
+                    ActivityOutputStatus::Failed => {
+                        return Err(anyhow::anyhow!("activity diagnostics failed"));
+                    }
+                }
+            }
+            match output_status {
+                ActivityOutputStatus::Complete => Ok(()),
+                ActivityOutputStatus::BrokenPipe => Ok(()),
+                ActivityOutputStatus::Failed => Err(anyhow::anyhow!("activity output failed")),
+            }
+        }
+        Err(_) => Err(anyhow::anyhow!("activity output drain timed out")),
+    }
+}
+
+async fn wait_for_activity_diagnostics(
+    receiver: &mut Option<tokio::sync::oneshot::Receiver<ActivityOutputStatus>>,
+) -> Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_tty_eof(
+    receiver: &mut Option<tokio::sync::oneshot::Receiver<ActivityStdinStatus>>,
+) -> Result<()> {
+    match receiver {
+        Some(receiver) => match receiver.await {
+            Ok(ActivityStdinStatus::Eof) => Ok(()),
+            Ok(ActivityStdinStatus::Failed) | Err(_) => {
+                Err(anyhow::anyhow!("activity stdin monitor failed"))
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+fn finish_early_activity_output(
+    status: Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>,
+) -> Result<()> {
+    match status {
+        Ok(ActivityOutputStatus::Complete | ActivityOutputStatus::BrokenPipe) => Ok(()),
+        Ok(ActivityOutputStatus::Failed) | Err(_) => Err(anyhow::anyhow!("activity output failed")),
+    }
+}
+
+fn normalize_activity_output_status(
+    status: Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>,
+) -> Result<ActivityOutputStatus> {
+    status.map_err(|_| anyhow::anyhow!("activity output failed"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityOutputStatus {
+    Complete,
+    BrokenPipe,
+    Failed,
+}
+
+fn spawn_activity_writer(
+    target_fd: RawFd,
+    capacity: usize,
+    thread_name: &'static str,
+) -> Result<(
+    std_mpsc::SyncSender<String>,
+    tokio::sync::oneshot::Receiver<ActivityOutputStatus>,
+)> {
+    let fd = unsafe { libc::dup(target_fd) };
+    if fd < 0 {
+        return Err(anyhow::anyhow!("activity output is unavailable"));
+    }
+    let (sender, receiver) = std_mpsc::sync_channel::<String>(capacity);
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let result_sender = Arc::new(std::sync::Mutex::new(Some(result_sender)));
+    let (watchdog_sender, watchdog_receiver) = std_mpsc::channel();
+    let watchdog_result = Arc::clone(&result_sender);
+    std::thread::Builder::new()
+        .name(format!("{thread_name}-watchdog"))
+        .spawn(move || {
+            while watchdog_receiver.recv().is_ok() {
+                match watchdog_receiver.recv_timeout(ACTIVITY_OUTPUT_TIMEOUT) {
+                    Ok(()) => {}
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        send_activity_output_status(&watchdog_result, ActivityOutputStatus::Failed);
+                        return;
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        })
+        .map_err(|_| anyhow::anyhow!("activity output is unavailable"))?;
+    let output = unsafe { std::fs::File::from_raw_fd(fd) };
+    let writer_result = Arc::clone(&result_sender);
+    std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            let fd = output.as_raw_fd();
+            let mut status = ActivityOutputStatus::Complete;
+            while let Ok(mut line) = receiver.recv() {
+                line.push('\n');
+                if watchdog_sender.send(()).is_err() {
+                    status = ActivityOutputStatus::Failed;
+                    break;
+                }
+                status = write_activity_output_line(fd, line.as_bytes(), ACTIVITY_OUTPUT_TIMEOUT);
+                let _ = watchdog_sender.send(());
+                if status != ActivityOutputStatus::Complete {
+                    break;
+                }
+            }
+            send_activity_output_status(&writer_result, status);
+        })
+        .map_err(|_| anyhow::anyhow!("activity output is unavailable"))?;
+    Ok((sender, result_receiver))
+}
+
+fn send_activity_output_status(
+    sender: &std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ActivityOutputStatus>>>,
+    status: ActivityOutputStatus,
+) {
+    if let Some(sender) = sender
+        .lock()
+        .expect("activity output status lock poisoned")
+        .take()
+    {
+        let _ = sender.send(status);
+    }
+}
+
+fn queue_activity_line(
+    sender: &std_mpsc::SyncSender<String>,
+    line: String,
+    label: &str,
+) -> Result<()> {
+    match sender.try_send(line) {
+        Ok(()) => Ok(()),
+        Err(std_mpsc::TrySendError::Full(_)) => Err(anyhow::anyhow!("{label} queue is full")),
+        Err(std_mpsc::TrySendError::Disconnected(_)) => {
+            Err(anyhow::anyhow!("{label} is unavailable"))
+        }
+    }
+}
+
+fn queue_activity_diagnostic(
+    sender: &Option<std_mpsc::SyncSender<String>>,
+    line: &str,
+) -> Result<()> {
+    match sender {
+        Some(sender) => queue_activity_line(sender, line.to_owned(), "activity diagnostics"),
+        None => Ok(()),
+    }
+}
+
+fn write_activity_output_line(fd: RawFd, bytes: &[u8], timeout: Duration) -> ActivityOutputStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut written = 0;
+    while written < bytes.len() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return ActivityOutputStatus::Failed;
+        }
+        let remaining = deadline.duration_since(now);
+        let timeout_ms = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if polled == 0 {
+            return ActivityOutputStatus::Failed;
+        }
+        if polled < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ActivityOutputStatus::Failed;
+        }
+        let count =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return ActivityOutputStatus::BrokenPipe;
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ActivityOutputStatus::Failed;
+        }
+        if count == 0 {
+            return ActivityOutputStatus::Failed;
+        }
+        written += count as usize;
+    }
+    ActivityOutputStatus::Complete
+}
+
+struct ActivityStdinMonitor {
+    stop: Arc<AtomicBool>,
+    eof: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<ActivityStdinStatus>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityStdinStatus {
+    Eof,
+    Failed,
+}
+
+impl ActivityStdinMonitor {
+    fn start() -> Result<Option<Self>> {
+        if !should_monitor_activity_stdin(true, std::io::stdin().is_terminal()) {
+            return Ok(None);
+        }
+        let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!("activity stdin monitor is unavailable"));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (eof_sender, eof_receiver) = tokio::sync::oneshot::channel();
+        let input = unsafe { std::fs::File::from_raw_fd(fd) };
+        std::thread::Builder::new()
+            .name("temote-activity-stdin".to_owned())
+            .spawn(move || {
+                let fd = input.as_raw_fd();
+                let mut byte = [0_u8; 1];
+                while !thread_stop.load(Ordering::Acquire) {
+                    let mut poll_fd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let polled = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+                    if polled < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        let _ = eof_sender.send(ActivityStdinStatus::Failed);
+                        return;
+                    }
+                    if polled == 0 {
+                        continue;
+                    }
+                    let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+                    if read == 0 {
+                        let _ = eof_sender.send(ActivityStdinStatus::Eof);
+                        return;
+                    }
+                    if read < 0
+                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        let _ = eof_sender.send(ActivityStdinStatus::Failed);
+                        return;
+                    }
+                }
+            })
+            .map_err(|_| anyhow::anyhow!("activity stdin monitor is unavailable"))?;
+        Ok(Some(Self {
+            stop,
+            eof: std::sync::Mutex::new(Some(eof_receiver)),
+        }))
+    }
+
+    fn subscribe(&self) -> tokio::sync::oneshot::Receiver<ActivityStdinStatus> {
+        self.eof
+            .lock()
+            .expect("activity stdin monitor lock poisoned")
+            .take()
+            .unwrap_or_else(|| {
+                let (_sender, receiver) = tokio::sync::oneshot::channel();
+                receiver
+            })
+    }
+}
+
+fn should_monitor_activity_stdin(follow: bool, is_terminal: bool) -> bool {
+    follow && is_terminal
+}
+
+impl Drop for ActivityStdinMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn format_local_activity_timestamp(timestamp_ms: u64) -> Result<String> {
+    let seconds: libc::time_t = (timestamp_ms / 1000)
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid activity timestamp"))?;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let converted = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+    if converted.is_null() {
+        return Err(anyhow::anyhow!("invalid activity timestamp"));
+    }
+    let local = unsafe { local.assume_init() };
+    let offset = local.tm_gmtoff;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let absolute_offset = offset.unsigned_abs();
+    let offset_hours = absolute_offset / 3600;
+    let offset_minutes = (absolute_offset % 3600) / 60;
+    Ok(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} {sign}{offset_hours:02}:{offset_minutes:02}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec,
+        timestamp_ms % 1000,
+    ))
+}
+
 async fn activity_replay_on_stream(
     stream: UnixStream,
     session_id: Option<String>,
     tail: usize,
 ) -> Result<ActivityReplay> {
-    anyhow::ensure!(tail <= 1024, "activity tail exceeds 1024 events");
-    let (reader, mut writer) = stream.into_split();
-    let request = encode_line(&ControlRequest::AttachActivity(AttachActivityRequest {
-        schema_version: ACTIVITY_SCHEMA_VERSION,
-        session_id: session_id.clone(),
-        tail,
-        follow: false,
-    }))?;
-    tokio::time::timeout(CONTROL_READ_TIMEOUT, writer.write_all(&request))
-        .await
-        .context("timed out writing activity attach request")??;
-    let mut reader = BufReader::new(reader);
-    let response = read_activity_client_line(&mut reader, "activity attach response").await?;
+    let mut connection = ActivityClientConnection::attach(stream, session_id, tail, false).await?;
+    let mut events = Vec::with_capacity(connection.state.attach.replayed);
+    loop {
+        match connection.next_frame().await? {
+            Some(ActivityClientFrame::Event(event)) => events.push(event),
+            Some(ActivityClientFrame::End) => {
+                return Ok(ActivityReplay {
+                    generation: connection.state.attach.generation,
+                    snapshot_sequence: connection.state.attach.snapshot_sequence,
+                    history_truncated: connection.state.attach.history_truncated,
+                    events,
+                });
+            }
+            Some(ActivityClientFrame::Gap { .. }) => {
+                return Err(anyhow::anyhow!("activity gap arrived before replay end"));
+            }
+            None => return Err(anyhow::anyhow!("activity stream ended before activity_end")),
+        }
+    }
+}
+
+fn decode_activity_attach_response(response: &str, tail: usize) -> Result<ActivityAttachResult> {
     let response: ActivityAttachResponse = serde_json::from_str(response.trim_end_matches('\n'))
         .map_err(|_| anyhow::anyhow!("invalid activity attach response"))?;
     if !response.ok {
@@ -1951,68 +2666,7 @@ async fn activity_replay_on_stream(
         "unsupported activity schema"
     );
     anyhow::ensure!(attach.replayed <= tail, "invalid activity replay count");
-
-    let mut events = Vec::with_capacity(attach.replayed);
-    loop {
-        let line = read_activity_client_line(&mut reader, "activity replay frame").await?;
-        anyhow::ensure!(
-            !line.is_empty(),
-            "activity stream ended before activity_end"
-        );
-        let frame = line
-            .strip_suffix('\n')
-            .context("activity frame is missing newline terminator")?;
-        anyhow::ensure!(!frame.ends_with('\r'), "invalid activity frame terminator");
-        match decode_event(frame.as_bytes()) {
-            Ok(event) => {
-                anyhow::ensure!(
-                    events.last().is_none_or(|previous: &ActivityEvent| {
-                        previous.sequence() < event.sequence()
-                    }),
-                    "activity replay sequence is not increasing"
-                );
-                anyhow::ensure!(
-                    event.sequence() <= attach.snapshot_sequence,
-                    "activity replay exceeds snapshot boundary"
-                );
-                anyhow::ensure!(
-                    session_id
-                        .as_deref()
-                        .is_none_or(|expected| event.session_id() == Some(expected)),
-                    "activity replay does not match requested session"
-                );
-                events.push(event);
-                anyhow::ensure!(
-                    events.len() <= attach.replayed,
-                    "too many activity replay events"
-                );
-            }
-            Err(_) => {
-                let end: ActivityEndFrame = serde_json::from_str(frame)
-                    .map_err(|_| anyhow::anyhow!("invalid activity replay frame"))?;
-                anyhow::ensure!(
-                    end.frame_type == "activity_end",
-                    "invalid activity replay frame"
-                );
-                anyhow::ensure!(
-                    end.snapshot_sequence == attach.snapshot_sequence
-                        && end.history_truncated == attach.history_truncated,
-                    "activity_end does not match attachment"
-                );
-                anyhow::ensure!(
-                    events.len() == attach.replayed,
-                    "activity replay count mismatch"
-                );
-                drop(writer);
-                return Ok(ActivityReplay {
-                    generation: attach.generation,
-                    snapshot_sequence: attach.snapshot_sequence,
-                    history_truncated: attach.history_truncated,
-                    events,
-                });
-            }
-        }
-    }
+    Ok(attach)
 }
 
 async fn read_activity_client_line<R>(reader: &mut R, label: &str) -> Result<String>
@@ -2783,6 +3437,27 @@ mod tests {
         .unwrap()
     }
 
+    fn activity_test_frame(sequence: u64, session_id: Option<&str>) -> String {
+        let mut frame = json!({
+            "type": "activity",
+            "event": {
+                "schema_version": ACTIVITY_SCHEMA_VERSION,
+                "sequence": sequence,
+                "operation_id": Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_7000 + u128::from(sequence)),
+                "timestamp_ms": 1_780_000_000_000_u64,
+                "session_id": session_id,
+                "session_instance": Value::Null,
+                "operation": "read_file",
+                "state": "started",
+                "duration_ms": Value::Null,
+                "safe_summary": "",
+            }
+        })
+        .to_string();
+        frame.push('\n');
+        frame
+    }
+
     async fn read_activity_test_json<R>(reader: &mut R) -> Value
     where
         R: AsyncBufReadExt + Unpin,
@@ -3334,6 +4009,213 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "invalid activity replay frame");
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn activity_cli_local_time_is_single_line_and_preserves_milliseconds() {
+        let formatted = format_local_activity_timestamp(1_780_000_000_123).unwrap();
+        assert_eq!(formatted.len(), 30);
+        assert_eq!(&formatted[19..23], ".123");
+        assert!(matches!(formatted.as_bytes()[24], b'+' | b'-'));
+        assert_eq!(&formatted[27..28], ":");
+        assert!(!formatted.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn activity_cli_stdin_policy_ignores_non_tty_and_all_no_follow_input() {
+        assert!(!should_monitor_activity_stdin(false, false));
+        assert!(!should_monitor_activity_stdin(false, true));
+        assert!(!should_monitor_activity_stdin(true, false));
+        assert!(should_monitor_activity_stdin(true, true));
+
+        assert!(activity_frame_read_has_timeout(false, false));
+        assert!(activity_frame_read_has_timeout(false, true));
+        assert!(activity_frame_read_has_timeout(true, false));
+        assert!(!activity_frame_read_has_timeout(true, true));
+    }
+
+    #[tokio::test]
+    async fn activity_cli_stdin_monitor_distinguishes_eof_from_failure() {
+        let (eof_sender, eof_receiver) = tokio::sync::oneshot::channel();
+        eof_sender.send(ActivityStdinStatus::Eof).unwrap();
+        let mut eof = Some(eof_receiver);
+        wait_for_tty_eof(&mut eof).await.unwrap();
+
+        let (failed_sender, failed_receiver) = tokio::sync::oneshot::channel();
+        failed_sender.send(ActivityStdinStatus::Failed).unwrap();
+        let mut failed = Some(failed_receiver);
+        assert_eq!(
+            wait_for_tty_eof(&mut failed).await.unwrap_err().to_string(),
+            "activity stdin monitor failed"
+        );
+
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        drop(closed_sender);
+        let mut closed = Some(closed_receiver);
+        assert_eq!(
+            wait_for_tty_eof(&mut closed).await.unwrap_err().to_string(),
+            "activity stdin monitor failed"
+        );
+    }
+
+    #[test]
+    fn activity_cli_output_queue_is_exactly_bounded_at_256_lines() {
+        assert_eq!(MAX_ACTIVITY_OUTPUT_QUEUE, 256);
+        let (sender, _receiver) = std_mpsc::sync_channel::<String>(MAX_ACTIVITY_OUTPUT_QUEUE);
+        for index in 0..MAX_ACTIVITY_OUTPUT_QUEUE {
+            sender.try_send(index.to_string()).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send("overflow".to_owned()),
+            Err(std_mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn activity_cli_output_writer_handles_success_broken_pipe_and_timeout() {
+        let mut success_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(success_pipe.as_mut_ptr()) }, 0);
+        let success_flags = unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) };
+        assert!(success_flags >= 0);
+        assert_eq!(
+            write_activity_output_line(success_pipe[1], b"one line\n", Duration::from_millis(100),),
+            ActivityOutputStatus::Complete
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) },
+            success_flags,
+            "activity output must preserve shared file-description flags"
+        );
+        let mut bytes = [0_u8; 9];
+        assert_eq!(
+            unsafe { libc::read(success_pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) },
+            9
+        );
+        assert_eq!(&bytes, b"one line\n");
+        unsafe {
+            libc::close(success_pipe[0]);
+            libc::close(success_pipe[1]);
+        }
+
+        let mut broken_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(broken_pipe.as_mut_ptr()) }, 0);
+        unsafe { libc::close(broken_pipe[0]) };
+        assert_eq!(
+            write_activity_output_line(broken_pipe[1], b"ignored\n", Duration::from_millis(100),),
+            ActivityOutputStatus::BrokenPipe
+        );
+        unsafe { libc::close(broken_pipe[1]) };
+
+        let mut full_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(full_pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(full_pipe[1], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(full_pipe[1], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let fill = [0_u8; 4096];
+        loop {
+            let written = unsafe { libc::write(full_pipe[1], fill.as_ptr().cast(), fill.len()) };
+            if written < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(full_pipe[1], libc::F_SETFL, flags) },
+            0
+        );
+        assert_eq!(
+            write_activity_output_line(full_pipe[1], b"blocked\n", Duration::from_millis(20),),
+            ActivityOutputStatus::Failed
+        );
+        assert_eq!(unsafe { libc::fcntl(full_pipe[1], libc::F_GETFL) }, flags);
+        unsafe {
+            libc::close(full_pipe[0]);
+            libc::close(full_pipe[1]);
+        }
+    }
+
+    #[test]
+    fn activity_cli_stream_state_accepts_end_then_strict_global_gap() {
+        let attach = ActivityAttachResult {
+            control_protocol: CONTROL_PROTOCOL_VERSION,
+            activity_schema: ACTIVITY_SCHEMA_VERSION,
+            generation: ACTIVITY_TEST_GENERATION,
+            snapshot_sequence: 0,
+            replayed: 0,
+            history_truncated: false,
+        };
+        let mut state = ActivityStreamState::new(attach, None);
+        assert!(matches!(
+            state
+                .decode_line(
+                    "{\"type\":\"activity_end\",\"snapshot_sequence\":0,\"history_truncated\":false}\n"
+                )
+                .unwrap(),
+            ActivityClientFrame::End
+        ));
+        assert!(matches!(
+            state
+                .decode_line(
+                    "{\"type\":\"activity_gap\",\"scope\":\"all_sessions\",\"after_sequence\":0,\"through_sequence\":3,\"dropped\":3}\n"
+                )
+                .unwrap(),
+            ActivityClientFrame::Gap {
+                after_sequence: 0,
+                through_sequence: 3,
+                dropped: 3,
+            }
+        ));
+        assert!(matches!(
+            state.decode_line(&activity_test_frame(4, None)).unwrap(),
+            ActivityClientFrame::Event(event) if event.sequence() == 4
+        ));
+        assert!(state.decode_line(&activity_test_frame(6, None)).is_err());
+        assert!(state
+            .decode_line(
+                "{\"type\":\"activity_gap\",\"scope\":\"target\",\"after_sequence\":4,\"through_sequence\":7,\"dropped\":3}\n"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn activity_cli_stream_state_rejects_overlapping_gap_and_event_ranges() {
+        let attach = ActivityAttachResult {
+            control_protocol: CONTROL_PROTOCOL_VERSION,
+            activity_schema: ACTIVITY_SCHEMA_VERSION,
+            generation: ACTIVITY_TEST_GENERATION,
+            snapshot_sequence: 3,
+            replayed: 0,
+            history_truncated: false,
+        };
+        let mut state = ActivityStreamState::new(attach, Some("target".to_owned()));
+        state
+            .decode_line(
+                "{\"type\":\"activity_end\",\"snapshot_sequence\":3,\"history_truncated\":false}\n",
+            )
+            .unwrap();
+        state
+            .decode_line(
+                "{\"type\":\"activity_gap\",\"scope\":\"all_sessions\",\"after_sequence\":5,\"through_sequence\":7,\"dropped\":2}\n",
+            )
+            .unwrap();
+        assert!(
+            state
+                .decode_line(
+                    "{\"type\":\"activity_gap\",\"scope\":\"all_sessions\",\"after_sequence\":6,\"through_sequence\":8,\"dropped\":2}\n",
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .decode_line(&activity_test_frame(7, Some("target")))
+                .is_err()
+        );
     }
 
     #[tokio::test]
