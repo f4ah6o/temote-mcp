@@ -206,3 +206,22 @@ Local stdio can expose the explicitly approval-gated `without_sandbox` tool. The
 - There is no secret-file denylist; permitted roots are the primary filesystem boundary.
 - Runtime audit records operation/status/timing metadata, not command arguments, command output, authenticated identity fields, or secret values.
 - Secret-bearing integrations keep credentials in the session process rather than session metadata.
+
+## Remote upgrade and reconnect
+
+Authenticated direct HTTP exposes `upgrade_preflight`, `upgrade_apply`, and
+`upgrade_status`. These tools are intentionally absent from stdio MCP and the
+multi-host gateway. Preflight and status are read-only host lifecycle calls.
+Apply accepts only an active managed normal `session_id` and an optional
+`expected_version`; it never accepts an executable path, URL, command, argv, or
+environment. Ask and agent sessions both require explicit approval from the
+local user, and public yolo sessions are rejected.
+
+After `upgrade_apply` returns a newly accepted transaction, Temote closes that
+HTTP connection and a detached local coordinator owns the remaining work. The
+client should reconnect to the same configured endpoint with normal
+authentication, verify the host/version/boot identity from initialize or ping,
+and call `upgrade_status(transaction_id)` until it is terminal. Temote cannot
+force an arbitrary MCP client to reconnect. A successful status means the
+coordinator verified the target version, stable host identity, session restore,
+and a new boot generation when ingress replacement was required.

@@ -140,8 +140,8 @@ fn resolve_codex_home() -> Result<PathBuf, String> {
 }
 
 fn current_binary() -> Result<PathBuf, String> {
-    let path = std::env::current_exe()
-        .map_err(|error| format!("could not resolve current temote-mcp binary: {error}"))?;
+    let path = crate::session_control::installed_upgrade_locator()
+        .map_err(|error| format!("could not resolve installed temote-mcp binary: {error:#}"))?;
     canonical_binary(&path)
 }
 

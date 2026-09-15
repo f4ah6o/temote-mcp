@@ -299,7 +299,7 @@ fn sidecar_executable() -> Result<PathBuf> {
         );
         return Ok(path);
     }
-    let executable = std::env::current_exe()?;
+    let executable = crate::session_control::installed_upgrade_locator()?;
     let directory = executable
         .parent()
         .context("temote-mcp executable has no parent directory")?;

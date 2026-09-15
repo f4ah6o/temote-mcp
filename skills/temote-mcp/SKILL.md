@@ -150,3 +150,15 @@ When a tool fails:
 ## Completion
 
 For implementation tasks, complete the requested lifecycle in the same turn when tools permit it: inspect, edit, test, review diff, commit, and push if the user requested push. Report concrete validation results, commit ID, push result, and any remaining limitation.
+
+## Direct-HTTP remote upgrade
+
+Use `upgrade_preflight` before proposing an upgrade. `upgrade_apply` accepts an
+active managed normal `session_id` and optional `expected_version`; never invent
+or pass an executable path, URL, command, argv, or environment. Both ask and
+agent sessions require explicit approval by the local user. The accepted HTTP
+connection is intentionally closed after its response is flushed. Reconnect to
+the same endpoint with normal authentication, verify process identity from
+initialize or ping, and call `upgrade_status(transaction_id)` until terminal.
+Temote cannot force the MCP client to reconnect. These tools are available only
+on authenticated direct HTTP, not stdio or the gateway.

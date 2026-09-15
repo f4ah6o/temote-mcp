@@ -69,7 +69,10 @@ pub fn run_main() -> ! {
 }
 
 fn helper_executable() -> Result<PathBuf> {
-    let executable = std::env::current_exe()?;
+    let executable = match std::env::var_os("TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR") {
+        Some(locator) => std::fs::canonicalize(locator)?,
+        None => std::env::current_exe()?,
+    };
     let directory = executable
         .parent()
         .context("temote-mcp executable has no parent directory")?;

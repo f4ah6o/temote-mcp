@@ -145,6 +145,15 @@ pub struct UpgradeSessionBlocker {
 pub struct SupervisorUpgradePreview {
     pub plan: SupervisorUpgradePlan,
     pub blocked_sessions: Vec<UpgradeSessionBlocker>,
+    #[serde(default)]
+    pub active_sessions: Vec<SupervisorUpgradeSessionIdentity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupervisorUpgradeSessionIdentity {
+    pub session_id: String,
+    pub process_id: u32,
+    pub started_at: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +161,32 @@ struct UpgradePlanOptions {
     fence: bool,
     force: bool,
     collect_blockers: bool,
+}
+
+pub(crate) struct SupervisorUpgradePlanRequest<'a> {
+    target_version: &'a str,
+    control_protocol: u64,
+    lifecycle_schema: u64,
+    available_environment: &'a approvals::CapturedStartEnvironment,
+    force: bool,
+}
+
+impl<'a> SupervisorUpgradePlanRequest<'a> {
+    pub(crate) fn new(
+        target_version: &'a str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &'a approvals::CapturedStartEnvironment,
+        force: bool,
+    ) -> Self {
+        Self {
+            target_version,
+            control_protocol,
+            lifecycle_schema,
+            available_environment,
+            force,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -484,6 +519,35 @@ impl SessionSupervisor {
         self.stop_owned(session_id, true).await
     }
 
+    pub async fn validate_public_upgrade_session(
+        &self,
+        session_id: &str,
+    ) -> Result<config::Session> {
+        config::validate_session_id(session_id)?;
+        anyhow::ensure!(
+            self.public_sessions.lock().await.contains(session_id),
+            "upgrade_apply requires a session managed by this authenticated HTTP server"
+        );
+        anyhow::ensure!(
+            self.sessions.lock().await.contains_key(session_id),
+            "upgrade_apply requires an active managed session"
+        );
+        let lifecycle = config::read_session_lifecycle(session_id)
+            .await?
+            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+        anyhow::ensure!(
+            lifecycle.status == config::LifecycleStatus::Active
+                && config::session_is_active(session_id).await?,
+            "upgrade_apply requires an ACTIVE managed session"
+        );
+        let session = config::read_session_metadata(session_id).await?;
+        anyhow::ensure!(
+            !session.permission_mode.is_yolo(),
+            "upgrade_apply rejects public yolo sessions"
+        );
+        Ok(session)
+    }
+
     pub async fn forget_session(
         &self,
         session_id: &str,
@@ -737,6 +801,7 @@ impl SessionSupervisor {
         cleanup_result
     }
 
+    #[cfg(test)]
     pub async fn build_upgrade_plan(
         &self,
         target_version: &str,
@@ -746,17 +811,38 @@ impl SessionSupervisor {
         fence: bool,
         force: bool,
     ) -> Result<SupervisorUpgradePlan> {
-        let preview = self
-            .prepare_upgrade_plan(
+        self.build_upgrade_plan_with_expected(
+            SupervisorUpgradePlanRequest::new(
                 target_version,
                 control_protocol,
                 lifecycle_schema,
                 available_environment,
+                force,
+            ),
+            fence,
+            None,
+        )
+        .await
+    }
+
+    pub async fn build_upgrade_plan_with_expected(
+        &self,
+        request: SupervisorUpgradePlanRequest<'_>,
+        fence: bool,
+        expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
+    ) -> Result<SupervisorUpgradePlan> {
+        let preview = self
+            .prepare_upgrade_plan(
+                request.target_version,
+                request.control_protocol,
+                request.lifecycle_schema,
+                request.available_environment,
                 UpgradePlanOptions {
                     fence,
-                    force,
+                    force: request.force,
                     collect_blockers: false,
                 },
+                expected_sessions,
             )
             .await?;
         Ok(preview.plan)
@@ -780,6 +866,7 @@ impl SessionSupervisor {
                 force,
                 collect_blockers: true,
             },
+            None,
         )
         .await
     }
@@ -791,6 +878,7 @@ impl SessionSupervisor {
         lifecycle_schema: u64,
         available_environment: &approvals::CapturedStartEnvironment,
         options: UpgradePlanOptions,
+        expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
     ) -> Result<SupervisorUpgradePreview> {
         let _transition = self.transitions.lock().await;
         anyhow::ensure!(
@@ -801,6 +889,37 @@ impl SessionSupervisor {
 
         let source_version = env!("CARGO_PKG_VERSION").to_owned();
         let handoff_required = options.force || source_version != target_version;
+        let active_sessions = {
+            let sessions = self.sessions.lock().await;
+            let mut identities = Vec::with_capacity(sessions.len());
+            for (session_id, handle) in sessions.iter() {
+                let snapshot = handle.snapshot().await?;
+                identities.push(SupervisorUpgradeSessionIdentity {
+                    session_id: session_id.clone(),
+                    process_id: snapshot.process_id,
+                    started_at: snapshot.started_at,
+                });
+            }
+            identities.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+            identities
+        };
+        if let Some(expected) = expected_sessions {
+            anyhow::ensure!(
+                active_sessions.len() == expected.len(),
+                "approved session set changed before supervisor handoff"
+            );
+            for expected in expected {
+                let current = active_sessions
+                    .iter()
+                    .find(|session| session.session_id == expected.session_id)
+                    .context("approved session set changed before supervisor handoff")?;
+                anyhow::ensure!(
+                    current.process_id == expected.source_process_id
+                        && current.started_at == expected.source_started_at,
+                    "approved session instance changed before supervisor handoff"
+                );
+            }
+        }
         let mut plans = Vec::new();
         let mut blocked_sessions = Vec::new();
         if handoff_required {
@@ -895,6 +1014,7 @@ impl SessionSupervisor {
                 sessions: plans,
             },
             blocked_sessions,
+            active_sessions,
         })
     }
 
@@ -2103,6 +2223,60 @@ mod tests {
         assert!(!plan.handoff_required);
         assert!(plan.sessions.is_empty());
         // A no-op must not leave lifecycle mutation fenced.
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn same_version_preview_freezes_active_session_identity() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("upgrade-noop-preview-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::default();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        let preview = supervisor
+            .preview_upgrade_plan(env!("CARGO_PKG_VERSION"), 1, 1, &environment, false)
+            .await
+            .unwrap();
+        assert!(!preview.plan.handoff_required);
+        assert_eq!(preview.active_sessions.len(), 1);
+        assert_eq!(preview.active_sessions[0].session_id, id);
+        assert!(preview.active_sessions[0].process_id > 0);
+        assert!(preview.active_sessions[0].started_at > 0);
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_fence_rejects_replaced_approved_session_instance() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("upgrade-expected-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::default();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        let session = config::read_session_metadata(&id).await.unwrap();
+        let expected = [crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: id.clone(),
+            source_process_id: session.process_id.saturating_add(1),
+            source_started_at: session.started_at,
+        }];
+        let error = supervisor
+            .build_upgrade_plan_with_expected(
+                SupervisorUpgradePlanRequest::new("different-version", 1, 1, &environment, false),
+                true,
+                Some(&expected),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session instance changed"));
         supervisor.stop(&id).await.unwrap();
         supervisor.shutdown().await.unwrap();
         cleanup_session(&id).await;

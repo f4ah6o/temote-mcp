@@ -32,6 +32,12 @@ pub enum Command {
         dry_run: bool,
         force: bool,
     },
+    UpgradeCoordinator {
+        transaction_id: String,
+        commit_fd: i32,
+        executable_fd: i32,
+        installed_locator: PathBuf,
+    },
     Activity {
         session_id: Option<String>,
         tail: usize,
@@ -235,6 +241,41 @@ where
             .take(&mut args)
             .is_present();
         return finish(args, Command::Upgrade { dry_run, force });
+    }
+    if noargs::cmd("upgrade-coordinator")
+        .doc("Internal: continue one accepted remote upgrade transaction")
+        .take(&mut args)
+        .is_present()
+    {
+        let transaction_id = noargs::opt("transaction")
+            .ty("ID")
+            .take(&mut args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(opt.value().to_owned()))
+            .map_err(format_error)?;
+        let commit_fd = noargs::opt("commit-fd")
+            .ty("FD")
+            .take(&mut args)
+            .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
+            .map_err(format_error)?;
+        let executable_fd = noargs::opt("executable-fd")
+            .ty("FD")
+            .take(&mut args)
+            .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
+            .map_err(format_error)?;
+        let installed_locator = noargs::opt("installed-locator")
+            .ty("PATH")
+            .take(&mut args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(PathBuf::from(opt.value())))
+            .map_err(format_error)?;
+        return finish(
+            args,
+            Command::UpgradeCoordinator {
+                transaction_id,
+                commit_fd,
+                executable_fd,
+                installed_locator,
+            },
+        );
     }
     if noargs::cmd("activity")
         .doc("Show recent local supervisor activity and follow new events")

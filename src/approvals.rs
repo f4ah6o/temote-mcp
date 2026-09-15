@@ -622,6 +622,9 @@ pub(crate) enum ApprovalClass {
     /// Local-only escape hatches that leave the Temote sandbox
     /// (`without_sandbox`).
     HostUnrestricted,
+    /// Applying the locally installed Temote binary from authenticated HTTP.
+    /// This always crosses the explicit local-user approval boundary.
+    RemoteUpgrade,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -653,6 +656,7 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
             config::PermissionMode::Ask => Request,
             _ => Skip,
         },
+        RemoteUpgrade => RequestUser,
         CodexAppServer | HostUnrestricted => match mode {
             config::PermissionMode::Yolo => Skip,
             _ => Request,
@@ -4370,6 +4374,9 @@ esac
             assert_eq!(local_approval(Ask, class), Request, "{class:?}");
             assert_eq!(local_approval(Agent, class), Request, "{class:?}");
             assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");
+        }
+        for mode in [Ask, Agent, Yolo] {
+            assert_eq!(local_approval(mode, RemoteUpgrade), RequestUser);
         }
     }
 

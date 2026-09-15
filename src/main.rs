@@ -48,6 +48,8 @@ mod session_control;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
+#[cfg(all(feature = "network", unix))]
+mod upgrade_coordinator;
 mod upgrade_transaction;
 mod work_handoff;
 
@@ -67,7 +69,6 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    approvals::bootstrap_service_account_process_boundary()?;
     let cli = match cli::parse_env() {
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Ok(cli::ParseOutcome::Print(output)) => {
@@ -79,6 +80,21 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if let Some(cli::Command::UpgradeCoordinator {
+        installed_locator, ..
+    }) = cli.command.as_ref()
+    {
+        session_control::initialize_installed_upgrade_locator_from(installed_locator)?;
+    } else if let Some(installed_locator) =
+        std::env::var_os(session_control::INTERNAL_INSTALLED_LOCATOR_ENV)
+    {
+        session_control::initialize_installed_upgrade_locator_from(std::path::Path::new(
+            &installed_locator,
+        ))?;
+    } else {
+        session_control::initialize_installed_upgrade_locator()?;
+    }
+    approvals::bootstrap_service_account_process_boundary()?;
     match cli.command.unwrap_or(cli::Command::Start {
         session_id: None,
         yolo: false,
@@ -113,6 +129,22 @@ async fn main() -> Result<()> {
             }
         }
         cli::Command::Upgrade { dry_run, force } => session_control::upgrade(dry_run, force).await,
+        cli::Command::UpgradeCoordinator {
+            transaction_id,
+            commit_fd,
+            executable_fd,
+            installed_locator: _,
+        } => {
+            #[cfg(all(feature = "network", unix))]
+            {
+                upgrade_coordinator::run_child(transaction_id, commit_fd, executable_fd).await
+            }
+            #[cfg(not(all(feature = "network", unix)))]
+            {
+                let _ = (transaction_id, commit_fd, executable_fd);
+                anyhow::bail!("remote upgrade coordinator is unsupported on this platform")
+            }
+        }
         cli::Command::Activity {
             session_id,
             tail,

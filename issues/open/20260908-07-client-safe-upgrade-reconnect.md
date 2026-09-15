@@ -139,6 +139,67 @@ cross-process admission lock, which belong to the `upgrade_apply` mutation path.
 
 Suggested implementation order step 1 landed on main: `src/upgrade_transaction.rs` provides the durable transaction schema (`UpgradeTransaction`, `UpgradeTransactionState` with prepared/committed/…/completed/failed/rolled_back), owner-only bounded atomic storage under `<state>/upgrade-transactions/<uuid>.json`, strict canonical UUID path validation, symlink/public-mode/oversize rejection on read, an exclusive `flock`-based per-transaction lock with automatic stale-owner release, bounded transaction listing, terminal-state locking, and secret-free schema tests. The remote tools, coordinator, response-flush barrier, and reconnect contract remain unimplemented.
 
+## Implementation status (2026-09-15, direct HTTP coordinator and Linux reconnect proof)
+
+The direct HTTP upgrade path is implemented for an already-installed Temote
+candidate:
+
+- authenticated direct HTTP exposes `upgrade_preflight`, `upgrade_apply`, and
+  `upgrade_status`; the gateway and stdio surfaces do not expose these tools;
+- apply accepts only an active managed normal public session, requires explicit
+  local approval in `ask` and `agent`, and rejects `yolo` sessions;
+- the approved candidate digest, installed locator, target version, source host,
+  source boot generation, restart plan, and exact active-session identities are
+  persisted or revalidated before mutation;
+- a double-forked one-shot coordinator owns the transaction independently of the
+  ingress process. Admission remains locked until the child reports `READY`, the
+  transaction lease remains locked through the terminal state, and a private
+  `READY` / `COMMIT` channel aborts on EOF before commit;
+- HTTP/1 responses use `Connection: close`. The transport sends `COMMIT` only
+  after the complete accepted response body and connection-driver shutdown have
+  succeeded; serialization, write, flush, or shutdown failure aborts without
+  starting destructive work;
+- upgrade-only supervisor control exchanges have one total deadline across
+  connect, write, shutdown, and response read. Handoff polling shares its
+  absolute deadline. Stalled private-listener tests verify timeout and release of
+  both admission and per-transaction locks;
+- local `temote-mcp upgrade` uses the same supervisor primitives and the same
+  cross-process runtime admission lock. Same-version forced handoff requires a
+  changed supervisor boot generation before the executable snapshot can be
+  released.
+
+Linux process evidence was captured with a fully private outer `HOME`,
+`CODEX_HOME`, XDG state/config/cache/runtime, `TMPDIR`, Temote runtime/socket
+namespace, and dedicated Cargo target. Exactly one ignored test ran:
+
+```text
+direct_http_upgrade_reconnects_after_real_ingress_replacement ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The 149.61-second test built a copied-source `2026.8.1` candidate without editing
+repository version metadata. It observed a successful 6.746-second preflight and
+26.267-second apply, then checked all of the following against the real atomic
+installed-image replacement, same-PID supervisor exec, direct-ingress restart,
+and OAuth reconnect:
+
+- the accepted response used `Connection: close` and returned the same durable
+  transaction ID later exposed by health and status;
+- the stable host ID stayed `upgrade-reconnect-e2e`, the version became
+  `2026.8.1`, and the replacement boot generation differed from the source;
+- the supervisor retained its PID, restored both approved sessions, and the
+  terminal status reported `completed`, matching verified host/version/boot
+  identity, `restored_session_count = 2`, and no failure summary;
+- reconnect performed fresh OAuth and MCP `initialize`, whose process identity
+  matched the replacement health identity;
+- both restored sessions were active with their approved logical paths and
+  `agent` permission mode, the execution snapshot was removed, all fixture
+  processes shut down, and no process retaining the private namespace remained.
+
+The Linux result does not establish macOS behavior. The required macOS
+process-boundary reconnect E2E remains pending, so this issue stays open and no
+both-platform completion claim is made.
+
 ## Background
 
 Temote already has a strong local upgrade path from `issues/open/20260902-zero-downtime-supervisor-upgrade.md`:
