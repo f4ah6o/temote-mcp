@@ -1273,13 +1273,19 @@ async fn call_tool_with_local_agent_executable(
                     .and_then(Value::as_str)
                     .context("missing tool_name")?;
                 let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                onepassword_mcp::call_tool_with_activity(
+                let result = onepassword_mcp::call_tool_with_activity(
                     &session,
                     tool_name,
                     arguments,
                     activity.as_ref(),
                 )
-                .await
+                .await?;
+                finish_embedded_activity_failure(
+                    activity.as_ref(),
+                    &result,
+                    EmbeddedActivityStatus::McpIsError,
+                );
+                Ok(result)
             }
             "onepassword_item_get" => {
                 let items = required_string_array(&args, "items")?;
@@ -1451,6 +1457,11 @@ async fn call_tool_with_local_agent_executable(
                     allowed_locators,
                 )
                 .await?;
+                finish_embedded_activity_failure(
+                    activity.as_ref(),
+                    &result,
+                    EmbeddedActivityStatus::ExitCode,
+                );
                 text_result(serde_json::to_string_pretty(&result)?)
             }
             "kintone_mcp_status" => {
@@ -1491,6 +1502,11 @@ async fn call_tool_with_local_agent_executable(
                 )
                 .await?;
                 let result = approvals::kintone_mcp_call(&session.id, tool_name, arguments).await?;
+                finish_embedded_activity_failure(
+                    activity.as_ref(),
+                    &result,
+                    EmbeddedActivityStatus::McpIsError,
+                );
                 approvals::activity(
                     &session.id,
                     format!("Called kintone MCP tool {tool_name}"),
@@ -1545,6 +1561,11 @@ async fn call_tool_with_local_agent_executable(
                 let result =
                     approvals::kintone_cli_run(&session.id, cwd, arguments.clone(), stdout_path)
                         .await?;
+                finish_embedded_activity_failure(
+                    activity.as_ref(),
+                    &result,
+                    EmbeddedActivityStatus::ExitCode,
+                );
                 approvals::activity(
                     &session.id,
                     format!("Ran cli-kintone {} {}", arguments[0], arguments[1]),
@@ -1882,6 +1903,32 @@ fn finish_tool_activity_on_error(activity: Option<&ActivityScope>, result: &Resu
     {
         let _ = activity
             .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmbeddedActivityStatus {
+    McpIsError,
+    ExitCode,
+}
+
+fn finish_embedded_activity_failure(
+    activity: Option<&ActivityScope>,
+    result: &Value,
+    status: EmbeddedActivityStatus,
+) {
+    let failed = match status {
+        EmbeddedActivityStatus::McpIsError => {
+            result.get("isError").and_then(Value::as_bool) == Some(true)
+        }
+        EmbeddedActivityStatus::ExitCode => result
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|exit_code| exit_code != 0),
+    };
+    if failed && let Some(activity) = activity {
+        let _ =
+            activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ChildFailed));
     }
 }
 
@@ -4267,6 +4314,80 @@ mod tests {
             denied.last().unwrap().summary(),
             &ActivitySummary::failure(ActivityErrorKind::ApprovalDenied)
         );
+    }
+
+    #[test]
+    fn activity_coverage_embedded_integration_failures_preserve_results_and_privacy() {
+        for (name, status, result) in [
+            (
+                "onepassword_mcp_call",
+                EmbeddedActivityStatus::McpIsError,
+                json!({"isError": true, "content": [{"text": "op-secret-sentinel"}]}),
+            ),
+            (
+                "kintone_mcp_call",
+                EmbeddedActivityStatus::McpIsError,
+                json!({"isError": true, "content": [{"text": "kintone-secret-sentinel"}]}),
+            ),
+            (
+                "onepassword_service_account_run",
+                EmbeddedActivityStatus::ExitCode,
+                json!({"exit_code": 7, "stderr": "service-secret-sentinel"}),
+            ),
+            (
+                "kintone_cli_run",
+                EmbeddedActivityStatus::ExitCode,
+                json!({"exit_code": -1, "stderr": "cli-secret-sentinel"}),
+            ),
+        ] {
+            let coverage = activity_tool_coverage(name).unwrap();
+            let (scope, emitter) = activity_job_scope(coverage.operation);
+            let unchanged = result.clone();
+            finish_embedded_activity_failure(Some(&scope), &result, status);
+            finish_covered_tool_activity(Some(coverage), Some(&scope), &Ok(result.clone()));
+
+            assert_eq!(result, unchanged, "response changed for {name}");
+            let updates = emitter.updates();
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(ActivityUpdate::state)
+                    .collect::<Vec<_>>(),
+                vec![ActivityState::Started, ActivityState::Failed],
+                "embedded failure state mismatch for {name}"
+            );
+            assert_eq!(
+                updates.last().unwrap().summary(),
+                &ActivitySummary::failure(ActivityErrorKind::ChildFailed)
+            );
+            assert!(
+                updates
+                    .iter()
+                    .all(|update| !update.summary().safe_summary().contains("sentinel"))
+            );
+        }
+
+        for (name, status, result) in [
+            (
+                "onepassword_mcp_call",
+                EmbeddedActivityStatus::McpIsError,
+                json!({"isError": false}),
+            ),
+            (
+                "kintone_cli_run",
+                EmbeddedActivityStatus::ExitCode,
+                json!({"exit_code": 0}),
+            ),
+        ] {
+            let coverage = activity_tool_coverage(name).unwrap();
+            let (scope, emitter) = activity_job_scope(coverage.operation);
+            finish_embedded_activity_failure(Some(&scope), &result, status);
+            finish_covered_tool_activity(Some(coverage), Some(&scope), &Ok(result));
+            assert_eq!(
+                emitter.states(),
+                vec![ActivityState::Started, ActivityState::Completed]
+            );
+        }
     }
 
     #[tokio::test]
