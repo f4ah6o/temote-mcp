@@ -1425,13 +1425,25 @@ fn git_activity_scope(
 
 fn git_activity_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
     match operation {
-        ActivityOperation::GitFetch | ActivityOperation::GitPull | ActivityOperation::GitPush => {
+        ActivityOperation::GitFetch => {
             let remote = match args.get("remote").and_then(Value::as_str) {
                 None | Some("origin") => ActivityRemote::Origin,
                 Some(_) => ActivityRemote::Other,
             };
             ActivitySummary::git(remote)
         }
+        ActivityOperation::GitPush => match args.get("remote").and_then(Value::as_str) {
+            Some("origin") => ActivitySummary::git(ActivityRemote::Origin),
+            Some(_) => ActivitySummary::git(ActivityRemote::Other),
+            None if args
+                .get("set_upstream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+            {
+                ActivitySummary::git(ActivityRemote::Origin)
+            }
+            None => ActivitySummary::empty(),
+        },
         _ => ActivitySummary::empty(),
     }
 }
@@ -5735,10 +5747,7 @@ mod tests {
     }
 
     fn recorded_git_pull_scope() -> (ActivityScope, RecordingActivityEmitter) {
-        recorded_scope(
-            ActivityOperation::GitPull,
-            ActivitySummary::git(ActivityRemote::Origin),
-        )
+        recorded_scope(ActivityOperation::GitPull, ActivitySummary::empty())
     }
 
     fn assert_git_completed(
@@ -5792,7 +5801,7 @@ mod tests {
         assert_eq!(git_activity_operation("git_status"), None);
         assert_eq!(
             git_activity_summary(&json!({}), ActivityOperation::GitPull).safe_summary(),
-            "remote=origin"
+            ""
         );
         assert_eq!(
             git_activity_summary(
@@ -5809,6 +5818,15 @@ mod tests {
             )
             .safe_summary(),
             "remote=other"
+        );
+        assert_eq!(
+            git_activity_summary(&json!({}), ActivityOperation::GitPush).safe_summary(),
+            ""
+        );
+        assert_eq!(
+            git_activity_summary(&json!({"set_upstream": true}), ActivityOperation::GitPush,)
+                .safe_summary(),
+            "remote=origin"
         );
         assert_eq!(
             git_activity_summary(&json!({}), ActivityOperation::GitCommit).safe_summary(),
@@ -6008,9 +6026,9 @@ mod tests {
             &ActivitySummary::empty(),
         );
 
-        let origin_summary = ActivitySummary::git(ActivityRemote::Origin);
+        let empty_summary = ActivitySummary::empty();
         let (push_scope, push_emitter) =
-            recorded_scope(ActivityOperation::GitPush, origin_summary.clone());
+            recorded_scope(ActivityOperation::GitPush, empty_summary.clone());
         let push_result = git_push(
             &json!({"session_id": session.id, "cwd": cwd}),
             &session,
@@ -6019,8 +6037,9 @@ mod tests {
         .await;
         finish_tool_activity(Some(&push_scope), &push_result);
         assert!(push_result.is_ok());
-        assert_git_completed(&push_emitter, ActivityOperation::GitPush, &origin_summary);
+        assert_git_completed(&push_emitter, ActivityOperation::GitPush, &empty_summary);
 
+        let origin_summary = ActivitySummary::git(ActivityRemote::Origin);
         let (fetch_scope, fetch_emitter) =
             recorded_scope(ActivityOperation::GitFetch, origin_summary.clone());
         let fetch_result = git_fetch(
