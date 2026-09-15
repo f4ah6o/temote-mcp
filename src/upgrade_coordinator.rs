@@ -16,7 +16,10 @@ use crate::upgrade_transaction::{
     UpgradeTransactionState, UpgradeTransactionStatus, UpgradeVerifiedIdentity,
 };
 
-const COORDINATOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
+// READY follows a second bounded digest and capability check of an executable
+// that may be as large as MAX_UPGRADE_EXECUTABLE_BYTES. Debug builds and slower
+// filesystems can legitimately take longer than the ordinary control timeout.
+const COORDINATOR_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const COORDINATOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
