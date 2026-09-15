@@ -1593,8 +1593,8 @@ fn cloudflare_error_detail(errors: &[CloudflareApiError]) -> String {
 
 #[cfg(target_os = "linux")]
 fn check_linux_helper(report: &mut Report) -> Result<bool> {
-    let executable =
-        std::env::current_exe().context("could not determine temote-mcp executable")?;
+    let executable = crate::session_control::installed_upgrade_locator()
+        .context("could not determine installed temote-mcp executable")?;
     let directory = executable
         .parent()
         .context("temote-mcp executable has no parent directory")?;

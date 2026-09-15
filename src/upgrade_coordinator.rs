@@ -582,7 +582,10 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
                 UpgradeTransactionState::PluginReconciling => {
                     let executable =
                         session_control::revalidate_installed_upgrade_executable(&self.executable)?;
-                    session_control::reconcile_codex_plugin(&executable)?
+                    session_control::reconcile_codex_plugin(
+                        &executable,
+                        self.executable.installed_locator(),
+                    )?
                 }
                 UpgradeTransactionState::Completed => {}
                 _ => anyhow::bail!("unsupported coordinator phase {}", phase.as_str()),

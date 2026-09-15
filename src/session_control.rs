@@ -65,6 +65,14 @@ pub fn initialize_installed_upgrade_locator_from(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn installed_upgrade_locator() -> Result<PathBuf> {
+    initialize_installed_upgrade_locator()?;
+    INSTALLED_UPGRADE_LOCATOR
+        .get()
+        .cloned()
+        .context("installed Temote executable locator was not initialized")
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ControlRequest {
@@ -1446,11 +1454,13 @@ pub struct InstalledUpgradeExecutable {
 
 #[derive(Debug)]
 struct UpgradeExecutionBinding {
+    directory: PathBuf,
     path: PathBuf,
     file: std::fs::File,
 }
 
 struct PendingUpgradeSnapshot {
+    directory: PathBuf,
     path: PathBuf,
     armed: bool,
 }
@@ -1459,6 +1469,7 @@ impl Drop for PendingUpgradeSnapshot {
     fn drop(&mut self) {
         if self.armed {
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.directory);
         }
     }
 }
@@ -1466,6 +1477,7 @@ impl Drop for PendingUpgradeSnapshot {
 impl Drop for UpgradeExecutionBinding {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 
@@ -1510,7 +1522,16 @@ fn create_upgrade_execution_snapshot(
             && directory_metadata.permissions().mode() & 0o077 == 0,
         "upgrade candidate directory is not private to the current user"
     );
-    let path = directory.join(format!("{}.candidate", uuid::Uuid::new_v4()));
+    let snapshot_directory = directory.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&snapshot_directory)
+        .context("cannot create private upgrade execution snapshot directory")?;
+    std::fs::set_permissions(&snapshot_directory, std::fs::Permissions::from_mode(0o700))?;
+    let path = snapshot_directory.join("temote-mcp");
+    let mut cleanup = PendingUpgradeSnapshot {
+        directory: snapshot_directory.clone(),
+        path: path.clone(),
+        armed: true,
+    };
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1519,10 +1540,6 @@ fn create_upgrade_execution_snapshot(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .context("cannot create private upgrade execution snapshot")?;
-    let mut cleanup = PendingUpgradeSnapshot {
-        path: path.clone(),
-        armed: true,
-    };
     source.seek(std::io::SeekFrom::Start(0))?;
     let copied = std::io::copy(
         &mut source.take(MAX_UPGRADE_EXECUTABLE_BYTES + 1),
@@ -1544,7 +1561,11 @@ fn create_upgrade_execution_snapshot(
         .context("cannot reopen private upgrade execution snapshot")?;
     file.seek(std::io::SeekFrom::Start(0))?;
     cleanup.armed = false;
-    Ok(UpgradeExecutionBinding { path, file })
+    Ok(UpgradeExecutionBinding {
+        directory: snapshot_directory,
+        path,
+        file,
+    })
 }
 
 fn bounded_upgrade_executable_digest(file: &mut std::fs::File) -> Result<[u8; 32]> {
@@ -1882,9 +1903,8 @@ pub async fn apply_supervisor_upgrade(
     Ok(plan.sessions.len())
 }
 
-pub fn reconcile_codex_plugin(executable: &Path) -> Result<()> {
-    let output = std::process::Command::new(executable)
-        .args(["codex", "plugin", "install"])
+pub fn reconcile_codex_plugin(executable: &Path, installed_locator: &Path) -> Result<()> {
+    let output = codex_plugin_reconcile_command(executable, installed_locator)
         .output()
         .context("Codex plugin reconciliation could not start")?;
     anyhow::ensure!(
@@ -1892,6 +1912,17 @@ pub fn reconcile_codex_plugin(executable: &Path) -> Result<()> {
         "Codex plugin reconciliation failed"
     );
     Ok(())
+}
+
+fn codex_plugin_reconcile_command(
+    executable: &Path,
+    installed_locator: &Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .env(INTERNAL_INSTALLED_LOCATOR_ENV, installed_locator)
+        .args(["codex", "plugin", "install"]);
+    command
 }
 
 pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
@@ -1932,7 +1963,7 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         .await?;
     }
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
-    if let Err(error) = reconcile_codex_plugin(&executable_path) {
+    if let Err(error) = reconcile_codex_plugin(&executable_path, executable.installed_locator()) {
         eprintln!("{error:#}; run `temote-mcp codex plugin install` manually");
     }
     println!(
@@ -2967,8 +2998,32 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"approved\n");
         let snapshot_path = snapshot.path.clone();
+        let snapshot_directory = snapshot.directory.clone();
+        assert_eq!(snapshot_path.file_name().unwrap(), "temote-mcp");
         drop(snapshot);
         assert!(!snapshot_path.exists());
+        assert!(!snapshot_directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_plugin_reconciliation_preserves_installed_locator_for_snapshot_child() {
+        let executable = Path::new("/private/upgrade-snapshot/temote-mcp");
+        let installed_locator = Path::new("/private/installed/temote-mcp");
+        let command = codex_plugin_reconcile_command(executable, installed_locator);
+
+        assert_eq!(command.get_program(), executable);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["codex", "plugin", "install"]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == INTERNAL_INSTALLED_LOCATOR_ENV)
+                .and_then(|(_, value)| value),
+            Some(installed_locator.as_os_str())
+        );
     }
 
     #[test]

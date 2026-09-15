@@ -192,3 +192,25 @@ Tailscale profile の未認証 `/mcp` は `401` と Bearer `WWW-Authenticate` ch
 `TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` / `session_restart` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません（新規 session は `agent` が既定）。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` / `session_restart` は lifecycle supervisor が public-owned として保持する session に限定されます。public session-bound tool は別途起動した yolo session を拒否し、unrestricted な local semantics を remote access に引き継ぎません。
 
 remote profile に `without_sandbox` は出ません。通常 session は filesystem containment と network-disabled sandbox を維持します。既定の `agent` は検証済み structured operation の Temote 側 approval prompt だけを省略し、tool 固有 validation、integration の authentication、sandbox 境界は引き続き有効です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。
+
+## リモートアップグレードと再接続
+
+認証済みの直接 HTTP は `upgrade_preflight`、`upgrade_apply`、`upgrade_status` を公開します。
+stdio MCP とマルチホストゲートウェイには公開しません。
+preflight と status には session が不要です。
+apply には実行中の HTTP 管理下にある通常 session が必要で、`ask` と `agent` のどちらでもローカル所有者が明示的に承認します。
+公開 yolo session は拒否します。
+
+リモート request が選べるのは、ローカルにインストール済みの Temote 実行ファイルだけです。
+path、URL、command、argument vector、environment は指定できません。
+省略可能な `expected_version` は、インストール済み候補が変わっていないことを確認するために使います。
+
+新しい transaction を受け付けると、Temote は HTTP/1 response を書き込み、socket を shutdown してから、独立したローカル coordinator に supervisor または ingress の変更を許可します。
+この順序が証明するのは server 側の書き込みと shutdown の成功であり、client application が response を処理したことではありません。
+書き込みまたは shutdown に失敗した場合、coordinator は破壊的な処理を始める前に中止します。
+
+accepted response には transaction ID が含まれます。
+同じ endpoint に再接続して認証をやり直し、`initialize` または `ping` で host、version、boot identity を確認してから、`upgrade_status` が終端状態になるまで確認します。
+local OAuth の registration と token は process-local state なので、ingress を再起動した場合は OAuth authorization flow もやり直します。
+completed transaction は、検証した host、target version、boot generation、復元 session 数を返します。
+実行ファイルの path、session path、credential、header、command output は返しません。

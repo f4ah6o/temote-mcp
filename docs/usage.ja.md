@@ -216,3 +216,23 @@ local stdio では、ローカル承認付きの `without_sandbox` を公開で�
 - secret-file denylist はありません。filesystem の主な境界は permitted root です。
 - runtime audit は operation/status/timing を記録し、command 引数、output、認証 identity、secret value は永続化しません。
 - secret を使う integration は credential を session process に保持し、session metadata へ保存しません。
+
+## リモートアップグレードと再接続
+
+認証済みの直接 HTTP では `upgrade_preflight`、`upgrade_apply`、
+`upgrade_status` を公開します。これらのツールは stdio MCP とマルチホスト
+ゲートウェイには公開しません。preflight と status は読み取り専用のホスト
+ライフサイクル操作です。apply が受け付けるのは、実行中で管理対象の通常
+セッションを示す `session_id` と、省略可能な `expected_version` だけです。
+実行ファイルのパス、URL、コマンド、argv、環境変数は指定できません。
+ask と agent のどちらでもローカル利用者の明示的な承認が必要で、公開 yolo
+セッションは拒否されます。
+
+`upgrade_apply` が新しいトランザクションを accepted として返した後、Temote
+はその HTTP 接続を閉じ、独立したローカル coordinator が残りの処理を所有します。
+クライアントは通常の認証で同じエンドポイントへ再接続し、initialize または
+ping のホスト、バージョン、boot identity を確認してから、
+`upgrade_status(transaction_id)` が終端状態になるまで確認してください。
+Temote は任意の MCP クライアントに再接続を強制できません。成功状態は、対象
+バージョン、安定したホスト identity、セッション復元、および ingress を交換した
+場合の新しい boot generation を coordinator が検証したことを示します。
