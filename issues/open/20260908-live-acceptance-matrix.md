@@ -37,6 +37,8 @@ The source issues are archived under `issues/done/` after this consolidation.
 - [ ] At least two concurrent gateway sessions are exercised through one external MCP endpoint.
 - [ ] Reconnect/generation fencing is observed live; stale generations are rejected and non-idempotent calls are not auto-replayed.
 
+Current bounded evidence (2026-09-15): an isolated official Wrangler 4.131.2 invocation reused a private copy of the standard Wrangler config; `wrangler whoami` exited 0 and returned an authenticated account plus permission table. This establishes current account API authentication only. It does not establish deployed Worker configuration, secrets, Durable Object state, or request-path acceptance, and no deployment/configuration mutation was performed.
+
 ### Connection profile matrix
 
 - [ ] Cloudflare profile external live acceptance is re-run on the current release.

@@ -1,7 +1,8 @@
 # `local_agent_run` cannot launch Codex installed through Vite+ (`vp`)
 
-Status: open / bounded launcher dependency closure implemented; verification pending
+Status: open / bounded launcher dependency closure implemented; Linux model smoke passed, Linux workspace-write blocked by host nested-userns policy, macOS live verification pending
 Created: 2026-09-11
+Updated: 2026-09-15
 Priority: P1 developer workflow regression
 Related:
 - `src/local_agent.rs`
@@ -254,3 +255,13 @@ exit 71 at /Users/fu2hito/.vite-plus/bin/codex
 ```
 
 Current source inspection indicates that the active server is likely pre-closure. Rebuild and restart the active Temote server before treating this live result as verification of the fix. Acceptance remains incomplete pending an unsandboxed macOS run and a successful live Codex call through the rebuilt server.
+
+## Linux live qualification (2026-09-15)
+
+An isolated rebuilt Temote normal `agent` session selected the real Linux Vite+ launcher (`~/.vite-plus/bin/codex`, `vp` 0.3.1, Codex 0.147.0) without changing the installed runtime, global configuration, or authentication source. A verified Temote binary pair completed a Luna/max model smoke through that launcher with exit 0 and `VITE_READ_ONLY_OK` in 12.822 seconds. This proves launcher/model reachability only; the task did not read a canary file.
+
+`workspace_write` could not start any child command, including `pwd`, and the Codex file editor could not create an allowed workspace file. The exact inner Codex named permission profile succeeds when invoked directly outside the outer Temote sandbox. Under Temote's Linux local-agent bwrap, a nested user-namespace probe fails because this host enables `kernel.apparmor_restrict_unprivileged_userns=1` and enforces a `bwrap-userns-restrict` profile. Removing the inner Codex sandbox is not accepted because it would remove the explicit imported-auth deny.
+
+The attempted `.git` and sibling writes were absent, but this is not proof of those boundaries because the allowed workspace write failed as well. Linux acceptance remains pending on a host or outer sandbox backend that permits nested user namespaces while retaining the named-profile auth deny. Re-run a real read-only canary read, an allowed bounded workspace write, and the protected metadata/sibling denials on that environment. The required macOS Vite+ live acceptance remains separate and pending.
+
+One earlier evaluation binary pair reported a missing `@openai/codex-linux-x64` package even though the matching package/vendor executable existed. A separately built pair with the same relevant source passed in the same process environment. The binary artifact difference is not yet explained, so it is retained as a failed attempt rather than claimed as a product fix or current launcher defect.
