@@ -1,5 +1,6 @@
 use std::fs;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::thread;
@@ -9,6 +10,18 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_MCP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+fn set_nonblocking(file: &impl AsRawFd) {
+    let descriptor = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    assert!(flags >= 0, "failed to read descriptor flags");
+    assert_eq!(
+        unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0,
+        "failed to make descriptor nonblocking"
+    );
+}
 
 struct ChildGuard {
     child: Child,
@@ -65,6 +78,7 @@ impl McpClient {
         let mut process = ChildGuard::spawn(&mut command);
         let stdin = process.child.stdin.take().unwrap();
         let stdout = process.child.stdout.take().unwrap();
+        set_nonblocking(&stdout);
         Self {
             process,
             stdin: Some(stdin),
@@ -86,7 +100,26 @@ impl McpClient {
         writeln!(stdin, "{request}").unwrap();
         stdin.flush().unwrap();
         let mut response = String::new();
-        assert_ne!(self.stdout.read_line(&mut response).unwrap(), 0);
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        loop {
+            match self.stdout.read_line(&mut response) {
+                Ok(0) => panic!("MCP stdout closed before a response"),
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "MCP response timed out");
+                    assert!(
+                        response.len() <= MAX_MCP_RESPONSE_BYTES,
+                        "MCP response exceeded {MAX_MCP_RESPONSE_BYTES} bytes"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to read MCP response: {error}"),
+            }
+        }
+        assert!(
+            response.len() <= MAX_MCP_RESPONSE_BYTES,
+            "MCP response exceeded {MAX_MCP_RESPONSE_BYTES} bytes"
+        );
         let response: Value = serde_json::from_str(response.trim()).unwrap();
         assert_eq!(response["id"], id);
         response
@@ -169,11 +202,31 @@ impl Fixture {
     }
 
     fn run(&self, binary: &Path, args: &[&str]) -> Output {
-        self.command(binary)
+        let mut command = self.command(binary);
+        command
             .args(args)
             .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut process = ChildGuard::spawn(&mut command);
+        let mut stdout = process.child.stdout.take().unwrap();
+        let mut stderr = process.child.stderr.take().unwrap();
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let status = process.wait(PROCESS_TIMEOUT);
+        Output {
+            status,
+            stdout: stdout_reader.join().unwrap(),
+            stderr: stderr_reader.join().unwrap(),
+        }
     }
 
     fn start_supervisor(&self, binary: &Path) -> ChildGuard {
