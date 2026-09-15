@@ -1,6 +1,6 @@
 # Completion evaluation manifest (2026-09-15, Asia/Tokyo)
 
-Status: frozen before evaluated solutions were inspected; execution stopped incomplete at the user's request. The task definitions remain unchanged, and unattempted arms are recorded in the results document.
+Status: frozen before evaluated solutions were inspected; resumed validation is blocked at current connector qualification. The previous user-requested stop and all existing attempts remain recorded. Task definitions, bases, model/effort requests, dispatch order, and denominator rules are unchanged; no new evaluated arm started during this qualification attempt.
 
 ## Purpose and immutable boundary
 

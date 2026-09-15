@@ -1,8 +1,31 @@
 # Completion evaluation results (2026-09-15, Asia/Tokyo)
 
-Status: stopped incomplete at the user's request. Task definitions remain frozen in [`completion-evaluation-manifest-20260915.md`](completion-evaluation-manifest-20260915.md); completed evidence and partial attempts are preserved without filling the missing arms or reviews.
+Status: resumed validation is **blocked at current connector qualification**, not completed. Task definitions remain frozen in [`completion-evaluation-manifest-20260915.md`](completion-evaluation-manifest-20260915.md). The earlier user-requested stop, completed evidence, partial attempts, failures, and unknown values are preserved; the current qualification failures do not constitute new evaluated arms.
 
-The stop arrived while T05-C-r2 was running. The evaluator interrupted its owner process, whose cleanup path attempted the typed session-stop operation; that operation returned `Connection reset by peer`, after which the private supervisor was terminated. A scoped process-reference audit found no process using the run directory or clone target. The partial two-file candidate was committed clearly as incomplete. No later arm, test, or review was started after the stop.
+The previous stop arrived while T05-C-r2 was running. The evaluator interrupted its owner process, whose cleanup path attempted the typed session-stop operation; that operation returned `Connection reset by peer`, after which the private supervisor was terminated. A scoped process-reference audit found no process using the run directory or clone target. The partial two-file candidate was committed clearly as incomplete. No later arm, test, or review was started in that stopped evaluation run.
+
+## Resumed qualification and residual disposition (2026-09-15)
+
+The resumed connector operates on Linux host `ms-01-alpha` with scoped sessions reporting `active`, `permission_mode=agent`, and `yolo=false`. The existing integration, activity, and evaluation worktrees were preserved. An independent read-only S15/S16 reviewer requested through `local_agent_run` did not produce a review: the tool returned JSON-RPC `-32000`, exit 1, and `bwrap: execvp /home/hirohito-fujita/.cargo/bin/codex: No such file or directory`. A following job list was empty. This does not establish a provider/model outcome.
+
+The separate current-connector `codex_status` returned JSON-RPC `-32000` with `CODEX_APP_SERVER_INCOMPATIBLE: expected 0.153.4, got temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; 2026.9.7)`. No task-start request followed that incompatible status. The installed connector was not replaced, and the frozen comparison driver was not silently substituted. Credential, remote, host-policy, and global-runtime settings were not changed.
+
+| Residual unit | Current disposition | Preserved evidence / concrete unblock condition |
+| --- | --- | --- |
+| T01-A independent confirmation | **blocked** | Existing implementation and gate evidence remain; obtain a completed independent review in a functioning scoped reviewer runtime. No approval was inferred from those gates. |
+| T06-B independent review | **blocked** | Candidate `b84ba70` and parent-side checks remain unchanged; obtain independent review of that exact candidate, including the production-socket coverage limitation. |
+| T05-C | **blocked; previous r2 incomplete** | Preserve incomplete commit `0054b969ba9229b4a772793321f05c98c4074785`, the prior last observed running revision, and cleanup evidence. A new completed run/review requires the frozen qualified C driver and isolated arm context; the previous state is not relabeled failed or completed. |
+| T07-C | **blocked; unattempted** | No new arm started. Restore the frozen qualified C execution path, common base `a24a40029e48204718803843181e2a1684b23ea0`, and one-active-C rule. |
+| T08-C | **blocked; unattempted** | No new arm started. Restore the same C qualification at common base `8ebaf598d61704447ecd73e4c4cfdd6e50f37b2d`. |
+| T08-A | **blocked; unattempted** | Preserve the frozen BCA dispatch order and direct Sol/high arm identity. A parent-written solution or a different runtime is not an equivalent A attempt. |
+| T09-A/B/C | **blocked; unattempted** | S15 `5be77826b500b7f0a9bdc18e1731e320dedd0ffb` remains unapproved. Record an independently accepted exact base before the first arm, then preserve CAB order. |
+| T10-A/B/C | **blocked; unattempted** | Use the same independently accepted S15 base as T09 and preserve ABC order; no accepted base is currently declared. |
+
+The parent performed only a partial static inspection of S15/S16 and raised review questions about detached-upgrade nonce rebinding and the newly awaited activity bind. These are not independent approval or a live reproduction. Candidate-only tests on activity HEAD `8a6efff690963a0334757b161ad9729f6cd52db0` passed format, strict all-target Clippy, no-default-features check, and diff check, but the lib, filtered producer/ingress/lifecycle, and gateway commands failed in the current sandbox. Multiple lib failures explicitly report read-only `/var/tmp`; other individual causes were not established. Full final-integration and explicit process-boundary tests were not run. The detailed command ledger is `docs/evaluations/completion-residual-validation-20260915.md` on branch `codex/20260915-completion-activity`; do not count it as a comparison-arm gate or replace prior host evidence with it.
+
+An `Applied` resume receipt acknowledges reconciliation, not successful continuation or task completion. The previously recorded stopped-child qualification returned `Applied` with `Interrupted`; it did not directly record a replacement-process PID or demonstrate completion after resume. English/Japanese usage and the Agent Skill receive the same qualification in the activity documentation follow-up. No new live resume evidence was collected in this attempt.
+
+**Adoption decision: HOLD.** Reviewed selectable candidates remain available, but missing reviews, incomplete/unattempted arms, real-provider differences, and host-boundary gaps do not support a completed three-arm adoption or rollout recommendation. All previous attempted-arm denominators are unchanged; current pre-arm qualification failures are listed separately. Observed model identity, usage, cost, and post-resume completion stay unknown wherever they were not directly measured. No quota, time limit, or blanket runtime termination is inferred from these connector errors.
 
 ## Runtime qualification
 
