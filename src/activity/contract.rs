@@ -39,7 +39,11 @@ pub enum ActivityOperation {
     SessionStop,
     ReadFile,
     WriteFile,
+    GitAdd,
+    GitCommit,
+    GitFetch,
     GitPull,
+    GitPush,
 }
 
 impl<'de> Deserialize<'de> for ActivityOperation {
@@ -53,7 +57,11 @@ impl<'de> Deserialize<'de> for ActivityOperation {
             "session_stop" => Ok(Self::SessionStop),
             "read_file" => Ok(Self::ReadFile),
             "write_file" => Ok(Self::WriteFile),
+            "git_add" => Ok(Self::GitAdd),
+            "git_commit" => Ok(Self::GitCommit),
+            "git_fetch" => Ok(Self::GitFetch),
             "git_pull" => Ok(Self::GitPull),
+            "git_push" => Ok(Self::GitPush),
             _ => Err(serde_invalid_json()),
         }
     }
@@ -1052,7 +1060,11 @@ mod tests {
             (ActivityOperation::SessionStop, "session_stop"),
             (ActivityOperation::ReadFile, "read_file"),
             (ActivityOperation::WriteFile, "write_file"),
+            (ActivityOperation::GitAdd, "git_add"),
+            (ActivityOperation::GitCommit, "git_commit"),
+            (ActivityOperation::GitFetch, "git_fetch"),
             (ActivityOperation::GitPull, "git_pull"),
+            (ActivityOperation::GitPush, "git_push"),
         ];
         for (operation, expected) in operations {
             let encoded = encode_update(&update(
