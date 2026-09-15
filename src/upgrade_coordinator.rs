@@ -101,6 +101,7 @@ pub async fn prepare_apply(
     );
     let executable_path = session_control::revalidate_installed_upgrade_executable(&executable)?;
     let _admission = upgrade_transaction::acquire_admission_lock()?;
+    session_control::verify_planned_upgrade_sessions(&preflight.planned_sessions, true).await?;
 
     // Ownerless PREPARED means COMMIT could never have been observed. It is the
     // only non-terminal state that is safe to terminalize automatically.
@@ -144,8 +145,17 @@ pub async fn prepare_apply(
         preflight.direct_ingress_action == "restart",
     );
     transaction.planned_session_count = preflight.planned_session_count;
+    transaction.planned_sessions = preflight.planned_sessions;
+    transaction.approved_executable_sha256 = Some(executable.digest_hex());
     upgrade_transaction::write_transaction(&transaction)?;
-    let commit = spawn_coordinator(&executable_path, &transaction.transaction_id).await?;
+    let commit = match spawn_coordinator(&executable_path, &transaction.transaction_id).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            transaction.mark_failed("upgrade coordinator failed before commit")?;
+            upgrade_transaction::write_transaction(&transaction)?;
+            return Err(error);
+        }
+    };
     // `_admission` intentionally remains held until READY proves child ownership.
     Ok(PreparedRemoteUpgrade {
         status: transaction.status(),
@@ -177,16 +187,34 @@ async fn spawn_coordinator(
             if libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            let forked = libc::fork();
+            if forked < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if forked > 0 {
+                libc::_exit(0);
+            }
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    command
+    let mut launcher = command
         .spawn()
         .context("failed to spawn detached upgrade coordinator")?;
     drop(child);
+    let launcher_status = tokio::time::timeout(
+        COORDINATOR_READY_TIMEOUT,
+        tokio::task::spawn_blocking(move || launcher.wait()),
+    )
+    .await
+    .context("upgrade coordinator launcher did not exit")?
+    .context("upgrade coordinator launcher wait task failed")??;
+    anyhow::ensure!(
+        launcher_status.success(),
+        "upgrade coordinator launcher failed"
+    );
     parent.set_nonblocking(true)?;
     let mut parent = tokio::net::UnixStream::from_std(parent)?;
     let mut line = String::new();
@@ -211,6 +239,10 @@ pub async fn run_child(transaction_id: String, commit_fd: RawFd) -> Result<()> {
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::UnixStream::from_std(stream)?;
     let lock = upgrade_transaction::acquire_transaction_lock(&transaction_id)?;
+    let transaction = upgrade_transaction::read_transaction(&transaction_id)?;
+    let executable = session_control::capture_installed_upgrade_executable()?;
+    validate_approved_candidate(&transaction, &executable)?;
+    session_control::verify_planned_upgrade_sessions(&transaction.planned_sessions, true).await?;
     stream.write_all(b"READY\n").await?;
     let mut line = String::new();
     let decision = tokio::time::timeout(
@@ -223,12 +255,6 @@ pub async fn run_child(transaction_id: String, commit_fd: RawFd) -> Result<()> {
         Ok(Ok(read)) if read > 0 && line == "COMMIT\n" => barrier.commit()?,
         _ => barrier.abort()?,
     }
-    let transaction = upgrade_transaction::read_transaction(&transaction_id)?;
-    let executable = session_control::capture_installed_upgrade_executable()?;
-    anyhow::ensure!(
-        executable.target_version == transaction.target_version,
-        "coordinator executable target version mismatch"
-    );
     session_control::revalidate_installed_upgrade_executable(&executable)?;
     let mut executor = ConcreteExecutor::new(transaction.clone(), executable);
     upgrade_transaction::run_upgrade_coordinator_with_lock(
@@ -239,6 +265,66 @@ pub async fn run_child(transaction_id: String, commit_fd: RawFd) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn validate_approved_candidate(
+    transaction: &UpgradeTransaction,
+    executable: &InstalledUpgradeExecutable,
+) -> Result<()> {
+    validate_approved_candidate_identity(
+        transaction,
+        &executable.target_version,
+        &executable.digest_hex(),
+    )
+}
+
+fn validate_approved_candidate_identity(
+    transaction: &UpgradeTransaction,
+    target_version: &str,
+    digest_hex: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        target_version == transaction.target_version,
+        "coordinator executable target version mismatch"
+    );
+    let approved_digest = transaction
+        .approved_executable_sha256
+        .as_deref()
+        .context("upgrade transaction has no approved executable identity")?;
+    anyhow::ensure!(
+        digest_hex == approved_digest,
+        "installed Temote executable changed after approval"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_version_candidate_swap_is_rejected_by_approved_digest() {
+        let mut transaction =
+            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
+        transaction.approved_executable_sha256 = Some("a".repeat(64));
+
+        let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"b".repeat(64))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after approval"));
+    }
+
+    #[test]
+    fn old_transaction_without_approved_digest_fails_closed_for_execution() {
+        let transaction =
+            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
+        let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"a".repeat(64))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no approved executable identity")
+        );
+    }
 }
 
 struct ConcreteExecutor {
@@ -269,6 +355,11 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
                 UpgradeTransactionState::SupervisorHandoff => {
                     let executable =
                         session_control::revalidate_installed_upgrade_executable(&self.executable)?;
+                    session_control::verify_planned_upgrade_sessions(
+                        &self.transaction.planned_sessions,
+                        true,
+                    )
+                    .await?;
                     self.restored = Some(
                         session_control::apply_supervisor_upgrade(
                             &executable,
@@ -279,23 +370,21 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
                     );
                 }
                 UpgradeTransactionState::SessionsVerifying => {
-                    if self.restored.is_none() {
-                        let active = session_control::request_session_views()
-                            .await?
-                            .into_iter()
-                            .filter(|view| view.status == "active")
-                            .count();
-                        anyhow::ensure!(
-                            active == self.transaction.planned_session_count,
-                            "restored session count mismatch: expected {}, found {active}",
-                            self.transaction.planned_session_count
-                        );
-                        self.restored = Some(active);
-                    }
+                    let active = session_control::verify_planned_upgrade_sessions(
+                        &self.transaction.planned_sessions,
+                        !self.transaction.supervisor_handoff_required,
+                    )
+                    .await?;
+                    self.restored = Some(active);
                 }
                 UpgradeTransactionState::IngressRestarting => {
                     let executable =
                         session_control::revalidate_installed_upgrade_executable(&self.executable)?;
+                    session_control::verify_planned_upgrade_sessions(
+                        &self.transaction.planned_sessions,
+                        !self.transaction.supervisor_handoff_required,
+                    )
+                    .await?;
                     let prepared = crate::lifecycle::prepare_direct_ingress_upgrade(
                         &self.transaction.target_version,
                     )

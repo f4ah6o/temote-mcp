@@ -694,6 +694,25 @@ pub async fn verify_direct_ingress_identity(
     let prepared = prepare_direct_ingress_upgrade(target_version).await?;
     let addr = prepared.plan.addr.context("direct ingress is not active")?;
     let identity = probe_origin_health(addr).await?;
+    validate_direct_ingress_identity(
+        &identity,
+        target_version,
+        expected_host_id,
+        source_boot_generation,
+        restart_required,
+        transaction_id,
+    )?;
+    Ok(identity)
+}
+
+fn validate_direct_ingress_identity(
+    identity: &DirectIngressIdentity,
+    target_version: &str,
+    expected_host_id: &str,
+    source_boot_generation: &str,
+    restart_required: bool,
+    transaction_id: &str,
+) -> Result<()> {
     anyhow::ensure!(
         identity.host_id == expected_host_id,
         "replacement ingress host identity mismatch"
@@ -712,7 +731,7 @@ pub async fn verify_direct_ingress_identity(
         identity.last_upgrade_transaction.as_deref() == Some(transaction_id),
         "replacement ingress does not report the expected upgrade transaction"
     );
-    Ok(identity)
+    Ok(())
 }
 
 fn parse_runtime_profile(state: &DirectIngressRuntimeState) -> Result<Profile> {
@@ -1661,10 +1680,12 @@ mod tests {
                 let mut request = [0u8; 1024];
                 let _ = stream.read(&mut request).await.unwrap();
                 assert!(String::from_utf8_lossy(&request).contains("GET /healthz HTTP/1.1"));
+                let body = r#"{"host_id":"host-a","version":"2026.9.0","boot_generation":"boot-a","last_upgrade_transaction":null}"#;
                 stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
                         )
                         .as_bytes(),
                     )
@@ -1678,5 +1699,25 @@ mod tests {
         probe_origin_health(healthy).await.unwrap();
         let unhealthy = serve_once("503 Service Unavailable").await;
         assert!(probe_origin_health(unhealthy).await.is_err());
+    }
+
+    #[test]
+    fn replacement_identity_rejects_stale_healthy_boot_generation() {
+        let identity = DirectIngressIdentity {
+            host_id: "host-a".to_owned(),
+            version: "2026.9.0".to_owned(),
+            boot_generation: "boot-old".to_owned(),
+            last_upgrade_transaction: Some("transaction-a".to_owned()),
+        };
+        let error = validate_direct_ingress_identity(
+            &identity,
+            "2026.9.0",
+            "host-a",
+            "boot-old",
+            true,
+            "transaction-a",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale source boot generation"));
     }
 }

@@ -99,6 +99,15 @@ pub struct UpgradeSessionBlocker {
 pub struct SupervisorUpgradePreview {
     pub plan: SupervisorUpgradePlan,
     pub blocked_sessions: Vec<UpgradeSessionBlocker>,
+    #[serde(default)]
+    pub active_sessions: Vec<SupervisorUpgradeSessionIdentity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupervisorUpgradeSessionIdentity {
+    pub session_id: String,
+    pub process_id: u32,
+    pub started_at: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -747,6 +756,20 @@ impl SessionSupervisor {
 
         let source_version = env!("CARGO_PKG_VERSION").to_owned();
         let handoff_required = options.force || source_version != target_version;
+        let active_sessions = {
+            let sessions = self.sessions.lock().await;
+            let mut identities = Vec::with_capacity(sessions.len());
+            for (session_id, handle) in sessions.iter() {
+                let snapshot = handle.snapshot().await?;
+                identities.push(SupervisorUpgradeSessionIdentity {
+                    session_id: session_id.clone(),
+                    process_id: snapshot.process_id,
+                    started_at: snapshot.started_at,
+                });
+            }
+            identities.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+            identities
+        };
         let mut plans = Vec::new();
         let mut blocked_sessions = Vec::new();
         if handoff_required {
@@ -841,6 +864,7 @@ impl SessionSupervisor {
                 sessions: plans,
             },
             blocked_sessions,
+            active_sessions,
         })
     }
 
@@ -1973,6 +1997,30 @@ mod tests {
         assert!(!plan.handoff_required);
         assert!(plan.sessions.is_empty());
         // A no-op must not leave lifecycle mutation fenced.
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn same_version_preview_freezes_active_session_identity() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("upgrade-noop-preview-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::default();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        let preview = supervisor
+            .preview_upgrade_plan(env!("CARGO_PKG_VERSION"), 1, 1, &environment, false)
+            .await
+            .unwrap();
+        assert!(!preview.plan.handoff_required);
+        assert_eq!(preview.active_sessions.len(), 1);
+        assert_eq!(preview.active_sessions[0].session_id, id);
+        assert!(preview.active_sessions[0].process_id > 0);
+        assert!(preview.active_sessions[0].started_at > 0);
         supervisor.stop(&id).await.unwrap();
         supervisor.shutdown().await.unwrap();
         cleanup_session(&id).await;

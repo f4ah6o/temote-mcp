@@ -42,14 +42,10 @@ const MAX_UPGRADE_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 static INSTALLED_UPGRADE_LOCATOR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn initialize_installed_upgrade_locator() -> Result<()> {
-    let path = std::fs::canonicalize(std::env::current_exe()?)?;
-    if let Some(existing) = INSTALLED_UPGRADE_LOCATOR.get() {
-        anyhow::ensure!(
-            existing == &path,
-            "installed Temote startup locator changed"
-        );
+    if INSTALLED_UPGRADE_LOCATOR.get().is_some() {
         return Ok(());
     }
+    let path = std::fs::canonicalize(std::env::current_exe()?)?;
     let _ = INSTALLED_UPGRADE_LOCATOR.set(path);
     Ok(())
 }
@@ -1418,6 +1414,15 @@ pub struct InstalledUpgradeExecutable {
     pub target_version: String,
 }
 
+impl InstalledUpgradeExecutable {
+    pub(crate) fn digest_hex(&self) -> String {
+        self.digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
 pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutable> {
     initialize_installed_upgrade_locator()?;
     let locator = INSTALLED_UPGRADE_LOCATOR
@@ -1481,6 +1486,8 @@ pub struct RemoteUpgradePreflight {
     pub reconnect_expected: bool,
     pub plugin_reconciliation_required: bool,
     pub client_restart_required_if_plugin_replaced: bool,
+    #[serde(skip)]
+    pub(crate) planned_sessions: Vec<crate::upgrade_transaction::UpgradePlannedSession>,
 }
 
 pub async fn remote_upgrade_preflight(
@@ -1520,7 +1527,18 @@ async fn upgrade_preflight_with_force(
     );
     #[cfg(not(all(feature = "network", unix)))]
     let (direct_ingress_action, direct_ingress_blocked, reconnect_expected) =
-        ("unsupported".to_owned(), true, false);
+        ("unavailable".to_owned(), false, false);
+    let planned_sessions = preview
+        .active_sessions
+        .iter()
+        .map(
+            |session| crate::upgrade_transaction::UpgradePlannedSession {
+                session_id: session.session_id.clone(),
+                source_process_id: session.process_id,
+                source_started_at: session.started_at,
+            },
+        )
+        .collect::<Vec<_>>();
     Ok(RemoteUpgradePreflight {
         source_version,
         target_version: executable.target_version.clone(),
@@ -1538,7 +1556,54 @@ async fn upgrade_preflight_with_force(
         reconnect_expected,
         plugin_reconciliation_required: true,
         client_restart_required_if_plugin_replaced: true,
+        planned_sessions,
     })
+}
+
+pub(crate) async fn verify_planned_upgrade_sessions(
+    planned: &[crate::upgrade_transaction::UpgradePlannedSession],
+    require_source_instance: bool,
+) -> Result<usize> {
+    let active = request_session_views()
+        .await?
+        .into_iter()
+        .filter(|view| view.status == "active")
+        .map(|view| crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: view.session_id,
+            source_process_id: view.process_id,
+            source_started_at: view.started_at,
+        })
+        .collect::<Vec<_>>();
+    validate_planned_upgrade_session_identities(planned, &active, require_source_instance)?;
+    Ok(active.len())
+}
+
+fn validate_planned_upgrade_session_identities(
+    planned: &[crate::upgrade_transaction::UpgradePlannedSession],
+    active: &[crate::upgrade_transaction::UpgradePlannedSession],
+    require_source_instance: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        active.len() == planned.len(),
+        "active session set changed after upgrade approval"
+    );
+    let active_by_id = active
+        .iter()
+        .map(|identity| (identity.session_id.as_str(), identity))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for expected in planned {
+        let current = active_by_id
+            .get(expected.session_id.as_str())
+            .with_context(|| "approved session set changed")?;
+        if require_source_instance {
+            anyhow::ensure!(
+                current.source_process_id == expected.source_process_id
+                    && current.source_started_at == expected.source_started_at,
+                "approved session instance changed"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub async fn apply_supervisor_upgrade(
@@ -3412,5 +3477,40 @@ mod tests {
         .unwrap();
         assert_eq!(encoded["permission_mode"], "agent");
         assert_eq!(encoded["yolo"], false);
+    }
+
+    #[test]
+    fn upgrade_session_identity_rejects_same_count_different_session() {
+        let planned = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 100,
+            source_started_at: 10,
+        }];
+        let active = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-b".to_owned(),
+            source_process_id: 200,
+            source_started_at: 20,
+        }];
+        let error =
+            validate_planned_upgrade_session_identities(&planned, &active, false).unwrap_err();
+        assert!(error.to_string().contains("session set changed"));
+    }
+
+    #[test]
+    fn upgrade_session_identity_rejects_replaced_source_instance() {
+        let planned = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 100,
+            source_started_at: 10,
+        }];
+        let replacement = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 101,
+            source_started_at: 11,
+        }];
+        let error =
+            validate_planned_upgrade_session_identities(&planned, &replacement, true).unwrap_err();
+        assert!(error.to_string().contains("session instance changed"));
+        validate_planned_upgrade_session_identities(&planned, &replacement, false).unwrap();
     }
 }

@@ -15,6 +15,7 @@ use crate::config;
 pub const UPGRADE_TRANSACTION_SCHEMA_VERSION: u64 = 1;
 pub const MAX_UPGRADE_TRANSACTION_BYTES: usize = 64 * 1024;
 pub const MAX_UPGRADE_TRANSACTIONS: usize = 64;
+const MAX_PLANNED_SESSIONS: usize = 64;
 const MAX_UPGRADE_TRANSACTION_STRING_BYTES: usize = 256;
 const MAX_FAILURE_SUMMARY_BYTES: usize = 1024;
 
@@ -93,6 +94,13 @@ impl UpgradeTransactionState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpgradePlannedSession {
+    pub session_id: String,
+    pub source_process_id: u32,
+    pub source_started_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeTransaction {
     pub schema: u64,
     pub transaction_id: String,
@@ -108,6 +116,10 @@ pub struct UpgradeTransaction {
     pub ingress_restart_required: bool,
     #[serde(default)]
     pub planned_session_count: usize,
+    #[serde(default)]
+    pub planned_sessions: Vec<UpgradePlannedSession>,
+    #[serde(default)]
+    pub approved_executable_sha256: Option<String>,
     #[serde(default)]
     pub verified_host_id: Option<String>,
     #[serde(default)]
@@ -144,6 +156,8 @@ impl UpgradeTransaction {
             supervisor_handoff_required,
             ingress_restart_required,
             planned_session_count: 0,
+            planned_sessions: Vec::new(),
+            approved_executable_sha256: None,
             verified_host_id: None,
             verified_version: None,
             verified_boot_generation: None,
@@ -332,6 +346,37 @@ fn validate_transaction(transaction: &UpgradeTransaction) -> Result<()> {
     }
     crate::host_identity::validate(&transaction.host_id)
         .context("invalid upgrade transaction host_id")?;
+    anyhow::ensure!(
+        transaction.planned_sessions.len() <= MAX_PLANNED_SESSIONS,
+        "upgrade transaction contains too many planned sessions"
+    );
+    let mut planned_ids = std::collections::BTreeSet::new();
+    for planned in &transaction.planned_sessions {
+        config::validate_session_id(&planned.session_id)
+            .context("invalid planned upgrade session ID")?;
+        anyhow::ensure!(
+            planned.source_process_id > 0 && planned.source_started_at > 0,
+            "planned upgrade session identity is incomplete"
+        );
+        anyhow::ensure!(
+            planned_ids.insert(planned.session_id.as_str()),
+            "duplicate planned upgrade session ID"
+        );
+    }
+    anyhow::ensure!(
+        transaction.planned_sessions.is_empty()
+            || transaction.planned_session_count == transaction.planned_sessions.len(),
+        "planned upgrade session count does not match identities"
+    );
+    if let Some(digest) = &transaction.approved_executable_sha256 {
+        anyhow::ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "approved upgrade executable identity is invalid"
+        );
+    }
     if let Some(host_id) = &transaction.verified_host_id {
         crate::host_identity::validate(host_id)
             .context("invalid verified upgrade transaction host_id")?;
@@ -1159,6 +1204,8 @@ mod tests {
             "supervisor_handoff_required",
             "ingress_restart_required",
             "planned_session_count",
+            "planned_sessions",
+            "approved_executable_sha256",
             "verified_host_id",
             "verified_version",
             "verified_boot_generation",
@@ -1167,11 +1214,38 @@ mod tests {
         ] {
             assert!(keys.iter().any(|key| key == expected), "missing {expected}");
         }
-        assert_eq!(keys.len(), 18);
+        assert_eq!(keys.len(), 20);
         let encoded = serde_json::to_string(&fixture.transaction).unwrap();
         for forbidden in ["token", "secret", "authorization", "cookie", "password"] {
             assert!(!encoded.to_ascii_lowercase().contains(forbidden));
         }
+    }
+
+    #[test]
+    fn older_transaction_without_private_approval_identity_remains_readable() {
+        let _guard = state_scan_test_lock();
+        let fixture = Fixture::new();
+        write_transaction(&fixture.transaction).unwrap();
+        let path = transaction_path(&fixture.transaction.transaction_id).unwrap();
+        let mut value = serde_json::to_value(&fixture.transaction).unwrap();
+        value.as_object_mut().unwrap().remove("planned_sessions");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("approved_executable_sha256");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = read_transaction(&fixture.transaction.transaction_id).unwrap();
+        assert!(loaded.planned_sessions.is_empty());
+        assert!(loaded.approved_executable_sha256.is_none());
+    }
+
+    #[test]
+    fn malformed_approved_executable_identity_is_rejected() {
+        let mut fixture = Fixture::new();
+        fixture.transaction.approved_executable_sha256 = Some("A".repeat(64));
+        assert!(write_transaction(&fixture.transaction).is_err());
+        fixture.transaction.approved_executable_sha256 = Some("a".repeat(63));
+        assert!(write_transaction(&fixture.transaction).is_err());
     }
 
     #[test]

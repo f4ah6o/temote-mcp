@@ -91,12 +91,19 @@ async fn serve_http1_connection(mut stream: tokio::net::TcpStream, app: Router) 
         let app = app.clone();
         let marker = Arc::clone(&service_marker);
         async move {
-            let (parts, incoming) = request.into_parts();
-            let bytes = incoming.collect().await?.to_bytes();
-            if bytes.len() > 8 * 1024 * 1024 {
-                return Ok::<_, hyper::Error>(
-                    (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
-                );
+            let (parts, mut incoming) = request.into_parts();
+            let mut bytes = Vec::new();
+            while let Some(frame) = incoming.frame().await {
+                let frame = frame?;
+                if let Ok(data) = frame.into_data() {
+                    if bytes.len().saturating_add(data.len()) > 8 * 1024 * 1024 {
+                        return Ok::<_, hyper::Error>(
+                            (StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+                                .into_response(),
+                        );
+                    }
+                    bytes.extend_from_slice(&data);
+                }
             }
             let request = hyper::Request::from_parts(parts, axum::body::Body::from(bytes));
             let mut response = app
@@ -901,6 +908,42 @@ mod tests {
         let mut message = String::new();
         std::io::Read::read_to_string(&mut decision, &mut message).unwrap();
         assert_eq!(message, "ABORT\n");
+    }
+
+    #[tokio::test]
+    async fn http1_driver_rejects_oversized_body_at_the_streaming_limit() {
+        let app = Router::new().route("/body", axum::routing::post(|| async { StatusCode::OK }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_http1_connection(stream, app).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            format!(
+                "POST /body HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                oversized.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &oversized)
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 413")
+        );
     }
 
     fn runtime() -> Runtime {
