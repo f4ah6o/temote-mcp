@@ -1,6 +1,6 @@
 # Completion evaluation manifest (2026-09-15, Asia/Tokyo)
 
-Status: frozen before evaluated solutions were inspected; execution in progress.
+Status: frozen before evaluated solutions were inspected; execution stopped incomplete at the user's request. The task definitions remain unchanged, and unattempted arms are recorded in the results document.
 
 ## Purpose and immutable boundary
 
