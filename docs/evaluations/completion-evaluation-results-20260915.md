@@ -51,6 +51,7 @@ Concurrent-client qualification exposed a separate defect during T01-C: a second
 - Read-only `session_list` probes through the two configured Temote connectors did not return within approximately 73 seconds and were stopped. They are recorded as probe timeouts; no session/tool equivalence claim is made.
 - No deployment, tunnel, production runtime, session, or provider configuration was changed.
 - An isolated official `wrangler` 4.131.2 (`sha512-jmkGE7monbPKyYQr1FPQN+SARVhddqw2fhXOmTKCw4lroqlFGSS6rit/RTvPi/qzNLKrXxkS8DhWXasJnStplg==`) reused a private copy of the standard Wrangler config. `wrangler whoami` exited 0 and reported a logged-in account and permission table. Account API authentication is therefore available; no account identifier, email, token, deployment, or configuration value is recorded here.
+- Read-only `wrangler deployments status --name temote-mcp-gateway` exited 0 and reported one current deployment version. It does not report or prove a published route/custom-domain target. `wrangler secret list --name temote-mcp-gateway --format json` exited 0 with an empty list, so the required `HOST_TOKENS_JSON` secret was not present under this account/script selection. No value was requested or returned.
 
 ## Three-arm task ledger
 
@@ -73,6 +74,6 @@ Runtime failures after an arm starts remain in the attempted denominator. A miss
 
 T01-A's first invocation stopped at the account usage limit before changing the clean worktree. The same child task and worktree resumed after account availability returned; retry 1 is retained in the ledger.
 
-T01-B completed through the Temote-owned delegation adapter. Its report correctly left observed model/effort unset because event telemetry did not expose them; the bounded event log did expose token counters, which are recorded as backend-specific usage without a cost inference. The arm remains an attempted completion with a runtime-test limitation rather than being excluded from comparison.
+The initial T01-B attempt completed through the Temote-owned delegation adapter before it was invalidated by answer exposure. Its report correctly left observed model/effort unset because event telemetry did not expose them; the bounded event log did expose token counters, which are recorded as backend-specific usage without a cost inference. The invalidated attempt and its runtime-test limitation remain in the denominator and are ineligible for selection.
 
 The initial T01 B/C worktrees were linked Git worktrees whose shared object database exposed post-base answer refs. Both Luna attempts found and inspected `232b5f1` despite the frozen prompt. Later retries use independent clones from a bundle containing only the common base's reachable history: no alternates, no answer refs, and `232b5f1` is not a readable object. The contaminated attempts and their runtime failures remain in the ledger; fresh-context retries do not erase them.
