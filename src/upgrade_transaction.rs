@@ -899,7 +899,16 @@ pub fn latest_transaction_id() -> Option<String> {
             transactions.push(transaction);
         }
     }
-    recent_transaction(&transactions).map(|transaction| transaction.transaction_id.clone())
+    transaction_for_health(&transactions).map(|transaction| transaction.transaction_id.clone())
+}
+
+fn transaction_for_health(transactions: &[UpgradeTransaction]) -> Option<&UpgradeTransaction> {
+    let active = active_transactions(transactions);
+    match active.as_slice() {
+        [transaction] => Some(*transaction),
+        [] => recent_transaction(transactions),
+        _ => None,
+    }
 }
 
 /// Read-only probe for whether another process currently owns the transaction lock.
@@ -1432,6 +1441,22 @@ mod tests {
         assert_eq!(
             recent_transaction(&transactions).unwrap().transaction_id,
             greater.transaction_id
+        );
+    }
+
+    #[test]
+    fn health_identity_prefers_single_active_transaction_with_same_timestamp() {
+        let mut active = Fixture::new();
+        let mut completed = Fixture::new();
+        active.transaction.transaction_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        completed.transaction.transaction_id = "ffffffff-ffff-4fff-8fff-ffffffffffff".to_owned();
+        active.transaction.updated_at = 42;
+        completed.transaction.updated_at = 42;
+        completed.transaction.state = UpgradeTransactionState::Completed;
+        assert_eq!(
+            transaction_for_health(&[completed.transaction.clone(), active.transaction.clone()])
+                .map(|transaction| transaction.transaction_id.as_str()),
+            Some(active.transaction.transaction_id.as_str()),
         );
     }
 

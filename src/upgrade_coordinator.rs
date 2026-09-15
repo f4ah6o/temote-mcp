@@ -2,7 +2,6 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,7 +98,7 @@ pub async fn prepare_apply(
         !preflight.direct_ingress_blocked,
         "direct ingress upgrade is blocked"
     );
-    let executable_path = session_control::revalidate_installed_upgrade_executable(&executable)?;
+    session_control::revalidate_installed_upgrade_executable(&executable)?;
     let _admission = upgrade_transaction::acquire_admission_lock()?;
     session_control::verify_planned_upgrade_sessions(&preflight.planned_sessions, true).await?;
 
@@ -122,11 +121,14 @@ pub async fn prepare_apply(
             });
         }
         UpgradeApplyDisposition::AlreadyCompleted(id) => {
-            return Ok(PreparedRemoteUpgrade {
-                status: upgrade_transaction::read_transaction(&id)?.status(),
-                commit: None,
-                accepted_new: false,
-            });
+            let completed = upgrade_transaction::read_transaction(&id)?;
+            if completed_upgrade_is_current(&completed, &preflight, &executable.digest_hex())? {
+                return Ok(PreparedRemoteUpgrade {
+                    status: completed.status(),
+                    commit: None,
+                    accepted_new: false,
+                });
+            }
         }
         UpgradeApplyDisposition::ConflictActive(id) => anyhow::bail!(
             "upgrade transaction {id} already owns the runtime for a different target"
@@ -134,21 +136,15 @@ pub async fn prepare_apply(
         UpgradeApplyDisposition::StartNew => {}
     }
 
-    let host_id = crate::host_identity::resolve()?;
-    let mut transaction = UpgradeTransaction::new(
-        preflight.source_version,
+    let mut transaction = prepared_transaction_from_approved(
+        preflight,
         executable.target_version.clone(),
-        host_id,
-        crate::boot_identity::generation(),
-        preflight.reconnect_expected,
-        preflight.supervisor_handoff_required,
-        preflight.direct_ingress_action == "restart",
+        executable.digest_hex(),
+        crate::host_identity::resolve()?,
+        crate::boot_identity::generation().to_owned(),
     );
-    transaction.planned_session_count = preflight.planned_session_count;
-    transaction.planned_sessions = preflight.planned_sessions;
-    transaction.approved_executable_sha256 = Some(executable.digest_hex());
     upgrade_transaction::write_transaction(&transaction)?;
-    let commit = match spawn_coordinator(&executable_path, &transaction.transaction_id).await {
+    let commit = match spawn_coordinator(&executable, &transaction.transaction_id).await {
         Ok(commit) => commit,
         Err(error) => {
             transaction.mark_failed("upgrade coordinator failed before commit")?;
@@ -164,13 +160,51 @@ pub async fn prepare_apply(
     })
 }
 
+fn completed_upgrade_is_current(
+    completed: &UpgradeTransaction,
+    preflight: &RemoteUpgradePreflight,
+    approved_digest: &str,
+) -> Result<bool> {
+    if preflight.supervisor_handoff_required || preflight.direct_ingress_action == "restart" {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        completed.approved_executable_sha256.as_deref() == Some(approved_digest),
+        "completed upgrade identity does not match the installed candidate"
+    );
+    Ok(true)
+}
+
+fn prepared_transaction_from_approved(
+    preflight: RemoteUpgradePreflight,
+    target_version: String,
+    approved_executable_sha256: String,
+    host_id: String,
+    source_boot_generation: String,
+) -> UpgradeTransaction {
+    let mut transaction = UpgradeTransaction::new(
+        preflight.source_version,
+        target_version,
+        host_id,
+        source_boot_generation,
+        preflight.reconnect_expected,
+        preflight.supervisor_handoff_required,
+        preflight.direct_ingress_action == "restart",
+    );
+    transaction.planned_session_count = preflight.planned_sessions.len();
+    transaction.planned_sessions = preflight.planned_sessions;
+    transaction.approved_executable_sha256 = Some(approved_executable_sha256);
+    transaction
+}
+
 async fn spawn_coordinator(
-    executable: &PathBuf,
+    executable: &InstalledUpgradeExecutable,
     transaction_id: &str,
 ) -> Result<CoordinatorCommit> {
     let (parent, child) = StdUnixStream::pair()?;
     let child_fd = child.as_raw_fd();
-    let mut command = Command::new(executable);
+    let executable_fd = executable.execution_fd();
+    let mut command = Command::new(executable.execution_path());
     command
         .args([
             "upgrade-coordinator",
@@ -178,13 +212,20 @@ async fn spawn_coordinator(
             transaction_id,
             "--commit-fd",
             &child_fd.to_string(),
+            "--executable-fd",
+            &executable_fd.to_string(),
         ])
+        .arg("--installed-locator")
+        .arg(executable.installed_locator())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     unsafe {
         command.pre_exec(move || {
             if libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(executable_fd, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let forked = libc::fork();
@@ -233,14 +274,29 @@ async fn spawn_coordinator(
     })
 }
 
-pub async fn run_child(transaction_id: String, commit_fd: RawFd) -> Result<()> {
+pub async fn run_child(
+    transaction_id: String,
+    commit_fd: RawFd,
+    executable_fd: RawFd,
+) -> Result<()> {
     anyhow::ensure!(commit_fd >= 3, "invalid coordinator commit FD");
+    anyhow::ensure!(
+        executable_fd >= 3 && executable_fd != commit_fd,
+        "invalid coordinator executable FD"
+    );
+    let mut running_executable = unsafe { std::fs::File::from_raw_fd(executable_fd) };
+    let approved_running_digest = bounded_file_digest_hex(&mut running_executable)?;
     let stream = unsafe { StdUnixStream::from_raw_fd(commit_fd) };
     stream.set_nonblocking(true)?;
     let mut stream = tokio::net::UnixStream::from_std(stream)?;
     let lock = upgrade_transaction::acquire_transaction_lock(&transaction_id)?;
     let transaction = upgrade_transaction::read_transaction(&transaction_id)?;
     let executable = session_control::capture_installed_upgrade_executable()?;
+    validate_approved_candidate_identity(
+        &transaction,
+        env!("CARGO_PKG_VERSION"),
+        &approved_running_digest,
+    )?;
     validate_approved_candidate(&transaction, &executable)?;
     session_control::verify_planned_upgrade_sessions(&transaction.planned_sessions, true).await?;
     stream.write_all(b"READY\n").await?;
@@ -265,6 +321,33 @@ pub async fn run_child(transaction_id: String, commit_fd: RawFd) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+fn bounded_file_digest_hex(file: &mut std::fs::File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied += read as u64;
+        anyhow::ensure!(
+            copied <= 256 * 1024 * 1024,
+            "coordinator executable exceeds bounded identity size"
+        );
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn validate_approved_candidate(
@@ -302,6 +385,32 @@ fn validate_approved_candidate_identity(
 mod tests {
     use super::*;
 
+    fn preflight(supervisor_handoff_required: bool) -> RemoteUpgradePreflight {
+        RemoteUpgradePreflight {
+            source_version: "2026.8.0".to_owned(),
+            target_version: "2026.9.0".to_owned(),
+            compatible: true,
+            supervisor_handoff_required,
+            planned_session_count: 1,
+            blocked_session_count: 0,
+            blocker_reasons: Vec::new(),
+            direct_ingress_action: if supervisor_handoff_required {
+                "restart".to_owned()
+            } else {
+                "untouched".to_owned()
+            },
+            direct_ingress_blocked: false,
+            reconnect_expected: supervisor_handoff_required,
+            plugin_reconciliation_required: true,
+            client_restart_required_if_plugin_replaced: true,
+            planned_sessions: vec![upgrade_transaction::UpgradePlannedSession {
+                session_id: "session-a".to_owned(),
+                source_process_id: 100,
+                source_started_at: 10,
+            }],
+        }
+    }
+
     #[test]
     fn same_version_candidate_swap_is_rejected_by_approved_digest() {
         let mut transaction =
@@ -311,6 +420,27 @@ mod tests {
         let error = validate_approved_candidate_identity(&transaction, "2026.9.0", &"b".repeat(64))
             .unwrap_err();
         assert!(error.to_string().contains("changed after approval"));
+    }
+
+    #[test]
+    fn opened_executable_identity_survives_path_replacement() {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("temote-mcp");
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&installed, b"approved image").unwrap();
+        std::fs::write(&replacement, b"different image").unwrap();
+        let mut approved = std::fs::File::open(&installed).unwrap();
+        std::fs::rename(&replacement, &installed).unwrap();
+
+        let open_digest = bounded_file_digest_hex(&mut approved).unwrap();
+        let installed_digest = format!("{:x}", Sha256::digest(std::fs::read(&installed).unwrap()));
+        assert_ne!(open_digest, installed_digest);
+        assert_eq!(
+            open_digest,
+            format!("{:x}", Sha256::digest(b"approved image"))
+        );
     }
 
     #[test]
@@ -324,6 +454,36 @@ mod tests {
                 .to_string()
                 .contains("no approved executable identity")
         );
+    }
+
+    #[test]
+    fn historical_completion_does_not_override_fresh_required_work() {
+        let mut completed =
+            UpgradeTransaction::new("2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true);
+        completed.approved_executable_sha256 = Some("a".repeat(64));
+        assert!(
+            !completed_upgrade_is_current(&completed, &preflight(true), &"a".repeat(64)).unwrap()
+        );
+        assert!(
+            completed_upgrade_is_current(&completed, &preflight(false), &"a".repeat(64)).unwrap()
+        );
+    }
+
+    #[test]
+    fn no_handoff_preflight_persists_exact_session_count_and_identity() {
+        let transaction = prepared_transaction_from_approved(
+            preflight(false),
+            "2026.9.0".to_owned(),
+            "a".repeat(64),
+            "host-a".to_owned(),
+            "boot-a".to_owned(),
+        );
+        upgrade_transaction::write_transaction(&transaction).unwrap();
+        let restored = upgrade_transaction::read_transaction(&transaction.transaction_id).unwrap();
+        assert_eq!(restored.planned_session_count, 1);
+        assert_eq!(restored.planned_sessions.len(), 1);
+        assert_eq!(restored.planned_sessions[0].session_id, "session-a");
+        upgrade_transaction::remove_transaction(&transaction.transaction_id).unwrap();
     }
 }
 
@@ -365,6 +525,7 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
                             &executable,
                             &self.transaction.target_version,
                             false,
+                            Some(&self.transaction.planned_sessions),
                         )
                         .await?,
                     );

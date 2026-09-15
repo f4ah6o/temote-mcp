@@ -692,6 +692,7 @@ impl SessionSupervisor {
         cleanup_result
     }
 
+    #[cfg(test)]
     pub async fn build_upgrade_plan(
         &self,
         target_version: &str,
@@ -700,6 +701,28 @@ impl SessionSupervisor {
         available_environment: &approvals::CapturedStartEnvironment,
         fence: bool,
         force: bool,
+    ) -> Result<SupervisorUpgradePlan> {
+        self.build_upgrade_plan_with_expected(
+            target_version,
+            control_protocol,
+            lifecycle_schema,
+            available_environment,
+            fence,
+            force,
+            None,
+        )
+        .await
+    }
+
+    pub async fn build_upgrade_plan_with_expected(
+        &self,
+        target_version: &str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &approvals::CapturedStartEnvironment,
+        fence: bool,
+        force: bool,
+        expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
     ) -> Result<SupervisorUpgradePlan> {
         let preview = self
             .prepare_upgrade_plan(
@@ -712,6 +735,7 @@ impl SessionSupervisor {
                     force,
                     collect_blockers: false,
                 },
+                expected_sessions,
             )
             .await?;
         Ok(preview.plan)
@@ -735,6 +759,7 @@ impl SessionSupervisor {
                 force,
                 collect_blockers: true,
             },
+            None,
         )
         .await
     }
@@ -746,6 +771,7 @@ impl SessionSupervisor {
         lifecycle_schema: u64,
         available_environment: &approvals::CapturedStartEnvironment,
         options: UpgradePlanOptions,
+        expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
     ) -> Result<SupervisorUpgradePreview> {
         let _transition = self.transitions.lock().await;
         anyhow::ensure!(
@@ -770,6 +796,23 @@ impl SessionSupervisor {
             identities.sort_by(|left, right| left.session_id.cmp(&right.session_id));
             identities
         };
+        if let Some(expected) = expected_sessions {
+            anyhow::ensure!(
+                active_sessions.len() == expected.len(),
+                "approved session set changed before supervisor handoff"
+            );
+            for expected in expected {
+                let current = active_sessions
+                    .iter()
+                    .find(|session| session.session_id == expected.session_id)
+                    .context("approved session set changed before supervisor handoff")?;
+                anyhow::ensure!(
+                    current.process_id == expected.source_process_id
+                        && current.started_at == expected.source_started_at,
+                    "approved session instance changed before supervisor handoff"
+                );
+            }
+        }
         let mut plans = Vec::new();
         let mut blocked_sessions = Vec::new();
         if handoff_required {
@@ -2021,6 +2064,40 @@ mod tests {
         assert_eq!(preview.active_sessions[0].session_id, id);
         assert!(preview.active_sessions[0].process_id > 0);
         assert!(preview.active_sessions[0].started_at > 0);
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_fence_rejects_replaced_approved_session_instance() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("upgrade-expected-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::default();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        let session = config::read_session_metadata(&id).await.unwrap();
+        let expected = [crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: id.clone(),
+            source_process_id: session.process_id.saturating_add(1),
+            source_started_at: session.started_at,
+        }];
+        let error = supervisor
+            .build_upgrade_plan_with_expected(
+                "different-version",
+                1,
+                1,
+                &environment,
+                true,
+                false,
+                Some(&expected),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session instance changed"));
         supervisor.stop(&id).await.unwrap();
         supervisor.shutdown().await.unwrap();
         cleanup_session(&id).await;

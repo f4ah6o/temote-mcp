@@ -34,6 +34,8 @@ pub enum Command {
     UpgradeCoordinator {
         transaction_id: String,
         commit_fd: i32,
+        executable_fd: i32,
+        installed_locator: PathBuf,
     },
     Session {
         command: SessionCommand,
@@ -249,11 +251,23 @@ where
             .take(&mut args)
             .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
             .map_err(format_error)?;
+        let executable_fd = noargs::opt("executable-fd")
+            .ty("FD")
+            .take(&mut args)
+            .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
+            .map_err(format_error)?;
+        let installed_locator = noargs::opt("installed-locator")
+            .ty("PATH")
+            .take(&mut args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(PathBuf::from(opt.value())))
+            .map_err(format_error)?;
         return finish(
             args,
             Command::UpgradeCoordinator {
                 transaction_id,
                 commit_fd,
+                executable_fd,
+                installed_locator,
             },
         );
     }

@@ -68,8 +68,6 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    session_control::initialize_installed_upgrade_locator()?;
-    approvals::bootstrap_service_account_process_boundary()?;
     let cli = match cli::parse_env() {
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Ok(cli::ParseOutcome::Print(output)) => {
@@ -81,6 +79,15 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if let Some(cli::Command::UpgradeCoordinator {
+        installed_locator, ..
+    }) = cli.command.as_ref()
+    {
+        session_control::initialize_installed_upgrade_locator_from(installed_locator)?;
+    } else {
+        session_control::initialize_installed_upgrade_locator()?;
+    }
+    approvals::bootstrap_service_account_process_boundary()?;
     match cli.command.unwrap_or(cli::Command::Start {
         session_id: None,
         yolo: false,
@@ -118,14 +125,16 @@ async fn main() -> Result<()> {
         cli::Command::UpgradeCoordinator {
             transaction_id,
             commit_fd,
+            executable_fd,
+            installed_locator: _,
         } => {
             #[cfg(all(feature = "network", unix))]
             {
-                upgrade_coordinator::run_child(transaction_id, commit_fd).await
+                upgrade_coordinator::run_child(transaction_id, commit_fd, executable_fd).await
             }
             #[cfg(not(all(feature = "network", unix)))]
             {
-                let _ = (transaction_id, commit_fd);
+                let _ = (transaction_id, commit_fd, executable_fd);
                 anyhow::bail!("remote upgrade coordinator is unsupported on this platform")
             }
         }

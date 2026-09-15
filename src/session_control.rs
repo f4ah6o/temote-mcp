@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read as _, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,19 @@ pub fn initialize_installed_upgrade_locator() -> Result<()> {
         return Ok(());
     }
     let path = std::fs::canonicalize(std::env::current_exe()?)?;
+    let _ = INSTALLED_UPGRADE_LOCATOR.set(path);
+    Ok(())
+}
+
+pub fn initialize_installed_upgrade_locator_from(path: &Path) -> Result<()> {
+    let path = std::fs::canonicalize(path).context("cannot resolve installed Temote locator")?;
+    if let Some(existing) = INSTALLED_UPGRADE_LOCATOR.get() {
+        anyhow::ensure!(
+            existing == &path,
+            "installed Temote startup locator changed"
+        );
+        return Ok(());
+    }
     let _ = INSTALLED_UPGRADE_LOCATOR.set(path);
     Ok(())
 }
@@ -126,6 +140,8 @@ enum ControlRequest {
         dry_run: bool,
         #[serde(default)]
         force: bool,
+        #[serde(default)]
+        expected_sessions: Option<Vec<crate::upgrade_transaction::UpgradePlannedSession>>,
     },
     AttachConsole,
 }
@@ -691,6 +707,7 @@ async fn handle_control_connection(
             environment,
             dry_run,
             force,
+            expected_sessions,
         } => {
             handle_upgrade_request(
                 stream,
@@ -700,6 +717,7 @@ async fn handle_control_connection(
                 environment,
                 dry_run,
                 force,
+                expected_sessions,
             )
             .await
         }
@@ -963,6 +981,7 @@ async fn handle_upgrade_request(
     environment: CapturedStartEnvironment,
     dry_run: bool,
     force: bool,
+    expected_sessions: Option<Vec<crate::upgrade_transaction::UpgradePlannedSession>>,
 ) -> Result<()> {
     let executable_preflight = (|| -> Result<(PathBuf, SupervisorCapabilities)> {
         environment.validate()?;
@@ -1001,13 +1020,14 @@ async fn handle_upgrade_request(
 
     let preflight: Result<SupervisorUpgradePlan> = async {
         let plan = supervisor
-            .build_upgrade_plan(
+            .build_upgrade_plan_with_expected(
                 &target_version,
                 capabilities.control_protocol,
                 capabilities.lifecycle_schema,
                 &environment,
                 true,
                 force,
+                expected_sessions.as_deref(),
             )
             .await?;
         Ok(plan)
@@ -1410,6 +1430,7 @@ fn remove_upgrade_plan(path: &Path) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct InstalledUpgradeExecutable {
     path: PathBuf,
+    file: Arc<std::fs::File>,
     digest: [u8; 32],
     pub target_version: String,
 }
@@ -1421,6 +1442,21 @@ impl InstalledUpgradeExecutable {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+
+    pub(crate) fn execution_fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+
+    pub(crate) fn execution_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        return PathBuf::from(format!("/proc/self/fd/{}", self.execution_fd()));
+        #[cfg(not(target_os = "linux"))]
+        PathBuf::from(format!("/dev/fd/{}", self.execution_fd()))
+    }
+
+    pub(crate) fn installed_locator(&self) -> &Path {
+        &self.path
+    }
 }
 
 pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutable> {
@@ -1428,9 +1464,29 @@ pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutab
     let locator = INSTALLED_UPGRADE_LOCATOR
         .get()
         .context("installed Temote startup locator is unavailable")?;
-    let (path, capabilities) = inspect_upgrade_executable(locator)?;
-    let mut file = std::fs::File::open(&path).context("cannot open installed Temote executable")?;
+    let path =
+        std::fs::canonicalize(locator).context("cannot resolve installed Temote executable")?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("cannot open installed Temote executable")?;
     let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "upgrade executable is not a regular file"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(mode & 0o111 != 0, "upgrade executable is not executable");
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "upgrade executable is not owned by the current user"
+    );
+    anyhow::ensure!(
+        mode & 0o022 == 0,
+        "upgrade executable is group/world writable"
+    );
     anyhow::ensure!(
         metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
         "upgrade executable exceeds bounded identity size"
@@ -1451,9 +1507,46 @@ pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutab
         hasher.update(&buffer[..read]);
     }
     let digest: [u8; 32] = hasher.finalize().into();
+    let fd = file.as_raw_fd();
+    let executable_path = {
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from(format!("/proc/self/fd/{fd}"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PathBuf::from(format!("/dev/fd/{fd}"))
+        }
+    };
+    let mut command = std::process::Command::new(executable_path);
+    command.args(["supervisor", "--capabilities"]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command
+        .output()
+        .context("failed to inspect installed Temote capabilities")?;
+    anyhow::ensure!(
+        output.status.success() && output.stdout.len() <= 64 * 1024,
+        "installed Temote executable did not report bounded capabilities"
+    );
+    let capabilities: SupervisorCapabilities = serde_json::from_slice(&output.stdout)
+        .context("invalid installed Temote capability response")?;
+    anyhow::ensure!(
+        capabilities.control_protocol == CONTROL_PROTOCOL_VERSION
+            && capabilities.lifecycle_schema == LIFECYCLE_SCHEMA_VERSION
+            && capabilities.upgrade_plan_schema == UPGRADE_PLAN_SCHEMA_VERSION,
+        "installed Temote executable is incompatible with the running lifecycle protocol"
+    );
     let target_version = capabilities.version;
     Ok(InstalledUpgradeExecutable {
         path,
+        file: Arc::new(file),
         digest,
         target_version,
     })
@@ -1512,6 +1605,7 @@ async fn upgrade_preflight_with_force(
         environment: CapturedStartEnvironment::capture(),
         dry_run: true,
         force,
+        expected_sessions: None,
     })
     .await?;
     let preview: crate::supervisor::SupervisorUpgradePreview =
@@ -1544,7 +1638,7 @@ async fn upgrade_preflight_with_force(
         target_version: executable.target_version.clone(),
         compatible: true,
         supervisor_handoff_required: preview.plan.handoff_required,
-        planned_session_count: preview.plan.sessions.len(),
+        planned_session_count: planned_sessions.len(),
         blocked_session_count: preview.blocked_sessions.len(),
         blocker_reasons: preview
             .blocked_sessions
@@ -1610,6 +1704,7 @@ pub async fn apply_supervisor_upgrade(
     executable: &Path,
     target_version: &str,
     force: bool,
+    expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
 ) -> Result<usize> {
     let ping = request(ControlRequest::Ping).await?;
     let source_version = ping
@@ -1624,6 +1719,7 @@ pub async fn apply_supervisor_upgrade(
         environment: CapturedStartEnvironment::capture(),
         dry_run: false,
         force,
+        expected_sessions: expected_sessions.map(|sessions| sessions.to_vec()),
     })
     .await?;
     let plan_value = result
@@ -1714,7 +1810,7 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     );
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
     let restored =
-        apply_supervisor_upgrade(&executable_path, &executable.target_version, force).await?;
+        apply_supervisor_upgrade(&executable_path, &executable.target_version, force, None).await?;
     #[cfg(all(feature = "network", unix))]
     {
         let executable_path = revalidate_installed_upgrade_executable(&executable)?;
