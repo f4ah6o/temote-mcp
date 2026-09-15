@@ -15,6 +15,19 @@ fn socket_namespace() -> String {
     format!("e2e{:x}", std::process::id())
 }
 
+#[cfg(unix)]
+fn private_upgrade_binary() -> (TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new().expect("failed to create private executable directory");
+    let binary = directory.path().join("temote-mcp");
+    fs::copy(env!("CARGO_BIN_EXE_temote-mcp"), &binary)
+        .expect("failed to copy upgrade test executable");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .expect("failed to protect upgrade test executable");
+    (directory, binary)
+}
+
 struct ChildGuard {
     child: Child,
 }
@@ -72,6 +85,7 @@ impl McpClient {
             .arg("mcp")
             .env("XDG_STATE_HOME", state_home)
             .env("HOME", state_home)
+            .env("TEMOTE_MCP_RUNTIME_DIR", state_home.join("runtime"))
             .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -208,6 +222,7 @@ fn spawn_supervisor(binary: &Path, project: &Path, state_home: &Path) -> ChildGu
         .arg("supervisor")
         .env("XDG_STATE_HOME", state_home)
         .env("HOME", state_home)
+        .env("TEMOTE_MCP_RUNTIME_DIR", state_home.join("runtime"))
         .env("TEMOTE_MCP_ROOTS", roots_env(project))
         .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
         .stdin(Stdio::null())
@@ -222,6 +237,7 @@ fn run_cli(binary: &Path, args: &[&str], cwd: &Path, state_home: &Path) -> Outpu
         .current_dir(cwd)
         .env("XDG_STATE_HOME", state_home)
         .env("HOME", state_home)
+        .env("TEMOTE_MCP_RUNTIME_DIR", state_home.join("runtime"))
         .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
         .stdin(Stdio::null())
         .output()
@@ -275,7 +291,7 @@ fn upgrade_failure_reports(state_home: &Path) -> Vec<PathBuf> {
 #[test]
 #[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
 fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let (_binary_directory, binary) = private_upgrade_binary();
     let project = TempDir::new().expect("failed to create E2E project directory");
     let state = TempDir::new().expect("failed to create isolated state directory");
     initialize_git_repository(project.path());
@@ -348,6 +364,7 @@ fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
         .current_dir(project.path())
         .env("XDG_STATE_HOME", state.path())
         .env("HOME", state.path())
+        .env("TEMOTE_MCP_RUNTIME_DIR", state.path().join("runtime"))
         .env("TEMOTE_MCP_SOCKET_NAMESPACE", &namespace)
         .stdin(Stdio::null())
         .output()
@@ -381,7 +398,7 @@ fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
 #[test]
 #[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
 fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let (_binary_directory, binary) = private_upgrade_binary();
     let project = TempDir::new().expect("failed to create E2E project directory");
     let state = TempDir::new().expect("failed to create isolated state directory");
     initialize_git_repository(project.path());
