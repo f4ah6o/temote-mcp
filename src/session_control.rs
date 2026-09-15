@@ -759,6 +759,7 @@ async fn dispatch_request(
             "status": "active",
             "host_id": host_identity::resolve()?,
             "version": env!("CARGO_PKG_VERSION"),
+            "boot_generation": crate::boot_identity::generation(),
             "pid": std::process::id(),
             "control_protocol": CONTROL_PROTOCOL_VERSION,
             "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
@@ -1835,6 +1836,10 @@ pub async fn apply_supervisor_upgrade(
         .context("running supervisor did not report its version")?
         .to_owned();
     let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
+    let source_boot_generation = ping
+        .get("boot_generation")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let result = request(ControlRequest::Upgrade {
         executable: executable.to_owned(),
         installed_locator: Some(installed_locator.to_owned()),
@@ -1872,8 +1877,12 @@ pub async fn apply_supervisor_upgrade(
                 "supervisor handoff verification timed out"
             );
             if let Ok(status) = request(ControlRequest::Ping).await
-                && status.get("version").and_then(Value::as_str) == Some(target_version)
-                && status.get("pid").and_then(Value::as_u64) == Some(source_pid)
+                && supervisor_handoff_identity_changed(
+                    &status,
+                    target_version,
+                    source_pid,
+                    source_boot_generation.as_deref(),
+                )
             {
                 let mut all_active = true;
                 for session in &plan.sessions {
@@ -1901,6 +1910,24 @@ pub async fn apply_supervisor_upgrade(
         }
     }
     Ok(plan.sessions.len())
+}
+
+fn supervisor_handoff_identity_changed(
+    status: &Value,
+    target_version: &str,
+    source_pid: u64,
+    source_boot_generation: Option<&str>,
+) -> bool {
+    if status.get("version").and_then(Value::as_str) != Some(target_version)
+        || status.get("pid").and_then(Value::as_u64) != Some(source_pid)
+    {
+        return false;
+    }
+    let Some(target_boot_generation) = status.get("boot_generation").and_then(Value::as_str) else {
+        return false;
+    };
+    !target_boot_generation.is_empty()
+        && source_boot_generation.is_none_or(|source| source != target_boot_generation)
 }
 
 pub fn reconcile_codex_plugin(executable: &Path, installed_locator: &Path) -> Result<()> {
@@ -1932,6 +1959,8 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&preflight)?);
         return Ok(());
     }
+    let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
+    ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
     anyhow::ensure!(
         preflight.blocked_session_count == 0,
         "upgrade is blocked by {} session(s)",
@@ -1970,6 +1999,18 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         "Temote upgrade complete: {} -> {}; restored {restored} session(s)",
         preflight.source_version, executable.target_version
     );
+    Ok(())
+}
+
+fn ensure_no_remote_upgrade_owns_runtime(
+    transactions: &[crate::upgrade_transaction::UpgradeTransaction],
+) -> Result<()> {
+    if let Some(active) = crate::upgrade_transaction::active_transactions(transactions).first() {
+        anyhow::bail!(
+            "upgrade transaction {} already owns the runtime",
+            active.transaction_id
+        );
+    }
     Ok(())
 }
 
@@ -2931,6 +2972,10 @@ mod tests {
             .unwrap();
         assert_eq!(result["status"], "active");
         assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            result["boot_generation"],
+            crate::boot_identity::generation()
+        );
         assert_eq!(result["pid"], std::process::id());
         assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
         assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
@@ -3024,6 +3069,46 @@ mod tests {
                 .and_then(|(_, value)| value),
             Some(installed_locator.as_os_str())
         );
+    }
+
+    #[test]
+    fn same_version_zero_session_handoff_requires_new_boot_generation() {
+        let source_boot = uuid::Uuid::new_v4().to_string();
+        let unchanged = json!({
+            "version": "2026.8.0",
+            "pid": 42,
+            "boot_generation": source_boot,
+        });
+        assert!(!supervisor_handoff_identity_changed(
+            &unchanged,
+            "2026.8.0",
+            42,
+            unchanged["boot_generation"].as_str(),
+        ));
+
+        let replaced = json!({
+            "version": "2026.8.0",
+            "pid": 42,
+            "boot_generation": uuid::Uuid::new_v4().to_string(),
+        });
+        assert!(supervisor_handoff_identity_changed(
+            &replaced,
+            "2026.8.0",
+            42,
+            unchanged["boot_generation"].as_str(),
+        ));
+    }
+
+    #[test]
+    fn local_upgrade_rejects_nonterminal_remote_runtime_owner() {
+        let active = crate::upgrade_transaction::UpgradeTransaction::new(
+            "2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true,
+        );
+        assert!(ensure_no_remote_upgrade_owns_runtime(&[active.clone()]).is_err());
+
+        let mut completed = active;
+        completed.state = crate::upgrade_transaction::UpgradeTransactionState::Completed;
+        assert!(ensure_no_remote_upgrade_owns_runtime(&[completed]).is_ok());
     }
 
     #[test]
