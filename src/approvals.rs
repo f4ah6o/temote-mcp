@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 use crate::config::{self, Session};
 use crate::{friction, kintone_cli, kintone_mcp, sandbox, secret_broker};
+use temote_mcp::activity::broker::ActivityBroker;
+use temote_mcp::activity::contract::ActivityUpdate;
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APPROVAL_RESPONSE_BYTES: usize = 64;
@@ -46,6 +48,9 @@ const MAX_APPROVAL_OPERATION_BYTES: usize = 256;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
 const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
+const ACTIVITY_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const ACTIVITY_ACK_ACCEPTED: &[u8] = b"accepted\n";
+const ACTIVITY_ACK_DISCARDED: &[u8] = b"discarded\n";
 #[cfg(test)]
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
@@ -370,6 +375,90 @@ impl ExpectedSessionInstance {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ActivityExpectedSession {
+    id: String,
+    started_at: u64,
+    process_id: u32,
+}
+
+impl ActivityExpectedSession {
+    fn matches(&self, expected: &ExpectedSessionInstance) -> bool {
+        self.id == expected.id
+            && self.started_at == expected.started_at
+            && self.process_id == expected.process_id
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityIngress {
+    expected_session: ActivityExpectedSession,
+    update: ActivityUpdate,
+}
+
+struct ActivitySinkState {
+    retired: bool,
+    expected_session: ExpectedSessionInstance,
+}
+
+#[derive(Clone)]
+struct ActivitySink {
+    broker: Arc<ActivityBroker>,
+    session_instance: Uuid,
+    state: Arc<StdMutex<ActivitySinkState>>,
+}
+
+impl ActivitySink {
+    fn new(broker: Arc<ActivityBroker>, session: &Session, session_instance: Uuid) -> Self {
+        Self {
+            broker,
+            session_instance,
+            state: Arc::new(StdMutex::new(ActivitySinkState {
+                retired: false,
+                expected_session: ExpectedSessionInstance::from_session(session),
+            })),
+        }
+    }
+
+    fn publish(&self, ingress: ActivityIngress) -> bool {
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        if state.retired || !ingress.expected_session.matches(&state.expected_session) {
+            return false;
+        }
+        self.broker
+            .publish(
+                ingress.update,
+                Some(&state.expected_session.id),
+                Some(self.session_instance),
+            )
+            .is_ok()
+    }
+
+    fn retire(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.retired = true;
+        }
+    }
+}
+
+pub(crate) struct RuntimeActivity {
+    broker: Arc<ActivityBroker>,
+    session_instance: Uuid,
+}
+
+impl RuntimeActivity {
+    pub(crate) fn new(broker: Arc<ActivityBroker>, session_instance: Uuid) -> Self {
+        Self {
+            broker,
+            session_instance,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Message {
@@ -385,6 +474,7 @@ enum Message {
         title: String,
         detail: Option<String>,
     },
+    ActivityUpdate(ActivityIngress),
     OnePasswordServiceAccount {
         request: ServiceAccountRequest,
     },
@@ -928,6 +1018,7 @@ pub struct RuntimeHandle {
     session: Session,
     commands: mpsc::Sender<RuntimeCommand>,
     join: JoinHandle<Result<()>>,
+    activity_sink: Option<ActivitySink>,
 }
 
 impl RuntimeHandle {
@@ -941,6 +1032,12 @@ impl RuntimeHandle {
 
     pub(crate) fn session_metadata(&self) -> Session {
         self.session.clone()
+    }
+
+    pub(crate) fn retire_activity(&self) {
+        if let Some(sink) = &self.activity_sink {
+            sink.retire();
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1007,6 +1104,9 @@ impl RuntimeHandle {
     }
 
     pub async fn shutdown(self) -> Result<()> {
+        if let Some(sink) = &self.activity_sink {
+            sink.retire();
+        }
         crate::codex_app_server::begin_session_shutdown(&self.session);
         if config::read_session_lifecycle(&self.id)
             .await
@@ -1047,6 +1147,9 @@ impl RuntimeHandle {
     }
 
     pub async fn wait(self) -> Result<()> {
+        if let Some(sink) = &self.activity_sink {
+            sink.retire();
+        }
         crate::codex_app_server::begin_session_shutdown(&self.session);
         self.join
             .await
@@ -1073,6 +1176,7 @@ pub async fn spawn_runtime(
     .await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn spawn_runtime_with_logical_path_and_environment(
     cwd: &Path,
     session_id: Option<&str>,
@@ -1080,6 +1184,48 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
     approval_sender: ApprovalSender,
     logical_path: Option<String>,
     environment: CapturedStartEnvironment,
+) -> Result<RuntimeHandle> {
+    spawn_runtime_inner(
+        cwd,
+        session_id,
+        permission_mode,
+        approval_sender,
+        logical_path,
+        environment,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn spawn_runtime_with_activity(
+    cwd: &Path,
+    session_id: Option<&str>,
+    permission_mode: config::PermissionMode,
+    approval_sender: ApprovalSender,
+    logical_path: Option<String>,
+    environment: CapturedStartEnvironment,
+    activity: RuntimeActivity,
+) -> Result<RuntimeHandle> {
+    spawn_runtime_inner(
+        cwd,
+        session_id,
+        permission_mode,
+        approval_sender,
+        logical_path,
+        environment,
+        Some(activity),
+    )
+    .await
+}
+
+async fn spawn_runtime_inner(
+    cwd: &Path,
+    session_id: Option<&str>,
+    permission_mode: config::PermissionMode,
+    approval_sender: ApprovalSender,
+    logical_path: Option<String>,
+    environment: CapturedStartEnvironment,
+    activity: Option<RuntimeActivity>,
 ) -> Result<RuntimeHandle> {
     environment.validate()?;
     let service_account_token = environment
@@ -1172,11 +1318,16 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         return Err(error);
     }
 
+    let activity_sink = activity
+        .map(|activity| ActivitySink::new(activity.broker, &session, activity.session_instance));
+
     let id_for_handle = session.id.clone();
     let cwd_for_handle = session.cwd.clone();
     let session_for_handle = session.clone();
     let fallback_session = session.clone();
     let final_path = path.clone();
+    let runtime_activity_sink = activity_sink.clone();
+    let completion_activity_sink = activity_sink.clone();
     let (commands, command_receiver) = mpsc::channel(MAX_PENDING_RUNTIME_COMMANDS);
     let runtime_join = tokio::spawn(async move {
         let result = run_runtime(
@@ -1184,9 +1335,12 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
             &mut session,
             command_receiver,
             approval_sender,
-            service_account_token.as_deref(),
-            kintone_bridge,
-            kintone_cli_bridge,
+            RuntimeServices {
+                service_account_token,
+                kintone_bridge,
+                kintone_cli_bridge,
+                activity_sink: runtime_activity_sink,
+            },
         )
         .await;
         (session, result)
@@ -1199,6 +1353,9 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
                 Err(anyhow::anyhow!("session runtime task failed: {error}")),
             ),
         };
+        if let Some(sink) = &completion_activity_sink {
+            sink.retire();
+        }
         crate::codex_app_server::begin_session_shutdown(&session);
         session.process_id = 0;
         if let Err(error) = config::save_session(&session).await {
@@ -1246,6 +1403,7 @@ pub async fn spawn_runtime_with_logical_path_and_environment(
         session: session_for_handle,
         commands,
         join,
+        activity_sink,
     })
 }
 
@@ -1312,8 +1470,8 @@ async fn receive_session_message(
     };
     let message: Message = match serde_json::from_str(&line) {
         Ok(message) => message,
-        Err(error) => {
-            eprintln!("[session {session_id}] ignoring invalid session message: {error}");
+        Err(_) => {
+            eprintln!("[session {session_id}] ignoring invalid session message");
             return;
         }
     };
@@ -1337,14 +1495,19 @@ impl Drop for ActiveOperationGuard {
     }
 }
 
+struct RuntimeServices {
+    service_account_token: Option<String>,
+    kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
+    kintone_cli_bridge: Arc<kintone_cli::Bridge>,
+    activity_sink: Option<ActivitySink>,
+}
+
 async fn run_runtime(
     listener: UnixListener,
     session: &mut Session,
     mut commands: mpsc::Receiver<RuntimeCommand>,
     approval_sender: ApprovalSender,
-    service_account_token: Option<&str>,
-    kintone_bridge: Arc<tokio::sync::Mutex<kintone_mcp::Bridge>>,
-    kintone_cli_bridge: Arc<kintone_cli::Bridge>,
+    services: RuntimeServices,
 ) -> Result<()> {
     let (approval_lifetime, _) = watch::channel(false);
     let (incoming_sender, mut incoming_receiver) = mpsc::channel(MAX_PENDING_SESSION_READS);
@@ -1371,6 +1534,29 @@ async fn run_runtime(
             }
             incoming = incoming_receiver.recv() => {
                 let Some(IncomingSessionMessage { mut stream, message, _permit }) = incoming else { continue };
+                let message = match message {
+                    Message::ActivityUpdate(ingress) => {
+                        let accepted = services.activity_sink
+                            .as_ref()
+                            .is_some_and(|sink| sink.publish(ingress));
+                        tokio::spawn(async move {
+                            let _permit = _permit;
+                            let ack = if accepted {
+                                ACTIVITY_ACK_ACCEPTED
+                            } else {
+                                ACTIVITY_ACK_DISCARDED
+                            };
+                            let _ = tokio::time::timeout(
+                                ACTIVITY_ACK_WRITE_TIMEOUT,
+                                stream.write_all(ack),
+                            )
+                            .await;
+                            let _ = stream.shutdown().await;
+                        });
+                        continue;
+                    }
+                    message => message,
+                };
                 drop(_permit);
                 if upgrade_quiesced && !matches!(&message, Message::Probe | Message::Activity { .. }) {
                     match &message {
@@ -1398,7 +1584,7 @@ async fn run_runtime(
                             );
                             let _ = stream.write_all(&bytes).await;
                         }
-                        Message::Probe | Message::Activity { .. } => unreachable!(),
+                        Message::Probe | Message::Activity { .. } | Message::ActivityUpdate(_) => unreachable!(),
                     }
                     let _ = stream.shutdown().await;
                     continue;
@@ -1412,9 +1598,10 @@ async fn run_runtime(
                     Message::Activity { title, detail } => {
                         show_activity_for_session(&session.id, &title, detail.as_deref());
                     }
+                    Message::ActivityUpdate(_) => unreachable!("handled before quiesce dispatch"),
                     Message::OnePasswordServiceAccount { request } => {
                         let session = session.clone();
-                        let token = service_account_token.map(str::to_owned);
+                        let token = services.service_account_token.clone();
                         let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
                             let _operation = operation;
@@ -1426,7 +1613,7 @@ async fn run_runtime(
                     }
                     Message::KintoneMcp { request } => {
                         let session = session.clone();
-                        let bridge = Arc::clone(&kintone_bridge);
+                        let bridge = Arc::clone(&services.kintone_bridge);
                         let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
                             let _operation = operation;
@@ -1438,7 +1625,7 @@ async fn run_runtime(
                     }
                     Message::KintoneCli { request } => {
                         let session = session.clone();
-                        let bridge = Arc::clone(&kintone_cli_bridge);
+                        let bridge = Arc::clone(&services.kintone_cli_bridge);
                         let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
                         tokio::spawn(async move {
                             let _operation = operation;
@@ -2377,6 +2564,54 @@ mod tests {
 
     use super::*;
     use crate::test_support;
+    use temote_mcp::activity::contract::{ActivityOperation, ActivityState, ActivitySummary};
+
+    fn activity_test_id() -> String {
+        format!("ai{}", &Uuid::new_v4().simple().to_string()[..8])
+    }
+
+    fn activity_test_broker() -> Arc<ActivityBroker> {
+        Arc::new(ActivityBroker::new(|| 1_780_000_000_000, Uuid::new_v4()))
+    }
+
+    fn activity_test_update() -> ActivityUpdate {
+        ActivityUpdate::new(
+            Uuid::new_v4(),
+            ActivityOperation::ReadFile,
+            ActivityState::Started,
+            None,
+            ActivitySummary::Empty,
+        )
+        .unwrap()
+    }
+
+    async fn write_activity_frame(path: &Path, bytes: &[u8]) -> String {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            BufReader::new(stream).read_line(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        response
+    }
+
+    fn activity_frame(session: &Session, update: &ActivityUpdate) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "type": "activity_update",
+            "expected_session": {
+                "id": session.id,
+                "started_at": session.started_at,
+                "process_id": session.process_id,
+            },
+            "update": update,
+        }))
+        .unwrap()
+    }
 
     fn test_session(root: &Path) -> Session {
         let root = config::canonical_directory(root).unwrap();
@@ -3248,6 +3483,220 @@ esac
             redact_token("before secret-token after", "secret-token"),
             "before [REDACTED_SERVICE_ACCOUNT_TOKEN] after"
         );
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_accepts_matching_instance_and_stamps_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let id = activity_test_id();
+        let broker = activity_test_broker();
+        let instance = Uuid::new_v4();
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime_with_activity(
+            root.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            CapturedStartEnvironment::default(),
+            RuntimeActivity::new(Arc::clone(&broker), instance),
+        )
+        .await
+        .unwrap();
+        let session = handle.session_metadata();
+        let frame = activity_frame(&session, &activity_test_update());
+
+        let response = write_activity_frame(&config::socket_path(&id).unwrap(), &frame).await;
+        assert_eq!(response.as_bytes(), ACTIVITY_ACK_ACCEPTED);
+        let events = broker.subscribe_snapshot(None, 10).unwrap().into_snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id(), Some(id.as_str()));
+        assert_eq!(events[0].session_instance(), Some(instance));
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_discards_stale_expected_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let id = activity_test_id();
+        let broker = activity_test_broker();
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime_with_activity(
+            root.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            CapturedStartEnvironment::default(),
+            RuntimeActivity::new(Arc::clone(&broker), Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        let mut session = handle.session_metadata();
+        session.started_at += 1;
+        let frame = activity_frame(&session, &activity_test_update());
+
+        let response = write_activity_frame(&config::socket_path(&id).unwrap(), &frame).await;
+        assert_eq!(response.as_bytes(), ACTIVITY_ACK_DISCARDED);
+        assert_eq!(broker.current_sequence().unwrap(), 0);
+        assert_eq!(handle.snapshot().await.unwrap().id, id);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_discards_retired_sink_without_stopping_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let id = activity_test_id();
+        let broker = activity_test_broker();
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime_with_activity(
+            root.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            CapturedStartEnvironment::default(),
+            RuntimeActivity::new(Arc::clone(&broker), Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        let session = handle.session_metadata();
+        handle.activity_sink.as_ref().unwrap().retire();
+        let frame = activity_frame(&session, &activity_test_update());
+
+        let response = write_activity_frame(&config::socket_path(&id).unwrap(), &frame).await;
+        assert_eq!(response.as_bytes(), ACTIVITY_ACK_DISCARDED);
+        assert_eq!(broker.current_sequence().unwrap(), 0);
+        assert_eq!(handle.snapshot().await.unwrap().id, id);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_rejects_unknown_and_duplicate_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let id = activity_test_id();
+        let broker = activity_test_broker();
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime_with_activity(
+            root.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            CapturedStartEnvironment::default(),
+            RuntimeActivity::new(Arc::clone(&broker), Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        let session = handle.session_metadata();
+        let update = serde_json::to_string(&activity_test_update()).unwrap();
+        let unknown = format!(
+            r#"{{"type":"activity_update","expected_session":{{"id":"{}","started_at":{},"process_id":{}}},"update":{},"extra":"secret-sentinel"}}"#,
+            session.id, session.started_at, session.process_id, update
+        );
+        let duplicate = format!(
+            r#"{{"type":"activity_update","expected_session":{{"id":"{}","started_at":{},"process_id":{}}},"update":{{"schema_version":1,"schema_version":1,"operation_id":"{}","operation":"read_file","state":"started","duration_ms":null,"summary":{{"kind":"empty"}}}}}}"#,
+            session.id,
+            session.started_at,
+            session.process_id,
+            Uuid::new_v4()
+        );
+        let unknown_schema_update =
+            update.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+        let unknown_schema = format!(
+            r#"{{"type":"activity_update","expected_session":{{"id":"{}","started_at":{},"process_id":{}}},"update":{}}}"#,
+            session.id, session.started_at, session.process_id, unknown_schema_update
+        );
+
+        for invalid in [unknown, duplicate, unknown_schema] {
+            let response =
+                write_activity_frame(&config::socket_path(&id).unwrap(), invalid.as_bytes()).await;
+            assert!(response.is_empty());
+        }
+        assert_eq!(broker.current_sequence().unwrap(), 0);
+        assert_eq!(handle.snapshot().await.unwrap().id, id);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_oversized_frame_does_not_stop_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let id = activity_test_id();
+        let broker = activity_test_broker();
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime_with_activity(
+            root.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            CapturedStartEnvironment::default(),
+            RuntimeActivity::new(Arc::clone(&broker), Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        let path = config::socket_path(&id).unwrap();
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        let oversized = vec![b'x'; MAX_SESSION_MESSAGE_BYTES + 1];
+        let _ = stream.write_all(&oversized).await;
+        let _ = stream.shutdown().await;
+        let mut response = String::new();
+        let _ = BufReader::new(stream).read_line(&mut response).await;
+
+        assert!(response.is_empty());
+        assert_eq!(broker.current_sequence().unwrap(), 0);
+        assert_eq!(handle.snapshot().await.unwrap().id, id);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_ingress_ack_failure_isolated_from_runtime_and_event() {
+        let root = tempfile::tempdir().unwrap();
+        let id = activity_test_id();
+        let broker = activity_test_broker();
+        let (sender, _receiver) = approval_channel();
+        let handle = spawn_runtime_with_activity(
+            root.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            CapturedStartEnvironment::default(),
+            RuntimeActivity::new(Arc::clone(&broker), Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+        let frame = activity_frame(&handle.session_metadata(), &activity_test_update());
+        let mut stream = UnixStream::connect(config::socket_path(&id).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while broker.current_sequence().unwrap() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(broker.current_sequence().unwrap(), 1);
+        assert_eq!(handle.snapshot().await.unwrap().id, id);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn activity_ingress_strictness_does_not_change_legacy_message_fields() {
+        let message: Message = serde_json::from_str(
+            r#"{"type":"activity","title":"legacy","detail":null,"extra":"preserved"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            message,
+            Message::Activity { title, detail }
+                if title == "legacy" && detail.is_none()
+        ));
     }
 
     #[tokio::test]
