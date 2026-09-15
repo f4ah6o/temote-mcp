@@ -463,7 +463,7 @@ fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
     );
     assert_cli_success(&upgrade, "forced same-version supervisor upgrade");
     assert!(
-        String::from_utf8_lossy(&upgrade.stdout).contains("supervisor handoff complete"),
+        String::from_utf8_lossy(&upgrade.stdout).contains("Temote upgrade complete:"),
         "upgrade did not report handoff completion: stdout={} stderr={}",
         String::from_utf8_lossy(&upgrade.stdout),
         String::from_utf8_lossy(&upgrade.stderr)
