@@ -845,6 +845,64 @@ mod tests {
         assert_eq!(message, "COMMIT\n");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn http1_driver_aborts_when_client_resets_before_accepted_response_flush() {
+        use std::os::fd::AsRawFd;
+
+        let (commit, mut decision) =
+            crate::upgrade_coordinator::CoordinatorCommit::test_pair().unwrap();
+        decision
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let app = Router::new().route(
+            "/accepted",
+            get(move || {
+                let commit = commit.clone();
+                async move {
+                    let mut response = Response::new(Body::from(vec![b'x'; 16 * 1024 * 1024]));
+                    response.extensions_mut().insert(UpgradeResponseMarker {
+                        commit,
+                        accepted_body_complete: true,
+                    });
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_http1_connection(stream, app).await
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"GET /accepted HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+        drop(client);
+        assert!(server.await.unwrap().is_err());
+        let mut message = String::new();
+        std::io::Read::read_to_string(&mut decision, &mut message).unwrap();
+        assert_eq!(message, "ABORT\n");
+    }
+
     fn runtime() -> Runtime {
         let (supervisor, _approvals) =
             SessionSupervisor::new(crate::named_roots::NamedRoots::default());
