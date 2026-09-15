@@ -664,6 +664,26 @@ impl From<&ActivityUpdate> for ActivityUpdateWire {
     }
 }
 
+impl Serialize for ActivityUpdate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ActivityUpdateWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let update = Self::from(ActivityUpdateWire::deserialize(deserializer)?);
+        update.validate().map_err(|_| serde_invalid_json())?;
+        Ok(update)
+    }
+}
+
 #[derive(Serialize)]
 struct ActivityEventWire<'a> {
     schema_version: u64,
