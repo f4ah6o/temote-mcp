@@ -84,6 +84,12 @@ async fn main() -> Result<()> {
     }) = cli.command.as_ref()
     {
         session_control::initialize_installed_upgrade_locator_from(installed_locator)?;
+    } else if let Some(installed_locator) =
+        std::env::var_os(session_control::INTERNAL_INSTALLED_LOCATOR_ENV)
+    {
+        session_control::initialize_installed_upgrade_locator_from(std::path::Path::new(
+            &installed_locator,
+        ))?;
     } else {
         session_control::initialize_installed_upgrade_locator()?;
     }

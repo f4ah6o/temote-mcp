@@ -112,7 +112,9 @@ pub async fn prepare_apply(
             upgrade_transaction::write_transaction(&transaction)?;
         }
     }
-    match upgrade_transaction::classify_persisted_apply(&executable.target_version)? {
+    let persisted = upgrade_transaction::load_transactions()?;
+    let sequence = upgrade_transaction::next_transaction_sequence(&persisted)?;
+    match upgrade_transaction::admit_apply(&persisted, &executable.target_version)? {
         UpgradeApplyDisposition::ExistingActive(id) => {
             return Ok(PreparedRemoteUpgrade {
                 status: upgrade_transaction::read_transaction(&id)?.status(),
@@ -142,6 +144,7 @@ pub async fn prepare_apply(
         executable.digest_hex(),
         crate::host_identity::resolve()?,
         crate::boot_identity::generation().to_owned(),
+        sequence,
     );
     upgrade_transaction::write_transaction(&transaction)?;
     let commit = match spawn_coordinator(&executable, &transaction.transaction_id).await {
@@ -181,6 +184,7 @@ fn prepared_transaction_from_approved(
     approved_executable_sha256: String,
     host_id: String,
     source_boot_generation: String,
+    sequence: u64,
 ) -> UpgradeTransaction {
     let mut transaction = UpgradeTransaction::new(
         preflight.source_version,
@@ -192,6 +196,7 @@ fn prepared_transaction_from_approved(
         preflight.direct_ingress_action == "restart",
     );
     transaction.planned_session_count = preflight.planned_sessions.len();
+    transaction.sequence = sequence;
     transaction.planned_sessions = preflight.planned_sessions;
     transaction.approved_executable_sha256 = Some(approved_executable_sha256);
     transaction
@@ -477,6 +482,7 @@ mod tests {
             "a".repeat(64),
             "host-a".to_owned(),
             "boot-a".to_owned(),
+            1,
         );
         upgrade_transaction::write_transaction(&transaction).unwrap();
         let restored = upgrade_transaction::read_transaction(&transaction.transaction_id).unwrap();
@@ -523,6 +529,7 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
                     self.restored = Some(
                         session_control::apply_supervisor_upgrade(
                             &executable,
+                            self.executable.installed_locator(),
                             &self.transaction.target_version,
                             false,
                             Some(&self.transaction.planned_sessions),
@@ -550,7 +557,12 @@ impl UpgradeCoordinatorExecutor for ConcreteExecutor {
                         &self.transaction.target_version,
                     )
                     .await?;
-                    crate::lifecycle::apply_direct_ingress_upgrade(prepared, &executable).await?;
+                    crate::lifecycle::apply_direct_ingress_upgrade(
+                        prepared,
+                        &executable,
+                        self.executable.installed_locator(),
+                    )
+                    .await?;
                 }
                 UpgradeTransactionState::EndpointVerifying => {
                     let identity = crate::lifecycle::verify_direct_ingress_identity(

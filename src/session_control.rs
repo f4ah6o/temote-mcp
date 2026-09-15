@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read as _, Write};
+use std::io::{Read as _, Seek as _, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -40,6 +40,7 @@ const UPGRADE_FAILURE_REPORT_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_FAILURE_REPORT_BYTES: usize = 64 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
 const MAX_UPGRADE_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+pub const INTERNAL_INSTALLED_LOCATOR_ENV: &str = "TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR";
 static INSTALLED_UPGRADE_LOCATOR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn initialize_installed_upgrade_locator() -> Result<()> {
@@ -133,6 +134,8 @@ enum ControlRequest {
     },
     Upgrade {
         executable: PathBuf,
+        #[serde(default)]
+        installed_locator: Option<PathBuf>,
         target_version: String,
         #[serde(default)]
         environment: CapturedStartEnvironment,
@@ -703,6 +706,7 @@ async fn handle_control_connection(
         }
         ControlRequest::Upgrade {
             executable,
+            installed_locator,
             target_version,
             environment,
             dry_run,
@@ -713,6 +717,7 @@ async fn handle_control_connection(
                 stream,
                 supervisor,
                 executable,
+                installed_locator,
                 target_version,
                 environment,
                 dry_run,
@@ -977,6 +982,7 @@ async fn handle_upgrade_request(
     mut stream: UnixStream,
     supervisor: Arc<SessionSupervisor>,
     executable: PathBuf,
+    installed_locator: Option<PathBuf>,
     target_version: String,
     environment: CapturedStartEnvironment,
     dry_run: bool,
@@ -1101,6 +1107,9 @@ async fn handle_upgrade_request(
         .arg("--restore-plan")
         .arg(&plan_path);
     let _exec_credential_handoff = environment.apply_to_command(&mut command)?;
+    if let Some(locator) = installed_locator {
+        command.env(INTERNAL_INSTALLED_LOCATOR_ENV, locator);
+    }
     let exec_error = command.exec();
     #[cfg(target_os = "linux")]
     drop(_exec_credential_handoff);
@@ -1430,9 +1439,34 @@ fn remove_upgrade_plan(path: &Path) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct InstalledUpgradeExecutable {
     path: PathBuf,
-    file: Arc<std::fs::File>,
+    execution: Arc<UpgradeExecutionBinding>,
     digest: [u8; 32],
     pub target_version: String,
+}
+
+#[derive(Debug)]
+struct UpgradeExecutionBinding {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+struct PendingUpgradeSnapshot {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PendingUpgradeSnapshot {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for UpgradeExecutionBinding {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl InstalledUpgradeExecutable {
@@ -1444,19 +1478,93 @@ impl InstalledUpgradeExecutable {
     }
 
     pub(crate) fn execution_fd(&self) -> i32 {
-        self.file.as_raw_fd()
+        self.execution.file.as_raw_fd()
     }
 
-    pub(crate) fn execution_path(&self) -> PathBuf {
-        #[cfg(target_os = "linux")]
-        return PathBuf::from(format!("/proc/self/fd/{}", self.execution_fd()));
-        #[cfg(not(target_os = "linux"))]
-        PathBuf::from(format!("/dev/fd/{}", self.execution_fd()))
+    pub(crate) fn execution_path(&self) -> &Path {
+        &self.execution.path
     }
 
     pub(crate) fn installed_locator(&self) -> &Path {
         &self.path
     }
+}
+
+fn create_upgrade_execution_snapshot(
+    source: &mut std::fs::File,
+) -> Result<UpgradeExecutionBinding> {
+    let directory = std::env::temp_dir()
+        .join(format!("temote-mcp-upgrade-candidates-{}", unsafe {
+            libc::geteuid()
+        }));
+    match std::fs::create_dir(&directory) {
+        Ok(()) => std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("cannot create upgrade candidate directory"),
+    }
+    let directory_metadata = std::fs::symlink_metadata(&directory)?;
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        directory_metadata.is_dir()
+            && directory_metadata.uid() == unsafe { libc::geteuid() }
+            && directory_metadata.permissions().mode() & 0o077 == 0,
+        "upgrade candidate directory is not private to the current user"
+    );
+    let path = directory.join(format!("{}.candidate", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("cannot create private upgrade execution snapshot")?;
+    let mut cleanup = PendingUpgradeSnapshot {
+        path: path.clone(),
+        armed: true,
+    };
+    source.seek(std::io::SeekFrom::Start(0))?;
+    let copied = std::io::copy(
+        &mut source.take(MAX_UPGRADE_EXECUTABLE_BYTES + 1),
+        &mut file,
+    )?;
+    anyhow::ensure!(
+        copied <= MAX_UPGRADE_EXECUTABLE_BYTES,
+        "upgrade executable exceeds bounded identity size"
+    );
+    file.sync_all()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))?;
+    // Linux rejects exec while any process has the image open for writing.
+    // Retain only a read descriptor once the private snapshot is complete.
+    drop(file);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("cannot reopen private upgrade execution snapshot")?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    cleanup.armed = false;
+    Ok(UpgradeExecutionBinding { path, file })
+}
+
+fn bounded_upgrade_executable_digest(file: &mut std::fs::File) -> Result<[u8; 32]> {
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied += read as u64;
+        anyhow::ensure!(
+            copied <= MAX_UPGRADE_EXECUTABLE_BYTES,
+            "upgrade executable exceeds bounded identity size"
+        );
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutable> {
@@ -1491,43 +1599,15 @@ pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutab
         metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
         "upgrade executable exceeds bounded identity size"
     );
-    let mut hasher = Sha256::new();
-    let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        copied += read as u64;
-        anyhow::ensure!(
-            copied <= MAX_UPGRADE_EXECUTABLE_BYTES,
-            "upgrade executable exceeds bounded identity size"
-        );
-        hasher.update(&buffer[..read]);
-    }
-    let digest: [u8; 32] = hasher.finalize().into();
-    let fd = file.as_raw_fd();
-    let executable_path = {
-        #[cfg(target_os = "linux")]
-        {
-            PathBuf::from(format!("/proc/self/fd/{fd}"))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            PathBuf::from(format!("/dev/fd/{fd}"))
-        }
-    };
-    let mut command = std::process::Command::new(executable_path);
+    let digest = bounded_upgrade_executable_digest(&mut file)?;
+    let mut execution = create_upgrade_execution_snapshot(&mut file)?;
+    let snapshot_digest = bounded_upgrade_executable_digest(&mut execution.file)?;
+    anyhow::ensure!(
+        snapshot_digest == digest,
+        "upgrade execution snapshot identity mismatch"
+    );
+    let mut command = std::process::Command::new(&execution.path);
     command.args(["supervisor", "--capabilities"]);
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     let output = command
         .output()
         .context("failed to inspect installed Temote capabilities")?;
@@ -1546,7 +1626,7 @@ pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutab
     let target_version = capabilities.version;
     Ok(InstalledUpgradeExecutable {
         path,
-        file: Arc::new(file),
+        execution: Arc::new(execution),
         digest,
         target_version,
     })
@@ -1562,7 +1642,7 @@ pub fn revalidate_installed_upgrade_executable(
             && current.target_version == approved.target_version,
         "installed Temote executable changed after approval"
     );
-    Ok(current.path)
+    Ok(approved.execution_path().to_owned())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1589,18 +1669,37 @@ pub async fn remote_upgrade_preflight(
     upgrade_preflight_with_force(executable, false).await
 }
 
+fn validate_running_supervisor_upgrade_capabilities(ping: &Value) -> Result<()> {
+    anyhow::ensure!(
+        ping.get("control_protocol").and_then(Value::as_u64) == Some(CONTROL_PROTOCOL_VERSION),
+        "running supervisor control protocol is incompatible; manual supervisor restart is required"
+    );
+    anyhow::ensure!(
+        ping.get("lifecycle_schema").and_then(Value::as_u64) == Some(LIFECYCLE_SCHEMA_VERSION),
+        "running supervisor lifecycle schema is incompatible; manual supervisor restart is required"
+    );
+    anyhow::ensure!(
+        ping.get("upgrade_plan_schema").and_then(Value::as_u64)
+            == Some(UPGRADE_PLAN_SCHEMA_VERSION),
+        "running supervisor upgrade plan schema is incompatible; manual supervisor restart is required"
+    );
+    Ok(())
+}
+
 async fn upgrade_preflight_with_force(
     executable: &InstalledUpgradeExecutable,
     force: bool,
 ) -> Result<RemoteUpgradePreflight> {
     let ping = request(ControlRequest::Ping).await?;
+    validate_running_supervisor_upgrade_capabilities(&ping)?;
     let source_version = ping
         .get("version")
         .and_then(Value::as_str)
         .context("running supervisor did not report its version")?
         .to_owned();
     let preview_value = request(ControlRequest::Upgrade {
-        executable: executable.path.clone(),
+        executable: executable.execution_path().to_owned(),
+        installed_locator: Some(executable.path.clone()),
         target_version: executable.target_version.clone(),
         environment: CapturedStartEnvironment::capture(),
         dry_run: true,
@@ -1702,11 +1801,13 @@ fn validate_planned_upgrade_session_identities(
 
 pub async fn apply_supervisor_upgrade(
     executable: &Path,
+    installed_locator: &Path,
     target_version: &str,
     force: bool,
     expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
 ) -> Result<usize> {
     let ping = request(ControlRequest::Ping).await?;
+    validate_running_supervisor_upgrade_capabilities(&ping)?;
     let source_version = ping
         .get("version")
         .and_then(Value::as_str)
@@ -1715,6 +1816,7 @@ pub async fn apply_supervisor_upgrade(
     let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
     let result = request(ControlRequest::Upgrade {
         executable: executable.to_owned(),
+        installed_locator: Some(installed_locator.to_owned()),
         target_version: target_version.to_owned(),
         environment: CapturedStartEnvironment::capture(),
         dry_run: false,
@@ -1809,14 +1911,25 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         "direct ingress upgrade is blocked"
     );
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
-    let restored =
-        apply_supervisor_upgrade(&executable_path, &executable.target_version, force, None).await?;
+    let restored = apply_supervisor_upgrade(
+        &executable_path,
+        executable.installed_locator(),
+        &executable.target_version,
+        force,
+        None,
+    )
+    .await?;
     #[cfg(all(feature = "network", unix))]
     {
         let executable_path = revalidate_installed_upgrade_executable(&executable)?;
         let ingress =
             crate::lifecycle::prepare_direct_ingress_upgrade(&executable.target_version).await?;
-        crate::lifecycle::apply_direct_ingress_upgrade(ingress, &executable_path).await?;
+        crate::lifecycle::apply_direct_ingress_upgrade(
+            ingress,
+            &executable_path,
+            executable.installed_locator(),
+        )
+        .await?;
     }
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
     if let Err(error) = reconcile_codex_plugin(&executable_path) {
@@ -2831,6 +2944,31 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = validate_upgrade_executable(&executable, "test-version").unwrap_err();
         assert!(error.to_string().contains("control protocol"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_upgrade_snapshot_stays_bound_after_locator_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let locator = temp.path().join("temote-mcp");
+        std::fs::write(&locator, b"#!/bin/sh\nprintf 'approved\\n'\n").unwrap();
+        std::fs::set_permissions(&locator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = std::fs::File::open(&locator).unwrap();
+        let snapshot = create_upgrade_execution_snapshot(&mut source).unwrap();
+
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nprintf 'replacement\\n'\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &locator).unwrap();
+
+        let output = std::process::Command::new(&snapshot.path).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"approved\n");
+        let snapshot_path = snapshot.path.clone();
+        drop(snapshot);
+        assert!(!snapshot_path.exists());
     }
 
     #[test]

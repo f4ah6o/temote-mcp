@@ -913,9 +913,17 @@ pub async fn prepare_direct_ingress_upgrade(
     })
 }
 
-fn spawn_direct_ingress(executable: &Path, state: &DirectIngressRuntimeState) -> Result<()> {
+fn spawn_direct_ingress(
+    executable: &Path,
+    installed_locator: &Path,
+    state: &DirectIngressRuntimeState,
+) -> Result<()> {
     let profile = parse_runtime_profile(state)?;
     let mut command = Command::new(executable);
+    command.env(
+        crate::session_control::INTERNAL_INSTALLED_LOCATOR_ENV,
+        installed_locator,
+    );
     command
         .arg("up")
         .arg("--profile")
@@ -950,6 +958,7 @@ fn spawn_direct_ingress(executable: &Path, state: &DirectIngressRuntimeState) ->
 pub async fn apply_direct_ingress_upgrade(
     prepared: PreparedDirectIngressUpgrade,
     executable: &Path,
+    installed_locator: &Path,
 ) -> Result<DirectIngressUpgradePlan> {
     match prepared.plan.action.as_str() {
         "inactive" => return Ok(prepared.plan),
@@ -977,7 +986,7 @@ pub async fn apply_direct_ingress_upgrade(
     );
     validate_restart_recipe(expected)?;
     down().await?;
-    spawn_direct_ingress(executable, expected)?;
+    spawn_direct_ingress(executable, installed_locator, expected)?;
 
     let deadline = tokio::time::Instant::now() + INGRESS_RESTART_TIMEOUT;
     loop {

@@ -111,6 +111,8 @@ pub struct UpgradeTransaction {
     pub state: UpgradeTransactionState,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub sequence: u64,
     pub reconnect_expected: bool,
     pub supervisor_handoff_required: bool,
     pub ingress_restart_required: bool,
@@ -152,6 +154,7 @@ impl UpgradeTransaction {
             state: UpgradeTransactionState::Prepared,
             created_at: now,
             updated_at: now,
+            sequence: 0,
             reconnect_expected,
             supervisor_handoff_required,
             ingress_restart_required,
@@ -764,12 +767,26 @@ pub enum UpgradeApplyDisposition {
 
 /// Selects the most recently updated transaction deterministically.
 ///
-/// Recency is ordered by `updated_at`, then by transaction ID so two
-/// transactions touched within the same second still resolve to one record.
+/// New records receive a durable monotonic `sequence`. Legacy records use
+/// `updated_at` and transaction ID as deterministic fallbacks.
 pub fn recent_transaction(transactions: &[UpgradeTransaction]) -> Option<&UpgradeTransaction> {
+    transactions.iter().max_by_key(|transaction| {
+        (
+            transaction.sequence,
+            transaction.updated_at,
+            transaction.transaction_id.clone(),
+        )
+    })
+}
+
+pub fn next_transaction_sequence(transactions: &[UpgradeTransaction]) -> Result<u64> {
     transactions
         .iter()
-        .max_by_key(|transaction| (transaction.updated_at, transaction.transaction_id.clone()))
+        .map(|transaction| transaction.sequence)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("upgrade transaction sequence is exhausted")
 }
 
 /// Selects the most recently updated completed transaction, if any.
@@ -779,7 +796,13 @@ pub fn latest_completed_transaction(
     transactions
         .iter()
         .filter(|transaction| transaction.state == UpgradeTransactionState::Completed)
-        .max_by_key(|transaction| (transaction.updated_at, transaction.transaction_id.clone()))
+        .max_by_key(|transaction| {
+            (
+                transaction.sequence,
+                transaction.updated_at,
+                transaction.transaction_id.clone(),
+            )
+        })
 }
 
 /// Returns the transactions that could still own the runtime.
@@ -1209,6 +1232,7 @@ mod tests {
             "state",
             "created_at",
             "updated_at",
+            "sequence",
             "reconnect_expected",
             "supervisor_handoff_required",
             "ingress_restart_required",
@@ -1223,7 +1247,7 @@ mod tests {
         ] {
             assert!(keys.iter().any(|key| key == expected), "missing {expected}");
         }
-        assert_eq!(keys.len(), 20);
+        assert_eq!(keys.len(), 21);
         let encoded = serde_json::to_string(&fixture.transaction).unwrap();
         for forbidden in ["token", "secret", "authorization", "cookie", "password"] {
             assert!(!encoded.to_ascii_lowercase().contains(forbidden));
@@ -1417,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn recent_transaction_prefers_updated_at_then_id() {
+    fn recent_transaction_prefers_sequence_then_legacy_fallbacks() {
         let mut older = Fixture::new().transaction.clone();
         older.updated_at = 10;
         let mut newer = Fixture::new().transaction.clone();
@@ -1457,6 +1481,25 @@ mod tests {
             transaction_for_health(&[completed.transaction.clone(), active.transaction.clone()])
                 .map(|transaction| transaction.transaction_id.as_str()),
             Some(active.transaction.transaction_id.as_str()),
+        );
+    }
+
+    #[test]
+    fn sequence_keeps_latest_completed_identity_with_same_timestamp() {
+        let mut previous = Fixture::new();
+        let mut current = Fixture::new();
+        previous.transaction.state = UpgradeTransactionState::Completed;
+        current.transaction.state = UpgradeTransactionState::Completed;
+        previous.transaction.updated_at = 42;
+        current.transaction.updated_at = 42;
+        previous.transaction.sequence = 1;
+        current.transaction.sequence = 2;
+        previous.transaction.transaction_id = "ffffffff-ffff-4fff-8fff-ffffffffffff".to_owned();
+        current.transaction.transaction_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        assert_eq!(
+            transaction_for_health(&[previous.transaction.clone(), current.transaction.clone()])
+                .map(|transaction| transaction.transaction_id.as_str()),
+            Some(current.transaction.transaction_id.as_str()),
         );
     }
 
