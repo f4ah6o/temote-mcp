@@ -624,7 +624,6 @@ impl TaskStore {
         self.directory.join(format!("{task_id}.json"))
     }
 
-    #[cfg(test)]
     fn load(&self, session: &config::Session, task_id: Uuid) -> Result<TaskRecord> {
         let _guard = self.lock()?;
         self.load_locked(session, task_id)
@@ -772,7 +771,6 @@ impl TaskStore {
             .get(owner)
             .context("Codex session instance lifecycle state is unavailable")?;
         anyhow::ensure!(!entry.closing, "Codex session instance is closing");
-        drop(registry);
         let actor_is_current = runtimes()
             .lock()
             .unwrap()
@@ -3454,9 +3452,10 @@ async fn task_get_with_store_and_binary(
         match ensure_runtime_with_binary(session, &record, store, binary, acquired_lease).await {
             Ok(EnsuredRuntime::Local(client)) => client,
             Ok(EnsuredRuntime::OwnedElsewhere) => {
-                return Ok(task_view_at_revision(&record, after_revision));
+                let current = store.load(session, task_id)?;
+                return Ok(task_view_at_revision(&current, after_revision));
             }
-            Err(_) => {
+            Ok(EnsuredRuntime::SetupFailed(lease)) => {
                 let apply_permit = ensure_current_active_instance(&owner, session).await?;
                 record = store.update_if_instance_live(session, task_id, &owner, |record| {
                     if !record.status.is_terminal() {
@@ -3466,8 +3465,10 @@ async fn task_get_with_store_and_binary(
                     Ok(())
                 })?;
                 drop(apply_permit);
+                drop(lease);
                 return Ok(task_view(&record, None));
             }
+            Err(error) => return Err(error),
         };
     let thread_id = record.thread_id.clone().unwrap();
     let response = request_for_instance(
@@ -3644,6 +3645,7 @@ fn extract_usage_from_turn(turn: &Value) -> Option<BTreeMap<String, u64>> {
 enum EnsuredRuntime {
     Local(RpcClient),
     OwnedElsewhere,
+    SetupFailed(Arc<TaskRuntimeLease>),
 }
 
 async fn ensure_runtime_with_binary(
@@ -3664,19 +3666,26 @@ async fn ensure_runtime_with_binary(
             None => return Ok(EnsuredRuntime::OwnedElsewhere),
         },
     };
-    let _operation_permit = ensure_current_active_instance(&owner, session).await?;
-    let (client, _) = spawn_initialized_client_with_binary_mode(
+    let _operation_permit = match ensure_current_active_instance(&owner, session).await {
+        Ok(permit) => permit,
+        Err(_) => return Ok(EnsuredRuntime::SetupFailed(lease)),
+    };
+    let (client, _) = match spawn_initialized_client_with_binary_mode(
         session,
         Some(record.task_id),
         binary,
         true,
         Some(Arc::clone(&lease)),
     )
-    .await?;
-    let thread_id = record
-        .thread_id
-        .as_deref()
-        .context("cannot resume Codex task without thread_id")?;
+    .await
+    {
+        Ok(initialized) => initialized,
+        Err(_) => return Ok(EnsuredRuntime::SetupFailed(lease)),
+    };
+    let Some(thread_id) = record.thread_id.as_deref() else {
+        client.shutdown().await;
+        return Ok(EnsuredRuntime::SetupFailed(lease));
+    };
     let resume = request_for_instance(
         &client,
         &owner,
@@ -3694,14 +3703,22 @@ async fn ensure_runtime_with_binary(
         }),
     )
     .await;
-    if let Err(error) = resume {
+    if resume.is_err() {
         client.shutdown().await;
-        return Err(error).context("Codex task could not resume its retained thread");
+        return Ok(EnsuredRuntime::SetupFailed(lease));
     }
-    if let Err(error) = insert_runtime(session, record.task_id, store, client.clone(), lease).await
+    if insert_runtime(
+        session,
+        record.task_id,
+        store,
+        client.clone(),
+        Arc::clone(&lease),
+    )
+    .await
+    .is_err()
     {
         client.shutdown().await;
-        return Err(error);
+        return Ok(EnsuredRuntime::SetupFailed(lease));
     }
     Ok(EnsuredRuntime::Local(client))
 }
@@ -3762,17 +3779,17 @@ async fn task_control_with_store_and_binary(
         match ensure_runtime_with_binary(session, &record, store, binary, acquired_lease).await {
             Ok(EnsuredRuntime::Local(client)) => client,
             Ok(EnsuredRuntime::OwnedElsewhere) => {
+                let current = store.load(session, task_id)?;
+                return replay_operation(&current, operation_id, request_fingerprint);
+            }
+            Ok(EnsuredRuntime::SetupFailed(lease)) => {
                 let shutting_down = session_instance_is_closing(&owner);
                 let record =
                     apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
+                drop(lease);
                 return Ok(task_view(&record, None));
             }
-            Err(_) => {
-                let shutting_down = session_instance_is_closing(&owner);
-                let record =
-                    apply_control_failure(store, session, task_id, operation_id, shutting_down)?;
-                return Ok(task_view(&record, None));
-            }
+            Err(error) => return Err(error),
         };
     let result = match action {
         "steer" => {
@@ -6744,6 +6761,58 @@ for raw in sys.stdin:
         client.shutdown().await;
         assert!(lease_observer.upgrade().is_none());
         assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_setup_retains_lease_through_recoverable_state_write() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let (session_handle, owner) =
+            active_test_session(root.path(), "failed-runtime-setup", true).await;
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let task_id = Uuid::new_v4();
+        let record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            4,
+            Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"),
+            Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"),
+        );
+        store.save(&record).unwrap();
+        let lease = store.try_acquire_runtime_lease(task_id).unwrap().unwrap();
+        let setup = ensure_runtime_with_binary(
+            &owner,
+            &record,
+            &store,
+            &root.path().join("missing-app-server"),
+            Some(lease),
+        )
+        .await
+        .unwrap();
+        let EnsuredRuntime::SetupFailed(lease) = setup else {
+            panic!("missing app-server unexpectedly produced a usable runtime");
+        };
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_none());
+
+        let permit = ensure_current_active_instance(&record.owner, &owner)
+            .await
+            .unwrap();
+        let persisted = store
+            .update_if_instance_live(&owner, task_id, &record.owner, |record| {
+                record.status = TaskStatus::Unknown;
+                record.revision = record.revision.saturating_add(1);
+                Ok(())
+            })
+            .unwrap();
+        drop(permit);
+        assert_eq!(persisted.status, TaskStatus::Unknown);
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_none());
+
+        drop(lease);
+        assert!(store.try_acquire_runtime_lease(task_id).unwrap().is_some());
+        remove_session_with_store(&owner, &store).await.unwrap();
+        session_handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
