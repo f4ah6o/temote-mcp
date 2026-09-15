@@ -18,7 +18,9 @@ use crate::{
     dev_tool, evidence, friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk,
     recall, sandbox, session_control::SessionBackend, work_handoff,
 };
-use temote_mcp::activity::contract::{ActivityErrorKind, ActivityOperation, ActivitySummary};
+use temote_mcp::activity::contract::{
+    ActivityErrorKind, ActivityOperation, ActivityRemote, ActivitySummary,
+};
 use temote_mcp::activity::scope::ActivityScope;
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -781,7 +783,7 @@ async fn call_tool_with_local_agent_executable(
         "read_file" => {
             let activity = file_activity_scope(&session, ActivityOperation::ReadFile);
             let result = read_file_tool(&args, &session).await;
-            finish_file_activity(activity.as_ref(), &result);
+            finish_tool_activity(activity.as_ref(), &result);
             result
         }
         "evidence_read" => evidence_read_tool(&args, &session),
@@ -825,7 +827,7 @@ async fn call_tool_with_local_agent_executable(
         "write_file" => {
             let activity = file_activity_scope(&session, ActivityOperation::WriteFile);
             let result = write_file(&args, &session, activity.as_ref()).await;
-            finish_file_activity(activity.as_ref(), &result);
+            finish_tool_activity(activity.as_ref(), &result);
             result
         }
         "apply_patch" => {
@@ -833,11 +835,22 @@ async fn call_tool_with_local_agent_executable(
             let outcome = apply_patch::apply(&session, request).await?;
             text_result(serde_json::to_string_pretty(&outcome)?)
         }
-        "git_add" => git_add(&args, &session).await,
-        "git_commit" => git_commit(&args, &session).await,
-        "git_fetch" => git_fetch(&args, &session).await,
-        "git_pull" => git_pull(&args, &session).await,
-        "git_push" => git_push(&args, &session).await,
+        name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push") => {
+            let operation = git_activity_operation(name).expect("matched Git activity operation");
+            let activity = git_activity_scope(&session, &args, operation);
+            let result = match operation {
+                ActivityOperation::GitAdd => git_add(&args, &session, activity.as_ref()).await,
+                ActivityOperation::GitCommit => {
+                    git_commit(&args, &session, activity.as_ref()).await
+                }
+                ActivityOperation::GitFetch => git_fetch(&args, &session, activity.as_ref()).await,
+                ActivityOperation::GitPull => git_pull(&args, &session, activity.as_ref()).await,
+                ActivityOperation::GitPush => git_push(&args, &session, activity.as_ref()).await,
+                _ => unreachable!("Git operation mapping returned a non-Git variant"),
+            };
+            finish_tool_activity(activity.as_ref(), &result);
+            result
+        }
         "execute" => execute(&args, &session).await,
         "start_command" => start_command(&args, &session).await,
         "poll_job" => poll_job(&args, &session).await,
@@ -1399,12 +1412,41 @@ fn file_activity_scope(
     session: &config::Session,
     operation: ActivityOperation,
 ) -> Option<ActivityScope> {
-    activity_runtime::emitter(session)
-        .ok()
-        .map(|emitter| ActivityScope::new(operation, emitter))
+    tool_activity_scope(session, operation, ActivitySummary::empty())
 }
 
-fn finish_file_activity(activity: Option<&ActivityScope>, result: &Result<Value>) {
+fn git_activity_scope(
+    session: &config::Session,
+    args: &Value,
+    operation: ActivityOperation,
+) -> Option<ActivityScope> {
+    tool_activity_scope(session, operation, git_activity_summary(args, operation))
+}
+
+fn git_activity_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
+    match operation {
+        ActivityOperation::GitFetch | ActivityOperation::GitPull | ActivityOperation::GitPush => {
+            let remote = match args.get("remote").and_then(Value::as_str) {
+                None | Some("origin") => ActivityRemote::Origin,
+                Some(_) => ActivityRemote::Other,
+            };
+            ActivitySummary::git(remote)
+        }
+        _ => ActivitySummary::empty(),
+    }
+}
+
+fn tool_activity_scope(
+    session: &config::Session,
+    operation: ActivityOperation,
+    summary: ActivitySummary,
+) -> Option<ActivityScope> {
+    activity_runtime::emitter(session)
+        .ok()
+        .map(|emitter| ActivityScope::with_summary(operation, summary, emitter))
+}
+
+fn finish_tool_activity(activity: Option<&ActivityScope>, result: &Result<Value>) {
     let Some(activity) = activity else {
         return;
     };
@@ -1814,7 +1856,22 @@ async fn write_file(
     text_result(result?)
 }
 
-async fn git_add(args: &Value, session: &config::Session) -> Result<Value> {
+fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
+    match name {
+        "git_add" => Some(ActivityOperation::GitAdd),
+        "git_commit" => Some(ActivityOperation::GitCommit),
+        "git_fetch" => Some(ActivityOperation::GitFetch),
+        "git_pull" => Some(ActivityOperation::GitPull),
+        "git_push" => Some(ActivityOperation::GitPush),
+        _ => None,
+    }
+}
+
+async fn git_add(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let paths = required_string_array(args, "paths")?;
     anyhow::ensure!(!paths.is_empty(), "paths must not be empty");
@@ -1827,10 +1884,14 @@ async fn git_add(args: &Value, session: &config::Session) -> Result<Value> {
     for path in paths {
         command.push(resolve_git_add_path(session, &path)?);
     }
-    run_git_and_report(session, cwd, command, "Stage files").await
+    run_git_and_report(session, cwd, command, "Stage files", activity).await
 }
 
-async fn git_commit(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_commit(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let message = args
         .get("message")
@@ -1855,10 +1916,14 @@ async fn git_commit(args: &Value, session: &config::Session) -> Result<Value> {
         "-m".to_owned(),
         message.to_owned(),
     ];
-    run_git_and_report(session, cwd, command, "Create Git commit").await
+    run_git_and_report(session, cwd, command, "Create Git commit", activity).await
 }
 
-async fn git_fetch(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_fetch(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
     ensure_configured_git_remote(session, &cwd, &remote).await?;
@@ -1872,10 +1937,14 @@ async fn git_fetch(args: &Value, session: &config::Session) -> Result<Value> {
         "--prune".to_owned(),
         remote,
     ];
-    run_approved_git_command(session, cwd, command, "git_fetch").await
+    run_approved_git_command(session, cwd, command, "git_fetch", activity).await
 }
 
-async fn git_pull(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_pull(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let command = vec![
         "git".to_owned(),
@@ -1887,10 +1956,14 @@ async fn git_pull(args: &Value, session: &config::Session) -> Result<Value> {
         "--ff-only".to_owned(),
         "--recurse-submodules=no".to_owned(),
     ];
-    run_approved_git_command(session, cwd, command, "git_pull").await
+    run_approved_git_command(session, cwd, command, "git_pull", activity).await
 }
 
-async fn git_push(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_push(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let remote = optional_git_remote(args)?;
     let set_upstream = args
@@ -1921,7 +1994,7 @@ async fn git_push(args: &Value, session: &config::Session) -> Result<Value> {
         command.push(remote);
         command.push("HEAD".to_owned());
     }
-    run_approved_git_command(session, cwd, command, "git_push").await
+    run_approved_git_command(session, cwd, command, "git_push", activity).await
 }
 
 fn optional_git_remote(args: &Value) -> Result<Option<String>> {
@@ -1983,24 +2056,33 @@ async fn run_approved_git_command(
     cwd: PathBuf,
     command: Vec<String>,
     operation: &str,
+    activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let repository_root = sandbox::git_worktree_root(&cwd)?;
     config::ensure_permitted(session, &repository_root)
         .context("Git repository root must be inside a permitted session root")?;
-    if !approvals::ensure_local_approval(
+    if !approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::GitNetwork,
         operation,
         format!("argv: {command:?}"),
         repository_root.clone(),
         BTreeMap::new(),
+        activity,
     )
     .await?
     {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
         anyhow::bail!("user denied {operation}")
     }
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let output = sandbox::run_unrestricted_with_env(
         &command,
         &repository_root,
@@ -2106,9 +2188,13 @@ async fn run_git_and_report(
     cwd: PathBuf,
     command: Vec<String>,
     title: &str,
+    activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let output = if session.yolo() {
         sandbox::run_unrestricted(&command, &cwd, None).await
     } else {
@@ -3192,6 +3278,33 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_support;
+    use temote_mcp::activity::contract::{ActivityState, ActivityUpdate};
+    use temote_mcp::activity::scope::{ActivityEmitError, ActivityEmitter};
+
+    #[derive(Clone, Default)]
+    struct RecordingActivityEmitter {
+        updates: Arc<Mutex<Vec<ActivityUpdate>>>,
+    }
+
+    impl RecordingActivityEmitter {
+        fn updates(&self) -> Vec<ActivityUpdate> {
+            self.updates.lock().unwrap().clone()
+        }
+
+        fn states(&self) -> Vec<ActivityState> {
+            self.updates()
+                .into_iter()
+                .map(|update| update.state())
+                .collect()
+        }
+    }
+
+    impl ActivityEmitter for RecordingActivityEmitter {
+        fn try_emit(&self, update: ActivityUpdate) -> Result<(), ActivityEmitError> {
+            self.updates.lock().unwrap().push(update);
+            Ok(())
+        }
+    }
 
     fn cached_success(text: impl Into<String>) -> CachedJobResult {
         CachedJobResult::Success {
@@ -5569,6 +5682,358 @@ mod tests {
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
+    fn activity_git_pull_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let remote = tempfile::tempdir().unwrap();
+        let seed = tempfile::tempdir().unwrap();
+        let checkout_root = tempfile::tempdir().unwrap();
+        run_git_fixture(remote.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(seed.path(), &["init", "--quiet"]);
+        run_git_fixture(seed.path(), &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            seed.path(),
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(seed.path().join("tracked.txt"), "one\n").unwrap();
+        run_git_fixture(seed.path(), &["add", "tracked.txt"]);
+        run_git_fixture(seed.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(seed.path(), &["branch", "-M", "main"]);
+        run_git_fixture(
+            seed.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git_fixture(seed.path(), &["push", "--quiet", "-u", "origin", "main"]);
+        run_git_fixture(remote.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let checkout = checkout_root.path().join("checkout");
+        run_git_fixture(
+            checkout_root.path(),
+            &[
+                "clone",
+                "--quiet",
+                remote.path().to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(seed.path().join("tracked.txt"), "two\n").unwrap();
+        run_git_fixture(seed.path(), &["add", "tracked.txt"]);
+        run_git_fixture(seed.path(), &["commit", "--quiet", "-m", "update"]);
+        run_git_fixture(seed.path(), &["push", "--quiet"]);
+        (remote, seed, checkout_root, checkout)
+    }
+
+    fn recorded_scope(
+        operation: ActivityOperation,
+        summary: ActivitySummary,
+    ) -> (ActivityScope, RecordingActivityEmitter) {
+        let emitter = RecordingActivityEmitter::default();
+        let scope = ActivityScope::with_summary(operation, summary, emitter.clone());
+        (scope, emitter)
+    }
+
+    fn recorded_git_pull_scope() -> (ActivityScope, RecordingActivityEmitter) {
+        recorded_scope(
+            ActivityOperation::GitPull,
+            ActivitySummary::git(ActivityRemote::Origin),
+        )
+    }
+
+    fn assert_git_completed(
+        emitter: &RecordingActivityEmitter,
+        operation: ActivityOperation,
+        summary: &ActivitySummary,
+    ) {
+        let updates = emitter.updates();
+        assert_eq!(
+            updates
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+        assert!(updates.iter().all(|update| update.operation() == operation));
+        assert!(updates.iter().all(|update| update.summary() == summary));
+    }
+
+    fn spawn_git_pull(
+        session: config::Session,
+        activity: ActivityScope,
+    ) -> tokio::task::JoinHandle<Result<Value>> {
+        tokio::spawn(async move {
+            let result = git_pull(
+                &json!({"session_id": session.id, "cwd": session.cwd}),
+                &session,
+                Some(&activity),
+            )
+            .await;
+            finish_tool_activity(Some(&activity), &result);
+            result
+        })
+    }
+
+    #[test]
+    fn activity_approval_maps_all_git_operations_and_safe_remote_classes() {
+        for (name, expected) in [
+            ("git_add", ActivityOperation::GitAdd),
+            ("git_commit", ActivityOperation::GitCommit),
+            ("git_fetch", ActivityOperation::GitFetch),
+            ("git_pull", ActivityOperation::GitPull),
+            ("git_push", ActivityOperation::GitPush),
+        ] {
+            assert_eq!(git_activity_operation(name), Some(expected));
+        }
+        assert_eq!(git_activity_operation("git_status"), None);
+        assert_eq!(
+            git_activity_summary(&json!({}), ActivityOperation::GitPull).safe_summary(),
+            "remote=origin"
+        );
+        assert_eq!(
+            git_activity_summary(
+                &json!({"remote": "private-name"}),
+                ActivityOperation::GitFetch,
+            )
+            .safe_summary(),
+            "remote=other"
+        );
+        assert_eq!(
+            git_activity_summary(
+                &json!({"remote": "secret-remote-marker"}),
+                ActivityOperation::GitPush,
+            )
+            .safe_summary(),
+            "remote=other"
+        );
+        assert_eq!(
+            git_activity_summary(&json!({}), ActivityOperation::GitCommit).safe_summary(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_approval_git_pull_allow_and_deny_have_ordered_states() {
+        let (_remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        let session_id = format!("activity-approval-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime(&checkout, Some(&session_id), false, sender)
+            .await
+            .unwrap();
+        let session = config::load_session(&session_id).await.unwrap();
+
+        let (allowed_scope, allowed_emitter) = recorded_git_pull_scope();
+        let allowed_task = spawn_git_pull(session.clone(), allowed_scope);
+        let allowed_prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("git_pull did not request approval")
+            .expect("approval channel closed");
+        assert_eq!(allowed_prompt.request.operation, "git_pull");
+        assert_eq!(
+            allowed_emitter.states(),
+            vec![ActivityState::Started, ActivityState::WaitingApproval]
+        );
+        allowed_prompt.respond(true);
+        let allowed = allowed_task.await.unwrap().unwrap();
+        assert!(
+            allowed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"exit_code\":0")
+        );
+        assert_eq!(
+            allowed_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "two\n"
+        );
+
+        let (denied_scope, denied_emitter) = recorded_git_pull_scope();
+        let denied_task = spawn_git_pull(session, denied_scope);
+        let denied_prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("second git_pull did not request approval")
+            .expect("approval channel closed");
+        assert_eq!(
+            denied_emitter.states(),
+            vec![ActivityState::Started, ActivityState::WaitingApproval]
+        );
+        denied_prompt.respond(false);
+        let denied = denied_task
+            .await
+            .unwrap()
+            .expect_err("denied git_pull unexpectedly succeeded");
+        assert!(denied.to_string().contains("user denied git_pull"));
+        let denied_updates = denied_emitter.updates();
+        assert_eq!(
+            denied_updates
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed,
+            ]
+        );
+        assert_eq!(
+            denied_updates.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::ApprovalDenied)
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_approval_agent_skips_waiting_and_absent_console_fails_closed() {
+        let (_remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        let cwd = config::canonical_directory(&checkout).unwrap();
+        let agent_session = config::Session {
+            id: format!("activity-agent-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: 1,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let (agent_scope, agent_emitter) = recorded_git_pull_scope();
+        let agent_result = git_pull(
+            &json!({"session_id": agent_session.id, "cwd": cwd}),
+            &agent_session,
+            Some(&agent_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&agent_scope), &agent_result);
+        assert!(agent_result.is_ok());
+        assert_eq!(
+            agent_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+
+        let ask_session = config::Session {
+            id: format!("activity-no-console-{}", Uuid::new_v4()),
+            permission_mode: config::PermissionMode::Ask,
+            ..agent_session
+        };
+        let (absent_scope, absent_emitter) = recorded_git_pull_scope();
+        let absent_result = git_pull(
+            &json!({"session_id": ask_session.id, "cwd": ask_session.cwd}),
+            &ask_session,
+            Some(&absent_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&absent_scope), &absent_result);
+        assert!(absent_result.is_err());
+        let absent_updates = absent_emitter.updates();
+        assert_eq!(
+            absent_updates
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed,
+            ]
+        );
+        assert_eq!(
+            absent_updates.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::OperationFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_approval_local_git_tools_keep_results_and_complete_once() {
+        let (_remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        run_git_fixture(&checkout, &["pull", "--quiet", "--ff-only"]);
+        run_git_fixture(&checkout, &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            &checkout,
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        let cwd = config::canonical_directory(&checkout).unwrap();
+        let session = config::Session {
+            id: format!("activity-git-tools-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: 1,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        std::fs::write(checkout.join("local.txt"), "local\n").unwrap();
+
+        let (add_scope, add_emitter) =
+            recorded_scope(ActivityOperation::GitAdd, ActivitySummary::empty());
+        let add_result = git_add(
+            &json!({"session_id": session.id, "cwd": cwd, "paths": ["local.txt"]}),
+            &session,
+            Some(&add_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&add_scope), &add_result);
+        assert!(add_result.is_ok());
+        assert_git_completed(
+            &add_emitter,
+            ActivityOperation::GitAdd,
+            &ActivitySummary::empty(),
+        );
+
+        let (commit_scope, commit_emitter) =
+            recorded_scope(ActivityOperation::GitCommit, ActivitySummary::empty());
+        let commit_result = git_commit(
+            &json!({"session_id": session.id, "cwd": cwd, "message": "local update"}),
+            &session,
+            Some(&commit_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&commit_scope), &commit_result);
+        assert!(commit_result.is_ok());
+        assert_git_completed(
+            &commit_emitter,
+            ActivityOperation::GitCommit,
+            &ActivitySummary::empty(),
+        );
+
+        let origin_summary = ActivitySummary::git(ActivityRemote::Origin);
+        let (push_scope, push_emitter) =
+            recorded_scope(ActivityOperation::GitPush, origin_summary.clone());
+        let push_result = git_push(
+            &json!({"session_id": session.id, "cwd": cwd}),
+            &session,
+            Some(&push_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&push_scope), &push_result);
+        assert!(push_result.is_ok());
+        assert_git_completed(&push_emitter, ActivityOperation::GitPush, &origin_summary);
+
+        let (fetch_scope, fetch_emitter) =
+            recorded_scope(ActivityOperation::GitFetch, origin_summary.clone());
+        let fetch_result = git_fetch(
+            &json!({"session_id": session.id, "cwd": cwd}),
+            &session,
+            Some(&fetch_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&fetch_scope), &fetch_result);
+        assert!(fetch_result.is_ok());
+        assert_git_completed(&fetch_emitter, ActivityOperation::GitFetch, &origin_summary);
+    }
+
     #[tokio::test]
     async fn agent_git_fetch_skips_the_local_console() {
         let repo = tempfile::tempdir().unwrap();
@@ -5591,6 +6056,7 @@ mod tests {
         let result = git_fetch(
             &json!({"session_id": "agent-git-fetch", "cwd": cwd}),
             &session,
+            None,
         )
         .await
         .expect("agent git_fetch must not require a local approval console");
@@ -5617,9 +6083,13 @@ mod tests {
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
         };
-        let error = git_fetch(&json!({"session_id": session.id, "cwd": cwd}), &session)
-            .await
-            .expect_err("ask git_fetch must fail closed without a running console");
+        let error = git_fetch(
+            &json!({"session_id": session.id, "cwd": cwd}),
+            &session,
+            None,
+        )
+        .await
+        .expect_err("ask git_fetch must fail closed without a running console");
         assert!(
             error.to_string().contains("not running"),
             "unexpected error: {error}"

@@ -67,7 +67,11 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::SessionStop => "session_stop",
         ActivityOperation::ReadFile => "read_file",
         ActivityOperation::WriteFile => "write_file",
+        ActivityOperation::GitAdd => "git_add",
+        ActivityOperation::GitCommit => "git_commit",
+        ActivityOperation::GitFetch => "git_fetch",
         ActivityOperation::GitPull => "git_pull",
+        ActivityOperation::GitPush => "git_push",
     }
 }
 

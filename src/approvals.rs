@@ -25,6 +25,7 @@ use crate::config::{self, Session};
 use crate::{friction, kintone_cli, kintone_mcp, sandbox, secret_broker};
 use temote_mcp::activity::broker::ActivityBroker;
 use temote_mcp::activity::contract::{ActivityUpdate, encode_update};
+use temote_mcp::activity::scope::ActivityScope;
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APPROVAL_RESPONSE_BYTES: usize = 64;
@@ -670,12 +671,31 @@ pub(crate) async fn ensure_local_approval(
     cwd: PathBuf,
     metadata: BTreeMap<String, String>,
 ) -> Result<bool> {
+    ensure_local_approval_with_activity(session, class, operation, detail, cwd, metadata, None)
+        .await
+}
+
+pub(crate) async fn ensure_local_approval_with_activity(
+    session: &Session,
+    class: ApprovalClass,
+    operation: &str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+    activity: Option<&ActivityScope>,
+) -> Result<bool> {
     match local_approval(session.permission_mode, class) {
         LocalApproval::Skip => Ok(true),
         LocalApproval::Request => {
+            if let Some(activity) = activity {
+                let _ = activity.waiting_approval();
+            }
             request_with_metadata(&session.id, operation, detail, cwd, metadata).await
         }
         LocalApproval::RequestUser => {
+            if let Some(activity) = activity {
+                let _ = activity.waiting_approval();
+            }
             request_user_approval_for_instance(session, operation, detail, cwd, metadata).await
         }
     }
