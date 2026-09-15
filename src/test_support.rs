@@ -145,7 +145,7 @@ fn shared_process_root_validation_rejects_relative_public_and_symlink_paths() {
         std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             validate_private_process_root(private.path().to_owned()).unwrap(),
-            private.path()
+            std::fs::canonicalize(private.path()).unwrap()
         );
         let link = public.path().join("private-link");
         symlink(private.path(), &link).unwrap();
