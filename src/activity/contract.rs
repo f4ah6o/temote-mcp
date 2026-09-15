@@ -49,6 +49,43 @@ pub enum ActivityOperation {
     StopJob,
     LocalAgentRun,
     DevToolRun,
+    GetImage,
+    EvidenceRead,
+    CodexStatus,
+    CodexTaskStart,
+    CodexTaskGet,
+    CodexTaskControl,
+    ListDirectory,
+    ApplyPatch,
+    PollJob,
+    JobList,
+    CheckpointSave,
+    CheckpointLoad,
+    WorkHandoff,
+    FrictionSummary,
+    LearningCandidateList,
+    Recall,
+    RecallFeedback,
+    #[serde(rename = "onepassword_mcp_discover")]
+    OnePasswordMcpDiscover,
+    #[serde(rename = "onepassword_mcp_read_resource")]
+    OnePasswordMcpReadResource,
+    #[serde(rename = "onepassword_mcp_call")]
+    OnePasswordMcpCall,
+    #[serde(rename = "onepassword_item_get")]
+    OnePasswordItemGet,
+    #[serde(rename = "onepassword_secret_resolve")]
+    OnePasswordSecretResolve,
+    #[serde(rename = "onepassword_service_account_status")]
+    OnePasswordServiceAccountStatus,
+    #[serde(rename = "onepassword_service_account_run")]
+    OnePasswordServiceAccountRun,
+    KintoneMcpStatus,
+    KintoneMcpDiscover,
+    KintoneMcpCall,
+    KintoneCliStatus,
+    KintoneCliRun,
+    WithoutSandbox,
 }
 
 impl<'de> Deserialize<'de> for ActivityOperation {
@@ -72,6 +109,36 @@ impl<'de> Deserialize<'de> for ActivityOperation {
             "stop_job" => Ok(Self::StopJob),
             "local_agent_run" => Ok(Self::LocalAgentRun),
             "dev_tool_run" => Ok(Self::DevToolRun),
+            "get_image" => Ok(Self::GetImage),
+            "evidence_read" => Ok(Self::EvidenceRead),
+            "codex_status" => Ok(Self::CodexStatus),
+            "codex_task_start" => Ok(Self::CodexTaskStart),
+            "codex_task_get" => Ok(Self::CodexTaskGet),
+            "codex_task_control" => Ok(Self::CodexTaskControl),
+            "list_directory" => Ok(Self::ListDirectory),
+            "apply_patch" => Ok(Self::ApplyPatch),
+            "poll_job" => Ok(Self::PollJob),
+            "job_list" => Ok(Self::JobList),
+            "checkpoint_save" => Ok(Self::CheckpointSave),
+            "checkpoint_load" => Ok(Self::CheckpointLoad),
+            "work_handoff" => Ok(Self::WorkHandoff),
+            "friction_summary" => Ok(Self::FrictionSummary),
+            "learning_candidate_list" => Ok(Self::LearningCandidateList),
+            "recall" => Ok(Self::Recall),
+            "recall_feedback" => Ok(Self::RecallFeedback),
+            "onepassword_mcp_discover" => Ok(Self::OnePasswordMcpDiscover),
+            "onepassword_mcp_read_resource" => Ok(Self::OnePasswordMcpReadResource),
+            "onepassword_mcp_call" => Ok(Self::OnePasswordMcpCall),
+            "onepassword_item_get" => Ok(Self::OnePasswordItemGet),
+            "onepassword_secret_resolve" => Ok(Self::OnePasswordSecretResolve),
+            "onepassword_service_account_status" => Ok(Self::OnePasswordServiceAccountStatus),
+            "onepassword_service_account_run" => Ok(Self::OnePasswordServiceAccountRun),
+            "kintone_mcp_status" => Ok(Self::KintoneMcpStatus),
+            "kintone_mcp_discover" => Ok(Self::KintoneMcpDiscover),
+            "kintone_mcp_call" => Ok(Self::KintoneMcpCall),
+            "kintone_cli_status" => Ok(Self::KintoneCliStatus),
+            "kintone_cli_run" => Ok(Self::KintoneCliRun),
+            "without_sandbox" => Ok(Self::WithoutSandbox),
             _ => Err(serde_invalid_json()),
         }
     }
@@ -170,6 +237,31 @@ pub enum ActivityCancellationReason {
     Timeout,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityResult {
+    Accepted,
+}
+
+impl ActivityResult {
+    fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "accepted" => Some(Self::Accepted),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_wire_string(deserializer)?;
+        Self::from_wire_name(&value).ok_or_else(serde_invalid_json)
+    }
+}
+
 impl ActivityCancellationReason {
     fn from_wire_name(value: &str) -> Option<Self> {
         match value {
@@ -233,6 +325,9 @@ pub enum ActivitySummary {
     Cancellation {
         reason: ActivityCancellationReason,
     },
+    Result {
+        result: ActivityResult,
+    },
 }
 
 impl<'de> Deserialize<'de> for ActivitySummary {
@@ -261,6 +356,7 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
         let mut error = None;
         let mut remote = None;
         let mut reason = None;
+        let mut result = None;
 
         while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
             match field.as_str() {
@@ -300,22 +396,37 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                             .map_err(|_| serde_invalid_json())?,
                     );
                 }
+                "result" => {
+                    if result.is_some() {
+                        return Err(serde_invalid_json());
+                    }
+                    result = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde_invalid_json())?,
+                    );
+                }
                 _ => return Err(serde_invalid_json()),
             }
         }
 
         let kind = kind.ok_or_else(serde_invalid_json)?;
         match kind.as_str() {
-            "empty" if error.is_none() && remote.is_none() && reason.is_none() => {
+            "empty"
+                if error.is_none() && remote.is_none() && reason.is_none() && result.is_none() =>
+            {
                 Ok(Self::Value::Empty)
             }
-            "failure" if error.is_some() && remote.is_none() && reason.is_none() => {
+            "failure"
+                if error.is_some() && remote.is_none() && reason.is_none() && result.is_none() =>
+            {
                 let error = error.ok_or_else(serde_invalid_json)?;
                 let kind =
                     ActivityErrorKind::from_wire_name(&error).ok_or_else(serde_invalid_json)?;
                 Ok(Self::Value::Failure { kind })
             }
-            "git" if error.is_none() && remote.is_some() && reason.is_none() => {
+            "git"
+                if error.is_none() && remote.is_some() && reason.is_none() && result.is_none() =>
+            {
                 let remote = remote.ok_or_else(serde_invalid_json)?;
                 let remote = match remote.as_str() {
                     "origin" => ActivityRemote::Origin,
@@ -324,11 +435,21 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                 };
                 Ok(Self::Value::Git { remote })
             }
-            "cancellation" if error.is_none() && remote.is_none() && reason.is_some() => {
+            "cancellation"
+                if error.is_none() && remote.is_none() && reason.is_some() && result.is_none() =>
+            {
                 let reason = reason.ok_or_else(serde_invalid_json)?;
                 let reason = ActivityCancellationReason::from_wire_name(&reason)
                     .ok_or_else(serde_invalid_json)?;
                 Ok(Self::Value::Cancellation { reason })
+            }
+            "result"
+                if error.is_none() && remote.is_none() && reason.is_none() && result.is_some() =>
+            {
+                let result = result.ok_or_else(serde_invalid_json)?;
+                let result =
+                    ActivityResult::from_wire_name(&result).ok_or_else(serde_invalid_json)?;
+                Ok(Self::Value::Result { result })
             }
             _ => Err(serde_invalid_json()),
         }
@@ -350,6 +471,10 @@ impl ActivitySummary {
 
     pub const fn cancellation(reason: ActivityCancellationReason) -> Self {
         Self::Cancellation { reason }
+    }
+
+    pub const fn result(result: ActivityResult) -> Self {
+        Self::Result { result }
     }
 
     pub fn safe_summary(&self) -> String {
@@ -383,6 +508,9 @@ impl ActivitySummary {
             Self::Cancellation {
                 reason: ActivityCancellationReason::Timeout,
             } => "reason=timeout",
+            Self::Result {
+                result: ActivityResult::Accepted,
+            } => "result=accepted",
         }
     }
 }
@@ -1143,6 +1271,63 @@ mod tests {
             (ActivityOperation::StopJob, "stop_job"),
             (ActivityOperation::LocalAgentRun, "local_agent_run"),
             (ActivityOperation::DevToolRun, "dev_tool_run"),
+            (ActivityOperation::GetImage, "get_image"),
+            (ActivityOperation::EvidenceRead, "evidence_read"),
+            (ActivityOperation::CodexStatus, "codex_status"),
+            (ActivityOperation::CodexTaskStart, "codex_task_start"),
+            (ActivityOperation::CodexTaskGet, "codex_task_get"),
+            (ActivityOperation::CodexTaskControl, "codex_task_control"),
+            (ActivityOperation::ListDirectory, "list_directory"),
+            (ActivityOperation::ApplyPatch, "apply_patch"),
+            (ActivityOperation::PollJob, "poll_job"),
+            (ActivityOperation::JobList, "job_list"),
+            (ActivityOperation::CheckpointSave, "checkpoint_save"),
+            (ActivityOperation::CheckpointLoad, "checkpoint_load"),
+            (ActivityOperation::WorkHandoff, "work_handoff"),
+            (ActivityOperation::FrictionSummary, "friction_summary"),
+            (
+                ActivityOperation::LearningCandidateList,
+                "learning_candidate_list",
+            ),
+            (ActivityOperation::Recall, "recall"),
+            (ActivityOperation::RecallFeedback, "recall_feedback"),
+            (
+                ActivityOperation::OnePasswordMcpDiscover,
+                "onepassword_mcp_discover",
+            ),
+            (
+                ActivityOperation::OnePasswordMcpReadResource,
+                "onepassword_mcp_read_resource",
+            ),
+            (
+                ActivityOperation::OnePasswordMcpCall,
+                "onepassword_mcp_call",
+            ),
+            (
+                ActivityOperation::OnePasswordItemGet,
+                "onepassword_item_get",
+            ),
+            (
+                ActivityOperation::OnePasswordSecretResolve,
+                "onepassword_secret_resolve",
+            ),
+            (
+                ActivityOperation::OnePasswordServiceAccountStatus,
+                "onepassword_service_account_status",
+            ),
+            (
+                ActivityOperation::OnePasswordServiceAccountRun,
+                "onepassword_service_account_run",
+            ),
+            (ActivityOperation::KintoneMcpStatus, "kintone_mcp_status"),
+            (
+                ActivityOperation::KintoneMcpDiscover,
+                "kintone_mcp_discover",
+            ),
+            (ActivityOperation::KintoneMcpCall, "kintone_mcp_call"),
+            (ActivityOperation::KintoneCliStatus, "kintone_cli_status"),
+            (ActivityOperation::KintoneCliRun, "kintone_cli_run"),
+            (ActivityOperation::WithoutSandbox, "without_sandbox"),
         ];
         for (operation, expected) in operations {
             let encoded = encode_update(&update(
@@ -1276,6 +1461,10 @@ mod tests {
             ActivitySummary::cancellation(ActivityCancellationReason::Timeout).safe_summary(),
             "reason=timeout"
         );
+        assert_eq!(
+            ActivitySummary::result(ActivityResult::Accepted).safe_summary(),
+            "result=accepted"
+        );
 
         for reason in [
             ActivityCancellationReason::StopRequested,
@@ -1301,6 +1490,28 @@ mod tests {
                 "kind": "cancellation",
                 "reason": "timeout",
                 "error": "operation_failed"
+            }))
+            .is_err()
+        );
+
+        let result = ActivitySummary::result(ActivityResult::Accepted);
+        assert_eq!(
+            serde_json::from_value::<ActivitySummary>(serde_json::to_value(&result).unwrap())
+                .unwrap(),
+            result
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "result",
+                "result": "raw-result-sentinel"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "result",
+                "result": "accepted",
+                "reason": "timeout"
             }))
             .is_err()
         );

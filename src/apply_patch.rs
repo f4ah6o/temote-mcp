@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use temote_mcp::activity::contract::{ActivityErrorKind, ActivitySummary};
+use temote_mcp::activity::scope::ActivityScope;
 
 use crate::{approvals, config, friction, sandbox};
 
@@ -95,23 +97,41 @@ pub(crate) fn parse_request(value: &Value) -> Result<ApplyPatchRequest> {
     Ok(request)
 }
 
+#[cfg(test)]
 pub(crate) async fn apply(
     session: &config::Session,
     request: ApplyPatchRequest,
+) -> Result<ApplyPatchOutcome> {
+    apply_with_activity(session, request, None).await
+}
+
+pub(crate) async fn apply_with_activity(
+    session: &config::Session,
+    request: ApplyPatchRequest,
+    activity: Option<&ActivityScope>,
 ) -> Result<ApplyPatchOutcome> {
     anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
     let parsed = parse_patch(&request.patch)?;
     let prepared = preflight(session, &parsed)?;
     let detail = approval_detail(&prepared);
-    let approved = approvals::ensure_local_approval(
+    let approved = approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::LocalStructured,
         "apply_patch",
         detail,
         session.cwd.clone(),
         Default::default(),
+        activity,
     )
     .await?;
+    if !approved {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+    } else if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let outcome = apply_prepared_after_approval(session, prepared, approved).await?;
     if outcome.status == "partial_failure" {
         friction::record_observed(

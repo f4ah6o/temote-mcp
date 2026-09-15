@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use temote_mcp::activity::contract::{ActivityErrorKind, ActivitySummary};
+use temote_mcp::activity::scope::ActivityScope;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -268,10 +270,11 @@ pub async fn read_resource(session: &config::Session, uri: &str) -> Result<Value
     Ok(result)
 }
 
-pub async fn call_tool(
+pub async fn call_tool_with_activity(
     session: &config::Session,
     tool_name: &str,
     arguments: Value,
+    activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     validate_child_tool_call(tool_name, &arguments).context("invalid 1Password MCP tool call")?;
     enforce_path_boundary(session, tool_name, &arguments)?;
@@ -304,18 +307,27 @@ pub async fn call_tool(
         .pointer("/annotations/readOnlyHint")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !read_only
-        && !approvals::ensure_local_approval(
+    if !read_only {
+        let approved = approvals::ensure_local_approval_with_activity(
             session,
             approvals::ApprovalClass::Integration,
             "onepassword_mcp_call",
             safe_call_summary(tool_name, &arguments),
             session.cwd.clone(),
             Default::default(),
+            activity,
         )
-        .await?
-    {
-        anyhow::bail!("user denied 1Password MCP tool call")
+        .await?;
+        if !approved {
+            if let Some(activity) = activity {
+                let _ = activity
+                    .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+            }
+            anyhow::bail!("user denied 1Password MCP tool call")
+        }
+        if let Some(activity) = activity {
+            let _ = activity.running();
+        }
     }
 
     let result = {
