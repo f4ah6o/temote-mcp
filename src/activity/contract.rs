@@ -44,6 +44,9 @@ pub enum ActivityOperation {
     GitFetch,
     GitPull,
     GitPush,
+    Execute,
+    StartCommand,
+    StopJob,
 }
 
 impl<'de> Deserialize<'de> for ActivityOperation {
@@ -62,6 +65,9 @@ impl<'de> Deserialize<'de> for ActivityOperation {
             "git_fetch" => Ok(Self::GitFetch),
             "git_pull" => Ok(Self::GitPull),
             "git_push" => Ok(Self::GitPush),
+            "execute" => Ok(Self::Execute),
+            "start_command" => Ok(Self::StartCommand),
+            "stop_job" => Ok(Self::StopJob),
             _ => Err(serde_invalid_json()),
         }
     }
@@ -152,6 +158,35 @@ pub enum ActivityRemote {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityCancellationReason {
+    StopRequested,
+    SessionStopped,
+    Timeout,
+}
+
+impl ActivityCancellationReason {
+    fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "stop_requested" => Some(Self::StopRequested),
+            "session_stopped" => Some(Self::SessionStopped),
+            "timeout" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityCancellationReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_wire_string(deserializer)?;
+        Self::from_wire_name(&value).ok_or_else(serde_invalid_json)
+    }
+}
+
 impl<'de> Deserialize<'de> for ActivityRemote {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -191,6 +226,9 @@ pub enum ActivitySummary {
     Git {
         remote: ActivityRemote,
     },
+    Cancellation {
+        reason: ActivityCancellationReason,
+    },
 }
 
 impl<'de> Deserialize<'de> for ActivitySummary {
@@ -218,6 +256,7 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
         let mut kind = None;
         let mut error = None;
         let mut remote = None;
+        let mut reason = None;
 
         while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
             match field.as_str() {
@@ -248,20 +287,31 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                             .map_err(|_| serde_invalid_json())?,
                     );
                 }
+                "reason" => {
+                    if reason.is_some() {
+                        return Err(serde_invalid_json());
+                    }
+                    reason = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde_invalid_json())?,
+                    );
+                }
                 _ => return Err(serde_invalid_json()),
             }
         }
 
         let kind = kind.ok_or_else(serde_invalid_json)?;
         match kind.as_str() {
-            "empty" if error.is_none() && remote.is_none() => Ok(Self::Value::Empty),
-            "failure" if error.is_some() && remote.is_none() => {
+            "empty" if error.is_none() && remote.is_none() && reason.is_none() => {
+                Ok(Self::Value::Empty)
+            }
+            "failure" if error.is_some() && remote.is_none() && reason.is_none() => {
                 let error = error.ok_or_else(serde_invalid_json)?;
                 let kind =
                     ActivityErrorKind::from_wire_name(&error).ok_or_else(serde_invalid_json)?;
                 Ok(Self::Value::Failure { kind })
             }
-            "git" if error.is_none() && remote.is_some() => {
+            "git" if error.is_none() && remote.is_some() && reason.is_none() => {
                 let remote = remote.ok_or_else(serde_invalid_json)?;
                 let remote = match remote.as_str() {
                     "origin" => ActivityRemote::Origin,
@@ -269,6 +319,12 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                     _ => return Err(serde_invalid_json()),
                 };
                 Ok(Self::Value::Git { remote })
+            }
+            "cancellation" if error.is_none() && remote.is_none() && reason.is_some() => {
+                let reason = reason.ok_or_else(serde_invalid_json)?;
+                let reason = ActivityCancellationReason::from_wire_name(&reason)
+                    .ok_or_else(serde_invalid_json)?;
+                Ok(Self::Value::Cancellation { reason })
             }
             _ => Err(serde_invalid_json()),
         }
@@ -286,6 +342,10 @@ impl ActivitySummary {
 
     pub const fn git(remote: ActivityRemote) -> Self {
         Self::Git { remote }
+    }
+
+    pub const fn cancellation(reason: ActivityCancellationReason) -> Self {
+        Self::Cancellation { reason }
     }
 
     pub fn safe_summary(&self) -> String {
@@ -310,6 +370,15 @@ impl ActivitySummary {
             Self::Git {
                 remote: ActivityRemote::Other,
             } => "remote=other",
+            Self::Cancellation {
+                reason: ActivityCancellationReason::StopRequested,
+            } => "reason=stop_requested",
+            Self::Cancellation {
+                reason: ActivityCancellationReason::SessionStopped,
+            } => "reason=session_stopped",
+            Self::Cancellation {
+                reason: ActivityCancellationReason::Timeout,
+            } => "reason=timeout",
         }
     }
 }
@@ -1065,6 +1134,9 @@ mod tests {
             (ActivityOperation::GitFetch, "git_fetch"),
             (ActivityOperation::GitPull, "git_pull"),
             (ActivityOperation::GitPush, "git_push"),
+            (ActivityOperation::Execute, "execute"),
+            (ActivityOperation::StartCommand, "start_command"),
+            (ActivityOperation::StopJob, "stop_job"),
         ];
         for (operation, expected) in operations {
             let encoded = encode_update(&update(
@@ -1171,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_only_the_three_safe_summary_forms() {
+    fn renders_only_fixed_safe_summary_forms() {
         assert_eq!(ActivitySummary::Empty.safe_summary(), "");
         assert_eq!(
             ActivitySummary::failure(ActivityErrorKind::ApprovalDenied).safe_summary(),
@@ -1184,6 +1256,47 @@ mod tests {
         assert_eq!(
             ActivitySummary::git(ActivityRemote::Other).safe_summary(),
             "remote=other"
+        );
+        assert_eq!(
+            ActivitySummary::cancellation(ActivityCancellationReason::StopRequested).safe_summary(),
+            "reason=stop_requested"
+        );
+        assert_eq!(
+            ActivitySummary::cancellation(ActivityCancellationReason::SessionStopped)
+                .safe_summary(),
+            "reason=session_stopped"
+        );
+        assert_eq!(
+            ActivitySummary::cancellation(ActivityCancellationReason::Timeout).safe_summary(),
+            "reason=timeout"
+        );
+
+        for reason in [
+            ActivityCancellationReason::StopRequested,
+            ActivityCancellationReason::SessionStopped,
+            ActivityCancellationReason::Timeout,
+        ] {
+            let summary = ActivitySummary::cancellation(reason);
+            let encoded = serde_json::to_vec(&summary).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ActivitySummary>(&encoded).unwrap(),
+                summary
+            );
+        }
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "cancellation",
+                "reason": "raw-error-sentinel"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "cancellation",
+                "reason": "timeout",
+                "error": "operation_failed"
+            }))
+            .is_err()
         );
 
         let value =

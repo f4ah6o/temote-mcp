@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ use crate::{
     recall, sandbox, session_control::SessionBackend, work_handoff,
 };
 use temote_mcp::activity::contract::{
-    ActivityErrorKind, ActivityOperation, ActivityRemote, ActivitySummary,
+    ActivityCancellationReason, ActivityErrorKind, ActivityOperation, ActivityRemote,
+    ActivitySummary,
 };
 use temote_mcp::activity::scope::ActivityScope;
 
@@ -75,6 +77,15 @@ struct OutputPolicy {
 struct JobCompletion {
     result: Option<CachedJobResult>,
     completed_at: Option<Instant>,
+    activity: Option<ActivityScope>,
+    activity_terminal: bool,
+}
+
+#[derive(Clone, Copy)]
+enum JobActivityOutcome {
+    Completed,
+    Failed,
+    Cancelled(ActivityCancellationReason),
 }
 
 struct Job {
@@ -851,8 +862,18 @@ async fn call_tool_with_local_agent_executable(
             finish_tool_activity(activity.as_ref(), &result);
             result
         }
-        "execute" => execute(&args, &session).await,
-        "start_command" => start_command(&args, &session).await,
+        "execute" => {
+            let activity = file_activity_scope(&session, ActivityOperation::Execute);
+            let result = execute(&args, &session, activity.clone()).await;
+            finish_tool_activity_on_error(activity.as_ref(), &result);
+            result
+        }
+        "start_command" => {
+            let activity = file_activity_scope(&session, ActivityOperation::StartCommand);
+            let result = start_command(&args, &session, activity.clone()).await;
+            finish_tool_activity_on_error(activity.as_ref(), &result);
+            result
+        }
         "poll_job" => poll_job(&args, &session).await,
         "job_list" => job_list(&args, &session),
         "checkpoint_save" => {
@@ -934,7 +955,12 @@ async fn call_tool_with_local_agent_executable(
             let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
             text_result(serde_json::to_string_pretty(&event)?)
         }
-        "stop_job" => stop_job(&args, &session).await,
+        "stop_job" => {
+            let activity = file_activity_scope(&session, ActivityOperation::StopJob);
+            let result = stop_job_with_activity(&args, &session, activity.as_ref()).await;
+            finish_tool_activity(activity.as_ref(), &result);
+            result
+        }
         "onepassword_mcp_discover" => {
             let result = onepassword_mcp::discover(&session).await?;
             text_result(serde_json::to_string_pretty(&result)?)
@@ -1467,6 +1493,15 @@ fn finish_tool_activity(activity: Option<&ActivityScope>, result: &Result<Value>
     } else {
         activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed))
     };
+}
+
+fn finish_tool_activity_on_error(activity: Option<&ActivityScope>, result: &Result<Value>) {
+    if result.is_err()
+        && let Some(activity) = activity
+    {
+        let _ = activity
+            .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed));
+    }
 }
 
 async fn read_file_tool(args: &Value, session: &config::Session) -> Result<Value> {
@@ -2225,10 +2260,26 @@ async fn run_git_and_report(
     text_result(result?)
 }
 
-async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
+async fn execute(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, mut handle, completion) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, handle, completion) =
+        spawn_sandboxed_command(args, session, activity).await?;
 
+    finish_foreground_or_store_job(session, rendered_command, handle, completion, output_policy)
+        .await
+}
+
+async fn finish_foreground_or_store_job(
+    session: &config::Session,
+    rendered_command: String,
+    mut handle: JoinHandle<()>,
+    completion: Arc<Mutex<JobCompletion>>,
+    output_policy: OutputPolicy,
+) -> Result<Value> {
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             joined.context("command task failed")?;
@@ -2254,9 +2305,14 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     }
 }
 
-async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
+async fn start_command(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, handle, completion) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, handle, completion) =
+        spawn_sandboxed_command(args, session, activity).await?;
     store_job(
         session,
         rendered_command,
@@ -2469,7 +2525,28 @@ async fn spawn_dev_tool(
 async fn spawn_sandboxed_command(
     args: &Value,
     session: &config::Session,
+    activity: Option<ActivityScope>,
 ) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    spawn_sandboxed_command_with_controls(
+        args,
+        session,
+        activity,
+        wait_for_session_stop(session.id.clone()),
+        MAX_JOB_LIFETIME,
+    )
+    .await
+}
+
+async fn spawn_sandboxed_command_with_controls<F>(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+    session_stop: F,
+    max_lifetime: Duration,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
@@ -2477,34 +2554,112 @@ async fn spawn_sandboxed_command(
     let slot = reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    if let Some(activity) = &activity {
+        let _ = activity.running();
+    }
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let task_command = rendered_command.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let completion = Arc::new(Mutex::new(JobCompletion {
+        activity,
+        ..JobCompletion::default()
+    }));
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
-        let result = tokio::select! {
+        let (result, outcome) = tokio::select! {
             result = run_session_command(&command, &cwd, &roots, yolo) => {
-                result.and_then(render_output)
+                let result = result.and_then(render_output);
+                let outcome = if result.is_ok() {
+                    JobActivityOutcome::Completed
+                } else {
+                    JobActivityOutcome::Failed
+                };
+                (result, outcome)
             }
-            _ = wait_for_session_stop(session_id.clone()) => {
-                Err(anyhow::anyhow!("session stopped; sandbox job cancelled"))
+            _ = session_stop => {
+                (
+                    Err(anyhow::anyhow!("session stopped; sandbox job cancelled")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
+                )
             }
-            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                Err(anyhow::anyhow!("sandbox job exceeded the two-hour lifetime limit"))
+            _ = tokio::time::sleep(max_lifetime) => {
+                (
+                    Err(anyhow::anyhow!("sandbox job exceeded the two-hour lifetime limit")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
+                )
             }
         };
         let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        {
-            let mut completion = task_completion.lock().unwrap();
-            completion.result = Some(cached);
-            completion.completed_at = Some(Instant::now());
-        }
+        finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
         report_command_finished(session_id, "execute", &task_command, &result).await;
     });
     Ok((rendered_command, handle, completion))
+}
+
+fn finish_job_completion(
+    completion: &Arc<Mutex<JobCompletion>>,
+    result: CachedJobResult,
+    outcome: JobActivityOutcome,
+) -> bool {
+    let mut completion = completion.lock().unwrap();
+    finish_job_completion_locked(&mut completion, result, outcome)
+}
+
+fn finish_job_completion_locked(
+    completion: &mut JobCompletion,
+    result: CachedJobResult,
+    outcome: JobActivityOutcome,
+) -> bool {
+    if completion.result.is_some() || completion.activity_terminal {
+        return false;
+    }
+
+    completion.result = Some(result);
+    completion.completed_at = Some(Instant::now());
+    completion.activity_terminal = true;
+    finish_job_activity(completion.activity.as_ref(), outcome);
+    true
+}
+
+fn cancel_pending_job_activity(
+    completion: &Arc<Mutex<JobCompletion>>,
+    reason: ActivityCancellationReason,
+) -> bool {
+    let mut completion = completion.lock().unwrap();
+    cancel_pending_job_activity_locked(&mut completion, reason)
+}
+
+fn cancel_pending_job_activity_locked(
+    completion: &mut JobCompletion,
+    reason: ActivityCancellationReason,
+) -> bool {
+    if completion.result.is_some() || completion.activity_terminal {
+        return false;
+    }
+
+    completion.activity_terminal = true;
+    finish_job_activity(
+        completion.activity.as_ref(),
+        JobActivityOutcome::Cancelled(reason),
+    );
+    true
+}
+
+fn finish_job_activity(activity: Option<&ActivityScope>, outcome: JobActivityOutcome) {
+    let Some(activity) = activity else {
+        return;
+    };
+    let _ = match outcome {
+        JobActivityOutcome::Completed => activity.complete(),
+        JobActivityOutcome::Failed => {
+            activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ChildFailed))
+        }
+        JobActivityOutcome::Cancelled(reason) => {
+            activity.cancel_with_summary(ActivitySummary::cancellation(reason))
+        }
+    };
 }
 
 async fn run_session_command(
@@ -2959,9 +3114,22 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     }
 }
 
+#[cfg(test)]
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
+    stop_job_with_activity(args, session, None).await
+}
+
+async fn stop_job_with_activity(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let job = take_job_for_session(job_id, &session.id)?;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    cancel_pending_job_activity(&job.completion, ActivityCancellationReason::StopRequested);
     job.handle.abort();
     let _ = job.handle.await;
     approvals::activity(
@@ -3330,6 +3498,314 @@ mod tests {
             text: text.into(),
             evidence: None,
         }
+    }
+
+    fn activity_job_session(cwd: &Path) -> config::Session {
+        config::Session {
+            id: format!("activity-job-{}", Uuid::new_v4()),
+            cwd: cwd.to_path_buf(),
+            permitted_directories: vec![cwd.to_path_buf()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Yolo,
+        }
+    }
+
+    fn activity_job_scope(
+        operation: ActivityOperation,
+    ) -> (ActivityScope, RecordingActivityEmitter) {
+        let emitter = RecordingActivityEmitter::default();
+        let scope = ActivityScope::new(operation, emitter.clone());
+        (scope, emitter)
+    }
+
+    fn activity_job_terminal_updates(emitter: &RecordingActivityEmitter) -> Vec<ActivityUpdate> {
+        emitter
+            .updates()
+            .into_iter()
+            .filter(|update| {
+                matches!(
+                    update.state(),
+                    ActivityState::Completed | ActivityState::Failed | ActivityState::Cancelled
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn activity_job_foreground_completion_and_child_failure_are_terminalized() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+
+        let (success_scope, success_emitter) = activity_job_scope(ActivityOperation::Execute);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "printf success"]}),
+            &session,
+            Some(success_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let success = finish_foreground_or_store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            success["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("success")
+        );
+        assert_eq!(
+            success_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+
+        let (failure_scope, failure_emitter) = activity_job_scope(ActivityOperation::Execute);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "exit 7"]}),
+            &session,
+            Some(failure_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let failure = finish_foreground_or_store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.to_string().contains("exit_code"));
+        assert_eq!(
+            failure_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Failed
+            ]
+        );
+        let terminal = activity_job_terminal_updates(&failure_emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "error=child_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_job_return_does_not_complete_and_stop_cancels_original_scope() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+        let (command_scope, command_emitter) = activity_job_scope(ActivityOperation::StartCommand);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &session,
+            Some(command_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let started = store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+            "Started",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            command_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Running]
+        );
+        let started: Value =
+            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
+        let job_id = started["job_id"].as_str().unwrap();
+
+        let (stop_scope, stop_emitter) = activity_job_scope(ActivityOperation::StopJob);
+        let stopped =
+            stop_job_with_activity(&json!({"job_id": job_id}), &session, Some(&stop_scope)).await;
+        finish_tool_activity(Some(&stop_scope), &stopped);
+        assert!(stopped.is_ok());
+
+        assert_eq!(
+            command_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Cancelled
+            ]
+        );
+        let terminal = activity_job_terminal_updates(&command_emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "reason=stop_requested"
+        );
+        assert_eq!(
+            stop_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+        assert_ne!(
+            command_scope_id(&command_emitter),
+            command_scope_id(&stop_emitter)
+        );
+    }
+
+    fn command_scope_id(emitter: &RecordingActivityEmitter) -> Uuid {
+        emitter.updates()[0].operation_id()
+    }
+
+    #[test]
+    fn activity_job_natural_first_and_stop_first_are_linearized_under_completion_lock() {
+        for natural_first in [true, false] {
+            let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
+            scope.running().unwrap();
+            let completion = Arc::new(Mutex::new(JobCompletion {
+                activity: Some(scope),
+                ..JobCompletion::default()
+            }));
+            let mut winner_guard = completion.lock().unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let contender_completion = Arc::clone(&completion);
+            let contender_barrier = Arc::clone(&barrier);
+
+            let contender = if natural_first {
+                std::thread::spawn(move || {
+                    contender_barrier.wait();
+                    cancel_pending_job_activity(
+                        &contender_completion,
+                        ActivityCancellationReason::StopRequested,
+                    )
+                })
+            } else {
+                std::thread::spawn(move || {
+                    contender_barrier.wait();
+                    finish_job_completion(
+                        &contender_completion,
+                        cached_success("natural"),
+                        JobActivityOutcome::Completed,
+                    )
+                })
+            };
+            barrier.wait();
+
+            let winner = if natural_first {
+                finish_job_completion_locked(
+                    &mut winner_guard,
+                    cached_success("natural"),
+                    JobActivityOutcome::Completed,
+                )
+            } else {
+                cancel_pending_job_activity_locked(
+                    &mut winner_guard,
+                    ActivityCancellationReason::StopRequested,
+                )
+            };
+            assert!(winner);
+            drop(winner_guard);
+            assert!(!contender.join().unwrap());
+
+            let terminal = activity_job_terminal_updates(&emitter);
+            assert_eq!(terminal.len(), 1);
+            if natural_first {
+                assert_eq!(terminal[0].state(), ActivityState::Completed);
+                assert_eq!(terminal[0].summary().as_safe_summary(), "");
+            } else {
+                assert_eq!(terminal[0].state(), ActivityState::Cancelled);
+                assert_eq!(
+                    terminal[0].summary().as_safe_summary(),
+                    "reason=stop_requested"
+                );
+                assert!(completion.lock().unwrap().result.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_job_session_stop_uses_fixed_cancellation_reason() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+        let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
+        let (_, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &session,
+            Some(scope),
+            async move {
+                let _ = stop_receiver.await;
+            },
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        stop_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        let terminal = activity_job_terminal_updates(&emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state(), ActivityState::Cancelled);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "reason=session_stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_job_lifetime_uses_fixed_cancellation_reason() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+        let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
+        let (_, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &session,
+            Some(scope),
+            std::future::pending(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        let terminal = activity_job_terminal_updates(&emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state(), ActivityState::Cancelled);
+        assert_eq!(terminal[0].summary().as_safe_summary(), "reason=timeout");
     }
 
     #[test]
@@ -4800,6 +5276,7 @@ mod tests {
             let completion = Arc::new(Mutex::new(JobCompletion {
                 result: Some(cached_success("owned")),
                 completed_at: Some(Instant::now()),
+                ..JobCompletion::default()
             }));
             let handle = runtime.spawn(async {});
             jobs().lock().unwrap().jobs.insert(
@@ -5069,6 +5546,7 @@ mod tests {
         let owner_completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success(marker_output)),
             completed_at: Some(Instant::now()),
+            ..JobCompletion::default()
         }));
         let other_completion = Arc::new(Mutex::new(JobCompletion::default()));
         jobs().lock().unwrap().jobs.insert(
@@ -5132,6 +5610,7 @@ mod tests {
             let completion = Arc::new(Mutex::new(JobCompletion {
                 result: Some(result),
                 completed_at: Some(Instant::now()),
+                ..JobCompletion::default()
             }));
             jobs().lock().unwrap().jobs.insert(
                 job_id,
@@ -5169,6 +5648,7 @@ mod tests {
         let completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success("still-cached")),
             completed_at: Some(Instant::now()),
+            ..JobCompletion::default()
         }));
         jobs().lock().unwrap().jobs.insert(
             job_id,
@@ -5210,6 +5690,7 @@ mod tests {
                 JobCompletion {
                     result: Some(cached_success("hidden")),
                     completed_at: Some(Instant::now()),
+                    ..JobCompletion::default()
                 }
             }));
             let handle = if running {
@@ -5395,6 +5876,7 @@ mod tests {
         let completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success("cached-result")),
             completed_at: Some(Instant::now()),
+            ..JobCompletion::default()
         }));
         let handle = tokio::spawn(async {});
         jobs().lock().unwrap().jobs.insert(
@@ -5609,6 +6091,7 @@ mod tests {
                     JobCompletion {
                         result: Some(cached_success(format!("done-{step}"))),
                         completed_at: Some(now + Duration::from_nanos(step as u64 + 1)),
+                        ..JobCompletion::default()
                     }
                 }));
                 let handle = if active {
@@ -5667,6 +6150,7 @@ mod tests {
         let completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success("expired")),
             completed_at: Some(Instant::now() - COMPLETED_JOB_TTL - Duration::from_secs(1)),
+            ..JobCompletion::default()
         }));
         let handle = tokio::spawn(async {});
         jobs().lock().unwrap().jobs.insert(
