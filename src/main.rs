@@ -113,6 +113,11 @@ async fn main() -> Result<()> {
             }
         }
         cli::Command::Upgrade { dry_run, force } => session_control::upgrade(dry_run, force).await,
+        cli::Command::Activity {
+            session_id,
+            tail,
+            follow,
+        } => session_control::run_activity_command(session_id, tail, follow).await,
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { session_id, path } => {
                 session_control::start_named(session_id, path).await
