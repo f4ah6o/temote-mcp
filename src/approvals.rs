@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::config::{self, Session};
 use crate::{friction, kintone_cli, kintone_mcp, sandbox, secret_broker};
 use temote_mcp::activity::broker::ActivityBroker;
-use temote_mcp::activity::contract::ActivityUpdate;
+use temote_mcp::activity::contract::{ActivityUpdate, encode_update};
 
 const MAX_SESSION_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_APPROVAL_RESPONSE_BYTES: usize = 64;
@@ -49,8 +49,8 @@ const MAX_APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_PENDING_APPROVAL_PROMPTS: usize = 128;
 const MAX_PENDING_RUNTIME_COMMANDS: usize = 64;
 const ACTIVITY_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const ACTIVITY_ACK_ACCEPTED: &[u8] = b"accepted\n";
-const ACTIVITY_ACK_DISCARDED: &[u8] = b"discarded\n";
+pub(crate) const ACTIVITY_ACK_ACCEPTED: &[u8] = b"accepted\n";
+pub(crate) const ACTIVITY_ACK_DISCARDED: &[u8] = b"discarded\n";
 #[cfg(test)]
 const MAX_CONSOLE_PATH_BYTES: usize = 4096;
 const MAX_CAPTURED_START_ENV_VALUE_BYTES: usize = 32 * 1024;
@@ -377,18 +377,37 @@ impl ExpectedSessionInstance {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ActivityExpectedSession {
+pub(crate) struct ActivityExpectedSession {
     id: String,
     started_at: u64,
     process_id: u32,
 }
 
 impl ActivityExpectedSession {
+    pub(crate) fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            started_at: session.started_at,
+            process_id: session.process_id,
+        }
+    }
+
     fn matches(&self, expected: &ExpectedSessionInstance) -> bool {
         self.id == expected.id
             && self.started_at == expected.started_at
             && self.process_id == expected.process_id
     }
+}
+
+pub(crate) fn encode_activity_update_message(
+    expected_session: ActivityExpectedSession,
+    update: ActivityUpdate,
+) -> Result<Vec<u8>> {
+    encode_update(&update).map_err(|error| anyhow::anyhow!(error))?;
+    encode_session_json_line(&Message::ActivityUpdate(ActivityIngress {
+        expected_session,
+        update,
+    }))
 }
 
 #[derive(Serialize, Deserialize)]

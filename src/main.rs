@@ -2,6 +2,7 @@
 
 #[cfg(feature = "network")]
 mod access;
+mod activity_runtime;
 mod apply_patch;
 mod approvals;
 mod boot_identity;
