@@ -31,6 +31,10 @@ const MAX_SESSION_CONTROL_LIST_BYTES: usize = 56 * 1024;
 const TERMINAL_SESSION_RETENTION: usize = 512;
 const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+// Upgrade requests can run while the caller owns the global admission lock or
+// the per-transaction lease. Bound the entire connect/write/read exchange so a
+// stalled supervisor cannot retain either lock indefinitely.
+const UPGRADE_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONSOLE_QUEUE: usize = 1;
 pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
@@ -355,7 +359,7 @@ impl SessionBackend {
                 supervisor.validate_public_upgrade_session(session_id).await
             }
             Self::LocalControl => {
-                request(ControlRequest::ValidatePublicUpgradeSession {
+                upgrade_request(ControlRequest::ValidatePublicUpgradeSession {
                     session_id: session_id.to_owned(),
                 })
                 .await?;
@@ -1712,14 +1716,14 @@ async fn upgrade_preflight_with_force(
     executable: &InstalledUpgradeExecutable,
     force: bool,
 ) -> Result<RemoteUpgradePreflight> {
-    let ping = request(ControlRequest::Ping).await?;
+    let ping = upgrade_request(ControlRequest::Ping).await?;
     validate_running_supervisor_upgrade_capabilities(&ping)?;
     let source_version = ping
         .get("version")
         .and_then(Value::as_str)
         .context("running supervisor did not report its version")?
         .to_owned();
-    let preview_value = request(ControlRequest::Upgrade {
+    let preview_value = upgrade_request(ControlRequest::Upgrade {
         executable: executable.execution_path().to_owned(),
         installed_locator: Some(executable.path.clone()),
         target_version: executable.target_version.clone(),
@@ -1779,7 +1783,7 @@ pub(crate) async fn verify_planned_upgrade_sessions(
     planned: &[crate::upgrade_transaction::UpgradePlannedSession],
     require_source_instance: bool,
 ) -> Result<usize> {
-    let active = request_session_views()
+    let active = request_upgrade_session_views()
         .await?
         .into_iter()
         .filter(|view| view.status == "active")
@@ -1828,7 +1832,7 @@ pub async fn apply_supervisor_upgrade(
     force: bool,
     expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
 ) -> Result<usize> {
-    let ping = request(ControlRequest::Ping).await?;
+    let ping = upgrade_request(ControlRequest::Ping).await?;
     validate_running_supervisor_upgrade_capabilities(&ping)?;
     let source_version = ping
         .get("version")
@@ -1840,7 +1844,7 @@ pub async fn apply_supervisor_upgrade(
         .get("boot_generation")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let result = request(ControlRequest::Upgrade {
+    let result = upgrade_request(ControlRequest::Upgrade {
         executable: executable.to_owned(),
         installed_locator: Some(installed_locator.to_owned()),
         target_version: target_version.to_owned(),
@@ -1876,7 +1880,7 @@ pub async fn apply_supervisor_upgrade(
                 tokio::time::Instant::now() < deadline,
                 "supervisor handoff verification timed out"
             );
-            if let Ok(status) = request(ControlRequest::Ping).await
+            if let Ok(status) = upgrade_request_until(ControlRequest::Ping, deadline).await
                 && supervisor_handoff_identity_changed(
                     &status,
                     target_version,
@@ -1886,9 +1890,12 @@ pub async fn apply_supervisor_upgrade(
             {
                 let mut all_active = true;
                 for session in &plan.sessions {
-                    let active = request(ControlRequest::Info {
-                        session_id: session.session_id.clone(),
-                    })
+                    let active = upgrade_request_until(
+                        ControlRequest::Info {
+                            session_id: session.session_id.clone(),
+                        },
+                        deadline,
+                    )
                     .await
                     .ok()
                     .and_then(|value| {
@@ -2162,7 +2169,12 @@ async fn run_approval_broker(
 }
 
 async fn request(request: ControlRequest) -> Result<Value> {
-    let mut stream = connect_supervisor().await?;
+    let path = config::supervisor_socket_path()?;
+    request_at_path(&path, request).await
+}
+
+async fn request_at_path(path: &Path, request: ControlRequest) -> Result<Value> {
+    let mut stream = connect_supervisor_at(path).await?;
     stream.write_all(&encode_line(&request)?).await?;
     stream.shutdown().await?;
     let mut reader = BufReader::new(stream);
@@ -2170,6 +2182,32 @@ async fn request(request: ControlRequest) -> Result<Value> {
     let response: ControlResponse =
         serde_json::from_str(line.trim()).context("invalid supervisor response")?;
     ensure_response_ok(response)
+}
+
+async fn upgrade_request(request: ControlRequest) -> Result<Value> {
+    upgrade_request_until(
+        request,
+        tokio::time::Instant::now() + UPGRADE_CONTROL_RPC_TIMEOUT,
+    )
+    .await
+}
+
+async fn upgrade_request_until(
+    request: ControlRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    let path = config::supervisor_socket_path()?;
+    upgrade_request_at_path_until(&path, request, deadline).await
+}
+
+async fn upgrade_request_at_path_until(
+    path: &Path,
+    request: ControlRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    tokio::time::timeout_at(deadline, request_at_path(path, request))
+        .await
+        .map_err(|_| anyhow::anyhow!("supervisor upgrade control request timed out"))?
 }
 
 fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
@@ -2186,7 +2224,11 @@ fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
 
 async fn connect_supervisor() -> Result<UnixStream> {
     let path = config::supervisor_socket_path()?;
-    UnixStream::connect(&path).await.with_context(|| {
+    connect_supervisor_at(&path).await
+}
+
+async fn connect_supervisor_at(path: &Path) -> Result<UnixStream> {
+    UnixStream::connect(path).await.with_context(|| {
         format!(
             "Temote session supervisor is not running at {}; run `temote-mcp supervisor` first",
             path.display()
@@ -2431,6 +2473,11 @@ async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<Sessio
 
 pub(crate) async fn request_session_views() -> Result<Vec<SessionView>> {
     let result = request(ControlRequest::List).await?;
+    serde_json::from_value(result).context("invalid supervisor session list response")
+}
+
+async fn request_upgrade_session_views() -> Result<Vec<SessionView>> {
+    let result = upgrade_request(ControlRequest::List).await?;
     serde_json::from_value(result).context("invalid supervisor session list response")
 }
 
@@ -2889,10 +2936,77 @@ fn print_json(value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::approvals;
     use crate::test_support;
+
+    fn stalled_control_listener(
+        socket_path: &Path,
+    ) -> (tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_by_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            accepted_by_server.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        (server, accepted)
+    }
+
+    #[tokio::test]
+    async fn upgrade_control_rpc_times_out_when_private_listener_stalls() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("control.sock");
+        let (server, accepted) = stalled_control_listener(&socket_path);
+
+        let error = upgrade_request_at_path_until(
+            &socket_path,
+            ControlRequest::Ping,
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(accepted.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("timed out"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn upgrade_control_rpc_timeout_releases_admission_and_transaction_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("control.sock");
+        let (server, accepted) = stalled_control_listener(&socket_path);
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+
+        let error = async {
+            let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
+            let _transaction =
+                crate::upgrade_transaction::acquire_transaction_lock(&transaction_id)?;
+            upgrade_request_at_path_until(
+                &socket_path,
+                ControlRequest::List,
+                tokio::time::Instant::now() + Duration::from_millis(200),
+            )
+            .await
+        }
+        .await
+        .unwrap_err();
+
+        assert!(accepted.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let admission = crate::upgrade_transaction::acquire_admission_lock().unwrap();
+        let transaction =
+            crate::upgrade_transaction::acquire_transaction_lock(&transaction_id).unwrap();
+        let transaction_lock_path = transaction.path().to_owned();
+        drop(transaction);
+        drop(admission);
+        std::fs::remove_file(transaction_lock_path).unwrap();
+        server.abort();
+    }
 
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
