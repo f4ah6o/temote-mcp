@@ -114,7 +114,7 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 49);
+  assert.equal(names.length, 51);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(names.includes(required), true, required);
   }
@@ -126,6 +126,12 @@ test("gateway routed tools and protocol versions match the Rust contract", () =>
   assert.deepEqual(gitPushTag.inputSchema.required, ["session_id", "tag", "source_sha"]);
   assert.equal(gitPushTag.inputSchema.properties.remote.default, "origin");
   assert.equal(gitPushTag.inputSchema.additionalProperties, false);
+  const workflowDispatch = PUBLIC_TOOLS.find((tool) => tool.name === "github_workflow_dispatch");
+  assert.ok(workflowDispatch);
+  assert.deepEqual(workflowDispatch.inputSchema.required, ["session_id", "workflow", "ref"]);
+  const workflowRunGet = PUBLIC_TOOLS.find((tool) => tool.name === "github_workflow_run_get");
+  assert.ok(workflowRunGet);
+  assert.deepEqual(workflowRunGet.inputSchema.required, ["session_id", "run_id"]);
   assert.deepEqual(
     PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties,
     {
@@ -1672,7 +1678,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 49);
+  assert.equal(rpc.result.tools.length, 51);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

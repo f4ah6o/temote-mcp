@@ -41,6 +41,9 @@ const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_GIT_TAG_NAME_BYTES: usize = 255;
+const MAX_GITHUB_WORKFLOW_BYTES: usize = 255;
+const MAX_GITHUB_REF_BYTES: usize = 255;
+const MAX_GITHUB_REMOTE_URL_BYTES: usize = 2048;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MCP_RESPONSE_BYTES: usize = 52 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -169,6 +172,16 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
     activity_tool("git_pull", ActivityOperation::GitPull, "Git network"),
     activity_tool("git_push", ActivityOperation::GitPush, "Git network"),
     activity_tool("git_push_tag", ActivityOperation::GitPush, "Git network"),
+    activity_tool(
+        "github_workflow_dispatch",
+        ActivityOperation::GithubWorkflowDispatch,
+        "GitHub workflow dispatch",
+    ),
+    activity_tool(
+        "github_workflow_run_get",
+        ActivityOperation::GithubWorkflowRunGet,
+        "GitHub workflow status",
+    ),
     activity_job_tool(
         "execute",
         ActivityOperation::Execute,
@@ -860,6 +873,8 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push_tag","title":"Push an exact Git tag ref","description":"Push one exact commit SHA to refs/tags/<tag> on a configured remote using force-with-lease safety. Omitting expected_remote_sha is create-only; supplying it permits an update only when the remote tag still equals that exact SHA. Arbitrary refspecs, URLs, and unconditional force are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"tag":{"type":"string","minLength":1,"maxLength":255},"source_sha":{"type":"string","minLength":40,"maxLength":64},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","tag","source_sha"],"additionalProperties":false}},
+        {"name":"github_workflow_dispatch","title":"Dispatch a GitHub Actions workflow","description":"Dispatch an exact workflow file or numeric workflow ID at an exact branch/tag ref for the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping, never the ambient active gh account, and returns the created workflow run ID without exposing tokens.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"workflow":{"type":"string","minLength":1,"maxLength":255},"ref":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","workflow","ref"],"additionalProperties":false}},
+        {"name":"github_workflow_run_get","title":"Read a GitHub Actions workflow run","description":"Read bounded status for one exact workflow run ID in the GitHub repository resolved from a configured remote. Requires the same repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"run_id":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","run_id"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Optional output_limit_bytes or status_only becomes the default completed-result view for later polls.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -1173,6 +1188,12 @@ async fn call_tool_with_local_agent_executable(
                     }
                     _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
+            }
+            "github_workflow_dispatch" => {
+                github_workflow_dispatch(&args, &session, activity.as_ref()).await
+            }
+            "github_workflow_run_get" => {
+                github_workflow_run_get(&args, &session, activity.as_ref()).await
             }
             "execute" => execute(&args, &session, activity.clone()).await,
             "start_command" => start_command(&args, &session, activity.clone()).await,
@@ -2576,6 +2597,608 @@ fn build_git_push_tag_command(
         remote.to_owned(),
         format!("{source_sha}:{tag_ref}"),
     ]
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GithubRepository {
+    owner: String,
+    repo: String,
+}
+
+async fn github_workflow_dispatch(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    let repository = configured_github_repository(session, &cwd, &remote).await?;
+    let workflow = args
+        .get("workflow")
+        .and_then(Value::as_str)
+        .context("missing or non-string workflow")?;
+    validate_github_workflow(workflow)?;
+    let git_ref = args
+        .get("ref")
+        .and_then(Value::as_str)
+        .context("missing or non-string ref")?;
+    validate_github_ref(git_ref)?;
+    ensure_generic_git_ref_valid(session, &cwd, git_ref).await?;
+
+    let path = github_workflow_dispatch_path(&repository, workflow);
+    let body = json!({
+        "ref": git_ref,
+        "return_run_details": true,
+    });
+    let output = run_approved_github_api(
+        session,
+        cwd,
+        &repository,
+        GithubApiCall {
+            method: GithubApiMethod::Post,
+            path: &path,
+            body: Some(&body),
+            operation: "github_workflow_dispatch",
+        },
+        activity,
+    )
+    .await?;
+    let response = parse_github_workflow_dispatch_response(&output)?;
+    text_result(serde_json::to_string(&response)?)
+}
+
+async fn github_workflow_run_get(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    let repository = configured_github_repository(session, &cwd, &remote).await?;
+    let run_id = args
+        .get("run_id")
+        .and_then(Value::as_str)
+        .context("missing or non-string run_id")?;
+    let run_id = validate_github_run_id(run_id)?;
+    let path = github_workflow_run_get_path(&repository, run_id);
+    let output = run_approved_github_api(
+        session,
+        cwd,
+        &repository,
+        GithubApiCall {
+            method: GithubApiMethod::Get,
+            path: &path,
+            body: None,
+            operation: "github_workflow_run_get",
+        },
+        activity,
+    )
+    .await?;
+    let response = parse_github_workflow_run_response(&output, run_id)?;
+    text_result(serde_json::to_string(&response)?)
+}
+
+async fn configured_github_repository(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+) -> Result<GithubRepository> {
+    validate_git_remote(remote)?;
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            remote.to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "configured Git remote is unavailable");
+    let remote_url = output.stdout.trim();
+    anyhow::ensure!(
+        !remote_url.is_empty() && remote_url.len() <= MAX_GITHUB_REMOTE_URL_BYTES,
+        "configured Git remote URL is invalid"
+    );
+    github_repository_from_remote_url(remote_url)
+}
+
+fn github_repository_from_remote_url(remote_url: &str) -> Result<GithubRepository> {
+    let path = if let Some(path) = remote_url.strip_prefix("https://github.com/") {
+        path
+    } else if let Some(path) = remote_url.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = remote_url.strip_prefix("ssh://git@github.com/") {
+        path
+    } else {
+        anyhow::bail!("configured remote must resolve to github.com")
+    };
+    anyhow::ensure!(
+        !path.contains(['?', '#', '@']),
+        "configured GitHub remote URL is invalid"
+    );
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut components = path.split('/');
+    let owner = components.next().unwrap_or_default();
+    let repo = components.next().unwrap_or_default();
+    anyhow::ensure!(
+        !owner.is_empty() && !repo.is_empty() && components.next().is_none(),
+        "configured GitHub remote must identify exactly one owner/repository"
+    );
+    validate_github_repository_component(owner, false)?;
+    validate_github_repository_component(repo, true)?;
+    Ok(GithubRepository {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+    })
+}
+
+fn validate_github_repository_component(value: &str, allow_dot_underscore: bool) -> Result<()> {
+    anyhow::ensure!(value.len() <= 100, "GitHub repository identity is too long");
+    anyhow::ensure!(
+        value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '-'
+                || (allow_dot_underscore && matches!(character, '.' | '_'))
+        }),
+        "configured GitHub repository identity contains unsafe characters"
+    );
+    anyhow::ensure!(!value.contains(".."), "invalid GitHub repository identity");
+    Ok(())
+}
+
+fn validate_github_workflow(workflow: &str) -> Result<()> {
+    anyhow::ensure!(
+        !workflow.is_empty() && workflow.len() <= MAX_GITHUB_WORKFLOW_BYTES,
+        "workflow must be between 1 and {MAX_GITHUB_WORKFLOW_BYTES} bytes"
+    );
+    if workflow.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::ensure!(
+            workflow.parse::<u64>().is_ok(),
+            "numeric workflow ID is invalid"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        workflow.ends_with(".yml") || workflow.ends_with(".yaml"),
+        "workflow must be a numeric ID or workflow filename ending in .yml/.yaml"
+    );
+    anyhow::ensure!(
+        workflow
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '-')),
+        "workflow filename contains unsafe characters"
+    );
+    anyhow::ensure!(!workflow.contains(".."), "workflow filename is invalid");
+    Ok(())
+}
+
+fn validate_github_ref(git_ref: &str) -> Result<()> {
+    anyhow::ensure!(
+        !git_ref.is_empty() && git_ref.len() <= MAX_GITHUB_REF_BYTES,
+        "ref must be between 1 and {MAX_GITHUB_REF_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !git_ref.starts_with('-') && !git_ref.starts_with("refs/"),
+        "ref must be an unqualified branch or tag name"
+    );
+    anyhow::ensure!(
+        !git_ref.chars().any(char::is_control),
+        "ref must not contain control characters"
+    );
+    Ok(())
+}
+
+async fn ensure_generic_git_ref_valid(
+    session: &config::Session,
+    cwd: &Path,
+    git_ref: &str,
+) -> Result<()> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "check-ref-format".to_owned(),
+            format!("refs/heads/{git_ref}"),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "invalid Git branch/tag ref");
+    Ok(())
+}
+
+fn validate_github_run_id(run_id: &str) -> Result<u64> {
+    anyhow::ensure!(
+        !run_id.is_empty()
+            && run_id.len() <= 20
+            && run_id.bytes().all(|byte| byte.is_ascii_digit()),
+        "run_id must be a positive decimal integer"
+    );
+    let parsed = run_id.parse::<u64>().context("run_id is out of range")?;
+    anyhow::ensure!(parsed > 0, "run_id must be greater than zero");
+    Ok(parsed)
+}
+
+fn github_workflow_dispatch_path(repository: &GithubRepository, workflow: &str) -> String {
+    format!(
+        "repos/{}/{}/actions/workflows/{workflow}/dispatches",
+        repository.owner, repository.repo
+    )
+}
+
+fn github_workflow_run_get_path(repository: &GithubRepository, run_id: u64) -> String {
+    format!(
+        "repos/{}/{}/actions/runs/{run_id}",
+        repository.owner, repository.repo
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GithubApiMethod {
+    Get,
+    Post,
+}
+
+impl GithubApiMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        }
+    }
+}
+
+struct GithubApiCall<'a> {
+    method: GithubApiMethod,
+    path: &'a str,
+    #[cfg_attr(not(feature = "network"), allow(dead_code))]
+    body: Option<&'a Value>,
+    operation: &'a str,
+}
+
+async fn run_approved_github_api(
+    session: &config::Session,
+    cwd: PathBuf,
+    repository: &GithubRepository,
+    call: GithubApiCall<'_>,
+    activity: Option<&ActivityScope>,
+) -> Result<String> {
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    if !approvals::ensure_local_approval_with_activity(
+        session,
+        approvals::ApprovalClass::GitNetwork,
+        call.operation,
+        format!("method={} path={}", call.method.as_str(), call.path),
+        repository_root.clone(),
+        BTreeMap::new(),
+        activity,
+    )
+    .await?
+    {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+        anyhow::bail!("user denied {}", call.operation)
+    }
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    #[cfg(feature = "network")]
+    {
+        let token = repo_scoped_github_token(session, &repository_root, repository).await?;
+        github_api_request(&token, call.method, call.path, call.body).await
+    }
+    #[cfg(not(feature = "network"))]
+    {
+        let _ = (repository, call);
+        anyhow::bail!("GitHub API operations require the network feature")
+    }
+}
+
+#[cfg(feature = "network")]
+async fn github_api_request(
+    token: &str,
+    method: GithubApiMethod,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<String> {
+    const MAX_GITHUB_API_RESPONSE_BYTES: u64 = 256 * 1024;
+    anyhow::ensure!(
+        !path.is_empty()
+            && path.len() <= 1024
+            && !path.starts_with('/')
+            && !path.contains("..")
+            && path
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || matches!(character, '/' | '.' | '_' | '-')),
+        "GitHub API path is invalid"
+    );
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .user_agent(format!("temote-mcp/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to initialize GitHub API client")?;
+    let url = format!("https://api.github.com/{path}");
+    let mut request = match method {
+        GithubApiMethod::Get => client.get(url),
+        GithubApiMethod::Post => client.post(url),
+    }
+    .header("Accept", "application/vnd.github+json")
+    .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("GitHub API is unavailable"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!(github_api_error_message(status.as_u16()));
+    }
+    if let Some(length) = response.content_length() {
+        anyhow::ensure!(
+            length <= MAX_GITHUB_API_RESPONSE_BYTES,
+            "GitHub API response is too large"
+        );
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| anyhow::anyhow!("GitHub API response could not be read"))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_GITHUB_API_RESPONSE_BYTES as usize,
+        "GitHub API response is too large"
+    );
+    String::from_utf8(bytes.to_vec()).context("GitHub API response is not UTF-8")
+}
+
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
+fn github_api_error_message(status: u16) -> &'static str {
+    match status {
+        401 => "GitHub repository credential was rejected",
+        403 => "GitHub repository credential lacks required permission",
+        404 => "GitHub repository workflow/run is unavailable",
+        422 => "GitHub workflow request was rejected",
+        _ => "GitHub API operation failed",
+    }
+}
+
+#[cfg(feature = "network")]
+async fn repo_scoped_github_token(
+    session: &config::Session,
+    repository_root: &Path,
+    repository: &GithubRepository,
+) -> Result<zeroize::Zeroizing<String>> {
+    let local_helpers = run_host_git_inspection(
+        session,
+        repository_root,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--local".to_owned(),
+            "--includes".to_owned(),
+            "--get-all".to_owned(),
+            "credential.helper".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        local_helpers.status == 0,
+        "GitHub repository credential mapping is unavailable"
+    );
+    let local_use_http_path = run_host_git_inspection(
+        session,
+        repository_root,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--local".to_owned(),
+            "--includes".to_owned(),
+            "--get".to_owned(),
+            "credential.useHttpPath".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        local_use_http_path.status == 0
+            && repo_scoped_github_credential_mapping_valid(
+                &local_helpers.stdout,
+                &local_use_http_path.stdout,
+            ),
+        "GitHub repository credential mapping is unavailable"
+    );
+
+    let path = format!("{}/{}.git", repository.owner, repository.repo);
+    let input = format!("protocol=https\nhost=github.com\npath={path}\n\n");
+    let environment = HashMap::from([
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ("GCM_INTERACTIVE".to_owned(), "Never".to_owned()),
+        ("GIT_ASKPASS".to_owned(), "/bin/false".to_owned()),
+    ]);
+    let output = sandbox::run_unrestricted_with_env(
+        &github_managed_credential_command(),
+        repository_root,
+        Some(input.as_bytes()),
+        &environment,
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "GitHub repository credential is unavailable"
+    );
+    let credential_stdout = zeroize::Zeroizing::new(output.stdout);
+    let token = parse_repo_scoped_github_credential(&credential_stdout)?;
+    Ok(zeroize::Zeroizing::new(token))
+}
+
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
+fn repo_scoped_github_credential_mapping_valid(
+    local_helpers_stdout: &str,
+    local_use_http_path_stdout: &str,
+) -> bool {
+    let local_helpers = local_helpers_stdout.lines().collect::<Vec<_>>();
+    local_helpers == ["", "!gh git credential --managed"]
+        && local_use_http_path_stdout
+            .trim()
+            .eq_ignore_ascii_case("true")
+}
+
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
+fn github_managed_credential_command() -> Vec<String> {
+    vec![
+        "gh".to_owned(),
+        "git".to_owned(),
+        "credential".to_owned(),
+        "--managed".to_owned(),
+        "get".to_owned(),
+    ]
+}
+
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
+fn parse_repo_scoped_github_credential(stdout: &str) -> Result<String> {
+    const MAX_CREDENTIAL_RESPONSE_BYTES: usize = 16 * 1024;
+    const MAX_GITHUB_TOKEN_BYTES: usize = 4096;
+    anyhow::ensure!(
+        stdout.len() <= MAX_CREDENTIAL_RESPONSE_BYTES,
+        "GitHub repository credential response is too large"
+    );
+    let mut protocol = None;
+    let mut host = None;
+    let mut username = None;
+    let mut password = None;
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .context("GitHub repository credential response is malformed")?;
+        anyhow::ensure!(
+            !value.chars().any(char::is_control),
+            "GitHub repository credential response is malformed"
+        );
+        let slot = match key {
+            "protocol" => &mut protocol,
+            "host" => &mut host,
+            "username" => &mut username,
+            "password" => &mut password,
+            _ => continue,
+        };
+        anyhow::ensure!(
+            slot.replace(value.to_owned()).is_none(),
+            "GitHub repository credential response is malformed"
+        );
+    }
+    anyhow::ensure!(
+        protocol.as_deref() == Some("https"),
+        "GitHub repository credential mismatch"
+    );
+    anyhow::ensure!(
+        host.as_deref() == Some("github.com"),
+        "GitHub repository credential mismatch"
+    );
+    let username = username.context("GitHub repository credential is incomplete")?;
+    anyhow::ensure!(
+        !username.is_empty() && username.len() <= 256,
+        "GitHub repository credential is incomplete"
+    );
+    let password = password.context("GitHub repository credential is incomplete")?;
+    anyhow::ensure!(
+        !password.is_empty() && password.len() <= MAX_GITHUB_TOKEN_BYTES,
+        "GitHub repository credential is incomplete"
+    );
+    Ok(password)
+}
+
+fn parse_github_workflow_dispatch_response(stdout: &str) -> Result<Value> {
+    anyhow::ensure!(
+        stdout.len() <= 64 * 1024,
+        "GitHub dispatch response is too large"
+    );
+    let value: Value = serde_json::from_str(stdout).context("invalid GitHub dispatch response")?;
+    let run_id = value
+        .get("workflow_run_id")
+        .and_then(Value::as_u64)
+        .context("GitHub dispatch response is missing workflow_run_id")?;
+    anyhow::ensure!(
+        run_id > 0,
+        "GitHub dispatch returned invalid workflow_run_id"
+    );
+    let html_url = bounded_github_html_url(value.get("html_url"))?;
+    Ok(json!({
+        "workflow_run_id": run_id.to_string(),
+        "html_url": html_url,
+    }))
+}
+
+fn parse_github_workflow_run_response(stdout: &str, expected_run_id: u64) -> Result<Value> {
+    anyhow::ensure!(
+        stdout.len() <= 256 * 1024,
+        "GitHub workflow run response is too large"
+    );
+    let value: Value =
+        serde_json::from_str(stdout).context("invalid GitHub workflow run response")?;
+    let run_id = value
+        .get("id")
+        .and_then(Value::as_u64)
+        .context("GitHub workflow run response is missing id")?;
+    anyhow::ensure!(run_id == expected_run_id, "GitHub workflow run ID mismatch");
+    let status = bounded_github_enum(value.get("status"), "status")?;
+    let conclusion = match value.get("conclusion") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(bounded_github_enum(Some(value), "conclusion")?),
+    };
+    let event = bounded_github_enum(value.get("event"), "event")?;
+    let head_sha = value
+        .get("head_sha")
+        .and_then(Value::as_str)
+        .context("GitHub workflow run response is missing head_sha")?;
+    validate_git_object_id(head_sha, "GitHub workflow head_sha")?;
+    let html_url = bounded_github_html_url(value.get("html_url"))?;
+    Ok(json!({
+        "run_id": run_id.to_string(),
+        "status": status,
+        "conclusion": conclusion,
+        "event": event,
+        "head_sha": head_sha.to_ascii_lowercase(),
+        "html_url": html_url,
+    }))
+}
+
+fn bounded_github_enum<'a>(value: Option<&'a Value>, field: &str) -> Result<&'a str> {
+    let value = value
+        .and_then(Value::as_str)
+        .with_context(|| format!("GitHub response is missing {field}"))?;
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= 64
+            && value.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            ),
+        "GitHub response contains invalid {field}"
+    );
+    Ok(value)
+}
+
+fn bounded_github_html_url(value: Option<&Value>) -> Result<&str> {
+    let value = value
+        .and_then(Value::as_str)
+        .context("GitHub response is missing html_url")?;
+    anyhow::ensure!(
+        value.len() <= 2048 && value.starts_with("https://github.com/"),
+        "GitHub response contains invalid html_url"
+    );
+    Ok(value)
 }
 
 fn optional_git_remote(args: &Value) -> Result<Option<String>> {
@@ -6258,7 +6881,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 49);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -6280,6 +6903,16 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_pull"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push_tag"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "github_workflow_dispatch")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "github_workflow_run_get")
+        );
         for name in [
             "codex_status",
             "codex_task_start",
@@ -7664,6 +8297,232 @@ mod tests {
             assert_eq!(command[7], "origin");
             assert_eq!(command[8], format!("{source}:{tag_ref}"));
             assert!(!command.iter().any(|argument| argument == "--force"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn github_repository_and_workflow_inputs_are_bounded_and_repo_scoped() {
+        for (remote, owner, repo) in [
+            ("https://github.com/openai/example.git", "openai", "example"),
+            ("git@github.com:openai/example.git", "openai", "example"),
+            ("ssh://git@github.com/openai/example", "openai", "example"),
+        ] {
+            assert_eq!(
+                github_repository_from_remote_url(remote).unwrap(),
+                GithubRepository {
+                    owner: owner.to_owned(),
+                    repo: repo.to_owned(),
+                }
+            );
+        }
+        for remote in [
+            "https://gitlab.com/openai/example.git",
+            "https://token@github.com/openai/example.git",
+            "https://github.com/openai/example/extra.git",
+            "https://github.com/openai/../example.git",
+        ] {
+            assert!(
+                github_repository_from_remote_url(remote).is_err(),
+                "{remote}"
+            );
+        }
+
+        for workflow in ["release.yml", "release.yaml", "123456"] {
+            validate_github_workflow(workflow).unwrap();
+        }
+        for workflow in [
+            "",
+            "release",
+            "../release.yml",
+            ".github/workflows/release.yml",
+        ] {
+            assert!(validate_github_workflow(workflow).is_err(), "{workflow}");
+        }
+        for git_ref in ["main", "latest", "release/2026.09"] {
+            validate_github_ref(git_ref).unwrap();
+        }
+        for git_ref in ["", "-main", "refs/heads/main", "bad\nref"] {
+            assert!(validate_github_ref(git_ref).is_err(), "{git_ref:?}");
+        }
+        assert_eq!(validate_github_run_id("123").unwrap(), 123);
+        for run_id in ["", "0", "-1", "1.5", "18446744073709551616"] {
+            assert!(validate_github_run_id(run_id).is_err(), "{run_id}");
+        }
+    }
+
+    #[test]
+    fn github_workflow_paths_and_responses_are_bounded() {
+        let repository = GithubRepository {
+            owner: "openai".to_owned(),
+            repo: "example".to_owned(),
+        };
+        assert_eq!(repository.owner, "openai");
+        assert_eq!(repository.repo, "example");
+        assert_eq!(
+            github_workflow_dispatch_path(&repository, "release.yml"),
+            "repos/openai/example/actions/workflows/release.yml/dispatches"
+        );
+        assert_eq!(
+            github_workflow_run_get_path(&repository, 42),
+            "repos/openai/example/actions/runs/42"
+        );
+        assert_eq!(GithubApiMethod::Get.as_str(), "GET");
+        assert_eq!(GithubApiMethod::Post.as_str(), "POST");
+
+        assert_eq!(
+            parse_github_workflow_dispatch_response(
+                r#"{"workflow_run_id":42,"run_url":"https://api.github.com/repos/openai/example/actions/runs/42","html_url":"https://github.com/openai/example/actions/runs/42"}"#,
+            )
+            .unwrap(),
+            json!({
+                "workflow_run_id": "42",
+                "html_url": "https://github.com/openai/example/actions/runs/42",
+            })
+        );
+        assert_eq!(
+            parse_github_workflow_run_response(
+                r#"{"id":42,"status":"in_progress","conclusion":null,"event":"workflow_dispatch","head_sha":"0123456789abcdef0123456789abcdef01234567","html_url":"https://github.com/openai/example/actions/runs/42"}"#,
+                42,
+            )
+            .unwrap(),
+            json!({
+                "run_id": "42",
+                "status": "in_progress",
+                "conclusion": Value::Null,
+                "event": "workflow_dispatch",
+                "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                "html_url": "https://github.com/openai/example/actions/runs/42",
+            })
+        );
+        assert!(parse_github_workflow_run_response(
+            r#"{"id":43,"status":"completed","conclusion":"success","event":"workflow_dispatch","head_sha":"0123456789abcdef0123456789abcdef01234567","html_url":"https://github.com/openai/example/actions/runs/43"}"#,
+            42,
+        )
+        .is_err());
+        assert_eq!(
+            github_api_error_message(401),
+            "GitHub repository credential was rejected"
+        );
+        assert_eq!(
+            github_api_error_message(403),
+            "GitHub repository credential lacks required permission"
+        );
+        assert_eq!(
+            github_api_error_message(404),
+            "GitHub repository workflow/run is unavailable"
+        );
+        assert_eq!(
+            github_api_error_message(422),
+            "GitHub workflow request was rejected"
+        );
+        assert_eq!(github_api_error_message(500), "GitHub API operation failed");
+    }
+
+    #[test]
+    fn github_repository_credential_mapping_requires_managed_repo_local_helper() {
+        assert!(repo_scoped_github_credential_mapping_valid(
+            "\n!gh git credential --managed\n",
+            "true\n",
+        ));
+        assert_eq!(
+            github_managed_credential_command(),
+            ["gh", "git", "credential", "--managed", "get"]
+        );
+        for helpers in [
+            "!gh git credential --managed\n",
+            "\nstore\n!gh git credential --managed\n",
+            "\n!gh auth token\n",
+            "\n!gh git credential --managed\nstore\n",
+            "",
+        ] {
+            assert!(
+                !repo_scoped_github_credential_mapping_valid(helpers, "true\n"),
+                "unexpectedly accepted helpers {helpers:?}"
+            );
+        }
+        for use_http_path in ["false\n", "", "1\n"] {
+            assert!(!repo_scoped_github_credential_mapping_valid(
+                "\n!gh git credential --managed\n",
+                use_http_path,
+            ));
+        }
+    }
+
+    #[test]
+    fn generated_github_credential_mapping_rejects_extra_repo_local_helpers() -> noprop::TestResult
+    {
+        test_support::run(0x4748_4d41_5050_494e, 1024, |ctx| {
+            let prefix_count = noprop::sample_usize_in(ctx, 0..8);
+            let mut local = String::new();
+            for index in 0..prefix_count {
+                local.push_str(&format!("helper-{index}\n"));
+            }
+            local.push_str("\n!gh git credential --managed\n");
+            assert_eq!(
+                repo_scoped_github_credential_mapping_valid(&local, "true\n"),
+                prefix_count == 0
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn github_repository_credential_parser_is_repo_bound_and_secret_safe() {
+        let secret = "ghp_secret_sentinel_123";
+        let valid =
+            format!("protocol=https\nhost=github.com\nusername=f4ah6o\npassword={secret}\n\n");
+        assert_eq!(parse_repo_scoped_github_credential(&valid).unwrap(), secret);
+
+        for invalid in [
+            format!("protocol=https\nhost=gitlab.com\nusername=user\npassword={secret}\n"),
+            format!(
+                "protocol=https\nhost=github.com\nusername=user\npassword={secret}\npassword=second\n"
+            ),
+            "protocol=https\nhost=github.com\nusername=user\npassword=\n".to_owned(),
+        ] {
+            let error = parse_repo_scoped_github_credential(&invalid).unwrap_err();
+            assert!(
+                !error.to_string().contains(secret),
+                "credential error leaked the secret: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_github_credential_parser_never_echoes_secret_on_mismatch() -> noprop::TestResult {
+        test_support::run(0x4748_4352_4544_454e, 1024, |ctx| {
+            let secret = format!("ghp_{:016x}", noprop::sample_u64(ctx));
+            let response =
+                format!("protocol=https\nhost=gitlab.com\nusername=user\npassword={secret}\n");
+            let error = parse_repo_scoped_github_credential(&response).unwrap_err();
+            assert!(!error.to_string().contains(&secret));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_github_dispatches_stay_on_configured_repository() -> noprop::TestResult {
+        test_support::run(0x4748_4449_5350_4154, 1024, |ctx| {
+            let owner = format!("owner-{:016x}", noprop::sample_u64(ctx));
+            let repo = format!("repo-{:016x}", noprop::sample_u64(ctx));
+            let workflow = format!("release-{:016x}.yml", noprop::sample_u64(ctx));
+            let git_ref = format!("release/{:016x}", noprop::sample_u64(ctx));
+            let repository = github_repository_from_remote_url(&format!(
+                "https://github.com/{owner}/{repo}.git"
+            ))
+            .unwrap();
+            validate_github_workflow(&workflow).unwrap();
+            validate_github_ref(&git_ref).unwrap();
+            let path = github_workflow_dispatch_path(&repository, &workflow);
+            assert_eq!(
+                path,
+                format!("repos/{owner}/{repo}/actions/workflows/{workflow}/dispatches")
+            );
+            let body = json!({"ref": git_ref, "return_run_details": true});
+            assert_eq!(body["ref"], git_ref);
+            assert_eq!(body["return_run_details"], true);
+            assert!(!path.contains("token"));
             Ok(())
         })
     }

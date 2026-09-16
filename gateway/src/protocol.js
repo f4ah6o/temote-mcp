@@ -452,6 +452,37 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "github_workflow_dispatch",
+    "Dispatch a GitHub Actions workflow",
+    "Dispatch one workflow/ref pair using the configured repository's managed Git credential mapping.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+        workflow: { type: "string", minLength: 1, maxLength: 255 },
+        ref: { type: "string", minLength: 1, maxLength: 255 },
+      },
+      ["session_id", "workflow", "ref"],
+    ),
+  ),
+  tool(
+    "github_workflow_run_get",
+    "Read a GitHub Actions workflow run",
+    "Read bounded status for one workflow run ID using the configured repository's managed Git credential mapping.",
+    { ...networkMutation, readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+        run_id: { type: "string", minLength: 1, maxLength: 20 },
+      },
+      ["session_id", "run_id"],
+    ),
+  ),
+  tool(
     "execute",
     "Run a sandboxed command",
     "Execute argv in the selected host's network-disabled sandbox.",

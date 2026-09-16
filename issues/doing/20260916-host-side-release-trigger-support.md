@@ -1,6 +1,6 @@
 # host-side Git tag push / GitHub Actions dispatch を Temote から安全に実行できるようにする
 
-Status: doing / lease-protected tag trigger implemented; GitHub workflow dispatch remains
+Status: doing / tag trigger + GitHub workflow dispatch/status implemented; live workflow acceptance remains
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -68,15 +68,40 @@ Verification:
 
 - current repository の configured GitHub remote から owner/repo を解決。
 - workflow file/id と ref のみを受け取る。
-- host-side GitHub credential を利用し、token を MCP client に返さない。
-- dispatch 後は run id を返し、poll/status/log summary まで追跡可能にする。
+- repository-local managed Git credential mapping を利用し、token を MCP client や child environment に返さない。
+- dispatch 後は run id を返し、exact run status / conclusion を poll 可能にする。raw logs/artifacts は別surfaceとする。
+
+### Implemented second slice (2026-09-16)
+
+`github_workflow_dispatch` と `github_workflow_run_get` を追加した。
+
+- repository は caller input では受け付けず、selected configured remote の URL を read-only host Git inspection で取得し、`https://github.com/OWNER/REPO(.git)` / `git@github.com:OWNER/REPO(.git)` / `ssh://git@github.com/OWNER/REPO(.git)` の3形だけを bounded parser で受理する。
+- workflow は numeric workflow ID または slash を含まない `.yml` / `.yaml` filename だけ。
+- ref は unqualified branch/tag name だけを受け付け、Temote 側で Git ref grammar を確認する。
+- dispatch は GitHub REST workflow-dispatch endpoint へ `return_run_details=true` を送り、推測検索ではなく response の `workflow_run_id` を直接返す。
+- `github_workflow_run_get` は exact run ID の `status`, `conclusion`, `event`, `head_sha`, GitHub `html_url` だけを bounded response として返す。raw logs/artifacts はこの surface では取得しない。
+- child process へ継承される `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` は sensitive env list へ追加して除去する。GitHub API credential は ambient active `gh` account を使わず、repository-local Git config が helper reset + `!gh git credential --managed`、かつ `credential.useHttpPath=true` の exact mappingを持つ場合だけ approval 後に hidden managed helper `gh git credential --managed get` を current repository cwd で直接呼び出して内部解決する。`git credential fill` は URL-scoped global helperへ戻り得るため使わない。解決した token は bounded な direct GitHub REST request にだけ利用し、global `gh auth` stateを変更しない。
+- GitHub API endpoint/body は Temote が構築し、caller は arbitrary repository / endpoint / raw HTTP/gh argv を指定できない。
+
+Verification:
+
+- GitHub repository/workflow/ref/run-id validation + response parsing: PASS。
+- `noprop`: 1,024 generated owner/repo/workflow/ref combinations で dispatch endpoint が configured repository から逸脱しないことを確認。
+- sensitive child environment `noprop`: PASS（GH/GITHUB token names を含む）。
+- repository-scoped credential mapping tests: exact repo-local helper reset + `!gh git credential --managed` / `useHttpPath=true` のみaccept。current repo では `git config --get-urlmatch credential.helper https://github.com/f4ah6o/temote-mcp.git` が global `!/usr/bin/gh auth git-credential` を返すことを実測し、`git credential fill` では ambient account fallback を防げないと確認したため、hidden managed helperをdirect invocationする実装へ変更した。
+- direct managed helper argv (`gh git credential --managed get`) を固定テストし、extra repo-local helperを generated/PBT 1,024 cases でreject。
+- credential resolution: exact repo path is supplied to the verified `gh git credential --managed get` helper after repository-local mapping validation; parser rejects wrong host / duplicate or incomplete secret fields and never echoes the secret sentinel。`noprop` 1,024 cases PASS。
+- activity operation serialization: PASS。activity advertised-tool coverage 3/3 PASS。
+- public tool metadata: PASS。
+- Rust gateway contract snapshot + gateway runtime: PASS / 2/2。
+- live GitHub workflow dispatch は未実施。release/deploy workflow を勝手に起動する副作用を避け、明示的な実 live 対象がある場合だけ実施する。
 
 ## 受け入れ条件
 
 - [x] normal/agent用の host-side tag trigger surfaceを、sandbox networkを開放せず実装した。外部GitHub credentialを使うlive tag pushは rebuilt/runtime acceptance待ち。
 - [x] tag update は expected old SHA が一致しない場合 fail-closed（local bare remote E2Eで確認）。
 - [x] arbitrary force push / arbitrary refspec / arbitrary URL はschema/command builder上許可しない。
-- [ ] workflow dispatch は configured repository と exact workflow/ref に限定される。
-- [x] tag preflight/pushはcredential値を入力・返却せず、host childから既知sensitive environment namesを除去する。
-- [ ] release workflow の run state を running → completed/failed まで追跡できる。
+- [x] workflow dispatch は configured repository と exact workflow/ref に限定される（pure/PBT で確認、live dispatch は未実施）。
+- [x] tag/GitHub release toolsはcredential値を入力・返却しない。継承 `GH_TOKEN` / `GITHUB_TOKEN` / enterprise variantsは既知sensitive environmentとして扱い、GitHub API tokenは repository credential helperからapproval後に内部取得して `Zeroizing<String>` で保持し、child environmentではなくdirect RESTのAuthorizationにだけ使う。
+- [x] exact run ID の `github_workflow_run_get` で queued/running/completed + conclusion を poll できる surface を実装した。live run tracking acceptance は未実施。
 - [x] branch push の既存 safety contract を回帰させない（focused local bare remote regression PASS）。

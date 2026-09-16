@@ -863,6 +863,86 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "ref": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "workflow": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "workflow",
+          "ref"
+        ],
+        "type": "object"
+      },
+      "name": "github_workflow_dispatch"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "run_id": {
+            "maxLength": 20,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "name": "github_workflow_run_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
           "command": {
             "items": {
               "type": "string"

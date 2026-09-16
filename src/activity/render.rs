@@ -81,6 +81,8 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::GitFetch => "git_fetch",
         ActivityOperation::GitPull => "git_pull",
         ActivityOperation::GitPush => "git_push",
+        ActivityOperation::GithubWorkflowDispatch => "github_workflow_dispatch",
+        ActivityOperation::GithubWorkflowRunGet => "github_workflow_run_get",
         ActivityOperation::Execute => "execute",
         ActivityOperation::StartCommand => "start_command",
         ActivityOperation::StopJob => "stop_job",

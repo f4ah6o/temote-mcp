@@ -80,8 +80,11 @@ Use ordinary `execute` for read-only Git inspection. Use Temote MCP's dedicated 
 2. `git_commit` with the intended commit message.
 3. `git_fetch` or `git_pull` when remote updates are required.
 4. `git_push` after local validation when the user requested pushing a branch. Use `git_push_tag` only for an explicitly requested tag/release trigger, with the exact source commit SHA and an expected old SHA for updates.
+5. If the requested release uses GitHub Actions `workflow_dispatch`, use `github_workflow_dispatch` with the exact workflow/ref, preserve the returned run ID, and poll `github_workflow_run_get` until the run is terminal. Do not substitute `gh` through `execute`.
 
 `git_pull` is fast-forward-only. `git_push` does not expose force push or arbitrary URL/refspec input. `git_push_tag` is limited to `refs/tags/<tag>` and uses exact `--force-with-lease` expectations: omission means the tag must not exist; an update requires the caller's exact expected remote SHA. Do not bypass these restrictions with a shell command. In `ask` these Git tools require local approval; in the default `agent` mode the validated structured operation runs without the local approval console; `yolo` keeps its existing local behavior.
+
+GitHub workflow tools do not use the globally active `gh` account. They require a repository-local managed Git credential mapping (`credential.helper` reset followed by `!gh git credential --managed`, with `credential.useHttpPath=true`) and fail closed when that mapping is absent. Never run `gh auth switch`, `gh auth login`, or `gh auth logout` to make a structured operation succeed. A raw `gh auth status` failure inside the normal sandbox is not authoritative evidence that the host repository credential is invalid.
 
 Before committing, inspect the diff/status and run the task-relevant checks. After pushing, verify the branch is synchronized when practical.
 
@@ -95,7 +98,7 @@ Never infer that yolo mode disables authorization outside Temote MCP.
 
 ## Network behavior
 
-Normal `execute` commands have no network access. Prefer dedicated network-aware tools such as `git_fetch`, `git_pull`, `git_push`, and `git_push_tag` for supported operations.
+Normal `execute` commands have no network access. Prefer dedicated network-aware tools such as `git_fetch`, `git_pull`, `git_push`, `git_push_tag`, `github_workflow_dispatch`, and `github_workflow_run_get` for supported operations.
 
 `without_sandbox` may exist only on local stdio and requires host approval in `ask`/`agent` mode; it is not available on the public HTTP endpoint. Do not depend on it being present.
 
