@@ -22,6 +22,7 @@ pub(crate) const MAX_OPENCODE_TASK_BYTES: usize = 64 * 1024;
 const MAX_CWD_BYTES: usize = 4096;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_PROFILE_BYTES: usize = 128;
+const MAX_EFFORT_BYTES: usize = 128;
 const MAX_TASK_PREVIEW_BYTES: usize = 2048;
 const MAX_TASK_PREVIEW_CHARS: usize = 384;
 const MAX_TASK_PREVIEW_LINES: usize = 8;
@@ -558,10 +559,10 @@ where
         object.keys().all(|key| {
             matches!(
                 key.as_str(),
-                "session_id" | "agent" | "task" | "cwd" | "access" | "model" | "profile"
+                "session_id" | "agent" | "task" | "cwd" | "access" | "model" | "effort" | "profile"
             )
         }),
-        "local_agent_run accepts only session_id, agent, task, cwd, access, model, and profile"
+        "local_agent_run accepts only session_id, agent, task, cwd, access, model, effort, and profile"
     );
 
     let requested_session_id = object
@@ -584,7 +585,12 @@ where
         None => resolve_cwd(session, None)?,
     };
     let model = optional_bounded_string(args, "model", MAX_MODEL_BYTES)?;
+    let effort = optional_effort(args)?;
     let profile = optional_profile(args)?;
+    anyhow::ensure!(
+        agent == Agent::Codex || effort.is_none(),
+        "effort is supported only for the codex local agent"
+    );
 
     let mut environment = filtered_environment()?;
     let executable = resolve(agent, &environment, session)?;
@@ -630,6 +636,7 @@ where
             &cwd_argument,
             access,
             model.as_deref(),
+            effort.as_deref(),
             profile.as_deref(),
             state.read_only_paths(),
         )?,
@@ -766,6 +773,22 @@ fn optional_profile(args: &Value) -> Result<Option<String>> {
         );
     }
     Ok(profile)
+}
+
+fn optional_effort(args: &Value) -> Result<Option<String>> {
+    let effort = optional_bounded_string(args, "effort", MAX_EFFORT_BYTES)?;
+    if let Some(effort) = effort.as_deref() {
+        anyhow::ensure!(
+            effort
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '.'))
+                && !effort.starts_with('.')
+                && !effort.contains(".."),
+            "effort must be a simple Codex reasoning effort name"
+        );
+    }
+    Ok(effort)
 }
 
 fn max_task_bytes(agent: Agent) -> usize {
@@ -1712,6 +1735,7 @@ fn build_codex_command(
     cwd: &str,
     access: Access,
     model: Option<&str>,
+    effort: Option<&str>,
     profile: Option<&str>,
     auth_paths: &[PathBuf],
 ) -> Result<Vec<String>> {
@@ -1734,6 +1758,12 @@ fn build_codex_command(
     ];
     if let Some(model) = model {
         command.extend(["--model".to_owned(), model.to_owned()]);
+    }
+    if let Some(effort) = effort {
+        command.extend([
+            "--config".to_owned(),
+            format!("model_reasoning_effort={}", toml_basic_string(effort)),
+        ]);
     }
     if let Some(profile) = profile {
         command.extend(["--profile".to_owned(), profile.to_owned()]);
@@ -2015,7 +2045,7 @@ mod tests {
     }
 
     #[test]
-    fn task_and_profile_bounds_fail_closed() {
+    fn task_profile_and_effort_bounds_fail_closed() {
         assert!(validate_task("", MAX_TASK_BYTES).is_err());
         assert!(validate_task(&"x".repeat(MAX_TASK_BYTES), MAX_TASK_BYTES).is_ok());
         assert!(validate_task(&"x".repeat(MAX_TASK_BYTES + 1), MAX_TASK_BYTES).is_err());
@@ -2036,7 +2066,36 @@ mod tests {
             .is_err()
         );
         assert!(optional_profile(&json!({"profile": "../escape"})).is_err());
+        for effort in ["high", "xhigh", "max", "extra_high"] {
+            assert_eq!(
+                optional_effort(&json!({"effort": effort}))
+                    .unwrap()
+                    .as_deref(),
+                Some(effort)
+            );
+        }
+        assert!(optional_effort(&json!({"effort": "../escape"})).is_err());
+        assert!(optional_effort(&json!({"effort": "high\nmax"})).is_err());
+        assert!(optional_effort(&json!({"effort": "x".repeat(MAX_EFFORT_BYTES + 1)})).is_err());
         assert!(validate_text_argument("line\nfeed", "model", MAX_MODEL_BYTES).is_err());
+    }
+
+    #[test]
+    fn opencode_rejects_codex_reasoning_effort_before_executable_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path());
+        let mut value = args("opencode", "read_only");
+        value["effort"] = Value::String("max".to_owned());
+        let error = prepare_with_resolver(&value, &session, |_agent, _environment, _session| {
+            panic!("OpenCode effort must fail before executable resolution")
+        })
+        .err()
+        .expect("OpenCode effort unexpectedly succeeded");
+        assert!(
+            error
+                .to_string()
+                .contains("effort is supported only for the codex local agent")
+        );
     }
 
     #[test]
@@ -2046,6 +2105,7 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::ReadOnly,
+            None,
             None,
             None,
             &[],
@@ -2142,6 +2202,7 @@ mod tests {
             "/workspace",
             Access::ReadOnly,
             Some("gpt-test"),
+            Some("max"),
             Some("luna-max"),
             &[],
         )
@@ -2150,6 +2211,11 @@ mod tests {
         assert!(read_only.contains(&"--ignore-user-config".to_owned()));
         assert!(read_only.contains(&"--strict-config".to_owned()));
         assert!(read_only.contains(&"--ephemeral".to_owned()));
+        assert!(
+            read_only
+                .iter()
+                .any(|value| value == "model_reasoning_effort=\"max\"")
+        );
         assert!(!read_only.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
         assert!(
             read_only
@@ -2172,6 +2238,7 @@ mod tests {
             Access::ReadOnly,
             None,
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -2179,6 +2246,7 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::WorkspaceWrite,
+            None,
             None,
             None,
             &[],
@@ -2293,6 +2361,7 @@ mod tests {
             "/usr/bin/codex",
             "/workspace",
             Access::WorkspaceWrite,
+            None,
             None,
             None,
             std::slice::from_ref(&auth_path),

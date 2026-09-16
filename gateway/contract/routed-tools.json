@@ -445,6 +445,11 @@
           "cwd": {
             "type": "string"
           },
+          "effort": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
           "host_id": {
             "type": "string"
           },

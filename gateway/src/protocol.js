@@ -159,6 +159,7 @@ function localAgentSchema() {
       cwd: { type: "string" },
       access: { type: "string", enum: ["read_only", "workspace_write"] },
       model: { type: "string", minLength: 1, maxLength: 256 },
+      effort: { type: "string", minLength: 1, maxLength: 128 },
       profile: { type: "string", minLength: 1, maxLength: 128 },
     },
     ["session_id", "agent", "task", "access"],
