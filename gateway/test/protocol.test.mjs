@@ -114,13 +114,18 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 48);
+  assert.equal(names.length, 49);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(names.includes(required), true, required);
   }
   for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "local_agent_run", "dev_tool_run"]) {
     assert.equal(names.includes(required), true, required);
   }
+  const gitPushTag = PUBLIC_TOOLS.find((tool) => tool.name === "git_push_tag");
+  assert.ok(gitPushTag);
+  assert.deepEqual(gitPushTag.inputSchema.required, ["session_id", "tag", "source_sha"]);
+  assert.equal(gitPushTag.inputSchema.properties.remote.default, "origin");
+  assert.equal(gitPushTag.inputSchema.additionalProperties, false);
   assert.deepEqual(
     PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties,
     {
@@ -1667,7 +1672,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 48);
+  assert.equal(rpc.result.tools.length, 49);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

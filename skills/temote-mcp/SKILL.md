@@ -79,9 +79,9 @@ Use ordinary `execute` for read-only Git inspection. Use Temote MCP's dedicated 
 1. `git_add` with explicit paths.
 2. `git_commit` with the intended commit message.
 3. `git_fetch` or `git_pull` when remote updates are required.
-4. `git_push` after local validation when the user requested pushing.
+4. `git_push` after local validation when the user requested pushing a branch. Use `git_push_tag` only for an explicitly requested tag/release trigger, with the exact source commit SHA and an expected old SHA for updates.
 
-`git_pull` is fast-forward-only. `git_push` does not expose force push or arbitrary URL/refspec input. Do not bypass these restrictions with a shell command. In `ask` these Git tools require local approval; in the default `agent` mode the validated structured operation runs without the local approval console; `yolo` keeps its existing local behavior.
+`git_pull` is fast-forward-only. `git_push` does not expose force push or arbitrary URL/refspec input. `git_push_tag` is limited to `refs/tags/<tag>` and uses exact `--force-with-lease` expectations: omission means the tag must not exist; an update requires the caller's exact expected remote SHA. Do not bypass these restrictions with a shell command. In `ask` these Git tools require local approval; in the default `agent` mode the validated structured operation runs without the local approval console; `yolo` keeps its existing local behavior.
 
 Before committing, inspect the diff/status and run the task-relevant checks. After pushing, verify the branch is synchronized when practical.
 
@@ -95,7 +95,7 @@ Never infer that yolo mode disables authorization outside Temote MCP.
 
 ## Network behavior
 
-Normal `execute` commands have no network access. Prefer dedicated network-aware tools such as `git_fetch`, `git_pull`, and `git_push` for supported operations.
+Normal `execute` commands have no network access. Prefer dedicated network-aware tools such as `git_fetch`, `git_pull`, `git_push`, and `git_push_tag` for supported operations.
 
 `without_sandbox` may exist only on local stdio and requires host approval in `ask`/`agent` mode; it is not available on the public HTTP endpoint. Do not depend on it being present.
 

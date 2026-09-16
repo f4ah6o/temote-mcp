@@ -187,6 +187,7 @@ authoritative learningはrepo-managed Markdownです。`recall({session_id, quer
 - `git_fetch`: 設定済み remote を fetch
 - `git_pull`: fast-forward-only
 - `git_push`: current branch を push。force や任意 URL/refspec は受け付けない
+- `git_push_tag`: exact local commit SHA を configured remote の `refs/tags/<tag>` へ push する。`expected_remote_sha` 省略時は create-only、指定時は remote tag がその exact old SHA の場合だけ更新する。lightweight remote tag ref に限定し、任意 refspec / URL / annotated tag 作成 / unconditional force は受け付けない
 
 remote Git 操作は host operation なので、通常 session ではローカル承認が必要です。
 

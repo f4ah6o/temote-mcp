@@ -79,7 +79,7 @@ The legacy inline `/permission ...` terminal command UI is not the owner of deta
 An explicit session permission mode controls the Temote-local approval layer:
 
 - `ask` keeps the strictest policy: sandbox and path containment stay in force, and host/network-sensitive structured operations require the local approval console.
-- `agent` is the default for newly created sessions, including authenticated public `session_start`. It keeps the same sandbox, path containment, network restriction for ordinary commands, and tool-specific validation, but does not require the local approval console for otherwise-valid structured operations: Git fetch/pull/push, `local_agent_run`, `dev_tool_run`, checkpoints, patches, and the structured 1Password/kintone integrations.
+- `agent` is the default for newly created sessions, including authenticated public `session_start`. It keeps the same sandbox, path containment, network restriction for ordinary commands, and tool-specific validation, but does not require the local approval console for otherwise-valid structured operations: Git fetch/pull/branch-push/tag-push, `local_agent_run`, `dev_tool_run`, checkpoints, patches, and the structured 1Password/kintone integrations.
 - `yolo` remains the local-only unrestricted mode and cannot be created or promoted through public HTTP.
 
 `agent` is not a weaker spelling of `yolo`: ordinary `execute`/`start_command` remain sandboxed with network disabled, public `without_sandbox` remains unavailable, force-push and arbitrary Git URLs/refspecs remain rejected, and integrations keep their own authentication and capability boundaries.
@@ -177,6 +177,7 @@ Ordinary sandboxed commands keep Git metadata read-only. Use the dedicated tools
 - `git_fetch` fetches a configured remote.
 - `git_pull` is fast-forward-only.
 - `git_push` pushes the current branch and exposes no force option or arbitrary remote URL/refspec.
+- `git_push_tag` pushes one exact local commit SHA to `refs/tags/<tag>` on a configured remote. Without `expected_remote_sha` it is create-only; with an expected SHA it updates only if the remote tag still equals that exact old SHA. It creates lightweight remote tag refs only and exposes no arbitrary refspec, URL, annotated-tag creation, or unconditional force.
 
 Remote Git operations are host operations. In `ask` mode they require local approval; in `agent` mode the validated structured operation runs without the local approval console, and in `yolo` mode the existing local behavior is unchanged. The safe-remote, fast-forward-only, current-branch, and no-force rules are identical in every mode.
 

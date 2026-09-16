@@ -40,6 +40,7 @@ const MAX_COMMAND_ARGUMENTS: usize = 256;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_GIT_TAG_NAME_BYTES: usize = 255;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MCP_RESPONSE_BYTES: usize = 52 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -167,6 +168,7 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
     activity_tool("git_fetch", ActivityOperation::GitFetch, "Git network"),
     activity_tool("git_pull", ActivityOperation::GitPull, "Git network"),
     activity_tool("git_push", ActivityOperation::GitPush, "Git network"),
+    activity_tool("git_push_tag", ActivityOperation::GitPush, "Git network"),
     activity_job_tool(
         "execute",
         ActivityOperation::Execute,
@@ -842,7 +844,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB. With optional start_line/end_line or offset_bytes plus max_bytes, return bounded range metadata with an unambiguous UTF-8 next offset. Omitting range arguments preserves whole-file behavior.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"offset_bytes":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":4,"maximum":8388608}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"evidence_read","title":"Read scoped Temote evidence","description":"Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"evidence_id":{"type":"string","format":"uuid"},"offset_bytes":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384}},"required":["session_id","evidence_id"],"additionalProperties":false}},
-        {"name":"codex_status","title":"Check Codex app-server compatibility","description":"Check the locally installed Codex app-server through stdio, fail closed unless the supported protocol version is present, and return only model/effort compatibility metadata.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"codex_status","title":"Check Codex app-server compatibility","description":"Check the locally installed Codex app-server through stdio, validate the concrete protocol response shapes Temote consumes, and return bounded model/effort plus best-effort version diagnostics without a release-number allowlist.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
         {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
@@ -857,6 +859,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_push_tag","title":"Push an exact Git tag ref","description":"Push one exact commit SHA to refs/tags/<tag> on a configured remote using force-with-lease safety. Omitting expected_remote_sha is create-only; supplying it permits an update only when the remote tag still equals that exact SHA. Arbitrary refspecs, URLs, and unconditional force are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"tag":{"type":"string","minLength":1,"maxLength":255},"source_sha":{"type":"string","minLength":40,"maxLength":64},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","tag","source_sha"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Optional output_limit_bytes or status_only becomes the default completed-result view for later polls.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -1147,7 +1150,8 @@ async fn call_tool_with_local_agent_executable(
                 }
                 text_result(serde_json::to_string_pretty(&outcome)?)
             }
-            name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push") => {
+            name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push"
+            | "git_push_tag") => {
                 let operation =
                     git_activity_operation(name).expect("matched Git activity operation");
                 match operation {
@@ -1160,6 +1164,9 @@ async fn call_tool_with_local_agent_executable(
                     }
                     ActivityOperation::GitPull => {
                         git_pull(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitPush if name == "git_push_tag" => {
+                        git_push_tag(&args, &session, activity.as_ref()).await
                     }
                     ActivityOperation::GitPush => {
                         git_push(&args, &session, activity.as_ref()).await
@@ -2306,6 +2313,7 @@ fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
         "git_fetch" => Some(ActivityOperation::GitFetch),
         "git_pull" => Some(ActivityOperation::GitPull),
         "git_push" => Some(ActivityOperation::GitPush),
+        "git_push_tag" => Some(ActivityOperation::GitPush),
         _ => None,
     }
 }
@@ -2440,6 +2448,136 @@ async fn git_push(
     run_approved_git_command(session, cwd, command, "git_push", activity).await
 }
 
+async fn git_push_tag(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    ensure_configured_git_remote(session, &cwd, &remote).await?;
+
+    let tag = args
+        .get("tag")
+        .and_then(Value::as_str)
+        .context("missing or non-string tag")?;
+    validate_git_tag_name(tag)?;
+    ensure_git_tag_ref_valid(session, &cwd, tag).await?;
+
+    let source_sha = args
+        .get("source_sha")
+        .and_then(Value::as_str)
+        .context("missing or non-string source_sha")?;
+    validate_git_object_id(source_sha, "source_sha")?;
+    let source_sha = resolve_exact_git_commit(session, &cwd, source_sha).await?;
+
+    let expected_remote_sha = args
+        .get("expected_remote_sha")
+        .map(|value| {
+            let value = value
+                .as_str()
+                .context("expected_remote_sha must be a string")?;
+            validate_git_object_id(value, "expected_remote_sha")?;
+            Ok::<String, anyhow::Error>(value.to_ascii_lowercase())
+        })
+        .transpose()?;
+
+    let command =
+        build_git_push_tag_command(&remote, tag, &source_sha, expected_remote_sha.as_deref());
+    run_approved_git_command(session, cwd, command, "git_push_tag", activity).await
+}
+
+fn validate_git_tag_name(tag: &str) -> Result<()> {
+    anyhow::ensure!(!tag.is_empty(), "tag must not be empty");
+    anyhow::ensure!(
+        tag.len() <= MAX_GIT_TAG_NAME_BYTES,
+        "tag must be at most {MAX_GIT_TAG_NAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !tag.starts_with('-') && !tag.starts_with("refs/"),
+        "tag must be an unqualified Git tag name"
+    );
+    anyhow::ensure!(
+        !tag.chars().any(char::is_control),
+        "tag must not contain control characters"
+    );
+    Ok(())
+}
+
+fn validate_git_object_id(value: &str, field: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{field} must be an exact 40- or 64-hex Git object ID"
+    );
+    Ok(())
+}
+
+async fn ensure_git_tag_ref_valid(session: &config::Session, cwd: &Path, tag: &str) -> Result<()> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "check-ref-format".to_owned(),
+            format!("refs/tags/{tag}"),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "invalid Git tag name");
+    Ok(())
+}
+
+async fn resolve_exact_git_commit(
+    session: &config::Session,
+    cwd: &Path,
+    source_sha: &str,
+) -> Result<String> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "--end-of-options".to_owned(),
+            format!("{source_sha}^{{commit}}"),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "source_sha does not resolve to a local Git commit"
+    );
+    let resolved = output.stdout.trim();
+    validate_git_object_id(resolved, "resolved source_sha")?;
+    anyhow::ensure!(
+        resolved.eq_ignore_ascii_case(source_sha),
+        "source_sha must name the complete commit object ID"
+    );
+    Ok(resolved.to_ascii_lowercase())
+}
+
+fn build_git_push_tag_command(
+    remote: &str,
+    tag: &str,
+    source_sha: &str,
+    expected_remote_sha: Option<&str>,
+) -> Vec<String> {
+    let tag_ref = format!("refs/tags/{tag}");
+    let expected = expected_remote_sha.unwrap_or_default();
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "push.recurseSubmodules=off".to_owned(),
+        "push".to_owned(),
+        format!("--force-with-lease={tag_ref}:{expected}"),
+        remote.to_owned(),
+        format!("{source_sha}:{tag_ref}"),
+    ]
+}
+
 fn optional_git_remote(args: &Value) -> Result<Option<String>> {
     let Some(value) = args.get("remote") else {
         return Ok(None);
@@ -2454,16 +2592,15 @@ async fn ensure_configured_git_remote(
     cwd: &Path,
     remote: &str,
 ) -> Result<()> {
-    let output = sandbox::run(
+    let output = run_host_git_inspection(
+        session,
+        cwd,
         &[
             "git".to_owned(),
             "remote".to_owned(),
             "get-url".to_owned(),
             remote.to_owned(),
         ],
-        cwd,
-        &session.permitted_directories,
-        None,
     )
     .await?;
     anyhow::ensure!(
@@ -2472,6 +2609,24 @@ async fn ensure_configured_git_remote(
         output.stderr.trim()
     );
     Ok(())
+}
+
+async fn run_host_git_inspection(
+    session: &config::Session,
+    cwd: &Path,
+    command: &[String],
+) -> Result<sandbox::Output> {
+    let repository_root = sandbox::git_worktree_root(cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    sandbox::run_unrestricted_with_env(
+        command,
+        &repository_root,
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await
 }
 
 fn validate_git_remote(remote: &str) -> Result<()> {
@@ -6103,7 +6258,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 46);
+        assert_eq!(tools.len(), 47);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -6124,6 +6279,7 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_fetch"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_pull"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_push_tag"));
         for name in [
             "codex_status",
             "codex_task_start",
@@ -7428,6 +7584,90 @@ mod tests {
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
+    fn git_fixture_stdout(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn git_push_tag_validation_and_command_are_exact_and_lease_bound() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        validate_git_object_id(sha1, "source_sha").unwrap();
+        validate_git_object_id(sha256, "source_sha").unwrap();
+        for invalid in [
+            "",
+            "abc",
+            "g123456789012345678901234567890123456789",
+            &"a".repeat(41),
+        ] {
+            assert!(validate_git_object_id(invalid, "source_sha").is_err());
+        }
+        for valid in ["latest", "release/2026.09", "v1.2.3"] {
+            validate_git_tag_name(valid).unwrap();
+        }
+        for invalid in ["", "-latest", "refs/tags/latest", "bad\ntag"] {
+            assert!(validate_git_tag_name(invalid).is_err());
+        }
+
+        let create = build_git_push_tag_command("origin", "latest", sha1, None);
+        assert_eq!(
+            create,
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "push.recurseSubmodules=off",
+                "push",
+                "--force-with-lease=refs/tags/latest:",
+                "origin",
+                "0123456789abcdef0123456789abcdef01234567:refs/tags/latest",
+            ]
+        );
+        assert!(!create.iter().any(|argument| argument == "--force"));
+
+        let update = build_git_push_tag_command("upstream", "latest", sha256, Some(sha1));
+        assert_eq!(
+            update[6],
+            format!("--force-with-lease=refs/tags/latest:{sha1}")
+        );
+        assert_eq!(update[7], "upstream");
+        assert_eq!(update[8], format!("{sha256}:refs/tags/latest"));
+    }
+
+    #[test]
+    fn generated_git_push_tag_commands_never_escape_tag_namespace() -> noprop::TestResult {
+        test_support::run(0x5441_4750_5553_484c, 1024, |ctx| {
+            let tag = format!("release-{:016x}", noprop::sample_u64(ctx));
+            let source = format!("{:040x}", noprop::sample_u64(ctx));
+            let expected = format!("{:040x}", noprop::sample_u64(ctx));
+            validate_git_tag_name(&tag).unwrap();
+            validate_git_object_id(&source, "source_sha").unwrap();
+            validate_git_object_id(&expected, "expected_remote_sha").unwrap();
+            let command = build_git_push_tag_command("origin", &tag, &source, Some(&expected));
+            let tag_ref = format!("refs/tags/{tag}");
+            assert_eq!(
+                command[6],
+                format!("--force-with-lease={tag_ref}:{expected}")
+            );
+            assert_eq!(command[7], "origin");
+            assert_eq!(command[8], format!("{source}:{tag_ref}"));
+            assert!(!command.iter().any(|argument| argument == "--force"));
+            Ok(())
+        })
+    }
+
     fn activity_git_pull_fixture() -> (
         tempfile::TempDir,
         tempfile::TempDir,
@@ -7469,6 +7709,132 @@ mod tests {
         run_git_fixture(seed.path(), &["commit", "--quiet", "-m", "update"]);
         run_git_fixture(seed.path(), &["push", "--quiet"]);
         (remote, seed, checkout_root, checkout)
+    }
+
+    #[tokio::test]
+    async fn git_push_tag_is_create_only_by_default_and_updates_with_exact_lease() {
+        let (remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        run_git_fixture(&checkout, &["fetch", "--quiet", "origin"]);
+        let source_one = git_fixture_stdout(&checkout, &["rev-parse", "HEAD"]);
+        let source_two = git_fixture_stdout(&checkout, &["rev-parse", "origin/main"]);
+        assert_ne!(source_one, source_two);
+
+        let cwd = config::canonical_directory(&checkout).unwrap();
+        let session = config::Session {
+            id: format!("tag-push-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let base_args = json!({
+            "session_id": session.id,
+            "cwd": cwd,
+            "remote": "origin",
+            "tag": "latest",
+        });
+
+        let mut create = base_args.clone();
+        create["source_sha"] = json!(source_one);
+        git_push_tag(&create, &session, None).await.unwrap();
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/tags/latest"]),
+            source_one
+        );
+        assert!(git_fixture_stdout(&checkout, &["tag", "--list", "latest"]).is_empty());
+
+        let mut create_again = base_args.clone();
+        create_again["source_sha"] = json!(source_two);
+        assert!(git_push_tag(&create_again, &session, None).await.is_err());
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/tags/latest"]),
+            source_one
+        );
+
+        let mut stale_update = base_args.clone();
+        stale_update["source_sha"] = json!(source_two);
+        stale_update["expected_remote_sha"] = json!(source_two);
+        assert!(git_push_tag(&stale_update, &session, None).await.is_err());
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/tags/latest"]),
+            source_one
+        );
+
+        let mut exact_update = base_args;
+        exact_update["source_sha"] = json!(source_two);
+        exact_update["expected_remote_sha"] = json!(source_one);
+        git_push_tag(&exact_update, &session, None).await.unwrap();
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/tags/latest"]),
+            source_two
+        );
+    }
+
+    #[tokio::test]
+    async fn git_push_branch_behavior_remains_non_force_and_host_side() {
+        let remote = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        run_git_fixture(remote.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(repository.path(), &["init", "--quiet"]);
+        run_git_fixture(repository.path(), &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            repository.path(),
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(repository.path().join("tracked.txt"), "one\n").unwrap();
+        run_git_fixture(repository.path(), &["add", "tracked.txt"]);
+        run_git_fixture(repository.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(repository.path(), &["branch", "-M", "main"]);
+        run_git_fixture(
+            repository.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+
+        let cwd = config::canonical_directory(repository.path()).unwrap();
+        let session = config::Session {
+            id: format!("branch-push-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        git_push(
+            &json!({
+                "session_id": session.id,
+                "cwd": cwd,
+                "remote": "origin",
+                "set_upstream": true,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/main"]),
+            git_fixture_stdout(repository.path(), &["rev-parse", "HEAD"])
+        );
+
+        std::fs::write(repository.path().join("tracked.txt"), "two\n").unwrap();
+        run_git_fixture(repository.path(), &["add", "tracked.txt"]);
+        run_git_fixture(repository.path(), &["commit", "--quiet", "-m", "update"]);
+        git_push(
+            &json!({
+                "session_id": session.id,
+                "cwd": session.cwd,
+                "remote": "origin",
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/main"]),
+            git_fixture_stdout(repository.path(), &["rev-parse", "HEAD"])
+        );
     }
 
     fn recorded_scope(
@@ -7532,6 +7898,7 @@ mod tests {
             ("git_fetch", ActivityOperation::GitFetch),
             ("git_pull", ActivityOperation::GitPull),
             ("git_push", ActivityOperation::GitPush),
+            ("git_push_tag", ActivityOperation::GitPush),
         ] {
             assert_eq!(git_activity_operation(name), Some(expected));
         }

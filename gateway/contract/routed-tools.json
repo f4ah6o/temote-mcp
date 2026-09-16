@@ -815,6 +815,54 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "expected_remote_sha": {
+            "maxLength": 64,
+            "minLength": 40,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "source_sha": {
+            "maxLength": 64,
+            "minLength": 40,
+            "type": "string"
+          },
+          "tag": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "tag",
+          "source_sha"
+        ],
+        "type": "object"
+      },
+      "name": "git_push_tag"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
           "command": {
             "items": {
               "type": "string"

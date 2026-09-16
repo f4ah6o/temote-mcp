@@ -435,6 +435,23 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "git_push_tag",
+    "Push an exact Git tag ref",
+    "Push one exact commit to a tag ref with create-only or exact-old-SHA lease protection.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+        tag: { type: "string", minLength: 1, maxLength: 255 },
+        source_sha: { type: "string", minLength: 40, maxLength: 64 },
+        expected_remote_sha: { type: "string", minLength: 40, maxLength: 64 },
+      },
+      ["session_id", "tag", "source_sha"],
+    ),
+  ),
+  tool(
     "execute",
     "Run a sandboxed command",
     "Execute argv in the selected host's network-disabled sandbox.",
