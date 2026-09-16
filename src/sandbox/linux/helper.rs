@@ -368,6 +368,20 @@ fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
+const LOCAL_AGENT_BLOCKING_STREAM_SOCKETPAIR_TYPE: u64 =
+    (libc::SOCK_STREAM | libc::SOCK_CLOEXEC) as u64;
+const LOCAL_AGENT_NONBLOCKING_STREAM_SOCKETPAIR_TYPE: u64 =
+    (libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u64;
+
+#[cfg(test)]
+fn local_agent_stream_socketpair_type_allowed(socket_type: u64) -> bool {
+    matches!(
+        socket_type,
+        LOCAL_AGENT_BLOCKING_STREAM_SOCKETPAIR_TYPE
+            | LOCAL_AGENT_NONBLOCKING_STREAM_SOCKETPAIR_TYPE
+    )
+}
+
 fn exec_absolute(program: &Path, args: &[String]) -> ! {
     let program = match CString::new(program.as_os_str().as_bytes()) {
         Ok(program) => program,
@@ -440,10 +454,11 @@ fn build_seccomp_filter(network: LinuxNetworkPolicy) -> Result<BpfProgram> {
     } else {
         // The network-enabled local-agent profile has no inherited IPC file
         // descriptors and must not create path-based Unix sockets, which could
-        // reach host control sockets. Rust runtimes do use an unnamed AF_UNIX
-        // socketpair for in-process signal handling. Keep socket(AF_UNIX)
-        // denied, and allow only the exact Tokio-compatible socketpair form:
-        // AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, protocol 0.
+        // reach host control sockets. Runtimes use connected unnamed AF_UNIX
+        // socketpairs for signal handling and child-process stdio. libuv may
+        // request either a blocking CLOEXEC stream pair and set O_NONBLOCK
+        // later, or request NONBLOCK atomically. Keep socket(AF_UNIX) denied and
+        // allow only those two connected stream-pair forms with protocol 0.
         let unix_rule = SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
@@ -451,20 +466,26 @@ fn build_seccomp_filter(network: LinuxNetworkPolicy) -> Result<BpfProgram> {
             libc::AF_UNIX as u64,
         )?])?;
         rules.insert(libc::SYS_socket, vec![unix_rule.clone()]);
-        let allowed_stream_type =
-            (libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u64;
         let invalid_domain_rule = SeccompRule::new(vec![SeccompCondition::new(
             0,
             SeccompCmpArgLen::Dword,
             SeccompCmpOp::Ne,
             libc::AF_UNIX as u64,
         )?])?;
-        let invalid_type_rule = SeccompRule::new(vec![SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Ne,
-            allowed_stream_type,
-        )?])?;
+        let invalid_type_rule = SeccompRule::new(vec![
+            SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                LOCAL_AGENT_BLOCKING_STREAM_SOCKETPAIR_TYPE,
+            )?,
+            SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                LOCAL_AGENT_NONBLOCKING_STREAM_SOCKETPAIR_TYPE,
+            )?,
+        ])?;
         let invalid_protocol_rule = SeccompRule::new(vec![SeccompCondition::new(
             2,
             SeccompCmpArgLen::Dword,
@@ -548,6 +569,47 @@ fn fail(error: impl Display) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_local_agent_socketpair_type_allowlist_matches_reference() -> noprop::TestResult {
+        crate::test_support::run(0x534f_434b_5041_4952, 1024, |ctx| {
+            let socket_type = noprop::sample_u32(ctx) as u64;
+            let expected = socket_type == LOCAL_AGENT_BLOCKING_STREAM_SOCKETPAIR_TYPE
+                || socket_type == LOCAL_AGENT_NONBLOCKING_STREAM_SOCKETPAIR_TYPE;
+            assert_eq!(
+                local_agent_stream_socketpair_type_allowed(socket_type),
+                expected,
+                "unexpected allowlist decision for socket type {socket_type:#x}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn local_agent_socketpair_type_allowlist_is_exact() {
+        assert!(local_agent_stream_socketpair_type_allowed(
+            LOCAL_AGENT_BLOCKING_STREAM_SOCKETPAIR_TYPE
+        ));
+        assert!(local_agent_stream_socketpair_type_allowed(
+            LOCAL_AGENT_NONBLOCKING_STREAM_SOCKETPAIR_TYPE
+        ));
+        assert!(!local_agent_stream_socketpair_type_allowed(
+            libc::SOCK_STREAM as u64
+        ));
+        assert!(!local_agent_stream_socketpair_type_allowed(
+            (libc::SOCK_DGRAM | libc::SOCK_CLOEXEC) as u64
+        ));
+        assert!(!local_agent_stream_socketpair_type_allowed(
+            (libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK | libc::SOCK_DGRAM)
+                as u64
+        ));
+    }
+
+    #[test]
+    fn local_agent_seccomp_filter_compiles_with_runtime_socketpair_allowlist() {
+        let program = build_seccomp_filter(LinuxNetworkPolicy::LocalAgent).unwrap();
+        assert!(!program.is_empty());
+    }
 
     #[test]
     fn malformed_policy_and_helper_misuse_fail_closed() {

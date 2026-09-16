@@ -1973,16 +1973,9 @@ mod linux_tests {
         Ok(fd)
     }
 
-    fn allowed_stream_socketpair() -> Result<(OwnedFd, OwnedFd)> {
+    fn allowed_stream_socketpair(socket_type: i32) -> Result<(OwnedFd, OwnedFd)> {
         let mut fds = [-1; 2];
-        let result = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                0,
-                fds.as_mut_ptr(),
-            )
-        };
+        let result = unsafe { libc::socketpair(libc::AF_UNIX, socket_type, 0, fds.as_mut_ptr()) };
         anyhow::ensure!(
             result == 0,
             "required stream socketpair was denied: {}",
@@ -2031,7 +2024,9 @@ mod linux_tests {
         length: libc::socklen_t,
         label: &str,
     ) -> Result<()> {
-        let (first, _second) = allowed_stream_socketpair()?;
+        let (first, _second) = allowed_stream_socketpair(
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        )?;
         // SAFETY: `address` is initialized by `unix_socket_address` and lives
         // through this syscall; `first` is a valid connected stream socket.
         let result = unsafe {
@@ -2578,7 +2573,9 @@ done
             let abstract_name =
                 std::env::var(ABSTRACT_SOCKET).context("abstract Unix socket name is missing")?;
 
-            let (_first, _second) = allowed_stream_socketpair()?;
+            let (_blocking_first, _blocking_second) =
+                allowed_stream_socketpair(libc::SOCK_STREAM | libc::SOCK_CLOEXEC)?;
+            let (_nonblocking_first, _nonblocking_second) = allowed_stream_socketpair(STREAM_TYPE)?;
             assert_socket_denied(STREAM_TYPE)?;
             assert_socket_denied(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)?;
             assert_socketpair_denied(
@@ -2586,7 +2583,7 @@ done
                 libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
                 0,
             )?;
-            assert_socketpair_denied(libc::AF_UNIX, STREAM_TYPE & !libc::SOCK_NONBLOCK, 0)?;
+            assert_socketpair_denied(libc::AF_UNIX, libc::SOCK_STREAM, 0)?;
             assert_socketpair_denied(libc::AF_UNIX, STREAM_TYPE, 1)?;
             assert_socketpair_denied(libc::AF_INET, STREAM_TYPE, 0)?;
 
