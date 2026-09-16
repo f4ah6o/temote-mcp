@@ -725,6 +725,10 @@ fn discover_result() -> Value {
         server_info(),
     );
     meta.insert(PROCESS_IDENTITY_META_KEY.to_owned(), process_identity());
+    meta.insert(
+        "dev.temote/contractFingerprint".to_owned(),
+        json!(public_contract_fingerprint()),
+    );
     json!({
         "resultType": "complete",
         "supportedVersions": [MODERN_PROTOCOL_VERSION],
@@ -759,6 +763,134 @@ fn modernize_result(method: &str, mut result: Value) -> Value {
         object.insert("cacheScope".to_owned(), json!("private"));
     }
     result
+}
+
+/// Public contract advertised to repository-controlled MCP surfaces.
+///
+/// The contract covers the public tool names with their exact input schemas
+/// and annotations plus the routed protocol versions. Model-facing prose
+/// (`title`, `description`) is stripped so parity checks compare behavior
+/// rather than wording. This is the same value checked in as
+/// `gateway/contract/routed-tools.json`.
+fn strip_gateway_contract_prose(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("title");
+            object.remove("description");
+            for child in object.values_mut() {
+                strip_gateway_contract_prose(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_gateway_contract_prose(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn routed_gateway_contract() -> Value {
+    let mut routed_tools = tools(true, true).as_array().unwrap().to_owned();
+    let host_property = json!({"type": "string"});
+    for tool in &mut routed_tools {
+        let name = tool["name"].as_str().unwrap_or_default().to_owned();
+        if name == "session_list" {
+            tool["inputSchema"] = json!({
+                "type": "object",
+                "properties": {"host_id": host_property.clone()},
+                "additionalProperties": false
+            });
+            continue;
+        }
+        if let Some(properties) = tool
+            .pointer_mut("/inputSchema/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.insert("host_id".to_owned(), host_property.clone());
+        }
+        if name == "session_start" {
+            tool["inputSchema"]["required"] = json!(["host_id", "path"]);
+        }
+    }
+    routed_tools.insert(0, json!({
+        "name": "host_info",
+        "title": "Inspect a federated Temote host",
+        "description": "Show one currently leased federated host.",
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"host_id": host_property.clone()},
+            "required": ["host_id"],
+            "additionalProperties": false
+        }
+    }));
+    routed_tools.insert(0, json!({
+        "name": "host_list",
+        "title": "List federated Temote hosts",
+        "description": "List currently leased federated hosts.",
+        "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    }));
+    let mut routed_tools = Value::Array(routed_tools);
+    strip_gateway_contract_prose(&mut routed_tools);
+    json!({
+        "latestLegacyProtocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+        "supportedLegacyProtocolVersions": SUPPORTED_LEGACY_PROTOCOL_VERSIONS,
+        "modernProtocolVersion": MODERN_PROTOCOL_VERSION,
+        "tools": routed_tools,
+    })
+}
+
+/// Deterministic JSON with recursively sorted object keys.
+///
+/// `serde_json` maps are only order-preserving when the `preserve_order`
+/// feature is enabled by some dependency, so sorting is explicit here. The
+/// gateway reimplements the same canonicalization; the fingerprints must match
+/// byte for byte over the canonical UTF-8 text.
+fn canonical_contract_json(value: &Value) -> String {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(left, _)| *left);
+            let rendered = entries
+                .into_iter()
+                .map(|(key, child)| {
+                    format!(
+                        "{}:{}",
+                        Value::String(key.clone()),
+                        canonical_contract_json(child)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{rendered}}}")
+        }
+        Value::Array(items) => {
+            let rendered = items
+                .iter()
+                .map(canonical_contract_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{rendered}]")
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Bounded public contract fingerprint shared by diagnostics surfaces.
+///
+/// The local server reports this from `session_info` and `server/discover`;
+/// the gateway reports it from `/healthz`. Operators compare either value
+/// against `gateway/contract/public-tools.fingerprint`, which the snapshot test
+/// keeps in sync with `gateway/contract/routed-tools.json`.
+pub(crate) fn public_contract_fingerprint() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let text = canonical_contract_json(&routed_gateway_contract());
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    })
 }
 
 fn client_checkpoint_schema() -> Value {
@@ -1091,7 +1223,9 @@ async fn call_tool_with_local_agent_executable(
         if matches!(view.status.as_str(), "starting" | "active" | "stopping") {
             approvals::activity(&view.session_id, "Read session info", None).await;
         }
-        return text_result(serde_json::to_string_pretty(&view)?);
+        let mut rendered = serde_json::to_value(&view)?;
+        rendered["server_contract_fingerprint"] = json!(public_contract_fingerprint());
+        return text_result(serde_json::to_string_pretty(&rendered)?);
     }
     let session = config::load_session(&session_id).await?;
     anyhow::ensure!(
@@ -7297,76 +7431,6 @@ mod tests {
         );
     }
 
-    fn strip_gateway_contract_prose(value: &mut Value) {
-        match value {
-            Value::Object(object) => {
-                object.remove("title");
-                object.remove("description");
-                for child in object.values_mut() {
-                    strip_gateway_contract_prose(child);
-                }
-            }
-            Value::Array(items) => {
-                for item in items {
-                    strip_gateway_contract_prose(item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn routed_gateway_contract() -> Value {
-        let mut routed_tools = tools(true, true).as_array().unwrap().to_owned();
-        let host_property = json!({"type": "string"});
-        for tool in &mut routed_tools {
-            let name = tool["name"].as_str().unwrap_or_default().to_owned();
-            if name == "session_list" {
-                tool["inputSchema"] = json!({
-                    "type": "object",
-                    "properties": {"host_id": host_property.clone()},
-                    "additionalProperties": false
-                });
-                continue;
-            }
-            if let Some(properties) = tool
-                .pointer_mut("/inputSchema/properties")
-                .and_then(Value::as_object_mut)
-            {
-                properties.insert("host_id".to_owned(), host_property.clone());
-            }
-            if name == "session_start" {
-                tool["inputSchema"]["required"] = json!(["host_id", "path"]);
-            }
-        }
-        routed_tools.insert(0, json!({
-            "name": "host_info",
-            "title": "Inspect a federated Temote host",
-            "description": "Show one currently leased federated host.",
-            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
-            "inputSchema": {
-                "type": "object",
-                "properties": {"host_id": host_property.clone()},
-                "required": ["host_id"],
-                "additionalProperties": false
-            }
-        }));
-        routed_tools.insert(0, json!({
-            "name": "host_list",
-            "title": "List federated Temote hosts",
-            "description": "List currently leased federated hosts.",
-            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        }));
-        let mut routed_tools = Value::Array(routed_tools);
-        strip_gateway_contract_prose(&mut routed_tools);
-        json!({
-            "latestLegacyProtocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
-            "supportedLegacyProtocolVersions": SUPPORTED_LEGACY_PROTOCOL_VERSIONS,
-            "modernProtocolVersion": MODERN_PROTOCOL_VERSION,
-            "tools": routed_tools,
-        })
-    }
-
     #[test]
     fn routed_gateway_contract_matches_checked_in_snapshot() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7388,6 +7452,46 @@ mod tests {
             )
         });
         assert_eq!(checked_in, rendered, "gateway contract snapshot is stale");
+    }
+
+    #[test]
+    fn public_contract_fingerprint_matches_checked_in_snapshot() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("gateway")
+            .join("contract")
+            .join("public-tools.fingerprint");
+        let rendered = format!("{}\n", public_contract_fingerprint());
+        if std::env::var_os("TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &rendered).unwrap();
+        }
+        let checked_in = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not read public contract fingerprint {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test public_contract_fingerprint_matches_checked_in_snapshot",
+                path.display()
+            )
+        });
+        assert_eq!(
+            checked_in, rendered,
+            "public contract fingerprint is stale; the connected runtime would not match the repository contract"
+        );
+    }
+
+    #[test]
+    fn diagnostics_surfaces_report_the_public_contract_fingerprint() {
+        let fingerprint = public_contract_fingerprint();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(
+            fingerprint
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
+        assert_eq!(
+            discover_result()["_meta"]["dev.temote/contractFingerprint"],
+            json!(fingerprint)
+        );
     }
 
     #[test]

@@ -88,7 +88,7 @@ npx wrangler deployments status --name temote-mcp-gateway
 curl -sSf https://<gateway-host>/healthz
 ```
 
-`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway"}`). A direct-origin response or a different service identity means the hostname still points at the wrong target. Authenticated MCP reachability through Access is tracked separately from this local check.
+`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`). A direct-origin response or a different service identity means the hostname still points at the wrong target. `contractFingerprint` is the SHA-256 digest of the public tool contract; it must equal `gateway/contract/public-tools.fingerprint` from the deployed source revision and the `server_contract_fingerprint` reported by the local/connected server's `session_info`. A mismatch means the deployed Worker carries a stale tool schema. Authenticated MCP reachability through Access is tracked separately from this local check.
 
 ### Rollback
 

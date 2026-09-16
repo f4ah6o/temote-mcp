@@ -88,7 +88,7 @@ npx wrangler deployments status --name temote-mcp-gateway
 curl -sSf https://<gateway-host>/healthz
 ```
 
-`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway"}`）。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。Access 経由の MCP 疎通は、この local check とは別に確認します。
+`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`）。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。`contractFingerprint` は public tool contract の SHA-256 digest で、deploy した source revision の `gateway/contract/public-tools.fingerprint` と、local/connected server の `session_info` が返す `server_contract_fingerprint` に一致する必要があります。不一致は deployed Worker が古い tool schema を持つことを意味します。Access 経由の MCP 疎通は、この local check とは別に確認します。
 
 ### Rollback
 

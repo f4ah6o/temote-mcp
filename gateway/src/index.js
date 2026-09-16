@@ -7,6 +7,7 @@ import {
   modernProtocolVersion,
   modernizeResult,
   negotiateProtocolVersion,
+  publicContractFingerprint,
   rpcError,
   rpcResult,
   hostIdFromRpc,
@@ -68,6 +69,7 @@ async function handleRequest(request, env) {
       service: "temote-mcp-gateway",
       readiness: "ready",
       identity: "temote-mcp-gateway",
+      contractFingerprint: await publicContractFingerprint(),
     }));
   }
   if (url.pathname === "/mcp") {

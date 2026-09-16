@@ -62,6 +62,12 @@ git diff --check
 
 Update the pinned version only in a dedicated toolchain change, and fix any new lint in that same change. The 2026.9.10 release failed at `Validate release` because release CI floated to Clippy `1.98.0` while the local gate ran an older stable that did not yet contain the new lint. `tests/toolchain_contract.rs` fails if either workflow stops consuming the repository-managed file, if the channel is not an exact `X.Y.Z` release, or if the development docs drop the contract or the motivating regression.
 
+### Connected runtime contract parity
+
+The public tool contract (tool names, exact input schemas, annotations, and routed protocol versions) is checked in as `gateway/contract/routed-tools.json`; its SHA-256 fingerprint is `gateway/contract/public-tools.fingerprint`. The local server reports the same fingerprint from `session_info` (`server_contract_fingerprint`) and `server/discover` (`_meta["dev.temote/contractFingerprint"]`), and the gateway reports it from `/healthz` (`contractFingerprint`). A release or deployment is contract-parity-safe only when the repository value and every deployed surface agree.
+
+Repository tests keep the chain honest: the Rust snapshot tests regenerate and compare both checked-in files, the gateway parity test compares `PUBLIC_TOOLS` plus its own computed fingerprint against those same files, and the `Allocate Release` workflow runs an explicit `Verify public contract parity` step before publishing. Source presence does not imply connected runtime availability: after a deploy, upgrade, or session restart, read the fingerprint from the actual connected runtime and compare it with the repository value instead of assuming a merged commit or a restarted session refreshed the connector schema. When a tool is missing from the connected surface, fix or redeploy the runtime instead of falling back to raw `execute` or yolo mode.
+
 ### Developing Temote from inside a normal Temote sandbox
 
 An already-sandboxed normal Temote session is not a production-shaped host for tests that need to create another bubblewrap/user namespace or connect to local Unix control sockets. In that environment, `/var/tmp`, bubblewrap ownership/userns checks, or Unix-socket syscalls can fail before the product assertion runs. Do not reinterpret those failures as passing security coverage, and do not weaken the outer sandbox to make the nested tests green.

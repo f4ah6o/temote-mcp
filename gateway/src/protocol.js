@@ -180,6 +180,50 @@ function tool(name, title, description, annotations, inputSchema) {
   return { name, title, description, annotations, inputSchema };
 }
 
+export function stripContractProse(value) {
+  if (Array.isArray(value)) return value.map(stripContractProse);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== "title" && key !== "description")
+      .map(([key, child]) => [key, stripContractProse(child)]),
+  );
+}
+
+function canonicalContractJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalContractJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalContractJson(value[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+let publicContractFingerprintPromise;
+
+export function publicContractFingerprint() {
+  publicContractFingerprintPromise ??= computePublicContractFingerprint();
+  return publicContractFingerprintPromise;
+}
+
+async function computePublicContractFingerprint() {
+  const contract = {
+    latestLegacyProtocolVersion: LEGACY_PROTOCOL_VERSION,
+    supportedLegacyProtocolVersions: [...SUPPORTED_LEGACY_PROTOCOL_VERSIONS],
+    modernProtocolVersion: MODERN_PROTOCOL_VERSION,
+    tools: stripContractProse(PUBLIC_TOOLS),
+  };
+  const bytes = new TextEncoder().encode(canonicalContractJson(contract));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export const PUBLIC_TOOLS = [
   tool(
     "host_list",

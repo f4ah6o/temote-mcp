@@ -11,7 +11,9 @@ import {
   gatewayVersion,
   hostIdFromRpc,
   negotiateProtocolVersion,
+  publicContractFingerprint,
   sessionIdFromRpc,
+  stripContractProse,
   validateHostId,
   validateSessionId,
 } from "../src/protocol.js";
@@ -20,6 +22,11 @@ const ROUTED_CONTRACT = JSON.parse(fs.readFileSync(
   new URL("../contract/routed-tools.json", import.meta.url),
   "utf8",
 ));
+
+const CONTRACT_FINGERPRINT = fs.readFileSync(
+  new URL("../contract/public-tools.fingerprint", import.meta.url),
+  "utf8",
+).trim();
 
 class MemoryStorage {
   constructor() {
@@ -85,16 +92,6 @@ async function waitFor(predicate, message) {
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.fail(message);
-}
-
-function stripContractProse(value) {
-  if (Array.isArray(value)) return value.map(stripContractProse);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([key]) => key !== "title" && key !== "description")
-      .map(([key, child]) => [key, stripContractProse(child)]),
-  );
 }
 
 function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
@@ -219,7 +216,14 @@ test("healthz exposes explicit gateway identity and readiness without credential
     service: "temote-mcp-gateway",
     readiness: "ready",
     identity: "temote-mcp-gateway",
+    contractFingerprint: CONTRACT_FINGERPRINT,
   });
+});
+
+test("gateway public contract fingerprint matches the checked-in snapshot", async () => {
+  const fingerprint = await publicContractFingerprint();
+  assert.match(fingerprint, /^[0-9a-f]{64}$/);
+  assert.equal(fingerprint, CONTRACT_FINGERPRINT);
 });
 
 test("Access email allowlist is fail-closed and case-insensitive", () => {
