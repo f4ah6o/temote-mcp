@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ const MAX_EVENT_BYTES: usize = 16 * 1024;
 const MAX_EVENTS: usize = 512;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 64;
+const MAX_SCOPE_PATH_BYTES: usize = 4096;
 const CANDIDATE_THRESHOLD: u64 = 4;
 const CANDIDATE_NAMESPACE: Uuid = Uuid::from_bytes([
     0x16, 0xba, 0x3a, 0x2a, 0xf5, 0xdf, 0x4a, 0xb5, 0xb4, 0x98, 0x21, 0x0f, 0x87, 0xd4, 0xc4, 0x63,
@@ -531,13 +533,37 @@ fn validate_event(event: &FrictionEvent) -> Result<()> {
         "unsupported friction schema version"
     );
     config::validate_session_id(&event.session_id)?;
-    let canonical = config::canonical_directory(&event.scope_cwd)?;
-    anyhow::ensure!(
-        canonical == event.scope_cwd,
-        "friction scope is not canonical"
-    );
+    validate_persisted_scope(&event.scope_cwd)?;
     validate_optional_identifier(event.operation_class.as_deref(), "operation_class")?;
     validate_optional_identifier(event.tool_name.as_deref(), "tool_name")?;
+    Ok(())
+}
+
+fn validate_persisted_scope(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    anyhow::ensure!(path.is_absolute(), "friction scope must be absolute");
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_SCOPE_PATH_BYTES,
+        "friction scope must contain 1..={MAX_SCOPE_PATH_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !bytes.contains(&0),
+        "friction scope must not contain NUL bytes"
+    );
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!("friction scope is not lexically normalized")
+            }
+        }
+    }
+    anyhow::ensure!(
+        normalized.as_os_str().as_bytes() == bytes,
+        "friction scope is not lexically normalized"
+    );
     Ok(())
 }
 
@@ -679,6 +705,184 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.read_all().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn deleted_historical_scope_does_not_break_current_summary_candidate_or_prune() {
+        let stale_root = tempfile::tempdir().unwrap();
+        let current_root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = Store::new(state.path().join("friction")).with_max_events(2);
+        let stale_session = session(stale_root.path(), "stale-scope");
+        let stale_event = store
+            .record(
+                &stale_session,
+                FrictionKind::ExecuteFailed,
+                ObservationSource::Observed,
+                Some("execute"),
+                Some("execute"),
+                EventOutcome::Failed,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut persisted_stale_event = stale_event.clone();
+        persisted_stale_event.occurred_at = 0;
+        std::fs::write(
+            store
+                .directory
+                .join(format!("{}.json", persisted_stale_event.event_id)),
+            serde_json::to_vec_pretty(&persisted_stale_event).unwrap(),
+        )
+        .unwrap();
+        let stale_scope = stale_session.cwd.clone();
+        drop(stale_root);
+        assert!(!stale_scope.exists());
+
+        let current_session = session(current_root.path(), "current-scope");
+        let summary = store.summary(&current_session).unwrap();
+        assert_eq!(summary.event_count, 0);
+        assert_eq!(summary.score, 0);
+        assert!(store.candidates(&current_session).unwrap().is_empty());
+
+        for _ in 0..2 {
+            store
+                .record(
+                    &current_session,
+                    FrictionKind::ExecuteFailed,
+                    ObservationSource::Observed,
+                    Some("execute"),
+                    Some("execute"),
+                    EventOutcome::Failed,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let retained = store.read_all().unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .all(|event| event.event_id != stale_event.event_id)
+        );
+        assert!(retained.iter().all(|event| {
+            event.session_id == current_session.id && event.scope_cwd == current_session.cwd
+        }));
+    }
+
+    #[test]
+    fn persisted_scope_validation_is_existence_independent_and_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = config::canonical_directory(root.path()).unwrap();
+        validate_persisted_scope(&canonical).unwrap();
+        drop(root);
+        assert!(!canonical.exists());
+        validate_persisted_scope(&canonical).unwrap();
+
+        for invalid in [
+            PathBuf::from("relative/scope"),
+            PathBuf::from("/tmp/../escape"),
+            PathBuf::from("/tmp/./scope"),
+            PathBuf::from("/tmp//scope"),
+        ] {
+            assert!(validate_persisted_scope(&invalid).is_err(), "{invalid:?}");
+        }
+        let oversized = PathBuf::from(format!("/{}", "x".repeat(MAX_SCOPE_PATH_BYTES)));
+        assert!(validate_persisted_scope(&oversized).is_err());
+    }
+
+    #[test]
+    fn generated_persisted_scope_validation_matches_normalized_absolute_path_model()
+    -> noprop::TestResult {
+        crate::test_support::run(0x4652_4943_5449_4f4e, 1024, |ctx| {
+            let suffix = format!("scope-{:016x}", noprop::sample_u64(ctx));
+            let canonical = PathBuf::from(format!("/tmp/{suffix}"));
+            assert!(validate_persisted_scope(&canonical).is_ok());
+
+            let invalid = match noprop::sample_usize_in(ctx, 0..=3) {
+                0 => PathBuf::from(format!("tmp/{suffix}")),
+                1 => PathBuf::from(format!("/tmp/../{suffix}")),
+                2 => PathBuf::from(format!("/tmp/./{suffix}")),
+                _ => PathBuf::from(format!("/tmp//{suffix}")),
+            };
+            assert!(validate_persisted_scope(&invalid).is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn persisted_event_integrity_checks_remain_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let session = session(root.path(), "integrity");
+
+        let public_state = tempfile::tempdir().unwrap();
+        let public_store = Store::new(public_state.path().join("friction"));
+        let public_event = public_store
+            .record(
+                &session,
+                FrictionKind::ExecuteFailed,
+                ObservationSource::Observed,
+                Some("execute"),
+                Some("execute"),
+                EventOutcome::Failed,
+                None,
+                None,
+            )
+            .unwrap();
+        let public_path = public_store
+            .directory
+            .join(format!("{}.json", public_event.event_id));
+        std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(public_store.read_all().is_err());
+
+        let mismatch_state = tempfile::tempdir().unwrap();
+        let mismatch_store = Store::new(mismatch_state.path().join("friction"));
+        let mismatch_event = mismatch_store
+            .record(
+                &session,
+                FrictionKind::ExecuteFailed,
+                ObservationSource::Observed,
+                Some("execute"),
+                Some("execute"),
+                EventOutcome::Failed,
+                None,
+                None,
+            )
+            .unwrap();
+        let mismatch_path = mismatch_store
+            .directory
+            .join(format!("{}.json", mismatch_event.event_id));
+        let mut mismatched = mismatch_event.clone();
+        mismatched.event_id = Uuid::new_v4();
+        std::fs::write(
+            &mismatch_path,
+            serde_json::to_vec_pretty(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(mismatch_store.read_all().is_err());
+
+        let symlink_state = tempfile::tempdir().unwrap();
+        let symlink_store = Store::new(symlink_state.path().join("friction"));
+        let symlink_event = symlink_store
+            .record(
+                &session,
+                FrictionKind::ExecuteFailed,
+                ObservationSource::Observed,
+                Some("execute"),
+                Some("execute"),
+                EventOutcome::Failed,
+                None,
+                None,
+            )
+            .unwrap();
+        let symlink_path = symlink_store
+            .directory
+            .join(format!("{}.json", symlink_event.event_id));
+        let target = symlink_state.path().join("target.json");
+        std::fs::rename(&symlink_path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+        assert!(symlink_store.read_all().is_err());
     }
 
     #[test]
