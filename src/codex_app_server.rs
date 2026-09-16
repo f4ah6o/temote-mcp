@@ -23,7 +23,10 @@ use uuid::Uuid;
 
 use crate::{approvals, config, evidence};
 
-const SUPPORTED_APP_SERVER_VERSION: &str = "0.153.4";
+const SUPPORTED_APP_SERVER_VERSIONS: &[&str] = &["0.147.0", "0.153.4"];
+const APP_SERVER_CLIENT_NAME: &str = "temote-mcp";
+const APP_SERVER_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_APP_SERVER_USER_AGENT_BYTES: usize = 512;
 const TASK_SCHEMA_VERSION: u64 = 1;
 const TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const MAX_TASK_RECORD_BYTES: usize = 64 * 1024;
@@ -1666,8 +1669,8 @@ async fn spawn_initialized_client_with_binary_mode(
     let initialized = async {
         let initialize_params = json!({
             "clientInfo": {
-                "name": "temote-mcp",
-                "version": env!("CARGO_PKG_VERSION")
+                "name": APP_SERVER_CLIENT_NAME,
+                "version": APP_SERVER_CLIENT_VERSION
             },
             "capabilities": {
                 "experimentalApi": true
@@ -1704,21 +1707,86 @@ fn validate_initialize_response(value: &Value) -> Result<()> {
     let object = value
         .as_object()
         .context("Codex app-server initialize result must be an object")?;
+    let _version = app_server_version_from_initialize_response(value)?;
+    let codex_home = object
+        .get("codexHome")
+        .and_then(Value::as_str)
+        .context("Codex app-server initialize result is missing codexHome")?;
+    anyhow::ensure!(
+        Path::new(codex_home).is_absolute(),
+        "Codex app-server initialize result has invalid codexHome"
+    );
+    required_initialize_string(object, "platformFamily")?;
+    required_initialize_string(object, "platformOs")?;
+    Ok(())
+}
+
+fn app_server_version_from_initialize_response(value: &Value) -> Result<&str> {
+    let object = value
+        .as_object()
+        .context("Codex app-server initialize result must be an object")?;
     let user_agent = object
         .get("userAgent")
         .and_then(Value::as_str)
         .context("Codex app-server initialize result is missing userAgent")?;
+    let version = app_server_version_from_user_agent(user_agent).with_context(|| {
+        format!("CODEX_APP_SERVER_INCOMPATIBLE: unrecognized app-server identity: {user_agent}")
+    })?;
     anyhow::ensure!(
-        user_agent.split_whitespace().next().is_some_and(|prefix| {
-            prefix == format!("codex_cli_rs/{SUPPORTED_APP_SERVER_VERSION}")
-        }),
-        "CODEX_APP_SERVER_INCOMPATIBLE: expected {SUPPORTED_APP_SERVER_VERSION}, got {user_agent}"
+        SUPPORTED_APP_SERVER_VERSIONS.contains(&version),
+        "CODEX_APP_SERVER_INCOMPATIBLE: Codex app-server {version} is not supported by this Temote build; update Temote MCP"
     );
+    Ok(version)
+}
+
+fn required_initialize_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a str> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("Codex app-server initialize result is missing {field}"))?;
     anyhow::ensure!(
-        object.get("codexHome").and_then(Value::as_str).is_some(),
-        "Codex app-server initialize result is missing codexHome"
+        !value.is_empty(),
+        "Codex app-server initialize result has invalid {field}"
     );
-    Ok(())
+    Ok(value)
+}
+
+fn app_server_version_from_user_agent(user_agent: &str) -> Option<&str> {
+    if user_agent.len() > MAX_APP_SERVER_USER_AGENT_BYTES {
+        return None;
+    }
+
+    let product_and_metadata = user_agent.strip_prefix(APP_SERVER_CLIENT_NAME)?;
+    let product_and_metadata = product_and_metadata.strip_prefix('/')?;
+    let (version, metadata) = product_and_metadata.split_once(' ')?;
+
+    let platform_and_rest = metadata.strip_prefix('(')?;
+    let (platform, origin_and_client) = platform_and_rest.split_once(") ")?;
+    let (platform_name, architecture) = platform.split_once("; ")?;
+    if !bounded_user_agent_component(platform_name, 128, true)
+        || !bounded_user_agent_component(architecture, 64, false)
+    {
+        return None;
+    }
+
+    let (origin, client) = origin_and_client.split_once(" (")?;
+    if !bounded_user_agent_component(origin, 64, false) {
+        return None;
+    }
+    let expected_client = format!("{APP_SERVER_CLIENT_NAME}; {APP_SERVER_CLIENT_VERSION})");
+    (client == expected_client).then_some(version)
+}
+
+fn bounded_user_agent_component(value: &str, max_bytes: usize, allow_space: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.chars().all(|character| {
+            (character.is_ascii_graphic() || (allow_space && character == ' '))
+                && !matches!(character, '(' | ')' | ';')
+        })
 }
 
 fn spawn_client_if_instance_live(
@@ -2364,8 +2432,8 @@ fn mark_waiting_approval(session: &config::Session, task_id: Uuid, waiting: bool
 }
 
 fn advertised_effort_name(entry: &Value) -> Option<&str> {
-    // Codex 0.153.4 `model/list` advertises `ReasoningEffortOption` objects with a
-    // `reasoningEffort` field. Accept the legacy `effort` key and a bare string so a
+    // Verified Codex app-server versions advertise `ReasoningEffortOption` objects with
+    // a `reasoningEffort` field. Accept the legacy `effort` key and a bare string so a
     // schema alias never silently empties the advertised effort set.
     entry
         .get("reasoningEffort")
@@ -2436,9 +2504,10 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
             Some(json!({"model": model, "efforts": efforts}))
         })
         .collect::<Vec<_>>();
+    let app_server_version = app_server_version_from_initialize_response(&initialized)?;
     Ok(json!({
         "compatible": true,
-        "app_server_version": SUPPORTED_APP_SERVER_VERSION,
+        "app_server_version": app_server_version,
         "platform_family": initialized.get("platformFamily"),
         "platform_os": initialized.get("platformOs"),
         "models": advertised,
@@ -3273,7 +3342,7 @@ for raw in sys.stdin:
     i = req.get('id')
     method = req.get('method')
     if method == 'initialize':
-        result = {'userAgent':'codex_cli_rs/0.153.4 (temote-mcp; test)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'macos'}
+        result = {'userAgent':'temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; __CLIENT_VERSION__)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}
     elif method == 'model/list':
         if mode == 'model-fail':
             print(json.dumps({'id':i,'error':{'code':-1,'message':'model list unavailable'}}), flush=True)
@@ -3321,6 +3390,7 @@ for raw in sys.stdin:
         continue
     print(json.dumps({'id':i,'result':result}), flush=True)
 "##;
+        let script = script.replace("__CLIENT_VERSION__", APP_SERVER_CLIENT_VERSION);
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
@@ -3354,7 +3424,7 @@ for raw in sys.stdin:
     i = req.get('id')
     method = req.get('method')
     if method == 'initialize':
-        result = {'userAgent':'codex_cli_rs/0.153.4 (temote-mcp; test)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'macos'}
+        result = {'userAgent':'temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; __CLIENT_VERSION__)','codexHome':'/tmp/codex','platformFamily':'unix','platformOs':'linux'}
     elif method == 'model/list':
         result = {'data':[{'model':'gpt-5.6-luna','id':'luna','displayName':'Luna','description':'test','hidden':False,'isDefault':True,'defaultReasoningEffort':'high','supportedReasoningEfforts':[{'reasoningEffort':'low'},{'reasoningEffort':'medium'},{'reasoningEffort':'high'},{'reasoningEffort':'max'},{'reasoningEffort':'xhigh'}]}]}
     elif method == blocked_method:
@@ -3390,7 +3460,8 @@ for raw in sys.stdin:
         .replace("__ENTERED__", &python_string(&entered))
         .replace("__RELEASE__", &python_string(&release))
         .replace("__TURN_STARTED__", &python_string(&turn_started))
-        .replace("__STEER_SENT__", &python_string(&steer_sent));
+        .replace("__STEER_SENT__", &python_string(&steer_sent))
+        .replace("__CLIENT_VERSION__", APP_SERVER_CLIENT_VERSION);
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         (path, entered, release, turn_started, steer_sent)
@@ -5540,6 +5611,130 @@ for raw in sys.stdin:
         assert_eq!(advertised_effort_name(&json!("medium")), Some("medium"));
     }
 
+    fn initialize_response(user_agent: &str) -> Value {
+        json!({
+            "userAgent": user_agent,
+            "codexHome": "/tmp/codex",
+            "platformFamily": "unix",
+            "platformOs": "linux",
+        })
+    }
+
+    #[test]
+    fn initialize_validation_accepts_verified_user_agent_shapes() {
+        for (version, user_agent) in [
+            (
+                "0.147.0",
+                format!(
+                    "temote-mcp/0.147.0 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+                ),
+            ),
+            (
+                "0.153.4",
+                format!(
+                    "temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+                ),
+            ),
+            (
+                "0.153.4",
+                format!(
+                    "temote-mcp/0.153.4 (macOS 15.6; aarch64) dumb (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+                ),
+            ),
+        ] {
+            validate_initialize_response(&initialize_response(&user_agent)).unwrap();
+            assert_eq!(
+                app_server_version_from_user_agent(&user_agent),
+                Some(version)
+            );
+        }
+    }
+
+    #[test]
+    fn initialize_validation_rejects_wrong_or_ambiguous_user_agents() {
+        let invalid = [
+            format!(
+                "temote-mcp/0.146.9 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.147.1 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.153.3 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.154.0 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "codex_cli_rs/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "other-client/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.153.4 codex_cli_rs/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION}) trailing"
+            ),
+            "temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; spoofed)".to_owned(),
+            "temote-mcp/0.153.4".to_owned(),
+            format!(
+                "temote-mcp/0.153.4 (Ubuntu 24.4.0 x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) bad origin (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+            ),
+            format!(
+                "temote-mcp/0.153.4 ({}; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})",
+                "x".repeat(MAX_APP_SERVER_USER_AGENT_BYTES)
+            ),
+        ];
+
+        for user_agent in invalid {
+            let error = validate_initialize_response(&initialize_response(&user_agent))
+                .expect_err(&user_agent);
+            assert!(
+                error.to_string().contains("CODEX_APP_SERVER_INCOMPATIBLE"),
+                "unexpected error for {user_agent}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn initialize_validation_requires_the_verified_response_shape() {
+        let user_agent = format!(
+            "temote-mcp/0.153.4 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; {APP_SERVER_CLIENT_VERSION})"
+        );
+        let valid = initialize_response(&user_agent);
+
+        for field in ["userAgent", "codexHome", "platformFamily", "platformOs"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                validate_initialize_response(&missing).is_err(),
+                "missing {field} was accepted"
+            );
+
+            for invalid_value in [Value::Null, json!(7)] {
+                let mut wrong_type = valid.clone();
+                wrong_type[field] = invalid_value;
+                assert!(
+                    validate_initialize_response(&wrong_type).is_err(),
+                    "non-string {field} was accepted"
+                );
+            }
+        }
+
+        let mut relative_home = valid.clone();
+        relative_home["codexHome"] = json!("relative/codex-home");
+        assert!(validate_initialize_response(&relative_home).is_err());
+
+        let mut empty_platform = valid;
+        empty_platform["platformOs"] = json!("");
+        assert!(validate_initialize_response(&empty_platform).is_err());
+    }
+
     #[tokio::test]
     async fn fake_app_server_handshake_start_read_steer_interrupt_and_evidence() {
         let root = tempfile::tempdir().unwrap();
@@ -5550,7 +5745,7 @@ for raw in sys.stdin:
             spawn_initialized_client_with_binary_mode(&session, Some(task_id), &binary, false)
                 .await
                 .unwrap();
-        assert_eq!(initialized["platformOs"], "macos");
+        assert_eq!(initialized["platformOs"], "linux");
         let models = client
             .request("model/list", json!({"includeHidden":true}))
             .await
@@ -5609,11 +5804,9 @@ for raw in sys.stdin:
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path(), "protocol", true);
         let incompatible = root.path().join("fake-app-server-incompatible");
-        std::fs::write(
-            &incompatible,
-            "#!/usr/bin/env python3\nimport json,sys\nfor line in sys.stdin:\n r=json.loads(line)\n if r.get('method')=='initialize': print(json.dumps({'id':r['id'],'result':{'userAgent':'temote-mcp/9.9.9','codexHome':'/tmp','platformFamily':'unix','platformOs':'macos'}}),flush=True)\n",
-        )
-        .unwrap();
+        let incompatible_script = "#!/usr/bin/env python3\nimport json,sys\nfor line in sys.stdin:\n r=json.loads(line)\n if r.get('method')=='initialize': print(json.dumps({'id':r['id'],'result':{'userAgent':'temote-mcp/0.153.3 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; __CLIENT_VERSION__)','codexHome':'/tmp','platformFamily':'unix','platformOs':'linux'}}),flush=True)\n"
+            .replace("__CLIENT_VERSION__", APP_SERVER_CLIENT_VERSION);
+        std::fs::write(&incompatible, incompatible_script).unwrap();
         std::fs::set_permissions(&incompatible, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = spawn_initialized_client_with_binary_mode(&session, None, &incompatible, false)
             .await

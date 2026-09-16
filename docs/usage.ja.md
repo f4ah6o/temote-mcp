@@ -84,7 +84,7 @@ stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated と
 
 ### Experimental Codex task
 
-opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_control` は、local `codex app-server --stdio` に接続し、名前付きの status/task 操作だけを扱います。app-server の handshake は `0.153.4` として検証します。task は完全な session instance と canonical working directory に所有されるため、別 session、別 process generation、別 scope から resume できません。
+opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_control` は、local `codex app-server --stdio` に接続し、名前付きの status/task 操作だけを扱います。app-server の handshake は `0.147.0` または `0.153.4` として検証します。task は完全な session instance と canonical working directory に所有されるため、別 session、別 process generation、別 scope から resume できません。
 
 `codex_task_start` と `codex_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。Temote は child turn の start/control より先に accepted receipt を永続化します。crash で副作用の成否が不明な場合は盲目的に replay せず `reconciliation_required` を返します。通常 session では local approval が必要です。approval detail には Codex provenance、operation/tool、target と scope、mutation/read-only、safe な model/effort または command/file-change summary を表示します。prompt、control input、transcript、raw command argument、patch body、command output は task metadata や approval/activity summary に保存しません。`codex_task_get` の詳細 thread data は、opaque な `evidence_id` で取得する bounded・期限付き・session/scope限定の evidence だけです。
 
