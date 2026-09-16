@@ -75,6 +75,8 @@ sandbox/path containment を維持したまま、supported development toolchain
 
 `GOMODCACHE` はこのsliceでは意図的に変更しない。Go module cache は build cache だけでなく dependency store を兼ね、空のprivate directoryへ切り替えると network-disabled/offline execution が既存のread-only module contentsを再利用できなくなるためである。host module contentsをread-onlyのまま利用しつつ、`cache/download` 等のwrite metadataだけをprivate overlayへ分離する設計が必要。
 
+Go 1.25 の `cmd/go/internal/modfetch` も stat / go.mod の disk cache を `GOMODCACHE/cache/download/...` に直接書くため、`GOCACHE` や `XDG_CACHE_HOME` ではこの warning を移せない。`GOMODCACHE` 全体をprivate empty storeへ切り替える方式は、Temote の network-disabled command sandboxで既存 host module cacheを再利用できなくする。このため残りは environment tweak ではなく、read-only module contentsをlowerとして見せつつ write metadata/new entriesをprivate upperへ受ける sandbox mount/overlay contractとして設計する。
+
 Verification:
 
 - `sandbox::generic_tests::preserves_home_for_login_shells`: PASS。
