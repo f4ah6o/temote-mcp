@@ -512,7 +512,11 @@
           "tool": {
             "enum": [
               "cargo",
-              "vp"
+              "vp",
+              "uv",
+              "npm",
+              "pnpm",
+              "go"
             ],
             "type": "string"
           }

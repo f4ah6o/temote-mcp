@@ -118,12 +118,14 @@ The child environment is cleared and rebuilt from a small allow-list, so Temote-
 
 ### Structured developer tool broker
 
-`dev_tool_run({session_id, tool, operation, args?, cwd?})` runs a validated Cargo or Vite+ operation through the developer broker. `tool` is limited to `cargo` and `vp`; callers cannot select an executable or supply a raw host command. The cwd is canonicalized inside the permitted session roots, child output is bounded, and long operations return a normal `job_id`.
+`dev_tool_run({session_id, tool, operation, args?, cwd?})` runs a validated Cargo, Vite+, uv, npm, pnpm, or Go operation through the developer broker. Callers cannot select an executable or supply a raw host command. The cwd is canonicalized inside the permitted session roots, child output is bounded, and long operations return a normal `job_id`.
 
 Operation classes:
 
 - offline development (`cargo fmt|check|clippy|test|build`; `vp check|lint|fmt|format|test|build|pack`) run in the developer sandbox with network disabled; workspace write plus narrowly scoped tool cache/state write only;
 - dependency/network (`cargo fetch|install|update`; `vp install|add|update|outdated|info|rebuild`) use the explicit network profile with the same scoped writes;
+- the initial package-manager slice adds `uv lock`, `npm install|ci|update|ping|outdated`, `pnpm install|fetch|update|outdated`, and `go mod_download` (rendered as `go mod download`). These operations accept no caller-supplied arguments yet; `uv lock` forces `--no-build --no-python-downloads`, npm/pnpm install/update paths force lifecycle scripts off with `--ignore-scripts` and `npm_config_ignore_scripts=true`, and pnpm install/update/fetch also force `--ignore-pnpmfile` so project hooks cannot execute;
+- lifecycle build scripts are a separate offline phase: `npm rebuild` and `pnpm rebuild_pending` (rendered as `pnpm rebuild --pending`) run with the developer sandbox network disabled. This lets a dependency fetch/install complete with scripts disabled first, then executes required build scripts without giving those scripts outbound network access;
 - `vp run|exec|dlx`, `vp upgrade|implode`, and every unknown operation stay rejected rather than entering an offline/safe path.
 
 In `ask` mode a validated operation requires local approval; in `agent` mode it runs without the local approval console; in `yolo` mode the existing local behavior is unchanged. The classification and containment rules are identical in every mode.

@@ -16,6 +16,10 @@ pub const MAX_DEV_TOOL_ARGUMENTS: usize = 64;
 pub enum DevTool {
     Cargo,
     Vp,
+    Uv,
+    Npm,
+    Pnpm,
+    Go,
 }
 
 impl DevTool {
@@ -23,7 +27,13 @@ impl DevTool {
         match value {
             "cargo" => Ok(Self::Cargo),
             "vp" => Ok(Self::Vp),
-            _ => anyhow::bail!("unsupported developer tool {value:?}; expected cargo or vp"),
+            "uv" => Ok(Self::Uv),
+            "npm" => Ok(Self::Npm),
+            "pnpm" => Ok(Self::Pnpm),
+            "go" => Ok(Self::Go),
+            _ => anyhow::bail!(
+                "unsupported developer tool {value:?}; expected cargo, vp, uv, npm, pnpm, or go"
+            ),
         }
     }
 
@@ -31,6 +41,10 @@ impl DevTool {
         match self {
             Self::Cargo => "cargo",
             Self::Vp => "vp",
+            Self::Uv => "uv",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Go => "go",
         }
     }
 
@@ -38,6 +52,10 @@ impl DevTool {
         match self {
             Self::Cargo => "cargo",
             Self::Vp => "vp",
+            Self::Uv => "uv",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Go => "go",
         }
     }
 }
@@ -91,6 +109,7 @@ impl DevToolRequest {
         let operation = operation.into();
         validate_operation(&operation)?;
         validate_arguments(&args)?;
+        validate_tool_arguments(tool, &operation, &args)?;
         Ok(Self {
             tool,
             operation,
@@ -163,6 +182,20 @@ fn validate_arguments(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_tool_arguments(tool: DevTool, operation: &str, args: &[String]) -> Result<()> {
+    if matches!(
+        tool,
+        DevTool::Uv | DevTool::Npm | DevTool::Pnpm | DevTool::Go
+    ) {
+        anyhow::ensure!(
+            args.is_empty(),
+            "{tool} {operation} does not accept caller-supplied arguments in the initial broker contract",
+            tool = tool.as_str()
+        );
+    }
+    Ok(())
+}
+
 pub fn classify(tool: DevTool, operation: &str) -> DevToolClassification {
     let class = match (tool, operation) {
         (DevTool::Cargo, "fmt" | "check" | "clippy" | "test" | "build") => DevToolClass::DevOffline,
@@ -175,6 +208,16 @@ pub fn classify(tool: DevTool, operation: &str) -> DevToolClassification {
         }
         (DevTool::Vp, "run" | "exec" | "dlx") => DevToolClass::ArbitraryCodeSensitive,
         (DevTool::Vp, "upgrade" | "implode") => DevToolClass::Rejected,
+        (DevTool::Uv, "lock") => DevToolClass::DependencyNetwork,
+        (DevTool::Npm, "install" | "ci" | "update" | "ping" | "outdated") => {
+            DevToolClass::DependencyNetwork
+        }
+        (DevTool::Npm, "rebuild") => DevToolClass::DevOffline,
+        (DevTool::Pnpm, "install" | "fetch" | "update" | "outdated") => {
+            DevToolClass::DependencyNetwork
+        }
+        (DevTool::Pnpm, "rebuild_pending") => DevToolClass::DevOffline,
+        (DevTool::Go, "mod_download") => DevToolClass::DependencyNetwork,
         _ => DevToolClass::Rejected,
     };
     let reason = match class {
@@ -200,6 +243,7 @@ pub(crate) struct PreparedDevToolRun {
     command: Vec<String>,
     environment: HashMap<String, String>,
     writable_roots: Vec<PathBuf>,
+    broker_state_root: Option<PathBuf>,
 }
 
 impl PreparedDevToolRun {
@@ -298,13 +342,22 @@ pub(crate) fn prepare_with_executable(
     );
     let cwd = crate::local_agent::resolve_cwd(session, request.cwd().map(PathBuf::as_path))?;
     let writable_roots = tool_state_roots(tool);
+    let broker_state_root = package_manager_state_root(tool)?;
     let program = match executable {
         Some(path) => path.to_string_lossy().into_owned(),
         None => tool.executable_name().to_owned(),
     };
-    let mut command = vec![program, request.operation().to_owned()];
-    command.extend(request.args().iter().cloned());
-    let environment = crate::local_agent::filtered_environment()?;
+    let command = build_command(&request, program, broker_state_root.as_deref());
+    let mut environment = crate::local_agent::filtered_environment()?;
+    if matches!(
+        (tool, request.operation()),
+        (DevTool::Npm, "install" | "ci" | "update") | (DevTool::Pnpm, "install" | "update")
+    ) {
+        environment.insert("npm_config_ignore_scripts".to_owned(), "true".to_owned());
+    }
+    if let Some(root) = &broker_state_root {
+        apply_package_manager_state_environment(tool, root, &mut environment);
+    }
     Ok(PreparedDevToolRun {
         tool,
         class: classification.class,
@@ -313,10 +366,106 @@ pub(crate) fn prepare_with_executable(
         command,
         environment,
         writable_roots,
+        broker_state_root,
     })
 }
 
+fn build_command(
+    request: &DevToolRequest,
+    program: String,
+    broker_state_root: Option<&Path>,
+) -> Vec<String> {
+    let mut command = match (request.tool(), request.operation()) {
+        (DevTool::Uv, "lock") => {
+            let mut command = vec![
+                program,
+                "lock".to_owned(),
+                "--no-build".to_owned(),
+                "--no-python-downloads".to_owned(),
+            ];
+            if let Some(root) = broker_state_root {
+                command.extend([
+                    "--cache-dir".to_owned(),
+                    root.join("cache").to_string_lossy().into_owned(),
+                ]);
+            }
+            command
+        }
+        (DevTool::Npm, "install" | "ci" | "update") => vec![
+            program,
+            request.operation().to_owned(),
+            "--ignore-scripts".to_owned(),
+        ],
+        (DevTool::Npm, "rebuild") => vec![program, "rebuild".to_owned()],
+        (DevTool::Pnpm, "install" | "update") => {
+            let mut command = vec![
+                program,
+                request.operation().to_owned(),
+                "--ignore-scripts".to_owned(),
+                "--ignore-pnpmfile".to_owned(),
+            ];
+            if let Some(root) = broker_state_root {
+                command.extend([
+                    "--store-dir".to_owned(),
+                    root.join("store").to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    root.join("state").to_string_lossy().into_owned(),
+                ]);
+            }
+            command
+        }
+        (DevTool::Pnpm, "fetch") => {
+            let mut command = vec![program, request.operation().to_owned()];
+            command.push("--ignore-pnpmfile".to_owned());
+            if let Some(root) = broker_state_root {
+                command.extend([
+                    "--store-dir".to_owned(),
+                    root.join("store").to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    root.join("state").to_string_lossy().into_owned(),
+                ]);
+            }
+            command
+        }
+        (DevTool::Pnpm, "outdated") => {
+            let mut command = vec![program, request.operation().to_owned()];
+            if let Some(root) = broker_state_root {
+                command.extend([
+                    "--store-dir".to_owned(),
+                    root.join("store").to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    root.join("state").to_string_lossy().into_owned(),
+                ]);
+            }
+            command
+        }
+        (DevTool::Pnpm, "rebuild_pending") => {
+            let mut command = vec![program, "rebuild".to_owned(), "--pending".to_owned()];
+            if let Some(root) = broker_state_root {
+                command.extend([
+                    "--store-dir".to_owned(),
+                    root.join("store").to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    root.join("state").to_string_lossy().into_owned(),
+                ]);
+            }
+            command
+        }
+        (DevTool::Go, "mod_download") => {
+            vec![program, "mod".to_owned(), "download".to_owned()]
+        }
+        _ => vec![program, request.operation().to_owned()],
+    };
+    command.extend(request.args().iter().cloned());
+    command
+}
+
 pub(crate) async fn run(prepared: PreparedDevToolRun) -> Result<crate::sandbox::Output> {
+    let mut prepared = prepared;
+    if let Some(root) = &prepared.broker_state_root {
+        let root = ensure_package_manager_state_root(root)?;
+        prepared.writable_roots.push(root);
+    }
     let scope = crate::sandbox::DeveloperToolScope {
         writable_roots: &prepared.writable_roots,
         network_access: prepared.class == DevToolClass::DependencyNetwork,
@@ -329,6 +478,99 @@ pub(crate) async fn run(prepared: PreparedDevToolRun) -> Result<crate::sandbox::
         &prepared.environment,
     )
     .await
+}
+
+fn package_manager_state_root(tool: DevTool) -> Result<Option<PathBuf>> {
+    if !matches!(
+        tool,
+        DevTool::Uv | DevTool::Npm | DevTool::Pnpm | DevTool::Go
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(
+        config::state_dir()?
+            .join("developer-tools")
+            .join(tool.as_str()),
+    ))
+}
+
+fn apply_package_manager_state_environment(
+    tool: DevTool,
+    root: &Path,
+    environment: &mut HashMap<String, String>,
+) {
+    match tool {
+        DevTool::Npm | DevTool::Pnpm => {
+            environment.insert(
+                "npm_config_cache".to_owned(),
+                root.join("npm-cache").to_string_lossy().into_owned(),
+            );
+        }
+        DevTool::Go => {
+            environment.insert(
+                "GOCACHE".to_owned(),
+                root.join("go-build").to_string_lossy().into_owned(),
+            );
+            environment.insert(
+                "GOMODCACHE".to_owned(),
+                root.join("go-mod").to_string_lossy().into_owned(),
+            );
+        }
+        DevTool::Uv | DevTool::Cargo | DevTool::Vp => {}
+    }
+}
+
+fn ensure_package_manager_state_root(root: &Path) -> Result<PathBuf> {
+    let parent = root
+        .parent()
+        .context("developer-tool state root has no parent")?;
+    let state_base = parent
+        .parent()
+        .context("developer-tool state parent has no Temote state base")?;
+    std::fs::create_dir_all(state_base)
+        .with_context(|| format!("failed to create {}", state_base.display()))?;
+    let base_metadata = std::fs::symlink_metadata(state_base)
+        .with_context(|| format!("failed to inspect {}", state_base.display()))?;
+    anyhow::ensure!(
+        base_metadata.file_type().is_dir() && !base_metadata.file_type().is_symlink(),
+        "Temote state path must be a real directory: {}",
+        state_base.display()
+    );
+    ensure_private_state_directory(parent)?;
+    ensure_private_state_directory(root)?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve {}", parent.display()))?;
+    let canonical_root = std::fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve {}", root.display()))?;
+    anyhow::ensure!(
+        canonical_root.parent() == Some(canonical_parent.as_path()),
+        "developer-tool state root escaped its Temote-owned parent"
+    );
+    Ok(canonical_root)
+}
+
+fn ensure_private_state_directory(path: &Path) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", path.display()));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "developer-tool state path must be a real directory: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn tool_state_roots(tool: DevTool) -> Vec<PathBuf> {
@@ -346,6 +588,7 @@ fn tool_state_roots(tool: DevTool) -> Vec<PathBuf> {
             ".cache/vite-plus",
             ".cache/pnpm",
         ],
+        DevTool::Uv | DevTool::Npm | DevTool::Pnpm | DevTool::Go => &[],
     };
     candidates
         .iter()
@@ -422,8 +665,80 @@ mod tests {
     }
 
     #[test]
+    fn package_manager_operations_use_a_narrow_dependency_network_contract() {
+        for (tool, operations) in [
+            (DevTool::Uv, &["lock"][..]),
+            (
+                DevTool::Npm,
+                &["install", "ci", "update", "ping", "outdated"][..],
+            ),
+            (
+                DevTool::Pnpm,
+                &["install", "fetch", "update", "outdated"][..],
+            ),
+            (DevTool::Go, &["mod_download"][..]),
+        ] {
+            for operation in operations {
+                assert_eq!(
+                    classify(tool, operation).class,
+                    DevToolClass::DependencyNetwork,
+                    "{} {operation}",
+                    tool.as_str()
+                );
+                assert!(DevToolRequest::new(tool, *operation, Vec::new(), None).is_ok());
+                assert!(
+                    DevToolRequest::new(
+                        tool,
+                        *operation,
+                        vec!["--registry=https://example.invalid".to_owned()],
+                        None
+                    )
+                    .is_err(),
+                    "{} {operation} must reject caller-supplied arguments in the first slice",
+                    tool.as_str()
+                );
+            }
+        }
+
+        for (tool, operation) in [
+            (DevTool::Npm, "rebuild"),
+            (DevTool::Pnpm, "rebuild_pending"),
+        ] {
+            assert_eq!(classify(tool, operation).class, DevToolClass::DevOffline);
+            assert!(DevToolRequest::new(tool, operation, Vec::new(), None).is_ok());
+        }
+
+        for (tool, operation) in [
+            (DevTool::Uv, "sync"),
+            (DevTool::Npm, "run"),
+            (DevTool::Npm, "exec"),
+            (DevTool::Pnpm, "run"),
+            (DevTool::Pnpm, "exec"),
+            (DevTool::Pnpm, "dlx"),
+            (DevTool::Pnpm, "rebuild"),
+            (DevTool::Go, "get"),
+            (DevTool::Go, "run"),
+            (DevTool::Go, "mod_tidy"),
+        ] {
+            assert_eq!(
+                classify(tool, operation).class,
+                DevToolClass::Rejected,
+                "{} {operation}",
+                tool.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn unknown_operations_fail_closed_for_every_tool() {
-        for tool in [DevTool::Cargo, DevTool::Vp] {
+        for tool in [
+            DevTool::Cargo,
+            DevTool::Vp,
+            DevTool::Uv,
+            DevTool::Npm,
+            DevTool::Pnpm,
+            DevTool::Go,
+        ] {
             assert_eq!(
                 classify(tool, "definitely-not-a-subcommand").class,
                 DevToolClass::Rejected
@@ -435,6 +750,10 @@ mod tests {
     fn tool_names_reject_paths_and_unknown_values() {
         assert_eq!(DevTool::parse("cargo").unwrap(), DevTool::Cargo);
         assert_eq!(DevTool::parse("vp").unwrap(), DevTool::Vp);
+        assert_eq!(DevTool::parse("uv").unwrap(), DevTool::Uv);
+        assert_eq!(DevTool::parse("npm").unwrap(), DevTool::Npm);
+        assert_eq!(DevTool::parse("pnpm").unwrap(), DevTool::Pnpm);
+        assert_eq!(DevTool::parse("go").unwrap(), DevTool::Go);
         for value in [
             "/usr/bin/cargo",
             "./cargo",
@@ -511,7 +830,14 @@ mod tests {
     fn generated_operations_classify_deterministically_and_fail_closed() -> noprop::TestResult {
         test_support::run(0x4445_5654_4f4f_4c01, test_support::DEFAULT_CASES, |ctx| {
             let operation = test_support::ascii_string(ctx, 80);
-            for tool in [DevTool::Cargo, DevTool::Vp] {
+            for tool in [
+                DevTool::Cargo,
+                DevTool::Vp,
+                DevTool::Uv,
+                DevTool::Npm,
+                DevTool::Pnpm,
+                DevTool::Go,
+            ] {
                 let first = classify(tool, &operation);
                 assert_eq!(
                     first,
@@ -607,6 +933,169 @@ mod tests {
     }
 
     #[test]
+    fn prepare_builds_fixed_package_manager_argv_and_disables_lifecycle_scripts() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let session = test_session(&cwd);
+        let fake = root.path().join("fake-tool");
+
+        for (tool, operation, expected_prefix) in [
+            ("npm", "ci", vec!["ci", "--ignore-scripts"]),
+            (
+                "pnpm",
+                "install",
+                vec!["install", "--ignore-scripts", "--ignore-pnpmfile"],
+            ),
+            (
+                "uv",
+                "lock",
+                vec!["lock", "--no-build", "--no-python-downloads"],
+            ),
+            ("go", "mod_download", vec!["mod", "download"]),
+        ] {
+            let args = json!({
+                "session_id": "dev-tool-test-session",
+                "tool": tool,
+                "operation": operation
+            });
+            let prepared = prepare_with_executable(&args, &session, Some(&fake)).unwrap();
+            assert_eq!(
+                prepared.command[0],
+                fake.to_string_lossy().into_owned(),
+                "{tool} {operation}"
+            );
+            assert_eq!(
+                prepared.command[1..1 + expected_prefix.len()],
+                expected_prefix
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>(),
+                "{tool} {operation}"
+            );
+            assert!(prepared.network_access(), "{tool} {operation}");
+            let state_root = prepared
+                .broker_state_root
+                .as_ref()
+                .expect("package-manager operations must have broker-owned state");
+            if matches!(tool, "npm" | "pnpm") {
+                assert_eq!(
+                    prepared
+                        .environment
+                        .get("npm_config_ignore_scripts")
+                        .map(String::as_str),
+                    Some("true")
+                );
+                assert_eq!(
+                    prepared.environment.get("npm_config_cache"),
+                    Some(&state_root.join("npm-cache").to_string_lossy().into_owned())
+                );
+            }
+            match tool {
+                "pnpm" => assert_eq!(
+                    prepared.command[4..],
+                    vec![
+                        "--store-dir".to_owned(),
+                        state_root.join("store").to_string_lossy().into_owned(),
+                        "--state-dir".to_owned(),
+                        state_root.join("state").to_string_lossy().into_owned(),
+                    ]
+                ),
+                "uv" => assert_eq!(
+                    prepared.command[4..],
+                    vec![
+                        "--cache-dir".to_owned(),
+                        state_root.join("cache").to_string_lossy().into_owned(),
+                    ]
+                ),
+                "go" => {
+                    assert_eq!(
+                        prepared.environment.get("GOCACHE"),
+                        Some(&state_root.join("go-build").to_string_lossy().into_owned())
+                    );
+                    assert_eq!(
+                        prepared.environment.get("GOMODCACHE"),
+                        Some(&state_root.join("go-mod").to_string_lossy().into_owned())
+                    );
+                }
+                "npm" => {}
+                _ => unreachable!(),
+            }
+        }
+
+        for (tool, operation, expected_prefix) in [
+            ("npm", "rebuild", vec!["rebuild"]),
+            ("pnpm", "rebuild_pending", vec!["rebuild", "--pending"]),
+        ] {
+            let args = json!({
+                "session_id": "dev-tool-test-session",
+                "tool": tool,
+                "operation": operation
+            });
+            let prepared = prepare_with_executable(&args, &session, Some(&fake)).unwrap();
+            assert_eq!(prepared.class, DevToolClass::DevOffline);
+            assert!(!prepared.network_access());
+            assert_eq!(
+                prepared.command[1..1 + expected_prefix.len()],
+                expected_prefix
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(prepared.environment.get("npm_config_ignore_scripts"), None);
+            if tool == "pnpm" {
+                let state_root = prepared.broker_state_root.as_ref().unwrap();
+                assert_eq!(
+                    prepared.command[3..],
+                    vec![
+                        "--store-dir".to_owned(),
+                        state_root.join("store").to_string_lossy().into_owned(),
+                        "--state-dir".to_owned(),
+                        state_root.join("state").to_string_lossy().into_owned(),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_manager_state_root_is_private_and_rejects_symlink_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state/developer-tools/npm");
+        let canonical = ensure_package_manager_state_root(&root).unwrap();
+        assert_eq!(canonical, std::fs::canonicalize(&root).unwrap());
+        for directory in [root.parent().unwrap(), root.as_path()] {
+            let metadata = std::fs::symlink_metadata(directory).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+
+        std::fs::remove_dir(&root).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &root).unwrap();
+        let error = ensure_package_manager_state_root(&root).unwrap_err();
+        assert!(
+            error.to_string().contains("real directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn package_managers_do_not_reuse_host_home_state_as_writable_roots() {
+        for tool in [DevTool::Uv, DevTool::Npm, DevTool::Pnpm, DevTool::Go] {
+            assert!(
+                tool_state_roots(tool).is_empty(),
+                "{} must use only its Temote-owned broker state root",
+                tool.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn prepare_rejects_dangerous_operations_and_unexpected_arguments() {
         let root = tempfile::tempdir().unwrap();
         let cwd = std::fs::canonicalize(root.path()).unwrap();
@@ -622,6 +1111,11 @@ mod tests {
             ("cargo", "publish"),
             ("cargo", "login"),
             ("cargo", "bench"),
+            ("uv", "sync"),
+            ("npm", "run"),
+            ("pnpm", "exec"),
+            ("pnpm", "rebuild"),
+            ("go", "get"),
         ] {
             let args = json!({
                 "session_id": "dev-tool-test-session",

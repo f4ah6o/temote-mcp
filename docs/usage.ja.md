@@ -128,12 +128,14 @@ stage、commit、fetch、pull、push には専用の `git_*` tool を使いま�
 
 ### 構造化 developer tool broker
 
-`dev_tool_run({session_id, tool, operation, args?, cwd?})` は、検証済みの Cargo / Vite+ operation を developer broker 経由で実行します。`tool` は `cargo` と `vp` のみで、caller は executable や raw host command を指定できません。cwd は permitted root 内に canonicalize し、child output は bounded、長時間 operation は通常の `job_id` を返します。
+`dev_tool_run({session_id, tool, operation, args?, cwd?})` は、検証済みの Cargo / Vite+ / uv / npm / pnpm / Go operation を developer broker 経由で実行します。caller は executable や raw host command を指定できません。cwd は permitted root 内に canonicalize し、child output は bounded、長時間 operation は通常の `job_id` を返します。
 
 operation class:
 
 - offline development（`cargo fmt|check|clippy|test|build`、`vp check|lint|fmt|format|test|build|pack`）は network 無効の developer sandbox で実行し、workspace write と限定的な tool cache/state write だけを許可します。
 - dependency/network（`cargo fetch|install|update`、`vp install|add|update|outdated|info|rebuild`）は明示的に分類された network profile を使い、write scope は同じです。
+- package-manager の first slice として `uv lock`、`npm install|ci|update|ping|outdated`、`pnpm install|fetch|update|outdated`、`go mod_download`（実 argv は `go mod download`）を追加します。初期 contract では caller-supplied args を受け付けず、`uv lock` は `--no-build --no-python-downloads`、npm/pnpm の install/update 系は `--ignore-scripts` と `npm_config_ignore_scripts=true`、pnpm install/update/fetch はさらに `--ignore-pnpmfile` を broker 側で強制して project hook の実行も防ぎます。
+- lifecycle build script は別の offline phase に分離します。`npm rebuild` と `pnpm rebuild_pending`（実 argv は `pnpm rebuild --pending`）は developer sandbox の network を無効にしたまま実行するため、依存取得時には script を止め、必要な build script だけを後段で outbound network なしに実行できます。
 - `vp run|exec|dlx`、`vp upgrade|implode`、その他の未知 operation は offline/safe path に入れず拒否します。
 
 `ask` では検証済み operation に local approval が必要で、`agent` では local approval console なしで実行し、`yolo` は従来の local behavior を維持します。分類と containment の規則はどの mode でも同一です。
