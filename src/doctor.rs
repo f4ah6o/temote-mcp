@@ -20,11 +20,13 @@ use crate::sandbox;
 #[cfg(target_os = "linux")]
 const BWRAP_INSTALL_HINT: &str =
     "Install bubblewrap (for example: sudo apt install bubblewrap) and make sure it is in PATH.";
-const APPARMOR_PROFILE_HINT: &str = "Ubuntu may be blocking unprivileged user namespaces. Try:\
-sudo apt update\
-sudo apt install apparmor-profiles apparmor-utils\
-sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict\
-sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict";
+#[cfg(target_os = "linux")]
+const APPARMOR_PROFILE_COMMANDS: [&str; 4] = [
+    "sudo apt update",
+    "sudo apt install apparmor-profiles apparmor-utils",
+    "sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict",
+    "sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict",
+];
 const MAX_TUNNEL_TOKEN_BYTES: u64 = 16 * 1024;
 const DOCTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DOCTOR_STREAM_BYTES: usize = 32 * 1024;
@@ -96,6 +98,16 @@ impl Check {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn apparmor_profile_hint() -> String {
+    let mut hint = String::from("Ubuntu may be blocking unprivileged user namespaces. Try:");
+    for command in APPARMOR_PROFILE_COMMANDS {
+        hint.push('\n');
+        hint.push_str(command);
+    }
+    hint
 }
 
 struct Report {
@@ -1685,9 +1697,10 @@ async fn check_bwrap(report: &mut Report) -> bool {
             let detail =
                 display_output(&output).unwrap_or_else(|| format!("exited with {}", output.status));
             let hint = if contains_loopback_permission_error(&output) {
-                APPARMOR_PROFILE_HINT
+                apparmor_profile_hint()
             } else {
                 "Run the bwrap namespace probe manually and check the host's user-namespace and network-namespace policy."
+                    .to_owned()
             };
             report.add(Check::fail("network namespace", detail, hint));
             false
@@ -1727,7 +1740,7 @@ fn check_user_namespace_settings(report: &mut Report, network_namespace_ok: bool
         Ok(value) if value.trim() == "1" => report.add(Check::warn(
             "AppArmor userns policy",
             "unprivileged user namespaces are restricted (1)",
-            APPARMOR_PROFILE_HINT,
+            apparmor_profile_hint(),
         )),
         Ok(value) => report.add(Check::pass(
             "AppArmor userns policy",
@@ -1798,18 +1811,18 @@ async fn check_sandbox_execution(report: &mut Report) {
                 output.stderr.trim().to_owned()
             };
             let hint = if contains_loopback_permission_error_text(&detail) {
-                APPARMOR_PROFILE_HINT
+                apparmor_profile_hint()
             } else {
-                "Fix the lower-level sandbox check above, then restart temote-mcp."
+                "Fix the lower-level sandbox check above, then restart temote-mcp.".to_owned()
             };
             report.add(Check::fail("sandbox execution", detail, hint));
         }
         Err(error) => {
             let detail = format!("{error:#}");
             let hint = if contains_loopback_permission_error_text(&detail) {
-                APPARMOR_PROFILE_HINT
+                apparmor_profile_hint()
             } else {
-                "Fix the lower-level sandbox check above, then restart temote-mcp."
+                "Fix the lower-level sandbox check above, then restart temote-mcp.".to_owned()
             };
             report.add(Check::fail("sandbox execution", detail, hint));
         }
@@ -1986,6 +1999,25 @@ fn contains_loopback_permission_error_text(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apparmor_remediation_keeps_commands_on_independent_lines() {
+        let hint = apparmor_profile_hint();
+        assert_eq!(
+            hint,
+            concat!(
+                "Ubuntu may be blocking unprivileged user namespaces. Try:\n",
+                "sudo apt update\n",
+                "sudo apt install apparmor-profiles apparmor-utils\n",
+                "sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict\n",
+                "sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"
+            )
+        );
+        let lines = hint.lines().collect::<Vec<_>>();
+        assert_eq!(&lines[1..], APPARMOR_PROFILE_COMMANDS.as_slice());
+        assert!(lines.iter().all(|line| !line.trim().is_empty()));
+    }
 
     #[test]
     fn generated_doctor_stream_capture_matches_prefix_model() -> noprop::TestResult {
