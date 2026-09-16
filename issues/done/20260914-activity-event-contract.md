@@ -13,7 +13,7 @@ activity viewer の最初の作業として、イベント/update の型、安�
 
 ## 背景
 
-親は [local activity viewer](../polished/20260914-local-activity-viewer.md) であり、本イシューはその S01 に対応する。
+親は [local activity viewer](../doing/20260914-local-activity-viewer.md) であり、本イシューはその S01 に対応する。
 親には CLI、履歴、ライブ配送、承認、job の要件があるが、本イシューは通信や並行処理に依存しない型の実装だけを扱う。
 以下に必要な契約を記載しているため、親の残りの作業を同時に実装する必要はない。
 

@@ -1,7 +1,7 @@
 # `temote-mcp upgrade` の helper と direct ingress handoff を安定化する
 
-Status: open
-Model: unknown
+Status: polished
+Model: deepseek-v4.1-flash
 Created: 2026-09-16
 Updated: 2026-09-16
 Branch: main
@@ -18,7 +18,7 @@ Linux ホストで crates.io の `temote-mcp 2026.9.9` をインストールし�
 
 運用手順は [`docs/managed-sessions.md`](../../docs/managed-sessions.md) と [`skills/temote-mcp/SKILL.md`](../../skills/temote-mcp/SKILL.md) にあり、replacement binary のインストール後に `upgrade --dry-run`、`upgrade` を実行する契約になっている。
 
-remote MCP client 自身が更新対象 ingress を呼び出す場合の durable coordinator と reconnect は、別の [`client-safe upgrade` issue](20260908-07-client-safe-upgrade-reconnect.md) で扱う。本 issue は、外部の local CLI または agent 実行環境から行う既存の local upgrade の運用安定性を扱う。
+remote MCP client 自身が更新対象 ingress を呼び出す場合の durable coordinator と reconnect は、別の [`client-safe upgrade` issue](../doing/20260908-07-client-safe-upgrade-reconnect.md) で扱う。本 issue は、外部の local CLI または agent 実行環境から行う既存の local upgrade の運用安定性を扱う。
 
 ## 問題
 
@@ -41,7 +41,7 @@ remote MCP client 自身が更新対象 ingress を呼び出す場合の durable
 
 ## 対象外
 
-- remote MCP から ingress 自身を更新する durable coordinator、transport commit barrier、reconnect API。これらは `20260908-07-client-safe-upgrade-reconnect.md` の対象とする。
+- remote MCP から ingress 自身を更新する durable coordinator、transport commit barrier、reconnect API。これらは `issues/doing/20260908-07-client-safe-upgrade-reconnect.md` の対象とする。
 - `--yolo`、sandbox、permission、session root の境界を緩める回避策。
 - package version metadata の手動更新。CalVer の version bump は release workflow が所有する。
 - 既存の unrelated な working-tree changes、`.tmp/`、`.wt/`、既存の session metadata の整理。
@@ -93,4 +93,8 @@ client restart を自動化すると利用中の会話や MCP connection を切�
 - 2026-09-16: 実稼働 supervisor は same-PID handoff で `2026.9.7 -> 2026.9.9` に更新され、active 12 session は restore 後も `active` だった。作業ツリーの既存変更はこの検証で変更していない。
 - 2026-09-16: `upgrade` の direct ingress restart は一度 `health=healthy` を返した後、呼び出し元 command の終了後に process が残らず、PID 287182 の stale state と port 8791 の接続拒否を観測した。`setsid` で同じ非秘密 restart recipe を起動すると PID 288826 で維持され、`upgrade --dry-run` は target `2026.9.9` / `untouched` / healthy、`/healthz` は `status=ok` になった。
 - 2026-09-16: `upgrade` は `/home/hirohito-fujita/.codex/plugins/cache/debug/temote-mcp/2026.9.9` への plugin install と既存 Codex client の restart 要求を返した。現在の client session をこの作業中に再起動していないため、旧 bridge 経由の通常 `execute` は helper argument error のまま残っている。
-- 2026-09-16: 関連 issue は `issues/done/20260902-zero-downtime-supervisor-upgrade.md` と `issues/open/20260908-07-client-safe-upgrade-reconnect.md`。前者は local supervisor handoff の実装済み契約、後者は remote ingress reconnect の未実装契約を追跡する。
+- 2026-09-16: 関連 issue は `issues/done/20260902-zero-downtime-supervisor-upgrade.md` と `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`。前者は local supervisor handoff の実装済み契約、後者は remote ingress reconnect の未実装契約を追跡する。
+
+## Triage note
+
+- 2026-09-16: 観測された摩擦、受け入れ条件、テスト計画が揃っており実装に着手できるため `ready` と判定し、`issues/open/` から `issues/polished/` へ移動した。実装時は (1) replacement binary と sandbox helper の世代切り替え、(2) direct ingress restart の process-group ownership、(3) dry-run/apply の runtime 観測一致、(4) plugin reconcile と client restart の分離、の slice 分割を推奨する。live 実機確認は `20260908-live-acceptance-matrix.md` 側で扱う。

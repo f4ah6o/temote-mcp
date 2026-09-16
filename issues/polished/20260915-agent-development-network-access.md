@@ -1,9 +1,9 @@
 # Agent mode で通常の開発ネットワークを利用可能にする
 
-Status: open
-Model: unknown
+Status: polished
+Model: deepseek-v4.1-flash
 Created: 2026-09-15
-Updated: 2026-09-15
+Updated: 2026-09-16
 Branch: main
 Priority: P1 developer experience
 
@@ -220,3 +220,7 @@ yes
 3. macOS で outbound + bind/listen、Linux で host network access + sandbox containment を検証する。
 4. public yolo / `without_sandbox` regression を必ず同時確認する。
 5. LAN-only filtering はこの issue に持ち込まない。
+
+## Triage note
+
+- 2026-09-16: Slice A〜C、受け入れ条件、deterministic/live テストの分離が揃っており実装に着手できるため `ready` と判定し、`issues/open/` から `issues/polished/` へ移動した。この変更は `AGENTS.md` の safety invariant「Normal `execute` / `start_command` run in the sandbox with network disabled」を agent mode について更新するため、実装と同じ変更で AGENTS.md と permission-mode docs を明示的に更新し、public yolo / `without_sandbox` の回帰を同時に確認すること。

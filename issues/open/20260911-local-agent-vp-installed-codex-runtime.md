@@ -1,7 +1,9 @@
 # `local_agent_run` cannot launch Codex installed through Vite+ (`vp`)
 
-Status: open / bounded launcher dependency closure implemented; verification pending
+Status: open / blocked on macOS Vite+ live verification and a nested-userns-capable Linux host
+Model: deepseek-v4.1-flash
 Created: 2026-09-11
+Updated: 2026-09-16
 Priority: P1 developer workflow regression
 Related:
 - `src/local_agent.rs`
@@ -254,3 +256,7 @@ exit 71 at /Users/fu2hito/.vite-plus/bin/codex
 ```
 
 Current source inspection indicates that the active server is likely pre-closure. Rebuild and restart the active Temote server before treating this live result as verification of the fix. Acceptance remains incomplete pending an unsandboxed macOS run and a successful live Codex call through the rebuilt server.
+
+## Triage note
+
+- 2026-09-16: Classified `blocked` and kept in `issues/open/`. The bounded launcher dependency closure is implemented on main (`src/local_agent.rs` with Vite+ fixtures), but the acceptance criteria require a real Vite+-managed Codex launch after authorization, which has not been obtained. Unmerged branch notes record a 2026-09-15 Linux run where launcher/model reachability passed but `workspace_write` could not start any child because the host enforces `kernel.apparmor_restrict_unprivileged_userns=1`, plus the still-pending macOS Vite+ live verification. Action: on a suitable macOS host and a nested-userns-capable Linux environment, re-run a read-only canary, an allowed workspace write, and the protected-metadata/sibling denials, then record the result in `20260908-live-acceptance-matrix.md`.

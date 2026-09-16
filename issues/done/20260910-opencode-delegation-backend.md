@@ -1,13 +1,14 @@
 # Proposal: OpenCode delegation backend
 
-- Status: Open / Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN`, explicit same-directory session resume, and bounded `--fork` landed; persistent/session lifecycle implementation not started
+- Status: done (Phase 1, one-shot 1.18.30 OpenCode backend, diagnostics, backend adapter extraction, live comparative measurement, normalized-report and observed-evidence fixes landed on main; `TEMOTE_OPENCODE_BIN`, explicit same-directory session resume, and bounded `--fork` landed; persistent server/session lifecycle is an explicit non-goal)
+- Model: deepseek-v4.1-flash
 - Date: 2026-09-10 (Asia/Tokyo)
-- Updated: 2026-09-12 (Asia/Tokyo)
+- Updated: 2026-09-16 (Asia/Tokyo)
 - Priority: P1
 - Original baseline inspected: `cbeb6d0dfa352c681d1d5696728f76653d5c5cd2` (`main`)
-- Proposal path: `issues/open/20260910-opencode-delegation-backend.md`
+- Proposal path: `issues/done/20260910-opencode-delegation-backend.md`
 - Related:
-  - [TEMOTE-08: Codex delegation dogfood and app server](20260908-08-codex-delegation-dogfood-and-app-server.md)
+  - [TEMOTE-08: Codex delegation dogfood and app server](../open/20260908-08-codex-delegation-dogfood-and-app-server.md)
   - [Developer Execution Broker](../done/20260910-developer-execution-broker.md)
   - `src/codex.rs`
   - `src/delegation/mod.rs`
@@ -667,3 +668,7 @@ The bounded `--fork` follow-up landed locally. It extends the explicit resume sl
 - `evidence.thread_id` remains the observed session ID from OpenCode events; for a fork that observed value is the new forked session, not the requested parent.
 - Deterministic coverage: `fork_requires_session_and_is_opencode_only`, `fork_command_places_fork_after_session_before_prompt`, and `fork_preflight_uses_parent_session_and_launches_new_session` in `src/delegation/opencode.rs`. No live fork was executed (an installed, authenticated OpenCode runtime is not a repository-local gate); the upstream fork behavior is recorded in the resume spike (E5).
 - `--continue` and `--attach` remain unsupported. Persistent OpenCode server/session lifecycle and automatic resume remain the outstanding work in this issue.
+
+## Triage note
+
+- 2026-09-16: Classified `done` and moved from `issues/open/` to `issues/done/`. Evidence: the acceptance criteria accept the one-shot `opencode run` backend and explicitly mark persistent session/server features as optional future work, while non-goals exclude persistent server/session management and `--attach`. The implementation and verification records are on main (`src/delegation/{mod,codex,opencode}.rs`, `TEMOTE_OPENCODE_BIN`, `--session`, `--fork`, diagnostics, `docs/evaluations/opencode-*.md`), and the unmerged `codex/20260915-complete-open-work` branch records the same move. Provider entitlement and one-shot live re-run belong to `20260908-live-acceptance-matrix.md`, not to this implementation issue.

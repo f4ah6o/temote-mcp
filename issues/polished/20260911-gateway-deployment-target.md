@@ -1,9 +1,9 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open
-Model: unknown
+Status: polished
+Model: deepseek-v4.1-flash
 Created: 2026-09-11
-Updated: 2026-09-14
+Updated: 2026-09-16
 Branch: main
 
 ## Resolution
@@ -175,3 +175,4 @@ Cloudflare route/domain verification remains Slice C live acceptance.
 ## Triage note
 
 - 2026-09-14: The S04 review found that `node gateway/scripts/deployment-preflight.mjs --hostname example.com --config gateway/wrangler.toml` exits with usage code 2 before `target_missing` can be emitted, while the existing five tests call `evaluateDeploymentPreflight` directly. The prior triage move to `done/` was therefore reverted to `open/`; the CLI fix and command-level regression test are required before completion. `CHANGES.md` remains unchanged during this triage because the repository-local implementation is not complete.
+- 2026-09-16: Classified `ready` and moved from `issues/open/` to `issues/polished/`. The remaining work is the CLI argument path plus a command-level regression test: `gateway/scripts/deployment-preflight.mjs` still throws usage when neither `--route` nor `--custom-domain` is supplied, so `target_missing` is unreachable from the CLI while the five existing tests call `evaluateDeploymentPreflight` directly. The unmerged `codex/20260915-completion-launcher` branch contains the prepared fix and tests (`04ddd76`) and the prior move to `done/` (`3be4af8`), so integrating that commit is the shortest path. Action: integrate or re-apply the fix, run `(cd gateway && npm test)`, then move to `done/`.

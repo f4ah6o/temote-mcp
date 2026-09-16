@@ -4,16 +4,16 @@ Date: 2026-09-12
 
 ## Issues addressed
 
-The selected issue slice in this pass is the repository-local deployment preflight from `issues/open/20260911-gateway-deployment-target.md` (Slice B). It follows the already-landed documentation slice and does not perform Cloudflare mutation or require credentials. The implementation issues were inspected against the current source and their implementation notes:
+The selected issue slice in this pass is the repository-local deployment preflight from `issues/polished/20260911-gateway-deployment-target.md` (Slice B). It follows the already-landed documentation slice and does not perform Cloudflare mutation or require credentials. The implementation issues were inspected against the current source and their implementation notes:
 
 - `issues/done/20260911-session-forget-stale-metadata.md`: implemented, including supervisor serialization, stale-artifact cleanup, liveness refusal, and filesystem-safety tests.
 - `issues/done/20260910-developer-execution-broker.md`: implemented; `dev_tool_run` classification, Cargo/Vite+ execution profiles, tests, and docs are present.
 - `issues/done/20260911-default-agent-permission-mode.md`: implemented; permission defaults, centralized approval policy, lifecycle persistence, tests, and docs are present.
 - `issues/open/20260911-local-agent-vp-installed-codex-runtime.md`: bounded Vite+ launcher dependency closure is implemented; verification is the remaining issue work.
-- `issues/open/20260911-gateway-deployment-target.md`: Slice A documentation/checks and the evaluator portion of Slice B are implemented; the command-level `target_missing` path still needs a fix and regression test. Cloudflare deployment verification remains live-only.
+- `issues/polished/20260911-gateway-deployment-target.md`: Slice A documentation/checks and the evaluator portion of Slice B are implemented; the command-level `target_missing` path still needs a fix and regression test. Cloudflare deployment verification remains live-only.
 - `issues/done/20260911-gateway-doctor-readiness.md`: local staged diagnostics and the read-only remote endpoint, Access, host-registration, and session-availability checks are implemented. Live Cloudflare verification remains pending.
-- `issues/open/20260910-opencode-delegation-backend.md`: backend extraction, one-shot OpenCode execution, diagnostics, explicit resume preflight, binary override, and report hardening are implemented. Persistent server/session lifecycle, fork, and attach remain deferred.
-- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`: only the explicitly ordered durable transaction-storage slice is implemented; remote coordinator/reconnect work remains a separate, substantial feature.
+- `issues/done/20260910-opencode-delegation-backend.md`: backend extraction, one-shot OpenCode execution, diagnostics, explicit resume preflight, binary override, and report hardening are implemented. Persistent server/session lifecycle, fork, and attach remain deferred.
+- `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`: only the explicitly ordered durable transaction-storage slice is implemented; remote coordinator/reconnect work remains a separate, substantial feature.
 - `issues/open/20260908-08-codex-delegation-dogfood-and-app-server.md`: implementation and fake transport are present; real app-server dogfood and comparative measurement require an appropriately configured host.
 - `issues/open/20260908-live-acceptance-matrix.md`: this is credential- and deployment-dependent tracking, not a repository-local implementation target.
 
@@ -24,7 +24,7 @@ The selected issue slice in this pass is the repository-local deployment preflig
 - `gateway/package.json`
 - `docs/gateway.md`
 - `docs/gateway.ja.md`
-- `issues/open/20260911-gateway-deployment-target.md`
+- `issues/polished/20260911-gateway-deployment-target.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 The preflight reads local Wrangler configuration and explicit operator target arguments only. It rejects missing or non-false `workers_dev`, distinguishes missing and mismatched targets, and returns `remote_unknown` rather than claiming Cloudflare readiness.
@@ -176,7 +176,7 @@ No commit or push was performed. All uncommitted work from the previous passes w
 
 ### Issue addressed
 
-`issues/open/20260908-07-client-safe-upgrade-reconnect.md`. This pass implemented the
+`issues/doing/20260908-07-client-safe-upgrade-reconnect.md`. This pass implemented the
 repository-local coordinator-safe primitives and durable read-only status that the
 issue's steps 2-4 and 7 require, without adding a remote protocol, transport barrier,
 or any credential-dependent call.
@@ -185,7 +185,7 @@ or any credential-dependent call.
 
 - `src/upgrade_transaction.rs`
 - `src/http.rs`
-- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -437,7 +437,7 @@ directory were preserved.
 
 ### Issue addressed
 
-`issues/open/20260908-07-client-safe-upgrade-reconnect.md` (endpoint generation-identity
+`issues/doing/20260908-07-client-safe-upgrade-reconnect.md` (endpoint generation-identity
 remainder). This pass stays repository-local and read-only: it exposes the existing
 non-secret process identity through the MCP handshake so a reconnecting client can
 verify host/version/boot generation, without adding remote upgrade tools, transport
@@ -446,7 +446,7 @@ barriers, or credential-dependent calls.
 ### Files changed
 
 - `src/mcp.rs`
-- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -506,7 +506,7 @@ No commit or push was performed. All existing worktree changes and the untracked
 
 ### Issue addressed
 
-`issues/open/20260908-07-client-safe-upgrade-reconnect.md` (suggested implementation
+`issues/doing/20260908-07-client-safe-upgrade-reconnect.md` (suggested implementation
 order steps 4-5). This pass implements the repository-local coordinator state machine
 that owns durable transaction transitions and the response-flush commit barrier. It
 does not add an OS process wrapper, transport wiring, or remote tools.
@@ -514,7 +514,7 @@ does not add an OS process wrapper, transport wiring, or remote tools.
 ### Files changed
 
 - `src/upgrade_transaction.rs`
-- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -580,7 +580,7 @@ existing worktree changes were left untouched.
 
 ### Issue addressed
 
-`issues/open/20260910-opencode-delegation-backend.md`. The issue's Status records
+`issues/done/20260910-opencode-delegation-backend.md`. The issue's Status records
 "persistent/session lifecycle implementation not started" and the remaining work as
 "persistent server/session lifecycle, automatic resume, fork, and attach". This pass
 implements the bounded **`--fork`** slice, mirroring the already-landed explicit
@@ -594,7 +594,7 @@ implements the bounded **`--fork`** slice, mirroring the already-landed explicit
 - `docs/usage.md`
 - `docs/usage.ja.md`
 - `docs/evaluations/opencode-session-resume-20260912.md`
-- `issues/open/20260910-opencode-delegation-backend.md`
+- `issues/done/20260910-opencode-delegation-backend.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -659,7 +659,7 @@ existing worktree changes were left untouched.
 
 ### Issue addressed
 
-`issues/open/20260908-07-client-safe-upgrade-reconnect.md` (suggested implementation
+`issues/doing/20260908-07-client-safe-upgrade-reconnect.md` (suggested implementation
 order step 7: duplicate/idempotency/stale-transaction handling). The issue's coordinator
 state machine and response-flush barrier are already implemented (Pass 9). This pass adds
 the repository-local admission decision over the complete persisted transaction set, so a
@@ -670,7 +670,7 @@ tools, or transaction-state writes.
 ### Files changed
 
 - `src/upgrade_transaction.rs`
-- `issues/open/20260908-07-client-safe-upgrade-reconnect.md`
+- `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 ### What changed
@@ -771,7 +771,7 @@ now pass with the repo-local HOME configuration recorded above.
 ### Git status
 
 No commit or push was performed. The modified tracked files are this report,
-`issues/open/20260908-07-client-safe-upgrade-reconnect.md`, and
+`issues/doing/20260908-07-client-safe-upgrade-reconnect.md`, and
 `src/upgrade_transaction.rs`. Existing untracked `.tmp/` and `.worktrees/` were preserved
 and left untouched.
 

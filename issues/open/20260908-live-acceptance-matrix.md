@@ -1,7 +1,9 @@
 # TEMOTE live acceptance matrix
 
-- Status: Open
+- Status: Open / tracking; external evidence pending
+- Model: deepseek-v4.1-flash
 - Date: 2026-09-08 (Asia/Tokyo)
+- Updated: 2026-09-16
 - Priority: P2
 - Type: validation / deployment tracking
 
@@ -82,3 +84,7 @@ Do not store tokens, API keys, OAuth codes, cookies, raw credential-bearing envi
 This tracking issue is complete when the applicable live matrix has evidence for the supported production paths. A provider that cannot be tested because entitlement/credentials are unavailable remains explicitly pending; it must not be silently substituted by another provider.
 
 Repository-local implementation regressions belong in their owning implementation issue or tests, not here.
+
+## Triage note
+
+- 2026-09-16: Classified `keep-open` and kept in `issues/open/` as the single tracker. The unchecked matrix items require external credentials, real providers, physical multi-host hardware, and macOS/Windows hosts; they do not block repository-local implementation work. Unmerged branches contain bounded evidence that should be folded in when integrated (Cloudflare account/read-only deployment status and the OpenCode provider entitlement attempt on 2026-09-15). The OpenCode delegation implementation issue is complete and its provider entitlement remains tracked here.

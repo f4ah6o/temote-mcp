@@ -1,5 +1,9 @@
 # Client-safe Temote upgrade with durable reconnect verification
 
+Status: doing
+Model: deepseek-v4.1-flash
+Updated: 2026-09-16
+
 Date: 2026-09-08
 
 ## Implementation status (2026-09-12)
@@ -518,3 +522,7 @@ If remote package acquisition is designed later, it requires a separate issue an
 - cross-host HA/failover;
 - weakening authentication, approval, sandbox, or yolo boundaries;
 - persisting credentials to make upgrade recovery easier.
+
+## Triage note
+
+- 2026-09-16: Classified `in-progress` and moved from `issues/open/` to `issues/doing/`. Evidence: main already has the durable transaction schema, boot identity, coordinator-safe primitives, coordinator state machine, and persisted apply admission, while the direct HTTP coordinator, response-delivery commit barrier, remote preflight/apply/status tools, and the Linux process-boundary reconnect E2E exist only on the unmerged `codex/20260915-completion-upgrade` branch (`1df8b3b`, `5441184`, `793924c`). The macOS process-boundary E2E required by the acceptance criteria remains pending. Action: review/integrate the prepared branch work, run the macOS E2E, then move to `done/`.

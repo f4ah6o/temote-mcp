@@ -1,16 +1,17 @@
 # TEMOTE-08: Lunaへの実装委譲を今回の開発で実証し、Codex app server連携へ進める
 
-- Status: Open / implementation and fake-transport verification landed; one real `codex delegate` dogfood task recorded 2026-09-11; real app-server dogfood and comparative measurement remain
+- Status: Open / blocked on a live authenticated Codex reviewer and provider environment; implementation and fake-transport verification landed; one real `codex delegate` dogfood task recorded 2026-09-11; real app-server dogfood and comparative measurement remain
+- Model: deepseek-v4.1-flash
 - Date: 2026-09-08 (Asia/Tokyo)
-- Updated: 2026-09-13 (Asia/Tokyo)
+- Updated: 2026-09-16 (Asia/Tokyo)
 - Priority: P1
 - Original baseline inspected: `8b95f1d91734e77e698d55d2babd097860f1c1b3` (`main`)
 - Implementation baseline now in `main`: `da64a3800eafb9ef19237ebd9d7310502201873f` and follow-up commits
 - Requested outcome: この機能の開発自体で、Luna Maxへ調査・実装・テストを任せ、親モデルが短い報告と証拠をレビューする。
 - Related:
   - [TEMOTE-05: durable continuation / apply_patch](../done/20260908-05-durable-continuation-and-apply-patch.md)
-  - [TEMOTE-06: friction / learning / recall](20260908-06-friction-learning-recall.md)
-  - [TEMOTE-07: client-safe upgrade / reconnect](20260908-07-client-safe-upgrade-reconnect.md)
+  - [TEMOTE-06: friction / learning / recall](../done/20260908-06-friction-learning-recall.md)
+  - [TEMOTE-07: client-safe upgrade / reconnect](../doing/20260908-07-client-safe-upgrade-reconnect.md)
   - [`docs/evaluations/codex-delegation.md`](../../docs/evaluations/codex-delegation.md)
 
 ## 現在の状態（2026-09-13）
@@ -240,3 +241,7 @@ API費用は測定日の公式単価、課金条件、認証方式を記録し�
 - GPT-5.6 Luna: https://developers.openai.com/api/docs/models/gpt-5.6-luna
 
 公開仕様でのモデル対応と、対象ホスト・認証方式での利用可否を混同しない。app serverの実験的APIやtransportの注意は導入版ごとに確認し、未検証の本番互換性を保証しない。
+
+## Triage note
+
+- 2026-09-16: 実装は完了しているが live dogfood・比較評価・採用判断の前提が揃わないため `blocked` と判定し、`issues/open/` に維持した。根拠: 2026-09-15 の再開で `local_agent_run` は `bwrap: execvp .../codex: No such file or directory`、`codex_status` は `CODEX_APP_SERVER_INCOMPATIBLE` で失敗し、review 結果も job も作成されなかった。作業ツリーの `src/codex_app_server.rs` 変更（0.147.0 対応と identity 検証強化）はこの再開障害の除去に対応する。Action: review 可能な認証済み Codex 環境で Phase D を再開するまで blocked を維持する。

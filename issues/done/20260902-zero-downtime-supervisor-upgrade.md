@@ -15,4 +15,4 @@ The original detailed design, acceptance checklist, and evidence remain availabl
 
 ## Follow-up
 
-Remote MCP-initiated upgrade/reconnect semantics are intentionally separate and remain tracked by `issues/open/20260908-07-client-safe-upgrade-reconnect.md`.
+Remote MCP-initiated upgrade/reconnect semantics are intentionally separate and remain tracked by `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`.

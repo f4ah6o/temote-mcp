@@ -293,3 +293,7 @@ The current behavior of stripping `OP_SERVICE_ACCOUNT_TOKEN` from the target is 
 ## Completion
 
 上記 security boundary、nested resolution、cleanup、gateway parity、documentation、Linux process-boundary regression tests を実装・検証したため close する。
+
+## Triage note
+
+- 2026-09-16: このファイルは tracked な canonical copy。`issues/done/20260903-nested-onepassword-secret-resolution.md` は同じイシューの untracked な stale duplicate（Status: done、短い evidence）である。判断: `duplicate`。完了イシューの現行規約である `issues/done/` に本ファイルの完全な evidence を統合して一本化する。triage ではファイルを削除していない。
