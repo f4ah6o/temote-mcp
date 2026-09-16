@@ -19,6 +19,32 @@ fmt:
 # Run the checks used before publishing changes.
 check: fmt-check test clippy gateway-test diff-check
 
+# Run the deterministic subset that is valid from inside an already-sandboxed
+# normal Temote developer session. This is intentionally not a replacement for
+# `just check` or CI: nested Linux sandbox and local socket/process acceptance
+# remain host-level gates and are reported as NOT RUN here.
+sandboxed-check: fmt-check sandboxed-test clippy sandboxed-no-default gateway-test diff-check
+
+sandboxed-test:
+    cargo test --lib --all-features --locked -- --skip sandbox::linux_tests
+    cargo test --bin temote-mcp --all-features --locked activity_job
+    cargo test --bin temote-mcp --all-features --locked activity_coverage
+    cargo test --bin temote-mcp --all-features --locked upgrade_transaction::tests::
+    cargo test --bin temote-mcp --all-features --locked upgrade_coordinator::tests::
+    @echo "NOT RUN (host/CI gate): Linux nested sandbox runtime tests (sandbox::linux_tests)"
+    @echo "NOT RUN (host/CI gate): full binary/local Unix-socket integration suite"
+    @echo "NOT RUN (host/CI gate): ignored supervisor/process-boundary E2E"
+
+sandboxed-no-default:
+    cargo check --no-default-features --all-targets --locked
+
+# Host-level Linux acceptance. This requires a production-shaped bubblewrap /
+# AppArmor/userns environment and is expected to fail when invoked from inside
+# an existing normal Temote sandbox.
+linux-sandbox-acceptance:
+    cargo build --bin temote-linux-sandbox --locked
+    cargo test --lib --all-features --locked linux_tests -- --nocapture
+
 fmt-check:
     cargo fmt --all -- --check
 

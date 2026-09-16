@@ -56,6 +56,26 @@ git diff --check
 
 `just check`, pull-request CI, and release validation all run the gateway suite. The checked-in `gateway/contract/routed-tools.json` snapshot is generated from Rust's public non-supervisor tool surface and compared with the Worker export. Regenerate an intentional contract change with `TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test routed_gateway_contract_matches_checked_in_snapshot`, then review the structural diff.
 
+### Developing Temote from inside a normal Temote sandbox
+
+An already-sandboxed normal Temote session is not a production-shaped host for tests that need to create another bubblewrap/user namespace or connect to local Unix control sockets. In that environment, `/var/tmp`, bubblewrap ownership/userns checks, or Unix-socket syscalls can fail before the product assertion runs. Do not reinterpret those failures as passing security coverage, and do not weaken the outer sandbox to make the nested tests green.
+
+Use the bounded deterministic developer gate instead:
+
+```sh
+just sandboxed-check
+```
+
+It runs format/check/clippy, library tests except the host-only `sandbox::linux_tests`, focused binary state-machine/coverage tests, the no-default-features check, gateway tests, and the diff check. It then prints the coverage that is **NOT RUN** in this environment: nested Linux sandbox runtime acceptance, the full local Unix-socket/binary integration suite, and process-boundary E2E.
+
+`just sandboxed-check` is not a substitute for `just check` or CI. GitHub CI runs on an unsandboxed runner, installs/configures the Linux bubblewrap/AppArmor runtime, executes `sandbox::linux_tests`, runs the complete all-target test suite (including local Unix-socket integration), and runs the ignored supervisor/process-boundary E2E. On a suitable Linux development host, the sandbox-specific acceptance can also be run explicitly with:
+
+```sh
+just linux-sandbox-acceptance
+```
+
+If that command is invoked from inside another normal Temote sandbox and fails at environment setup rather than at its assertions, record it as environment-blocked / NOT RUN rather than PASS.
+
 The installed HTTP/ingress lifecycle commands are `temote-mcp up --profile cloudflare|tailscale|openai` and `temote-mcp down`. They require a separately running `temote-mcp supervisor`; `down` does not stop that lifecycle supervisor or its sessions. Omitting the profile remains equivalent to `cloudflare`. The `justfile` provides development-oriented Cloudflare wrappers through `just up/down`; Tailscale/OpenAI profile testing should invoke the checkout binary directly so Cloudflare-only environment checks are not applied. For OpenAI, `TUNNEL_CLIENT_BIN` can point at a checkout/test binary while production should use the supported `tunnel-client` distribution and a Restricted runtime key rather than an admin key.
 
 ## Experimental Codex delegation and app-server

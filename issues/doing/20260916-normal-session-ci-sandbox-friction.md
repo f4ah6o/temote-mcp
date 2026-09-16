@@ -1,6 +1,6 @@
 # Normal Temote session から repository の Linux sandbox gate を実行できない
 
-Status: open
+Status: doing / deterministic gate implemented; host CI confirmation pending
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Priority: P1 developer workflow friction
@@ -59,10 +59,20 @@ Temote MCP 自身を Temote の normal sandboxed developer session から開発�
 
 ## Acceptance criteria
 
-- [ ] normal Temote developer session で実行可能な deterministic test subset が明示され、activity 等の通常変更で regression gate として使える。
-- [ ] nested sandbox が必要な Linux security tests は、対応 host で実行される gate が残り、未実行時は明確に NOT RUN / environment blocked と分かる。
-- [ ] `/var/tmp` read-only による fixture failure を product regression と誤判定しない supported workflow がある。
-- [ ] `/usr/bin/bwrap` の production security requirement は維持される。
-- [ ] Unix socket integration coverage は対応 host-level gate で維持され、normal sandbox で `EPERM` の場合に product regression と誤判定しない。
-- [ ] `AGENTS.md` / development docs の gate 記述が実際に実行可能な経路と一致する。
+- [x] normal Temote developer session で実行可能な deterministic test subset が明示され、activity 等の通常変更で regression gate として使える。
+- [x] nested sandbox が必要な Linux security tests は、対応 host で実行される gate が残り、未実行時は明確に NOT RUN / environment blocked と分かる。
+- [x] `/var/tmp` read-only による fixture failure を product regression と誤判定しない supported workflow がある。
+- [x] `/usr/bin/bwrap` の production security requirement は維持される。
+- [x] Unix socket integration coverage は対応 host-level gate で維持され、normal sandbox で `EPERM` の場合に product regression と誤判定しない。
+- [x] `AGENTS.md` / development docs の gate 記述が実際に実行可能な経路と一致する。
 - [ ] CI は security coverage を失わず green を維持する。
+
+## Implementation (2026-09-16)
+
+- `just sandboxed-check` を追加した。normal Temote sandbox で実行可能な format/check/clippy、host-only `sandbox::linux_tests` を除く library tests、activity job/coverage、upgrade transaction/coordinator、no-default-features、gateway、diff check を実行する。
+- recipe の最後に nested Linux sandbox runtime、full binary/local Unix-socket integration、process-boundary E2E を明示的に `NOT RUN (host/CI gate)` と表示する。これらを PASS に読み替えない。
+- `just linux-sandbox-acceptance` を追加し、production-shaped bubblewrap/userns 環境で helper build + `sandbox::linux_tests` を明示実行できるようにした。
+- `just check` と `.github/workflows/ci.yaml` の full/host gate は弱めていない。Linux CI は引き続き bubblewrap/AppArmor をセットアップして live sandbox acceptance、全 target tests、ignored process E2E を実行する。
+- `docs/development.md` と `AGENTS.md` に normal sandbox と host/CI の責務分離を記載した。host-only test が outer sandbox で assertion 前に失敗した場合は environment-blocked / NOT RUN と扱う。
+
+`just sandboxed-check` は normal Temote session で exit 0。library deterministic subset 100/100、activity job 5/5、activity coverage 3/3、upgrade transaction 40/40、upgrade coordinator 6/6、gateway 2/2 が PASS。fmt / clippy / no-default-features / diff check も PASS。nested Linux sandbox runtime、full binary/local Unix-socket integration、ignored supervisor/process-boundary E2E は recipe 出力で明示的に `NOT RUN (host/CI gate)` と表示された。push 後 CI の確認が残る。
