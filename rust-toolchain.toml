@@ -1,0 +1,9 @@
+# Repository-managed Rust/Clippy contract shared by local development,
+# normal CI, and release CI. Update this file only through a dedicated
+# toolchain PR so new lints are fixed before a release is triggered.
+# Motivating regression: 2026.9.10 release CI floated to Clippy 1.98.0
+# while local gates ran an older stable and missed the new lint.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -56,6 +56,12 @@ git diff --check
 
 `just check`, pull-request CI, and release validation all run the gateway suite. The checked-in `gateway/contract/routed-tools.json` snapshot is generated from Rust's public non-supervisor tool surface and compared with the Worker export. Regenerate an intentional contract change with `TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test routed_gateway_contract_matches_checked_in_snapshot`, then review the structural diff.
 
+### Rust toolchain contract
+
+`rust-toolchain.toml` is the single source of truth for the Rust/Clippy version used by local development, normal CI (`.github/workflows/ci.yaml`), the release allocation workflow (`.github/workflows/release.yaml`), and the cargo-dist build. Both workflows run `rustup show`, which installs and activates the pinned channel plus its `rustfmt` and `clippy` components from that file; the generated `.github/workflows/release.yml` inherits the same toolchain because `dist build` runs inside the checkout.
+
+Update the pinned version only in a dedicated toolchain change, and fix any new lint in that same change. The 2026.9.10 release failed at `Validate release` because release CI floated to Clippy `1.98.0` while the local gate ran an older stable that did not yet contain the new lint. `tests/toolchain_contract.rs` fails if either workflow stops consuming the repository-managed file, if the channel is not an exact `X.Y.Z` release, or if the development docs drop the contract or the motivating regression.
+
 ### Developing Temote from inside a normal Temote sandbox
 
 An already-sandboxed normal Temote session is not a production-shaped host for tests that need to create another bubblewrap/user namespace or connect to local Unix control sockets. In that environment, `/var/tmp`, bubblewrap ownership/userns checks, or Unix-socket syscalls can fail before the product assertion runs. Do not reinterpret those failures as passing security coverage, and do not weaken the outer sandbox to make the nested tests green.

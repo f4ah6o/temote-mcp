@@ -34,9 +34,7 @@ jobs:
           fi
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup show
 
       - name: Set up Node
         uses: actions/setup-node@v6
