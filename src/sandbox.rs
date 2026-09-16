@@ -1489,6 +1489,7 @@ fn safe_environment(cache_root: &Path) -> Result<HashMap<String, String>> {
         .collect::<HashMap<_, _>>();
     environment.insert("TEMOTE_MCP_SANDBOX".to_owned(), "1".to_owned());
     apply_standard_cache_environment(&mut environment, cache_root)?;
+    apply_codex_private_state_environment(&mut environment, cache_root)?;
     Ok(environment)
 }
 
@@ -1583,6 +1584,83 @@ fn apply_go_module_cache_environment(
     );
     environment.insert("GOPROXY".to_owned(), proxy);
     Ok(())
+}
+
+/// Direct Codex CLI probes create PATH-alias startup state under
+/// `$CODEX_HOME/tmp` before doing any real work. Ordinary sandboxed commands
+/// see the host `$HOME/.codex` read-only, so that write fails as
+/// `Read-only file system` and Codex prints a warning on every successful run.
+///
+/// Redirect only the mutable startup state into this command's private cache
+/// and expose the existing credential/config files as read-only symlinks. The
+/// host Codex home is never made writable, credential bytes are never copied,
+/// and the launcher shape (Vite+ managed or standalone) is irrelevant because
+/// Codex resolves the same `CODEX_HOME` contract.
+fn apply_codex_private_state_environment(
+    environment: &mut HashMap<String, String>,
+    cache_root: &Path,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (environment, cache_root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(home) = environment.get("HOME").map(PathBuf::from) else {
+            return Ok(());
+        };
+        if !home.is_absolute() {
+            return Ok(());
+        }
+        let source = home.join(".codex");
+        let metadata = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect host Codex home {}", source.display())
+                });
+            }
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+
+        let state = cache_root.join("codex-home");
+        std::fs::create_dir_all(state.join("tmp"))
+            .with_context(|| format!("failed to create private Codex state {}", state.display()))?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(state.join("tmp"), std::fs::Permissions::from_mode(0o700))?;
+        for name in ["auth.json", "config.toml"] {
+            let target = source.join(name);
+            let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let link = state.join(name);
+            if std::fs::symlink_metadata(&link).is_ok() {
+                continue;
+            }
+            std::os::unix::fs::symlink(&target, &link).with_context(|| {
+                format!(
+                    "failed to link read-only Codex file {} into {}",
+                    target.display(),
+                    link.display()
+                )
+            })?;
+        }
+        environment.insert(
+            "CODEX_HOME".to_owned(),
+            state.to_string_lossy().into_owned(),
+        );
+        Ok(())
+    }
 }
 
 fn go_file_proxy_url(path: &Path) -> Option<String> {
@@ -1829,6 +1907,78 @@ mod generic_tests {
 
         assert!(!environment.contains_key("GOMODCACHE"));
         assert!(!environment.contains_key("GOPROXY"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_environment_redirects_codex_startup_state_for_both_launcher_shapes() {
+        for vite_plus_managed in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let home = fixture.path().join("home with space");
+            let host_codex = home.join(".codex");
+            std::fs::create_dir_all(host_codex.join("tmp")).unwrap();
+            std::fs::write(host_codex.join("auth.json"), b"fixture-auth").unwrap();
+            std::fs::write(host_codex.join("config.toml"), b"fixture-config").unwrap();
+            if vite_plus_managed {
+                let launcher = home.join(".vite-plus/bin/codex");
+                std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+                std::fs::write(&launcher, b"#!/bin/sh\nexec vp codex \"$@\"\n").unwrap();
+            }
+            let cache = fixture.path().join("command-cache");
+            let mut environment =
+                HashMap::from([("HOME".to_owned(), home.to_string_lossy().into_owned())]);
+
+            apply_codex_private_state_environment(&mut environment, &cache).unwrap();
+
+            let state = environment
+                .get("CODEX_HOME")
+                .map(PathBuf::from)
+                .expect("Codex startup state must be redirected");
+            assert!(state.starts_with(&cache));
+            assert!(!state.starts_with(&home));
+
+            // The attempted mutable startup path is `$CODEX_HOME/tmp/arg0` for
+            // both launcher shapes; only the private state accepts that write.
+            let alias = state.join("tmp/arg0/codex");
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            std::fs::write(&alias, b"alias").unwrap();
+            assert_eq!(std::fs::read(&alias).unwrap(), b"alias");
+            assert!(!host_codex.join("tmp/arg0").exists());
+
+            // Credential/config bytes stay in the read-only host home.
+            assert_eq!(
+                std::fs::read_link(state.join("auth.json")).unwrap(),
+                host_codex.join("auth.json")
+            );
+            assert_eq!(
+                std::fs::read(state.join("config.toml")).unwrap(),
+                b"fixture-config"
+            );
+            let host_text = std::fs::read(host_codex.join("auth.json")).unwrap();
+            assert_eq!(host_text, b"fixture-auth");
+
+            assert!(
+                !environment
+                    .values()
+                    .any(|value| value.contains(".vite-plus")),
+                "Vite+ host state must not be exposed as writable Codex state"
+            );
+        }
+    }
+
+    #[test]
+    fn command_environment_leaves_codex_home_untouched_without_host_state() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("empty-home");
+        std::fs::create_dir(&home).unwrap();
+        let cache = fixture.path().join("command-cache");
+        let mut environment =
+            HashMap::from([("HOME".to_owned(), home.to_string_lossy().into_owned())]);
+
+        apply_codex_private_state_environment(&mut environment, &cache).unwrap();
+
+        assert!(!environment.contains_key("CODEX_HOME"));
+        assert!(!cache.exists());
     }
 
     #[test]
