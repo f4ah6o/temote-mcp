@@ -1,15 +1,18 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read as _, Write};
+use std::io::{IsTerminal as _, Read as _, Seek as _, Write};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -21,6 +24,12 @@ use crate::config::{self, LifecycleStatus, SessionLifecycle};
 use crate::host_identity;
 use crate::named_roots::NamedRoots;
 use crate::supervisor::{SessionSupervisor, SupervisorUpgradePlan};
+use temote_mcp::activity::broker::{ActivityBroker, ActivityDelivery};
+use temote_mcp::activity::contract::{
+    ACTIVITY_SCHEMA_VERSION, ActivityEvent, decode_event, encode_event,
+};
+use temote_mcp::activity::render::render_event;
+use uuid::Uuid;
 
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_SESSION_LIST_ENTRIES: usize = 256;
@@ -30,6 +39,14 @@ const MAX_SESSION_CONTROL_LIST_BYTES: usize = 56 * 1024;
 const TERMINAL_SESSION_RETENTION: usize = 512;
 const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+// Upgrade requests can run while the caller owns the global admission lock or
+// the per-transaction lease. Bound the entire connect/write/read exchange so a
+// stalled supervisor cannot retain either lock indefinitely.
+const UPGRADE_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACTIVITY_OUTPUT_QUEUE: usize = 256;
+const MAX_ACTIVITY_DIAGNOSTIC_QUEUE: usize = 64;
+const ACTIVITY_OUTPUT_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
 const MAX_CONSOLE_QUEUE: usize = 1;
@@ -40,6 +57,39 @@ const MAX_UPGRADE_PLAN_BYTES: usize = 1024 * 1024;
 const UPGRADE_FAILURE_REPORT_SCHEMA_VERSION: u64 = 1;
 const MAX_UPGRADE_FAILURE_REPORT_BYTES: usize = 64 * 1024;
 const RESTART_NOT_RESUMED_AFTER_SUPERVISOR_RESTART: &str = "automatic restart was not resumed after supervisor restart because captured start credentials are intentionally memory-only; use `temote-mcp session restart <id>`";
+const MAX_UPGRADE_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+pub const INTERNAL_INSTALLED_LOCATOR_ENV: &str = "TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR";
+static INSTALLED_UPGRADE_LOCATOR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn initialize_installed_upgrade_locator() -> Result<()> {
+    if INSTALLED_UPGRADE_LOCATOR.get().is_some() {
+        return Ok(());
+    }
+    let path = std::fs::canonicalize(std::env::current_exe()?)?;
+    let _ = INSTALLED_UPGRADE_LOCATOR.set(path);
+    Ok(())
+}
+
+pub fn initialize_installed_upgrade_locator_from(path: &Path) -> Result<()> {
+    let path = std::fs::canonicalize(path).context("cannot resolve installed Temote locator")?;
+    if let Some(existing) = INSTALLED_UPGRADE_LOCATOR.get() {
+        anyhow::ensure!(
+            existing == &path,
+            "installed Temote startup locator changed"
+        );
+        return Ok(());
+    }
+    let _ = INSTALLED_UPGRADE_LOCATOR.set(path);
+    Ok(())
+}
+
+pub(crate) fn installed_upgrade_locator() -> Result<PathBuf> {
+    initialize_installed_upgrade_locator()?;
+    INSTALLED_UPGRADE_LOCATOR
+        .get()
+        .cloned()
+        .context("installed Temote executable locator was not initialized")
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -105,8 +155,13 @@ enum ControlRequest {
         session_id: String,
         path: PathBuf,
     },
+    ValidatePublicUpgradeSession {
+        session_id: String,
+    },
     Upgrade {
         executable: PathBuf,
+        #[serde(default)]
+        installed_locator: Option<PathBuf>,
         target_version: String,
         #[serde(default)]
         environment: CapturedStartEnvironment,
@@ -114,8 +169,20 @@ enum ControlRequest {
         dry_run: bool,
         #[serde(default)]
         force: bool,
+        #[serde(default)]
+        expected_sessions: Option<Vec<crate::upgrade_transaction::UpgradePlannedSession>>,
     },
     AttachConsole,
+    AttachActivity(AttachActivityRequest),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachActivityRequest {
+    schema_version: u64,
+    session_id: Option<String>,
+    tail: usize,
+    follow: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +374,23 @@ impl SessionBackend {
             }
         }
     }
+
+    pub async fn validate_upgrade_session(&self, session_id: &str) -> Result<config::Session> {
+        config::validate_session_id(session_id)?;
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor.validate_public_upgrade_session(session_id).await
+            }
+            Self::LocalControl => {
+                upgrade_request(ControlRequest::ValidatePublicUpgradeSession {
+                    session_id: session_id.to_owned(),
+                })
+                .await?;
+                config::read_session_metadata(session_id).await
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +398,285 @@ struct ControlResponse {
     ok: bool,
     result: Option<Value>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityAttachResult {
+    control_protocol: u64,
+    activity_schema: u64,
+    generation: Uuid,
+    snapshot_sequence: u64,
+    replayed: usize,
+    history_truncated: bool,
+}
+
+#[derive(Debug)]
+struct ActivityAttachResponse {
+    ok: bool,
+    result: Option<ActivityAttachResult>,
+    error: Option<String>,
+}
+
+struct ActivityAttachResponseVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ActivityAttachResponseVisitor {
+    type Value = ActivityAttachResponse;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an activity attach response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut ok = None;
+        let mut result = None;
+        let mut result_seen = false;
+        let mut error = None;
+        let mut error_seen = false;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "ok" => {
+                    if ok.is_some() {
+                        return Err(serde::de::Error::custom("invalid activity attach response"));
+                    }
+                    ok = Some(map.next_value()?);
+                }
+                "result" => {
+                    if result_seen {
+                        return Err(serde::de::Error::custom("invalid activity attach response"));
+                    }
+                    result_seen = true;
+                    result = map.next_value()?;
+                }
+                "error" => {
+                    if error_seen {
+                        return Err(serde::de::Error::custom("invalid activity attach response"));
+                    }
+                    error_seen = true;
+                    error = map.next_value()?;
+                }
+                _ => return Err(serde::de::Error::custom("invalid activity attach response")),
+            }
+        }
+        if !result_seen || !error_seen {
+            return Err(serde::de::Error::custom("invalid activity attach response"));
+        }
+        Ok(ActivityAttachResponse {
+            ok: ok.ok_or_else(|| serde::de::Error::custom("invalid activity attach response"))?,
+            result,
+            error,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityAttachResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ActivityAttachResponseVisitor)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityEndFrame {
+    #[serde(rename = "type")]
+    frame_type: String,
+    snapshot_sequence: u64,
+    history_truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityGapFrame {
+    #[serde(rename = "type")]
+    frame_type: String,
+    scope: String,
+    after_sequence: u64,
+    through_sequence: u64,
+    dropped: u64,
+}
+
+#[derive(Debug)]
+enum ActivityClientFrame {
+    Event(ActivityEvent),
+    End,
+    Gap {
+        after_sequence: u64,
+        through_sequence: u64,
+        dropped: u64,
+    },
+}
+
+struct ActivityStreamState {
+    attach: ActivityAttachResult,
+    session_id: Option<String>,
+    replayed: usize,
+    last_event_sequence: u64,
+    live_cursor: u64,
+    ended: bool,
+}
+
+struct ActivityClientConnection {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    _writer: tokio::net::unix::OwnedWriteHalf,
+    follow: bool,
+    state: ActivityStreamState,
+}
+
+impl ActivityClientConnection {
+    async fn attach(
+        stream: UnixStream,
+        session_id: Option<String>,
+        tail: usize,
+        follow: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(tail <= 1024, "activity tail exceeds 1024 events");
+        let (reader, mut writer) = stream.into_split();
+        let request = encode_line(&ControlRequest::AttachActivity(AttachActivityRequest {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            tail,
+            follow,
+        }))?;
+        tokio::time::timeout(CONTROL_READ_TIMEOUT, writer.write_all(&request))
+            .await
+            .context("timed out writing activity attach request")??;
+        let mut reader = BufReader::new(reader);
+        let response = read_activity_client_line(&mut reader, "activity attach response").await?;
+        let attach = decode_activity_attach_response(&response, tail)?;
+        Ok(Self {
+            reader,
+            _writer: writer,
+            follow,
+            state: ActivityStreamState::new(attach, session_id),
+        })
+    }
+
+    async fn next_frame(&mut self) -> Result<Option<ActivityClientFrame>> {
+        let line = if activity_frame_read_has_timeout(self.follow, self.state.ended) {
+            read_activity_client_line(&mut self.reader, "activity stream frame").await?
+        } else {
+            read_line_limited(&mut self.reader, "activity stream frame").await?
+        };
+        if line.is_empty() {
+            return Ok(None);
+        }
+        self.state.decode_line(&line).map(Some)
+    }
+}
+
+fn activity_frame_read_has_timeout(follow: bool, replay_ended: bool) -> bool {
+    !follow || !replay_ended
+}
+
+impl ActivityStreamState {
+    fn new(attach: ActivityAttachResult, session_id: Option<String>) -> Self {
+        let live_cursor = attach.snapshot_sequence;
+        Self {
+            attach,
+            session_id,
+            replayed: 0,
+            last_event_sequence: 0,
+            live_cursor,
+            ended: false,
+        }
+    }
+
+    fn decode_line(&mut self, line: &str) -> Result<ActivityClientFrame> {
+        let frame = line
+            .strip_suffix('\n')
+            .context("activity frame is missing newline terminator")?;
+        anyhow::ensure!(!frame.ends_with('\r'), "invalid activity frame terminator");
+        if let Ok(event) = decode_event(frame.as_bytes()) {
+            anyhow::ensure!(
+                self.last_event_sequence < event.sequence(),
+                "activity event sequence is not increasing"
+            );
+            anyhow::ensure!(
+                self.session_id
+                    .as_deref()
+                    .is_none_or(|expected| event.session_id() == Some(expected)),
+                "activity event does not match requested session"
+            );
+            if self.ended {
+                let advances_stream = if self.session_id.is_some() {
+                    event.sequence() > self.live_cursor
+                } else {
+                    self.live_cursor
+                        .checked_add(1)
+                        .is_some_and(|next| event.sequence() == next)
+                };
+                anyhow::ensure!(advances_stream, "invalid live activity sequence");
+                self.live_cursor = event.sequence();
+            } else {
+                anyhow::ensure!(
+                    event.sequence() <= self.attach.snapshot_sequence,
+                    "activity replay exceeds snapshot boundary"
+                );
+                self.replayed += 1;
+                anyhow::ensure!(
+                    self.replayed <= self.attach.replayed,
+                    "too many activity replay events"
+                );
+            }
+            self.last_event_sequence = event.sequence();
+            return Ok(ActivityClientFrame::Event(event));
+        }
+        if let Ok(end) = serde_json::from_str::<ActivityEndFrame>(frame) {
+            anyhow::ensure!(
+                !self.ended && end.frame_type == "activity_end",
+                "invalid activity replay frame"
+            );
+            anyhow::ensure!(
+                end.snapshot_sequence == self.attach.snapshot_sequence
+                    && end.history_truncated == self.attach.history_truncated,
+                "activity_end does not match attachment"
+            );
+            anyhow::ensure!(
+                self.replayed == self.attach.replayed,
+                "activity replay count mismatch"
+            );
+            self.ended = true;
+            return Ok(ActivityClientFrame::End);
+        }
+        if let Ok(gap) = serde_json::from_str::<ActivityGapFrame>(frame) {
+            anyhow::ensure!(
+                self.ended && gap.frame_type == "activity_gap" && gap.scope == "all_sessions",
+                "invalid activity gap frame"
+            );
+            anyhow::ensure!(
+                gap.after_sequence < gap.through_sequence
+                    && gap.through_sequence - gap.after_sequence == gap.dropped
+                    && if self.session_id.is_some() {
+                        gap.after_sequence >= self.live_cursor
+                    } else {
+                        gap.after_sequence == self.live_cursor
+                    },
+                "invalid activity gap range"
+            );
+            self.live_cursor = gap.through_sequence;
+            return Ok(ActivityClientFrame::Gap {
+                after_sequence: gap.after_sequence,
+                through_sequence: gap.through_sequence,
+                dropped: gap.dropped,
+            });
+        }
+        Err(anyhow::anyhow!("invalid activity replay frame"))
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ActivityReplay {
+    pub(crate) generation: Uuid,
+    pub(crate) snapshot_sequence: u64,
+    pub(crate) history_truncated: bool,
+    pub(crate) events: Vec<ActivityEvent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -645,34 +1008,43 @@ async fn handle_control_connection(
     supervisor: Arc<SessionSupervisor>,
     console_registration: mpsc::Sender<mpsc::Sender<ApprovalPrompt>>,
 ) -> Result<()> {
-    let line = tokio::time::timeout(
-        CONTROL_READ_TIMEOUT,
-        read_stream_line(&mut stream, "supervisor control request"),
-    )
-    .await
-    .context("timed out waiting for supervisor control request")??;
-    let request: ControlRequest =
-        serde_json::from_str(line.trim()).context("invalid control request")?;
+    let (line, buffered_input) =
+        tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_request(&mut stream))
+            .await
+            .context("timed out waiting for supervisor control request")??;
+    let request: ControlRequest = serde_json::from_str(line.trim())
+        .map_err(|_| anyhow::anyhow!("invalid control request"))?;
 
     match request {
         ControlRequest::AttachConsole => {
             handle_console_attachment(stream, console_registration).await
         }
+        ControlRequest::AttachActivity(_) if buffered_input => Ok(()),
+        ControlRequest::AttachActivity(request) => {
+            let broker = supervisor.activity_broker();
+            handle_activity_attachment(stream, broker, request).await
+        }
         ControlRequest::Upgrade {
             executable,
+            installed_locator,
             target_version,
             environment,
             dry_run,
             force,
+            expected_sessions,
         } => {
             handle_upgrade_request(
                 stream,
                 supervisor,
-                executable,
-                target_version,
-                environment,
-                dry_run,
-                force,
+                UpgradeControlRequest {
+                    executable,
+                    installed_locator,
+                    target_version,
+                    environment,
+                    dry_run,
+                    force,
+                    expected_sessions,
+                },
             )
             .await
         }
@@ -701,6 +1073,7 @@ async fn dispatch_request(
             "status": "active",
             "host_id": host_identity::resolve()?,
             "version": env!("CARGO_PKG_VERSION"),
+            "boot_generation": crate::boot_identity::generation(),
             "pid": std::process::id(),
             "control_protocol": CONTROL_PROTOCOL_VERSION,
             "lifecycle_schema": LIFECYCLE_SCHEMA_VERSION,
@@ -800,8 +1173,135 @@ async fn dispatch_request(
             supervisor.revoke_directory(&session_id, path).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::ValidatePublicUpgradeSession { session_id } => {
+            let session = supervisor
+                .validate_public_upgrade_session(&session_id)
+                .await?;
+            Ok(json!({
+                "session_id": session.id,
+                "permission_mode": session.permission_mode,
+                "status": "active"
+            }))
+        }
         ControlRequest::Upgrade { .. } => unreachable!("handled before dispatch"),
         ControlRequest::AttachConsole => unreachable!("handled before dispatch"),
+        ControlRequest::AttachActivity(_) => unreachable!("handled before dispatch"),
+    }
+}
+
+async fn handle_activity_attachment(
+    stream: UnixStream,
+    broker: Arc<ActivityBroker>,
+    request: AttachActivityRequest,
+) -> Result<()> {
+    if request.schema_version != ACTIVITY_SCHEMA_VERSION {
+        return write_activity_attach_error(stream, "unsupported activity schema").await;
+    }
+    let mut subscription =
+        match broker.subscribe_snapshot(request.session_id.as_deref(), request.tail) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                return write_activity_attach_error(
+                    stream,
+                    &format!("activity attachment unavailable: {error}"),
+                )
+                .await;
+            }
+        };
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let response = encode_line(&json!({
+        "ok": true,
+        "result": {
+            "control_protocol": CONTROL_PROTOCOL_VERSION,
+            "activity_schema": ACTIVITY_SCHEMA_VERSION,
+            "generation": subscription.generation(),
+            "snapshot_sequence": subscription.cutoff(),
+            "replayed": subscription.replayed(),
+            "history_truncated": subscription.history_truncated(),
+        },
+        "error": Value::Null,
+    }))?;
+    if !write_activity_bytes(&mut reader, &mut writer, &response).await? {
+        return Ok(());
+    }
+
+    for event in subscription.snapshot() {
+        let mut line = encode_event(event)?;
+        line.push(b'\n');
+        if !write_activity_bytes(&mut reader, &mut writer, &line).await? {
+            return Ok(());
+        }
+    }
+    let end = encode_line(&json!({
+        "type": "activity_end",
+        "snapshot_sequence": subscription.cutoff(),
+        "history_truncated": subscription.history_truncated(),
+    }))?;
+    if !write_activity_bytes(&mut reader, &mut writer, &end).await? || !request.follow {
+        let _ = writer.shutdown().await;
+        return Ok(());
+    }
+
+    loop {
+        let mut byte = [0_u8; 1];
+        let delivery = tokio::select! {
+            biased;
+            input = reader.read(&mut byte) => {
+                input.context("failed to monitor activity attachment input")?;
+                return Ok(());
+            }
+            delivery = subscription.recv() => delivery?,
+        };
+        let line = match delivery {
+            ActivityDelivery::Event(event) => {
+                let mut line = encode_event(&event)?;
+                line.push(b'\n');
+                line
+            }
+            ActivityDelivery::Gap(gap) => encode_line(&json!({
+                "type": "activity_gap",
+                "scope": "all_sessions",
+                "after_sequence": gap.after_sequence(),
+                "through_sequence": gap.through_sequence(),
+                "dropped": gap.dropped(),
+            }))?,
+        };
+        if !write_activity_bytes(&mut reader, &mut writer, &line).await? {
+            return Ok(());
+        }
+    }
+}
+
+async fn write_activity_attach_error(stream: UnixStream, message: &str) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let response = encode_line(&json!({
+        "ok": false,
+        "result": Value::Null,
+        "error": message,
+    }))?;
+    let _ = write_activity_bytes(&mut reader, &mut writer, &response).await?;
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+async fn write_activity_bytes<R, W>(reader: &mut R, writer: &mut W, bytes: &[u8]) -> Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut byte = [0_u8; 1];
+    tokio::select! {
+        biased;
+        input = reader.read(&mut byte) => {
+            input.context("failed to monitor activity attachment input")?;
+            Ok(false)
+        }
+        written = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, writer.write_all(bytes)) => {
+            written.context("timed out writing activity attachment")??;
+            Ok(true)
+        }
     }
 }
 
@@ -828,6 +1328,16 @@ fn validate_upgrade_executable(
     path: &Path,
     claimed_version: &str,
 ) -> Result<(PathBuf, SupervisorCapabilities)> {
+    let (path, capabilities) = inspect_upgrade_executable(path)?;
+    anyhow::ensure!(
+        capabilities.version == claimed_version,
+        "upgrade executable version changed during preflight: expected {claimed_version}, found {}",
+        capabilities.version
+    );
+    Ok((path, capabilities))
+}
+
+fn inspect_upgrade_executable(path: &Path) -> Result<(PathBuf, SupervisorCapabilities)> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve upgrade executable {}", path.display()))?;
     let metadata = std::fs::metadata(&path)
@@ -842,6 +1352,19 @@ fn validate_upgrade_executable(
         mode & 0o111 != 0,
         "upgrade executable is not executable: {}",
         path.display()
+    );
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "upgrade executable is not owned by the current user"
+    );
+    anyhow::ensure!(
+        mode & 0o022 == 0,
+        "upgrade executable is group/world writable"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
+        "upgrade executable exceeds bounded identity size"
     );
 
     let output = std::process::Command::new(&path)
@@ -863,11 +1386,6 @@ fn validate_upgrade_executable(
     );
     let capabilities: SupervisorCapabilities = serde_json::from_slice(&output.stdout)
         .context("invalid supervisor capability response from upgrade executable")?;
-    anyhow::ensure!(
-        capabilities.version == claimed_version,
-        "upgrade executable version changed during preflight: expected {claimed_version}, found {}",
-        capabilities.version
-    );
     anyhow::ensure!(
         capabilities.control_protocol == CONTROL_PROTOCOL_VERSION,
         "supervisor control protocol {} is incompatible with running protocol {}",
@@ -900,15 +1418,30 @@ async fn write_control_error(stream: &mut UnixStream, error: &anyhow::Error) -> 
     Ok(())
 }
 
-async fn handle_upgrade_request(
-    mut stream: UnixStream,
-    supervisor: Arc<SessionSupervisor>,
+struct UpgradeControlRequest {
     executable: PathBuf,
+    installed_locator: Option<PathBuf>,
     target_version: String,
     environment: CapturedStartEnvironment,
     dry_run: bool,
     force: bool,
+    expected_sessions: Option<Vec<crate::upgrade_transaction::UpgradePlannedSession>>,
+}
+
+async fn handle_upgrade_request(
+    mut stream: UnixStream,
+    supervisor: Arc<SessionSupervisor>,
+    request: UpgradeControlRequest,
 ) -> Result<()> {
+    let UpgradeControlRequest {
+        executable,
+        installed_locator,
+        target_version,
+        environment,
+        dry_run,
+        force,
+        expected_sessions,
+    } = request;
     let executable_preflight = (|| -> Result<(PathBuf, SupervisorCapabilities)> {
         environment.validate()?;
         validate_upgrade_executable(&executable, &target_version)
@@ -946,13 +1479,16 @@ async fn handle_upgrade_request(
 
     let preflight: Result<SupervisorUpgradePlan> = async {
         let plan = supervisor
-            .build_upgrade_plan(
-                &target_version,
-                capabilities.control_protocol,
-                capabilities.lifecycle_schema,
-                &environment,
+            .build_upgrade_plan_with_expected(
+                crate::supervisor::SupervisorUpgradePlanRequest::new(
+                    &target_version,
+                    capabilities.control_protocol,
+                    capabilities.lifecycle_schema,
+                    &environment,
+                    force,
+                ),
                 true,
-                force,
+                expected_sessions.as_deref(),
             )
             .await?;
         Ok(plan)
@@ -1026,6 +1562,9 @@ async fn handle_upgrade_request(
         .arg("--restore-plan")
         .arg(&plan_path);
     let _exec_credential_handoff = environment.apply_to_command(&mut command)?;
+    if let Some(locator) = installed_locator {
+        command.env(INTERNAL_INSTALLED_LOCATOR_ENV, locator);
+    }
     let exec_error = command.exec();
     #[cfg(target_os = "linux")]
     drop(_exec_credential_handoff);
@@ -1352,55 +1891,411 @@ fn remove_upgrade_plan(path: &Path) -> Result<()> {
     }
 }
 
-pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
-    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
-    let target_version = env!("CARGO_PKG_VERSION").to_owned();
-    let ping = request(ControlRequest::Ping).await?;
-    let source_version = ping
-        .get("version")
-        .and_then(Value::as_str)
-        .context("running supervisor did not report its version; bootstrap by restarting it once with a handoff-capable Temote release")?;
-    let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
+#[derive(Clone, Debug)]
+pub struct InstalledUpgradeExecutable {
+    path: PathBuf,
+    execution: Arc<UpgradeExecutionBinding>,
+    digest: [u8; 32],
+    pub target_version: String,
+}
+
+#[derive(Debug)]
+struct UpgradeExecutionBinding {
+    directory: PathBuf,
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+struct PendingUpgradeSnapshot {
+    directory: PathBuf,
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for PendingUpgradeSnapshot {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+}
+
+impl Drop for UpgradeExecutionBinding {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+impl InstalledUpgradeExecutable {
+    pub(crate) fn digest_hex(&self) -> String {
+        self.digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub(crate) fn execution_fd(&self) -> i32 {
+        self.execution.file.as_raw_fd()
+    }
+
+    pub(crate) fn execution_path(&self) -> &Path {
+        &self.execution.path
+    }
+
+    pub(crate) fn installed_locator(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn create_upgrade_execution_snapshot(
+    source: &mut std::fs::File,
+) -> Result<UpgradeExecutionBinding> {
+    let directory = std::env::temp_dir()
+        .join(format!("temote-mcp-upgrade-candidates-{}", unsafe {
+            libc::geteuid()
+        }));
+    match std::fs::create_dir(&directory) {
+        Ok(()) => std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("cannot create upgrade candidate directory"),
+    }
+    let directory_metadata = std::fs::symlink_metadata(&directory)?;
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        directory_metadata.is_dir()
+            && directory_metadata.uid() == unsafe { libc::geteuid() }
+            && directory_metadata.permissions().mode() & 0o077 == 0,
+        "upgrade candidate directory is not private to the current user"
+    );
+    let snapshot_directory = directory.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&snapshot_directory)
+        .context("cannot create private upgrade execution snapshot directory")?;
+    std::fs::set_permissions(&snapshot_directory, std::fs::Permissions::from_mode(0o700))?;
+    let path = snapshot_directory.join("temote-mcp");
+    let mut cleanup = PendingUpgradeSnapshot {
+        directory: snapshot_directory.clone(),
+        path: path.clone(),
+        armed: true,
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("cannot create private upgrade execution snapshot")?;
+    source.seek(std::io::SeekFrom::Start(0))?;
+    let copied = std::io::copy(
+        &mut source.take(MAX_UPGRADE_EXECUTABLE_BYTES + 1),
+        &mut file,
+    )?;
+    anyhow::ensure!(
+        copied <= MAX_UPGRADE_EXECUTABLE_BYTES,
+        "upgrade executable exceeds bounded identity size"
+    );
+    file.sync_all()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500))?;
+    // Linux rejects exec while any process has the image open for writing.
+    // Retain only a read descriptor once the private snapshot is complete.
+    drop(file);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("cannot reopen private upgrade execution snapshot")?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    cleanup.armed = false;
+    Ok(UpgradeExecutionBinding {
+        directory: snapshot_directory,
+        path,
+        file,
+    })
+}
+
+fn bounded_upgrade_executable_digest(file: &mut std::fs::File) -> Result<[u8; 32]> {
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied += read as u64;
+        anyhow::ensure!(
+            copied <= MAX_UPGRADE_EXECUTABLE_BYTES,
+            "upgrade executable exceeds bounded identity size"
+        );
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub fn capture_installed_upgrade_executable() -> Result<InstalledUpgradeExecutable> {
+    initialize_installed_upgrade_locator()?;
+    let locator = INSTALLED_UPGRADE_LOCATOR
+        .get()
+        .context("installed Temote startup locator is unavailable")?;
+    let path =
+        std::fs::canonicalize(locator).context("cannot resolve installed Temote executable")?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .context("cannot open installed Temote executable")?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "upgrade executable is not a regular file"
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    anyhow::ensure!(mode & 0o111 != 0, "upgrade executable is not executable");
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "upgrade executable is not owned by the current user"
+    );
+    anyhow::ensure!(
+        mode & 0o022 == 0,
+        "upgrade executable is group/world writable"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
+        "upgrade executable exceeds bounded identity size"
+    );
+    let digest = bounded_upgrade_executable_digest(&mut file)?;
+    let mut execution = create_upgrade_execution_snapshot(&mut file)?;
+    let snapshot_digest = bounded_upgrade_executable_digest(&mut execution.file)?;
+    anyhow::ensure!(
+        snapshot_digest == digest,
+        "upgrade execution snapshot identity mismatch"
+    );
+    let mut command = std::process::Command::new(&execution.path);
+    command.args(["supervisor", "--capabilities"]);
+    let output = command
+        .output()
+        .context("failed to inspect installed Temote capabilities")?;
+    anyhow::ensure!(
+        output.status.success() && output.stdout.len() <= 64 * 1024,
+        "installed Temote executable did not report bounded capabilities"
+    );
+    let capabilities: SupervisorCapabilities = serde_json::from_slice(&output.stdout)
+        .context("invalid installed Temote capability response")?;
+    anyhow::ensure!(
+        capabilities.control_protocol == CONTROL_PROTOCOL_VERSION
+            && capabilities.lifecycle_schema == LIFECYCLE_SCHEMA_VERSION
+            && capabilities.upgrade_plan_schema == UPGRADE_PLAN_SCHEMA_VERSION,
+        "installed Temote executable is incompatible with the running lifecycle protocol"
+    );
+    let target_version = capabilities.version;
+    Ok(InstalledUpgradeExecutable {
+        path,
+        execution: Arc::new(execution),
+        digest,
+        target_version,
+    })
+}
+
+pub fn revalidate_installed_upgrade_executable(
+    approved: &InstalledUpgradeExecutable,
+) -> Result<PathBuf> {
+    let current = capture_installed_upgrade_executable()?;
+    anyhow::ensure!(
+        current.path == approved.path
+            && current.digest == approved.digest
+            && current.target_version == approved.target_version,
+        "installed Temote executable changed after approval"
+    );
+    Ok(approved.execution_path().to_owned())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RemoteUpgradePreflight {
+    pub source_version: String,
+    pub target_version: String,
+    pub compatible: bool,
+    pub supervisor_handoff_required: bool,
+    pub planned_session_count: usize,
+    pub blocked_session_count: usize,
+    pub blocker_reasons: Vec<&'static str>,
+    pub direct_ingress_action: String,
+    pub direct_ingress_blocked: bool,
+    pub reconnect_expected: bool,
+    pub plugin_reconciliation_required: bool,
+    pub client_restart_required_if_plugin_replaced: bool,
+    #[serde(skip)]
+    pub(crate) planned_sessions: Vec<crate::upgrade_transaction::UpgradePlannedSession>,
+}
+
+pub async fn remote_upgrade_preflight(
+    executable: &InstalledUpgradeExecutable,
+) -> Result<RemoteUpgradePreflight> {
+    upgrade_preflight_with_force(executable, false).await
+}
+
+fn validate_running_supervisor_upgrade_capabilities(ping: &Value) -> Result<()> {
     anyhow::ensure!(
         ping.get("control_protocol").and_then(Value::as_u64) == Some(CONTROL_PROTOCOL_VERSION),
         "running supervisor control protocol is incompatible; manual supervisor restart is required"
     );
+    anyhow::ensure!(
+        ping.get("lifecycle_schema").and_then(Value::as_u64) == Some(LIFECYCLE_SCHEMA_VERSION),
+        "running supervisor lifecycle schema is incompatible; manual supervisor restart is required"
+    );
+    anyhow::ensure!(
+        ping.get("upgrade_plan_schema").and_then(Value::as_u64)
+            == Some(UPGRADE_PLAN_SCHEMA_VERSION),
+        "running supervisor upgrade plan schema is incompatible; manual supervisor restart is required"
+    );
+    Ok(())
+}
 
-    #[cfg(all(feature = "network", unix))]
-    let ingress_upgrade = crate::lifecycle::prepare_direct_ingress_upgrade(&target_version).await?;
-    #[cfg(all(feature = "network", unix))]
-    if !dry_run && let Some(blocker) = ingress_upgrade.blocker() {
-        anyhow::bail!("direct ingress upgrade blocked before supervisor handoff: {blocker}");
-    }
-
-    let result = request(ControlRequest::Upgrade {
-        executable: executable.clone(),
-        target_version: target_version.clone(),
+async fn upgrade_preflight_with_force(
+    executable: &InstalledUpgradeExecutable,
+    force: bool,
+) -> Result<RemoteUpgradePreflight> {
+    let ping = upgrade_request(ControlRequest::Ping).await?;
+    validate_running_supervisor_upgrade_capabilities(&ping)?;
+    let source_version = ping
+        .get("version")
+        .and_then(Value::as_str)
+        .context("running supervisor did not report its version")?
+        .to_owned();
+    let preview_value = upgrade_request(ControlRequest::Upgrade {
+        executable: executable.execution_path().to_owned(),
+        installed_locator: Some(executable.path.clone()),
+        target_version: executable.target_version.clone(),
         environment: CapturedStartEnvironment::capture(),
-        dry_run,
+        dry_run: true,
         force,
+        expected_sessions: None,
     })
-    .await
-    .with_context(|| {
-        format!(
-            "running supervisor {source_version} does not support safe handoff or rejected the upgrade; bootstrap with one manual supervisor restart if this is the first handoff-capable release"
+    .await?;
+    let preview: crate::supervisor::SupervisorUpgradePreview =
+        serde_json::from_value(preview_value).context("invalid supervisor upgrade preview")?;
+    #[cfg(all(feature = "network", unix))]
+    let ingress =
+        crate::lifecycle::prepare_direct_ingress_upgrade(&executable.target_version).await?;
+    #[cfg(all(feature = "network", unix))]
+    let (direct_ingress_action, direct_ingress_blocked, reconnect_expected) = (
+        ingress.plan().action.clone(),
+        ingress.blocker().is_some(),
+        ingress.plan().action == "restart",
+    );
+    #[cfg(not(all(feature = "network", unix)))]
+    let (direct_ingress_action, direct_ingress_blocked, reconnect_expected) =
+        ("unavailable".to_owned(), false, false);
+    let planned_sessions = preview
+        .active_sessions
+        .iter()
+        .map(
+            |session| crate::upgrade_transaction::UpgradePlannedSession {
+                session_id: session.session_id.clone(),
+                source_process_id: session.process_id,
+                source_started_at: session.started_at,
+            },
         )
-    })?;
+        .collect::<Vec<_>>();
+    Ok(RemoteUpgradePreflight {
+        source_version,
+        target_version: executable.target_version.clone(),
+        compatible: true,
+        supervisor_handoff_required: preview.plan.handoff_required,
+        planned_session_count: planned_sessions.len(),
+        blocked_session_count: preview.blocked_sessions.len(),
+        blocker_reasons: preview
+            .blocked_sessions
+            .iter()
+            .map(|_| "session_not_restorable")
+            .collect(),
+        direct_ingress_action,
+        direct_ingress_blocked,
+        reconnect_expected,
+        plugin_reconciliation_required: true,
+        client_restart_required_if_plugin_replaced: true,
+        planned_sessions,
+    })
+}
 
-    if dry_run {
-        #[cfg(all(feature = "network", unix))]
-        let result = serde_json::json!({
-            "supervisor": result,
-            "ingress": ingress_upgrade.plan(),
-            "plugin": {
-                "action": "reconcile_after_success",
-                "client_restart_required_if_replaced": true
-            }
-        });
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
+pub(crate) async fn verify_planned_upgrade_sessions(
+    planned: &[crate::upgrade_transaction::UpgradePlannedSession],
+    require_source_instance: bool,
+) -> Result<usize> {
+    let active = request_upgrade_session_views()
+        .await?
+        .into_iter()
+        .filter(|view| view.status == "active")
+        .map(|view| crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: view.session_id,
+            source_process_id: view.process_id,
+            source_started_at: view.started_at,
+        })
+        .collect::<Vec<_>>();
+    validate_planned_upgrade_session_identities(planned, &active, require_source_instance)?;
+    Ok(active.len())
+}
+
+fn validate_planned_upgrade_session_identities(
+    planned: &[crate::upgrade_transaction::UpgradePlannedSession],
+    active: &[crate::upgrade_transaction::UpgradePlannedSession],
+    require_source_instance: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        active.len() == planned.len(),
+        "active session set changed after upgrade approval"
+    );
+    let active_by_id = active
+        .iter()
+        .map(|identity| (identity.session_id.as_str(), identity))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for expected in planned {
+        let current = active_by_id
+            .get(expected.session_id.as_str())
+            .with_context(|| "approved session set changed")?;
+        if require_source_instance {
+            anyhow::ensure!(
+                current.source_process_id == expected.source_process_id
+                    && current.source_started_at == expected.source_started_at,
+                "approved session instance changed"
+            );
+        }
     }
+    Ok(())
+}
 
+pub async fn apply_supervisor_upgrade(
+    executable: &Path,
+    installed_locator: &Path,
+    target_version: &str,
+    force: bool,
+    expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
+) -> Result<usize> {
+    let ping = upgrade_request(ControlRequest::Ping).await?;
+    validate_running_supervisor_upgrade_capabilities(&ping)?;
+    let source_version = ping
+        .get("version")
+        .and_then(Value::as_str)
+        .context("running supervisor did not report its version")?
+        .to_owned();
+    let source_pid = ping.get("pid").and_then(Value::as_u64).unwrap_or_default();
+    let source_boot_generation = ping
+        .get("boot_generation")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let result = upgrade_request(ControlRequest::Upgrade {
+        executable: executable.to_owned(),
+        installed_locator: Some(installed_locator.to_owned()),
+        target_version: target_version.to_owned(),
+        environment: CapturedStartEnvironment::capture(),
+        dry_run: false,
+        force,
+        expected_sessions: expected_sessions.map(|sessions| sessions.to_vec()),
+    })
+    .await?;
     let plan_value = result
         .get("plan")
         .cloned()
@@ -1410,104 +2305,160 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         .get("restore_plan_path")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    if !plan.handoff_required {
-        println!("supervisor already runs Temote {target_version}; no handoff required");
-    } else {
+    if plan.handoff_required {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            if let Some(restore_plan_path) = restore_plan_path.as_deref()
-                && let Some(report) = read_upgrade_failure_report(restore_plan_path)?
+            if let Some(path) = restore_plan_path.as_deref()
+                && let Some(report) = read_upgrade_failure_report(path)?
             {
                 anyhow::ensure!(
                     report.source_version == source_version
                         && report.target_version == target_version,
-                    "supervisor upgrade failure report identity does not match the requested handoff"
+                    "supervisor upgrade failure report identity mismatch"
                 );
                 anyhow::bail!(format_upgrade_failure_report(&report));
             }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "supervisor handoff did not become healthy within the bounded verification window; source version={source_version} pid={source_pid}, target version={target_version}"
-                );
-            }
-            match request(ControlRequest::Ping).await {
-                Ok(status)
-                    if status.get("version").and_then(Value::as_str)
-                        == Some(target_version.as_str())
-                        && status.get("pid").and_then(Value::as_u64) == Some(source_pid) =>
-                {
-                    let mut healthy = true;
-                    for session in &plan.sessions {
-                        match request(ControlRequest::Info {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "supervisor handoff verification timed out"
+            );
+            if let Ok(status) = upgrade_request_until(ControlRequest::Ping, deadline).await
+                && supervisor_handoff_identity_changed(
+                    &status,
+                    target_version,
+                    source_pid,
+                    source_boot_generation.as_deref(),
+                )
+            {
+                let mut all_active = true;
+                for session in &plan.sessions {
+                    let active = upgrade_request_until(
+                        ControlRequest::Info {
                             session_id: session.session_id.clone(),
-                        })
-                        .await
-                        {
-                            Ok(view)
-                                if view.get("status").and_then(Value::as_str) == Some("active") => {
-                            }
-                            _ => {
-                                healthy = false;
-                                break;
-                            }
-                        }
-                    }
-                    if healthy {
+                        },
+                        deadline,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                    if active.as_deref() != Some("active") {
+                        all_active = false;
                         break;
                     }
                 }
-                _ => {}
+                if all_active {
+                    return Ok(plan.sessions.len());
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        println!(
-            "supervisor handoff complete: {source_version} -> {target_version}; restored {} session(s); pid={source_pid}",
-            plan.sessions.len()
-        );
     }
+    Ok(plan.sessions.len())
+}
 
+fn supervisor_handoff_identity_changed(
+    status: &Value,
+    target_version: &str,
+    source_pid: u64,
+    source_boot_generation: Option<&str>,
+) -> bool {
+    if status.get("version").and_then(Value::as_str) != Some(target_version)
+        || status.get("pid").and_then(Value::as_u64) != Some(source_pid)
+    {
+        return false;
+    }
+    let Some(target_boot_generation) = status.get("boot_generation").and_then(Value::as_str) else {
+        return false;
+    };
+    !target_boot_generation.is_empty()
+        && source_boot_generation.is_none_or(|source| source != target_boot_generation)
+}
+
+pub fn reconcile_codex_plugin(executable: &Path, installed_locator: &Path) -> Result<()> {
+    let output = codex_plugin_reconcile_command(executable, installed_locator)
+        .output()
+        .context("Codex plugin reconciliation could not start")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Codex plugin reconciliation failed"
+    );
+    Ok(())
+}
+
+fn codex_plugin_reconcile_command(
+    executable: &Path,
+    installed_locator: &Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command
+        .env(INTERNAL_INSTALLED_LOCATOR_ENV, installed_locator)
+        .args(["codex", "plugin", "install"]);
+    command
+}
+
+pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
+    let executable = capture_installed_upgrade_executable()?;
+    let preflight = upgrade_preflight_with_force(&executable, force).await?;
+    if dry_run {
+        println!("{}", serde_json::to_string_pretty(&preflight)?);
+        return Ok(());
+    }
+    let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
+    ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
+    anyhow::ensure!(
+        preflight.blocked_session_count == 0,
+        "upgrade is blocked by {} session(s)",
+        preflight.blocked_session_count
+    );
+    anyhow::ensure!(
+        !preflight.direct_ingress_blocked,
+        "direct ingress upgrade is blocked"
+    );
+    let executable_path = revalidate_installed_upgrade_executable(&executable)?;
+    let restored = apply_supervisor_upgrade(
+        &executable_path,
+        executable.installed_locator(),
+        &executable.target_version,
+        force,
+        None,
+    )
+    .await?;
     #[cfg(all(feature = "network", unix))]
     {
-        let ingress_result =
-            crate::lifecycle::apply_direct_ingress_upgrade(ingress_upgrade, &executable).await?;
-        match ingress_result.action.as_str() {
-            "restarted" => println!(
-                "direct ingress restart complete: profile={} health={}",
-                ingress_result.profile.as_deref().unwrap_or("unknown"),
-                ingress_result.health
-            ),
-            "untouched" => println!(
-                "direct ingress left running: profile={} health={}",
-                ingress_result.profile.as_deref().unwrap_or("unknown"),
-                ingress_result.health
-            ),
-            _ => {}
-        }
+        let executable_path = revalidate_installed_upgrade_executable(&executable)?;
+        let ingress =
+            crate::lifecycle::prepare_direct_ingress_upgrade(&executable.target_version).await?;
+        crate::lifecycle::apply_direct_ingress_upgrade(
+            ingress,
+            &executable_path,
+            executable.installed_locator(),
+        )
+        .await?;
     }
+    let executable_path = revalidate_installed_upgrade_executable(&executable)?;
+    if let Err(error) = reconcile_codex_plugin(&executable_path, executable.installed_locator()) {
+        eprintln!("{error:#}; run `temote-mcp codex plugin install` manually");
+    }
+    println!(
+        "Temote upgrade complete: {} -> {}; restored {restored} session(s)",
+        preflight.source_version, executable.target_version
+    );
+    Ok(())
+}
 
-    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
-    match std::process::Command::new(&executable)
-        .args(["codex", "plugin", "install"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if !text.trim().is_empty() {
-                println!("{}", text.trim());
-            }
-        }
-        Ok(output) => {
-            eprintln!(
-                "Codex plugin reconciliation failed (exit {}); run `temote-mcp codex plugin install` manually. An already-running Codex session must be restarted after plugin replacement.\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(error) => {
-            eprintln!(
-                "Codex plugin reconciliation could not start: {error}; run `temote-mcp codex plugin install` manually. An already-running Codex session must be restarted after plugin replacement."
-            );
-        }
+fn ensure_no_remote_upgrade_owns_runtime(
+    transactions: &[crate::upgrade_transaction::UpgradeTransaction],
+) -> Result<()> {
+    if let Some(active) = crate::upgrade_transaction::active_transactions(transactions).first() {
+        anyhow::bail!(
+            "upgrade transaction {} already owns the runtime",
+            active.transaction_id
+        );
     }
     Ok(())
 }
@@ -1518,59 +2469,9 @@ async fn restart_session(
     environment: CapturedStartEnvironment,
     public: bool,
 ) -> Result<()> {
-    config::validate_session_id(session_id)?;
-    supervisor.reap_finished().await;
-    let session = config::read_session_metadata(session_id).await?;
-    let lifecycle = config::read_session_lifecycle(session_id).await?;
-    if public {
-        anyhow::ensure!(
-            config::session_is_active(session_id).await?,
-            "public session_restart requires an active managed session"
-        );
-        let path = lifecycle
-            .as_ref()
-            .and_then(|state| state.logical_path.as_deref())
-            .context("public managed session has no named-root path")?;
-        supervisor.stop_public(session_id).await?;
-        supervisor
-            .start_public_with_mode_with_environment(
-                path,
-                Some(session_id),
-                session.permission_mode,
-                environment,
-            )
-            .await?;
-    } else {
-        crate::codex_app_server::begin_session_shutdown(&session);
-        if config::session_is_active(session_id).await? {
-            supervisor.stop(session_id).await?;
-        } else {
-            crate::codex_app_server::remove_session(&session).await?;
-        }
-        if let Some(path) = lifecycle
-            .as_ref()
-            .and_then(|state| state.logical_path.as_deref())
-        {
-            supervisor
-                .start_with_mode_with_environment(
-                    path,
-                    Some(session_id),
-                    session.permission_mode,
-                    environment,
-                )
-                .await?;
-        } else {
-            supervisor
-                .start_local_with_mode_with_environment(
-                    &session.cwd,
-                    Some(session_id),
-                    session.permission_mode,
-                    environment,
-                )
-                .await?;
-        }
-    }
-    Ok(())
+    supervisor
+        .restart_with_environment(session_id, environment, public)
+        .await
 }
 
 async fn handle_console_attachment(
@@ -1660,7 +2561,12 @@ async fn run_approval_broker(
 }
 
 async fn request(request: ControlRequest) -> Result<Value> {
-    let mut stream = connect_supervisor().await?;
+    let path = config::supervisor_socket_path()?;
+    request_at_path(&path, request).await
+}
+
+async fn request_at_path(path: &Path, request: ControlRequest) -> Result<Value> {
+    let mut stream = connect_supervisor_at(path).await?;
     stream.write_all(&encode_line(&request)?).await?;
     stream.shutdown().await?;
     let mut reader = BufReader::new(stream);
@@ -1668,6 +2574,624 @@ async fn request(request: ControlRequest) -> Result<Value> {
     let response: ControlResponse =
         serde_json::from_str(line.trim()).context("invalid supervisor response")?;
     ensure_response_ok(response)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn activity_replay(
+    session_id: Option<String>,
+    tail: usize,
+) -> Result<ActivityReplay> {
+    let stream = tokio::time::timeout(CONTROL_READ_TIMEOUT, connect_supervisor())
+        .await
+        .context("timed out connecting to session supervisor")??;
+    activity_replay_on_stream(stream, session_id, tail).await
+}
+
+pub async fn run_activity_command(
+    session_id: Option<String>,
+    tail: usize,
+    follow: bool,
+) -> Result<()> {
+    match run_activity(session_id, tail, follow).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            report_activity_command_error(&error.to_string()).await;
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn report_activity_command_error(error: &str) {
+    let Ok((sender, mut result)) =
+        spawn_activity_writer(libc::STDERR_FILENO, 1, "temote-activity-final-error")
+    else {
+        return;
+    };
+    if queue_activity_line(&sender, format!("Error: {error}"), "activity diagnostics").is_err() {
+        return;
+    }
+    drop(sender);
+    let _ = tokio::time::timeout(Duration::from_millis(100), &mut result).await;
+}
+
+async fn run_activity(session_id: Option<String>, tail: usize, follow: bool) -> Result<()> {
+    if let Some(session_id) = session_id.as_deref() {
+        config::validate_session_id(session_id)?;
+    }
+    let stream = tokio::time::timeout(CONTROL_READ_TIMEOUT, connect_supervisor())
+        .await
+        .context("timed out connecting to session supervisor")??;
+    let mut connection = ActivityClientConnection::attach(stream, session_id, tail, follow).await?;
+    let (output, mut output_result) = spawn_activity_writer(
+        libc::STDOUT_FILENO,
+        MAX_ACTIVITY_OUTPUT_QUEUE,
+        "temote-activity-output",
+    )?;
+    let (diagnostics, diagnostics_result) = spawn_activity_writer(
+        libc::STDERR_FILENO,
+        MAX_ACTIVITY_DIAGNOSTIC_QUEUE,
+        "temote-activity-diagnostics",
+    )?;
+    let mut diagnostics = Some(diagnostics);
+    let mut diagnostics_result = Some(diagnostics_result);
+    queue_activity_diagnostic(
+        &diagnostics,
+        "Attached to best-effort recent activity; this view does not guarantee current state.",
+    )?;
+    if connection.state.attach.history_truncated {
+        queue_activity_diagnostic(
+            &diagnostics,
+            "Retained activity history was truncated before this replay.",
+        )?;
+    }
+    let stdin_monitor = if follow {
+        ActivityStdinMonitor::start()?
+    } else {
+        None
+    };
+    let mut stdin_eof = stdin_monitor.as_ref().map(ActivityStdinMonitor::subscribe);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut cancelled = false;
+    loop {
+        enum ActivityLoopEvent {
+            Cancelled,
+            Stdin(Result<()>),
+            Output(Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>),
+            Diagnostics(Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>),
+            Frame(Result<Option<ActivityClientFrame>>),
+        }
+        let event = if follow {
+            tokio::select! {
+                biased;
+                signal = &mut ctrl_c => {
+                    signal.context("failed to receive Ctrl-C")?;
+                    ActivityLoopEvent::Cancelled
+                }
+                stdin = wait_for_tty_eof(&mut stdin_eof) => ActivityLoopEvent::Stdin(stdin),
+                status = &mut output_result => ActivityLoopEvent::Output(status),
+                status = wait_for_activity_diagnostics(&mut diagnostics_result) => ActivityLoopEvent::Diagnostics(status),
+                frame = connection.next_frame() => ActivityLoopEvent::Frame(frame),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                signal = &mut ctrl_c => {
+                    signal.context("failed to receive Ctrl-C")?;
+                    ActivityLoopEvent::Cancelled
+                }
+                status = &mut output_result => ActivityLoopEvent::Output(status),
+                status = wait_for_activity_diagnostics(&mut diagnostics_result) => ActivityLoopEvent::Diagnostics(status),
+                frame = connection.next_frame() => ActivityLoopEvent::Frame(frame),
+            }
+        };
+        let frame = match event {
+            ActivityLoopEvent::Cancelled => {
+                cancelled = true;
+                break;
+            }
+            ActivityLoopEvent::Stdin(status) => {
+                status?;
+                cancelled = true;
+                break;
+            }
+            ActivityLoopEvent::Output(status) => return finish_early_activity_output(status),
+            ActivityLoopEvent::Diagnostics(status) => match status {
+                Ok(ActivityOutputStatus::Complete | ActivityOutputStatus::BrokenPipe) => {
+                    diagnostics = None;
+                    diagnostics_result = None;
+                    continue;
+                }
+                Ok(ActivityOutputStatus::Failed) | Err(_) => {
+                    return Err(anyhow::anyhow!("activity diagnostics failed"));
+                }
+            },
+            ActivityLoopEvent::Frame(frame) => frame?,
+        };
+        let Some(frame) = frame else {
+            if follow {
+                queue_activity_diagnostic(
+                    &diagnostics,
+                    "Activity stream disconnected; rerun `temote-mcp activity` to reconnect.",
+                )?;
+                break;
+            }
+            return Err(anyhow::anyhow!("activity stream ended before activity_end"));
+        };
+        match frame {
+            ActivityClientFrame::Event(event) => {
+                let timestamp = format_local_activity_timestamp(event.timestamp_ms())?;
+                let line = render_event(&event, &timestamp)?;
+                match output.try_send(line) {
+                    Ok(()) => {}
+                    Err(std_mpsc::TrySendError::Full(_)) => {
+                        return Err(anyhow::anyhow!("activity output queue is full"));
+                    }
+                    Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                        return finish_early_activity_output((&mut output_result).await);
+                    }
+                }
+            }
+            ActivityClientFrame::End => {
+                if connection.state.attach.replayed == 0 {
+                    queue_activity_diagnostic(
+                        &diagnostics,
+                        "No matching recent activity was retained.",
+                    )?;
+                }
+                if !follow {
+                    break;
+                }
+            }
+            ActivityClientFrame::Gap {
+                after_sequence,
+                through_sequence,
+                dropped,
+            } => queue_activity_diagnostic(
+                &diagnostics,
+                &format!(
+                    "Activity gap across all sessions after sequence {after_sequence} through {through_sequence} ({dropped} events); rerun to replay retained history."
+                ),
+            )?,
+        }
+    }
+    drop(stdin_monitor);
+    drop(output);
+    drop(diagnostics);
+    let drain = tokio::time::timeout(ACTIVITY_OUTPUT_TIMEOUT, async {
+        let output = (&mut output_result).await;
+        let diagnostics = match diagnostics_result.as_mut() {
+            Some(receiver) => Some(receiver.await),
+            None => None,
+        };
+        (output, diagnostics)
+    });
+    tokio::pin!(drain);
+    if cancelled {
+        let _ = (&mut drain).await;
+        return Ok(());
+    }
+    let drained = tokio::select! {
+        biased;
+        signal = &mut ctrl_c => {
+            signal.context("failed to receive Ctrl-C")?;
+            cancelled = true;
+            None
+        }
+        drained = &mut drain => Some(drained),
+    };
+    if cancelled {
+        return Ok(());
+    }
+    match drained.expect("activity drain result missing without cancellation") {
+        Ok((output_status, diagnostics_status)) => {
+            let output_status = normalize_activity_output_status(output_status)?;
+            if output_status == ActivityOutputStatus::BrokenPipe {
+                return Ok(());
+            }
+            if let Some(status) = diagnostics_status {
+                match normalize_activity_output_status(status)? {
+                    ActivityOutputStatus::Complete | ActivityOutputStatus::BrokenPipe => {}
+                    ActivityOutputStatus::Failed => {
+                        return Err(anyhow::anyhow!("activity diagnostics failed"));
+                    }
+                }
+            }
+            match output_status {
+                ActivityOutputStatus::Complete => Ok(()),
+                ActivityOutputStatus::BrokenPipe => Ok(()),
+                ActivityOutputStatus::Failed => Err(anyhow::anyhow!("activity output failed")),
+            }
+        }
+        Err(_) => Err(anyhow::anyhow!("activity output drain timed out")),
+    }
+}
+
+async fn wait_for_activity_diagnostics(
+    receiver: &mut Option<tokio::sync::oneshot::Receiver<ActivityOutputStatus>>,
+) -> Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_for_tty_eof(
+    receiver: &mut Option<tokio::sync::oneshot::Receiver<ActivityStdinStatus>>,
+) -> Result<()> {
+    match receiver {
+        Some(receiver) => match receiver.await {
+            Ok(ActivityStdinStatus::Eof) => Ok(()),
+            Ok(ActivityStdinStatus::Failed) | Err(_) => {
+                Err(anyhow::anyhow!("activity stdin monitor failed"))
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+fn finish_early_activity_output(
+    status: Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>,
+) -> Result<()> {
+    match status {
+        Ok(ActivityOutputStatus::Complete | ActivityOutputStatus::BrokenPipe) => Ok(()),
+        Ok(ActivityOutputStatus::Failed) | Err(_) => Err(anyhow::anyhow!("activity output failed")),
+    }
+}
+
+fn normalize_activity_output_status(
+    status: Result<ActivityOutputStatus, tokio::sync::oneshot::error::RecvError>,
+) -> Result<ActivityOutputStatus> {
+    status.map_err(|_| anyhow::anyhow!("activity output failed"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityOutputStatus {
+    Complete,
+    BrokenPipe,
+    Failed,
+}
+
+fn spawn_activity_writer(
+    target_fd: RawFd,
+    capacity: usize,
+    thread_name: &'static str,
+) -> Result<(
+    std_mpsc::SyncSender<String>,
+    tokio::sync::oneshot::Receiver<ActivityOutputStatus>,
+)> {
+    let fd = unsafe { libc::dup(target_fd) };
+    if fd < 0 {
+        return Err(anyhow::anyhow!("activity output is unavailable"));
+    }
+    let (sender, receiver) = std_mpsc::sync_channel::<String>(capacity);
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let result_sender = Arc::new(std::sync::Mutex::new(Some(result_sender)));
+    let (watchdog_sender, watchdog_receiver) = std_mpsc::channel();
+    let watchdog_result = Arc::clone(&result_sender);
+    std::thread::Builder::new()
+        .name(format!("{thread_name}-watchdog"))
+        .spawn(move || {
+            while watchdog_receiver.recv().is_ok() {
+                match watchdog_receiver.recv_timeout(ACTIVITY_OUTPUT_TIMEOUT) {
+                    Ok(()) => {}
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        send_activity_output_status(&watchdog_result, ActivityOutputStatus::Failed);
+                        return;
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        })
+        .map_err(|_| anyhow::anyhow!("activity output is unavailable"))?;
+    let output = unsafe { std::fs::File::from_raw_fd(fd) };
+    let writer_result = Arc::clone(&result_sender);
+    std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            let fd = output.as_raw_fd();
+            let mut status = ActivityOutputStatus::Complete;
+            while let Ok(mut line) = receiver.recv() {
+                line.push('\n');
+                if watchdog_sender.send(()).is_err() {
+                    status = ActivityOutputStatus::Failed;
+                    break;
+                }
+                status = write_activity_output_line(fd, line.as_bytes(), ACTIVITY_OUTPUT_TIMEOUT);
+                let _ = watchdog_sender.send(());
+                if status != ActivityOutputStatus::Complete {
+                    break;
+                }
+            }
+            send_activity_output_status(&writer_result, status);
+        })
+        .map_err(|_| anyhow::anyhow!("activity output is unavailable"))?;
+    Ok((sender, result_receiver))
+}
+
+fn send_activity_output_status(
+    sender: &std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ActivityOutputStatus>>>,
+    status: ActivityOutputStatus,
+) {
+    if let Some(sender) = sender
+        .lock()
+        .expect("activity output status lock poisoned")
+        .take()
+    {
+        let _ = sender.send(status);
+    }
+}
+
+fn queue_activity_line(
+    sender: &std_mpsc::SyncSender<String>,
+    line: String,
+    label: &str,
+) -> Result<()> {
+    match sender.try_send(line) {
+        Ok(()) => Ok(()),
+        Err(std_mpsc::TrySendError::Full(_)) => Err(anyhow::anyhow!("{label} queue is full")),
+        Err(std_mpsc::TrySendError::Disconnected(_)) => {
+            Err(anyhow::anyhow!("{label} is unavailable"))
+        }
+    }
+}
+
+fn queue_activity_diagnostic(
+    sender: &Option<std_mpsc::SyncSender<String>>,
+    line: &str,
+) -> Result<()> {
+    match sender {
+        Some(sender) => queue_activity_line(sender, line.to_owned(), "activity diagnostics"),
+        None => Ok(()),
+    }
+}
+
+fn write_activity_output_line(fd: RawFd, bytes: &[u8], timeout: Duration) -> ActivityOutputStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut written = 0;
+    while written < bytes.len() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return ActivityOutputStatus::Failed;
+        }
+        let remaining = deadline.duration_since(now);
+        let timeout_ms = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if polled == 0 {
+            return ActivityOutputStatus::Failed;
+        }
+        if polled < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ActivityOutputStatus::Failed;
+        }
+        let count =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return ActivityOutputStatus::BrokenPipe;
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return ActivityOutputStatus::Failed;
+        }
+        if count == 0 {
+            return ActivityOutputStatus::Failed;
+        }
+        written += count as usize;
+    }
+    ActivityOutputStatus::Complete
+}
+
+struct ActivityStdinMonitor {
+    stop: Arc<AtomicBool>,
+    eof: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<ActivityStdinStatus>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityStdinStatus {
+    Eof,
+    Failed,
+}
+
+impl ActivityStdinMonitor {
+    fn start() -> Result<Option<Self>> {
+        if !should_monitor_activity_stdin(true, std::io::stdin().is_terminal()) {
+            return Ok(None);
+        }
+        let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+        if fd < 0 {
+            return Err(anyhow::anyhow!("activity stdin monitor is unavailable"));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (eof_sender, eof_receiver) = tokio::sync::oneshot::channel();
+        let input = unsafe { std::fs::File::from_raw_fd(fd) };
+        std::thread::Builder::new()
+            .name("temote-activity-stdin".to_owned())
+            .spawn(move || {
+                let fd = input.as_raw_fd();
+                let mut byte = [0_u8; 1];
+                while !thread_stop.load(Ordering::Acquire) {
+                    let mut poll_fd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let polled = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+                    if polled < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        let _ = eof_sender.send(ActivityStdinStatus::Failed);
+                        return;
+                    }
+                    if polled == 0 {
+                        continue;
+                    }
+                    let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+                    if read == 0 {
+                        let _ = eof_sender.send(ActivityStdinStatus::Eof);
+                        return;
+                    }
+                    if read < 0
+                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        let _ = eof_sender.send(ActivityStdinStatus::Failed);
+                        return;
+                    }
+                }
+            })
+            .map_err(|_| anyhow::anyhow!("activity stdin monitor is unavailable"))?;
+        Ok(Some(Self {
+            stop,
+            eof: std::sync::Mutex::new(Some(eof_receiver)),
+        }))
+    }
+
+    fn subscribe(&self) -> tokio::sync::oneshot::Receiver<ActivityStdinStatus> {
+        self.eof
+            .lock()
+            .expect("activity stdin monitor lock poisoned")
+            .take()
+            .unwrap_or_else(|| {
+                let (_sender, receiver) = tokio::sync::oneshot::channel();
+                receiver
+            })
+    }
+}
+
+fn should_monitor_activity_stdin(follow: bool, is_terminal: bool) -> bool {
+    follow && is_terminal
+}
+
+impl Drop for ActivityStdinMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn format_local_activity_timestamp(timestamp_ms: u64) -> Result<String> {
+    let seconds: libc::time_t = (timestamp_ms / 1000)
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid activity timestamp"))?;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let converted = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+    if converted.is_null() {
+        return Err(anyhow::anyhow!("invalid activity timestamp"));
+    }
+    let local = unsafe { local.assume_init() };
+    let offset = local.tm_gmtoff;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let absolute_offset = offset.unsigned_abs();
+    let offset_hours = absolute_offset / 3600;
+    let offset_minutes = (absolute_offset % 3600) / 60;
+    Ok(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} {sign}{offset_hours:02}:{offset_minutes:02}",
+        local.tm_year + 1900,
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec,
+        timestamp_ms % 1000,
+    ))
+}
+
+async fn activity_replay_on_stream(
+    stream: UnixStream,
+    session_id: Option<String>,
+    tail: usize,
+) -> Result<ActivityReplay> {
+    let mut connection = ActivityClientConnection::attach(stream, session_id, tail, false).await?;
+    let mut events = Vec::with_capacity(connection.state.attach.replayed);
+    loop {
+        match connection.next_frame().await? {
+            Some(ActivityClientFrame::Event(event)) => events.push(event),
+            Some(ActivityClientFrame::End) => {
+                return Ok(ActivityReplay {
+                    generation: connection.state.attach.generation,
+                    snapshot_sequence: connection.state.attach.snapshot_sequence,
+                    history_truncated: connection.state.attach.history_truncated,
+                    events,
+                });
+            }
+            Some(ActivityClientFrame::Gap { .. }) => {
+                return Err(anyhow::anyhow!("activity gap arrived before replay end"));
+            }
+            None => return Err(anyhow::anyhow!("activity stream ended before activity_end")),
+        }
+    }
+}
+
+fn decode_activity_attach_response(response: &str, tail: usize) -> Result<ActivityAttachResult> {
+    let response: ActivityAttachResponse = serde_json::from_str(response.trim_end_matches('\n'))
+        .map_err(|_| anyhow::anyhow!("invalid activity attach response"))?;
+    if !response.ok {
+        anyhow::ensure!(
+            response.result.is_none() && response.error.is_some(),
+            "invalid activity attach response"
+        );
+        return Err(anyhow::anyhow!("activity attachment rejected"));
+    }
+    anyhow::ensure!(response.error.is_none(), "invalid activity attach response");
+    let attach = response
+        .result
+        .context("invalid activity attach response")?;
+    anyhow::ensure!(
+        attach.control_protocol == CONTROL_PROTOCOL_VERSION,
+        "unsupported supervisor control protocol"
+    );
+    anyhow::ensure!(
+        attach.activity_schema == ACTIVITY_SCHEMA_VERSION,
+        "unsupported activity schema"
+    );
+    anyhow::ensure!(attach.replayed <= tail, "invalid activity replay count");
+    Ok(attach)
+}
+
+async fn read_activity_client_line<R>(reader: &mut R, label: &str) -> Result<String>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, read_line_limited(reader, label))
+        .await
+        .with_context(|| format!("timed out waiting for {label}"))?
+}
+
+async fn upgrade_request(request: ControlRequest) -> Result<Value> {
+    upgrade_request_until(
+        request,
+        tokio::time::Instant::now() + UPGRADE_CONTROL_RPC_TIMEOUT,
+    )
+    .await
+}
+
+async fn upgrade_request_until(
+    request: ControlRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    let path = config::supervisor_socket_path()?;
+    upgrade_request_at_path_until(&path, request, deadline).await
+}
+
+async fn upgrade_request_at_path_until(
+    path: &Path,
+    request: ControlRequest,
+    deadline: tokio::time::Instant,
+) -> Result<Value> {
+    tokio::time::timeout_at(deadline, request_at_path(path, request))
+        .await
+        .map_err(|_| anyhow::anyhow!("supervisor upgrade control request timed out"))?
 }
 
 fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
@@ -1684,7 +3208,11 @@ fn ensure_response_ok(response: ControlResponse) -> Result<Value> {
 
 async fn connect_supervisor() -> Result<UnixStream> {
     let path = config::supervisor_socket_path()?;
-    UnixStream::connect(&path).await.with_context(|| {
+    connect_supervisor_at(&path).await
+}
+
+async fn connect_supervisor_at(path: &Path) -> Result<UnixStream> {
+    UnixStream::connect(path).await.with_context(|| {
         format!(
             "Temote session supervisor is not running at {}; run `temote-mcp supervisor` first",
             path.display()
@@ -1998,6 +3526,11 @@ async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<Sessio
 
 pub(crate) async fn request_session_views() -> Result<Vec<SessionView>> {
     let result = request(ControlRequest::List).await?;
+    serde_json::from_value(result).context("invalid supervisor session list response")
+}
+
+async fn request_upgrade_session_views() -> Result<Vec<SessionView>> {
+    let result = upgrade_request(ControlRequest::List).await?;
     serde_json::from_value(result).context("invalid supervisor session list response")
 }
 
@@ -2413,19 +3946,23 @@ fn encode_line<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn read_stream_line(stream: &mut UnixStream, label: &str) -> Result<String> {
+async fn read_control_request(stream: &mut UnixStream) -> Result<(String, bool)> {
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let read = BufReader::new(stream)
+    let read = (&mut reader)
         .take((MAX_CONTROL_MESSAGE_BYTES + 1) as u64)
         .read_line(&mut line)
         .await
-        .with_context(|| format!("failed to read {label}"))?;
-    anyhow::ensure!(read > 0, "{label} closed before a message");
+        .context("failed to read supervisor control request")?;
+    anyhow::ensure!(
+        read > 0,
+        "supervisor control request closed before a message"
+    );
     anyhow::ensure!(
         read <= MAX_CONTROL_MESSAGE_BYTES,
-        "{label} exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
+        "supervisor control request exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes"
     );
-    Ok(line)
+    Ok((line, !reader.buffer().is_empty()))
 }
 
 async fn read_line_limited<R>(reader: &mut R, label: &str) -> Result<String>
@@ -2460,6 +3997,141 @@ mod tests {
     use super::*;
     use crate::approvals;
     use crate::test_support;
+    use temote_mcp::activity::contract::{
+        ActivityOperation, ActivityState, ActivitySummary, ActivityUpdate,
+    };
+    use temote_mcp::activity::history::{ActivityHistory, MAX_ACTIVITY_HISTORY_BYTES};
+    use uuid::Uuid;
+
+    const ACTIVITY_TEST_GENERATION: Uuid =
+        Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0701);
+    const ACTIVITY_TEST_INSTANCE: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0702);
+
+    fn stalled_control_listener(
+        socket_path: &Path,
+    ) -> (tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_by_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            accepted_by_server.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        (server, accepted)
+    }
+
+    #[tokio::test]
+    async fn upgrade_control_rpc_times_out_when_private_listener_stalls() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("control.sock");
+        let (server, accepted) = stalled_control_listener(&socket_path);
+
+        let error = upgrade_request_at_path_until(
+            &socket_path,
+            ControlRequest::Ping,
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(accepted.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("timed out"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn upgrade_control_rpc_timeout_releases_admission_and_transaction_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("control.sock");
+        let (server, accepted) = stalled_control_listener(&socket_path);
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+
+        let error = async {
+            let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
+            let _transaction =
+                crate::upgrade_transaction::acquire_transaction_lock(&transaction_id)?;
+            upgrade_request_at_path_until(
+                &socket_path,
+                ControlRequest::List,
+                tokio::time::Instant::now() + Duration::from_millis(200),
+            )
+            .await
+        }
+        .await
+        .unwrap_err();
+
+        assert!(accepted.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let admission = crate::upgrade_transaction::acquire_admission_lock().unwrap();
+        let transaction =
+            crate::upgrade_transaction::acquire_transaction_lock(&transaction_id).unwrap();
+        let transaction_lock_path = transaction.path().to_owned();
+        drop(transaction);
+        drop(admission);
+        std::fs::remove_file(transaction_lock_path).unwrap();
+        server.abort();
+    }
+
+    fn activity_test_broker(broadcast_capacity: usize) -> Arc<ActivityBroker> {
+        Arc::new(
+            ActivityBroker::with_limits(
+                ActivityHistory::with_limits(32, MAX_ACTIVITY_HISTORY_BYTES).unwrap(),
+                broadcast_capacity,
+                16,
+                || 1_780_000_000_000,
+                ACTIVITY_TEST_GENERATION,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn activity_test_update(operation_id: u128) -> ActivityUpdate {
+        ActivityUpdate::new(
+            Uuid::from_u128(operation_id),
+            ActivityOperation::ReadFile,
+            ActivityState::Started,
+            None,
+            ActivitySummary::empty(),
+        )
+        .unwrap()
+    }
+
+    fn activity_test_frame(sequence: u64, session_id: Option<&str>) -> String {
+        let mut frame = json!({
+            "type": "activity",
+            "event": {
+                "schema_version": ACTIVITY_SCHEMA_VERSION,
+                "sequence": sequence,
+                "operation_id": Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_7000 + u128::from(sequence)),
+                "timestamp_ms": 1_780_000_000_000_u64,
+                "session_id": session_id,
+                "session_instance": Value::Null,
+                "operation": "read_file",
+                "state": "started",
+                "duration_ms": Value::Null,
+                "safe_summary": "",
+            }
+        })
+        .to_string();
+        frame.push('\n');
+        frame
+    }
+
+    async fn read_activity_test_json<R>(reader: &mut R) -> Value
+    where
+        R: AsyncBufReadExt + Unpin,
+    {
+        let line = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_line_limited(reader, "activity test response"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!line.is_empty(), "activity response closed unexpectedly");
+        serde_json::from_str(line.trim()).unwrap()
+    }
 
     fn fixture() -> (tempfile::TempDir, NamedRoots) {
         let temp = tempfile::tempdir().unwrap();
@@ -2539,11 +4211,767 @@ mod tests {
             .unwrap();
         assert_eq!(result["status"], "active");
         assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            result["boot_generation"],
+            crate::boot_identity::generation()
+        );
         assert_eq!(result["pid"], std::process::id());
         assert_eq!(result["control_protocol"], CONTROL_PROTOCOL_VERSION);
         assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
         assert_eq!(result["upgrade_plan_schema"], UPGRADE_PLAN_SCHEMA_VERSION);
         assert_eq!(result["roots_configured"], true);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_replays_filtered_tail_and_sends_one_end_marker() {
+        let broker = activity_test_broker(8);
+        broker
+            .publish(
+                activity_test_update(0x7001),
+                Some("other"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        broker
+            .publish(
+                activity_test_update(0x7002),
+                Some("target"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_activity_attachment(
+            server,
+            Arc::clone(&broker),
+            AttachActivityRequest {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                session_id: Some("target".to_owned()),
+                tail: 100,
+                follow: false,
+            },
+        ));
+        let mut reader = BufReader::new(client);
+
+        let response = read_activity_test_json(&mut reader).await;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["control_protocol"], 2);
+        assert_eq!(response["result"]["activity_schema"], 1);
+        assert_eq!(
+            response["result"]["generation"],
+            ACTIVITY_TEST_GENERATION.to_string()
+        );
+        assert_eq!(response["result"]["snapshot_sequence"], 2);
+        assert_eq!(response["result"]["replayed"], 1);
+        assert_eq!(response["result"]["history_truncated"], false);
+        let event = read_activity_test_json(&mut reader).await;
+        assert_eq!(event["type"], "activity");
+        assert_eq!(event["event"]["sequence"], 2);
+        assert_eq!(event["event"]["session_id"], "target");
+        let end = read_activity_test_json(&mut reader).await;
+        assert_eq!(
+            end,
+            json!({
+                "type": "activity_end",
+                "snapshot_sequence": 2,
+                "history_truncated": false,
+            })
+        );
+        assert_eq!(
+            read_line_limited(&mut reader, "activity eof")
+                .await
+                .unwrap(),
+            ""
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_follows_live_events_and_any_input_detaches_only_viewer() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let broker = supervisor.activity_broker();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(
+                &encode_line(&ControlRequest::AttachActivity(AttachActivityRequest {
+                    schema_version: ACTIVITY_SCHEMA_VERSION,
+                    session_id: None,
+                    tail: 0,
+                    follow: true,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_activity_test_json(&mut reader).await["ok"], true);
+        assert_eq!(
+            read_activity_test_json(&mut reader).await["type"],
+            "activity_end"
+        );
+
+        broker
+            .publish(
+                activity_test_update(0x7010),
+                Some("target"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        let event = read_activity_test_json(&mut reader).await;
+        assert_eq!(event["event"]["sequence"], 1);
+
+        writer
+            .write_all(b"{\"command\":\"stop\",\"session_id\":\"target\"}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_line_limited(&mut reader, "activity eof")
+                .await
+                .unwrap(),
+            ""
+        );
+        assert_eq!(broker.subscribe_snapshot(None, 0).unwrap().cutoff(), 1);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_reports_global_broadcast_gap_before_next_event() {
+        let broker = activity_test_broker(2);
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_activity_attachment(
+            server,
+            Arc::clone(&broker),
+            AttachActivityRequest {
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                session_id: None,
+                tail: 0,
+                follow: true,
+            },
+        ));
+        let (reader, writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+        assert_eq!(read_activity_test_json(&mut reader).await["ok"], true);
+        assert_eq!(
+            read_activity_test_json(&mut reader).await["type"],
+            "activity_end"
+        );
+
+        for operation_id in 0x7020..0x7024 {
+            broker
+                .publish(
+                    activity_test_update(operation_id),
+                    Some("target"),
+                    Some(ACTIVITY_TEST_INSTANCE),
+                )
+                .unwrap();
+        }
+        let gap = read_activity_test_json(&mut reader).await;
+        assert_eq!(
+            gap,
+            json!({
+                "type": "activity_gap",
+                "scope": "all_sessions",
+                "after_sequence": 0,
+                "through_sequence": 2,
+                "dropped": 2,
+            })
+        );
+        assert_eq!(
+            read_activity_test_json(&mut reader).await["event"]["sequence"],
+            3
+        );
+        drop(writer);
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn activity_attachment_request_is_strict_without_changing_legacy_variants() {
+        let request: ControlRequest = serde_json::from_str(
+            r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":100,"follow":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(request, ControlRequest::AttachActivity(_)));
+        assert!(
+            serde_json::from_str::<ControlRequest>(
+                r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":100,"follow":true,"extra":false}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ControlRequest>(
+                r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":100,"tail":101,"follow":true}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ControlRequest>(r#"{"command":"list","extra":true}"#).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_parse_errors_never_echo_values_or_unknown_keys() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let (registration, _registrations) = mpsc::channel(2);
+        for request in [
+            r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":"value-sentinel","follow":true}"#,
+            r#"{"command":"attach_activity","schema_version":1,"session_id":null,"tail":0,"follow":true,"key-sentinel":"value-sentinel"}"#,
+        ] {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let error =
+                handle_control_connection(server, Arc::clone(&supervisor), registration.clone())
+                    .await
+                    .unwrap_err();
+            let logged = format!("{error:#}");
+            assert_eq!(logged, "invalid control request");
+            assert!(!logged.contains("sentinel"));
+        }
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_rejects_unknown_schema_with_bounded_response() {
+        let broker = activity_test_broker(8);
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_activity_attachment(
+            server,
+            broker,
+            AttachActivityRequest {
+                schema_version: ACTIVITY_SCHEMA_VERSION + 1,
+                session_id: None,
+                tail: 0,
+                follow: false,
+            },
+        ));
+        let mut reader = BufReader::new(client);
+        let response = read_activity_test_json(&mut reader).await;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["result"], Value::Null);
+        assert_eq!(response["error"], "unsupported activity schema");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_no_follow_keeps_write_half_until_valid_replay_end() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        supervisor
+            .activity_broker()
+            .publish(
+                activity_test_update(0x7080),
+                Some("target"),
+                Some(ACTIVITY_TEST_INSTANCE),
+            )
+            .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+
+        let replay = activity_replay_on_stream(client, Some("target".to_owned()), 1)
+            .await
+            .unwrap();
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.events[0].sequence(), 1);
+        assert_eq!(replay.snapshot_sequence, 1);
+        assert!(!replay.history_truncated);
+        assert_eq!(
+            replay.generation,
+            supervisor
+                .activity_broker()
+                .subscribe_snapshot(None, 0)
+                .unwrap()
+                .generation()
+        );
+        task.await.unwrap().unwrap();
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_rejects_eof_before_replay_end() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            assert!(
+                read_line_limited(&mut reader, "activity request")
+                    .await
+                    .unwrap()
+                    .contains("attach_activity")
+            );
+            writer
+                .write_all(
+                    &encode_line(&json!({
+                        "ok": true,
+                        "result": {
+                            "control_protocol": 2,
+                            "activity_schema": 1,
+                            "generation": ACTIVITY_TEST_GENERATION,
+                            "snapshot_sequence": 0,
+                            "replayed": 0,
+                            "history_truncated": false,
+                        },
+                        "error": Value::Null,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let error = activity_replay_on_stream(client, None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "activity stream ended before activity_end"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_rejects_incompatible_metadata_before_frames() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            let _ = read_line_limited(&mut reader, "activity request")
+                .await
+                .unwrap();
+            writer
+                .write_all(
+                    &encode_line(&json!({
+                        "ok": true,
+                        "result": {
+                            "control_protocol": 2,
+                            "activity_schema": 2,
+                            "generation": ACTIVITY_TEST_GENERATION,
+                            "snapshot_sequence": 0,
+                            "replayed": 0,
+                            "history_truncated": false,
+                        },
+                        "error": Value::Null,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let error = activity_replay_on_stream(client, None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unsupported activity schema");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_client_strict_handshake_never_echoes_peer_errors() {
+        let duplicate_metadata = concat!(
+            "{\"ok\":true,\"result\":{",
+            "\"control_protocol\":2,\"control_protocol\":2,\"activity_schema\":1,",
+            "\"generation\":\"00000000-0000-4000-8000-000000000701\",",
+            "\"snapshot_sequence\":0,\"replayed\":0,\"history_truncated\":false},",
+            "\"error\":null}\n"
+        );
+        let malicious_error =
+            "{\"ok\":false,\"result\":null,\"error\":\"secret-sentinel\\u001b[31m\"}\n";
+        let missing_error = concat!(
+            "{\"ok\":true,\"result\":{",
+            "\"control_protocol\":2,\"activity_schema\":1,",
+            "\"generation\":\"00000000-0000-4000-8000-000000000701\",",
+            "\"snapshot_sequence\":0,\"replayed\":0,\"history_truncated\":false}}\n"
+        );
+        let missing_result = "{\"ok\":false,\"error\":\"unavailable\"}\n";
+        for (response, expected) in [
+            (duplicate_metadata, "invalid activity attach response"),
+            (malicious_error, "activity attachment rejected"),
+            (missing_error, "invalid activity attach response"),
+            (missing_result, "invalid activity attach response"),
+        ] {
+            let (server, client) = UnixStream::pair().unwrap();
+            let response = response.as_bytes().to_vec();
+            let server_task = tokio::spawn(async move {
+                let (reader, mut writer) = server.into_split();
+                let mut reader = BufReader::new(reader);
+                let _ = read_line_limited(&mut reader, "activity request")
+                    .await
+                    .unwrap();
+                writer.write_all(&response).await.unwrap();
+            });
+            let error = activity_replay_on_stream(client, None, 0)
+                .await
+                .unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert_eq!(diagnostic, expected);
+            assert!(!diagnostic.contains("sentinel"));
+            assert!(!diagnostic.contains('\u{1b}'));
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_client_uses_strict_event_decoder() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            let _ = read_line_limited(&mut reader, "activity request")
+                .await
+                .unwrap();
+            writer
+                .write_all(
+                    &encode_line(&json!({
+                        "ok": true,
+                        "result": {
+                            "control_protocol": 2,
+                            "activity_schema": 1,
+                            "generation": ACTIVITY_TEST_GENERATION,
+                            "snapshot_sequence": 1,
+                            "replayed": 1,
+                            "history_truncated": false,
+                        },
+                        "error": Value::Null,
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let duplicate_sequence = concat!(
+                "{\"type\":\"activity\",\"event\":{",
+                "\"schema_version\":1,\"sequence\":1,\"sequence\":1,",
+                "\"operation_id\":\"00000000-0000-4000-8000-000000007080\",",
+                "\"timestamp_ms\":1780000000000,\"session_id\":null,",
+                "\"session_instance\":null,\"operation\":\"read_file\",",
+                "\"state\":\"started\",\"duration_ms\":null,\"safe_summary\":\"\"}}\n"
+            );
+            writer
+                .write_all(duplicate_sequence.as_bytes())
+                .await
+                .unwrap();
+        });
+        let error = activity_replay_on_stream(client, None, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "invalid activity replay frame");
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn activity_cli_local_time_is_single_line_and_preserves_milliseconds() {
+        let formatted = format_local_activity_timestamp(1_780_000_000_123).unwrap();
+        assert_eq!(formatted.len(), 30);
+        assert_eq!(&formatted[19..23], ".123");
+        assert!(matches!(formatted.as_bytes()[24], b'+' | b'-'));
+        assert_eq!(&formatted[27..28], ":");
+        assert!(!formatted.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn activity_cli_stdin_policy_ignores_non_tty_and_all_no_follow_input() {
+        assert!(!should_monitor_activity_stdin(false, false));
+        assert!(!should_monitor_activity_stdin(false, true));
+        assert!(!should_monitor_activity_stdin(true, false));
+        assert!(should_monitor_activity_stdin(true, true));
+
+        assert!(activity_frame_read_has_timeout(false, false));
+        assert!(activity_frame_read_has_timeout(false, true));
+        assert!(activity_frame_read_has_timeout(true, false));
+        assert!(!activity_frame_read_has_timeout(true, true));
+    }
+
+    #[tokio::test]
+    async fn activity_cli_stdin_monitor_distinguishes_eof_from_failure() {
+        let (eof_sender, eof_receiver) = tokio::sync::oneshot::channel();
+        eof_sender.send(ActivityStdinStatus::Eof).unwrap();
+        let mut eof = Some(eof_receiver);
+        wait_for_tty_eof(&mut eof).await.unwrap();
+
+        let (failed_sender, failed_receiver) = tokio::sync::oneshot::channel();
+        failed_sender.send(ActivityStdinStatus::Failed).unwrap();
+        let mut failed = Some(failed_receiver);
+        assert_eq!(
+            wait_for_tty_eof(&mut failed).await.unwrap_err().to_string(),
+            "activity stdin monitor failed"
+        );
+
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        drop(closed_sender);
+        let mut closed = Some(closed_receiver);
+        assert_eq!(
+            wait_for_tty_eof(&mut closed).await.unwrap_err().to_string(),
+            "activity stdin monitor failed"
+        );
+    }
+
+    #[test]
+    fn activity_cli_output_queue_is_exactly_bounded_at_256_lines() {
+        assert_eq!(MAX_ACTIVITY_OUTPUT_QUEUE, 256);
+        let (sender, _receiver) = std_mpsc::sync_channel::<String>(MAX_ACTIVITY_OUTPUT_QUEUE);
+        for index in 0..MAX_ACTIVITY_OUTPUT_QUEUE {
+            sender.try_send(index.to_string()).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send("overflow".to_owned()),
+            Err(std_mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn activity_cli_output_writer_handles_success_broken_pipe_and_timeout() {
+        let mut success_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(success_pipe.as_mut_ptr()) }, 0);
+        let success_flags = unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) };
+        assert!(success_flags >= 0);
+        assert_eq!(
+            write_activity_output_line(success_pipe[1], b"one line\n", Duration::from_millis(100),),
+            ActivityOutputStatus::Complete
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) },
+            success_flags,
+            "activity output must preserve shared file-description flags"
+        );
+        let mut bytes = [0_u8; 9];
+        assert_eq!(
+            unsafe { libc::read(success_pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) },
+            9
+        );
+        assert_eq!(&bytes, b"one line\n");
+        unsafe {
+            libc::close(success_pipe[0]);
+            libc::close(success_pipe[1]);
+        }
+
+        let mut broken_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(broken_pipe.as_mut_ptr()) }, 0);
+        unsafe { libc::close(broken_pipe[0]) };
+        assert_eq!(
+            write_activity_output_line(broken_pipe[1], b"ignored\n", Duration::from_millis(100),),
+            ActivityOutputStatus::BrokenPipe
+        );
+        unsafe { libc::close(broken_pipe[1]) };
+
+        let mut full_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(full_pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(full_pipe[1], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(full_pipe[1], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let fill = [0_u8; 4096];
+        loop {
+            let written = unsafe { libc::write(full_pipe[1], fill.as_ptr().cast(), fill.len()) };
+            if written < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(full_pipe[1], libc::F_SETFL, flags) },
+            0
+        );
+        assert_eq!(
+            write_activity_output_line(full_pipe[1], b"blocked\n", Duration::from_millis(20),),
+            ActivityOutputStatus::Failed
+        );
+        assert_eq!(unsafe { libc::fcntl(full_pipe[1], libc::F_GETFL) }, flags);
+        unsafe {
+            libc::close(full_pipe[0]);
+            libc::close(full_pipe[1]);
+        }
+    }
+
+    #[test]
+    fn activity_cli_stream_state_accepts_end_then_strict_global_gap() {
+        let attach = ActivityAttachResult {
+            control_protocol: CONTROL_PROTOCOL_VERSION,
+            activity_schema: ACTIVITY_SCHEMA_VERSION,
+            generation: ACTIVITY_TEST_GENERATION,
+            snapshot_sequence: 0,
+            replayed: 0,
+            history_truncated: false,
+        };
+        let mut state = ActivityStreamState::new(attach, None);
+        assert!(matches!(
+            state
+                .decode_line(
+                    "{\"type\":\"activity_end\",\"snapshot_sequence\":0,\"history_truncated\":false}\n"
+                )
+                .unwrap(),
+            ActivityClientFrame::End
+        ));
+        assert!(matches!(
+            state
+                .decode_line(
+                    "{\"type\":\"activity_gap\",\"scope\":\"all_sessions\",\"after_sequence\":0,\"through_sequence\":3,\"dropped\":3}\n"
+                )
+                .unwrap(),
+            ActivityClientFrame::Gap {
+                after_sequence: 0,
+                through_sequence: 3,
+                dropped: 3,
+            }
+        ));
+        assert!(matches!(
+            state.decode_line(&activity_test_frame(4, None)).unwrap(),
+            ActivityClientFrame::Event(event) if event.sequence() == 4
+        ));
+        assert!(state.decode_line(&activity_test_frame(6, None)).is_err());
+        assert!(state
+            .decode_line(
+                "{\"type\":\"activity_gap\",\"scope\":\"target\",\"after_sequence\":4,\"through_sequence\":7,\"dropped\":3}\n"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn activity_cli_stream_state_rejects_overlapping_gap_and_event_ranges() {
+        let attach = ActivityAttachResult {
+            control_protocol: CONTROL_PROTOCOL_VERSION,
+            activity_schema: ACTIVITY_SCHEMA_VERSION,
+            generation: ACTIVITY_TEST_GENERATION,
+            snapshot_sequence: 3,
+            replayed: 0,
+            history_truncated: false,
+        };
+        let mut state = ActivityStreamState::new(attach, Some("target".to_owned()));
+        state
+            .decode_line(
+                "{\"type\":\"activity_end\",\"snapshot_sequence\":3,\"history_truncated\":false}\n",
+            )
+            .unwrap();
+        state
+            .decode_line(
+                "{\"type\":\"activity_gap\",\"scope\":\"all_sessions\",\"after_sequence\":5,\"through_sequence\":7,\"dropped\":2}\n",
+            )
+            .unwrap();
+        assert!(
+            state
+                .decode_line(
+                    "{\"type\":\"activity_gap\",\"scope\":\"all_sessions\",\"after_sequence\":6,\"through_sequence\":8,\"dropped\":2}\n",
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .decode_line(&activity_test_frame(7, Some("target")))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_old_peer_close_is_observable_without_hanging() {
+        let (old_peer, mut client) = UnixStream::pair().unwrap();
+        let old_peer_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(old_peer);
+            let line = read_line_limited(&mut reader, "legacy request")
+                .await
+                .unwrap();
+            assert!(line.contains("attach_activity"));
+        });
+        let request = ControlRequest::AttachActivity(AttachActivityRequest {
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            session_id: None,
+            tail: 100,
+            follow: true,
+        });
+        client
+            .write_all(&encode_line(&request).unwrap())
+            .await
+            .unwrap();
+        let mut response = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        old_peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_pipelined_input_is_not_dispatched_or_buffered() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+        client
+            .write_all(
+                b"{\"command\":\"attach_activity\",\"schema_version\":1,\"session_id\":null,\"tail\":0,\"follow\":true}\n{\"allow\":true}\n",
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            supervisor
+                .activity_broker()
+                .subscribe_snapshot(None, 0)
+                .unwrap()
+                .cutoff(),
+            0
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_attachment_initial_request_timeout_does_not_dispatch() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let (server, client) = UnixStream::pair().unwrap();
+        let (registration, _registrations) = mpsc::channel(1);
+        let task = tokio::spawn(handle_control_connection(
+            server,
+            Arc::clone(&supervisor),
+            registration,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("timed out waiting for supervisor control request")
+        );
+        drop(client);
         supervisor.shutdown().await.unwrap();
     }
 
@@ -2583,6 +5011,95 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = validate_upgrade_executable(&executable, "test-version").unwrap_err();
         assert!(error.to_string().contains("control protocol"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_upgrade_snapshot_stays_bound_after_locator_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let locator = temp.path().join("temote-mcp");
+        std::fs::write(&locator, b"#!/bin/sh\nprintf 'approved\\n'\n").unwrap();
+        std::fs::set_permissions(&locator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = std::fs::File::open(&locator).unwrap();
+        let snapshot = create_upgrade_execution_snapshot(&mut source).unwrap();
+
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nprintf 'replacement\\n'\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &locator).unwrap();
+
+        let output = std::process::Command::new(&snapshot.path).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"approved\n");
+        let snapshot_path = snapshot.path.clone();
+        let snapshot_directory = snapshot.directory.clone();
+        assert_eq!(snapshot_path.file_name().unwrap(), "temote-mcp");
+        drop(snapshot);
+        assert!(!snapshot_path.exists());
+        assert!(!snapshot_directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_plugin_reconciliation_preserves_installed_locator_for_snapshot_child() {
+        let executable = Path::new("/private/upgrade-snapshot/temote-mcp");
+        let installed_locator = Path::new("/private/installed/temote-mcp");
+        let command = codex_plugin_reconcile_command(executable, installed_locator);
+
+        assert_eq!(command.get_program(), executable);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["codex", "plugin", "install"]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == INTERNAL_INSTALLED_LOCATOR_ENV)
+                .and_then(|(_, value)| value),
+            Some(installed_locator.as_os_str())
+        );
+    }
+
+    #[test]
+    fn same_version_zero_session_handoff_requires_new_boot_generation() {
+        let source_boot = uuid::Uuid::new_v4().to_string();
+        let unchanged = json!({
+            "version": "2026.8.0",
+            "pid": 42,
+            "boot_generation": source_boot,
+        });
+        assert!(!supervisor_handoff_identity_changed(
+            &unchanged,
+            "2026.8.0",
+            42,
+            unchanged["boot_generation"].as_str(),
+        ));
+
+        let replaced = json!({
+            "version": "2026.8.0",
+            "pid": 42,
+            "boot_generation": uuid::Uuid::new_v4().to_string(),
+        });
+        assert!(supervisor_handoff_identity_changed(
+            &replaced,
+            "2026.8.0",
+            42,
+            unchanged["boot_generation"].as_str(),
+        ));
+    }
+
+    #[test]
+    fn local_upgrade_rejects_nonterminal_remote_runtime_owner() {
+        let active = crate::upgrade_transaction::UpgradeTransaction::new(
+            "2026.8.0", "2026.9.0", "host-a", "boot-a", true, true, true,
+        );
+        assert!(ensure_no_remote_upgrade_owns_runtime(std::slice::from_ref(&active)).is_err());
+
+        let mut completed = active;
+        completed.state = crate::upgrade_transaction::UpgradeTransactionState::Completed;
+        assert!(ensure_no_remote_upgrade_owns_runtime(&[completed]).is_ok());
     }
 
     #[test]
@@ -3325,5 +5842,40 @@ mod tests {
         .unwrap();
         assert_eq!(encoded["permission_mode"], "agent");
         assert_eq!(encoded["yolo"], false);
+    }
+
+    #[test]
+    fn upgrade_session_identity_rejects_same_count_different_session() {
+        let planned = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 100,
+            source_started_at: 10,
+        }];
+        let active = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-b".to_owned(),
+            source_process_id: 200,
+            source_started_at: 20,
+        }];
+        let error =
+            validate_planned_upgrade_session_identities(&planned, &active, false).unwrap_err();
+        assert!(error.to_string().contains("session set changed"));
+    }
+
+    #[test]
+    fn upgrade_session_identity_rejects_replaced_source_instance() {
+        let planned = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 100,
+            source_started_at: 10,
+        }];
+        let replacement = vec![crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: "session-a".to_owned(),
+            source_process_id: 101,
+            source_started_at: 11,
+        }];
+        let error =
+            validate_planned_upgrade_session_identities(&planned, &replacement, true).unwrap_err();
+        assert!(error.to_string().contains("session instance changed"));
+        validate_planned_upgrade_session_identities(&planned, &replacement, false).unwrap();
     }
 }

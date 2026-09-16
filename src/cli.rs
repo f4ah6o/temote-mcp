@@ -5,6 +5,7 @@ use std::{net::SocketAddr, str::FromStr};
 #[path = "codex.rs"]
 mod codex;
 
+use crate::config;
 #[cfg(feature = "network")]
 use crate::gateway;
 use crate::profile;
@@ -30,6 +31,17 @@ pub enum Command {
     Upgrade {
         dry_run: bool,
         force: bool,
+    },
+    Activity {
+        session_id: Option<String>,
+        tail: usize,
+        follow: bool,
+    },
+    UpgradeCoordinator {
+        transaction_id: String,
+        commit_fd: i32,
+        executable_fd: i32,
+        installed_locator: PathBuf,
     },
     Session {
         command: SessionCommand,
@@ -230,6 +242,49 @@ where
             .is_present();
         return finish(args, Command::Upgrade { dry_run, force });
     }
+    if noargs::cmd("activity")
+        .doc("Show recent local supervisor activity and follow new events")
+        .take(&mut args)
+        .is_present()
+    {
+        let command = parse_activity(&mut args).map_err(format_error)?;
+        return finish(args, command);
+    }
+    if noargs::cmd("upgrade-coordinator")
+        .doc("Internal: continue one accepted remote upgrade transaction")
+        .take(&mut args)
+        .is_present()
+    {
+        let transaction_id = noargs::opt("transaction")
+            .ty("ID")
+            .take(&mut args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(opt.value().to_owned()))
+            .map_err(format_error)?;
+        let commit_fd = noargs::opt("commit-fd")
+            .ty("FD")
+            .take(&mut args)
+            .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
+            .map_err(format_error)?;
+        let executable_fd = noargs::opt("executable-fd")
+            .ty("FD")
+            .take(&mut args)
+            .then(|opt| opt.value().parse::<i32>().map_err(|_| "must be an integer"))
+            .map_err(format_error)?;
+        let installed_locator = noargs::opt("installed-locator")
+            .ty("PATH")
+            .take(&mut args)
+            .then(|opt| Ok::<_, std::convert::Infallible>(PathBuf::from(opt.value())))
+            .map_err(format_error)?;
+        return finish(
+            args,
+            Command::UpgradeCoordinator {
+                transaction_id,
+                commit_fd,
+                executable_fd,
+                installed_locator,
+            },
+        );
+    }
     if noargs::cmd("session")
         .doc("Manage sessions owned by the local Temote supervisor")
         .take(&mut args)
@@ -320,6 +375,57 @@ where
         Some(help) => Ok(ParseOutcome::Print(help)),
         None => unreachable!("a command or help should have been selected"),
     }
+}
+
+fn parse_activity(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
+    let tail = noargs::opt("tail")
+        .ty("COUNT")
+        .doc("Replay the latest 0 to 1024 matching events (default: 100)")
+        .default("100")
+        .take(args)
+        .then(|opt| opt.value().parse::<usize>())?;
+    if tail > 1024 {
+        return Err(noargs::Error::other(
+            args,
+            "activity tail must be an integer from 0 to 1024",
+        ));
+    }
+    let follow = !noargs::flag("no-follow")
+        .doc("Print the replay and exit after activity_end")
+        .take(args)
+        .is_present();
+    let session_arg = noargs::arg("[SESSION_ID]").doc("Optional exact session ID filter");
+    let next = args
+        .remaining_args()
+        .next()
+        .map(|(_, value)| value.to_owned());
+    let session_id = match next.as_deref() {
+        Some("--") => {
+            let marker = session_arg.take(args);
+            debug_assert_eq!(marker.value(), "--");
+            session_arg
+                .take(args)
+                .present()
+                .map(|arg| arg.value().to_owned())
+        }
+        Some(value) if value.starts_with('-') => None,
+        Some(_) => session_arg
+            .take(args)
+            .present()
+            .map(|arg| arg.value().to_owned()),
+        None => None,
+    };
+    if session_id
+        .as_deref()
+        .is_some_and(|session_id| config::validate_session_id(session_id).is_err())
+    {
+        return Err(noargs::Error::other(args, "invalid activity session ID"));
+    }
+    Ok(Command::Activity {
+        session_id,
+        tail,
+        follow,
+    })
 }
 
 fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
@@ -916,6 +1022,65 @@ mod tests {
     }
 
     #[test]
+    fn activity_cli_defaults_and_explicit_options_are_exact() {
+        assert!(matches!(
+            command(&["temote-mcp", "activity"]),
+            Command::Activity {
+                session_id: None,
+                tail: 100,
+                follow: true,
+            }
+        ));
+        assert!(matches!(
+            command(&[
+                "temote-mcp",
+                "activity",
+                "sf",
+                "--tail",
+                "0",
+                "--no-follow",
+            ]),
+            Command::Activity {
+                session_id: Some(session_id),
+                tail: 0,
+                follow: false,
+            } if session_id == "sf"
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "activity", "--tail", "1024"]),
+            Command::Activity {
+                session_id: None,
+                tail: 1024,
+                follow: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn activity_cli_rejects_invalid_tail_session_and_extra_arguments() {
+        for values in [
+            vec!["temote-mcp", "activity", "--tail", "-1"],
+            vec!["temote-mcp", "activity", "--tail", "1.5"],
+            vec!["temote-mcp", "activity", "--tail", "1025"],
+            vec!["temote-mcp", "activity", "--tail"],
+            vec!["temote-mcp", "activity", "--unknown"],
+            vec!["temote-mcp", "activity", "bad/session"],
+            vec!["temote-mcp", "activity", "one", "two"],
+        ] {
+            assert!(parse(argv(&values)).is_err(), "accepted {values:?}");
+        }
+        assert!(
+            parse(argv(&[
+                "temote-mcp",
+                "activity",
+                "--tail",
+                "184467440737095516160",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn session_forget_is_available_and_distinct_from_stop() {
         assert!(matches!(
             command(&["temote-mcp", "session", "forget", "my-session"]),
@@ -941,6 +1106,7 @@ mod tests {
         assert!(help.contains("mcp"));
         assert!(help.contains("codex"));
         assert!(help.contains("upgrade"));
+        assert!(help.contains("activity"));
         assert!(help.contains("--version"));
 
         let ParseOutcome::Print(start_help) =

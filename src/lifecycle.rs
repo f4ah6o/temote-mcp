@@ -643,7 +643,15 @@ fn probe_address(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-async fn probe_origin_health(addr: SocketAddr) -> Result<()> {
+#[derive(Clone, Debug, Deserialize)]
+pub struct DirectIngressIdentity {
+    pub host_id: String,
+    pub version: String,
+    pub boot_generation: String,
+    pub last_upgrade_transaction: Option<String>,
+}
+
+async fn probe_origin_health(addr: SocketAddr) -> Result<DirectIngressIdentity> {
     let addr = probe_address(addr);
     let probe = async {
         let mut stream = TcpStream::connect(addr)
@@ -662,11 +670,67 @@ async fn probe_origin_health(addr: SocketAddr) -> Result<()> {
             response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
             "direct ingress origin health endpoint did not return HTTP 200"
         );
-        Ok(())
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .context("direct ingress health response has no body")?;
+        let value: DirectIngressIdentity =
+            serde_json::from_str(body).context("direct ingress health response is invalid")?;
+        Ok(value)
     };
-    tokio::time::timeout(ORIGIN_HEALTH_TIMEOUT, probe)
+    let identity = tokio::time::timeout(ORIGIN_HEALTH_TIMEOUT, probe)
         .await
         .context("direct ingress origin health probe timed out")??;
+    Ok(identity)
+}
+
+pub async fn verify_direct_ingress_identity(
+    target_version: &str,
+    expected_host_id: &str,
+    source_boot_generation: &str,
+    restart_required: bool,
+    transaction_id: &str,
+) -> Result<DirectIngressIdentity> {
+    let prepared = prepare_direct_ingress_upgrade(target_version).await?;
+    let addr = prepared.plan.addr.context("direct ingress is not active")?;
+    let identity = probe_origin_health(addr).await?;
+    validate_direct_ingress_identity(
+        &identity,
+        target_version,
+        expected_host_id,
+        source_boot_generation,
+        restart_required,
+        transaction_id,
+    )?;
+    Ok(identity)
+}
+
+fn validate_direct_ingress_identity(
+    identity: &DirectIngressIdentity,
+    target_version: &str,
+    expected_host_id: &str,
+    source_boot_generation: &str,
+    restart_required: bool,
+    transaction_id: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        identity.host_id == expected_host_id,
+        "replacement ingress host identity mismatch"
+    );
+    anyhow::ensure!(
+        identity.version == target_version,
+        "replacement ingress version mismatch"
+    );
+    if restart_required {
+        anyhow::ensure!(
+            identity.boot_generation != source_boot_generation,
+            "replacement ingress still reports the stale source boot generation"
+        );
+    }
+    anyhow::ensure!(
+        identity.last_upgrade_transaction.as_deref() == Some(transaction_id),
+        "replacement ingress does not report the expected upgrade transaction"
+    );
     Ok(())
 }
 
@@ -822,7 +886,7 @@ pub async fn prepare_direct_ingress_upgrade(
     );
     let health_result = probe_origin_health(state.addr).await;
     let (healthy, health) = match health_result {
-        Ok(()) => (true, "healthy".to_owned()),
+        Ok(_) => (true, "healthy".to_owned()),
         Err(error) => (false, format!("unhealthy: {error:#}")),
     };
     let restart_reason = direct_ingress_restart_reason(&state.version, target_version, healthy);
@@ -849,9 +913,17 @@ pub async fn prepare_direct_ingress_upgrade(
     })
 }
 
-fn spawn_direct_ingress(executable: &Path, state: &DirectIngressRuntimeState) -> Result<()> {
+fn spawn_direct_ingress(
+    executable: &Path,
+    installed_locator: &Path,
+    state: &DirectIngressRuntimeState,
+) -> Result<()> {
     let profile = parse_runtime_profile(state)?;
     let mut command = Command::new(executable);
+    command.env(
+        crate::session_control::INTERNAL_INSTALLED_LOCATOR_ENV,
+        installed_locator,
+    );
     command
         .arg("up")
         .arg("--profile")
@@ -886,6 +958,7 @@ fn spawn_direct_ingress(executable: &Path, state: &DirectIngressRuntimeState) ->
 pub async fn apply_direct_ingress_upgrade(
     prepared: PreparedDirectIngressUpgrade,
     executable: &Path,
+    installed_locator: &Path,
 ) -> Result<DirectIngressUpgradePlan> {
     match prepared.plan.action.as_str() {
         "inactive" => return Ok(prepared.plan),
@@ -913,7 +986,7 @@ pub async fn apply_direct_ingress_upgrade(
     );
     validate_restart_recipe(expected)?;
     down().await?;
-    spawn_direct_ingress(executable, expected)?;
+    spawn_direct_ingress(executable, installed_locator, expected)?;
 
     let deadline = tokio::time::Instant::now() + INGRESS_RESTART_TIMEOUT;
     loop {
@@ -1616,10 +1689,12 @@ mod tests {
                 let mut request = [0u8; 1024];
                 let _ = stream.read(&mut request).await.unwrap();
                 assert!(String::from_utf8_lossy(&request).contains("GET /healthz HTTP/1.1"));
+                let body = r#"{"host_id":"host-a","version":"2026.9.0","boot_generation":"boot-a","last_upgrade_transaction":null}"#;
                 stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
                         )
                         .as_bytes(),
                     )
@@ -1633,5 +1708,25 @@ mod tests {
         probe_origin_health(healthy).await.unwrap();
         let unhealthy = serve_once("503 Service Unavailable").await;
         assert!(probe_origin_health(unhealthy).await.is_err());
+    }
+
+    #[test]
+    fn replacement_identity_rejects_stale_healthy_boot_generation() {
+        let identity = DirectIngressIdentity {
+            host_id: "host-a".to_owned(),
+            version: "2026.9.0".to_owned(),
+            boot_generation: "boot-old".to_owned(),
+            last_upgrade_transaction: Some("transaction-a".to_owned()),
+        };
+        let error = validate_direct_ingress_identity(
+            &identity,
+            "2026.9.0",
+            "host-a",
+            "boot-old",
+            true,
+            "transaction-a",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale source boot generation"));
     }
 }

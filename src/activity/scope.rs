@@ -205,6 +205,28 @@ impl ActivityScope {
         Self::with_summary_and_clock(operation, summary, emitter, SystemMonotonicClock)
     }
 
+    /// Creates a scope using an existing stable operation identity.
+    ///
+    /// This is used when an operation already has a durable UUID, such as an
+    /// upgrade transaction that continues in a detached coordinator.
+    pub fn with_operation_id<E>(
+        operation: ActivityOperation,
+        operation_id: Uuid,
+        summary: ActivitySummary,
+        emitter: E,
+    ) -> Self
+    where
+        E: ActivityEmitter + 'static,
+    {
+        Self::new_with_identity(
+            operation,
+            operation_id,
+            summary,
+            Arc::new(SystemMonotonicClock),
+            Arc::new(emitter),
+        )
+    }
+
     /// Creates a scope with a fresh UUID and an injected monotonic clock.
     pub fn with_clock<C, E>(operation: ActivityOperation, emitter: E, clock: C) -> Self
     where

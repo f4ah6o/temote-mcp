@@ -4,9 +4,11 @@
 //! uses Access JWT assertions; Tailscale uses Temote local OAuth. MCP dispatch
 //! remains provider-neutral.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-#[cfg(test)]
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -16,13 +18,23 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use tower::ServiceExt;
 
 use crate::local_oauth::{AuthorizeRequest, OAuthError, RegistrationRequest, TokenRequest};
 use crate::provider::AuthProvider;
 #[cfg(test)]
 use crate::provider::PublicEndpoint;
 use crate::session_control::SessionBackend;
+use temote_mcp::activity::contract::{
+    ActivityErrorKind, ActivityOperation, ActivityResult, ActivitySummary,
+};
+use temote_mcp::activity::scope::ActivityScope;
 
 const MAX_OAUTH_REGISTER_BODY_BYTES: usize = 128 * 1024;
 const MAX_OAUTH_TOKEN_BODY_BYTES: usize = 64 * 1024;
@@ -32,6 +44,13 @@ const MAX_AUDIT_FIELD_BYTES: usize = 256;
 pub struct Runtime {
     pub authenticator: AuthProvider,
     pub sessions: SessionBackend,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct UpgradeResponseMarker {
+    commit: crate::upgrade_coordinator::CoordinatorCommit,
+    accepted_body_complete: bool,
 }
 
 pub async fn serve(
@@ -50,9 +69,79 @@ pub async fn serve(
     eprintln!("temote-mcp HTTP server listening on http://{addr}");
     eprintln!("MCP endpoint for remote clients: {public_url}/mcp");
     eprintln!("Authentication: {}", runtime.authenticator.name());
-    axum::serve(listener, router(runtime))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let app = router(runtime);
+    let mut shutdown = Box::pin(shutdown_signal());
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("failed to accept HTTP connection")?;
+                let app = app.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_http1_connection(stream, app).await {
+                        eprintln!("HTTP connection failed: {error:#}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn serve_http1_connection(mut stream: tokio::net::TcpStream, app: Router) -> Result<()> {
+    let marker = Arc::new(Mutex::new(None::<UpgradeResponseMarker>));
+    let service_marker = Arc::clone(&marker);
+    let service = service_fn(move |request: hyper::Request<Incoming>| {
+        let app = app.clone();
+        let marker = Arc::clone(&service_marker);
+        async move {
+            let (parts, mut incoming) = request.into_parts();
+            let mut bytes = Vec::new();
+            while let Some(frame) = incoming.frame().await {
+                let frame = frame?;
+                if let Ok(data) = frame.into_data() {
+                    if bytes.len().saturating_add(data.len()) > 8 * 1024 * 1024 {
+                        return Ok::<_, hyper::Error>(
+                            (StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+                                .into_response(),
+                        );
+                    }
+                    bytes.extend_from_slice(&data);
+                }
+            }
+            let request = hyper::Request::from_parts(parts, axum::body::Body::from(bytes));
+            let mut response = app
+                .oneshot(request)
+                .await
+                .expect("axum router is infallible");
+            if let Some(upgrade) = response.extensions_mut().remove::<UpgradeResponseMarker>() {
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                *marker
+                    .lock()
+                    .expect("upgrade response marker mutex poisoned") = Some(upgrade);
+            }
+            Ok::<_, hyper::Error>(response)
+        }
+    });
+    let result = http1::Builder::new()
+        .serve_connection(TokioIo::new(&mut stream), service)
+        .await;
+    let shutdown = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+    if let Some(upgrade) = marker
+        .lock()
+        .expect("upgrade response marker mutex poisoned")
+        .take()
+    {
+        if result.is_ok() && shutdown.is_ok() && upgrade.accepted_body_complete {
+            upgrade.commit.commit()?;
+        } else {
+            let _ = upgrade.commit.abort();
+        }
+    }
+    result.context("HTTP/1 response driver failed")?;
+    shutdown.context("HTTP/1 socket shutdown failed")?;
     Ok(())
 }
 
@@ -124,6 +213,7 @@ async fn healthz() -> Response {
     Json(json!({
         "status": "ok",
         "service": "temote-mcp",
+        "version": env!("CARGO_PKG_VERSION"),
         "host_id": host_id,
         "boot_generation": crate::boot_identity::generation(),
         "last_upgrade_transaction": crate::upgrade_transaction::latest_transaction_id(),
@@ -262,8 +352,16 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
         audit.finish(response.status(), started);
         return response;
     };
-    let response_value = match crate::mcp::dispatch_public(&request, Some(&runtime.sessions)).await
-    {
+    let direct = dispatch_direct_upgrade(&request, &runtime).await;
+    let (response_result, upgrade_commit) = match direct {
+        Ok(Some(value)) => (Ok(value.result), value.commit),
+        Ok(None) => (
+            crate::mcp::dispatch_public(&request, Some(&runtime.sessions)).await,
+            None,
+        ),
+        Err(error) => (Err(error), None),
+    };
+    let response_value = match response_result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(error) => json!({
             "jsonrpc": "2.0",
@@ -271,9 +369,263 @@ async fn mcp_post(headers: HeaderMap, State(runtime): State<Runtime>, body: Byte
             "error": {"code": -32000, "message": format!("{error:#}")}
         }),
     };
-    let response = with_cors(Json(response_value));
+    let mut response = with_cors(Json(response_value));
+    if let Some(commit) = upgrade_commit {
+        response.extensions_mut().insert(UpgradeResponseMarker {
+            commit,
+            accepted_body_complete: true,
+        });
+    }
     audit.finish(response.status(), started);
     response
+}
+
+struct DirectUpgradeDispatch {
+    result: Value,
+    commit: Option<crate::upgrade_coordinator::CoordinatorCommit>,
+}
+
+async fn dispatch_direct_upgrade(
+    request: &Value,
+    runtime: &Runtime,
+) -> Result<Option<DirectUpgradeDispatch>> {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method == "tools/list" {
+        let mut result = crate::mcp::dispatch_public(request, Some(&runtime.sessions)).await?;
+        let tools = result
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .context("public tool list has no tools array")?;
+        tools.extend(direct_upgrade_tools());
+        return Ok(Some(DirectUpgradeDispatch {
+            result,
+            commit: None,
+        }));
+    }
+    if method != "tools/call" {
+        return Ok(None);
+    }
+    let params = request
+        .get("params")
+        .and_then(Value::as_object)
+        .context("tools/call params must be an object")?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .context("missing tool name")?;
+    if !matches!(
+        name,
+        "upgrade_preflight" | "upgrade_apply" | "upgrade_status"
+    ) {
+        return Ok(None);
+    }
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let object = args
+        .as_object()
+        .context("upgrade tool arguments must be an object")?;
+    let (value, commit) = match name {
+        "upgrade_preflight" => {
+            anyhow::ensure!(object.is_empty(), "upgrade_preflight takes no arguments");
+            let (_, preflight) = crate::upgrade_coordinator::preflight()
+                .await
+                .map_err(|_| anyhow::anyhow!("upgrade preflight failed"))?;
+            (serde_json::to_value(preflight)?, None)
+        }
+        "upgrade_status" => {
+            anyhow::ensure!(
+                object.keys().all(|key| key == "transaction_id"),
+                "upgrade_status accepts only transaction_id"
+            );
+            let id = object
+                .get("transaction_id")
+                .and_then(Value::as_str)
+                .context("missing transaction_id")?;
+            (
+                serde_json::to_value(
+                    crate::upgrade_coordinator::status(id)
+                        .map_err(|_| anyhow::anyhow!("upgrade status unavailable"))?,
+                )?,
+                None,
+            )
+        }
+        "upgrade_apply" => {
+            anyhow::ensure!(
+                object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "session_id" | "expected_version")),
+                "upgrade_apply accepts only session_id and expected_version"
+            );
+            let session_id = object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .context("missing session_id")?;
+            let expected = object
+                .get("expected_version")
+                .map(|value| value.as_str().context("expected_version must be a string"))
+                .transpose()?;
+            if let Some(expected) = expected {
+                anyhow::ensure!(
+                    !expected.is_empty() && expected.len() <= 256,
+                    "expected_version is empty or oversized"
+                );
+            }
+            let session = runtime
+                .sessions
+                .validate_upgrade_session(session_id)
+                .await?;
+            let operation_id = uuid::Uuid::new_v4();
+            let activity = crate::activity_runtime::emitter(&session)
+                .await
+                .ok()
+                .map(|emitter| {
+                    ActivityScope::with_operation_id(
+                        ActivityOperation::SupervisorUpgrade,
+                        operation_id,
+                        ActivitySummary::empty(),
+                        emitter,
+                    )
+                });
+            let preflight_result = crate::upgrade_coordinator::preflight()
+                .await
+                .map_err(|_| anyhow::anyhow!("upgrade preflight failed"));
+            let (executable, preflight) = match preflight_result {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(activity) = &activity {
+                        let _ = activity.fail_with_summary(ActivitySummary::failure(
+                            ActivityErrorKind::OperationFailed,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(expected) = expected
+                && expected != executable.target_version
+            {
+                if let Some(activity) = &activity {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::InvalidInput,
+                    ));
+                }
+                anyhow::bail!(
+                    "installed target version changed: expected {expected}, found {}",
+                    executable.target_version
+                );
+            }
+            let detail = format!(
+                "Temote remote upgrade\nsource_version: {}\ntarget_version: {}\nmanaged_sessions: {}\nreconnect_expected: {}",
+                preflight.source_version,
+                preflight.target_version,
+                preflight.planned_session_count,
+                preflight.reconnect_expected
+            );
+            let metadata = BTreeMap::from([
+                (
+                    "source_version".to_owned(),
+                    preflight.source_version.clone(),
+                ),
+                (
+                    "target_version".to_owned(),
+                    preflight.target_version.clone(),
+                ),
+                (
+                    "reconnect_expected".to_owned(),
+                    preflight.reconnect_expected.to_string(),
+                ),
+            ]);
+            let approved = crate::approvals::ensure_local_approval_with_activity(
+                &session,
+                crate::approvals::ApprovalClass::RemoteUpgrade,
+                "upgrade_apply",
+                detail,
+                session.cwd.clone(),
+                metadata,
+                activity.as_ref(),
+            )
+            .await;
+            let approved = match approved {
+                Ok(approved) => approved,
+                Err(error) => {
+                    if let Some(activity) = &activity {
+                        let _ = activity.fail_with_summary(ActivitySummary::failure(
+                            ActivityErrorKind::OperationFailed,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if !approved {
+                if let Some(activity) = &activity {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::ApprovalDenied,
+                    ));
+                }
+                anyhow::bail!("user denied Temote remote upgrade");
+            }
+            if let Err(error) = runtime.sessions.validate_upgrade_session(session_id).await {
+                if let Some(activity) = &activity {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::RuntimeUnavailable,
+                    ));
+                }
+                return Err(error);
+            }
+            let prepared = crate::upgrade_coordinator::prepare_apply(
+                executable,
+                preflight,
+                expected,
+                Some(crate::upgrade_coordinator::UpgradeActivityContext {
+                    session: crate::upgrade_transaction::UpgradePlannedSession {
+                        session_id: session.id.clone(),
+                        source_process_id: session.process_id,
+                        source_started_at: session.started_at,
+                    },
+                    operation_id,
+                }),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("upgrade apply admission failed"));
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(activity) = &activity {
+                        let _ = activity.fail_with_summary(ActivitySummary::failure(
+                            ActivityErrorKind::OperationFailed,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            if prepared.commit.is_none()
+                && let Some(activity) = &activity
+            {
+                let _ = activity
+                    .complete_with_summary(ActivitySummary::result(ActivityResult::Accepted));
+            }
+            let value = json!({
+                "accepted": prepared.accepted_new,
+                "transaction": prepared.status,
+            });
+            (value, prepared.commit)
+        }
+        _ => unreachable!(),
+    };
+    let result = json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}]});
+    Ok(Some(DirectUpgradeDispatch { result, commit }))
+}
+
+fn direct_upgrade_tools() -> Vec<Value> {
+    vec![
+        json!({"name":"upgrade_preflight","title":"Preview Temote upgrade","description":"Read a bounded compatibility and reconnect preview for the canonical locally installed Temote binary.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"upgrade_apply","title":"Apply Temote upgrade","description":"Apply the canonical locally installed Temote binary through a detached durable coordinator after explicit local approval.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"expected_version":{"type":"string","maxLength":256}},"required":["session_id"],"additionalProperties":false}}),
+        json!({"name":"upgrade_status","title":"Read Temote upgrade status","description":"Read bounded durable upgrade status after reconnect.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"transaction_id":{"type":"string","format":"uuid"}},"required":["transaction_id"],"additionalProperties":false}}),
+    ]
 }
 
 fn validate_modern_http_request(headers: &HeaderMap, request: &Value) -> Option<Response> {
@@ -536,6 +888,147 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use url::Url;
+
+    #[tokio::test]
+    async fn http1_driver_commits_only_after_complete_close_delimited_response() {
+        let (commit, mut decision) =
+            crate::upgrade_coordinator::CoordinatorCommit::test_pair().unwrap();
+        decision
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let app = Router::new().route(
+            "/accepted",
+            get(move || {
+                let commit = commit.clone();
+                async move {
+                    let mut response = Json(json!({"accepted":true})).into_response();
+                    response.extensions_mut().insert(UpgradeResponseMarker {
+                        commit,
+                        accepted_body_complete: true,
+                    });
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_http1_connection(stream, app).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"GET /accepted HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("connection: close"));
+        assert!(response.contains("{\"accepted\":true}"));
+        let mut message = String::new();
+        std::io::Read::read_to_string(&mut decision, &mut message).unwrap();
+        assert_eq!(message, "COMMIT\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn http1_driver_aborts_when_client_resets_before_accepted_response_flush() {
+        use std::os::fd::AsRawFd;
+
+        let (commit, mut decision) =
+            crate::upgrade_coordinator::CoordinatorCommit::test_pair().unwrap();
+        decision
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let app = Router::new().route(
+            "/accepted",
+            get(move || {
+                let commit = commit.clone();
+                async move {
+                    let mut response = Response::new(Body::from(vec![b'x'; 16 * 1024 * 1024]));
+                    response.extensions_mut().insert(UpgradeResponseMarker {
+                        commit,
+                        accepted_body_complete: true,
+                    });
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_http1_connection(stream, app).await
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"GET /accepted HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+        drop(client);
+        assert!(server.await.unwrap().is_err());
+        let mut message = String::new();
+        std::io::Read::read_to_string(&mut decision, &mut message).unwrap();
+        assert_eq!(message, "ABORT\n");
+    }
+
+    #[tokio::test]
+    async fn http1_driver_rejects_oversized_body_at_the_streaming_limit() {
+        let app = Router::new().route("/body", axum::routing::post(|| async { StatusCode::OK }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_http1_connection(stream, app).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            format!(
+                "POST /body HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                oversized.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, &oversized)
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 413")
+        );
+    }
 
     fn runtime() -> Runtime {
         let (supervisor, _approvals) =
@@ -954,6 +1447,9 @@ mod tests {
             .unwrap()
             .clone();
         assert!(tools.iter().any(|tool| tool["name"] == "session_list"));
+        for name in ["upgrade_preflight", "upgrade_apply", "upgrade_status"] {
+            assert!(tools.iter().any(|tool| tool["name"] == name));
+        }
         assert!(!tools.iter().any(|tool| tool["name"] == "without_sandbox"));
         assert_eq!(
             tools
@@ -969,6 +1465,19 @@ mod tests {
                 .unwrap()["annotations"]["readOnlyHint"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn upgrade_tools_are_absent_from_stdio_dispatch() {
+        let result = crate::mcp::dispatch(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/list"
+        }))
+        .await
+        .unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        for name in ["upgrade_preflight", "upgrade_apply", "upgrade_status"] {
+            assert!(!tools.iter().any(|tool| tool["name"] == name));
+        }
     }
 
     #[tokio::test]

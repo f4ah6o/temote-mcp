@@ -20,15 +20,22 @@ disabled-strategies = ["quick-install", "compile"]
 default = ["network"]
 network = [
     "dep:axum",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
     "dep:dotenvy",
     "dep:reqwest",
     "dep:url",
     "dep:ring",
     "dep:zeroize",
+    "dep:tower",
 ]
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 base64 = "0.22"
 noargs = "0.4.3"
 onepassword-sdk-unofficial = "0.3.0"
@@ -40,6 +47,7 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 url = { version = "2", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 zeroize = { version = "1.9.0", optional = true }
 
@@ -52,9 +60,7 @@ libc = "0.2"
 [dev-dependencies]
 similar = "2"
 noprop = "=0.2.0"
-http-body-util = "0.1"
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 
 # Shippable binaries built by dist.
 [profile.dist]

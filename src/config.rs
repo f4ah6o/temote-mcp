@@ -183,6 +183,14 @@ impl SessionLifecycle {
     }
 }
 
+#[cfg(test)]
+pub fn state_dir() -> Result<PathBuf> {
+    crate::test_support::private_process_root()
+        .map(|root| root.join("state").join("temote-mcp"))
+        .map_err(anyhow::Error::msg)
+}
+
+#[cfg(not(test))]
 pub fn state_dir() -> Result<PathBuf> {
     crate::platform_paths::state_dir()
         .or_else(crate::platform_paths::data_local_dir)
@@ -289,7 +297,15 @@ fn socket_dir() -> Result<PathBuf> {
     let namespace = std::env::var("TEMOTE_MCP_SOCKET_NAMESPACE")
         .ok()
         .filter(|value| !value.is_empty());
-    socket_dir_for(uid, namespace.as_deref())
+    default_socket_dir(uid, namespace.as_deref())
+}
+
+fn default_socket_dir(uid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
+    #[cfg(test)]
+    if namespace.is_none() {
+        return crate::test_support::private_process_root().map_err(anyhow::Error::msg);
+    }
+    socket_dir_for(uid, namespace)
 }
 
 fn socket_dir_for(uid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
@@ -796,6 +812,34 @@ pub fn unix_time() -> u64 {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[test]
+    fn test_isolation_defaults_are_process_private() {
+        let root = test_support::private_process_root().unwrap();
+        let state = state_dir().unwrap();
+        assert_eq!(state, root.join("state/temote-mcp"));
+        if let Some(platform_state) = crate::platform_paths::state_dir()
+            .or_else(crate::platform_paths::data_local_dir)
+            .map(|path| path.join("temote-mcp"))
+        {
+            assert_ne!(state, platform_state);
+        }
+        assert_eq!(default_socket_dir(1000, None).unwrap(), root);
+        assert_ne!(
+            default_socket_dir(1000, None).unwrap(),
+            socket_dir_for(1000, None).unwrap()
+        );
+
+        let session = session_path("test-defaults").unwrap();
+        assert!(session.starts_with(root.join("state/temote-mcp")));
+        let socket = default_socket_dir(1000, None)
+            .unwrap()
+            .join(format!("{}.sock", "x".repeat(64)));
+        assert!(
+            socket.as_os_str().len() < 104,
+            "socket path too long: {socket:?}"
+        );
+    }
 
     #[test]
     fn validates_custom_session_ids() {

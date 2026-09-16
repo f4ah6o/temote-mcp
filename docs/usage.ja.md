@@ -15,6 +15,8 @@ temote-mcp session info my-project
 
 local approval input が必要な場合は `temote-mcp session console` を使います。この console を閉じる、または stdin EOF になっても runtime は停止せず、console だけが detach します。console 不在中の approval-required operation は fail closed します。
 
+supervisor の bounded local activity stream は `temote-mcp activity [SESSION_ID] [--tail N] [--no-follow]` で確認できます。既定では follow し、filter 後の最新100件を replay します。durable audit log ではなく best-effort な診断機能です。privacy、欠落、retention、切断時の動作は [managed session と named root](managed-sessions.ja.md#local-activity-viewer) を参照してください。
+
 installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` で compatible な same-PID supervisor handoff と coordinated session restart/restore を行えます。credential value は永続化せず、restart context 不足または in-flight operation があれば中止し、planned session を全て確認してから成功を返します。handoff protocol 導入前の supervisor からは最初に手動 restart が1回必要です。
 
 `session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` を確認できます。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。restart は old full session instance を fence し、replacement の開始前に登録済み Codex runtime を shutdown します。replacement の開始に失敗しても old child runtime は残しません。
@@ -86,7 +88,7 @@ stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated と
 
 opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_control` は、local `codex app-server --stdio` に接続し、名前付きの status/task 操作だけを扱います。app-server の handshake は `0.147.0` または `0.153.4` として検証します。task は完全な session instance と canonical working directory に所有されるため、別 session、別 process generation、別 scope から resume できません。
 
-`codex_task_start` と `codex_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。Temote は child turn の start/control より先に accepted receipt を永続化します。crash で副作用の成否が不明な場合は盲目的に replay せず `reconciliation_required` を返します。通常 session では local approval が必要です。approval detail には Codex provenance、operation/tool、target と scope、mutation/read-only、safe な model/effort または command/file-change summary を表示します。prompt、control input、transcript、raw command argument、patch body、command output は task metadata や approval/activity summary に保存しません。`codex_task_get` の詳細 thread data は、opaque な `evidence_id` で取得する bounded・期限付き・session/scope限定の evidence だけです。
+`codex_task_start` と `codex_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。型付き `resume` は保持済みの thread / turn を reconcile する操作であり、新しい turn の開始や終了済み child process の再起動は行いません。Temote は child turn の start/control より先に accepted receipt を永続化します。crash で副作用の成否が不明な場合は盲目的に replay せず `reconciliation_required` を返します。通常 session では local approval が必要です。approval detail には Codex provenance、operation/tool、target と scope、mutation/read-only、safe な model/effort または command/file-change summary を表示します。prompt、control input、transcript、raw command argument、patch body、command output は task metadata や approval/activity summary に保存しません。`codex_task_get` の詳細 thread data は、opaque な `evidence_id` で取得する bounded・期限付き・session/scope限定の evidence だけです。
 
 Temote の yolo は Temote 自身の local sandbox と approval behavior だけを変更し、Codex child の mutation を認可しません。Codex app-server の command/file-change approval request は child 側の approval boundary を維持し、user approval transport が利用できない場合は fail closed します。thread 作成前の initialization または model/list の失敗は `retryable_failed` として同じ start operation を再試行できます。一方、thread/start または turn/start の request 送信後に成否が不明になった場合は replay せず `reconciliation_required` を維持します。`codex_task_get` は `after_revision` / `not_modified` を判定する前に remote thread を reconcile します。task record は task retention の全期間、unexpired の terminal record を含めて保持され、expired かつ live child runtime のない terminal record だけが prune 対象です。scope が retention limit に達した場合は、unexpired record を削除せず新しい start を拒否します。compact された operation receipt も retention 中の exact replay/conflict 検出を維持します。
 
@@ -214,3 +216,23 @@ local stdio では、ローカル承認付きの `without_sandbox` を公開で�
 - secret-file denylist はありません。filesystem の主な境界は permitted root です。
 - runtime audit は operation/status/timing を記録し、command 引数、output、認証 identity、secret value は永続化しません。
 - secret を使う integration は credential を session process に保持し、session metadata へ保存しません。
+
+## リモートアップグレードと再接続
+
+認証済みの直接 HTTP では `upgrade_preflight`、`upgrade_apply`、
+`upgrade_status` を公開します。これらのツールは stdio MCP とマルチホスト
+ゲートウェイには公開しません。preflight と status は読み取り専用のホスト
+ライフサイクル操作です。apply が受け付けるのは、実行中で管理対象の通常
+セッションを示す `session_id` と、省略可能な `expected_version` だけです。
+実行ファイルのパス、URL、コマンド、argv、環境変数は指定できません。
+ask と agent のどちらでもローカル利用者の明示的な承認が必要で、公開 yolo
+セッションは拒否されます。
+
+`upgrade_apply` が新しいトランザクションを accepted として返した後、Temote
+はその HTTP 接続を閉じ、独立したローカル coordinator が残りの処理を所有します。
+クライアントは通常の認証で同じエンドポイントへ再接続し、initialize または
+ping のホスト、バージョン、boot identity を確認してから、
+`upgrade_status(transaction_id)` が終端状態になるまで確認してください。
+Temote は任意の MCP クライアントに再接続を強制できません。成功状態は、対象
+バージョン、安定したホスト identity、セッション復元、および ingress を交換した
+場合の新しい boot generation を coordinator が検証したことを示します。

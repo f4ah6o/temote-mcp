@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,10 +15,15 @@ use crate::line_protocol::{
     BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line, validate_child_tool_call,
 };
 use crate::{
-    apply_patch, approvals, checkpoints, child_env, codex_app_server, config, dev_tool, evidence,
-    friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk, recall, sandbox,
-    session_control::SessionBackend, work_handoff,
+    activity_runtime, apply_patch, approvals, checkpoints, child_env, codex_app_server, config,
+    dev_tool, evidence, friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk,
+    recall, sandbox, session_control::SessionBackend, work_handoff,
 };
+use temote_mcp::activity::contract::{
+    ActivityCancellationReason, ActivityErrorKind, ActivityOperation, ActivityRemote,
+    ActivityResult, ActivitySummary,
+};
+use temote_mcp::activity::scope::ActivityScope;
 
 const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_JOBS_PER_SESSION: usize = 8;
@@ -49,6 +55,269 @@ const SUPPORTED_LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26"
 const SERVER_INSTRUCTIONS: &str = "Call session_list first. When the local session supervisor has no session for the required project, create one with session_start using a configured named-root path, then call session_info before normal tools. Existing tools require session_id except session_list and session_start.";
 const PROCESS_IDENTITY_META_KEY: &str = "io.temote/processIdentity";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityOwner {
+    McpCall,
+    JobWorker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivitySuccess {
+    Completed,
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivityToolCoverage {
+    name: &'static str,
+    operation: ActivityOperation,
+    owner: ActivityOwner,
+    success: ActivitySuccess,
+    fixture: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityNonDispatchOwner {
+    Supervisor,
+    Excluded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivityNonDispatchCoverage {
+    name: &'static str,
+    owner: ActivityNonDispatchOwner,
+    fixture: &'static str,
+}
+
+const ACTIVITY_NON_DISPATCH_COVERAGE: &[ActivityNonDispatchCoverage] = &[
+    ActivityNonDispatchCoverage {
+        name: "session_list",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_start",
+        owner: ActivityNonDispatchOwner::Supervisor,
+        fixture: "activity lifecycle",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_stop",
+        owner: ActivityNonDispatchOwner::Supervisor,
+        fixture: "activity lifecycle",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_restart",
+        owner: ActivityNonDispatchOwner::Supervisor,
+        fixture: "activity lifecycle",
+    },
+    ActivityNonDispatchCoverage {
+        name: "session_info",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
+];
+
+const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
+    activity_tool("read_file", ActivityOperation::ReadFile, "file read"),
+    activity_tool(
+        "evidence_read",
+        ActivityOperation::EvidenceRead,
+        "evidence read",
+    ),
+    activity_tool(
+        "codex_status",
+        ActivityOperation::CodexStatus,
+        "Codex status",
+    ),
+    activity_tool_accepted(
+        "codex_task_start",
+        ActivityOperation::CodexTaskStart,
+        "Codex start acceptance",
+    ),
+    activity_tool(
+        "codex_task_get",
+        ActivityOperation::CodexTaskGet,
+        "Codex get",
+    ),
+    activity_tool_accepted(
+        "codex_task_control",
+        ActivityOperation::CodexTaskControl,
+        "Codex control acceptance",
+    ),
+    activity_job_tool(
+        "local_agent_run",
+        ActivityOperation::LocalAgentRun,
+        "fake local agent worker",
+    ),
+    activity_job_tool(
+        "dev_tool_run",
+        ActivityOperation::DevToolRun,
+        "fake developer tool worker",
+    ),
+    activity_tool("get_image", ActivityOperation::GetImage, "image read"),
+    activity_tool(
+        "list_directory",
+        ActivityOperation::ListDirectory,
+        "directory listing",
+    ),
+    activity_tool("write_file", ActivityOperation::WriteFile, "file write"),
+    activity_tool("apply_patch", ActivityOperation::ApplyPatch, "patch apply"),
+    activity_tool("git_add", ActivityOperation::GitAdd, "Git local"),
+    activity_tool("git_commit", ActivityOperation::GitCommit, "Git local"),
+    activity_tool("git_fetch", ActivityOperation::GitFetch, "Git network"),
+    activity_tool("git_pull", ActivityOperation::GitPull, "Git network"),
+    activity_tool("git_push", ActivityOperation::GitPush, "Git network"),
+    activity_job_tool(
+        "execute",
+        ActivityOperation::Execute,
+        "sandbox command worker",
+    ),
+    activity_job_tool(
+        "start_command",
+        ActivityOperation::StartCommand,
+        "sandbox command worker",
+    ),
+    activity_tool("poll_job", ActivityOperation::PollJob, "job poll"),
+    activity_tool("job_list", ActivityOperation::JobList, "job list"),
+    activity_tool(
+        "checkpoint_save",
+        ActivityOperation::CheckpointSave,
+        "checkpoint save",
+    ),
+    activity_tool(
+        "checkpoint_load",
+        ActivityOperation::CheckpointLoad,
+        "checkpoint load",
+    ),
+    activity_tool(
+        "work_handoff",
+        ActivityOperation::WorkHandoff,
+        "work handoff",
+    ),
+    activity_tool(
+        "friction_summary",
+        ActivityOperation::FrictionSummary,
+        "friction summary",
+    ),
+    activity_tool(
+        "learning_candidate_list",
+        ActivityOperation::LearningCandidateList,
+        "learning candidates",
+    ),
+    activity_tool("recall", ActivityOperation::Recall, "learning recall"),
+    activity_tool(
+        "recall_feedback",
+        ActivityOperation::RecallFeedback,
+        "recall feedback",
+    ),
+    activity_tool(
+        "stop_job",
+        ActivityOperation::StopJob,
+        "job cancellation request",
+    ),
+    activity_tool(
+        "onepassword_mcp_discover",
+        ActivityOperation::OnePasswordMcpDiscover,
+        "1Password MCP discovery",
+    ),
+    activity_tool(
+        "onepassword_mcp_read_resource",
+        ActivityOperation::OnePasswordMcpReadResource,
+        "1Password MCP resource",
+    ),
+    activity_tool(
+        "onepassword_mcp_call",
+        ActivityOperation::OnePasswordMcpCall,
+        "1Password MCP outer call",
+    ),
+    activity_tool(
+        "onepassword_item_get",
+        ActivityOperation::OnePasswordItemGet,
+        "1Password item outer call",
+    ),
+    activity_tool(
+        "onepassword_secret_resolve",
+        ActivityOperation::OnePasswordSecretResolve,
+        "1Password SDK outer call",
+    ),
+    activity_tool(
+        "onepassword_service_account_status",
+        ActivityOperation::OnePasswordServiceAccountStatus,
+        "1Password service-account status",
+    ),
+    activity_tool(
+        "onepassword_service_account_run",
+        ActivityOperation::OnePasswordServiceAccountRun,
+        "1Password service-account outer call",
+    ),
+    activity_tool(
+        "kintone_mcp_status",
+        ActivityOperation::KintoneMcpStatus,
+        "kintone MCP status",
+    ),
+    activity_tool(
+        "kintone_mcp_discover",
+        ActivityOperation::KintoneMcpDiscover,
+        "kintone MCP discovery",
+    ),
+    activity_tool(
+        "kintone_mcp_call",
+        ActivityOperation::KintoneMcpCall,
+        "kintone MCP outer call",
+    ),
+    activity_tool(
+        "kintone_cli_status",
+        ActivityOperation::KintoneCliStatus,
+        "cli-kintone status",
+    ),
+    activity_tool(
+        "kintone_cli_run",
+        ActivityOperation::KintoneCliRun,
+        "cli-kintone outer call",
+    ),
+    activity_tool(
+        "without_sandbox",
+        ActivityOperation::WithoutSandbox,
+        "host command",
+    ),
+];
+
+const fn activity_tool(
+    name: &'static str,
+    operation: ActivityOperation,
+    fixture: &'static str,
+) -> ActivityToolCoverage {
+    ActivityToolCoverage {
+        name,
+        operation,
+        owner: ActivityOwner::McpCall,
+        success: ActivitySuccess::Completed,
+        fixture,
+    }
+}
+
+const fn activity_tool_accepted(
+    name: &'static str,
+    operation: ActivityOperation,
+    fixture: &'static str,
+) -> ActivityToolCoverage {
+    ActivityToolCoverage {
+        success: ActivitySuccess::Accepted,
+        ..activity_tool(name, operation, fixture)
+    }
+}
+
+const fn activity_job_tool(
+    name: &'static str,
+    operation: ActivityOperation,
+    fixture: &'static str,
+) -> ActivityToolCoverage {
+    ActivityToolCoverage {
+        owner: ActivityOwner::JobWorker,
+        ..activity_tool(name, operation, fixture)
+    }
+}
+
 #[derive(Clone)]
 enum CachedJobResult {
     Success {
@@ -71,6 +340,15 @@ struct OutputPolicy {
 struct JobCompletion {
     result: Option<CachedJobResult>,
     completed_at: Option<Instant>,
+    activity: Option<ActivityScope>,
+    activity_terminal: bool,
+}
+
+#[derive(Clone, Copy)]
+enum JobActivityOutcome {
+    Completed,
+    Failed,
+    Cancelled(ActivityCancellationReason),
 }
 
 struct Job {
@@ -670,6 +948,7 @@ async fn call_tool_with_local_agent_executable(
         .unwrap_or_else(|| json!({}));
     reap_jobs();
     if name == "session_list" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Excluded);
         anyhow::ensure!(
             args.as_object().is_some_and(|object| object.is_empty()),
             "session_list takes no arguments"
@@ -677,6 +956,7 @@ async fn call_tool_with_local_agent_executable(
         return session_list(sessions).await;
     }
     if name == "session_start" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Supervisor);
         anyhow::ensure!(
             public,
             "session_start is available only from temote-mcp serve"
@@ -704,6 +984,7 @@ async fn call_tool_with_local_agent_executable(
         return text_result(serde_json::to_string_pretty(&info)?);
     }
     if name == "session_restart" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Supervisor);
         anyhow::ensure!(
             public,
             "session_restart is available only from temote-mcp serve"
@@ -725,6 +1006,7 @@ async fn call_tool_with_local_agent_executable(
         return text_result(serde_json::to_string_pretty(&info)?);
     }
     if name == "session_stop" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Supervisor);
         anyhow::ensure!(
             public,
             "session_stop is available only from temote-mcp serve"
@@ -753,6 +1035,7 @@ async fn call_tool_with_local_agent_executable(
     );
     let session_id = required_session_id(&args)?;
     if name == "session_info" {
+        assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Excluded);
         let view = crate::session_control::inspect_session(&session_id).await?;
         if matches!(view.status.as_str(), "starting" | "active" | "stopping") {
             approvals::activity(&view.session_id, "Read session info", None).await;
@@ -764,438 +1047,522 @@ async fn call_tool_with_local_agent_executable(
         !public || !session.yolo(),
         "yolo sessions are unavailable on the public MCP endpoint"
     );
-    match name {
-        "get_image" => {
-            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
-            let result = get_image(&path).await;
-            report_result(
-                &session.id,
-                format!("Read image {}", display_path(&path, &session.cwd)),
-                &result,
-            )
-            .await;
-            result
-        }
-        "read_file" => read_file_tool(&args, &session).await,
-        "evidence_read" => evidence_read_tool(&args, &session),
-        "codex_status" => {
-            let (detail, metadata) = codex_status_approval();
-            authorize_codex_operation(&session, "codex_status", detail, metadata).await?;
-            text_result(serde_json::to_string_pretty(
-                &codex_app_server::status(&session).await?,
-            )?)
-        }
-        "codex_task_start" => {
-            let (detail, metadata) = codex_task_start_approval(&args);
-            authorize_codex_operation(&session, "codex_task_start", detail, metadata).await?;
-            text_result(serde_json::to_string_pretty(
-                &codex_app_server::task_start(&args, &session).await?,
-            )?)
-        }
-        "codex_task_get" => text_result(serde_json::to_string_pretty(
-            &codex_app_server::task_get(&args, &session).await?,
-        )?),
-        "codex_task_control" => {
-            let (detail, metadata) = codex_task_control_approval(&args);
-            authorize_codex_operation(&session, "codex_task_control", detail, metadata).await?;
-            text_result(serde_json::to_string_pretty(
-                &codex_app_server::task_control(&args, &session).await?,
-            )?)
-        }
-        "local_agent_run" => local_agent_run(&args, &session, local_agent_executable).await,
-        "dev_tool_run" => dev_tool_run(&args, &session).await,
-        "list_directory" => {
-            let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
-            let result = list_directory(&path).await;
-            report_result(
-                &session.id,
-                format!("Listed {}", display_path(&path, &session.cwd)),
-                &result,
-            )
-            .await;
-            text_result(result?)
-        }
-        "write_file" => write_file(&args, &session).await,
-        "apply_patch" => {
-            let request = apply_patch::parse_request(&args)?;
-            let outcome = apply_patch::apply(&session, request).await?;
-            text_result(serde_json::to_string_pretty(&outcome)?)
-        }
-        "git_add" => git_add(&args, &session).await,
-        "git_commit" => git_commit(&args, &session).await,
-        "git_fetch" => git_fetch(&args, &session).await,
-        "git_pull" => git_pull(&args, &session).await,
-        "git_push" => git_push(&args, &session).await,
-        "execute" => execute(&args, &session).await,
-        "start_command" => start_command(&args, &session).await,
-        "poll_job" => poll_job(&args, &session).await,
-        "job_list" => job_list(&args, &session),
-        "checkpoint_save" => {
-            let request = checkpoints::parse_save_request(&args)?;
-            anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
-            let approval_detail = checkpoints::approval_detail(&request.checkpoint);
-            let approved = approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::LocalStructured,
-                "checkpoint_save",
-                approval_detail,
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?;
-            let store = checkpoints::Store::default_store()?;
-            let (saved, activity_detail) =
-                save_checkpoint_after_approval(&session, request, &store, approved)?;
-            approvals::activity(
-                &session.id,
-                "Saved client-reported checkpoint",
-                Some(activity_detail),
-            )
-            .await;
-            text_result(serde_json::to_string_pretty(&saved)?)
-        }
-        "checkpoint_load" => {
-            let request = checkpoints::parse_load_request(&args)?;
-            anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
-            let loaded = checkpoints::load(&session, request.checkpoint_id)?;
-            approvals::activity(&session.id, "Loaded client-reported checkpoint", None).await;
-            text_result(serde_json::to_string_pretty(&loaded)?)
-        }
-        "work_handoff" => {
-            let request = work_handoff::parse_request(&args)?;
-            text_result(work_handoff::render(&session, request)?)
-        }
-        "friction_summary" => {
-            let store = friction::Store::default_store()?;
-            let summary = store.summary(&session)?;
-            text_result(serde_json::to_string_pretty(&summary)?)
-        }
-        "learning_candidate_list" => {
-            let store = friction::Store::default_store()?;
-            let candidates = store.candidates(&session)?;
-            text_result(serde_json::to_string_pretty(&candidates)?)
-        }
-        "recall" => {
-            let query = args
-                .get("query")
-                .and_then(Value::as_str)
-                .context("missing query")?;
-            let knowledge_root = args.get("knowledge_root").and_then(Value::as_str);
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
-            let response = recall::search(&session, query, knowledge_root, limit)?;
-            text_result(serde_json::to_string_pretty(&response)?)
-        }
-        "recall_feedback" => {
-            anyhow::ensure!(
-                args.get("outcome").and_then(Value::as_str) == Some("no_hit"),
-                "recall_feedback outcome must be no_hit"
-            );
-            let retry_group = args
-                .get("retry_group")
-                .and_then(Value::as_str)
-                .map(Uuid::parse_str)
-                .transpose()
-                .context("retry_group must be a UUID")?;
-            let approved = approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::LocalStructured,
-                "recall_feedback",
-                "signal: no_hit; query/content: not persisted".to_owned(),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?;
-            anyhow::ensure!(approved, "user denied recall feedback persistence");
-            let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
-            text_result(serde_json::to_string_pretty(&event)?)
-        }
-        "stop_job" => stop_job(&args, &session).await,
-        "onepassword_mcp_discover" => {
-            let result = onepassword_mcp::discover(&session).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "onepassword_mcp_read_resource" => {
-            let uri = args
-                .get("uri")
-                .and_then(Value::as_str)
-                .context("missing uri")?;
-            let result = onepassword_mcp::read_resource(&session, uri).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "onepassword_mcp_call" => {
-            let tool_name = args
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .context("missing tool_name")?;
-            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            onepassword_mcp::call_tool(&session, tool_name, arguments).await
-        }
-        "onepassword_item_get" => {
-            let items = required_string_array(&args, "items")?;
-            let vault = args
-                .get("vault")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("vault must be a string")
-                })
-                .transpose()?;
-            let account = args
-                .get("account")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("account must be a string")
-                })
-                .transpose()?;
-            let request = onepassword_cli::ItemGetRequest::new(items, vault, account)?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "onepassword_item_get",
-                request.approval_summary(),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied 1Password item read")
+    let coverage = activity_tool_coverage(name);
+    let activity = if let Some(coverage) = coverage {
+        tool_activity_scope(
+            &session,
+            coverage.operation,
+            activity_tool_summary(&args, coverage.operation),
+        )
+        .await
+    } else {
+        None
+    };
+    let result = async {
+        match name {
+            "get_image" => {
+                let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
+                let result = get_image(&path).await;
+                report_result(
+                    &session.id,
+                    format!("Read image {}", display_path(&path, &session.cwd)),
+                    &result,
+                )
+                .await;
+                result
             }
-            match onepassword_cli::item_get_coalesced(&session, &request).await {
-                Ok(items) => {
-                    approvals::activity(
-                        &session.id,
-                        format!("Read {} 1Password item(s)", items.len()),
-                        None,
-                    )
-                    .await;
-                    text_result(serde_json::to_string_pretty(&items)?)
+            "read_file" => read_file_tool(&args, &session).await,
+            "evidence_read" => evidence_read_tool(&args, &session),
+            "codex_status" => {
+                let (detail, metadata) = codex_status_approval();
+                authorize_codex_operation(
+                    &session,
+                    "codex_status",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &codex_app_server::status(&session).await?,
+                )?)
+            }
+            "codex_task_start" => {
+                let (detail, metadata) = codex_task_start_approval(&args);
+                authorize_codex_operation(
+                    &session,
+                    "codex_task_start",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &codex_app_server::task_start(&args, &session).await?,
+                )?)
+            }
+            "codex_task_get" => text_result(serde_json::to_string_pretty(
+                &codex_app_server::task_get(&args, &session).await?,
+            )?),
+            "codex_task_control" => {
+                let (detail, metadata) = codex_task_control_approval(&args);
+                authorize_codex_operation(
+                    &session,
+                    "codex_task_control",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &codex_app_server::task_control(&args, &session).await?,
+                )?)
+            }
+            "local_agent_run" => {
+                local_agent_run(&args, &session, local_agent_executable, activity.clone()).await
+            }
+            "dev_tool_run" => dev_tool_run(&args, &session, activity.clone()).await,
+            "list_directory" => {
+                let path = config::resolve_existing_path(&session, &required_path(&args, "path")?)?;
+                let result = list_directory(&path).await;
+                report_result(
+                    &session.id,
+                    format!("Listed {}", display_path(&path, &session.cwd)),
+                    &result,
+                )
+                .await;
+                text_result(result?)
+            }
+            "write_file" => write_file(&args, &session, activity.as_ref()).await,
+            "apply_patch" => {
+                let request = apply_patch::parse_request(&args)?;
+                let outcome =
+                    apply_patch::apply_with_activity(&session, request, activity.as_ref()).await?;
+                if outcome.status == "partial_failure"
+                    && let Some(activity) = activity.as_ref()
+                {
+                    let _ = activity.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::OperationFailed,
+                    ));
                 }
-                Err(error) => {
-                    approvals::activity(&session.id, "1Password item read failed", None).await;
-                    Err(error)
+                text_result(serde_json::to_string_pretty(&outcome)?)
+            }
+            name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push") => {
+                let operation =
+                    git_activity_operation(name).expect("matched Git activity operation");
+                match operation {
+                    ActivityOperation::GitAdd => git_add(&args, &session, activity.as_ref()).await,
+                    ActivityOperation::GitCommit => {
+                        git_commit(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitFetch => {
+                        git_fetch(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitPull => {
+                        git_pull(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitPush => {
+                        git_push(&args, &session, activity.as_ref()).await
+                    }
+                    _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
             }
-        }
-        "onepassword_secret_resolve" => {
-            let account = args
-                .get("account")
-                .and_then(Value::as_str)
-                .context("missing account")?
-                .to_owned();
-            let references = required_string_array(&args, "references")?;
-            let request = onepassword_sdk::ResolveRequest::new(account, references)?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "onepassword_secret_resolve",
-                request.approval_summary(),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied 1Password secret resolution")
+            "execute" => execute(&args, &session, activity.clone()).await,
+            "start_command" => start_command(&args, &session, activity.clone()).await,
+            "poll_job" => poll_job(&args, &session).await,
+            "job_list" => job_list(&args, &session),
+            "checkpoint_save" => {
+                let request = checkpoints::parse_save_request(&args)?;
+                anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+                let approval_detail = checkpoints::approval_detail(&request.checkpoint);
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::LocalStructured,
+                        operation: "checkpoint_save",
+                        detail: approval_detail,
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied checkpoint save",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let store = checkpoints::Store::default_store()?;
+                let (saved, activity_detail) =
+                    save_checkpoint_after_approval(&session, request, &store, true)?;
+                approvals::activity(
+                    &session.id,
+                    "Saved client-reported checkpoint",
+                    Some(activity_detail),
+                )
+                .await;
+                text_result(serde_json::to_string_pretty(&saved)?)
             }
-            match onepassword_sdk::resolve(&session, &request).await {
-                Ok(values) => {
-                    approvals::activity(
-                        &session.id,
-                        format!("Resolved {} 1Password secret(s)", values.len()),
-                        None,
-                    )
-                    .await;
-                    text_result(serde_json::to_string_pretty(&values)?)
-                }
-                Err(error) => {
-                    approvals::activity(&session.id, "1Password secret resolution failed", None)
+            "checkpoint_load" => {
+                let request = checkpoints::parse_load_request(&args)?;
+                anyhow::ensure!(request.session_id == session.id, "session ID mismatch");
+                let loaded = checkpoints::load(&session, request.checkpoint_id)?;
+                approvals::activity(&session.id, "Loaded client-reported checkpoint", None).await;
+                text_result(serde_json::to_string_pretty(&loaded)?)
+            }
+            "work_handoff" => {
+                let request = work_handoff::parse_request(&args)?;
+                text_result(work_handoff::render(&session, request)?)
+            }
+            "friction_summary" => {
+                let store = friction::Store::default_store()?;
+                let summary = store.summary(&session)?;
+                text_result(serde_json::to_string_pretty(&summary)?)
+            }
+            "learning_candidate_list" => {
+                let store = friction::Store::default_store()?;
+                let candidates = store.candidates(&session)?;
+                text_result(serde_json::to_string_pretty(&candidates)?)
+            }
+            "recall" => {
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .context("missing query")?;
+                let knowledge_root = args.get("knowledge_root").and_then(Value::as_str);
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
+                let response = recall::search(&session, query, knowledge_root, limit)?;
+                text_result(serde_json::to_string_pretty(&response)?)
+            }
+            "recall_feedback" => {
+                anyhow::ensure!(
+                    args.get("outcome").and_then(Value::as_str) == Some("no_hit"),
+                    "recall_feedback outcome must be no_hit"
+                );
+                let retry_group = args
+                    .get("retry_group")
+                    .and_then(Value::as_str)
+                    .map(Uuid::parse_str)
+                    .transpose()
+                    .context("retry_group must be a UUID")?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::LocalStructured,
+                        operation: "recall_feedback",
+                        detail: "signal: no_hit; query/content: not persisted".to_owned(),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied recall feedback persistence",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let event = friction::record_client_reported_recall_miss(&session, retry_group)?;
+                text_result(serde_json::to_string_pretty(&event)?)
+            }
+            "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
+            "onepassword_mcp_discover" => {
+                let result = onepassword_mcp::discover(&session).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "onepassword_mcp_read_resource" => {
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .context("missing uri")?;
+                let result = onepassword_mcp::read_resource(&session, uri).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "onepassword_mcp_call" => {
+                let tool_name = args
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .context("missing tool_name")?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                onepassword_mcp::call_tool_with_activity(
+                    &session,
+                    tool_name,
+                    arguments,
+                    activity.as_ref(),
+                )
+                .await
+            }
+            "onepassword_item_get" => {
+                let items = required_string_array(&args, "items")?;
+                let vault = args
+                    .get("vault")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("vault must be a string")
+                    })
+                    .transpose()?;
+                let account = args
+                    .get("account")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("account must be a string")
+                    })
+                    .transpose()?;
+                let request = onepassword_cli::ItemGetRequest::new(items, vault, account)?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "onepassword_item_get",
+                        detail: request.approval_summary(),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied 1Password item read",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                match onepassword_cli::item_get_coalesced(&session, &request).await {
+                    Ok(items) => {
+                        approvals::activity(
+                            &session.id,
+                            format!("Read {} 1Password item(s)", items.len()),
+                            None,
+                        )
                         .await;
-                    Err(error)
+                        text_result(serde_json::to_string_pretty(&items)?)
+                    }
+                    Err(error) => {
+                        approvals::activity(&session.id, "1Password item read failed", None).await;
+                        Err(error)
+                    }
                 }
             }
-        }
-        "onepassword_service_account_status" => {
-            let result = approvals::onepassword_service_account_status(&session.id).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "onepassword_service_account_run" => {
-            let command = required_command(&args)?;
-            let cwd = cwd(&args, &session)?;
-            let env_files = args
-                .get("env_files")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| {
-                            let value =
-                                item.as_str().context("env_files entries must be strings")?;
-                            bounded_path(value, "env_files entry")
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let environment = args
-                .get("environment")
-                .map(|value| {
-                    value
-                        .as_object()
-                        .context("environment must be an object")?
-                        .iter()
-                        .map(|(name, value)| {
-                            value
-                                .as_str()
-                                .map(|value| (name.clone(), value.to_owned()))
-                                .context("environment values must be strings")
-                        })
-                        .collect::<Result<std::collections::BTreeMap<_, _>>>()
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let allowed_locators = args
-                .get("allowed_locators")
-                .map(|_| required_string_array(&args, "allowed_locators"))
-                .transpose()?
-                .unwrap_or_default();
-            approvals::validate_service_account_run_input(
-                &command,
-                &env_files,
-                &environment,
-                &allowed_locators,
-            )?;
-            let detail = service_account_approval_detail(
-                &command,
-                &env_files,
-                &environment,
-                &allowed_locators,
-            )?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "onepassword_service_account_run",
-                detail,
-                cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied 1Password service-account command")
+            "onepassword_secret_resolve" => {
+                let account = args
+                    .get("account")
+                    .and_then(Value::as_str)
+                    .context("missing account")?
+                    .to_owned();
+                let references = required_string_array(&args, "references")?;
+                let request = onepassword_sdk::ResolveRequest::new(account, references)?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "onepassword_secret_resolve",
+                        detail: request.approval_summary(),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied 1Password secret resolution",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                match onepassword_sdk::resolve(&session, &request).await {
+                    Ok(values) => {
+                        approvals::activity(
+                            &session.id,
+                            format!("Resolved {} 1Password secret(s)", values.len()),
+                            None,
+                        )
+                        .await;
+                        text_result(serde_json::to_string_pretty(&values)?)
+                    }
+                    Err(error) => {
+                        approvals::activity(
+                            &session.id,
+                            "1Password secret resolution failed",
+                            None,
+                        )
+                        .await;
+                        Err(error)
+                    }
+                }
             }
-            let result = approvals::onepassword_service_account_run(
-                &session.id,
-                cwd,
-                command,
-                env_files,
-                environment,
-                allowed_locators,
-            )
-            .await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_mcp_status" => {
-            let result = approvals::kintone_mcp_status(&session.id).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_mcp_discover" => {
-            let result = approvals::kintone_mcp_discover(&session.id).await?;
-            approvals::activity(&session.id, "Discovered kintone MCP capabilities", None).await;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_mcp_call" => {
-            let tool_name = args
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .context("missing tool_name")?;
-            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            validate_child_tool_call(tool_name, &arguments)
-                .context("invalid kintone MCP tool call")?;
-            let listed = approvals::kintone_mcp_discover(&session.id).await?;
-            let known = listed["tools"].as_array().is_some_and(|tools| {
-                tools
+            "onepassword_service_account_status" => {
+                let result = approvals::onepassword_service_account_status(&session.id).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "onepassword_service_account_run" => {
+                let command = required_command(&args)?;
+                let cwd = cwd(&args, &session)?;
+                let env_files = args
+                    .get("env_files")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| {
+                                let value =
+                                    item.as_str().context("env_files entries must be strings")?;
+                                bounded_path(value, "env_files entry")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let environment = args
+                    .get("environment")
+                    .map(|value| {
+                        value
+                            .as_object()
+                            .context("environment must be an object")?
+                            .iter()
+                            .map(|(name, value)| {
+                                value
+                                    .as_str()
+                                    .map(|value| (name.clone(), value.to_owned()))
+                                    .context("environment values must be strings")
+                            })
+                            .collect::<Result<std::collections::BTreeMap<_, _>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let allowed_locators = args
+                    .get("allowed_locators")
+                    .map(|_| required_string_array(&args, "allowed_locators"))
+                    .transpose()?
+                    .unwrap_or_default();
+                approvals::validate_service_account_run_input(
+                    &command,
+                    &env_files,
+                    &environment,
+                    &allowed_locators,
+                )?;
+                let detail = service_account_approval_detail(
+                    &command,
+                    &env_files,
+                    &environment,
+                    &allowed_locators,
+                )?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "onepassword_service_account_run",
+                        detail,
+                        cwd: cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied 1Password service-account command",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let result = approvals::onepassword_service_account_run(
+                    &session.id,
+                    cwd,
+                    command,
+                    env_files,
+                    environment,
+                    allowed_locators,
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_mcp_status" => {
+                let result = approvals::kintone_mcp_status(&session.id).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_mcp_discover" => {
+                let result = approvals::kintone_mcp_discover(&session.id).await?;
+                approvals::activity(&session.id, "Discovered kintone MCP capabilities", None).await;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_mcp_call" => {
+                let tool_name = args
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .context("missing tool_name")?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                validate_child_tool_call(tool_name, &arguments)
+                    .context("invalid kintone MCP tool call")?;
+                let listed = approvals::kintone_mcp_discover(&session.id).await?;
+                let known = listed["tools"].as_array().is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["name"].as_str() == Some(tool_name))
+                });
+                anyhow::ensure!(known, "unknown kintone MCP tool: {tool_name}");
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "kintone_mcp_call",
+                        detail: safe_child_call_summary(tool_name, &arguments),
+                        cwd: session.cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied kintone MCP tool call",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let result = approvals::kintone_mcp_call(&session.id, tool_name, arguments).await?;
+                approvals::activity(
+                    &session.id,
+                    format!("Called kintone MCP tool {tool_name}"),
+                    None,
+                )
+                .await;
+                Ok(result)
+            }
+            "kintone_cli_status" => {
+                let result = approvals::kintone_cli_status(&session.id).await?;
+                text_result(serde_json::to_string_pretty(&result)?)
+            }
+            "kintone_cli_run" => {
+                let arguments = args
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .context("missing arguments")?
                     .iter()
-                    .any(|tool| tool["name"].as_str() == Some(tool_name))
-            });
-            anyhow::ensure!(known, "unknown kintone MCP tool: {tool_name}");
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "kintone_mcp_call",
-                safe_child_call_summary(tool_name, &arguments),
-                session.cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied kintone MCP tool call")
+                    .map(|argument| {
+                        argument
+                            .as_str()
+                            .map(str::to_owned)
+                            .context("arguments entries must be strings")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    arguments.len() >= 2,
+                    "kintone_cli_run requires a cli-kintone command pair"
+                );
+                validate_command_budget(&arguments)?;
+                let cwd = cwd(&args, &session)?;
+                let stdout_path = args
+                    .get("stdout_path")
+                    .map(|value| {
+                        let value = value.as_str().context("stdout_path must be a string")?;
+                        bounded_path(value, "stdout_path")
+                    })
+                    .transpose()?;
+                request_activity_approval(
+                    &session,
+                    ActivityApprovalRequest {
+                        class: approvals::ApprovalClass::Integration,
+                        operation: "kintone_cli_run",
+                        detail: safe_kintone_cli_summary(&arguments, stdout_path.as_deref()),
+                        cwd: cwd.clone(),
+                        metadata: BTreeMap::new(),
+                        denial: "user denied cli-kintone command",
+                    },
+                    activity.as_ref(),
+                )
+                .await?;
+                let result =
+                    approvals::kintone_cli_run(&session.id, cwd, arguments.clone(), stdout_path)
+                        .await?;
+                approvals::activity(
+                    &session.id,
+                    format!("Ran cli-kintone {} {}", arguments[0], arguments[1]),
+                    None,
+                )
+                .await;
+                text_result(serde_json::to_string_pretty(&result)?)
             }
-            let result = approvals::kintone_mcp_call(&session.id, tool_name, arguments).await?;
-            approvals::activity(
-                &session.id,
-                format!("Called kintone MCP tool {tool_name}"),
-                None,
-            )
-            .await;
-            Ok(result)
+            "without_sandbox" => without_sandbox(&args, &session, activity.as_ref()).await,
+            _ => anyhow::bail!("unknown tool: {name}"),
         }
-        "kintone_cli_status" => {
-            let result = approvals::kintone_cli_status(&session.id).await?;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "kintone_cli_run" => {
-            let arguments = args
-                .get("arguments")
-                .and_then(Value::as_array)
-                .context("missing arguments")?
-                .iter()
-                .map(|argument| {
-                    argument
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("arguments entries must be strings")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            anyhow::ensure!(
-                arguments.len() >= 2,
-                "kintone_cli_run requires a cli-kintone command pair"
-            );
-            validate_command_budget(&arguments)?;
-            let cwd = cwd(&args, &session)?;
-            let stdout_path = args
-                .get("stdout_path")
-                .map(|value| {
-                    let value = value.as_str().context("stdout_path must be a string")?;
-                    bounded_path(value, "stdout_path")
-                })
-                .transpose()?;
-            if !approvals::ensure_local_approval(
-                &session,
-                approvals::ApprovalClass::Integration,
-                "kintone_cli_run",
-                safe_kintone_cli_summary(&arguments, stdout_path.as_deref()),
-                cwd.clone(),
-                BTreeMap::new(),
-            )
-            .await?
-            {
-                anyhow::bail!("user denied cli-kintone command")
-            }
-            let result =
-                approvals::kintone_cli_run(&session.id, cwd, arguments.clone(), stdout_path)
-                    .await?;
-            approvals::activity(
-                &session.id,
-                format!("Ran cli-kintone {} {}", arguments[0], arguments[1]),
-                None,
-            )
-            .await;
-            text_result(serde_json::to_string_pretty(&result)?)
-        }
-        "without_sandbox" => without_sandbox(&args, &session).await,
-        _ => anyhow::bail!("unknown tool: {name}"),
     }
+    .await;
+    finish_covered_tool_activity(coverage, activity.as_ref(), &result);
+    result
 }
 
 async fn session_list(sessions: Option<&SessionBackend>) -> Result<Value> {
@@ -1276,18 +1643,81 @@ async fn authorize_codex_operation(
     action: &str,
     detail: String,
     metadata: BTreeMap<String, String>,
+    activity: Option<&ActivityScope>,
 ) -> Result<()> {
-    let approved = approvals::ensure_local_approval(
+    let approved = approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::CodexAppServer,
         action,
         detail,
         session.cwd.clone(),
         metadata,
+        activity,
     )
     .await?;
-    anyhow::ensure!(approved, "user denied Codex operation");
+    finish_activity_approval(approved, activity, "user denied Codex operation")?;
     Ok(())
+}
+
+fn finish_activity_approval(
+    approved: bool,
+    activity: Option<&ActivityScope>,
+    denial: &'static str,
+) -> Result<()> {
+    if !approved {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+        anyhow::bail!(denial);
+    }
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    Ok(())
+}
+
+struct ActivityApprovalRequest<'a> {
+    class: approvals::ApprovalClass,
+    operation: &'a str,
+    detail: String,
+    cwd: PathBuf,
+    metadata: BTreeMap<String, String>,
+    denial: &'static str,
+}
+
+async fn request_activity_approval(
+    session: &config::Session,
+    request: ActivityApprovalRequest<'_>,
+    activity: Option<&ActivityScope>,
+) -> Result<()> {
+    let ActivityApprovalRequest {
+        class,
+        operation,
+        detail,
+        cwd,
+        metadata,
+        denial,
+    } = request;
+    let approved = match activity {
+        Some(activity) => {
+            approvals::ensure_local_approval_with_activity(
+                session,
+                class,
+                operation,
+                detail,
+                cwd,
+                metadata,
+                Some(activity),
+            )
+            .await?
+        }
+        None => {
+            approvals::ensure_local_approval(session, class, operation, detail, cwd, metadata)
+                .await?
+        }
+    };
+    finish_activity_approval(approved, activity, denial)
 }
 
 fn codex_status_approval() -> (String, BTreeMap<String, String>) {
@@ -1381,6 +1811,93 @@ fn safe_codex_argument(args: &Value, key: &str) -> String {
 
 fn text_result(text: String) -> Result<Value> {
     Ok(json!({"content":[{"type":"text","text":text}]}))
+}
+
+fn activity_tool_coverage(name: &str) -> Option<&'static ActivityToolCoverage> {
+    ACTIVITY_TOOL_COVERAGE
+        .iter()
+        .find(|coverage| coverage.name == name)
+}
+
+fn assert_non_dispatch_activity_owner(name: &str, owner: ActivityNonDispatchOwner) {
+    let coverage = ACTIVITY_NON_DISPATCH_COVERAGE
+        .iter()
+        .find(|coverage| coverage.name == name)
+        .expect("known non-dispatch tool must have activity coverage");
+    assert_eq!(coverage.owner, owner);
+    assert!(!coverage.fixture.is_empty());
+}
+
+fn activity_tool_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
+    git_activity_summary(args, operation)
+}
+
+fn git_activity_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
+    match operation {
+        ActivityOperation::GitFetch | ActivityOperation::GitPull | ActivityOperation::GitPush => {
+            let remote = match args.get("remote").and_then(Value::as_str) {
+                None | Some("origin") => ActivityRemote::Origin,
+                Some(_) => ActivityRemote::Other,
+            };
+            ActivitySummary::git(remote)
+        }
+        _ => ActivitySummary::empty(),
+    }
+}
+
+async fn tool_activity_scope(
+    session: &config::Session,
+    operation: ActivityOperation,
+    summary: ActivitySummary,
+) -> Option<ActivityScope> {
+    activity_runtime::emitter(session)
+        .await
+        .ok()
+        .map(|emitter| ActivityScope::with_summary(operation, summary, emitter))
+}
+
+#[cfg(test)]
+fn finish_tool_activity(activity: Option<&ActivityScope>, result: &Result<Value>) {
+    let Some(activity) = activity else {
+        return;
+    };
+    let _ = if result.is_ok() {
+        activity.complete()
+    } else {
+        activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed))
+    };
+}
+
+fn finish_tool_activity_on_error(activity: Option<&ActivityScope>, result: &Result<Value>) {
+    if result.is_err()
+        && let Some(activity) = activity
+    {
+        let _ = activity
+            .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed));
+    }
+}
+
+fn finish_covered_tool_activity(
+    coverage: Option<&ActivityToolCoverage>,
+    activity: Option<&ActivityScope>,
+    result: &Result<Value>,
+) {
+    let (Some(coverage), Some(activity)) = (coverage, activity) else {
+        return;
+    };
+    if result.is_err() {
+        finish_tool_activity_on_error(Some(activity), result);
+        return;
+    }
+    if coverage.owner == ActivityOwner::JobWorker {
+        return;
+    }
+    let _ = match coverage.success {
+        ActivitySuccess::Completed => activity.complete(),
+        ActivitySuccess::Accepted => {
+            activity.complete_with_summary(ActivitySummary::result(ActivityResult::Accepted))
+        }
+    };
 }
 
 async fn read_file_tool(args: &Value, session: &config::Session) -> Result<Value> {
@@ -1729,7 +2246,11 @@ fn push_directory_listing_entry(
     Ok(())
 }
 
-async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
+async fn write_file(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let absolute = config::resolve_write_path(session, &required_path(args, "path")?)?;
     ensure_regular_write_target(&absolute).await?;
     let parent = absolute.parent().context("file has no parent directory")?;
@@ -1747,6 +2268,9 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
         "temote-mcp-write".to_owned(),
         absolute.display().to_string(),
     ];
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let result = if session.yolo() {
         tokio::fs::write(&absolute, content)
             .await
@@ -1775,7 +2299,22 @@ async fn write_file(args: &Value, session: &config::Session) -> Result<Value> {
     text_result(result?)
 }
 
-async fn git_add(args: &Value, session: &config::Session) -> Result<Value> {
+fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
+    match name {
+        "git_add" => Some(ActivityOperation::GitAdd),
+        "git_commit" => Some(ActivityOperation::GitCommit),
+        "git_fetch" => Some(ActivityOperation::GitFetch),
+        "git_pull" => Some(ActivityOperation::GitPull),
+        "git_push" => Some(ActivityOperation::GitPush),
+        _ => None,
+    }
+}
+
+async fn git_add(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let paths = required_string_array(args, "paths")?;
     anyhow::ensure!(!paths.is_empty(), "paths must not be empty");
@@ -1788,10 +2327,14 @@ async fn git_add(args: &Value, session: &config::Session) -> Result<Value> {
     for path in paths {
         command.push(resolve_git_add_path(session, &path)?);
     }
-    run_git_and_report(session, cwd, command, "Stage files").await
+    run_git_and_report(session, cwd, command, "Stage files", activity).await
 }
 
-async fn git_commit(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_commit(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let message = args
         .get("message")
@@ -1816,10 +2359,14 @@ async fn git_commit(args: &Value, session: &config::Session) -> Result<Value> {
         "-m".to_owned(),
         message.to_owned(),
     ];
-    run_git_and_report(session, cwd, command, "Create Git commit").await
+    run_git_and_report(session, cwd, command, "Create Git commit", activity).await
 }
 
-async fn git_fetch(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_fetch(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
     ensure_configured_git_remote(session, &cwd, &remote).await?;
@@ -1833,10 +2380,14 @@ async fn git_fetch(args: &Value, session: &config::Session) -> Result<Value> {
         "--prune".to_owned(),
         remote,
     ];
-    run_approved_git_command(session, cwd, command, "git_fetch").await
+    run_approved_git_command(session, cwd, command, "git_fetch", activity).await
 }
 
-async fn git_pull(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_pull(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let command = vec![
         "git".to_owned(),
@@ -1848,10 +2399,14 @@ async fn git_pull(args: &Value, session: &config::Session) -> Result<Value> {
         "--ff-only".to_owned(),
         "--recurse-submodules=no".to_owned(),
     ];
-    run_approved_git_command(session, cwd, command, "git_pull").await
+    run_approved_git_command(session, cwd, command, "git_pull", activity).await
 }
 
-async fn git_push(args: &Value, session: &config::Session) -> Result<Value> {
+async fn git_push(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let cwd = cwd(args, session)?;
     let remote = optional_git_remote(args)?;
     let set_upstream = args
@@ -1882,7 +2437,7 @@ async fn git_push(args: &Value, session: &config::Session) -> Result<Value> {
         command.push(remote);
         command.push("HEAD".to_owned());
     }
-    run_approved_git_command(session, cwd, command, "git_push").await
+    run_approved_git_command(session, cwd, command, "git_push", activity).await
 }
 
 fn optional_git_remote(args: &Value) -> Result<Option<String>> {
@@ -1944,24 +2499,33 @@ async fn run_approved_git_command(
     cwd: PathBuf,
     command: Vec<String>,
     operation: &str,
+    activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let repository_root = sandbox::git_worktree_root(&cwd)?;
     config::ensure_permitted(session, &repository_root)
         .context("Git repository root must be inside a permitted session root")?;
-    if !approvals::ensure_local_approval(
+    if !approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::GitNetwork,
         operation,
         format!("argv: {command:?}"),
         repository_root.clone(),
         BTreeMap::new(),
+        activity,
     )
     .await?
     {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
         anyhow::bail!("user denied {operation}")
     }
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let output = sandbox::run_unrestricted_with_env(
         &command,
         &repository_root,
@@ -2067,9 +2631,13 @@ async fn run_git_and_report(
     cwd: PathBuf,
     command: Vec<String>,
     title: &str,
+    activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
     let output = if session.yolo() {
         sandbox::run_unrestricted(&command, &cwd, None).await
     } else {
@@ -2088,10 +2656,26 @@ async fn run_git_and_report(
     text_result(result?)
 }
 
-async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
+async fn execute(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, mut handle, completion) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, handle, completion) =
+        spawn_sandboxed_command(args, session, activity).await?;
 
+    finish_foreground_or_store_job(session, rendered_command, handle, completion, output_policy)
+        .await
+}
+
+async fn finish_foreground_or_store_job(
+    session: &config::Session,
+    rendered_command: String,
+    mut handle: JoinHandle<()>,
+    completion: Arc<Mutex<JobCompletion>>,
+    output_policy: OutputPolicy,
+) -> Result<Value> {
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             joined.context("command task failed")?;
@@ -2117,9 +2701,14 @@ async fn execute(args: &Value, session: &config::Session) -> Result<Value> {
     }
 }
 
-async fn start_command(args: &Value, session: &config::Session) -> Result<Value> {
+async fn start_command(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, handle, completion) = spawn_sandboxed_command(args, session).await?;
+    let (rendered_command, handle, completion) =
+        spawn_sandboxed_command(args, session, activity).await?;
     store_job(
         session,
         rendered_command,
@@ -2135,6 +2724,7 @@ async fn local_agent_run(
     args: &Value,
     session: &config::Session,
     executable: Option<&Path>,
+    activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let prepared = match executable {
         Some(executable) => local_agent::prepare_with_executable(args, session, executable)?,
@@ -2147,16 +2737,23 @@ async fn local_agent_run(
     {
         let detail = prepared.approval_detail();
         approvals::ensure_approval_detail_fits(&detail)?;
-        let approved = approvals::ensure_local_approval(
+        let approved = approvals::ensure_local_approval_with_activity(
             session,
             approvals::ApprovalClass::LocalAgent,
             "local_agent_run",
             detail,
             prepared.cwd.clone(),
             prepared.approval_metadata(),
+            activity.as_ref(),
         )
         .await?;
-        anyhow::ensure!(approved, "user denied local_agent_run");
+        if !approved {
+            if let Some(activity) = &activity {
+                let _ = activity
+                    .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+            }
+            anyhow::bail!("user denied local_agent_run");
+        }
     }
 
     let current_session = config::load_session(&session.id).await?;
@@ -2170,7 +2767,7 @@ async fn local_agent_run(
         None => prepared.revalidate(&current_session)?,
     }
     let (description, mut handle, completion) =
-        spawn_local_agent(prepared, &current_session).await?;
+        spawn_local_agent(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             joined.context("local agent task failed")?;
@@ -2199,33 +2796,68 @@ async fn local_agent_run(
 async fn spawn_local_agent(
     prepared: local_agent::PreparedRun,
     session: &config::Session,
+    activity: Option<ActivityScope>,
 ) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    spawn_local_agent_with_controls(
+        prepared,
+        session,
+        activity,
+        wait_for_session_stop(session.id.clone()),
+        MAX_JOB_LIFETIME,
+    )
+    .await
+}
+
+async fn spawn_local_agent_with_controls<F>(
+    prepared: local_agent::PreparedRun,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+    session_stop: F,
+    max_lifetime: Duration,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let slot = reserve_job_slot(&session.id)?;
     let description = prepared.activity_label();
     approvals::activity(&session.id, format!("Running {description}"), None).await;
+    if let Some(activity) = &activity {
+        let _ = activity.running();
+    }
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let activity_label = description.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let completion = Arc::new(Mutex::new(JobCompletion {
+        activity,
+        ..JobCompletion::default()
+    }));
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
-        let result = tokio::select! {
+        let (result, outcome) = tokio::select! {
             result = local_agent::run(prepared) => {
-                result.and_then(render_output)
+                let result = result.and_then(render_output);
+                let outcome = if result.is_ok() {
+                    JobActivityOutcome::Completed
+                } else {
+                    JobActivityOutcome::Failed
+                };
+                (result, outcome)
             }
-            _ = wait_for_session_stop(session_id.clone()) => {
-                Err(anyhow::anyhow!("session stopped; local agent job cancelled"))
+            _ = session_stop => {
+                (
+                    Err(anyhow::anyhow!("session stopped; local agent job cancelled")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
+                )
             }
-            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                Err(anyhow::anyhow!("local agent job exceeded the two-hour lifetime limit"))
+            _ = tokio::time::sleep(max_lifetime) => {
+                (
+                    Err(anyhow::anyhow!("local agent job exceeded the two-hour lifetime limit")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
+                )
             }
         };
         let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        {
-            let mut completion = task_completion.lock().unwrap();
-            completion.result = Some(cached);
-            completion.completed_at = Some(Instant::now());
-        }
+        finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
         report_local_agent_finished(session_id, activity_label, &result).await;
@@ -2233,14 +2865,19 @@ async fn spawn_local_agent(
     Ok((description, handle, completion))
 }
 
-async fn dev_tool_run(args: &Value, session: &config::Session) -> Result<Value> {
-    dev_tool_run_with_executable(args, session, None).await
+async fn dev_tool_run(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+) -> Result<Value> {
+    dev_tool_run_with_executable(args, session, None, activity).await
 }
 
 async fn dev_tool_run_with_executable(
     args: &Value,
     session: &config::Session,
     executable: Option<&Path>,
+    activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let prepared = match executable {
         Some(executable) => dev_tool::prepare_with_executable(args, session, Some(executable))?,
@@ -2248,16 +2885,23 @@ async fn dev_tool_run_with_executable(
     };
     let detail = prepared.approval_detail();
     approvals::ensure_approval_detail_fits(&detail)?;
-    let approved = approvals::ensure_local_approval(
+    let approved = approvals::ensure_local_approval_with_activity(
         session,
         approvals::ApprovalClass::DeveloperTool,
         "dev_tool_run",
         detail,
         prepared.cwd().to_path_buf(),
         BTreeMap::new(),
+        activity.as_ref(),
     )
     .await?;
-    anyhow::ensure!(approved, "user denied dev_tool_run");
+    if !approved {
+        if let Some(activity) = &activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+        anyhow::bail!("user denied dev_tool_run");
+    }
 
     let current_session = config::load_session(&session.id).await?;
     anyhow::ensure!(
@@ -2266,7 +2910,8 @@ async fn dev_tool_run_with_executable(
         "session instance changed while developer-tool approval was pending"
     );
     prepared.revalidate(&current_session)?;
-    let (description, mut handle, completion) = spawn_dev_tool(prepared, &current_session).await?;
+    let (description, mut handle, completion) =
+        spawn_dev_tool(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
         Ok(joined) => {
             joined.context("developer tool task failed")?;
@@ -2295,33 +2940,68 @@ async fn dev_tool_run_with_executable(
 async fn spawn_dev_tool(
     prepared: dev_tool::PreparedDevToolRun,
     session: &config::Session,
+    activity: Option<ActivityScope>,
 ) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    spawn_dev_tool_with_controls(
+        prepared,
+        session,
+        activity,
+        wait_for_session_stop(session.id.clone()),
+        MAX_JOB_LIFETIME,
+    )
+    .await
+}
+
+async fn spawn_dev_tool_with_controls<F>(
+    prepared: dev_tool::PreparedDevToolRun,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+    session_stop: F,
+    max_lifetime: Duration,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let slot = reserve_job_slot(&session.id)?;
     let description = prepared.activity_label();
     approvals::activity(&session.id, format!("Running {description}"), None).await;
+    if let Some(activity) = &activity {
+        let _ = activity.running();
+    }
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let activity_label = description.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let completion = Arc::new(Mutex::new(JobCompletion {
+        activity,
+        ..JobCompletion::default()
+    }));
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
-        let result = tokio::select! {
+        let (result, outcome) = tokio::select! {
             result = dev_tool::run(prepared) => {
-                result.and_then(render_output)
+                let result = result.and_then(render_output);
+                let outcome = if result.is_ok() {
+                    JobActivityOutcome::Completed
+                } else {
+                    JobActivityOutcome::Failed
+                };
+                (result, outcome)
             }
-            _ = wait_for_session_stop(session_id.clone()) => {
-                Err(anyhow::anyhow!("session stopped; developer tool job cancelled"))
+            _ = session_stop => {
+                (
+                    Err(anyhow::anyhow!("session stopped; developer tool job cancelled")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
+                )
             }
-            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                Err(anyhow::anyhow!("developer tool job exceeded the two-hour lifetime limit"))
+            _ = tokio::time::sleep(max_lifetime) => {
+                (
+                    Err(anyhow::anyhow!("developer tool job exceeded the two-hour lifetime limit")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
+                )
             }
         };
         let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        {
-            let mut completion = task_completion.lock().unwrap();
-            completion.result = Some(cached);
-            completion.completed_at = Some(Instant::now());
-        }
+        finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
         report_local_agent_finished(session_id, activity_label, &result).await;
@@ -2332,7 +3012,28 @@ async fn spawn_dev_tool(
 async fn spawn_sandboxed_command(
     args: &Value,
     session: &config::Session,
+    activity: Option<ActivityScope>,
 ) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+    spawn_sandboxed_command_with_controls(
+        args,
+        session,
+        activity,
+        wait_for_session_stop(session.id.clone()),
+        MAX_JOB_LIFETIME,
+    )
+    .await
+}
+
+async fn spawn_sandboxed_command_with_controls<F>(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<ActivityScope>,
+    session_stop: F,
+    max_lifetime: Duration,
+) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
@@ -2340,34 +3041,112 @@ async fn spawn_sandboxed_command(
     let slot = reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    if let Some(activity) = &activity {
+        let _ = activity.running();
+    }
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let task_command = rendered_command.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion::default()));
+    let completion = Arc::new(Mutex::new(JobCompletion {
+        activity,
+        ..JobCompletion::default()
+    }));
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
-        let result = tokio::select! {
+        let (result, outcome) = tokio::select! {
             result = run_session_command(&command, &cwd, &roots, yolo) => {
-                result.and_then(render_output)
+                let result = result.and_then(render_output);
+                let outcome = if result.is_ok() {
+                    JobActivityOutcome::Completed
+                } else {
+                    JobActivityOutcome::Failed
+                };
+                (result, outcome)
             }
-            _ = wait_for_session_stop(session_id.clone()) => {
-                Err(anyhow::anyhow!("session stopped; sandbox job cancelled"))
+            _ = session_stop => {
+                (
+                    Err(anyhow::anyhow!("session stopped; sandbox job cancelled")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
+                )
             }
-            _ = tokio::time::sleep(MAX_JOB_LIFETIME) => {
-                Err(anyhow::anyhow!("sandbox job exceeded the two-hour lifetime limit"))
+            _ = tokio::time::sleep(max_lifetime) => {
+                (
+                    Err(anyhow::anyhow!("sandbox job exceeded the two-hour lifetime limit")),
+                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
+                )
             }
         };
         let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        {
-            let mut completion = task_completion.lock().unwrap();
-            completion.result = Some(cached);
-            completion.completed_at = Some(Instant::now());
-        }
+        finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
         report_command_finished(session_id, "execute", &task_command, &result).await;
     });
     Ok((rendered_command, handle, completion))
+}
+
+fn finish_job_completion(
+    completion: &Arc<Mutex<JobCompletion>>,
+    result: CachedJobResult,
+    outcome: JobActivityOutcome,
+) -> bool {
+    let mut completion = completion.lock().unwrap();
+    finish_job_completion_locked(&mut completion, result, outcome)
+}
+
+fn finish_job_completion_locked(
+    completion: &mut JobCompletion,
+    result: CachedJobResult,
+    outcome: JobActivityOutcome,
+) -> bool {
+    if completion.result.is_some() || completion.activity_terminal {
+        return false;
+    }
+
+    completion.result = Some(result);
+    completion.completed_at = Some(Instant::now());
+    completion.activity_terminal = true;
+    finish_job_activity(completion.activity.as_ref(), outcome);
+    true
+}
+
+fn cancel_pending_job_activity(
+    completion: &Arc<Mutex<JobCompletion>>,
+    reason: ActivityCancellationReason,
+) -> bool {
+    let mut completion = completion.lock().unwrap();
+    cancel_pending_job_activity_locked(&mut completion, reason)
+}
+
+fn cancel_pending_job_activity_locked(
+    completion: &mut JobCompletion,
+    reason: ActivityCancellationReason,
+) -> bool {
+    if completion.result.is_some() || completion.activity_terminal {
+        return false;
+    }
+
+    completion.activity_terminal = true;
+    finish_job_activity(
+        completion.activity.as_ref(),
+        JobActivityOutcome::Cancelled(reason),
+    );
+    true
+}
+
+fn finish_job_activity(activity: Option<&ActivityScope>, outcome: JobActivityOutcome) {
+    let Some(activity) = activity else {
+        return;
+    };
+    let _ = match outcome {
+        JobActivityOutcome::Completed => activity.complete(),
+        JobActivityOutcome::Failed => {
+            activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ChildFailed))
+        }
+        JobActivityOutcome::Cancelled(reason) => {
+            activity.cancel_with_summary(ActivitySummary::cancellation(reason))
+        }
+    };
 }
 
 async fn run_session_command(
@@ -2822,9 +3601,22 @@ async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
     }
 }
 
+#[cfg(test)]
 async fn stop_job(args: &Value, session: &config::Session) -> Result<Value> {
+    stop_job_with_activity(args, session, None).await
+}
+
+async fn stop_job_with_activity(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let job_id = required_job_id(args)?;
     let job = take_job_for_session(job_id, &session.id)?;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    cancel_pending_job_activity(&job.completion, ActivityCancellationReason::StopRequested);
     job.handle.abort();
     let _ = job.handle.await;
     approvals::activity(
@@ -2891,21 +3683,26 @@ fn validate_command_budget(command: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn without_sandbox(args: &Value, session: &config::Session) -> Result<Value> {
+async fn without_sandbox(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
-    if !approvals::ensure_local_approval(
+    request_activity_approval(
         session,
-        approvals::ApprovalClass::HostUnrestricted,
-        "without_sandbox",
-        format!("argv: {command:?}"),
-        cwd.clone(),
-        BTreeMap::new(),
+        ActivityApprovalRequest {
+            class: approvals::ApprovalClass::HostUnrestricted,
+            operation: "without_sandbox",
+            detail: format!("argv: {command:?}"),
+            cwd: cwd.clone(),
+            metadata: BTreeMap::new(),
+            denial: "user denied without_sandbox",
+        },
+        activity,
     )
-    .await?
-    {
-        anyhow::bail!("user denied without_sandbox")
-    }
+    .await?;
     run_and_report(session.id.clone(), command, cwd, true, &[]).await
 }
 
@@ -3153,6 +3950,33 @@ fn render_output(output: sandbox::Output) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_support;
+    use temote_mcp::activity::contract::{ActivityState, ActivityUpdate};
+    use temote_mcp::activity::scope::{ActivityEmitError, ActivityEmitter};
+
+    #[derive(Clone, Default)]
+    struct RecordingActivityEmitter {
+        updates: Arc<Mutex<Vec<ActivityUpdate>>>,
+    }
+
+    impl RecordingActivityEmitter {
+        fn updates(&self) -> Vec<ActivityUpdate> {
+            self.updates.lock().unwrap().clone()
+        }
+
+        fn states(&self) -> Vec<ActivityState> {
+            self.updates()
+                .into_iter()
+                .map(|update| update.state())
+                .collect()
+        }
+    }
+
+    impl ActivityEmitter for RecordingActivityEmitter {
+        fn try_emit(&self, update: ActivityUpdate) -> Result<(), ActivityEmitError> {
+            self.updates.lock().unwrap().push(update);
+            Ok(())
+        }
+    }
 
     fn cached_success(text: impl Into<String>) -> CachedJobResult {
         CachedJobResult::Success {
@@ -3166,6 +3990,946 @@ mod tests {
             text: text.into(),
             evidence: None,
         }
+    }
+
+    fn activity_job_session(cwd: &Path) -> config::Session {
+        config::Session {
+            id: format!("activity-job-{}", Uuid::new_v4()),
+            cwd: cwd.to_path_buf(),
+            permitted_directories: vec![cwd.to_path_buf()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Yolo,
+        }
+    }
+
+    fn activity_job_scope(
+        operation: ActivityOperation,
+    ) -> (ActivityScope, RecordingActivityEmitter) {
+        let emitter = RecordingActivityEmitter::default();
+        let scope = ActivityScope::new(operation, emitter.clone());
+        (scope, emitter)
+    }
+
+    fn activity_job_terminal_updates(emitter: &RecordingActivityEmitter) -> Vec<ActivityUpdate> {
+        emitter
+            .updates()
+            .into_iter()
+            .filter(|update| {
+                matches!(
+                    update.state(),
+                    ActivityState::Completed | ActivityState::Failed | ActivityState::Cancelled
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn activity_coverage_classifies_every_advertised_session_tool_once() {
+        let advertised_tools = tools(false, true);
+        let advertised = advertised_tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let covered = ACTIVITY_TOOL_COVERAGE
+            .iter()
+            .map(|coverage| coverage.name)
+            .chain(
+                ACTIVITY_NON_DISPATCH_COVERAGE
+                    .iter()
+                    .map(|coverage| coverage.name),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            ACTIVITY_TOOL_COVERAGE.len() + ACTIVITY_NON_DISPATCH_COVERAGE.len(),
+            covered.len()
+        );
+        assert_eq!(advertised, covered);
+        assert!(
+            ACTIVITY_TOOL_COVERAGE
+                .iter()
+                .all(|coverage| !coverage.fixture.is_empty())
+        );
+        assert!(
+            ACTIVITY_NON_DISPATCH_COVERAGE
+                .iter()
+                .all(|coverage| !coverage.fixture.is_empty())
+        );
+        assert_eq!(
+            ACTIVITY_NON_DISPATCH_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.owner == ActivityNonDispatchOwner::Supervisor)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["session_restart", "session_start", "session_stop"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            ACTIVITY_NON_DISPATCH_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.owner == ActivityNonDispatchOwner::Excluded)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["session_info", "session_list"].into_iter().collect()
+        );
+        assert_eq!(
+            ACTIVITY_TOOL_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.owner == ActivityOwner::JobWorker)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "dev_tool_run",
+                "execute",
+                "local_agent_run",
+                "start_command",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            ACTIVITY_TOOL_COVERAGE
+                .iter()
+                .filter(|coverage| coverage.success == ActivitySuccess::Accepted)
+                .map(|coverage| coverage.name)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["codex_task_control", "codex_task_start"]
+                .into_iter()
+                .collect()
+        );
+
+        for coverage in ACTIVITY_TOOL_COVERAGE {
+            let (scope, emitter) = activity_job_scope(coverage.operation);
+            finish_covered_tool_activity(
+                Some(coverage),
+                Some(&scope),
+                &text_result("fixture result".to_owned()),
+            );
+            let updates = emitter.updates();
+            assert!(
+                updates
+                    .iter()
+                    .all(|update| update.operation() == coverage.operation),
+                "operation mismatch for {}",
+                coverage.name
+            );
+            match coverage.owner {
+                ActivityOwner::McpCall => {
+                    assert_eq!(
+                        updates
+                            .iter()
+                            .map(ActivityUpdate::state)
+                            .collect::<Vec<_>>(),
+                        vec![ActivityState::Started, ActivityState::Completed],
+                        "terminal mismatch for {}",
+                        coverage.name
+                    );
+                    let expected = match coverage.success {
+                        ActivitySuccess::Completed => ActivitySummary::empty(),
+                        ActivitySuccess::Accepted => {
+                            ActivitySummary::result(ActivityResult::Accepted)
+                        }
+                    };
+                    assert_eq!(updates.last().unwrap().summary(), &expected);
+                }
+                ActivityOwner::JobWorker => assert_eq!(
+                    updates
+                        .iter()
+                        .map(ActivityUpdate::state)
+                        .collect::<Vec<_>>(),
+                    vec![ActivityState::Started],
+                    "dispatcher finalized worker-owned {}",
+                    coverage.name
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn activity_coverage_finalizes_call_worker_accepted_and_failure_paths() {
+        let (completed_scope, completed_emitter) =
+            activity_job_scope(ActivityOperation::EvidenceRead);
+        finish_covered_tool_activity(
+            activity_tool_coverage("evidence_read"),
+            Some(&completed_scope),
+            &text_result("ok".to_owned()),
+        );
+        assert_eq!(
+            completed_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Completed]
+        );
+
+        let (accepted_scope, accepted_emitter) =
+            activity_job_scope(ActivityOperation::CodexTaskStart);
+        finish_covered_tool_activity(
+            activity_tool_coverage("codex_task_start"),
+            Some(&accepted_scope),
+            &text_result("accepted".to_owned()),
+        );
+        let accepted = accepted_emitter.updates();
+        assert_eq!(
+            accepted
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![ActivityState::Started, ActivityState::Completed]
+        );
+        assert_eq!(
+            accepted.last().unwrap().summary(),
+            &ActivitySummary::result(ActivityResult::Accepted)
+        );
+
+        let (worker_scope, worker_emitter) = activity_job_scope(ActivityOperation::Execute);
+        finish_covered_tool_activity(
+            activity_tool_coverage("execute"),
+            Some(&worker_scope),
+            &text_result("backgrounded".to_owned()),
+        );
+        assert_eq!(worker_emitter.states(), vec![ActivityState::Started]);
+
+        let (failure_scope, failure_emitter) =
+            activity_job_scope(ActivityOperation::KintoneMcpStatus);
+        let failed: Result<Value> = Err(anyhow::anyhow!("raw-secret-sentinel"));
+        finish_covered_tool_activity(
+            activity_tool_coverage("kintone_mcp_status"),
+            Some(&failure_scope),
+            &failed,
+        );
+        let failed = failure_emitter.updates();
+        assert_eq!(
+            failed.iter().map(ActivityUpdate::state).collect::<Vec<_>>(),
+            vec![ActivityState::Started, ActivityState::Failed]
+        );
+        assert_eq!(
+            failed.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::OperationFailed)
+        );
+        assert!(
+            failed
+                .iter()
+                .all(|update| !update.summary().safe_summary().contains("sentinel"))
+        );
+    }
+
+    #[test]
+    fn activity_coverage_explicit_approval_result_is_ordered_and_terminal_once() {
+        let (allowed_scope, allowed_emitter) =
+            activity_job_scope(ActivityOperation::CheckpointSave);
+        allowed_scope.waiting_approval().unwrap();
+        finish_activity_approval(true, Some(&allowed_scope), "denied").unwrap();
+        finish_covered_tool_activity(
+            activity_tool_coverage("checkpoint_save"),
+            Some(&allowed_scope),
+            &text_result("saved".to_owned()),
+        );
+        assert_eq!(
+            allowed_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+
+        let (denied_scope, denied_emitter) = activity_job_scope(ActivityOperation::CheckpointSave);
+        denied_scope.waiting_approval().unwrap();
+        let denied = finish_activity_approval(false, Some(&denied_scope), "denied");
+        assert!(denied.is_err());
+        let outer_failure: Result<Value> = Err(anyhow::anyhow!("denied"));
+        finish_covered_tool_activity(
+            activity_tool_coverage("checkpoint_save"),
+            Some(&denied_scope),
+            &outer_failure,
+        );
+        let denied = denied_emitter.updates();
+        assert_eq!(
+            denied.iter().map(ActivityUpdate::state).collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed,
+            ]
+        );
+        assert_eq!(
+            denied.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::ApprovalDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_job_foreground_completion_and_child_failure_are_terminalized() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+
+        let (success_scope, success_emitter) = activity_job_scope(ActivityOperation::Execute);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "printf success"]}),
+            &session,
+            Some(success_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let success = finish_foreground_or_store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            success["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("success")
+        );
+        assert_eq!(
+            success_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+
+        let (failure_scope, failure_emitter) = activity_job_scope(ActivityOperation::Execute);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "exit 7"]}),
+            &session,
+            Some(failure_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let failure = finish_foreground_or_store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.to_string().contains("exit_code"));
+        assert_eq!(
+            failure_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Failed
+            ]
+        );
+        let terminal = activity_job_terminal_updates(&failure_emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "error=child_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_job_return_does_not_complete_and_stop_cancels_original_scope() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+        let (command_scope, command_emitter) = activity_job_scope(ActivityOperation::StartCommand);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &session,
+            Some(command_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let started = store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+            "Started",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            command_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Running]
+        );
+        let started: Value =
+            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
+        let job_id = started["job_id"].as_str().unwrap();
+
+        let (stop_scope, stop_emitter) = activity_job_scope(ActivityOperation::StopJob);
+        let stopped =
+            stop_job_with_activity(&json!({"job_id": job_id}), &session, Some(&stop_scope)).await;
+        finish_tool_activity(Some(&stop_scope), &stopped);
+        assert!(stopped.is_ok());
+
+        assert_eq!(
+            command_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Cancelled
+            ]
+        );
+        let terminal = activity_job_terminal_updates(&command_emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "reason=stop_requested"
+        );
+        assert_eq!(
+            stop_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+        assert_ne!(
+            command_scope_id(&command_emitter),
+            command_scope_id(&stop_emitter)
+        );
+    }
+
+    fn command_scope_id(emitter: &RecordingActivityEmitter) -> Uuid {
+        emitter.updates()[0].operation_id()
+    }
+
+    #[test]
+    fn activity_job_natural_first_and_stop_first_are_linearized_under_completion_lock() {
+        for natural_first in [true, false] {
+            let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
+            scope.running().unwrap();
+            let completion = Arc::new(Mutex::new(JobCompletion {
+                activity: Some(scope),
+                ..JobCompletion::default()
+            }));
+            let mut winner_guard = completion.lock().unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let contender_completion = Arc::clone(&completion);
+            let contender_barrier = Arc::clone(&barrier);
+
+            let contender = if natural_first {
+                std::thread::spawn(move || {
+                    contender_barrier.wait();
+                    cancel_pending_job_activity(
+                        &contender_completion,
+                        ActivityCancellationReason::StopRequested,
+                    )
+                })
+            } else {
+                std::thread::spawn(move || {
+                    contender_barrier.wait();
+                    finish_job_completion(
+                        &contender_completion,
+                        cached_success("natural"),
+                        JobActivityOutcome::Completed,
+                    )
+                })
+            };
+            barrier.wait();
+
+            let winner = if natural_first {
+                finish_job_completion_locked(
+                    &mut winner_guard,
+                    cached_success("natural"),
+                    JobActivityOutcome::Completed,
+                )
+            } else {
+                cancel_pending_job_activity_locked(
+                    &mut winner_guard,
+                    ActivityCancellationReason::StopRequested,
+                )
+            };
+            assert!(winner);
+            drop(winner_guard);
+            assert!(!contender.join().unwrap());
+
+            let terminal = activity_job_terminal_updates(&emitter);
+            assert_eq!(terminal.len(), 1);
+            if natural_first {
+                assert_eq!(terminal[0].state(), ActivityState::Completed);
+                assert_eq!(terminal[0].summary().as_safe_summary(), "");
+            } else {
+                assert_eq!(terminal[0].state(), ActivityState::Cancelled);
+                assert_eq!(
+                    terminal[0].summary().as_safe_summary(),
+                    "reason=stop_requested"
+                );
+                assert!(completion.lock().unwrap().result.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_job_session_stop_uses_fixed_cancellation_reason() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+        let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
+        let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
+        let (_, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &session,
+            Some(scope),
+            async move {
+                let _ = stop_receiver.await;
+            },
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        stop_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        let terminal = activity_job_terminal_updates(&emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state(), ActivityState::Cancelled);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "reason=session_stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_job_lifetime_uses_fixed_cancellation_reason() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = activity_job_session(cwd.path());
+        let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
+        let (_, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "sleep 30"]}),
+            &session,
+            Some(scope),
+            std::future::pending(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        let terminal = activity_job_terminal_updates(&emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state(), ActivityState::Cancelled);
+        assert_eq!(terminal[0].summary().as_safe_summary(), "reason=timeout");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_job_executable(directory: &Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_local_args(session_id: &str, task: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "agent": "codex",
+            "task": task,
+            "access": "read_only"
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_dev_args(session_id: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "tool": "cargo",
+            "operation": "check",
+            "args": ["--workspace"]
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn activity_delegated_job_wait(handle: JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("delegated worker did not finish")
+            .expect("delegated worker task failed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn activity_delegated_job_assert_terminal(
+        emitter: &RecordingActivityEmitter,
+        state: ActivityState,
+        summary: &str,
+    ) {
+        let terminal = activity_job_terminal_updates(emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].state(), state);
+        assert_eq!(terminal[0].summary().as_safe_summary(), summary);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_success_is_terminal_and_omits_prompt_and_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let prompt_sentinel = "delegated-prompt-secret-sentinel";
+        let agent_output_sentinel = "delegated-agent-output-secret-sentinel";
+        let dev_output_sentinel = "delegated-dev-output-secret-sentinel";
+        let fake_agent = activity_delegated_job_executable(
+            fake_dir.path(),
+            "codex",
+            &format!("#!/bin/sh\nprintf '{agent_output_sentinel}\\n'\n"),
+        );
+        let fake_dev = activity_delegated_job_executable(
+            fake_dir.path(),
+            "cargo",
+            &format!("#!/bin/sh\nprintf '{dev_output_sentinel}\\n'\n"),
+        );
+        let id = format!("activity-delegated-success-{}", Uuid::new_v4());
+        let (sender, _receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            workspace.path(),
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let agent_result = local_agent_run(
+            &activity_delegated_local_args(&id, prompt_sentinel),
+            &session,
+            Some(&fake_agent),
+            Some(agent_scope),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_string(&agent_result)
+                .unwrap()
+                .contains(agent_output_sentinel)
+        );
+        assert_eq!(
+            agent_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let dev_result = dev_tool_run_with_executable(
+            &activity_delegated_dev_args(&id),
+            &session,
+            Some(&fake_dev),
+            Some(dev_scope),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_string(&dev_result)
+                .unwrap()
+                .contains(dev_output_sentinel)
+        );
+        assert_eq!(
+            dev_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed
+            ]
+        );
+
+        let updates =
+            serde_json::to_string(&(agent_emitter.updates(), dev_emitter.updates())).unwrap();
+        for sentinel in [prompt_sentinel, agent_output_sentinel, dev_output_sentinel] {
+            assert!(!updates.contains(sentinel), "activity leaked {sentinel}");
+        }
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_denial_never_reaches_running() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake_agent =
+            activity_delegated_job_executable(fake_dir.path(), "codex", "#!/bin/sh\nexit 99\n");
+        let fake_dev =
+            activity_delegated_job_executable(fake_dir.path(), "cargo", "#!/bin/sh\nexit 99\n");
+        let id = format!("activity-delegated-deny-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            workspace.path(),
+            Some(&id),
+            config::PermissionMode::Ask,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let agent_session = session.clone();
+        let agent_id = id.clone();
+        let agent_task = tokio::spawn(async move {
+            local_agent_run(
+                &activity_delegated_local_args(&agent_id, "denied-prompt-sentinel"),
+                &agent_session,
+                Some(&fake_agent),
+                Some(agent_scope),
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.request.operation, "local_agent_run");
+        prompt.respond(false);
+        assert!(agent_task.await.unwrap().is_err());
+        assert_eq!(
+            agent_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed
+            ]
+        );
+        activity_delegated_job_assert_terminal(
+            &agent_emitter,
+            ActivityState::Failed,
+            "error=approval_denied",
+        );
+
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let dev_session = session.clone();
+        let dev_id = id.clone();
+        let dev_task = tokio::spawn(async move {
+            dev_tool_run_with_executable(
+                &activity_delegated_dev_args(&dev_id),
+                &dev_session,
+                Some(&fake_dev),
+                Some(dev_scope),
+            )
+            .await
+        });
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.request.operation, "dev_tool_run");
+        prompt.respond(false);
+        assert!(dev_task.await.unwrap().is_err());
+        assert_eq!(
+            dev_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed
+            ]
+        );
+        activity_delegated_job_assert_terminal(
+            &dev_emitter,
+            ActivityState::Failed,
+            "error=approval_denied",
+        );
+        let denial_updates =
+            serde_json::to_string(&(agent_emitter.updates(), dev_emitter.updates())).unwrap();
+        assert!(!denial_updates.contains("denied-prompt-sentinel"));
+        assert!(snapshot_jobs_for_session(&id, 50).jobs.is_empty());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_timeout_uses_fixed_reason_for_both_workers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let sleeper = "#!/bin/sh\nexec /bin/sleep 30\n";
+        let fake_agent = activity_delegated_job_executable(fake_dir.path(), "codex", sleeper);
+        let fake_dev = activity_delegated_job_executable(fake_dir.path(), "cargo", sleeper);
+        let session = activity_job_session(workspace.path());
+
+        let prepared_agent = local_agent::prepare_with_executable(
+            &activity_delegated_local_args(&session.id, "timeout-prompt-sentinel"),
+            &session,
+            &fake_agent,
+        )
+        .unwrap();
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let (_, agent_handle, agent_completion) = spawn_local_agent_with_controls(
+            prepared_agent,
+            &session,
+            Some(agent_scope),
+            std::future::pending(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_wait(agent_handle).await;
+        assert!(matches!(
+            agent_completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        activity_delegated_job_assert_terminal(
+            &agent_emitter,
+            ActivityState::Cancelled,
+            "reason=timeout",
+        );
+
+        let prepared_dev = dev_tool::prepare_with_executable(
+            &activity_delegated_dev_args(&session.id),
+            &session,
+            Some(&fake_dev),
+        )
+        .unwrap();
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let (_, dev_handle, dev_completion) = spawn_dev_tool_with_controls(
+            prepared_dev,
+            &session,
+            Some(dev_scope),
+            std::future::pending(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_wait(dev_handle).await;
+        assert!(matches!(
+            dev_completion.lock().unwrap().result,
+            Some(CachedJobResult::Error { .. })
+        ));
+        activity_delegated_job_assert_terminal(
+            &dev_emitter,
+            ActivityState::Cancelled,
+            "reason=timeout",
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn activity_delegated_job_stop_cancels_both_workers_before_abort() {
+        let workspace = tempfile::tempdir().unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let sleeper = "#!/bin/sh\nexec /bin/sleep 30\n";
+        let fake_agent = activity_delegated_job_executable(fake_dir.path(), "codex", sleeper);
+        let fake_dev = activity_delegated_job_executable(fake_dir.path(), "cargo", sleeper);
+        let session = activity_job_session(workspace.path());
+
+        let prepared_agent = local_agent::prepare_with_executable(
+            &activity_delegated_local_args(&session.id, "stop-prompt-sentinel"),
+            &session,
+            &fake_agent,
+        )
+        .unwrap();
+        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
+        let (description, handle, completion) = spawn_local_agent_with_controls(
+            prepared_agent,
+            &session,
+            Some(agent_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let started = store_job(
+            &session,
+            description,
+            handle,
+            completion,
+            OutputPolicy::default(),
+            "Backgrounded",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agent_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Running]
+        );
+        let started: Value =
+            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
+        stop_job(
+            &json!({"job_id": started["job_id"].as_str().unwrap()}),
+            &session,
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_assert_terminal(
+            &agent_emitter,
+            ActivityState::Cancelled,
+            "reason=stop_requested",
+        );
+
+        let prepared_dev = dev_tool::prepare_with_executable(
+            &activity_delegated_dev_args(&session.id),
+            &session,
+            Some(&fake_dev),
+        )
+        .unwrap();
+        let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
+        let (description, handle, completion) = spawn_dev_tool_with_controls(
+            prepared_dev,
+            &session,
+            Some(dev_scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let started = store_job(
+            &session,
+            description,
+            handle,
+            completion,
+            OutputPolicy::default(),
+            "Backgrounded",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dev_emitter.states(),
+            vec![ActivityState::Started, ActivityState::Running]
+        );
+        let started: Value =
+            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
+        stop_job(
+            &json!({"job_id": started["job_id"].as_str().unwrap()}),
+            &session,
+        )
+        .await
+        .unwrap();
+        activity_delegated_job_assert_terminal(
+            &dev_emitter,
+            ActivityState::Cancelled,
+            "reason=stop_requested",
+        );
     }
 
     #[test]
@@ -4636,6 +6400,7 @@ mod tests {
             let completion = Arc::new(Mutex::new(JobCompletion {
                 result: Some(cached_success("owned")),
                 completed_at: Some(Instant::now()),
+                ..JobCompletion::default()
             }));
             let handle = runtime.spawn(async {});
             jobs().lock().unwrap().jobs.insert(
@@ -4905,6 +6670,7 @@ mod tests {
         let owner_completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success(marker_output)),
             completed_at: Some(Instant::now()),
+            ..JobCompletion::default()
         }));
         let other_completion = Arc::new(Mutex::new(JobCompletion::default()));
         jobs().lock().unwrap().jobs.insert(
@@ -4968,6 +6734,7 @@ mod tests {
             let completion = Arc::new(Mutex::new(JobCompletion {
                 result: Some(result),
                 completed_at: Some(Instant::now()),
+                ..JobCompletion::default()
             }));
             jobs().lock().unwrap().jobs.insert(
                 job_id,
@@ -5005,6 +6772,7 @@ mod tests {
         let completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success("still-cached")),
             completed_at: Some(Instant::now()),
+            ..JobCompletion::default()
         }));
         jobs().lock().unwrap().jobs.insert(
             job_id,
@@ -5046,6 +6814,7 @@ mod tests {
                 JobCompletion {
                     result: Some(cached_success("hidden")),
                     completed_at: Some(Instant::now()),
+                    ..JobCompletion::default()
                 }
             }));
             let handle = if running {
@@ -5231,6 +7000,7 @@ mod tests {
         let completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success("cached-result")),
             completed_at: Some(Instant::now()),
+            ..JobCompletion::default()
         }));
         let handle = tokio::spawn(async {});
         jobs().lock().unwrap().jobs.insert(
@@ -5445,6 +7215,7 @@ mod tests {
                     JobCompletion {
                         result: Some(cached_success(format!("done-{step}"))),
                         completed_at: Some(now + Duration::from_nanos(step as u64 + 1)),
+                        ..JobCompletion::default()
                     }
                 }));
                 let handle = if active {
@@ -5503,6 +7274,7 @@ mod tests {
         let completion = Arc::new(Mutex::new(JobCompletion {
             result: Some(cached_success("expired")),
             completed_at: Some(Instant::now() - COMPLETED_JOB_TTL - Duration::from_secs(1)),
+            ..JobCompletion::default()
         }));
         let handle = tokio::spawn(async {});
         jobs().lock().unwrap().jobs.insert(
@@ -5530,6 +7302,358 @@ mod tests {
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
+    fn activity_git_pull_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+    ) {
+        let remote = tempfile::tempdir().unwrap();
+        let seed = tempfile::tempdir().unwrap();
+        let checkout_root = tempfile::tempdir().unwrap();
+        run_git_fixture(remote.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(seed.path(), &["init", "--quiet"]);
+        run_git_fixture(seed.path(), &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            seed.path(),
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(seed.path().join("tracked.txt"), "one\n").unwrap();
+        run_git_fixture(seed.path(), &["add", "tracked.txt"]);
+        run_git_fixture(seed.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(seed.path(), &["branch", "-M", "main"]);
+        run_git_fixture(
+            seed.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git_fixture(seed.path(), &["push", "--quiet", "-u", "origin", "main"]);
+        run_git_fixture(remote.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let checkout = checkout_root.path().join("checkout");
+        run_git_fixture(
+            checkout_root.path(),
+            &[
+                "clone",
+                "--quiet",
+                remote.path().to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(seed.path().join("tracked.txt"), "two\n").unwrap();
+        run_git_fixture(seed.path(), &["add", "tracked.txt"]);
+        run_git_fixture(seed.path(), &["commit", "--quiet", "-m", "update"]);
+        run_git_fixture(seed.path(), &["push", "--quiet"]);
+        (remote, seed, checkout_root, checkout)
+    }
+
+    fn recorded_scope(
+        operation: ActivityOperation,
+        summary: ActivitySummary,
+    ) -> (ActivityScope, RecordingActivityEmitter) {
+        let emitter = RecordingActivityEmitter::default();
+        let scope = ActivityScope::with_summary(operation, summary, emitter.clone());
+        (scope, emitter)
+    }
+
+    fn recorded_git_pull_scope() -> (ActivityScope, RecordingActivityEmitter) {
+        recorded_scope(
+            ActivityOperation::GitPull,
+            ActivitySummary::git(ActivityRemote::Origin),
+        )
+    }
+
+    fn assert_git_completed(
+        emitter: &RecordingActivityEmitter,
+        operation: ActivityOperation,
+        summary: &ActivitySummary,
+    ) {
+        let updates = emitter.updates();
+        assert_eq!(
+            updates
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+        assert!(updates.iter().all(|update| update.operation() == operation));
+        assert!(updates.iter().all(|update| update.summary() == summary));
+    }
+
+    fn spawn_git_pull(
+        session: config::Session,
+        activity: ActivityScope,
+    ) -> tokio::task::JoinHandle<Result<Value>> {
+        tokio::spawn(async move {
+            let result = git_pull(
+                &json!({"session_id": session.id, "cwd": session.cwd}),
+                &session,
+                Some(&activity),
+            )
+            .await;
+            finish_tool_activity(Some(&activity), &result);
+            result
+        })
+    }
+
+    #[test]
+    fn activity_approval_maps_all_git_operations_and_safe_remote_classes() {
+        for (name, expected) in [
+            ("git_add", ActivityOperation::GitAdd),
+            ("git_commit", ActivityOperation::GitCommit),
+            ("git_fetch", ActivityOperation::GitFetch),
+            ("git_pull", ActivityOperation::GitPull),
+            ("git_push", ActivityOperation::GitPush),
+        ] {
+            assert_eq!(git_activity_operation(name), Some(expected));
+        }
+        assert_eq!(git_activity_operation("git_status"), None);
+        assert_eq!(
+            git_activity_summary(&json!({}), ActivityOperation::GitPull).safe_summary(),
+            "remote=origin"
+        );
+        assert_eq!(
+            git_activity_summary(
+                &json!({"remote": "private-name"}),
+                ActivityOperation::GitFetch,
+            )
+            .safe_summary(),
+            "remote=other"
+        );
+        assert_eq!(
+            git_activity_summary(
+                &json!({"remote": "secret-remote-marker"}),
+                ActivityOperation::GitPush,
+            )
+            .safe_summary(),
+            "remote=other"
+        );
+        assert_eq!(
+            git_activity_summary(&json!({}), ActivityOperation::GitCommit).safe_summary(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_approval_git_pull_allow_and_deny_have_ordered_states() {
+        let (_remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        let session_id = format!("activity-approval-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let handle = approvals::spawn_runtime(&checkout, Some(&session_id), false, sender)
+            .await
+            .unwrap();
+        let session = config::load_session(&session_id).await.unwrap();
+
+        let (allowed_scope, allowed_emitter) = recorded_git_pull_scope();
+        let allowed_task = spawn_git_pull(session.clone(), allowed_scope);
+        let allowed_prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("git_pull did not request approval")
+            .expect("approval channel closed");
+        assert_eq!(allowed_prompt.request.operation, "git_pull");
+        assert_eq!(
+            allowed_emitter.states(),
+            vec![ActivityState::Started, ActivityState::WaitingApproval]
+        );
+        allowed_prompt.respond(true);
+        let allowed = allowed_task.await.unwrap().unwrap();
+        assert!(
+            allowed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"exit_code\":0")
+        );
+        assert_eq!(
+            allowed_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "two\n"
+        );
+
+        let (denied_scope, denied_emitter) = recorded_git_pull_scope();
+        let denied_task = spawn_git_pull(session, denied_scope);
+        let denied_prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("second git_pull did not request approval")
+            .expect("approval channel closed");
+        assert_eq!(
+            denied_emitter.states(),
+            vec![ActivityState::Started, ActivityState::WaitingApproval]
+        );
+        denied_prompt.respond(false);
+        let denied = denied_task
+            .await
+            .unwrap()
+            .expect_err("denied git_pull unexpectedly succeeded");
+        assert!(denied.to_string().contains("user denied git_pull"));
+        let denied_updates = denied_emitter.updates();
+        assert_eq!(
+            denied_updates
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed,
+            ]
+        );
+        assert_eq!(
+            denied_updates.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::ApprovalDenied)
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_approval_agent_skips_waiting_and_absent_console_fails_closed() {
+        let (_remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        let cwd = config::canonical_directory(&checkout).unwrap();
+        let agent_session = config::Session {
+            id: format!("activity-agent-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: 1,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let (agent_scope, agent_emitter) = recorded_git_pull_scope();
+        let agent_result = git_pull(
+            &json!({"session_id": agent_session.id, "cwd": cwd}),
+            &agent_session,
+            Some(&agent_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&agent_scope), &agent_result);
+        assert!(agent_result.is_ok());
+        assert_eq!(
+            agent_emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Completed,
+            ]
+        );
+
+        let ask_session = config::Session {
+            id: format!("activity-no-console-{}", Uuid::new_v4()),
+            permission_mode: config::PermissionMode::Ask,
+            ..agent_session
+        };
+        let (absent_scope, absent_emitter) = recorded_git_pull_scope();
+        let absent_result = git_pull(
+            &json!({"session_id": ask_session.id, "cwd": ask_session.cwd}),
+            &ask_session,
+            Some(&absent_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&absent_scope), &absent_result);
+        assert!(absent_result.is_err());
+        let absent_updates = absent_emitter.updates();
+        assert_eq!(
+            absent_updates
+                .iter()
+                .map(ActivityUpdate::state)
+                .collect::<Vec<_>>(),
+            vec![
+                ActivityState::Started,
+                ActivityState::WaitingApproval,
+                ActivityState::Failed,
+            ]
+        );
+        assert_eq!(
+            absent_updates.last().unwrap().summary(),
+            &ActivitySummary::failure(ActivityErrorKind::OperationFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_approval_local_git_tools_keep_results_and_complete_once() {
+        let (_remote, _seed, _checkout_root, checkout) = activity_git_pull_fixture();
+        run_git_fixture(&checkout, &["pull", "--quiet", "--ff-only"]);
+        run_git_fixture(&checkout, &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            &checkout,
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        let cwd = config::canonical_directory(&checkout).unwrap();
+        let session = config::Session {
+            id: format!("activity-git-tools-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: 1,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        std::fs::write(checkout.join("local.txt"), "local\n").unwrap();
+
+        let (add_scope, add_emitter) =
+            recorded_scope(ActivityOperation::GitAdd, ActivitySummary::empty());
+        let add_result = git_add(
+            &json!({"session_id": session.id, "cwd": cwd, "paths": ["local.txt"]}),
+            &session,
+            Some(&add_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&add_scope), &add_result);
+        assert!(add_result.is_ok());
+        assert_git_completed(
+            &add_emitter,
+            ActivityOperation::GitAdd,
+            &ActivitySummary::empty(),
+        );
+
+        let (commit_scope, commit_emitter) =
+            recorded_scope(ActivityOperation::GitCommit, ActivitySummary::empty());
+        let commit_result = git_commit(
+            &json!({"session_id": session.id, "cwd": cwd, "message": "local update"}),
+            &session,
+            Some(&commit_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&commit_scope), &commit_result);
+        assert!(commit_result.is_ok());
+        assert_git_completed(
+            &commit_emitter,
+            ActivityOperation::GitCommit,
+            &ActivitySummary::empty(),
+        );
+
+        let origin_summary = ActivitySummary::git(ActivityRemote::Origin);
+        let (push_scope, push_emitter) =
+            recorded_scope(ActivityOperation::GitPush, origin_summary.clone());
+        let push_result = git_push(
+            &json!({"session_id": session.id, "cwd": cwd}),
+            &session,
+            Some(&push_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&push_scope), &push_result);
+        assert!(push_result.is_ok());
+        assert_git_completed(&push_emitter, ActivityOperation::GitPush, &origin_summary);
+
+        let (fetch_scope, fetch_emitter) =
+            recorded_scope(ActivityOperation::GitFetch, origin_summary.clone());
+        let fetch_result = git_fetch(
+            &json!({"session_id": session.id, "cwd": cwd}),
+            &session,
+            Some(&fetch_scope),
+        )
+        .await;
+        finish_tool_activity(Some(&fetch_scope), &fetch_result);
+        assert!(fetch_result.is_ok());
+        assert_git_completed(&fetch_emitter, ActivityOperation::GitFetch, &origin_summary);
+    }
+
     #[tokio::test]
     async fn agent_git_fetch_skips_the_local_console() {
         let repo = tempfile::tempdir().unwrap();
@@ -5552,6 +7676,7 @@ mod tests {
         let result = git_fetch(
             &json!({"session_id": "agent-git-fetch", "cwd": cwd}),
             &session,
+            None,
         )
         .await
         .expect("agent git_fetch must not require a local approval console");
@@ -5578,9 +7703,13 @@ mod tests {
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
         };
-        let error = git_fetch(&json!({"session_id": session.id, "cwd": cwd}), &session)
-            .await
-            .expect_err("ask git_fetch must fail closed without a running console");
+        let error = git_fetch(
+            &json!({"session_id": session.id, "cwd": cwd}),
+            &session,
+            None,
+        )
+        .await
+        .expect_err("ask git_fetch must fail closed without a running console");
         assert!(
             error.to_string().contains("not running"),
             "unexpected error: {error}"
@@ -5616,7 +7745,7 @@ mod tests {
             "operation": "check",
             "args": ["--workspace"]
         });
-        let result = dev_tool_run_with_executable(&args, &session, Some(&fake))
+        let result = dev_tool_run_with_executable(&args, &session, Some(&fake), None)
             .await
             .expect("agent dev_tool_run must not require a local approval console");
         let encoded = serde_json::to_string(&result).unwrap();

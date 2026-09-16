@@ -68,6 +68,28 @@ approval console は runtime owner ではありません。stdin EOF、Ctrl-C、
 
 HTTP `serve/up` は独自の approval console を持たず、session runtime も所有しません。`serve/up` は起動時に local control protocol version を検証し、lifecycle supervisor の upgrade/restart が必要な場合は fail closed します。Tailscale OAuth approval と runtime の host approval は同じ再接続可能な `temote-mcp session console` を使います。HTTP origin / ingress が再起動しても session runtime は lifecycle supervisor 配下で生存します。
 
+## local activity viewer
+
+running supervisor が保持する最近の activity と live activity は local CLI で確認できます。
+
+```sh
+temote-mcp activity
+temote-mcp activity my-project --tail 100
+temote-mcp activity my-project --tail 0 --no-follow
+```
+
+session ID を指定すると完全一致で filter します。`--tail` は filter 後に適用し、`0` から `1024` までを受け付け、既定値は `100` です。replay は古い順に表示します。既定では後続 activity を follow します。`--no-follow` は bounded replay の end marker を受信すると終了します。viewer は supervisor を起動・再接続しません。有効な session ID に保持済み event がない場合は、error ではなく空の replay になります。
+
+各 event は local time の1行表示で、session routing ID、短縮した instance ID と operation ID、operation、state、該当する場合は固定の safe summary を含みます。session lifecycle / permission、file / Git tool、command / job、delegated developer tool、対応 integration、受け付けた Codex task call、supervisor upgrade phase が対象です。Codex start/control event の completed は Temote が call を受け付けたことを表し、Codex turn の完了を表しません。
+
+activity は process memory 上だけの best-effort な診断 stream です。supervisor が保持するのは最大4096 eventかつ8 MiBで、1 serialized event は最大2048 bytes、summary は最大512 UTF-8 bytesです。live broadcast capacity は1024 event、各 producer queue は256 typed update、同時 viewer は最大16です。queue saturation、process termination、ingress failure、broker contention では sequence 採番前に update が欠落し得るため、後続 gap からその件数を算出できません。history-truncated notice は過去の retained event が eviction 済みであることを示します。live gap は global sequence interval を示すもので、session filter に一致した欠落件数とは限りません。意図的な tail 制限や activity のない session は gap ではありません。
+
+viewer は command、path、Git branch / 任意 remote 名、URL、prompt、payload、stdout/stderr、environment value、credential、raw error を表示しません。session routing ID と短縮した生成 ID は意図的に表示します。activity は audit log でも現在の operation 状態の正本でもなく、履歴を disk に保存しません。
+
+follow mode では Ctrl-C、TTY EOF、supervisor socket EOF により viewer だけを切断して成功終了します。pipe または `/dev/null` からの stdin EOF は無視します。output pipe が閉じられた場合も成功終了します。invalid frame と output failure は失敗終了です。`--no-follow` は stdin を無視し、完全な end marker で成功終了し、end marker 前の socket EOF では失敗終了します。supervisor restart または successful same-PID binary handoff では activity generation と memory history がリセットされ、接続中の viewer は切断されます。replacement supervisor へは command を再実行して接続してください。
+
+この attachment は owner-only local Unix control socket だけで利用できます。stdio MCP、authenticated public HTTP、multi-host gateway には公開しません。attach / disconnect は session、approval、job、runtime を変更しません。
+
 ## runtime と failure isolation
 
 session Unix socket は MCP operation と host bridge の runtime boundary として維持します。local CLI session と HTTP managed session は、sandbox permission、approval state、1Password bridge、kintone bridge、metadata、socket lifecycle を同じ runtime 実装で処理します。

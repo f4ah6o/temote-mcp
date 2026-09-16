@@ -1,7 +1,85 @@
 use noprop::TestCaseContext;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 pub const DEFAULT_CASES: usize = 1024;
 const DEFAULT_SEED: u64 = 0x5445_4D4F_5445_0001;
+
+/// Return a process-private root for unit tests that exercise production path defaults.
+///
+/// Cargo runs the library and binary unit suites in separate processes, so the PID and
+/// random suffix isolate concurrent test executables without mutating process-wide
+/// environment variables. The short `/tmp` name also leaves enough room for the Unix
+/// socket path limit when a maximum-length session ID is appended.
+pub fn private_process_root() -> Result<PathBuf, String> {
+    static ROOT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    ROOT.get_or_init(create_private_process_root).clone()
+}
+
+fn create_private_process_root() -> Result<PathBuf, String> {
+    for _ in 0..16 {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let path = PathBuf::from(format!("/tmp/tm{:x}-{}", std::process::id(), &nonce[..6]));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&path)
+                        .map_err(|error| {
+                            format!(
+                                "failed to inspect private test root {}: {error}",
+                                path.display()
+                            )
+                        })?
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    if mode != 0o700 {
+                        return Err(format!(
+                            "private test root {} has mode {mode:04o}, expected 0700",
+                            path.display()
+                        ));
+                    }
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create private test root {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err("failed to allocate a unique private test root".to_owned())
+}
+
+#[test]
+fn test_isolation_process_root_is_stable_private_and_short() {
+    let root = private_process_root().unwrap();
+    assert_eq!(private_process_root().unwrap(), root);
+    assert_eq!(root.parent(), Some(std::path::Path::new("/tmp")));
+    assert!(
+        root.as_os_str().len() <= 32,
+        "test root is too long: {root:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+}
 
 pub fn seed(salt: u64) -> u64 {
     let base = match std::env::var("TEMOTE_PBT_SEED") {

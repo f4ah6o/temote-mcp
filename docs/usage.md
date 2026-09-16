@@ -15,6 +15,8 @@ temote-mcp session info my-project
 
 Use `temote-mcp session console` when local approval input is required. Closing that console or sending stdin EOF detaches it without stopping the runtime. While no console is attached, approval-required operations fail closed.
 
+Use `temote-mcp activity [SESSION_ID] [--tail N] [--no-follow]` to inspect the supervisor's bounded local activity stream. It follows by default, uses a filtered tail of 100, and is a best-effort diagnostic rather than a durable audit log. See [Managed sessions and named roots](managed-sessions.md#local-activity-viewer) for privacy, loss, retention, and disconnect behavior.
+
 After replacing the installed binary, run `temote-mcp upgrade --dry-run` and then `temote-mcp upgrade` for a compatible same-PID supervisor handoff with coordinated session restart/restore. No credential values are persisted; missing restart context or an in-flight operation aborts the transition, and every planned session is verified before success. A supervisor from before the handoff protocol needs one manual restart first.
 
 `session list` includes durable `starting`, `active`, `stopping`, `stopped`, and `crashed` states. `session info` includes the working directory, permitted roots, permission mode, timestamps, exit reason, and last error. A dead or ambiguous socket is never silently treated as active. Manual restart is available with `temote-mcp session restart <id>`; automatic restart is not enabled. Restart fences the old full session instance, shuts down its registered Codex runtimes before starting the replacement, and does not leave those child runtimes running if replacement startup fails.
@@ -98,7 +100,7 @@ The combined stdout/stderr retained for a command is capped at 1 MiB and reports
 
 The opt-in `codex_status`, `codex_task_start`, `codex_task_get`, and `codex_task_control` tools connect to a local `codex app-server --stdio` and accept only the named status/task operations. The app-server handshake is version-checked (`0.147.0` or `0.153.4`). A task is owned by the complete session instance and its canonical working directory, so it cannot be resumed from another session, process generation, or scope.
 
-`codex_task_start` and `codex_task_control` require an opaque `operation_id`; control actions are typed `steer`, `resume`, and `interrupt`. Temote persists an accepted receipt before starting or controlling the child turn; an uncertain crash returns `reconciliation_required` instead of replaying a side effect. Normal sessions require local approval. Approval details identify Codex provenance, operation/tool, target and scope, mutation/read-only status, and safe model/effort or command/file-change summaries. Prompts, control input, transcripts, raw command arguments, patch bodies, and command output are not placed in task metadata or approval/activity summaries. `codex_task_get` exposes only bounded, expiring, session-and-scope-bound evidence through an opaque `evidence_id`.
+`codex_task_start` and `codex_task_control` require an opaque `operation_id`; control actions are typed `steer`, `resume`, and `interrupt`. Typed `resume` reconciles the retained thread and turn; it does not start a new turn or revive a terminated child process. Temote persists an accepted receipt before starting or controlling the child turn; an uncertain crash returns `reconciliation_required` instead of replaying a side effect. Normal sessions require local approval. Approval details identify Codex provenance, operation/tool, target and scope, mutation/read-only status, and safe model/effort or command/file-change summaries. Prompts, control input, transcripts, raw command arguments, patch bodies, and command output are not placed in task metadata or approval/activity summaries. `codex_task_get` exposes only bounded, expiring, session-and-scope-bound evidence through an opaque `evidence_id`.
 
 Temote yolo changes only Temote's own local sandbox and approval behavior; it does not authorize Codex child mutations. Codex app-server command and file-change approval requests keep the child approval boundary and fail closed when the user-approval transport is unavailable. Pre-thread initialization or model-list failures are reported as `retryable_failed` and the same start operation can be retried; after a thread/start or turn/start request may have been sent, replay remains `reconciliation_required`. `codex_task_get` reconciles the remote thread before applying `after_revision`/`not_modified`. Task records are retained for the full task-retention period, including unexpired terminal records; only expired terminal records without a live child runtime may be pruned. A scope at its retention limit rejects a new start instead of deleting an unexpired record, and compacted operation receipts retain exact-replay conflict protection during retention.
 
@@ -204,3 +206,22 @@ Local stdio can expose the explicitly approval-gated `without_sandbox` tool. The
 - There is no secret-file denylist; permitted roots are the primary filesystem boundary.
 - Runtime audit records operation/status/timing metadata, not command arguments, command output, authenticated identity fields, or secret values.
 - Secret-bearing integrations keep credentials in the session process rather than session metadata.
+
+## Remote upgrade and reconnect
+
+Authenticated direct HTTP exposes `upgrade_preflight`, `upgrade_apply`, and
+`upgrade_status`. These tools are intentionally absent from stdio MCP and the
+multi-host gateway. Preflight and status are read-only host lifecycle calls.
+Apply accepts only an active managed normal `session_id` and an optional
+`expected_version`; it never accepts an executable path, URL, command, argv, or
+environment. Ask and agent sessions both require explicit approval from the
+local user, and public yolo sessions are rejected.
+
+After `upgrade_apply` returns a newly accepted transaction, Temote closes that
+HTTP connection and a detached local coordinator owns the remaining work. The
+client should reconnect to the same configured endpoint with normal
+authentication, verify the host/version/boot identity from initialize or ping,
+and call `upgrade_status(transaction_id)` until it is terminal. Temote cannot
+force an arbitrary MCP client to reconnect. A successful status means the
+coordinator verified the target version, stable host identity, session restore,
+and a new boot generation when ingress replacement was required.

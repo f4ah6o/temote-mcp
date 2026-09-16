@@ -37,9 +37,64 @@ impl std::error::Error for ContractError {}
 pub enum ActivityOperation {
     SessionStart,
     SessionStop,
+    SessionRestart,
+    SessionPermissionMode,
+    SessionPermissionAllow,
+    SessionPermissionRevoke,
+    SessionRestartPolicy,
+    SessionForget,
+    SessionCrash,
+    SessionAutoRestart,
+    SupervisorUpgrade,
     ReadFile,
     WriteFile,
+    GitAdd,
+    GitCommit,
+    GitFetch,
     GitPull,
+    GitPush,
+    Execute,
+    StartCommand,
+    StopJob,
+    LocalAgentRun,
+    DevToolRun,
+    GetImage,
+    EvidenceRead,
+    CodexStatus,
+    CodexTaskStart,
+    CodexTaskGet,
+    CodexTaskControl,
+    ListDirectory,
+    ApplyPatch,
+    PollJob,
+    JobList,
+    CheckpointSave,
+    CheckpointLoad,
+    WorkHandoff,
+    FrictionSummary,
+    LearningCandidateList,
+    Recall,
+    RecallFeedback,
+    #[serde(rename = "onepassword_mcp_discover")]
+    OnePasswordMcpDiscover,
+    #[serde(rename = "onepassword_mcp_read_resource")]
+    OnePasswordMcpReadResource,
+    #[serde(rename = "onepassword_mcp_call")]
+    OnePasswordMcpCall,
+    #[serde(rename = "onepassword_item_get")]
+    OnePasswordItemGet,
+    #[serde(rename = "onepassword_secret_resolve")]
+    OnePasswordSecretResolve,
+    #[serde(rename = "onepassword_service_account_status")]
+    OnePasswordServiceAccountStatus,
+    #[serde(rename = "onepassword_service_account_run")]
+    OnePasswordServiceAccountRun,
+    KintoneMcpStatus,
+    KintoneMcpDiscover,
+    KintoneMcpCall,
+    KintoneCliStatus,
+    KintoneCliRun,
+    WithoutSandbox,
 }
 
 impl<'de> Deserialize<'de> for ActivityOperation {
@@ -51,9 +106,57 @@ impl<'de> Deserialize<'de> for ActivityOperation {
         match value.as_str() {
             "session_start" => Ok(Self::SessionStart),
             "session_stop" => Ok(Self::SessionStop),
+            "session_restart" => Ok(Self::SessionRestart),
+            "session_permission_mode" => Ok(Self::SessionPermissionMode),
+            "session_permission_allow" => Ok(Self::SessionPermissionAllow),
+            "session_permission_revoke" => Ok(Self::SessionPermissionRevoke),
+            "session_restart_policy" => Ok(Self::SessionRestartPolicy),
+            "session_forget" => Ok(Self::SessionForget),
+            "session_crash" => Ok(Self::SessionCrash),
+            "session_auto_restart" => Ok(Self::SessionAutoRestart),
+            "supervisor_upgrade" => Ok(Self::SupervisorUpgrade),
             "read_file" => Ok(Self::ReadFile),
             "write_file" => Ok(Self::WriteFile),
+            "git_add" => Ok(Self::GitAdd),
+            "git_commit" => Ok(Self::GitCommit),
+            "git_fetch" => Ok(Self::GitFetch),
             "git_pull" => Ok(Self::GitPull),
+            "git_push" => Ok(Self::GitPush),
+            "execute" => Ok(Self::Execute),
+            "start_command" => Ok(Self::StartCommand),
+            "stop_job" => Ok(Self::StopJob),
+            "local_agent_run" => Ok(Self::LocalAgentRun),
+            "dev_tool_run" => Ok(Self::DevToolRun),
+            "get_image" => Ok(Self::GetImage),
+            "evidence_read" => Ok(Self::EvidenceRead),
+            "codex_status" => Ok(Self::CodexStatus),
+            "codex_task_start" => Ok(Self::CodexTaskStart),
+            "codex_task_get" => Ok(Self::CodexTaskGet),
+            "codex_task_control" => Ok(Self::CodexTaskControl),
+            "list_directory" => Ok(Self::ListDirectory),
+            "apply_patch" => Ok(Self::ApplyPatch),
+            "poll_job" => Ok(Self::PollJob),
+            "job_list" => Ok(Self::JobList),
+            "checkpoint_save" => Ok(Self::CheckpointSave),
+            "checkpoint_load" => Ok(Self::CheckpointLoad),
+            "work_handoff" => Ok(Self::WorkHandoff),
+            "friction_summary" => Ok(Self::FrictionSummary),
+            "learning_candidate_list" => Ok(Self::LearningCandidateList),
+            "recall" => Ok(Self::Recall),
+            "recall_feedback" => Ok(Self::RecallFeedback),
+            "onepassword_mcp_discover" => Ok(Self::OnePasswordMcpDiscover),
+            "onepassword_mcp_read_resource" => Ok(Self::OnePasswordMcpReadResource),
+            "onepassword_mcp_call" => Ok(Self::OnePasswordMcpCall),
+            "onepassword_item_get" => Ok(Self::OnePasswordItemGet),
+            "onepassword_secret_resolve" => Ok(Self::OnePasswordSecretResolve),
+            "onepassword_service_account_status" => Ok(Self::OnePasswordServiceAccountStatus),
+            "onepassword_service_account_run" => Ok(Self::OnePasswordServiceAccountRun),
+            "kintone_mcp_status" => Ok(Self::KintoneMcpStatus),
+            "kintone_mcp_discover" => Ok(Self::KintoneMcpDiscover),
+            "kintone_mcp_call" => Ok(Self::KintoneMcpCall),
+            "kintone_cli_status" => Ok(Self::KintoneCliStatus),
+            "kintone_cli_run" => Ok(Self::KintoneCliRun),
+            "without_sandbox" => Ok(Self::WithoutSandbox),
             _ => Err(serde_invalid_json()),
         }
     }
@@ -144,6 +247,95 @@ pub enum ActivityRemote {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityCancellationReason {
+    StopRequested,
+    SessionStopped,
+    Timeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityResult {
+    Accepted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityUpgradePhase {
+    Committed,
+    SupervisorHandoff,
+    SessionsVerifying,
+    IngressRestarting,
+    EndpointVerifying,
+    PluginReconciling,
+}
+
+impl ActivityUpgradePhase {
+    fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "committed" => Some(Self::Committed),
+            "supervisor_handoff" => Some(Self::SupervisorHandoff),
+            "sessions_verifying" => Some(Self::SessionsVerifying),
+            "ingress_restarting" => Some(Self::IngressRestarting),
+            "endpoint_verifying" => Some(Self::EndpointVerifying),
+            "plugin_reconciling" => Some(Self::PluginReconciling),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityUpgradePhase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_wire_string(deserializer)?;
+        Self::from_wire_name(&value).ok_or_else(serde_invalid_json)
+    }
+}
+
+impl ActivityResult {
+    fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "accepted" => Some(Self::Accepted),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_wire_string(deserializer)?;
+        Self::from_wire_name(&value).ok_or_else(serde_invalid_json)
+    }
+}
+
+impl ActivityCancellationReason {
+    fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "stop_requested" => Some(Self::StopRequested),
+            "session_stopped" => Some(Self::SessionStopped),
+            "timeout" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityCancellationReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_wire_string(deserializer)?;
+        Self::from_wire_name(&value).ok_or_else(serde_invalid_json)
+    }
+}
+
 impl<'de> Deserialize<'de> for ActivityRemote {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -183,6 +375,15 @@ pub enum ActivitySummary {
     Git {
         remote: ActivityRemote,
     },
+    Cancellation {
+        reason: ActivityCancellationReason,
+    },
+    Result {
+        result: ActivityResult,
+    },
+    UpgradePhase {
+        phase: ActivityUpgradePhase,
+    },
 }
 
 impl<'de> Deserialize<'de> for ActivitySummary {
@@ -210,6 +411,9 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
         let mut kind = None;
         let mut error = None;
         let mut remote = None;
+        let mut reason = None;
+        let mut result = None;
+        let mut phase = None;
 
         while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
             match field.as_str() {
@@ -240,20 +444,67 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                             .map_err(|_| serde_invalid_json())?,
                     );
                 }
+                "reason" => {
+                    if reason.is_some() {
+                        return Err(serde_invalid_json());
+                    }
+                    reason = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde_invalid_json())?,
+                    );
+                }
+                "result" => {
+                    if result.is_some() {
+                        return Err(serde_invalid_json());
+                    }
+                    result = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde_invalid_json())?,
+                    );
+                }
+                "phase" => {
+                    if phase.is_some() {
+                        return Err(serde_invalid_json());
+                    }
+                    phase = Some(
+                        map.next_value::<String>()
+                            .map_err(|_| serde_invalid_json())?,
+                    );
+                }
                 _ => return Err(serde_invalid_json()),
             }
         }
 
         let kind = kind.ok_or_else(serde_invalid_json)?;
         match kind.as_str() {
-            "empty" if error.is_none() && remote.is_none() => Ok(Self::Value::Empty),
-            "failure" if error.is_some() && remote.is_none() => {
+            "empty"
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_none() =>
+            {
+                Ok(Self::Value::Empty)
+            }
+            "failure"
+                if error.is_some()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_none() =>
+            {
                 let error = error.ok_or_else(serde_invalid_json)?;
                 let kind =
                     ActivityErrorKind::from_wire_name(&error).ok_or_else(serde_invalid_json)?;
                 Ok(Self::Value::Failure { kind })
             }
-            "git" if error.is_none() && remote.is_some() => {
+            "git"
+                if error.is_none()
+                    && remote.is_some()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_none() =>
+            {
                 let remote = remote.ok_or_else(serde_invalid_json)?;
                 let remote = match remote.as_str() {
                     "origin" => ActivityRemote::Origin,
@@ -261,6 +512,42 @@ impl<'de> Visitor<'de> for ActivitySummaryVisitor {
                     _ => return Err(serde_invalid_json()),
                 };
                 Ok(Self::Value::Git { remote })
+            }
+            "cancellation"
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_some()
+                    && result.is_none()
+                    && phase.is_none() =>
+            {
+                let reason = reason.ok_or_else(serde_invalid_json)?;
+                let reason = ActivityCancellationReason::from_wire_name(&reason)
+                    .ok_or_else(serde_invalid_json)?;
+                Ok(Self::Value::Cancellation { reason })
+            }
+            "result"
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_some()
+                    && phase.is_none() =>
+            {
+                let result = result.ok_or_else(serde_invalid_json)?;
+                let result =
+                    ActivityResult::from_wire_name(&result).ok_or_else(serde_invalid_json)?;
+                Ok(Self::Value::Result { result })
+            }
+            "upgrade_phase"
+                if error.is_none()
+                    && remote.is_none()
+                    && reason.is_none()
+                    && result.is_none()
+                    && phase.is_some() =>
+            {
+                let phase = phase.ok_or_else(serde_invalid_json)?;
+                let phase =
+                    ActivityUpgradePhase::from_wire_name(&phase).ok_or_else(serde_invalid_json)?;
+                Ok(Self::Value::UpgradePhase { phase })
             }
             _ => Err(serde_invalid_json()),
         }
@@ -278,6 +565,18 @@ impl ActivitySummary {
 
     pub const fn git(remote: ActivityRemote) -> Self {
         Self::Git { remote }
+    }
+
+    pub const fn cancellation(reason: ActivityCancellationReason) -> Self {
+        Self::Cancellation { reason }
+    }
+
+    pub const fn result(result: ActivityResult) -> Self {
+        Self::Result { result }
+    }
+
+    pub const fn upgrade_phase(phase: ActivityUpgradePhase) -> Self {
+        Self::UpgradePhase { phase }
     }
 
     pub fn safe_summary(&self) -> String {
@@ -302,6 +601,36 @@ impl ActivitySummary {
             Self::Git {
                 remote: ActivityRemote::Other,
             } => "remote=other",
+            Self::Cancellation {
+                reason: ActivityCancellationReason::StopRequested,
+            } => "reason=stop_requested",
+            Self::Cancellation {
+                reason: ActivityCancellationReason::SessionStopped,
+            } => "reason=session_stopped",
+            Self::Cancellation {
+                reason: ActivityCancellationReason::Timeout,
+            } => "reason=timeout",
+            Self::Result {
+                result: ActivityResult::Accepted,
+            } => "result=accepted",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::Committed,
+            } => "phase=committed",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::SupervisorHandoff,
+            } => "phase=supervisor_handoff",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::SessionsVerifying,
+            } => "phase=sessions_verifying",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::IngressRestarting,
+            } => "phase=ingress_restarting",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::EndpointVerifying,
+            } => "phase=endpoint_verifying",
+            Self::UpgradePhase {
+                phase: ActivityUpgradePhase::PluginReconciling,
+            } => "phase=plugin_reconciling",
         }
     }
 }
@@ -664,6 +993,26 @@ impl From<&ActivityUpdate> for ActivityUpdateWire {
     }
 }
 
+impl Serialize for ActivityUpdate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ActivityUpdateWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let update = Self::from(ActivityUpdateWire::deserialize(deserializer)?);
+        update.validate().map_err(|_| serde_invalid_json())?;
+        Ok(update)
+    }
+}
+
 #[derive(Serialize)]
 struct ActivityEventWire<'a> {
     schema_version: u64,
@@ -676,6 +1025,162 @@ struct ActivityEventWire<'a> {
     state: ActivityState,
     duration_ms: Option<u64>,
     safe_summary: &'a str,
+}
+
+struct ActivityEventWireOwned {
+    schema_version: u64,
+    sequence: u64,
+    operation_id: Uuid,
+    timestamp_ms: u64,
+    session_id: Option<String>,
+    session_instance: Option<Uuid>,
+    operation: ActivityOperation,
+    state: ActivityState,
+    duration_ms: Option<u64>,
+    safe_summary: String,
+}
+
+struct ActivityEventWireVisitor;
+
+impl<'de> Visitor<'de> for ActivityEventWireVisitor {
+    type Value = ActivityEventWireOwned;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an activity event object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut schema_version = None;
+        let mut sequence = None;
+        let mut operation_id = None;
+        let mut timestamp_ms = None;
+        let mut session_id = None;
+        let mut session_id_seen = false;
+        let mut session_instance = None;
+        let mut session_instance_seen = false;
+        let mut operation = None;
+        let mut state = None;
+        let mut duration_ms = None;
+        let mut duration_seen = false;
+        let mut safe_summary = None;
+
+        while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
+            match field.as_str() {
+                "schema_version" => set_once(&mut schema_version, map.next_value())?,
+                "sequence" => set_once(&mut sequence, map.next_value())?,
+                "operation_id" => set_once(&mut operation_id, map.next_value())?,
+                "timestamp_ms" => set_once(&mut timestamp_ms, map.next_value())?,
+                "session_id" => {
+                    if session_id_seen {
+                        return Err(serde_invalid_json());
+                    }
+                    session_id_seen = true;
+                    session_id = map.next_value().map_err(|_| serde_invalid_json())?;
+                }
+                "session_instance" => {
+                    if session_instance_seen {
+                        return Err(serde_invalid_json());
+                    }
+                    session_instance_seen = true;
+                    session_instance = map.next_value().map_err(|_| serde_invalid_json())?;
+                }
+                "operation" => set_once(&mut operation, map.next_value())?,
+                "state" => set_once(&mut state, map.next_value())?,
+                "duration_ms" => {
+                    if duration_seen {
+                        return Err(serde_invalid_json());
+                    }
+                    duration_seen = true;
+                    duration_ms = map.next_value().map_err(|_| serde_invalid_json())?;
+                }
+                "safe_summary" => set_once(&mut safe_summary, map.next_value())?,
+                _ => return Err(serde_invalid_json()),
+            }
+        }
+
+        if !session_id_seen || !session_instance_seen || !duration_seen {
+            return Err(serde_invalid_json());
+        }
+        Ok(ActivityEventWireOwned {
+            schema_version: schema_version.ok_or_else(serde_invalid_json)?,
+            sequence: sequence.ok_or_else(serde_invalid_json)?,
+            operation_id: operation_id.ok_or_else(serde_invalid_json)?,
+            timestamp_ms: timestamp_ms.ok_or_else(serde_invalid_json)?,
+            session_id,
+            session_instance,
+            operation: operation.ok_or_else(serde_invalid_json)?,
+            state: state.ok_or_else(serde_invalid_json)?,
+            duration_ms,
+            safe_summary: safe_summary.ok_or_else(serde_invalid_json)?,
+        })
+    }
+}
+
+fn set_once<T, E>(slot: &mut Option<T>, value: Result<T, E>) -> Result<(), E>
+where
+    E: SerdeError,
+{
+    if slot.is_some() {
+        return Err(serde_invalid_json());
+    }
+    *slot = Some(value.map_err(|_| serde_invalid_json())?);
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for ActivityEventWireOwned {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ActivityEventWireVisitor)
+    }
+}
+
+struct ActivityEnvelopeOwned {
+    event: ActivityEventWireOwned,
+}
+
+struct ActivityEnvelopeVisitor;
+
+impl<'de> Visitor<'de> for ActivityEnvelopeVisitor {
+    type Value = ActivityEnvelopeOwned;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an activity envelope")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut event_type: Option<String> = None;
+        let mut event = None;
+        while let Some(field) = map.next_key::<String>().map_err(|_| serde_invalid_json())? {
+            match field.as_str() {
+                "type" => set_once(&mut event_type, map.next_value())?,
+                "event" => set_once(&mut event, map.next_value())?,
+                _ => return Err(serde_invalid_json()),
+            }
+        }
+        if event_type.as_deref() != Some("activity") {
+            return Err(serde_invalid_json());
+        }
+        Ok(ActivityEnvelopeOwned {
+            event: event.ok_or_else(serde_invalid_json)?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityEnvelopeOwned {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ActivityEnvelopeVisitor)
+    }
 }
 
 impl<'a> From<&'a ActivityEvent> for ActivityEventWire<'a> {
@@ -735,6 +1240,29 @@ pub fn encode_event(event: &ActivityEvent) -> Result<Vec<u8>, ContractError> {
         return Err(ContractError::TooLarge);
     }
     Ok(bytes)
+}
+
+pub fn decode_event(bytes: &[u8]) -> Result<ActivityEvent, ContractError> {
+    if bytes.len() > MAX_ACTIVITY_EVENT_BYTES {
+        return Err(ContractError::TooLarge);
+    }
+    let wire: ActivityEnvelopeOwned =
+        serde_json::from_slice(bytes).map_err(|_| ContractError::InvalidJson)?;
+    let wire = wire.event;
+    let event = ActivityEvent {
+        schema_version: wire.schema_version,
+        sequence: wire.sequence,
+        operation_id: wire.operation_id,
+        timestamp_ms: wire.timestamp_ms,
+        session_id: wire.session_id,
+        session_instance: wire.session_instance,
+        operation: wire.operation,
+        state: wire.state,
+        duration_ms: wire.duration_ms,
+        safe_summary: wire.safe_summary,
+    };
+    event.validate()?;
+    Ok(event)
 }
 
 fn validate_update(update: &ActivityUpdate) -> Result<(), ContractError> {
@@ -851,9 +1379,99 @@ mod tests {
         let operations = [
             (ActivityOperation::SessionStart, "session_start"),
             (ActivityOperation::SessionStop, "session_stop"),
+            (ActivityOperation::SessionRestart, "session_restart"),
+            (
+                ActivityOperation::SessionPermissionMode,
+                "session_permission_mode",
+            ),
+            (
+                ActivityOperation::SessionPermissionAllow,
+                "session_permission_allow",
+            ),
+            (
+                ActivityOperation::SessionPermissionRevoke,
+                "session_permission_revoke",
+            ),
+            (
+                ActivityOperation::SessionRestartPolicy,
+                "session_restart_policy",
+            ),
+            (ActivityOperation::SessionForget, "session_forget"),
+            (ActivityOperation::SessionCrash, "session_crash"),
+            (
+                ActivityOperation::SessionAutoRestart,
+                "session_auto_restart",
+            ),
+            (ActivityOperation::SupervisorUpgrade, "supervisor_upgrade"),
             (ActivityOperation::ReadFile, "read_file"),
             (ActivityOperation::WriteFile, "write_file"),
+            (ActivityOperation::GitAdd, "git_add"),
+            (ActivityOperation::GitCommit, "git_commit"),
+            (ActivityOperation::GitFetch, "git_fetch"),
             (ActivityOperation::GitPull, "git_pull"),
+            (ActivityOperation::GitPush, "git_push"),
+            (ActivityOperation::Execute, "execute"),
+            (ActivityOperation::StartCommand, "start_command"),
+            (ActivityOperation::StopJob, "stop_job"),
+            (ActivityOperation::LocalAgentRun, "local_agent_run"),
+            (ActivityOperation::DevToolRun, "dev_tool_run"),
+            (ActivityOperation::GetImage, "get_image"),
+            (ActivityOperation::EvidenceRead, "evidence_read"),
+            (ActivityOperation::CodexStatus, "codex_status"),
+            (ActivityOperation::CodexTaskStart, "codex_task_start"),
+            (ActivityOperation::CodexTaskGet, "codex_task_get"),
+            (ActivityOperation::CodexTaskControl, "codex_task_control"),
+            (ActivityOperation::ListDirectory, "list_directory"),
+            (ActivityOperation::ApplyPatch, "apply_patch"),
+            (ActivityOperation::PollJob, "poll_job"),
+            (ActivityOperation::JobList, "job_list"),
+            (ActivityOperation::CheckpointSave, "checkpoint_save"),
+            (ActivityOperation::CheckpointLoad, "checkpoint_load"),
+            (ActivityOperation::WorkHandoff, "work_handoff"),
+            (ActivityOperation::FrictionSummary, "friction_summary"),
+            (
+                ActivityOperation::LearningCandidateList,
+                "learning_candidate_list",
+            ),
+            (ActivityOperation::Recall, "recall"),
+            (ActivityOperation::RecallFeedback, "recall_feedback"),
+            (
+                ActivityOperation::OnePasswordMcpDiscover,
+                "onepassword_mcp_discover",
+            ),
+            (
+                ActivityOperation::OnePasswordMcpReadResource,
+                "onepassword_mcp_read_resource",
+            ),
+            (
+                ActivityOperation::OnePasswordMcpCall,
+                "onepassword_mcp_call",
+            ),
+            (
+                ActivityOperation::OnePasswordItemGet,
+                "onepassword_item_get",
+            ),
+            (
+                ActivityOperation::OnePasswordSecretResolve,
+                "onepassword_secret_resolve",
+            ),
+            (
+                ActivityOperation::OnePasswordServiceAccountStatus,
+                "onepassword_service_account_status",
+            ),
+            (
+                ActivityOperation::OnePasswordServiceAccountRun,
+                "onepassword_service_account_run",
+            ),
+            (ActivityOperation::KintoneMcpStatus, "kintone_mcp_status"),
+            (
+                ActivityOperation::KintoneMcpDiscover,
+                "kintone_mcp_discover",
+            ),
+            (ActivityOperation::KintoneMcpCall, "kintone_mcp_call"),
+            (ActivityOperation::KintoneCliStatus, "kintone_cli_status"),
+            (ActivityOperation::KintoneCliRun, "kintone_cli_run"),
+            (ActivityOperation::WithoutSandbox, "without_sandbox"),
         ];
         for (operation, expected) in operations {
             let encoded = encode_update(&update(
@@ -960,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_only_the_three_safe_summary_forms() {
+    fn renders_only_fixed_safe_summary_forms() {
         assert_eq!(ActivitySummary::Empty.safe_summary(), "");
         assert_eq!(
             ActivitySummary::failure(ActivityErrorKind::ApprovalDenied).safe_summary(),
@@ -973,6 +1591,119 @@ mod tests {
         assert_eq!(
             ActivitySummary::git(ActivityRemote::Other).safe_summary(),
             "remote=other"
+        );
+        assert_eq!(
+            ActivitySummary::cancellation(ActivityCancellationReason::StopRequested).safe_summary(),
+            "reason=stop_requested"
+        );
+        assert_eq!(
+            ActivitySummary::cancellation(ActivityCancellationReason::SessionStopped)
+                .safe_summary(),
+            "reason=session_stopped"
+        );
+        assert_eq!(
+            ActivitySummary::cancellation(ActivityCancellationReason::Timeout).safe_summary(),
+            "reason=timeout"
+        );
+        assert_eq!(
+            ActivitySummary::result(ActivityResult::Accepted).safe_summary(),
+            "result=accepted"
+        );
+        for (phase, expected) in [
+            (ActivityUpgradePhase::Committed, "phase=committed"),
+            (
+                ActivityUpgradePhase::SupervisorHandoff,
+                "phase=supervisor_handoff",
+            ),
+            (
+                ActivityUpgradePhase::SessionsVerifying,
+                "phase=sessions_verifying",
+            ),
+            (
+                ActivityUpgradePhase::IngressRestarting,
+                "phase=ingress_restarting",
+            ),
+            (
+                ActivityUpgradePhase::EndpointVerifying,
+                "phase=endpoint_verifying",
+            ),
+            (
+                ActivityUpgradePhase::PluginReconciling,
+                "phase=plugin_reconciling",
+            ),
+        ] {
+            let summary = ActivitySummary::upgrade_phase(phase);
+            assert_eq!(summary.safe_summary(), expected);
+            assert_eq!(
+                serde_json::from_value::<ActivitySummary>(serde_json::to_value(&summary).unwrap())
+                    .unwrap(),
+                summary
+            );
+        }
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "upgrade_phase",
+                "phase": "raw-phase-sentinel"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "upgrade_phase",
+                "phase": "committed",
+                "result": "accepted"
+            }))
+            .is_err()
+        );
+
+        for reason in [
+            ActivityCancellationReason::StopRequested,
+            ActivityCancellationReason::SessionStopped,
+            ActivityCancellationReason::Timeout,
+        ] {
+            let summary = ActivitySummary::cancellation(reason);
+            let encoded = serde_json::to_vec(&summary).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ActivitySummary>(&encoded).unwrap(),
+                summary
+            );
+        }
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "cancellation",
+                "reason": "raw-error-sentinel"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "cancellation",
+                "reason": "timeout",
+                "error": "operation_failed"
+            }))
+            .is_err()
+        );
+
+        let result = ActivitySummary::result(ActivityResult::Accepted);
+        assert_eq!(
+            serde_json::from_value::<ActivitySummary>(serde_json::to_value(&result).unwrap())
+                .unwrap(),
+            result
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "result",
+                "result": "raw-result-sentinel"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ActivitySummary>(json!({
+                "kind": "result",
+                "result": "accepted",
+                "reason": "timeout"
+            }))
+            .is_err()
         );
 
         let value =
@@ -1020,6 +1751,7 @@ mod tests {
         assert_eq!(event.safe_summary(), "remote=origin");
         let encoded = encode_event(&event).unwrap();
         assert!(!encoded.ends_with(b"\n"));
+        assert_eq!(decode_event(&encoded), Ok(event.clone()));
         let actual: Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(
             actual,
@@ -1074,15 +1806,46 @@ mod tests {
         .unwrap();
         let mut value: Value = serde_json::from_slice(&encode_event(&event).unwrap()).unwrap();
         let event = value
-            .get_mut("event")
-            .and_then(Value::as_object_mut)
-            .unwrap();
+            .get("event")
+            .and_then(Value::as_object)
+            .unwrap()
+            .clone();
 
         for field in ["session_id", "session_instance", "duration_ms"] {
             let mut missing = event.clone();
             missing.remove(field);
             assert_ne!(missing.get(field), Some(&Value::Null));
+            value["event"] = Value::Object(missing);
+            assert_eq!(
+                decode_event(&serde_json::to_vec(&value).unwrap()),
+                Err(ContractError::InvalidJson)
+            );
         }
+    }
+
+    #[test]
+    fn decode_event_rejects_duplicate_unknown_and_semantically_invalid_fields() {
+        let valid = br#"{"type":"activity","event":{"schema_version":1,"sequence":1,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":"00000000-0000-4000-8000-000000000003","operation":"git_pull","state":"completed","duration_ms":1832,"safe_summary":"remote=origin"}}"#;
+        assert!(decode_event(valid).is_ok());
+        for invalid in [
+            br#"{"type":"activity","type":"activity","event":{"schema_version":1,"sequence":1,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":null,"operation":"git_pull","state":"completed","duration_ms":1,"safe_summary":""}}"#.as_slice(),
+            br#"{"type":"activity","event":{"schema_version":1,"sequence":1,"sequence":2,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":null,"operation":"git_pull","state":"completed","duration_ms":1,"safe_summary":""}}"#.as_slice(),
+            br#"{"type":"activity","event":{"schema_version":1,"sequence":1,"operation_id":"00000000-0000-4000-8000-000000000002","timestamp_ms":1780000000000,"session_id":"sf","session_instance":null,"operation":"git_pull","state":"completed","duration_ms":1,"safe_summary":"","extra":true}}"#.as_slice(),
+        ] {
+            assert_eq!(decode_event(invalid), Err(ContractError::InvalidJson));
+        }
+
+        let unknown_schema = std::str::from_utf8(valid).unwrap().replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":2",
+            1,
+        );
+        assert_eq!(
+            decode_event(unknown_schema.as_bytes()),
+            Err(ContractError::UnknownSchema)
+        );
+        let oversized = vec![b' '; MAX_ACTIVITY_EVENT_BYTES + 1];
+        assert_eq!(decode_event(&oversized), Err(ContractError::TooLarge));
     }
 
     #[test]

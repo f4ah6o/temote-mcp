@@ -11,8 +11,57 @@ use tempfile::TempDir;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn socket_namespace() -> String {
-    format!("e2e{:x}", std::process::id())
+fn socket_namespace(state_home: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    state_home.hash(&mut hash);
+    format!("e{:011x}", hash.finish() & 0x7ff_ffff_ffff)
+}
+
+fn isolate_process<'a>(command: &'a mut Command, state_home: &Path) -> &'a mut Command {
+    let private_directories = [
+        state_home.join("cache"),
+        state_home.join("codex"),
+        state_home.join("config"),
+        state_home.join("runtime"),
+        state_home.join("tmp"),
+        state_home.join("xdg-runtime"),
+    ];
+    for directory in &private_directories {
+        fs::create_dir_all(directory).expect("failed to create isolated process directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("failed to protect isolated process directory");
+        }
+    }
+    let path = std::env::var_os("PATH").expect("PATH is required for process-boundary tests");
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", state_home)
+        .env("CODEX_HOME", state_home.join("codex"))
+        .env("XDG_CACHE_HOME", state_home.join("cache"))
+        .env("XDG_CONFIG_HOME", state_home.join("config"))
+        .env("XDG_RUNTIME_DIR", state_home.join("xdg-runtime"))
+        .env("XDG_STATE_HOME", state_home)
+        .env("TMPDIR", state_home.join("tmp"))
+        .env("TEMOTE_MCP_RUNTIME_DIR", state_home.join("runtime"))
+}
+
+#[cfg(unix)]
+fn private_upgrade_binary() -> (TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new().expect("failed to create private executable directory");
+    let binary = directory.path().join("temote-mcp");
+    fs::copy(env!("CARGO_BIN_EXE_temote-mcp"), &binary)
+        .expect("failed to copy upgrade test executable");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .expect("failed to protect upgrade test executable");
+    (directory, binary)
 }
 
 struct ChildGuard {
@@ -68,11 +117,10 @@ struct McpClient {
 impl McpClient {
     fn spawn(binary: &Path, state_home: &Path) -> Self {
         let mut command = Command::new(binary);
-        command
+        isolate_process(&mut command, state_home)
             .arg("mcp")
-            .env("XDG_STATE_HOME", state_home)
-            .env("HOME", state_home)
-            .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
+            .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace(state_home))
+            .current_dir(state_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -187,8 +235,10 @@ fn wait_for_session_status(client: &mut McpClient, session_id: &str, status: &st
     }
 }
 
-fn initialize_git_repository(project: &Path) {
-    let status = Command::new("git")
+fn initialize_git_repository(project: &Path, state_home: &Path) {
+    let mut command = Command::new("git");
+    let status = isolate_process(&mut command, state_home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .args(["init", "-q"])
         .current_dir(project)
         .status()
@@ -204,12 +254,11 @@ fn roots_env(project: &Path) -> String {
 
 fn spawn_supervisor(binary: &Path, project: &Path, state_home: &Path) -> ChildGuard {
     let mut command = Command::new(binary);
-    command
+    isolate_process(&mut command, state_home)
         .arg("supervisor")
-        .env("XDG_STATE_HOME", state_home)
-        .env("HOME", state_home)
         .env("TEMOTE_MCP_ROOTS", roots_env(project))
-        .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
+        .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace(state_home))
+        .current_dir(project)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -217,12 +266,11 @@ fn spawn_supervisor(binary: &Path, project: &Path, state_home: &Path) -> ChildGu
 }
 
 fn run_cli(binary: &Path, args: &[&str], cwd: &Path, state_home: &Path) -> Output {
-    Command::new(binary)
+    let mut command = Command::new(binary);
+    isolate_process(&mut command, state_home)
         .args(args)
         .current_dir(cwd)
-        .env("XDG_STATE_HOME", state_home)
-        .env("HOME", state_home)
-        .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace())
+        .env("TEMOTE_MCP_SOCKET_NAMESPACE", socket_namespace(state_home))
         .stdin(Stdio::null())
         .output()
         .expect("failed to run temote-mcp CLI")
@@ -254,18 +302,18 @@ fn wait_for_supervisor(binary: &Path, cwd: &Path, state_home: &Path) {
 }
 
 #[cfg(unix)]
-fn supervisor_socket_path() -> PathBuf {
+fn supervisor_socket_path(state_home: &Path) -> PathBuf {
     let uid = unsafe { libc::geteuid() };
     PathBuf::from("/tmp")
-        .join(format!("tmcp-{uid}-{}", socket_namespace()))
+        .join(format!("tmcp-{uid}-{}", socket_namespace(state_home)))
         .join("supervisor.sock")
 }
 
 #[cfg(unix)]
-fn running_supervisor_pid() -> u32 {
+fn running_supervisor_pid(state_home: &Path) -> u32 {
     use std::os::unix::net::UnixStream;
 
-    let socket = supervisor_socket_path();
+    let socket = supervisor_socket_path(state_home);
     let mut stream =
         UnixStream::connect(&socket).expect("failed to connect to bootstrapped supervisor");
     writeln!(stream, "{}", json!({"command": "ping"})).expect("failed to write supervisor ping");
@@ -289,15 +337,15 @@ fn running_supervisor_pid() -> u32 {
 #[cfg(unix)]
 struct BootstrappedSupervisorGuard {
     pid: u32,
+    socket: PathBuf,
 }
 
 #[cfg(unix)]
 impl Drop for BootstrappedSupervisorGuard {
     fn drop(&mut self) {
         let _ = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGINT) };
-        let socket = supervisor_socket_path();
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        while socket.exists() && Instant::now() < deadline {
+        while self.socket.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -325,12 +373,12 @@ fn upgrade_failure_reports(state_home: &Path) -> Vec<PathBuf> {
 #[test]
 #[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
 fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let (_binary_directory, binary) = private_upgrade_binary();
     let project = TempDir::new().expect("failed to create E2E project directory");
     let state = TempDir::new().expect("failed to create isolated state directory");
-    initialize_git_repository(project.path());
+    initialize_git_repository(project.path(), state.path());
 
-    let namespace = format!("bad{:x}", std::process::id());
+    let namespace = socket_namespace(state.path());
     assert!(namespace.len() <= 12, "test socket namespace is too long");
     let uid = unsafe { libc::geteuid() };
     let socket_dir = PathBuf::from("/tmp").join(format!("tmcp-{uid}-{namespace}"));
@@ -393,11 +441,10 @@ fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
         }
     });
 
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    let output = isolate_process(&mut command, state.path())
         .args(["upgrade", "--force"])
         .current_dir(project.path())
-        .env("XDG_STATE_HOME", state.path())
-        .env("HOME", state.path())
         .env("TEMOTE_MCP_SOCKET_NAMESPACE", &namespace)
         .stdin(Stdio::null())
         .output()
@@ -431,10 +478,10 @@ fn supervisor_upgrade_rejects_incompatible_generation_before_handoff() {
 #[test]
 #[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
 fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
-    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let (_binary_directory, binary) = private_upgrade_binary();
     let project = TempDir::new().expect("failed to create E2E project directory");
     let state = TempDir::new().expect("failed to create isolated state directory");
-    initialize_git_repository(project.path());
+    initialize_git_repository(project.path(), state.path());
     let canonical_project =
         fs::canonicalize(project.path()).expect("failed to canonicalize project");
     let session_id = format!("upgrade-e2e-{}", std::process::id());
@@ -466,7 +513,7 @@ fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
     );
     assert_cli_success(&upgrade, "forced same-version supervisor upgrade");
     assert!(
-        String::from_utf8_lossy(&upgrade.stdout).contains("supervisor handoff complete"),
+        String::from_utf8_lossy(&upgrade.stdout).contains("Temote upgrade complete:"),
         "upgrade did not report handoff completion: stdout={} stderr={}",
         String::from_utf8_lossy(&upgrade.stdout),
         String::from_utf8_lossy(&upgrade.stderr)
@@ -516,9 +563,9 @@ fn legacy_start_bootstraps_agent_supervisor_without_manual_socket_setup() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
     let project = TempDir::new().expect("failed to create E2E project directory");
     let state = TempDir::new().expect("failed to create isolated state directory");
-    initialize_git_repository(project.path());
+    initialize_git_repository(project.path(), state.path());
     let session_id = format!("bootstrap-e2e-{}", std::process::id());
-    let socket = supervisor_socket_path();
+    let socket = supervisor_socket_path(state.path());
     let _ = fs::remove_file(&socket);
 
     let start = run_cli(
@@ -530,7 +577,8 @@ fn legacy_start_bootstraps_agent_supervisor_without_manual_socket_setup() {
     assert_cli_success(&start, "legacy start with automatic supervisor bootstrap");
 
     let supervisor = BootstrappedSupervisorGuard {
-        pid: running_supervisor_pid(),
+        pid: running_supervisor_pid(state.path()),
+        socket: socket.clone(),
     };
     let info = run_cli(
         &binary,
@@ -564,7 +612,7 @@ fn supervisor_session_lifecycle_survives_console_eof_and_records_crash() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
     let project = TempDir::new().expect("failed to create E2E project directory");
     let state = TempDir::new().expect("failed to create isolated state directory");
-    initialize_git_repository(project.path());
+    initialize_git_repository(project.path(), state.path());
     let canonical_project =
         fs::canonicalize(project.path()).expect("failed to canonicalize project");
     let session_id = format!("cli-e2e-{}", std::process::id());
@@ -650,9 +698,7 @@ fn supervisor_session_lifecycle_survives_console_eof_and_records_crash() {
         "git did not observe the fixture through the session: {git_status}"
     );
 
-    let outside_cwd = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("HOME is required for the E2E boundary check");
+    let outside_cwd = state.path().to_path_buf();
     assert_ne!(fs::canonicalize(&outside_cwd).unwrap(), canonical_project);
     let rejected = client.tool_call(
         "execute",

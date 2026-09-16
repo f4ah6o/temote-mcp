@@ -2,18 +2,65 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
+use temote_mcp::activity::broker::{ActivityBroker, BrokerError};
+use temote_mcp::activity::contract::{
+    ActivityErrorKind, ActivityOperation, ActivitySummary, ActivityUpdate,
+};
+use temote_mcp::activity::scope::{ActivityEmitError, ActivityEmitter, ActivityScope};
 
 const MAX_MANAGED_SESSIONS: usize = 64;
 const MAX_AUTOMATIC_RESTARTS: u32 = 5;
 const MAX_RESTART_BACKOFF_SECONDS: u64 = 30;
+
+fn activity_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+struct SupervisorActivityEmitter {
+    broker: Arc<ActivityBroker>,
+    session_id: String,
+    session_instance: Option<Uuid>,
+}
+
+impl ActivityEmitter for SupervisorActivityEmitter {
+    fn try_emit(&self, update: ActivityUpdate) -> Result<(), ActivityEmitError> {
+        self.broker
+            .publish(update, Some(&self.session_id), self.session_instance)
+            .map(|_| ())
+            .map_err(|error| match error {
+                BrokerError::Busy => ActivityEmitError::Full,
+                BrokerError::InvalidInput | BrokerError::EventTooLarge => {
+                    ActivityEmitError::InvalidInput
+                }
+                BrokerError::Closed => ActivityEmitError::Closed,
+                BrokerError::InvalidCapacity
+                | BrokerError::SequenceExhausted
+                | BrokerError::InvariantViolation => ActivityEmitError::InvariantViolation,
+            })
+    }
+}
+
+fn finish_supervisor_activity<T>(activity: &ActivityScope, result: &Result<T>) {
+    let _ = if result.is_ok() {
+        activity.complete()
+    } else {
+        activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::OperationFailed))
+    };
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "UpgradeSessionPlanWire", into = "UpgradeSessionPlanWire")]
@@ -99,6 +146,15 @@ pub struct UpgradeSessionBlocker {
 pub struct SupervisorUpgradePreview {
     pub plan: SupervisorUpgradePlan,
     pub blocked_sessions: Vec<UpgradeSessionBlocker>,
+    #[serde(default)]
+    pub active_sessions: Vec<SupervisorUpgradeSessionIdentity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SupervisorUpgradeSessionIdentity {
+    pub session_id: String,
+    pub process_id: u32,
+    pub started_at: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +162,32 @@ struct UpgradePlanOptions {
     fence: bool,
     force: bool,
     collect_blockers: bool,
+}
+
+pub(crate) struct SupervisorUpgradePlanRequest<'a> {
+    target_version: &'a str,
+    control_protocol: u64,
+    lifecycle_schema: u64,
+    available_environment: &'a approvals::CapturedStartEnvironment,
+    force: bool,
+}
+
+impl<'a> SupervisorUpgradePlanRequest<'a> {
+    pub(crate) fn new(
+        target_version: &'a str,
+        control_protocol: u64,
+        lifecycle_schema: u64,
+        available_environment: &'a approvals::CapturedStartEnvironment,
+        force: bool,
+    ) -> Self {
+        Self {
+            target_version,
+            control_protocol,
+            lifecycle_schema,
+            available_environment,
+            force,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -136,6 +218,7 @@ pub struct SessionSupervisor {
     closed: AtomicBool,
     upgrade_fenced: AtomicBool,
     max_sessions: usize,
+    activity_broker: Arc<ActivityBroker>,
 }
 
 impl SessionSupervisor {
@@ -145,6 +228,7 @@ impl SessionSupervisor {
 
     fn with_limit(roots: NamedRoots, max_sessions: usize) -> (Arc<Self>, ApprovalReceiver) {
         let (approval_sender, approval_receiver) = approvals::approval_channel();
+        let activity_broker = Arc::new(ActivityBroker::new(activity_now_ms, Uuid::new_v4()));
         (
             Arc::new(Self {
                 roots,
@@ -156,6 +240,7 @@ impl SessionSupervisor {
                 closed: AtomicBool::new(false),
                 upgrade_fenced: AtomicBool::new(false),
                 max_sessions,
+                activity_broker,
             }),
             approval_receiver,
         )
@@ -171,6 +256,48 @@ impl SessionSupervisor {
 
     pub fn approval_sender(&self) -> ApprovalSender {
         self.approval_sender.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn activity_broker(&self) -> Arc<ActivityBroker> {
+        Arc::clone(&self.activity_broker)
+    }
+
+    fn activity_scope(&self, operation: ActivityOperation, session_id: String) -> ActivityScope {
+        self.activity_scope_with_instance(operation, session_id, None)
+    }
+
+    fn activity_scope_with_instance(
+        &self,
+        operation: ActivityOperation,
+        session_id: String,
+        session_instance: Option<Uuid>,
+    ) -> ActivityScope {
+        ActivityScope::new(
+            operation,
+            SupervisorActivityEmitter {
+                broker: Arc::clone(&self.activity_broker),
+                session_id,
+                session_instance,
+            },
+        )
+    }
+
+    fn crash_activity_scope(
+        &self,
+        session_id: String,
+        session_instance: Option<Uuid>,
+    ) -> ActivityScope {
+        let detected = Instant::now();
+        ActivityScope::with_clock(
+            ActivityOperation::SessionCrash,
+            SupervisorActivityEmitter {
+                broker: Arc::clone(&self.activity_broker),
+                session_id,
+                session_instance,
+            },
+            move || detected,
+        )
     }
 
     fn ensure_mutations_allowed(&self) -> Result<()> {
@@ -288,14 +415,15 @@ impl SessionSupervisor {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
-        anyhow::ensure!(
-            self.roots_configured(),
-            "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
-        );
-        let cwd = self.roots.resolve(logical_path)?;
         let id = config::session_id(session_id)?;
-        let info = self
-            .start_resolved(
+        let activity = self.activity_scope(ActivityOperation::SessionStart, id.clone());
+        let result = async {
+            anyhow::ensure!(
+                self.roots_configured(),
+                "TEMOTE_MCP_ROOTS is not configured; session_start is disabled"
+            );
+            let cwd = self.roots.resolve(logical_path)?;
+            self.start_resolved(
                 cwd,
                 id.clone(),
                 permission_mode,
@@ -303,8 +431,11 @@ impl SessionSupervisor {
                 environment,
                 public,
             )
-            .await?;
-        Ok(info)
+            .await
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn start_local_with_environment(
@@ -333,10 +464,16 @@ impl SessionSupervisor {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
-        let cwd = config::canonical_directory(cwd)?;
         let id = config::session_id(session_id)?;
-        self.start_resolved(cwd, id, permission_mode, None, environment, false)
-            .await
+        let activity = self.activity_scope(ActivityOperation::SessionStart, id.clone());
+        let result = async {
+            let cwd = config::canonical_directory(cwd)?;
+            self.start_resolved(cwd, id, permission_mode, None, environment, false)
+                .await
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     async fn start_resolved(
@@ -376,13 +513,14 @@ impl SessionSupervisor {
             environment: environment.clone(),
             public,
         };
-        let handle = approvals::spawn_runtime_with_logical_path_and_environment(
+        let handle = approvals::spawn_runtime_with_activity(
             &cwd,
             Some(&id),
             permission_mode,
             self.approval_sender.clone(),
             logical_path,
             environment,
+            approvals::RuntimeActivity::new(Arc::clone(&self.activity_broker), Uuid::new_v4()),
         )
         .await
         .with_context(|| format!("failed to start managed session {id}"))?;
@@ -409,6 +547,99 @@ impl SessionSupervisor {
         self.stop_owned(session_id, true).await
     }
 
+    pub async fn restart_with_environment(
+        &self,
+        session_id: &str,
+        environment: approvals::CapturedStartEnvironment,
+        public: bool,
+    ) -> Result<()> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let activity =
+            self.activity_scope(ActivityOperation::SessionRestart, session_id.to_owned());
+        let result = async {
+            let session = config::read_session_metadata(session_id).await?;
+            let lifecycle = config::read_session_lifecycle(session_id).await?;
+            let logical_path = lifecycle
+                .as_ref()
+                .and_then(|state| state.logical_path.clone());
+            if public {
+                anyhow::ensure!(
+                    config::session_is_active(session_id).await?,
+                    "public session_restart requires an active managed session"
+                );
+                anyhow::ensure!(
+                    logical_path.is_some(),
+                    "public managed session has no named-root path"
+                );
+            }
+            crate::codex_app_server::begin_session_shutdown(&session);
+            if config::session_is_active(session_id).await? {
+                self.stop_owned_validated(session_id, public).await?;
+            } else {
+                crate::codex_app_server::remove_session(&session).await?;
+            }
+            if let Some(path) = logical_path {
+                let cwd = self.roots.resolve(&path)?;
+                self.start_resolved(
+                    cwd,
+                    session_id.to_owned(),
+                    session.permission_mode,
+                    Some(path),
+                    environment,
+                    public,
+                )
+                .await?;
+            } else {
+                let cwd = config::canonical_directory(&session.cwd)?;
+                self.start_resolved(
+                    cwd,
+                    session_id.to_owned(),
+                    session.permission_mode,
+                    None,
+                    environment,
+                    false,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
+    }
+
+    pub async fn validate_public_upgrade_session(
+        &self,
+        session_id: &str,
+    ) -> Result<config::Session> {
+        config::validate_session_id(session_id)?;
+        anyhow::ensure!(
+            self.public_sessions.lock().await.contains(session_id),
+            "upgrade_apply requires a session managed by this authenticated HTTP server"
+        );
+        anyhow::ensure!(
+            self.sessions.lock().await.contains_key(session_id),
+            "upgrade_apply requires an active managed session"
+        );
+        let lifecycle = config::read_session_lifecycle(session_id)
+            .await?
+            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+        anyhow::ensure!(
+            lifecycle.status == config::LifecycleStatus::Active
+                && config::session_is_active(session_id).await?,
+            "upgrade_apply requires an ACTIVE managed session"
+        );
+        let session = config::read_session_metadata(session_id).await?;
+        anyhow::ensure!(
+            !session.permission_mode.is_yolo(),
+            "upgrade_apply rejects public yolo sessions"
+        );
+        Ok(session)
+    }
+
     pub async fn forget_session(
         &self,
         session_id: &str,
@@ -417,19 +648,25 @@ impl SessionSupervisor {
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
-        anyhow::ensure!(
-            !self.sessions.lock().await.contains_key(session_id),
-            "session {session_id} is managed by this supervisor process; stop it before forgetting it"
-        );
-        anyhow::ensure!(
-            !self.restart_specs.lock().await.contains_key(session_id),
-            "session {session_id} has a pending restart or upgrade context; stop it before forgetting it"
-        );
-        anyhow::ensure!(
-            !self.public_sessions.lock().await.contains(session_id),
-            "session {session_id} is still registered as a public session; stop it before forgetting it"
-        );
-        config::forget_session_artifacts(session_id).await
+        let activity = self.activity_scope(ActivityOperation::SessionForget, session_id.to_owned());
+        let result = async {
+            anyhow::ensure!(
+                !self.sessions.lock().await.contains_key(session_id),
+                "session {session_id} is managed by this supervisor process; stop it before forgetting it"
+            );
+            anyhow::ensure!(
+                !self.restart_specs.lock().await.contains_key(session_id),
+                "session {session_id} has a pending restart or upgrade context; stop it before forgetting it"
+            );
+            anyhow::ensure!(
+                !self.public_sessions.lock().await.contains(session_id),
+                "session {session_id} is still registered as a public session; stop it before forgetting it"
+            );
+            config::forget_session_artifacts(session_id).await
+        }
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn set_permission_mode(
@@ -445,12 +682,20 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.set_permission_mode(permission_mode).await?;
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionMode,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.set_permission_mode(permission_mode).await;
         drop(sessions);
-        if let Some(spec) = self.restart_specs.lock().await.get_mut(session_id) {
+        if result.is_ok()
+            && let Some(spec) = self.restart_specs.lock().await.get_mut(session_id)
+        {
             spec.permission_mode = permission_mode;
         }
-        Ok(())
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn allow_directory(&self, session_id: &str, path: std::path::PathBuf) -> Result<()> {
@@ -462,7 +707,14 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.allow_directory(path).await
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionAllow,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.allow_directory(path).await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn revoke_directory(&self, session_id: &str, path: std::path::PathBuf) -> Result<()> {
@@ -474,7 +726,14 @@ impl SessionSupervisor {
         let handle = sessions.get(session_id).with_context(|| {
             format!("session {session_id} is not managed by this supervisor process")
         })?;
-        handle.revoke_directory(path).await
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionRevoke,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.revoke_directory(path).await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     pub async fn set_restart_policy(&self, session_id: &str, policy: &str) -> Result<()> {
@@ -482,25 +741,41 @@ impl SessionSupervisor {
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
-        anyhow::ensure!(
-            matches!(policy, "never" | "on-failure"),
-            "restart policy must be never or on-failure"
+        let session_instance = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(RuntimeHandle::activity_session_instance);
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionRestartPolicy,
+            session_id.to_owned(),
+            session_instance,
         );
-        let mut lifecycle = config::read_session_lifecycle(session_id)
-            .await?
-            .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
-        lifecycle.restart_policy = policy.to_owned();
-        if policy == "never" {
-            lifecycle.next_restart_at = None;
-            lifecycle.restart_limit_reason = None;
-        } else if lifecycle.status == config::LifecycleStatus::Crashed
-            && self.restart_specs.lock().await.contains_key(session_id)
-            && lifecycle.restart_count < MAX_AUTOMATIC_RESTARTS
-        {
-            lifecycle.next_restart_at = Some(config::unix_time() + 1);
-            lifecycle.restart_limit_reason = None;
+        let result = async {
+            anyhow::ensure!(
+                matches!(policy, "never" | "on-failure"),
+                "restart policy must be never or on-failure"
+            );
+            let mut lifecycle = config::read_session_lifecycle(session_id)
+                .await?
+                .with_context(|| format!("session {session_id} has no lifecycle metadata"))?;
+            lifecycle.restart_policy = policy.to_owned();
+            if policy == "never" {
+                lifecycle.next_restart_at = None;
+                lifecycle.restart_limit_reason = None;
+            } else if lifecycle.status == config::LifecycleStatus::Crashed
+                && self.restart_specs.lock().await.contains_key(session_id)
+                && lifecycle.restart_count < MAX_AUTOMATIC_RESTARTS
+            {
+                lifecycle.next_restart_at = Some(config::unix_time() + 1);
+                lifecycle.restart_limit_reason = None;
+            }
+            config::save_session_lifecycle(session_id, &lifecycle).await
         }
-        config::save_session_lifecycle(session_id, &lifecycle).await
+        .await;
+        finish_supervisor_activity(&activity, &result);
+        result
     }
 
     async fn schedule_restart(&self, session_id: &str, reason: &str) -> Result<()> {
@@ -553,13 +828,18 @@ impl SessionSupervisor {
             }
             lifecycle.last_restart_at = Some(now);
             lifecycle.next_restart_at = None;
+            let activity = self.activity_scope(ActivityOperation::SessionAutoRestart, id.clone());
             if let Err(error) = config::save_session_lifecycle(&id, &lifecycle).await {
+                let result: Result<()> = Err(anyhow::anyhow!("restart state persistence failed"));
+                finish_supervisor_activity(&activity, &result);
                 eprintln!("failed to persist restart attempt for {id}: {error:#}");
                 continue;
             }
             let old_session = match config::read_session_metadata(&id).await {
                 Ok(session) => session,
                 Err(error) => {
+                    let result: Result<()> = Err(anyhow::anyhow!("old instance inspection failed"));
+                    finish_supervisor_activity(&activity, &result);
                     eprintln!("failed to inspect old session instance for {id}: {error:#}");
                     if let Err(save_error) = self
                         .schedule_restart(
@@ -574,6 +854,8 @@ impl SessionSupervisor {
                 }
             };
             if let Err(error) = crate::codex_app_server::remove_session(&old_session).await {
+                let result: Result<()> = Err(anyhow::anyhow!("old instance cleanup failed"));
+                finish_supervisor_activity(&activity, &result);
                 eprintln!("automatic restart cleanup for session {id} failed: {error:#}");
                 if let Err(save_error) = self
                     .schedule_restart(&id, &format!("automatic restart cleanup failed: {error:#}"))
@@ -594,6 +876,8 @@ impl SessionSupervisor {
                 )
                 .await
             {
+                let result: Result<()> = Err(anyhow::anyhow!("automatic restart failed"));
+                finish_supervisor_activity(&activity, &result);
                 eprintln!("automatic restart for session {id} failed: {error:#}");
                 if let Err(save_error) = self
                     .schedule_restart(&id, &format!("automatic restart attempt failed: {error:#}"))
@@ -601,6 +885,9 @@ impl SessionSupervisor {
                 {
                     eprintln!("failed to schedule another restart for {id}: {save_error:#}");
                 }
+            } else {
+                let result: Result<()> = Ok(());
+                finish_supervisor_activity(&activity, &result);
             }
         }
     }
@@ -610,6 +897,13 @@ impl SessionSupervisor {
         self.ensure_mutations_allowed()?;
         self.reap_finished().await;
         config::validate_session_id(session_id)?;
+        let activity = self.activity_scope(ActivityOperation::SessionStop, session_id.to_owned());
+        let result = self.stop_owned_validated(session_id, public_only).await;
+        finish_supervisor_activity(&activity, &result);
+        result
+    }
+
+    async fn stop_owned_validated(&self, session_id: &str, public_only: bool) -> Result<()> {
         if public_only && !self.public_sessions.lock().await.contains(session_id) {
             anyhow::bail!(
                 "session {session_id} was not created through the public HTTP supervisor"
@@ -618,6 +912,7 @@ impl SessionSupervisor {
         let handle = {
             let mut sessions = self.sessions.lock().await;
             if let Some(handle) = sessions.get(session_id) {
+                handle.retire_activity();
                 crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
             }
             sessions.remove(session_id)
@@ -654,6 +949,7 @@ impl SessionSupervisor {
         cleanup_result
     }
 
+    #[cfg(test)]
     pub async fn build_upgrade_plan(
         &self,
         target_version: &str,
@@ -663,17 +959,38 @@ impl SessionSupervisor {
         fence: bool,
         force: bool,
     ) -> Result<SupervisorUpgradePlan> {
-        let preview = self
-            .prepare_upgrade_plan(
+        self.build_upgrade_plan_with_expected(
+            SupervisorUpgradePlanRequest::new(
                 target_version,
                 control_protocol,
                 lifecycle_schema,
                 available_environment,
+                force,
+            ),
+            fence,
+            None,
+        )
+        .await
+    }
+
+    pub async fn build_upgrade_plan_with_expected(
+        &self,
+        request: SupervisorUpgradePlanRequest<'_>,
+        fence: bool,
+        expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
+    ) -> Result<SupervisorUpgradePlan> {
+        let preview = self
+            .prepare_upgrade_plan(
+                request.target_version,
+                request.control_protocol,
+                request.lifecycle_schema,
+                request.available_environment,
                 UpgradePlanOptions {
                     fence,
-                    force,
+                    force: request.force,
                     collect_blockers: false,
                 },
+                expected_sessions,
             )
             .await?;
         Ok(preview.plan)
@@ -697,6 +1014,7 @@ impl SessionSupervisor {
                 force,
                 collect_blockers: true,
             },
+            None,
         )
         .await
     }
@@ -708,6 +1026,7 @@ impl SessionSupervisor {
         lifecycle_schema: u64,
         available_environment: &approvals::CapturedStartEnvironment,
         options: UpgradePlanOptions,
+        expected_sessions: Option<&[crate::upgrade_transaction::UpgradePlannedSession]>,
     ) -> Result<SupervisorUpgradePreview> {
         let _transition = self.transitions.lock().await;
         anyhow::ensure!(
@@ -718,6 +1037,37 @@ impl SessionSupervisor {
 
         let source_version = env!("CARGO_PKG_VERSION").to_owned();
         let handoff_required = options.force || source_version != target_version;
+        let active_sessions = {
+            let sessions = self.sessions.lock().await;
+            let mut identities = Vec::with_capacity(sessions.len());
+            for (session_id, handle) in sessions.iter() {
+                let snapshot = handle.snapshot().await?;
+                identities.push(SupervisorUpgradeSessionIdentity {
+                    session_id: session_id.clone(),
+                    process_id: snapshot.process_id,
+                    started_at: snapshot.started_at,
+                });
+            }
+            identities.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+            identities
+        };
+        if let Some(expected) = expected_sessions {
+            anyhow::ensure!(
+                active_sessions.len() == expected.len(),
+                "approved session set changed before supervisor handoff"
+            );
+            for expected in expected {
+                let current = active_sessions
+                    .iter()
+                    .find(|session| session.session_id == expected.session_id)
+                    .context("approved session set changed before supervisor handoff")?;
+                anyhow::ensure!(
+                    current.process_id == expected.source_process_id
+                        && current.started_at == expected.source_started_at,
+                    "approved session instance changed before supervisor handoff"
+                );
+            }
+        }
         let mut plans = Vec::new();
         let mut blocked_sessions = Vec::new();
         if handoff_required {
@@ -812,6 +1162,7 @@ impl SessionSupervisor {
                 sessions: plans,
             },
             blocked_sessions,
+            active_sessions,
         })
     }
 
@@ -948,6 +1299,7 @@ impl SessionSupervisor {
             let handle = {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(handle) = sessions.get(&id) {
+                    handle.retire_activity();
                     crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
                 }
                 sessions.remove(&id)
@@ -1138,7 +1490,14 @@ impl SessionSupervisor {
             };
             if let Some(handle) = handle {
                 let session = handle.session_metadata();
+                let session_instance = handle.activity_session_instance();
                 let wait_result = handle.wait().await;
+                if wait_result.is_err() {
+                    let crash = self.crash_activity_scope(id.clone(), session_instance);
+                    let _ = crash.fail_with_summary(ActivitySummary::failure(
+                        ActivityErrorKind::RuntimeUnavailable,
+                    ));
+                }
                 let cleanup_result = crate::codex_app_server::remove_session(&session).await;
                 let cleanup_failed = if let Err(error) = cleanup_result {
                     eprintln!("Codex task cleanup for ended session {id} failed: {error:#}");
@@ -1190,6 +1549,9 @@ impl SessionSupervisor {
         self.closed.store(true, Ordering::Release);
         let handles = {
             let mut sessions = self.sessions.lock().await;
+            for handle in sessions.values() {
+                handle.retire_activity();
+            }
             sessions.drain().collect::<Vec<_>>()
         };
         for (_, handle) in &handles {
@@ -1295,6 +1657,282 @@ mod tests {
         );
         cleanup_session(&first_id).await;
         cleanup_session(&second_id).await;
+    }
+
+    #[tokio::test]
+    async fn activity_lifecycle_start_and_stop_are_emitted_only_by_supervisor() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = format!("activity-lifecycle-{}", Uuid::new_v4());
+
+        supervisor
+            .start("src/repo-a", Some(&session_id))
+            .await
+            .unwrap();
+        assert!(
+            supervisor
+                .start("src/repo-a", Some(&session_id))
+                .await
+                .is_err()
+        );
+        supervisor.stop(&session_id).await.unwrap();
+
+        let subscription = supervisor
+            .activity_broker()
+            .subscribe_snapshot(Some(&session_id), 10)
+            .unwrap();
+        let events = subscription.snapshot();
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.operation(), event.state()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Started
+                ),
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Completed
+                ),
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Started
+                ),
+                (
+                    ActivityOperation::SessionStart,
+                    temote_mcp::activity::contract::ActivityState::Failed
+                ),
+                (
+                    ActivityOperation::SessionStop,
+                    temote_mcp::activity::contract::ActivityState::Started
+                ),
+                (
+                    ActivityOperation::SessionStop,
+                    temote_mcp::activity::contract::ActivityState::Completed
+                ),
+            ]
+        );
+        let operation_ids = events
+            .chunks_exact(2)
+            .map(|pair| {
+                assert_eq!(pair[0].operation_id(), pair[1].operation_id());
+                pair[0].operation_id()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(operation_ids.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.session_instance().is_none())
+        );
+        cleanup_session(&session_id).await;
+    }
+
+    #[tokio::test]
+    async fn activity_lifecycle_mutations_restart_and_forget_have_single_owners() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = format!("act-life-mut-{}", Uuid::new_v4());
+        let extra = _temp.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        supervisor
+            .start("src/repo-a", Some(&session_id))
+            .await
+            .unwrap();
+        let first_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+
+        supervisor
+            .set_permission_mode(&session_id, config::PermissionMode::Agent)
+            .await
+            .unwrap();
+        supervisor
+            .allow_directory(&session_id, extra.clone())
+            .await
+            .unwrap();
+        supervisor
+            .revoke_directory(&session_id, extra)
+            .await
+            .unwrap();
+        supervisor
+            .set_restart_policy(&session_id, "never")
+            .await
+            .unwrap();
+        supervisor
+            .restart_with_environment(
+                &session_id,
+                approvals::CapturedStartEnvironment::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let second_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        assert_ne!(first_instance, second_instance);
+        supervisor.stop(&session_id).await.unwrap();
+        supervisor.forget_session(&session_id).await.unwrap();
+
+        let events = supervisor
+            .activity_broker()
+            .subscribe_snapshot(Some(&session_id), 100)
+            .unwrap()
+            .into_snapshot();
+        let operations = events
+            .chunks_exact(2)
+            .map(|pair| {
+                assert_eq!(
+                    pair[0].state(),
+                    temote_mcp::activity::contract::ActivityState::Started
+                );
+                assert_eq!(
+                    pair[1].state(),
+                    temote_mcp::activity::contract::ActivityState::Completed
+                );
+                assert_eq!(pair[0].operation_id(), pair[1].operation_id());
+                pair[0].operation()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            vec![
+                ActivityOperation::SessionStart,
+                ActivityOperation::SessionPermissionMode,
+                ActivityOperation::SessionPermissionAllow,
+                ActivityOperation::SessionPermissionRevoke,
+                ActivityOperation::SessionRestartPolicy,
+                ActivityOperation::SessionRestart,
+                ActivityOperation::SessionStop,
+                ActivityOperation::SessionForget,
+            ]
+        );
+        assert!(!operations.contains(&ActivityOperation::SessionAutoRestart));
+        cleanup_session(&session_id).await;
+    }
+
+    #[tokio::test]
+    async fn activity_lifecycle_crash_is_zero_duration_and_auto_restart_is_new_instance() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let session_id = format!("act-life-crash-{}", Uuid::new_v4());
+        supervisor
+            .start("src/repo-a", Some(&session_id))
+            .await
+            .unwrap();
+        supervisor
+            .set_restart_policy(&session_id, "on-failure")
+            .await
+            .unwrap();
+        let first_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        supervisor.crash_for_test(&session_id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if config::read_session_lifecycle(&session_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|state| state.status == config::LifecycleStatus::Crashed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                supervisor.reap_finished().await;
+                let current = supervisor
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(RuntimeHandle::activity_session_instance);
+                if current.is_some_and(|instance| instance != first_instance) {
+                    break;
+                }
+                if current.is_none() {
+                    let mut lifecycle = config::read_session_lifecycle(&session_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    lifecycle.next_restart_at = Some(config::unix_time());
+                    config::save_session_lifecycle(&session_id, &lifecycle)
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second_instance = supervisor
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .unwrap()
+            .activity_session_instance()
+            .unwrap();
+        assert_ne!(first_instance, second_instance);
+
+        let events = supervisor
+            .activity_broker()
+            .subscribe_snapshot(Some(&session_id), 100)
+            .unwrap()
+            .into_snapshot();
+        let crash = events
+            .iter()
+            .filter(|event| event.operation() == ActivityOperation::SessionCrash)
+            .collect::<Vec<_>>();
+        assert_eq!(crash.len(), 2);
+        assert_eq!(
+            crash[0].state(),
+            temote_mcp::activity::contract::ActivityState::Started
+        );
+        assert_eq!(
+            crash[1].state(),
+            temote_mcp::activity::contract::ActivityState::Failed
+        );
+        assert_eq!(crash[1].duration_ms(), Some(0));
+        assert_eq!(crash[0].session_instance(), Some(first_instance));
+        let automatic = events
+            .iter()
+            .filter(|event| event.operation() == ActivityOperation::SessionAutoRestart)
+            .collect::<Vec<_>>();
+        assert_eq!(automatic.len(), 2);
+        assert_eq!(
+            automatic[0].state(),
+            temote_mcp::activity::contract::ActivityState::Started
+        );
+        assert_eq!(
+            automatic[1].state(),
+            temote_mcp::activity::contract::ActivityState::Completed
+        );
+
+        supervisor.stop(&session_id).await.unwrap();
+        cleanup_session(&session_id).await;
     }
 
     #[tokio::test]
@@ -1944,6 +2582,60 @@ mod tests {
         assert!(!plan.handoff_required);
         assert!(plan.sessions.is_empty());
         // A no-op must not leave lifecycle mutation fenced.
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn same_version_preview_freezes_active_session_identity() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("upgrade-noop-preview-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::default();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        let preview = supervisor
+            .preview_upgrade_plan(env!("CARGO_PKG_VERSION"), 1, 1, &environment, false)
+            .await
+            .unwrap();
+        assert!(!preview.plan.handoff_required);
+        assert_eq!(preview.active_sessions.len(), 1);
+        assert_eq!(preview.active_sessions[0].session_id, id);
+        assert!(preview.active_sessions[0].process_id > 0);
+        assert!(preview.active_sessions[0].started_at > 0);
+        supervisor.stop(&id).await.unwrap();
+        supervisor.shutdown().await.unwrap();
+        cleanup_session(&id).await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_fence_rejects_replaced_approved_session_instance() {
+        let (_temp, roots) = fixture();
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let id = format!("upgrade-expected-{}", uuid::Uuid::new_v4());
+        let environment = approvals::CapturedStartEnvironment::default();
+        supervisor
+            .start_with_environment("src/repo-a", Some(&id), environment.clone())
+            .await
+            .unwrap();
+        let session = config::read_session_metadata(&id).await.unwrap();
+        let expected = [crate::upgrade_transaction::UpgradePlannedSession {
+            session_id: id.clone(),
+            source_process_id: session.process_id.saturating_add(1),
+            source_started_at: session.started_at,
+        }];
+        let error = supervisor
+            .build_upgrade_plan_with_expected(
+                SupervisorUpgradePlanRequest::new("different-version", 1, 1, &environment, false),
+                true,
+                Some(&expected),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session instance changed"));
         supervisor.stop(&id).await.unwrap();
         supervisor.shutdown().await.unwrap();
         cleanup_session(&id).await;

@@ -68,6 +68,28 @@ The approval console is not the runtime owner. stdin EOF, Ctrl-C, PTY disconnect
 
 HTTP `serve/up` has no separate approval console and owns no session runtimes. `serve/up` verifies the local control-protocol version at startup and fails closed if the lifecycle supervisor must be upgraded/restarted first. Tailscale OAuth approval and runtime host approvals use the same reconnectable `temote-mcp session console`. If the HTTP origin or ingress restarts, session runtimes remain owned by the lifecycle supervisor.
 
+## Local activity viewer
+
+Use the local CLI to observe recent and live activity owned by the running supervisor:
+
+```sh
+temote-mcp activity
+temote-mcp activity my-project --tail 100
+temote-mcp activity my-project --tail 0 --no-follow
+```
+
+The optional session ID is an exact filter. `--tail` is applied after filtering, accepts `0` through `1024`, and defaults to `100`; replay is shown oldest first. The command follows new activity by default. `--no-follow` prints the bounded replay and exits after its end marker. The viewer does not start or reconnect a supervisor, and a valid session ID with no retained events produces an empty replay rather than an error.
+
+Each event is one line in local time and contains the session routing ID, shortened instance and operation IDs, operation, state, and a fixed safe summary when one applies. Covered operations include session lifecycle and permissions, file and Git tools, commands and jobs, delegated developer tools, supported integrations, accepted Codex task calls, and supervisor upgrade phases. A completed Codex start or control event means that Temote accepted the call; it does not mean the Codex turn finished.
+
+Activity is a best-effort, process-memory diagnostic stream. The supervisor retains at most 4096 events and 8 MiB; one serialized event is at most 2048 bytes and its summary at most 512 UTF-8 bytes. Live broadcast capacity is 1024 events, each producer queue holds 256 typed updates, and at most 16 viewers may attach. Queue saturation, process termination, ingress failure, or broker contention can drop an update before it receives a sequence number, so no later gap can count that loss. A history-truncated notice means older retained events were evicted. A live gap reports a global sequence interval and must not be read as the exact number of matching events omitted by a session filter. An intentional tail limit and a quiet session are not gap reports.
+
+The viewer never includes commands, paths, Git branch or arbitrary remote names, URLs, prompts, payloads, stdout/stderr, environment values, credentials, or raw errors. Session routing IDs and shortened generated identifiers are intentionally visible. Activity is not an audit log or a source of current operation truth, and no activity history is written to disk.
+
+In follow mode, Ctrl-C, TTY EOF, or supervisor socket EOF detaches only the viewer and exits successfully; EOF from a pipe or `/dev/null` on stdin is ignored. A closed output pipe also exits successfully. Invalid frames and output failures exit unsuccessfully. In `--no-follow` mode stdin is ignored, a complete end marker exits successfully, and socket EOF before that marker exits unsuccessfully. A supervisor restart or successful same-PID binary handoff resets the activity generation and in-memory history and closes existing viewers. Run the command again to attach to the replacement supervisor.
+
+This attachment exists only on the owner-only local Unix control socket. It is not exposed through stdio MCP, authenticated public HTTP, or the multi-host gateway, and attaching or disconnecting does not change a session, approval, job, or runtime.
+
 ## Runtime and failure isolation
 
 The session Unix socket remains the runtime boundary for MCP operations and host bridges. CLI and HTTP-managed sessions use the same runtime implementation for sandbox permissions, approval state, 1Password bridge state, kintone bridges, metadata, and socket lifecycle.
