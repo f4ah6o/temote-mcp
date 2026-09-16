@@ -174,6 +174,14 @@ pub enum SessionBackend {
 }
 
 impl SessionBackend {
+    pub async fn list(&self) -> Result<Vec<SessionView>> {
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => list_session_views(supervisor).await,
+            Self::LocalControl => request_session_views().await,
+        }
+    }
+
     #[cfg(test)]
     pub fn in_process(supervisor: Arc<SessionSupervisor>) -> Self {
         Self::InProcess(supervisor)
