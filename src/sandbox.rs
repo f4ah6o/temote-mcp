@@ -1449,8 +1449,33 @@ impl CommandCacheDir {
 
 impl Drop for CommandCacheDir {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = make_private_cache_tree_removable(&self.path);
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn make_private_cache_tree_removable(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o700);
+    std::fs::set_permissions(path, permissions)?;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            make_private_cache_tree_removable(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn safe_environment(cache_root: &Path) -> Result<HashMap<String, String>> {
@@ -1493,7 +1518,91 @@ fn apply_standard_cache_environment(
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
         environment.insert(name, path.to_string_lossy().into_owned());
     }
+    apply_go_module_cache_environment(environment, cache_root)?;
     Ok(())
+}
+
+fn apply_go_module_cache_environment(
+    environment: &mut HashMap<String, String>,
+    cache_root: &Path,
+) -> Result<()> {
+    let Some(home) = environment.get("HOME").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if !home.is_absolute() {
+        return Ok(());
+    }
+
+    // Go's on-disk module download cache already uses the GOPROXY protocol
+    // layout. Reuse that existing host cache as a read-only file proxy while
+    // directing all module-cache writes/extraction into this command's private
+    // temporary cache. This avoids granting write access to host-global
+    // $HOME/go/pkg/mod and still lets network-restricted commands consume
+    // dependencies that are already cached locally.
+    let host_download_cache = home.join("go/pkg/mod/cache/download");
+    let metadata = match std::fs::symlink_metadata(&host_download_cache) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect host Go module download cache {}",
+                    host_download_cache.display()
+                )
+            });
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let host_download_cache = std::fs::canonicalize(&host_download_cache).with_context(|| {
+        format!(
+            "failed to resolve host Go module download cache {}",
+            host_download_cache.display()
+        )
+    })?;
+    let Some(proxy) = go_file_proxy_url(&host_download_cache) else {
+        return Ok(());
+    };
+
+    let private_module_cache = cache_root.join("go-mod");
+    std::fs::create_dir_all(&private_module_cache).with_context(|| {
+        format!(
+            "failed to create private Go module cache {}",
+            private_module_cache.display()
+        )
+    })?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &private_module_cache,
+        std::fs::Permissions::from_mode(0o700),
+    )?;
+    environment.insert(
+        "GOMODCACHE".to_owned(),
+        private_module_cache.to_string_lossy().into_owned(),
+    );
+    environment.insert("GOPROXY".to_owned(), proxy);
+    Ok(())
+}
+
+fn go_file_proxy_url(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = path.to_str()?;
+    let mut url = String::with_capacity(path.len() + "file://".len());
+    url.push_str("file://");
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            url.push(byte as char);
+        } else {
+            url.push('%');
+            url.push(HEX[(byte >> 4) as usize] as char);
+            url.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    Some(url)
 }
 
 #[cfg(test)]
@@ -1645,7 +1754,81 @@ mod generic_tests {
             environment.get("GOCACHE").map(PathBuf::from),
             Some(cache.path().join("go-build"))
         );
+        let default_go_proxy = environment
+            .get("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("go/pkg/mod/cache/download"));
+        if default_go_proxy.is_some_and(|proxy| {
+            std::fs::symlink_metadata(proxy)
+                .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        }) {
+            assert_eq!(
+                environment.get("GOMODCACHE").map(PathBuf::from),
+                Some(cache.path().join("go-mod"))
+            );
+            assert!(
+                environment
+                    .get("GOPROXY")
+                    .is_some_and(|proxy| proxy.starts_with("file:///"))
+            );
+        } else {
+            assert!(!environment.contains_key("GOMODCACHE"));
+            assert!(!environment.contains_key("GOPROXY"));
+        }
+    }
+
+    #[test]
+    fn go_module_cache_uses_private_store_and_host_download_cache_as_file_proxy() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home with space");
+        let host_download = home.join("go/pkg/mod/cache/download");
+        let private = fixture.path().join("private-cache");
+        std::fs::create_dir_all(&host_download).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let mut environment =
+            HashMap::from([("HOME".to_owned(), home.to_string_lossy().into_owned())]);
+
+        apply_go_module_cache_environment(&mut environment, &private).unwrap();
+
+        assert_eq!(
+            environment.get("GOMODCACHE").map(PathBuf::from),
+            Some(private.join("go-mod"))
+        );
+        assert_eq!(
+            environment.get("GOPROXY").map(String::as_str),
+            Some(
+                go_file_proxy_url(&std::fs::canonicalize(host_download).unwrap())
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        assert!(private.join("go-mod").is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(private.join("go-mod"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn go_module_cache_remap_is_noop_without_a_host_download_cache() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let private = fixture.path().join("private-cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let mut environment =
+            HashMap::from([("HOME".to_owned(), home.to_string_lossy().into_owned())]);
+
+        apply_go_module_cache_environment(&mut environment, &private).unwrap();
+
         assert!(!environment.contains_key("GOMODCACHE"));
+        assert!(!environment.contains_key("GOPROXY"));
     }
 
     #[test]
@@ -1658,9 +1841,44 @@ mod generic_tests {
         {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
+
+            let readonly_module = path.join("go-mod/example.com/module@v1.0.0");
+            std::fs::create_dir_all(&readonly_module).unwrap();
+            std::fs::write(
+                readonly_module.join("go.mod"),
+                b"module example.com/module\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&readonly_module, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
         }
         drop(cache);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_cache_cleanup_does_not_follow_symlinks() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("target");
+        std::fs::create_dir(&outside_path).unwrap();
+        std::fs::set_permissions(&outside_path, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let cache = CommandCacheDir::create().unwrap();
+        let cache_path = cache.path().to_path_buf();
+        std::os::unix::fs::symlink(&outside_path, cache.path().join("outside-link")).unwrap();
+        drop(cache);
+
+        assert!(!cache_path.exists());
+        assert_eq!(
+            std::fs::metadata(&outside_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        std::fs::set_permissions(&outside_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -1689,6 +1907,26 @@ mod generic_tests {
                 assert!(path.starts_with(&root), "{name} escaped private cache root");
                 assert!(path.is_absolute(), "{name} cache path is not absolute");
             }
+            let module_cache = root.join("go-mod");
+            assert!(module_cache.starts_with(&root));
+            assert!(module_cache.is_absolute());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn generated_go_file_proxy_urls_escape_reserved_path_bytes() -> noprop::TestResult {
+        test_support::run(0x474f_5052_4f58_5955, 1024, |ctx| {
+            let path = PathBuf::from(format!(
+                "/tmp/go proxy/%23-{:016x}",
+                noprop::sample_u64(ctx)
+            ));
+            let url = go_file_proxy_url(&path).unwrap();
+            assert!(url.starts_with("file:///tmp/"));
+            assert!(!url.contains(' '));
+            assert!(!url.contains('#'));
+            assert!(url.contains("%20"));
+            assert!(url.contains("%25"));
             Ok(())
         })
     }
