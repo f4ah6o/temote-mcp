@@ -1,4 +1,4 @@
-set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+set shell := ["bash", "-e", "-o", "pipefail", "-c", "set -u; eval \"$0\""]
 set dotenv-load := false
 
 default:
