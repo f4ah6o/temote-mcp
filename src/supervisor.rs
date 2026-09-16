@@ -1716,7 +1716,9 @@ mod tests {
             ]
         );
         let operation_ids = events
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 assert_eq!(pair[0].operation_id(), pair[1].operation_id());
                 pair[0].operation_id()
@@ -1793,7 +1795,9 @@ mod tests {
             .unwrap()
             .into_snapshot();
         let operations = events
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 assert_eq!(
                     pair[0].state(),
