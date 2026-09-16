@@ -1,6 +1,6 @@
 # normal sandbox の direct Codex CLI が PATH alias 初期化で read-only warning を出す
 
-Status: open
+Status: superseded by bounded implementation packet
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Priority: P2 developer workflow friction
@@ -74,3 +74,7 @@ normal sandbox の filesystem boundary を広げずに、supported Codex CLI pro
 - [ ] Vite+ managed Codex と standalone Codex の双方について expected behavior を fixture で固定する。
 - [ ] host Codex credentials/config/state への write capability は増えない。
 - [ ] `local_agent_run` の既存 isolated state / auth import contract を回帰させない。
+
+## 2026-09-16 polishing disposition
+
+Implementation work is superseded by `issues/polished/20260916-codex-direct-cli-private-state.md`, which narrows this investigation to one bounded state/fixture change.

@@ -10,10 +10,10 @@ Type: agent mode / Git / GitHub / worktree / repository triage
 Related:
 - `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`
 - `issues/done/20260916-structured-git-branch-worktree-operations.md`
-- `issues/open/20260916-repo-scoped-github-account-selection.md`
-- `issues/open/20260916-local-agent-process-spawn-eperm.md`
-- `issues/open/20260916-readonly-git-inspection-safety-block.md`
-- `issues/open/20260916-gh-auth-status-misleading-in-sandbox.md`
+- `issues/doing/20260916-repo-scoped-github-account-selection.md`
+- `issues/closed/20260916-local-agent-process-spawn-eperm.md`
+- `issues/closed/20260916-readonly-git-inspection-safety-block.md`
+- `issues/closed/20260916-gh-auth-status-misleading-in-sandbox.md`
 
 ## Summary
 
@@ -173,7 +173,7 @@ Git command broker と分離した bounded GitHub operation。最低限:
 
 PR close は repository slug を caller の arbitrary URL から受けず、configured remote から解決する。
 
-認証は `issues/open/20260916-repo-scoped-github-account-selection.md` の repo-local credential contract を利用し、ambient `gh` active account に依存しない。
+認証は `issues/doing/20260916-repo-scoped-github-account-selection.md` の repo-local credential contract を利用し、ambient `gh` active account に依存しない。
 
 ### B5. local agent の通常 Git UX と host-side credential/network broker がまだ一体化していない
 
@@ -194,7 +194,8 @@ Repository not found
 #### Needed
 
 - local agent は通常の `git ...` syntax を使用する。
-- branch/worktree creation は canonical repository の repo-owned `.wt/<name>` に固定する。
+- branch/worktree creation は canonical repository identity から Temote が導出する `~/src/worktrees/<repo>/<task>` に固定し、agent に配置先を選ばせない。
+- existing `.wt/*` や sibling legacy worktree は discovery 対象にはするが、新規taskの標準workspaceとして自動採用・移動・削除しない。
 - fetch/pull/push は Temote host-side broker + repo-scoped credential routing を使う。
 - local agent 自身へ unrestricted network / Git metadata broad write を与えない。
 - rescue completion 時に parent orchestration から同じ branch/worktree が必ず観測できる。
@@ -334,3 +335,12 @@ Temote agent session
 - arbitrary Git subcommand / GitHub API endpointをraw passthroughすること
 - branch cleanupのために他作業者のdirty workをstash/reset/deleteすること
 - one sessionのpath rootを無制限に sibling repositoryへ拡大すること
+
+## 2026-09-16 polished execution queue
+
+This file is now an umbrella/tracking issue. After the Git shim packets, execute:
+
+1. `issues/polished/20260916-github-pr-broker.md`
+2. `issues/polished/20260916-agent-repository-triage-e2e.md`
+
+Cross-repo writes remain parent-orchestrator scope; do not broaden a local-agent session root.

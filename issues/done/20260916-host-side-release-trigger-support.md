@@ -1,6 +1,6 @@
 # host-side Git tag push / GitHub Actions dispatch を Temote から安全に実行できるようにする
 
-Status: doing / tag trigger + GitHub workflow dispatch/status implemented; live workflow acceptance remains
+Status: done / repository implementation complete
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -105,3 +105,7 @@ Verification:
 - [x] tag/GitHub release toolsはcredential値を入力・返却しない。継承 `GH_TOKEN` / `GITHUB_TOKEN` / enterprise variantsは既知sensitive environmentとして扱い、GitHub API tokenは repository credential helperからapproval後に内部取得して `Zeroizing<String>` で保持し、child environmentではなくdirect RESTのAuthorizationにだけ使う。
 - [x] exact run ID の `github_workflow_run_get` で queued/running/completed + conclusion を poll できる surface を実装した。live run tracking acceptance は未実施。
 - [x] branch push の既存 safety contract を回帰させない（focused local bare remote regression PASS）。
+
+## 2026-09-16 polishing completion
+
+All repository-local acceptance items are checked. The intentionally unrun live GitHub workflow/tag invocation is now a row in `issues/open/20260908-live-acceptance-matrix.md`; it no longer keeps this implementation issue open.

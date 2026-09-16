@@ -1,6 +1,6 @@
 # sandbox 内 `gh auth status` が network/credential isolation を「token invalid」と誤認させる
 
-Status: open
+Status: folded into repo-scoped Git network packet
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -59,3 +59,7 @@ GitHub capability の診断で、少なくとも次を明確に区別する。
 - [ ] token値、Authorization header、keyring contents、account secretを出力しない。
 - [ ] diagnostic のために `gh auth switch/login/logout` 等の mutation を自動実行しない。
 - [ ] agent/operator guidance が sandbox-child status と host-side structured operation の結果を区別する。
+
+## 2026-09-16 polishing disposition
+
+No separate capability is required. Sandbox-child `gh auth status` guidance and host-side readiness classification are folded into `issues/polished/20260916-git-shim-network-gh-git.md` and the existing repo-scoped credential tracker.

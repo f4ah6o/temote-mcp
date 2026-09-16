@@ -48,7 +48,7 @@ go env GOCACHE GOMODCACHE GOPATH
 /home/hirohito-fujita/go
 ```
 
-`issues/doing/20260916-agent-mode-language-cache-writable-defaults.md` は ordinary sandbox の private `XDG_CACHE_HOME` / `GOCACHE` first slice と Go module-cache overlay を追跡している。本 issue は **network-capable dependency operation の structured capability coverage** と package-manager-specific mutable state を扱い、単純な cache env 修正とは分離する。
+`issues/done/20260916-agent-mode-language-cache-writable-defaults.md` は ordinary sandbox の private `XDG_CACHE_HOME` / `GOCACHE` first slice と Go module-cache overlay を追跡している。本 issue は **network-capable dependency operation の structured capability coverage** と package-manager-specific mutable state を扱い、単純な cache env 修正とは分離する。
 
 ## Problem
 

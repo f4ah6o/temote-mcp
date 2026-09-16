@@ -1,6 +1,6 @@
 # release CI の floating stable Clippy と local gate の lint set がずれて release 時だけ失敗する
 
-Status: open
+Status: superseded by bounded implementation packet
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -43,3 +43,7 @@ release workflow は `dtolnay/rust-toolchain@stable` を使用する一方、rep
 - [ ] toolchain更新時に通常CIで新 lint failureを検出し、release trigger時まで持ち越さない。
 - [ ] release workflow の `Set up Rust` が repository-managed toolchain contract と一致する。
 - [ ] `2026.9.10` release failure の再発防止根拠を記録する。
+
+## 2026-09-16 polishing disposition
+
+Implementation work is superseded by `issues/polished/20260916-release-toolchain-contract.md`.

@@ -1,12 +1,12 @@
 # `local_agent_run` で OpenCode / Codex child process の spawn が EPERM になる
 
-Status: open
+Status: folded into active local-agent EPERM tracker
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
 Priority: P1 developer workflow regression
 Related:
-- `issues/open/20260911-local-agent-vp-installed-codex-runtime.md`
+- `issues/closed/20260911-local-agent-vp-installed-codex-runtime.md`
 - `src/local_agent.rs`
 - `src/sandbox.rs`
 
@@ -71,3 +71,7 @@ Codex job の stderr には Cloudflare MCP の OAuth `AuthRequired` も出たが
 ## Notes
 
 `20260911-local-agent-vp-installed-codex-runtime.md` は Vite+ launcher dependency closure と live verification を主対象としている。今回の OpenCode の runner-level `EPERM` と Codex の generic child-process `EPERM` が同一原因かは未確定なので、原因を決め打ちせず別 issue として追跡する。
+
+## 2026-09-16 polishing disposition
+
+Source-side socketpair and failure-classification fixes are already on `main`. Rebuilt-runtime acceptance is owned by `issues/doing/20260916-local-agent-opencode-eperm.md`; this broader duplicate is closed.

@@ -1,13 +1,13 @@
 # `local_agent_run` の nested exec が `true` まで `Operation not permitted` になる
 
-Status: open
+Status: folded into active local-agent EPERM tracker
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
 Priority: P1 developer workflow regression
 Related:
-- `issues/open/20260916-local-agent-process-spawn-eperm.md`
-- `issues/open/20260916-sandbox-setup-failure-misclassified-as-child-failed.md`
+- `issues/closed/20260916-local-agent-process-spawn-eperm.md`
+- `issues/closed/20260916-sandbox-setup-failure-misclassified-as-child-failed.md`
 - `src/local_agent.rs`
 - `src/sandbox.rs`
 
@@ -72,3 +72,7 @@ ls
 ## Scope note
 
 `20260916-local-agent-process-spawn-eperm.md` が broader root-cause tracker。本 Issue は `true` まで失敗する最小再現と、outer `execute` は成功するという境界条件を固定し、修正後の smoke acceptance を明確化するための focused regression issue とする。
+
+## 2026-09-16 polishing disposition
+
+The `true` / `pwd` / `ls` smoke probe is folded into `issues/doing/20260916-local-agent-opencode-eperm.md` and Phase 0 of `issues/ROADMAP-20260916-agent-mode-main-only.md`.

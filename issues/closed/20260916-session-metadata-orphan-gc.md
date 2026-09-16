@@ -1,6 +1,6 @@
 # session metadata の `invalid_orphan` が大量滞留しても safe cleanup path がない
 
-Status: doing / implementation draft present; not commit-ready
+Status: superseded by bounded implementation packet
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Priority: P1 developer workflow friction
@@ -125,3 +125,7 @@ Resume requirements before commit:
 9. `cargo fmt --all -- --check`, strict clippy, no-default check, relevant tests, `git diff --check`, `just sandboxed-check` を実行。
 10. host/CI-only tests は未実行なら `NOT RUN (host/CI gate)` と明記。
 11. diff review / scope review 後、上記5ファイル + 本Issueだけを stage して commit / push。
+
+## 2026-09-16 polishing disposition
+
+The earlier dirty-tree checkpoint is no longer current (`main` is tracked-clean apart from pre-existing `.tmp/`/`.wt/`). Fresh implementation must start from current main using `issues/polished/20260916-session-orphan-gc.md`; do not resurrect the stale five-file draft blindly.

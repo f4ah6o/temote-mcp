@@ -1,6 +1,6 @@
 # `local_agent_run` で Codex reasoning effort を直接指定できない
 
-Status: open / core implementation staged for commit; docs + live canary remain
+Status: doing / implementation landed; docs + rebuilt-runtime canary remain
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -119,3 +119,7 @@ Global `cargo fmt --all -- --check` はこの変更とは別の concurrent `sess
 2. current connected Temote runtimeを新buildへ切替後、実際に `local_agent_run(agent="codex", model=..., effort="max")` の live canaryを実施する。現在接続中runtime schemaはsource更新前のため、このturnでは live broker callを検証しない。
 3. concurrent `session gc` 作業が完了/分離されたclean treeで `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo check --no-default-features --all-targets --locked`, `just sandboxed-check` を実行する。
 4. full regression green確認後に本Issueを `issues/done` へ移動する。
+
+## 2026-09-16 polishing update
+
+`a8df54b` is on current `main`. Do not reimplement the schema/argv contract. Remaining work is only docs, full repository gate on a clean tree, and the rebuilt-runtime live canary; live evidence also updates the matrix.

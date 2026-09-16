@@ -8,9 +8,9 @@ Priority: P1 developer workflow friction
 Type: local agent / Git / gh-git / sandbox / developer UX
 Related:
 - `issues/done/20260916-structured-git-branch-worktree-operations.md`
-- `issues/open/20260916-repo-scoped-github-account-selection.md`
-- `issues/open/20260916-local-agent-process-spawn-eperm.md`
-- `issues/open/20260916-readonly-git-inspection-safety-block.md`
+- `issues/doing/20260916-repo-scoped-github-account-selection.md`
+- `issues/closed/20260916-local-agent-process-spawn-eperm.md`
+- `issues/closed/20260916-readonly-git-inspection-safety-block.md`
 - https://github.com/f4ah6o/gh-git
 
 ## Problem
@@ -21,7 +21,7 @@ Temote の `permission_mode=agent` は approval-free な structured operation �
 
 ```text
 git switch -c feat/example
-git worktree add .wt/example -b feat/example
+git worktree add <managed-by-temote> -b feat/example
 git commit -m "..."
 git fetch
 git push
@@ -143,13 +143,15 @@ raw passthrough ではなく、operation ごとに許可 grammar と safety inva
 
 既に実装済みの `git_branch_create`, `git_switch`, `git_worktree_add`, `git_add`, `git_commit`, `git_fetch`, `git_pull`, `git_push` の validation / sandbox / host-side execution logic を broker backend として再利用する。
 
-特に `git worktree add` は current structured implementation が持つ次の invariant を維持する。
+特に `git worktree add` は `issues/open/20260916-temote-managed-worktree-broker.md` の policy を authoritative とし、current structured implementation の repo-local `.wt` placement は legacy compatibility として扱う。
 
-- destination は repository-owned `<repository>/.wt/<safe-name>` のみ
+- new destination は Temote が導出する `~/src/worktrees/<repo>/<task>` のみ
+- agent/caller は arbitrary destination path を選べない
 - arbitrary external destination を受け付けない
 - exact structured operation 中だけ common `.git/worktrees` parent に必要な write capability を与える
 - existing sibling private metadata は read-only mask
 - `--force` / reset / stash / arbitrary refspec / arbitrary URL を公開しない
+- existing legacy worktree (`<repo>/.wt/*`, sibling paths, `/tmp` 等) は自動移動・削除しない
 
 MCP tool 自体は orchestration / compatibility surface として残してよいが、agent mode の通常フローでは直接要求しない。
 
@@ -232,7 +234,8 @@ git push
 - [ ] `git status`, `git diff`, `git log` が ordinary developer UX として動く。
 - [ ] `git add` -> `git commit` が selected workspace/index scope だけを mutation する。
 - [ ] `git switch -c <branch>` 相当を normal Git syntax から実行できる。
-- [ ] `git worktree add .wt/test -b test` 相当が `.git/worktrees` broad write permission なしで成功する。
+- [ ] agent の worktree create intent が `.git/worktrees` broad write permission なしで成功し、実配置は `~/src/worktrees/<repo>/<task>` に Temote が決定する。
+- [ ] agent が arbitrary worktree destination を指定しても managed-root 外への作成は拒否される。
 - [ ] worktree add/remove が existing sibling metadata と他作業者 worktree を変更しない。
 - [ ] GitHub HTTPS repository で `git fetch/pull/push` が repo-local `gh-git` identity を使用し、global active `gh` account に依存しない。
 - [ ] operation 前後で `gh auth status` の global active account が変化しない。
@@ -260,3 +263,18 @@ git push
 - `gh-git` 自体を Temote sandbox security boundary として扱うこと
 - global `gh` account state を repository ごとに切り替えること
 - public MCP endpoint から yolo 相当の Git capability を提供すること
+
+## 2026-09-16 polished execution queue
+
+This file is now an umbrella/tracking issue. Implement in order and do not assign this whole document to a coding agent:
+
+1. `issues/polished/20260916-git-shim-switch-create.md`
+2. `issues/polished/20260916-git-shim-add-commit.md`
+3. `issues/polished/20260916-managed-worktree-create-list.md`
+4. `issues/polished/20260916-managed-worktree-session-integration.md`
+5. `issues/polished/20260916-structured-worktree-remove.md`
+6. `issues/polished/20260916-managed-worktree-prune.md`
+7. `issues/polished/20260916-git-shim-worktree.md`
+4. `issues/polished/20260916-git-shim-network-gh-git.md`
+
+After those packets pass, close this umbrella from their combined evidence.

@@ -4,7 +4,7 @@ Status: done
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Priority: P1 cleanup / developer workflow friction
-Related: `issues/doing/20260916-agent-mode-language-cache-writable-defaults.md`
+Related: `issues/done/20260916-agent-mode-language-cache-writable-defaults.md`
 
 ## Observed
 

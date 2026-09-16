@@ -1,6 +1,6 @@
 # `local_agent_run` cannot launch Codex installed through Vite+ (`vp`)
 
-Status: open / blocked on macOS Vite+ live verification and a nested-userns-capable Linux host
+Status: consolidated into live acceptance matrix
 Model: deepseek-v4.1-flash
 Created: 2026-09-11
 Updated: 2026-09-16
@@ -260,3 +260,7 @@ Current source inspection indicates that the active server is likely pre-closure
 ## Triage note
 
 - 2026-09-16: Classified `blocked` and kept in `issues/open/`. The bounded launcher dependency closure is implemented on main (`src/local_agent.rs` with Vite+ fixtures), but the acceptance criteria require a real Vite+-managed Codex launch after authorization, which has not been obtained. Unmerged branch notes record a 2026-09-15 Linux run where launcher/model reachability passed but `workspace_write` could not start any child because the host enforces `kernel.apparmor_restrict_unprivileged_userns=1`, plus the still-pending macOS Vite+ live verification. Action: on a suitable macOS host and a nested-userns-capable Linux environment, re-run a read-only canary, an allowed workspace write, and the protected-metadata/sibling denials, then record the result in `20260908-live-acceptance-matrix.md`.
+
+## 2026-09-16 polishing disposition
+
+Repository-local launcher/dependency-closure implementation is already on `main`. Remaining macOS Vite+ and nested-userns-capable Linux evidence is consolidated into `issues/open/20260908-live-acceptance-matrix.md`; this file is closed to avoid a second live-only tracker.

@@ -1,6 +1,6 @@
 # host-side GitHub operation が ambient `gh` active account に依存しない repo-scoped credential selection を必要とする
 
-Status: doing / direct managed-helper selection implemented; live host credential acceptance pending
+Status: doing / implementation landed; live multi-account acceptance remains
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -94,3 +94,7 @@ deterministic tests は exact helper argv、extra local helper rejection、host/
 - [ ] repository/credential mismatch は bounded fixed error として fail-closed。
 - [ ] token値は client/output/log/auditに露出しない。
 - [ ] test fixture は複数account + 複数repo mapping と concurrent execution を再現する。
+
+## 2026-09-16 polishing update
+
+Current `main` includes repo-scoped GitHub workflow/tag credential routing. Further implementation belongs to `issues/polished/20260916-git-shim-network-gh-git.md`; this tracker owns only existing-implementation review and live multi-account acceptance.

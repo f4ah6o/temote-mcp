@@ -1,10 +1,10 @@
 # sandbox setup failure が activity 上 ChildFailed に分類される
 
-Status: open
+Status: superseded by bounded implementation packet
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Priority: P2 observability / developer workflow friction
-Related: `issues/doing/20260916-agent-mode-language-cache-writable-defaults.md`
+Related: `issues/done/20260916-agent-mode-language-cache-writable-defaults.md`
 
 ## Observed in code review
 
@@ -23,3 +23,7 @@ child spawn前のsandbox/runtime setup failureと、実際に開始したchild p
 - [ ] cancellation / timeout semanticsを回帰させない。
 - [ ] activity contract/gateway snapshotが必要なら同期する。
 - [ ] focused tests + deterministic gate green。
+
+## 2026-09-16 polishing disposition
+
+Implementation work is superseded by `issues/polished/20260916-sandbox-setup-activity-classification.md`.

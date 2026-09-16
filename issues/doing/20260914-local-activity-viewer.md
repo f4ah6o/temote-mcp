@@ -524,3 +524,7 @@ package version は CalVer workflow が管理するため、この実装のた�
 ## Triage note
 
 - 2026-09-16: S01〜S04 が main に landed し、S05 以降も未マージ branch で実装中であるため `in-progress`（doing 相当）と判定し、`issues/polished/` から `issues/doing/` へ移動した。根拠: main の `src/activity/{contract,history,broker,scope}.rs`（`8e207f9`、`3cc0886`、`ebdd877`、`2a3d955`）。未マージの `codex/20260915-completion-activity`（`5be7782`、`8a6efff`、`112b3cd`）に S05〜S15 と S16 docs/CHANGES があり、S15/S16 の独立 review は未承認。Action: 独立 review 後に branch を統合し、full gate と対応 OS 確認の後に `done/` へ移動する。
+
+## 2026-09-16 branch-salvage packet
+
+Do not merge `codex/20260915-completion-activity` wholesale. Current-main reconciliation and any remaining S05-S16 porting is owned by `issues/polished/20260916-completion-activity-branch-salvage.md`.

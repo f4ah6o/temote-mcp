@@ -54,7 +54,7 @@ session metadata directory exceeds 4096 entries
 - `src/session_control.rs`: `ControlRequest::List`, `list_session_views`, `reconcile_stale_sessions`, supervisor session ownership
 - `src/config.rs`: `sessions_dir`, `session_path`, `session_lifecycle_path`, metadata/lifecycle read-write
 - `issues/done/20260825-session-lifecycle-supervisor-hardening.md`
-- `issues/open/20260902-zero-downtime-supervisor-upgrade.md`
+- `issues/done/20260902-zero-downtime-supervisor-upgrade.md`
 
 ## 実装方針
 

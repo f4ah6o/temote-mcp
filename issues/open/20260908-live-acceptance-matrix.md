@@ -88,3 +88,7 @@ Repository-local implementation regressions belong in their owning implementatio
 ## Triage note
 
 - 2026-09-16: Classified `keep-open` and kept in `issues/open/` as the single tracker. The unchecked matrix items require external credentials, real providers, physical multi-host hardware, and macOS/Windows hosts; they do not block repository-local implementation work. Unmerged branches contain bounded evidence that should be folded in when integrated (Cloudflare account/read-only deployment status and the OpenCode provider entitlement attempt on 2026-09-15). The OpenCode delegation implementation issue is complete and its provider entitlement remains tracked here.
+
+## 2026-09-16 consolidation update
+
+This is the single tracker for live-only evidence. It now also owns the remaining live checks formerly duplicated by the Vite+-Codex runtime issue, host-side release-trigger implementation issue, connected-surface drift issue, package-manager broker, repo-scoped GitHub credential routing, and rebuilt-runtime OpenCode canary. Repository-local implementation stays in the owning `doing`/`polished` packet; this matrix records only actual live/host/CI evidence.

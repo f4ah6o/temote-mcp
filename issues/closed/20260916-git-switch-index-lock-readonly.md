@@ -1,13 +1,13 @@
 # Temote sandbox 内の `git switch main` が `.git/index.lock: Read-only file system` で失敗する
 
-Status: open
+Status: folded into Git shim switch/create packet
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
 Priority: P1 developer workflow friction
 Related:
 - `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`
-- `issues/open/20260916-local-agent-process-spawn-eperm.md`
+- `issues/closed/20260916-local-agent-process-spawn-eperm.md`
 - `issues/done/20260916-structured-git-branch-worktree-operations.md`
 
 ## Observed behavior
@@ -63,3 +63,7 @@ ordinary `execute` の protected `.git` read-only contract 自体は維持して
 ## Scope note
 
 根本対応は `20260916-agent-mode-git-broker-gh-git-integration.md` を正本とする。本 Issue は `git switch main` -> `.git/index.lock: Read-only file system` という具体的な developer-facing failure を固定し、Git broker 実装後の acceptance probe として追跡する。
+
+## 2026-09-16 polishing disposition
+
+The concrete `.git/index.lock` failure is now an acceptance probe for `issues/polished/20260916-git-shim-switch-create.md`. Do not implement a second branch-switch path.

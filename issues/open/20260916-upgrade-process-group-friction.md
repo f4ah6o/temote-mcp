@@ -1,6 +1,6 @@
 # `temote-mcp upgrade` の helper と direct ingress handoff を安定化する
 
-Status: polished
+Status: open / umbrella; use bounded child packets
 Model: deepseek-v4.1-flash
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -98,3 +98,7 @@ client restart を自動化すると利用中の会話や MCP connection を切�
 ## Triage note
 
 - 2026-09-16: 観測された摩擦、受け入れ条件、テスト計画が揃っており実装に着手できるため `ready` と判定し、`issues/open/` から `issues/polished/` へ移動した。実装時は (1) replacement binary と sandbox helper の世代切り替え、(2) direct ingress restart の process-group ownership、(3) dry-run/apply の runtime 観測一致、(4) plugin reconcile と client restart の分離、の slice 分割を推奨する。live 実機確認は `20260908-live-acceptance-matrix.md` 側で扱う。
+
+## 2026-09-16 polishing update
+
+Do not assign this whole issue to an implementation agent. Execute after the completion-upgrade audit in this order: `20260916-upgrade-helper-generation-preflight.md`, `20260916-upgrade-ingress-process-ownership.md`, `20260916-upgrade-runtime-observation-consistency.md`. Plugin/fresh-client behavior is live acceptance.

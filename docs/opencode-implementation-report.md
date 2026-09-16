@@ -4,17 +4,17 @@ Date: 2026-09-12
 
 ## Issues addressed
 
-The selected issue slice in this pass is the repository-local deployment preflight from `issues/polished/20260911-gateway-deployment-target.md` (Slice B). It follows the already-landed documentation slice and does not perform Cloudflare mutation or require credentials. The implementation issues were inspected against the current source and their implementation notes:
+The selected issue slice in this pass is the repository-local deployment preflight from `issues/open/20260911-gateway-deployment-target.md` (Slice B). It follows the already-landed documentation slice and does not perform Cloudflare mutation or require credentials. The implementation issues were inspected against the current source and their implementation notes:
 
 - `issues/done/20260911-session-forget-stale-metadata.md`: implemented, including supervisor serialization, stale-artifact cleanup, liveness refusal, and filesystem-safety tests.
 - `issues/done/20260910-developer-execution-broker.md`: implemented; `dev_tool_run` classification, Cargo/Vite+ execution profiles, tests, and docs are present.
 - `issues/done/20260911-default-agent-permission-mode.md`: implemented; permission defaults, centralized approval policy, lifecycle persistence, tests, and docs are present.
-- `issues/open/20260911-local-agent-vp-installed-codex-runtime.md`: bounded Vite+ launcher dependency closure is implemented; verification is the remaining issue work.
-- `issues/polished/20260911-gateway-deployment-target.md`: Slice A documentation/checks and the evaluator portion of Slice B are implemented; the command-level `target_missing` path still needs a fix and regression test. Cloudflare deployment verification remains live-only.
+- `issues/closed/20260911-local-agent-vp-installed-codex-runtime.md`: bounded Vite+ launcher dependency closure is implemented; verification is the remaining issue work.
+- `issues/open/20260911-gateway-deployment-target.md`: Slice A documentation/checks and the evaluator portion of Slice B are implemented; the command-level `target_missing` path still needs a fix and regression test. Cloudflare deployment verification remains live-only.
 - `issues/done/20260911-gateway-doctor-readiness.md`: local staged diagnostics and the read-only remote endpoint, Access, host-registration, and session-availability checks are implemented. Live Cloudflare verification remains pending.
 - `issues/done/20260910-opencode-delegation-backend.md`: backend extraction, one-shot OpenCode execution, diagnostics, explicit resume preflight, binary override, and report hardening are implemented. Persistent server/session lifecycle, fork, and attach remain deferred.
 - `issues/doing/20260908-07-client-safe-upgrade-reconnect.md`: only the explicitly ordered durable transaction-storage slice is implemented; remote coordinator/reconnect work remains a separate, substantial feature.
-- `issues/open/20260908-08-codex-delegation-dogfood-and-app-server.md`: implementation and fake transport are present; real app-server dogfood and comparative measurement require an appropriately configured host.
+- `issues/doing/20260908-08-codex-delegation-dogfood-and-app-server.md`: implementation and fake transport are present; real app-server dogfood and comparative measurement require an appropriately configured host.
 - `issues/open/20260908-live-acceptance-matrix.md`: this is credential- and deployment-dependent tracking, not a repository-local implementation target.
 
 ## Files changed
@@ -24,7 +24,7 @@ The selected issue slice in this pass is the repository-local deployment preflig
 - `gateway/package.json`
 - `docs/gateway.md`
 - `docs/gateway.ja.md`
-- `issues/polished/20260911-gateway-deployment-target.md`
+- `issues/open/20260911-gateway-deployment-target.md`
 - `docs/opencode-implementation-report.md` (this report)
 
 The preflight reads local Wrangler configuration and explicit operator target arguments only. It rejects missing or non-false `workers_dev`, distinguishes missing and mismatched targets, and returns `remote_unknown` rather than claiming Cloudflare readiness.

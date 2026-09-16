@@ -1,6 +1,6 @@
 # Agent mode で通常の開発ネットワークを利用可能にする
 
-Status: polished
+Status: open / umbrella; use bounded child packet
 Model: deepseek-v4.1-flash
 Created: 2026-09-15
 Updated: 2026-09-16
@@ -224,3 +224,7 @@ yes
 ## Triage note
 
 - 2026-09-16: Slice A〜C、受け入れ条件、deterministic/live テストの分離が揃っており実装に着手できるため `ready` と判定し、`issues/open/` から `issues/polished/` へ移動した。この変更は `AGENTS.md` の safety invariant「Normal `execute` / `start_command` run in the sandbox with network disabled」を agent mode について更新するため、実装と同じ変更で AGENTS.md と permission-mode docs を明示的に更新し、public yolo / `without_sandbox` の回帰を同時に確認すること。
+
+## 2026-09-16 polishing update
+
+Do not assign this whole issue to an implementation agent. Repository-local implementation is narrowed to `issues/polished/20260916-agent-network-mode-policy.md`; live outbound/listen/LAN evidence belongs to the live acceptance matrix.

@@ -145,7 +145,7 @@ Suggested implementation order step 1 landed on main: `src/upgrade_transaction.r
 
 ## Background
 
-Temote already has a strong local upgrade path from `issues/open/20260902-zero-downtime-supervisor-upgrade.md`:
+Temote already has a strong local upgrade path from `issues/done/20260902-zero-downtime-supervisor-upgrade.md`:
 
 - the lifecycle supervisor validates a target binary before destructive action;
 - active sessions are fenced, drained, restored, and socket-probed;
@@ -526,3 +526,7 @@ If remote package acquisition is designed later, it requires a separate issue an
 ## Triage note
 
 - 2026-09-16: Classified `in-progress` and moved from `issues/open/` to `issues/doing/`. Evidence: main already has the durable transaction schema, boot identity, coordinator-safe primitives, coordinator state machine, and persisted apply admission, while the direct HTTP coordinator, response-delivery commit barrier, remote preflight/apply/status tools, and the Linux process-boundary reconnect E2E exist only on the unmerged `codex/20260915-completion-upgrade` branch (`1df8b3b`, `5441184`, `793924c`). The macOS process-boundary E2E required by the acceptance criteria remains pending. Action: review/integrate the prepared branch work, run the macOS E2E, then move to `done/`.
+
+## 2026-09-16 branch-salvage packet
+
+Do not merge `codex/20260915-completion-upgrade` wholesale. Current-main reconciliation and bounded missing-slice porting is owned by `issues/polished/20260916-completion-upgrade-branch-salvage.md`.

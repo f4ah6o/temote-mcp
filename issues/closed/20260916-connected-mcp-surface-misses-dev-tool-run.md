@@ -1,6 +1,6 @@
 # connected MCP client surface に landed 済み `dev_tool_run` が現れない
 
-Status: open
+Status: superseded by bounded implementation packet
 Model: GPT-5.6 Sol
 Created: 2026-09-16
 Priority: P1 developer workflow friction
@@ -70,3 +70,7 @@ repository で supported と宣言し gateway parity test を通した public MC
 - [ ] server/source/gateway/connector の version or contract fingerprint drift を operator が bounded diagnostic で判別できる。
 - [ ] missing tool の場合に raw `execute` や yolo への危険な fallback を推奨しない。
 - [ ] release/deployment pipeline に contract-parity acceptance を追加する。
+
+## 2026-09-16 polishing disposition
+
+Implementation work is superseded by `issues/polished/20260916-connected-surface-contract-parity.md`. Live connected-client discovery remains in the live acceptance matrix.

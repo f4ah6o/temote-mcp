@@ -1,6 +1,6 @@
 # read-only の `git remote -v` が Temote tool 経由で safety block される
 
-Status: open
+Status: closed as non-reproducible
 Model: gpt-5.6-sol
 Created: 2026-09-16
 Updated: 2026-09-16
@@ -53,3 +53,7 @@ origin  https://github.com/f4ah6o/temote-mcp.git (push)
 このため、最初の `gh-git` session で観測した block を Temote sandbox / command policy の deterministic defect と断定しない。上位 tool safety classifier、request context、または一時的 classification の可能性を含めて扱う。
 
 Temote 側を変更する前に、同じ argv が Temote handler へ到達したケースと到達前に拒否されたケースを区別できる evidence が必要。再現しない限り broad allowlist / sandbox 緩和は行わない。
+
+## 2026-09-16 polishing disposition
+
+A later `temo` run executed the same read-only inspection successfully. No deterministic Temote defect is established. Re-open as a new bounded issue only if handler-reached versus pre-handler evidence reproduces the block.
