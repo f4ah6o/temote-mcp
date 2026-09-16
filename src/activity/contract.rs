@@ -209,6 +209,7 @@ pub enum ActivityErrorKind {
     ApprovalDenied,
     RuntimeUnavailable,
     ChildFailed,
+    SandboxSetupFailed,
     ProtocolFailed,
     OperationFailed,
 }
@@ -221,6 +222,7 @@ impl ActivityErrorKind {
             Self::ApprovalDenied => "approval_denied",
             Self::RuntimeUnavailable => "runtime_unavailable",
             Self::ChildFailed => "child_failed",
+            Self::SandboxSetupFailed => "sandbox_setup_failed",
             Self::ProtocolFailed => "protocol_failed",
             Self::OperationFailed => "operation_failed",
         }
@@ -233,6 +235,7 @@ impl ActivityErrorKind {
             "approval_denied" => Some(Self::ApprovalDenied),
             "runtime_unavailable" => Some(Self::RuntimeUnavailable),
             "child_failed" => Some(Self::ChildFailed),
+            "sandbox_setup_failed" => Some(Self::SandboxSetupFailed),
             "protocol_failed" => Some(Self::ProtocolFailed),
             "operation_failed" => Some(Self::OperationFailed),
             _ => None,
@@ -602,6 +605,7 @@ impl ActivitySummary {
                 ActivityErrorKind::ApprovalDenied => "error=approval_denied",
                 ActivityErrorKind::RuntimeUnavailable => "error=runtime_unavailable",
                 ActivityErrorKind::ChildFailed => "error=child_failed",
+                ActivityErrorKind::SandboxSetupFailed => "error=sandbox_setup_failed",
                 ActivityErrorKind::ProtocolFailed => "error=protocol_failed",
                 ActivityErrorKind::OperationFailed => "error=operation_failed",
             },
@@ -1606,6 +1610,10 @@ mod tests {
             "error=approval_denied"
         );
         assert_eq!(
+            ActivitySummary::failure(ActivityErrorKind::SandboxSetupFailed).safe_summary(),
+            "error=sandbox_setup_failed"
+        );
+        assert_eq!(
             ActivitySummary::git(ActivityRemote::Origin).safe_summary(),
             "remote=origin"
         );
@@ -1733,6 +1741,19 @@ mod tests {
         assert_eq!(
             value,
             json!({"kind": "failure", "error": "approval_denied"})
+        );
+
+        let setup_failure = ActivitySummary::failure(ActivityErrorKind::SandboxSetupFailed);
+        assert_eq!(
+            serde_json::to_value(&setup_failure).unwrap(),
+            json!({"kind": "failure", "error": "sandbox_setup_failed"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ActivitySummary>(
+                serde_json::to_value(&setup_failure).unwrap()
+            )
+            .unwrap(),
+            setup_failure
         );
     }
 

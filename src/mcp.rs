@@ -374,9 +374,24 @@ struct JobCompletion {
 }
 
 #[derive(Clone, Copy)]
+enum JobActivityFailure {
+    ChildFailed,
+    SandboxSetupFailed,
+}
+
+impl JobActivityFailure {
+    const fn error_kind(self) -> ActivityErrorKind {
+        match self {
+            Self::ChildFailed => ActivityErrorKind::ChildFailed,
+            Self::SandboxSetupFailed => ActivityErrorKind::SandboxSetupFailed,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum JobActivityOutcome {
     Completed,
-    Failed,
+    Failed(JobActivityFailure),
     Cancelled(ActivityCancellationReason),
 }
 
@@ -4059,7 +4074,7 @@ where
                 let outcome = if result.is_ok() {
                     JobActivityOutcome::Completed
                 } else {
-                    JobActivityOutcome::Failed
+                    JobActivityOutcome::Failed(JobActivityFailure::ChildFailed)
                 };
                 (result, outcome)
             }
@@ -4203,7 +4218,7 @@ where
                 let outcome = if result.is_ok() {
                     JobActivityOutcome::Completed
                 } else {
-                    JobActivityOutcome::Failed
+                    JobActivityOutcome::Failed(JobActivityFailure::ChildFailed)
                 };
                 (result, outcome)
             }
@@ -4275,13 +4290,21 @@ where
     let handle = tokio::spawn(async move {
         let (result, outcome) = tokio::select! {
             result = run_session_command(&command, &cwd, &roots, yolo) => {
-                let result = result.and_then(render_output);
-                let outcome = if result.is_ok() {
-                    JobActivityOutcome::Completed
-                } else {
-                    JobActivityOutcome::Failed
-                };
-                (result, outcome)
+                match result {
+                    Ok(output) => {
+                        let result = render_output(output);
+                        let outcome = if result.is_ok() {
+                            JobActivityOutcome::Completed
+                        } else {
+                            JobActivityOutcome::Failed(JobActivityFailure::ChildFailed)
+                        };
+                        (result, outcome)
+                    }
+                    Err(error) => (
+                        Err(error),
+                        JobActivityOutcome::Failed(JobActivityFailure::SandboxSetupFailed),
+                    ),
+                }
             }
             _ = session_stop => {
                 (
@@ -4360,8 +4383,8 @@ fn finish_job_activity(activity: Option<&ActivityScope>, outcome: JobActivityOut
     };
     let _ = match outcome {
         JobActivityOutcome::Completed => activity.complete(),
-        JobActivityOutcome::Failed => {
-            activity.fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ChildFailed))
+        JobActivityOutcome::Failed(failure) => {
+            activity.fail_with_summary(ActivitySummary::failure(failure.error_kind()))
         }
         JobActivityOutcome::Cancelled(reason) => {
             activity.cancel_with_summary(ActivitySummary::cancellation(reason))
@@ -5679,6 +5702,53 @@ mod tests {
         assert_eq!(
             terminal[0].summary().as_safe_summary(),
             "error=child_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_job_sandbox_setup_failure_is_not_child_failed() {
+        let cwd = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(cwd.path()).unwrap();
+        let mut session = activity_job_session(&canonical);
+        session.permission_mode = config::PermissionMode::Ask;
+        session.permitted_directories =
+            vec![canonical.clone(), canonical.join("missing-sandbox-root")];
+        let (scope, emitter) = activity_job_scope(ActivityOperation::Execute);
+        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+            &json!({"command": ["sh", "-c", "printf unreachable"]}),
+            &session,
+            Some(scope),
+            std::future::pending(),
+            MAX_JOB_LIFETIME,
+        )
+        .await
+        .unwrap();
+        let failure = finish_foreground_or_store_job(
+            &session,
+            rendered,
+            handle,
+            completion,
+            OutputPolicy::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            failure.to_string().contains("writable root"),
+            "unexpected sandbox setup failure: {failure:#}"
+        );
+        assert_eq!(
+            emitter.states(),
+            vec![
+                ActivityState::Started,
+                ActivityState::Running,
+                ActivityState::Failed
+            ]
+        );
+        let terminal = activity_job_terminal_updates(&emitter);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0].summary().as_safe_summary(),
+            "error=sandbox_setup_failed"
         );
     }
 
