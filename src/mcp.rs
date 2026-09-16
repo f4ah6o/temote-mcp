@@ -2835,7 +2835,7 @@ where
     let handle = tokio::spawn(async move {
         let (result, outcome) = tokio::select! {
             result = local_agent::run(prepared) => {
-                let result = result.and_then(render_output);
+                let result = render_local_agent_result(result);
                 let outcome = if result.is_ok() {
                     JobActivityOutcome::Completed
                 } else {
@@ -3946,6 +3946,77 @@ fn render_output(output: sandbox::Output) -> Result<String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalAgentFailureClass {
+    RunnerSpawnFailed,
+    SandboxSetupFailed,
+    AgentChildProcessDenied,
+    AgentNonzeroExit,
+}
+
+impl LocalAgentFailureClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunnerSpawnFailed => "runner_spawn_failed",
+            Self::SandboxSetupFailed => "sandbox_setup_failed",
+            Self::AgentChildProcessDenied => "agent_child_process_denied",
+            Self::AgentNonzeroExit => "agent_nonzero_exit",
+        }
+    }
+}
+
+fn local_agent_output_failure_class(output: &sandbox::Output) -> Option<LocalAgentFailureClass> {
+    if output.status == 0 {
+        return None;
+    }
+    let child_spawn_denied = [
+        "EPERM : failed to spawn process",
+        "Failed to create unified exec process: Operation not permitted",
+    ]
+    .iter()
+    .any(|sentinel| output.stderr.contains(sentinel) || output.stdout.contains(sentinel));
+    Some(if child_spawn_denied {
+        LocalAgentFailureClass::AgentChildProcessDenied
+    } else {
+        LocalAgentFailureClass::AgentNonzeroExit
+    })
+}
+
+fn render_local_agent_result(result: Result<sandbox::Output>) -> Result<String> {
+    match result {
+        Ok(output) => {
+            let failure_class = local_agent_output_failure_class(&output);
+            let text = json!({
+                "exit_code": output.status,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+                "truncated": output.truncated,
+                "failure_class": failure_class.map(LocalAgentFailureClass::as_str),
+            })
+            .to_string();
+            if output.status == 0 {
+                Ok(text)
+            } else {
+                anyhow::bail!(text)
+            }
+        }
+        Err(error) => {
+            let failure_class = if sandbox::is_local_agent_spawn_error(&error) {
+                LocalAgentFailureClass::RunnerSpawnFailed
+            } else {
+                LocalAgentFailureClass::SandboxSetupFailed
+            };
+            anyhow::bail!(
+                json!({
+                    "failure_class": failure_class.as_str(),
+                    "error": "local agent failed before a child result was available",
+                })
+                .to_string()
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3990,6 +4061,61 @@ mod tests {
             text: text.into(),
             evidence: None,
         }
+    }
+
+    #[test]
+    fn local_agent_failure_classifies_runner_child_and_generic_failures() {
+        let opencode = sandbox::Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: "EPERM : failed to spawn process".to_owned(),
+            truncated: false,
+        };
+        assert_eq!(
+            local_agent_output_failure_class(&opencode),
+            Some(LocalAgentFailureClass::AgentChildProcessDenied)
+        );
+
+        let codex = sandbox::Output {
+            status: 1,
+            stdout: "Failed to create unified exec process: Operation not permitted (os error 1)"
+                .to_owned(),
+            stderr: String::new(),
+            truncated: false,
+        };
+        assert_eq!(
+            local_agent_output_failure_class(&codex),
+            Some(LocalAgentFailureClass::AgentChildProcessDenied)
+        );
+
+        let generic = sandbox::Output {
+            status: 2,
+            stdout: String::new(),
+            stderr: "provider rejected request".to_owned(),
+            truncated: false,
+        };
+        assert_eq!(
+            local_agent_output_failure_class(&generic),
+            Some(LocalAgentFailureClass::AgentNonzeroExit)
+        );
+
+        let rendered =
+            render_local_agent_result(Err(anyhow::anyhow!("invalid sandbox root"))).unwrap_err();
+        let value: Value = serde_json::from_str(&rendered.to_string()).unwrap();
+        assert_eq!(value["failure_class"], "sandbox_setup_failed");
+    }
+
+    #[test]
+    fn local_agent_failure_class_is_null_on_success() {
+        let rendered = render_local_agent_result(Ok(sandbox::Output {
+            status: 0,
+            stdout: "ok".to_owned(),
+            stderr: String::new(),
+            truncated: false,
+        }))
+        .unwrap();
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert!(value["failure_class"].is_null());
     }
 
     fn activity_job_session(cwd: &Path) -> config::Session {

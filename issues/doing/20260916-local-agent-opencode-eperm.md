@@ -94,6 +94,14 @@ Repository-local verification:
 - `cargo clippy --all-targets -- -D warnings`: PASS.
 - Nested local-agent runtime fixtures remain NOT RUN in this Temote session: the outer development sandbox makes `/var/tmp` read-only / bubblewrap unavailable. This is tracked separately in `20260916-normal-session-ci-sandbox-friction.md`.
 
+Follow-up classification (2026-09-16):
+
+- Temote sandbox runner spawn errors now have a typed internal marker and render as fixed `failure_class=runner_spawn_failed` without requiring callers to parse OS error text.
+- pre-spawn/path/policy failures that do not reach a child result render as `failure_class=sandbox_setup_failed`.
+- a started agent that reports either OpenCode/Bun `EPERM : failed to spawn process` or Codex `Failed to create unified exec process: Operation not permitted` renders as `failure_class=agent_child_process_denied`.
+- other non-zero agent exits render as `failure_class=agent_nonzero_exit`; successful results carry `failure_class=null`.
+- classification tests: sandbox marker 1/1 PASS, MCP result classification 2/2 PASS.
+
 The currently running Temote server predates this source change, so repeating `local_agent_run(agent=opencode)` against that process would only retest the old policy. The real OpenCode 1.18.31 canary remains pending after a rebuilt Temote runtime is active.
 
 ## Acceptance criteria
@@ -101,6 +109,6 @@ The currently running Temote server predates this source change, so repeating `l
 - [ ] active normal `agent` session で `local_agent_run(agent=opencode, access=read_only)` の最小 canary が child process を開始できる。
 - [ ] `workspace_write` は既存 workspace write 境界の中だけで起動できる。
 - [ ] OpenCode 1.18.31 の実 executable で process launch まで到達することを、provider/model entitlement と分離して確認できる。
-- [ ] spawn failure は fixed/bounded classification と non-secret evidence で原因層を特定できる。
+- [x] spawn failure は fixed/bounded classification で runner / sandbox setup / agent child-process denial / generic non-zero exit を区別できる。
 - [ ] Codex local agent、OpenCode fake adapter、auth isolation、sandbox tests が回帰しない。
 - [ ] yolo、broad HOME exposure、raw argv/executable input を追加しない。

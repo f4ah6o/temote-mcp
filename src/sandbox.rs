@@ -236,6 +236,33 @@ pub struct Output {
     pub truncated: bool,
 }
 
+#[derive(Debug)]
+struct LocalAgentSpawnError {
+    source: std::io::Error,
+}
+
+impl LocalAgentSpawnError {
+    fn new(source: std::io::Error) -> Self {
+        Self { source }
+    }
+}
+
+impl std::fmt::Display for LocalAgentSpawnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("failed to start bounded local-agent command")
+    }
+}
+
+impl std::error::Error for LocalAgentSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub fn is_local_agent_spawn_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LocalAgentSpawnError>().is_some()
+}
+
 /// A verified intermediate symlink that must be visible for a bounded
 /// executable path graph to resolve inside the local-agent sandbox.
 ///
@@ -352,9 +379,7 @@ pub async fn run_local_agent(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = process
-        .spawn()
-        .context("failed to start bounded local-agent command")?;
+    let child = process.spawn().map_err(LocalAgentSpawnError::new)?;
     wait_with_limited_output(child, stdin).await
 }
 
@@ -1521,6 +1546,21 @@ mod generic_tests {
         }
         drop(cache);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn local_agent_spawn_error_has_fixed_classification() {
+        let error = anyhow::Error::new(LocalAgentSpawnError::new(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        ));
+        assert!(is_local_agent_spawn_error(&error));
+        assert_eq!(
+            error.to_string(),
+            "failed to start bounded local-agent command"
+        );
+        assert!(!is_local_agent_spawn_error(&anyhow::anyhow!(
+            "sandbox setup failed"
+        )));
     }
 
     #[test]
