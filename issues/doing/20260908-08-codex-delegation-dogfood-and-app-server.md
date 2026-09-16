@@ -1,6 +1,6 @@
 # TEMOTE-08: Lunaへの実装委譲を今回の開発で実証し、Codex app server連携へ進める
 
-- Status: Open / blocked on a live authenticated Codex reviewer and provider environment; implementation and fake-transport verification landed; one real `codex delegate` dogfood task recorded 2026-09-11; real app-server dogfood and comparative measurement remain
+- Status: doing / live evaluation remains externally blocked, but the reviewed cross-process app-server runtime ownership fix from the 2026-09-15 completion branch is not yet integrated into `main`
 - Model: deepseek-v4.1-flash
 - Date: 2026-09-08 (Asia/Tokyo)
 - Updated: 2026-09-16 (Asia/Tokyo)
@@ -15,6 +15,29 @@
   - [`docs/evaluations/codex-delegation.md`](../../docs/evaluations/codex-delegation.md)
 
 ## 現在の状態（2026-09-13）
+
+### 2026-09-16 integration audit
+
+`codex/20260915-complete-open-work` の live evaluation evidence を current `main` と再照合した。real Codex 0.153.4 user-agent grammar fix (`344e6b6`) は current `main` に同等以上の実装が既に存在する。一方、concurrent MCP clients が同一 task runtime を競合して再構築する defect に対する cross-process runtime lease / `reconciliation_deferred` / `CODEX_TASK_RUNTIME_OWNED` fix (`c7472b0`) と、その terminal cleanup follow-up (`1d6cd3e`) は current `main` に存在しない。
+
+completion evidence では `1d6cd3e` driver を normal managed `agent` session + real Codex 0.153.4 の2 MCP processで検証し、primary processだけが app-server children を所有、secondary get は `reconciliation_deferred=true`、secondary interrupt は persistence前に `CODEX_TASK_RUNTIME_OWNED`、session stop後は `interrupted` を永続化して child/runtimeを解放したことが記録されている。
+
+この repository-local defect fix を先に main へ統合し、deterministic tests と通常 gate を再実行する。live comparative measurement / provider acceptance はその後も別条件として残す。
+
+互換性判定については、app-server の特定 version 文字列を allowlist する方式を撤廃する。version は取得できる場合だけ診断 metadata として扱い、互換性は bounded initialize shape と、Temote が実際に使用する `model/list` / `thread/*` / `turn/*` の request/response contract を実行時に検証して fail-closed にする。release number と wire compatibility を同一視しない。
+
+実装確認では `c7472b0` の cross-process runtime lease/fencing と `1d6cd3e` の terminal-runtime cleanup follow-up を current `main` へ3-wayで統合した。current main の既存 0.147/0.153 系 schema互換コードは上書きせず、そのうえで version allowlist 自体を削除した。
+
+repository-local verification:
+
+- initialize version-agnostic tests: 3/3 PASS。
+- best-effort version diagnostic: 1/1 PASS。
+- `noprop` generated version property: 1,024 cases PASS。任意の生成version値で initialize validation が release allowlist に依存しないことを確認。
+- model/effort response schema test: PASS。
+- runtime lease core: 3/3 PASS（同一task二重lease拒否、terminal task cleanup defer、spawned actor lease lifetime）。
+- task store full-session/scope binding と terminal reconciliation: PASS。
+- `just sandboxed-check`: PASS / exit 0。
+- completion branch由来の cross-process 2-MCP test は current normal Temote outer sandbox では session socket inspection が `Operation not permitted (os error 1)` で assertion前に blocked。これは成功扱いせず host/CI gateとして残す。過去の completion evidence には real Codex 0.153.4 + normal managed `agent` session での2-MCP ownership regression PASS が記録されている。
 
 この issue の実装部分はすでに `main` に入っている。`codex delegate` の bounded structured report、scoped evidence、experimental app-server task controls、gateway contract、fake-transport/権限/失敗系テストが実装済みである。
 
