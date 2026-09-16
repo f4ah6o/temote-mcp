@@ -188,6 +188,9 @@ authoritative learningはrepo-managed Markdownです。`recall({session_id, quer
 - `git_pull`: fast-forward-only
 - `git_push`: current branch を push。force や任意 URL/refspec は受け付けない
 - `git_push_tag`: exact local commit SHA を configured remote の `refs/tags/<tag>` へ push する。`expected_remote_sha` 省略時は create-only、指定時は remote tag がその exact old SHA の場合だけ更新する。lightweight remote tag ref に限定し、任意 refspec / URL / annotated tag 作成 / unconditional force は受け付けない
+- `git_branch_create`: `HEAD` または validated repository-local/fetched ref から local branch を1つ作成する。current worktree は切り替えず、force/reset/refspec/URL input は受け付けない
+- `git_switch`: validated existing local branch へ force/reset/stash なしで切り替える。dirty file の上書きが必要なら Git 自身が拒否し、Temote は worktree を変更しない
+- `git_worktree_add`: linked worktree を `<repository>/.wt/<name>` にだけ作成する。`base` 指定時は validated repository-local commit から branch を新規作成し、省略時は existing local branch を attach する。任意 destination path / force option は受け付けない
 - `github_workflow_dispatch`: 選択した configured `github.com` remote からだけ GitHub repository を解決し、numeric workflow ID または `.yml` / `.yaml` filename を exact unqualified branch/tag ref で dispatch して、作成された workflow run ID を返す。repository-local Git credential mapping が helper を明示 reset したうえで `!gh git credential --managed` を選択し、`credential.useHttpPath=true` である場合だけ利用する。ambient な active `gh` account へは fallback しない。approval 後に exact repository credential を内部解決し、bounded な GitHub REST request にだけ利用する。継承 `GH_TOKEN` / `GITHUB_TOKEN` 系は sensitive として扱い続け、global `gh auth` state は変更せず、token 値は返さない
 - `github_workflow_run_get`: 同じ repository-scoped credential mapping を使い、configured GitHub repository の exact workflow run ID を bounded status として読む。`status=completed` になるまでこの tool を poll し、terminal result は `conclusion` で判定する。raw log/artifact は取得しない
 

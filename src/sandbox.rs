@@ -308,7 +308,7 @@ pub async fn run(
     writable_roots: &[PathBuf],
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
-    run_with_metadata_roots(command, cwd, writable_roots, &[], stdin).await
+    run_with_metadata_roots(command, cwd, writable_roots, &[], None, stdin).await
 }
 
 /// Runs the structured local-agent broker profile.
@@ -474,7 +474,56 @@ pub async fn run_git(
             git_root.display()
         );
     }
-    run_with_metadata_roots(command, &cwd, writable_roots, &validated_roots, stdin).await
+    run_with_metadata_roots(command, &cwd, writable_roots, &validated_roots, None, stdin).await
+}
+
+/// Runs the exact structured `git worktree add` command with the common
+/// repository `worktrees` directory writable only for creating new metadata.
+/// Existing sibling worktree metadata directories are re-masked read-only.
+pub async fn run_git_worktree_add(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    provided_git_metadata_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    let validated_roots = git_metadata_roots(cwd)?;
+    anyhow::ensure!(
+        provided_git_metadata_roots == validated_roots,
+        "Git metadata roots do not match the validated repository at {}",
+        cwd.display()
+    );
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
+    let mut permitted_roots = vec![cwd.clone()];
+    permitted_roots.extend(
+        writable_roots
+            .iter()
+            .map(|path| {
+                std::fs::canonicalize(path)
+                    .with_context(|| format!("cannot resolve writable root {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    for git_root in &validated_roots {
+        anyhow::ensure!(
+            permitted_roots
+                .iter()
+                .any(|permitted| git_root.starts_with(permitted)),
+            "Git metadata root is outside the permitted session roots: {}",
+            git_root.display()
+        );
+    }
+    let protected_worktree_roots = protected_git_worktree_metadata_roots(&validated_roots)?;
+    run_with_metadata_roots(
+        command,
+        &cwd,
+        writable_roots,
+        &validated_roots,
+        Some(&protected_worktree_roots),
+        stdin,
+    )
+    .await
 }
 
 async fn run_with_metadata_roots(
@@ -482,6 +531,7 @@ async fn run_with_metadata_roots(
     cwd: &Path,
     writable_roots: &[PathBuf],
     git_metadata_roots: &[PathBuf],
+    protected_worktree_roots: Option<&[PathBuf]>,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
@@ -491,12 +541,29 @@ async fn run_with_metadata_roots(
     #[cfg(target_os = "macos")]
     let spec = if git_metadata_roots.is_empty() {
         policy::SandboxSpec::command(&cwd, writable_roots)?
+    } else if let Some(protected_worktree_roots) = protected_worktree_roots {
+        policy::SandboxSpec::git_worktree_add(
+            &cwd,
+            writable_roots,
+            git_metadata_roots,
+            protected_worktree_roots,
+        )?
     } else {
         policy::SandboxSpec::git(&cwd, writable_roots, git_metadata_roots)?
     };
 
     #[cfg(target_os = "linux")]
-    let mut process = linux::command(command, &cwd, writable_roots, git_metadata_roots)?;
+    let mut process = if let Some(protected_worktree_roots) = protected_worktree_roots {
+        linux::git_worktree_add_command(
+            command,
+            &cwd,
+            writable_roots,
+            git_metadata_roots,
+            protected_worktree_roots,
+        )?
+    } else {
+        linux::command(command, &cwd, writable_roots, git_metadata_roots)?
+    };
 
     #[cfg(target_os = "macos")]
     let mut process = macos::command(&spec, command)?;
@@ -524,6 +591,54 @@ async fn run_with_metadata_roots(
         .spawn()
         .context("failed to start sandboxed command")?;
     wait_with_limited_output(child, stdin).await
+}
+
+fn protected_git_worktree_metadata_roots(git_metadata_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let common = git_metadata_roots
+        .first()
+        .context("validated Git metadata roots are empty")?;
+    anyhow::ensure!(
+        !common.join("gitdir").is_file(),
+        "first validated Git metadata root is not the common repository root"
+    );
+    let worktrees = common.join("worktrees");
+    let metadata = match std::fs::symlink_metadata(&worktrees) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", worktrees.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "Git worktrees metadata root must be a normal directory: {}",
+        worktrees.display()
+    );
+    let canonical_worktrees = std::fs::canonicalize(&worktrees)?;
+    let current_private = git_metadata_roots.get(1);
+    let mut protected = Vec::new();
+    for entry in std::fs::read_dir(&worktrees)? {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.is_symlink(),
+            "unexpected non-directory Git worktree metadata entry: {}",
+            entry.path().display()
+        );
+        let path = std::fs::canonicalize(entry.path())?;
+        anyhow::ensure!(
+            path.parent() == Some(canonical_worktrees.as_path()),
+            "Git worktree metadata entry escaped its validated parent: {}",
+            path.display()
+        );
+        if current_private.is_some_and(|current| current == &path) {
+            continue;
+        }
+        protected.push(path);
+    }
+    protected.sort();
+    protected.dedup();
+    Ok(protected)
 }
 
 /// Resolves the worktree's private Git directory and its common repository
@@ -1999,6 +2114,55 @@ mod generic_tests {
     }
 
     #[test]
+    fn worktree_add_scope_protects_siblings_but_not_current_private_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let common = repository.join(".git");
+        let current = common.join("worktrees").join("current");
+        let sibling = common.join("worktrees").join("sibling");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", current.display()),
+        )
+        .unwrap();
+        std::fs::write(current.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            current.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+
+        let roots = git_metadata_roots(&worktree).unwrap();
+        let protected = protected_git_worktree_metadata_roots(&roots).unwrap();
+
+        assert_eq!(protected, vec![std::fs::canonicalize(&sibling).unwrap()]);
+        assert!(!protected.contains(&std::fs::canonicalize(&current).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_add_scope_rejects_unexpected_worktree_metadata_entries() {
+        let repository = tempfile::tempdir().unwrap();
+        let git = repository.path().join(".git");
+        let worktrees = git.join("worktrees");
+        std::fs::create_dir_all(&worktrees).unwrap();
+        std::fs::write(worktrees.join("unexpected-file"), b"metadata").unwrap();
+
+        let common = std::fs::canonicalize(&git).unwrap();
+        let error = protected_git_worktree_metadata_roots(&[common]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected non-directory Git worktree metadata entry")
+        );
+    }
+
+    #[test]
     fn rejects_an_unrelated_git_pointer() {
         let worktree = tempfile::tempdir().unwrap();
         let unrelated = tempfile::tempdir().unwrap();
@@ -2672,6 +2836,93 @@ done
             "{}",
             String::from_utf8_lossy(&head.stderr)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_structured_worktree_add_can_create_without_sibling_metadata_write() -> Result<()>
+    {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        let sibling = root.path().join("sibling");
+        let destination = repository.join(".wt").join("review");
+        std::fs::create_dir_all(&repository)?;
+        std::fs::create_dir_all(repository.join(".wt"))?;
+        host_git(&repository, &["init", "-q"])?;
+        std::fs::write(repository.join("base.txt"), b"base\n")?;
+        host_git(&repository, &["add", "--", "base.txt"])?;
+        host_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=temote-mcp test",
+                "-c",
+                "user.email=temote-mcp@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )?;
+        host_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        )?;
+
+        let git_roots = git_metadata_roots(&repository)?;
+        let protected = protected_git_worktree_metadata_roots(&git_roots)?;
+        assert_eq!(protected.len(), 1);
+        let sibling_metadata = protected[0].clone();
+        let sibling_marker = sibling_metadata.join("temote-protected-marker");
+
+        let denied = run_git_worktree_add(
+            &command("/usr/bin/touch", &[sibling_marker.to_str().unwrap()]),
+            &repository,
+            std::slice::from_ref(&root.path().to_path_buf()),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_ne!(denied.status, 0);
+        assert!(!sibling_marker.exists());
+
+        let add = vec![
+            "/usr/bin/git".to_owned(),
+            "-c".to_owned(),
+            "core.hooksPath=/dev/null".to_owned(),
+            "worktree".to_owned(),
+            "add".to_owned(),
+            "-b".to_owned(),
+            "review".to_owned(),
+            destination.to_string_lossy().into_owned(),
+            "HEAD".to_owned(),
+        ];
+        let output = run_git_worktree_add(
+            &add,
+            &repository,
+            std::slice::from_ref(&root.path().to_path_buf()),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(
+            std::process::Command::new("/usr/bin/git")
+                .args(["branch", "--show-current"])
+                .current_dir(&destination)
+                .output()?
+                .stdout,
+            b"review\n"
+        );
+        assert!(sibling_metadata.is_dir());
+        assert!(!sibling_marker.exists());
         Ok(())
     }
 
@@ -3508,6 +3759,107 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&head.stderr)
         );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seatbelt_structured_worktree_add_can_create_without_sibling_metadata_write()
+    -> Result<()> {
+        if std::env::var_os("NIX_BUILD_TOP").is_some()
+            || std::env::var_os("TEMOTE_MCP_SANDBOX").is_some()
+        {
+            return Ok(());
+        }
+        let root = test_directory();
+        let repository = root.join("repository");
+        let sibling = root.join("sibling");
+        let destination = repository.join(".wt").join("review");
+        std::fs::create_dir_all(repository.join(".wt"))?;
+
+        let git = |args: &[&str]| -> Result<()> {
+            let output = std::process::Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(&repository)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "host git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(repository.join("base.txt"), b"base\n")?;
+        git(&["add", "--", "base.txt"])?;
+        git(&[
+            "-c",
+            "user.name=temote-mcp test",
+            "-c",
+            "user.email=temote-mcp@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ])?;
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "sibling",
+            sibling.to_str().unwrap(),
+        ])?;
+
+        let git_roots = git_metadata_roots(&repository)?;
+        let protected = protected_git_worktree_metadata_roots(&git_roots)?;
+        assert_eq!(protected.len(), 1);
+        let sibling_metadata = protected[0].clone();
+        let sibling_marker = sibling_metadata.join("temote-protected-marker");
+        let denied = run_git_worktree_add(
+            &[
+                "/usr/bin/touch".to_owned(),
+                sibling_marker.to_string_lossy().into_owned(),
+            ],
+            &repository,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_ne!(denied.status, 0);
+        assert!(!sibling_marker.exists());
+
+        let add = vec![
+            "/usr/bin/git".to_owned(),
+            "-c".to_owned(),
+            "core.hooksPath=/dev/null".to_owned(),
+            "worktree".to_owned(),
+            "add".to_owned(),
+            "-b".to_owned(),
+            "review".to_owned(),
+            destination.to_string_lossy().into_owned(),
+            "HEAD".to_owned(),
+        ];
+        let output = run_git_worktree_add(
+            &add,
+            &repository,
+            std::slice::from_ref(&root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        let branch = std::process::Command::new("/usr/bin/git")
+            .args(["branch", "--show-current"])
+            .current_dir(&destination)
+            .output()?;
+        assert!(branch.status.success());
+        assert_eq!(branch.stdout, b"review\n");
+        assert!(sibling_metadata.is_dir());
+        assert!(!sibling_marker.exists());
 
         std::fs::remove_dir_all(root)?;
         Ok(())

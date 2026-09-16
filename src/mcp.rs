@@ -41,6 +41,9 @@ const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
 const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_GIT_TAG_NAME_BYTES: usize = 255;
+const MAX_GIT_BRANCH_NAME_BYTES: usize = 255;
+const MAX_GIT_BASE_REF_BYTES: usize = 512;
+const MAX_GIT_WORKTREE_NAME_BYTES: usize = 64;
 const MAX_GITHUB_WORKFLOW_BYTES: usize = 255;
 const MAX_GITHUB_REF_BYTES: usize = 255;
 const MAX_GITHUB_REMOTE_URL_BYTES: usize = 2048;
@@ -172,6 +175,17 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
     activity_tool("git_pull", ActivityOperation::GitPull, "Git network"),
     activity_tool("git_push", ActivityOperation::GitPush, "Git network"),
     activity_tool("git_push_tag", ActivityOperation::GitPush, "Git network"),
+    activity_tool(
+        "git_branch_create",
+        ActivityOperation::GitBranchCreate,
+        "Git branch",
+    ),
+    activity_tool("git_switch", ActivityOperation::GitSwitch, "Git branch"),
+    activity_tool(
+        "git_worktree_add",
+        ActivityOperation::GitWorktreeAdd,
+        "Git worktree",
+    ),
     activity_tool(
         "github_workflow_dispatch",
         ActivityOperation::GithubWorkflowDispatch,
@@ -873,6 +887,9 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push_tag","title":"Push an exact Git tag ref","description":"Push one exact commit SHA to refs/tags/<tag> on a configured remote using force-with-lease safety. Omitting expected_remote_sha is create-only; supplying it permits an update only when the remote tag still equals that exact SHA. Arbitrary refspecs, URLs, and unconditional force are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"tag":{"type":"string","minLength":1,"maxLength":255},"source_sha":{"type":"string","minLength":40,"maxLength":64},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","tag","source_sha"],"additionalProperties":false}},
+        {"name":"git_branch_create","title":"Create a local Git branch","description":"Create one validated local branch from HEAD or a validated local/fetched repository ref. The operation exposes no force/reset/refspec/URL input and does not switch the current worktree.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","branch"],"additionalProperties":false}},
+        {"name":"git_switch","title":"Switch to an existing local Git branch","description":"Switch the current worktree to one validated existing local branch without force/reset/stash. Git refuses an unsafe switch when dirty files would be overwritten.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","branch"],"additionalProperties":false}},
+        {"name":"git_worktree_add","title":"Create a repository-owned Git worktree","description":"Create a linked worktree only at <repository>/.wt/<name>. If base is provided, create the validated branch from that local/fetched repository ref; otherwise attach an existing validated local branch. Arbitrary paths and force options are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","name","branch"],"additionalProperties":false}},
         {"name":"github_workflow_dispatch","title":"Dispatch a GitHub Actions workflow","description":"Dispatch an exact workflow file or numeric workflow ID at an exact branch/tag ref for the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping, never the ambient active gh account, and returns the created workflow run ID without exposing tokens.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"workflow":{"type":"string","minLength":1,"maxLength":255},"ref":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","workflow","ref"],"additionalProperties":false}},
         {"name":"github_workflow_run_get","title":"Read a GitHub Actions workflow run","description":"Read bounded status for one exact workflow run ID in the GitHub repository resolved from a configured remote. Requires the same repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"run_id":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","run_id"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
@@ -1166,7 +1183,7 @@ async fn call_tool_with_local_agent_executable(
                 text_result(serde_json::to_string_pretty(&outcome)?)
             }
             name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push"
-            | "git_push_tag") => {
+            | "git_push_tag" | "git_branch_create" | "git_switch" | "git_worktree_add") => {
                 let operation =
                     git_activity_operation(name).expect("matched Git activity operation");
                 match operation {
@@ -1185,6 +1202,15 @@ async fn call_tool_with_local_agent_executable(
                     }
                     ActivityOperation::GitPush => {
                         git_push(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitBranchCreate => {
+                        git_branch_create(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitSwitch => {
+                        git_switch(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitWorktreeAdd => {
+                        git_worktree_add(&args, &session, activity.as_ref()).await
                     }
                     _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
@@ -2335,6 +2361,9 @@ fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
         "git_pull" => Some(ActivityOperation::GitPull),
         "git_push" => Some(ActivityOperation::GitPush),
         "git_push_tag" => Some(ActivityOperation::GitPush),
+        "git_branch_create" => Some(ActivityOperation::GitBranchCreate),
+        "git_switch" => Some(ActivityOperation::GitSwitch),
+        "git_worktree_add" => Some(ActivityOperation::GitWorktreeAdd),
         _ => None,
     }
 }
@@ -2506,6 +2535,388 @@ async fn git_push_tag(
     let command =
         build_git_push_tag_command(&remote, tag, &source_sha, expected_remote_sha.as_deref());
     run_approved_git_command(session, cwd, command, "git_push_tag", activity).await
+}
+
+async fn git_branch_create(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("missing or non-string branch")?;
+    validate_git_branch_name(session, &cwd, branch).await?;
+    ensure_local_branch_absent(session, &cwd, branch).await?;
+    let base = args.get("base").map(|value| {
+        value
+            .as_str()
+            .context("base must be a string")
+            .map(str::to_owned)
+    });
+    let base = match base.transpose()? {
+        Some(base) => resolve_git_base_commit(session, &cwd, &base).await?,
+        None => resolve_git_base_commit(session, &cwd, "HEAD").await?,
+    };
+    approve_local_git_mutation(
+        session,
+        &cwd,
+        "git_branch_create",
+        format!("branch={branch} base={base}"),
+        activity,
+    )
+    .await?;
+    let command = build_git_branch_create_command(branch, &base);
+    run_git_and_report(session, cwd, command, "Create Git branch", activity).await
+}
+
+async fn git_switch(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("missing or non-string branch")?;
+    validate_git_branch_name(session, &cwd, branch).await?;
+    ensure_local_branch_exists(session, &cwd, branch).await?;
+    approve_local_git_mutation(
+        session,
+        &cwd,
+        "git_switch",
+        format!("branch={branch}"),
+        activity,
+    )
+    .await?;
+    let command = build_git_switch_command(branch);
+    run_git_and_report(session, cwd, command, "Switch Git branch", activity).await
+}
+
+async fn git_worktree_add(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .context("missing or non-string name")?;
+    validate_git_worktree_name(name)?;
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("missing or non-string branch")?;
+    validate_git_branch_name(session, &cwd, branch).await?;
+    let destination = git_worktree_destination(&repository_root, name)?;
+    ensure_git_worktree_destination_available(&repository_root, &destination)?;
+
+    let base = args.get("base").map(|value| {
+        value
+            .as_str()
+            .context("base must be a string")
+            .map(str::to_owned)
+    });
+    let (command, action) = match base.transpose()? {
+        Some(base) => {
+            ensure_local_branch_absent(session, &cwd, branch).await?;
+            let base = resolve_git_base_commit(session, &cwd, &base).await?;
+            (
+                build_git_worktree_add_create_command(&destination, branch, &base),
+                format!("name={name} branch={branch} base={base}"),
+            )
+        }
+        None => {
+            ensure_local_branch_exists(session, &cwd, branch).await?;
+            (
+                build_git_worktree_add_existing_command(&destination, branch),
+                format!("name={name} branch={branch}"),
+            )
+        }
+    };
+    approve_local_git_mutation(session, &cwd, "git_worktree_add", action, activity).await?;
+    ensure_git_worktree_root_exists(&repository_root)?;
+    run_git_worktree_add_and_report(session, cwd, command, "Create Git worktree", activity).await
+}
+
+async fn approve_local_git_mutation(
+    session: &config::Session,
+    cwd: &Path,
+    operation: &str,
+    detail: String,
+    activity: Option<&ActivityScope>,
+) -> Result<()> {
+    request_activity_approval(
+        session,
+        ActivityApprovalRequest {
+            class: approvals::ApprovalClass::LocalStructured,
+            operation,
+            detail,
+            cwd: cwd.to_path_buf(),
+            metadata: BTreeMap::new(),
+            denial: "user denied Git mutation",
+        },
+        activity,
+    )
+    .await
+}
+
+async fn validate_git_branch_name(
+    session: &config::Session,
+    cwd: &Path,
+    branch: &str,
+) -> Result<()> {
+    anyhow::ensure!(!branch.is_empty(), "branch must not be empty");
+    anyhow::ensure!(
+        branch.len() <= MAX_GIT_BRANCH_NAME_BYTES,
+        "branch must be at most {MAX_GIT_BRANCH_NAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !branch.starts_with('-') && !branch.starts_with("refs/"),
+        "branch must be an unqualified local branch name"
+    );
+    anyhow::ensure!(
+        !branch.chars().any(char::is_control),
+        "branch must not contain control characters"
+    );
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "check-ref-format".to_owned(),
+            "--branch".to_owned(),
+            branch.to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "invalid Git branch name");
+    Ok(())
+}
+
+fn validate_git_base_ref(base: &str) -> Result<()> {
+    anyhow::ensure!(!base.is_empty(), "base must not be empty");
+    anyhow::ensure!(
+        base.len() <= MAX_GIT_BASE_REF_BYTES,
+        "base must be at most {MAX_GIT_BASE_REF_BYTES} bytes"
+    );
+    anyhow::ensure!(!base.starts_with('-'), "base must not start with '-'");
+    anyhow::ensure!(
+        base == "HEAD"
+            || base.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+            }),
+        "base must be a repository-local ref or exact object ID"
+    );
+    anyhow::ensure!(
+        !base.contains("..")
+            && !base.contains("//")
+            && !base.contains("@{")
+            && !base.ends_with('/')
+            && !base.ends_with(".lock"),
+        "base contains an unsafe Git revision expression"
+    );
+    Ok(())
+}
+
+async fn resolve_git_base_commit(
+    session: &config::Session,
+    cwd: &Path,
+    base: &str,
+) -> Result<String> {
+    validate_git_base_ref(base)?;
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "--end-of-options".to_owned(),
+            format!("{base}^{{commit}}"),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "base does not resolve to a repository-local commit"
+    );
+    let resolved = output.stdout.trim();
+    validate_git_object_id(resolved, "resolved base")?;
+    Ok(resolved.to_ascii_lowercase())
+}
+
+async fn ensure_local_branch_absent(
+    session: &config::Session,
+    cwd: &Path,
+    branch: &str,
+) -> Result<()> {
+    let output = git_local_branch_probe(session, cwd, branch).await?;
+    anyhow::ensure!(output.status != 0, "local Git branch already exists");
+    Ok(())
+}
+
+async fn ensure_local_branch_exists(
+    session: &config::Session,
+    cwd: &Path,
+    branch: &str,
+) -> Result<()> {
+    let output = git_local_branch_probe(session, cwd, branch).await?;
+    anyhow::ensure!(output.status == 0, "local Git branch does not exist");
+    Ok(())
+}
+
+async fn git_local_branch_probe(
+    session: &config::Session,
+    cwd: &Path,
+    branch: &str,
+) -> Result<sandbox::Output> {
+    run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "show-ref".to_owned(),
+            "--verify".to_owned(),
+            "--quiet".to_owned(),
+            format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+}
+
+fn validate_git_worktree_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "worktree name must not be empty");
+    anyhow::ensure!(
+        name.len() <= MAX_GIT_WORKTREE_NAME_BYTES,
+        "worktree name must be at most {MAX_GIT_WORKTREE_NAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        name != "."
+            && name != ".."
+            && !name.starts_with('-')
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '_' | '-')),
+        "worktree name must be a safe repository-local path component"
+    );
+    Ok(())
+}
+
+fn git_worktree_destination(repository_root: &Path, name: &str) -> Result<PathBuf> {
+    validate_git_worktree_name(name)?;
+    Ok(repository_root.join(".wt").join(name))
+}
+
+fn ensure_git_worktree_destination_available(
+    repository_root: &Path,
+    destination: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        destination.starts_with(repository_root.join(".wt")),
+        "worktree destination escaped the repository-owned .wt root"
+    );
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => anyhow::bail!("worktree destination already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect worktree destination {}",
+                    destination.display()
+                )
+            });
+        }
+    }
+    let root = repository_root.join(".wt");
+    if let Ok(metadata) = std::fs::symlink_metadata(&root) {
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            ".wt must be a normal directory"
+        );
+        let canonical = std::fs::canonicalize(&root)?;
+        anyhow::ensure!(
+            canonical.starts_with(repository_root),
+            ".wt escaped the repository root"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_git_worktree_root_exists(repository_root: &Path) -> Result<()> {
+    let root = repository_root.join(".wt");
+    match std::fs::create_dir(&root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&root)?;
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                ".wt must be a normal directory"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to create {}", root.display())),
+    }
+}
+
+fn build_git_branch_create_command(branch: &str, base_sha: &str) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "branch".to_owned(),
+        "--no-track".to_owned(),
+        branch.to_owned(),
+        base_sha.to_owned(),
+    ]
+}
+
+fn build_git_switch_command(branch: &str) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "switch".to_owned(),
+        "--no-guess".to_owned(),
+        branch.to_owned(),
+    ]
+}
+
+fn build_git_worktree_add_create_command(
+    destination: &Path,
+    branch: &str,
+    base_sha: &str,
+) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "worktree".to_owned(),
+        "add".to_owned(),
+        "-b".to_owned(),
+        branch.to_owned(),
+        destination.to_string_lossy().into_owned(),
+        base_sha.to_owned(),
+    ]
+}
+
+fn build_git_worktree_add_existing_command(destination: &Path, branch: &str) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "worktree".to_owned(),
+        "add".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        branch.to_owned(),
+    ]
 }
 
 fn validate_git_tag_name(tag: &str) -> Result<()> {
@@ -3421,6 +3832,36 @@ async fn run_git_and_report(
     } else {
         let git_roots = sandbox::git_metadata_roots(&cwd)?;
         sandbox::run_git(
+            &command,
+            &cwd,
+            &session.permitted_directories,
+            &git_roots,
+            None,
+        )
+        .await
+    };
+    let result = output.and_then(render_output);
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
+    text_result(result?)
+}
+
+async fn run_git_worktree_add_and_report(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    title: &str,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let rendered_command = render_command(&command);
+    approvals::activity(&session.id, title, Some(rendered_command.clone())).await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let output = if session.yolo() {
+        sandbox::run_unrestricted(&command, &cwd, None).await
+    } else {
+        let git_roots = sandbox::git_metadata_roots(&cwd)?;
+        sandbox::run_git_worktree_add(
             &command,
             &cwd,
             &session.permitted_directories,
@@ -6881,7 +7322,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 49);
+        assert_eq!(tools.len(), 52);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -6903,6 +7344,9 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_pull"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push_tag"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_branch_create"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_switch"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_worktree_add"));
         assert!(
             tools
                 .iter()
@@ -8217,6 +8661,15 @@ mod tests {
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
+    fn run_git_command_fixture(cwd: &Path, command: &[String]) -> std::process::Output {
+        assert_eq!(command.first().map(String::as_str), Some("git"));
+        std::process::Command::new("git")
+            .args(&command[1..])
+            .current_dir(cwd)
+            .output()
+            .unwrap()
+    }
+
     fn git_fixture_stdout(cwd: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
@@ -8299,6 +8752,215 @@ mod tests {
             assert!(!command.iter().any(|argument| argument == "--force"));
             Ok(())
         })
+    }
+
+    #[test]
+    fn structured_git_branch_and_worktree_commands_are_force_free_and_repo_owned() {
+        let repository = tempfile::tempdir().unwrap();
+        let base_sha = "0123456789abcdef0123456789abcdef01234567";
+        for base in [
+            "HEAD",
+            "main",
+            "origin/main",
+            "refs/remotes/origin/main",
+            base_sha,
+        ] {
+            validate_git_base_ref(base).unwrap();
+        }
+        for base in ["", "-main", "HEAD~1", "main^{commit}", "main@{1}", "a..b"] {
+            assert!(validate_git_base_ref(base).is_err(), "{base}");
+        }
+        for name in ["feature", "task-123", "review_1", "r1.2"] {
+            validate_git_worktree_name(name).unwrap();
+        }
+        for name in ["", ".", "..", "-bad", "../bad", "nested/bad", "bad\nname"] {
+            assert!(validate_git_worktree_name(name).is_err(), "{name:?}");
+        }
+
+        let destination = git_worktree_destination(repository.path(), "feature").unwrap();
+        assert_eq!(destination, repository.path().join(".wt/feature"));
+
+        let branch = build_git_branch_create_command("feature", base_sha);
+        let switch = build_git_switch_command("feature");
+        let create = build_git_worktree_add_create_command(&destination, "feature", base_sha);
+        let existing = build_git_worktree_add_existing_command(&destination, "feature");
+        for command in [&branch, &switch, &create, &existing] {
+            assert_eq!(command.first().map(String::as_str), Some("git"));
+            for forbidden in ["--force", "-f", "-B", "reset", "stash"] {
+                assert!(
+                    !command.iter().any(|argument| argument == forbidden),
+                    "forbidden argument {forbidden} in {command:?}"
+                );
+            }
+        }
+        assert_eq!(branch[3], "branch");
+        assert_eq!(branch[4], "--no-track");
+        assert_eq!(switch[3], "switch");
+        assert_eq!(switch[4], "--no-guess");
+        assert_eq!(create[3], "worktree");
+        assert_eq!(create[4], "add");
+        assert_eq!(create[5], "-b");
+        assert_eq!(existing[5], destination.to_string_lossy());
+        assert_eq!(existing[6], "feature");
+    }
+
+    #[test]
+    fn generated_git_worktree_destinations_stay_under_repo_owned_root() -> noprop::TestResult {
+        test_support::run(0x4757_4f52_4b54_5245, 1024, |ctx| {
+            let repository =
+                PathBuf::from(format!("/tmp/repository-{:016x}", noprop::sample_u64(ctx)));
+            let name = format!("task-{:016x}", noprop::sample_u64(ctx));
+            let branch = format!("feature/{:016x}", noprop::sample_u64(ctx));
+            validate_git_worktree_name(&name).unwrap();
+            let destination = git_worktree_destination(&repository, &name).unwrap();
+            assert!(destination.starts_with(repository.join(".wt")));
+            let command = build_git_worktree_add_existing_command(&destination, &branch);
+            assert_eq!(command[5], destination.to_string_lossy());
+            assert_eq!(command[6], branch);
+            assert!(!command.iter().any(|argument| argument == "--force"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn structured_git_commands_preserve_dirty_worktree_and_create_linked_worktree() {
+        let repository = tempfile::tempdir().unwrap();
+        run_git_fixture(repository.path(), &["init", "--quiet"]);
+        run_git_fixture(repository.path(), &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            repository.path(),
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(repository.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_fixture(repository.path(), &["add", "tracked.txt"]);
+        run_git_fixture(repository.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(repository.path(), &["branch", "-M", "main"]);
+        let base_sha = git_fixture_stdout(repository.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::write(repository.path().join("untracked.txt"), "keep me\n").unwrap();
+        let create_branch = build_git_branch_create_command("feature", &base_sha);
+        let output = run_git_command_fixture(repository.path(), &create_branch);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            git_fixture_stdout(repository.path(), &["branch", "--show-current"]),
+            "main"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
+
+        let switch = build_git_switch_command("feature");
+        let output = run_git_command_fixture(repository.path(), &switch);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            git_fixture_stdout(repository.path(), &["branch", "--show-current"]),
+            "feature"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
+
+        run_git_fixture(repository.path(), &["switch", "--quiet", "main"]);
+        let worktree_root = repository.path().join(".wt");
+        std::fs::create_dir(&worktree_root).unwrap();
+        let destination = worktree_root.join("review");
+        let add = build_git_worktree_add_create_command(&destination, "review", &base_sha);
+        let output = run_git_command_fixture(repository.path(), &add);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            git_fixture_stdout(&destination, &["branch", "--show-current"]),
+            "review"
+        );
+        assert_eq!(
+            git_fixture_stdout(&destination, &["rev-parse", "HEAD"]),
+            base_sha
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn structured_git_switch_refuses_conflicting_dirty_change_without_discarding_it() {
+        let repository = tempfile::tempdir().unwrap();
+        run_git_fixture(repository.path(), &["init", "--quiet"]);
+        run_git_fixture(repository.path(), &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            repository.path(),
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(repository.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_fixture(repository.path(), &["add", "tracked.txt"]);
+        run_git_fixture(repository.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(repository.path(), &["branch", "-M", "main"]);
+        run_git_fixture(repository.path(), &["switch", "--quiet", "-c", "feature"]);
+        std::fs::write(repository.path().join("tracked.txt"), "feature\n").unwrap();
+        run_git_fixture(repository.path(), &["add", "tracked.txt"]);
+        run_git_fixture(repository.path(), &["commit", "--quiet", "-m", "feature"]);
+        run_git_fixture(repository.path(), &["switch", "--quiet", "main"]);
+
+        std::fs::write(repository.path().join("tracked.txt"), "dirty-main\n").unwrap();
+        let command = build_git_switch_command("feature");
+        let output = run_git_command_fixture(repository.path(), &command);
+        assert!(!output.status.success());
+        assert_eq!(
+            git_fixture_stdout(repository.path(), &["branch", "--show-current"]),
+            "main"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("tracked.txt")).unwrap(),
+            "dirty-main\n"
+        );
+    }
+
+    #[test]
+    fn structured_git_worktree_can_attach_an_existing_local_branch() {
+        let repository = tempfile::tempdir().unwrap();
+        run_git_fixture(repository.path(), &["init", "--quiet"]);
+        run_git_fixture(repository.path(), &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            repository.path(),
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(repository.path().join("tracked.txt"), "base\n").unwrap();
+        run_git_fixture(repository.path(), &["add", "tracked.txt"]);
+        run_git_fixture(repository.path(), &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(repository.path(), &["branch", "-M", "main"]);
+        run_git_fixture(repository.path(), &["branch", "review"]);
+
+        let worktree_root = repository.path().join(".wt");
+        std::fs::create_dir(&worktree_root).unwrap();
+        let destination = worktree_root.join("review");
+        let command = build_git_worktree_add_existing_command(&destination, "review");
+        let output = run_git_command_fixture(repository.path(), &command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            git_fixture_stdout(&destination, &["branch", "--show-current"]),
+            "review"
+        );
+        assert_eq!(
+            git_fixture_stdout(&destination, &["rev-parse", "HEAD"]),
+            git_fixture_stdout(repository.path(), &["rev-parse", "main"])
+        );
     }
 
     #[test]
@@ -8758,6 +9420,9 @@ mod tests {
             ("git_pull", ActivityOperation::GitPull),
             ("git_push", ActivityOperation::GitPush),
             ("git_push_tag", ActivityOperation::GitPush),
+            ("git_branch_create", ActivityOperation::GitBranchCreate),
+            ("git_switch", ActivityOperation::GitSwitch),
+            ("git_worktree_add", ActivityOperation::GitWorktreeAdd),
         ] {
             assert_eq!(git_activity_operation(name), Some(expected));
         }

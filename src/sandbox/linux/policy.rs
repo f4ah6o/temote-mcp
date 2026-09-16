@@ -27,6 +27,20 @@ const GIT_READ_ONLY_PATHS: &[&str] = &[
     "objects/pack",
 ];
 
+const GIT_WORKTREE_ADD_READ_ONLY_PATHS: &[&str] = &[
+    "config",
+    "hooks",
+    "info",
+    "attributes",
+    "description",
+    "packed-refs",
+    "shallow",
+    "refs/tags",
+    "refs/remotes",
+    "objects/info",
+    "objects/pack",
+];
+
 /// Network modes supported by the Temote Linux helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,7 +87,21 @@ impl LinuxSandboxPolicy {
         writable_roots: &[PathBuf],
         git_metadata_roots: &[PathBuf],
     ) -> Result<Self> {
-        Self::for_scoped_command(cwd, writable_roots, git_metadata_roots)
+        Self::for_scoped_command(cwd, writable_roots, git_metadata_roots, None)
+    }
+
+    pub fn for_git_worktree_add(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        git_metadata_roots: &[PathBuf],
+        protected_worktree_roots: &[PathBuf],
+    ) -> Result<Self> {
+        Self::for_scoped_command(
+            cwd,
+            writable_roots,
+            git_metadata_roots,
+            Some(protected_worktree_roots),
+        )
     }
 
     /// Developer-tool profile: the same workspace/state containment as
@@ -84,7 +112,7 @@ impl LinuxSandboxPolicy {
         writable_roots: &[PathBuf],
         network_access: bool,
     ) -> Result<Self> {
-        let mut policy = Self::for_scoped_command(cwd, writable_roots, &[])?;
+        let mut policy = Self::for_scoped_command(cwd, writable_roots, &[], None)?;
         if network_access {
             policy.network = LinuxNetworkPolicy::LocalAgent;
         }
@@ -95,6 +123,7 @@ impl LinuxSandboxPolicy {
         cwd: &Path,
         writable_roots: &[PathBuf],
         git_metadata_roots: &[PathBuf],
+        protected_worktree_roots: Option<&[PathBuf]>,
     ) -> Result<Self> {
         let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
         let mut writable = vec![cwd.clone()];
@@ -139,15 +168,33 @@ impl LinuxSandboxPolicy {
             }
         }
 
+        let mut common_git_roots = Vec::new();
         for git_root in &canonical_git_roots {
             if is_linked_worktree_metadata_root(git_root) {
                 read_only_paths.extend([git_root.join("gitdir"), git_root.join("commondir")]);
             } else {
-                read_only_paths.extend(
+                common_git_roots.push(git_root.clone());
+                let protected_paths = if protected_worktree_roots.is_some() {
+                    GIT_WORKTREE_ADD_READ_ONLY_PATHS
+                } else {
                     GIT_READ_ONLY_PATHS
-                        .iter()
-                        .map(|suffix| git_root.join(suffix)),
+                };
+                read_only_paths.extend(protected_paths.iter().map(|suffix| git_root.join(suffix)));
+            }
+        }
+
+        if let Some(protected_worktree_roots) = protected_worktree_roots {
+            for protected in protected_worktree_roots {
+                let protected =
+                    canonical_existing_directory(protected, "protected worktree metadata root")?;
+                anyhow::ensure!(
+                    common_git_roots.iter().any(|common| {
+                        protected.parent() == Some(common.join("worktrees").as_path())
+                    }),
+                    "protected worktree metadata root is not a direct child of a validated common Git worktrees directory: {}",
+                    protected.display()
                 );
+                read_only_paths.push(protected);
             }
         }
 
@@ -771,6 +818,33 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn worktree_add_policy_opens_parent_but_masks_existing_sibling_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("workspace");
+        let git = cwd.join(".git");
+        let sibling = git.join("worktrees").join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
+        let git = std::fs::canonicalize(&git).unwrap();
+        let sibling = std::fs::canonicalize(&sibling).unwrap();
+
+        let policy = LinuxSandboxPolicy::for_git_worktree_add(
+            &cwd,
+            std::slice::from_ref(&cwd),
+            std::slice::from_ref(&git),
+            std::slice::from_ref(&sibling),
+        )
+        .unwrap();
+
+        assert!(policy.validate().is_ok());
+        assert!(policy.writable_roots.contains(&git));
+        assert!(!policy.read_only_paths.contains(&git.join("worktrees")));
+        assert!(policy.read_only_paths.contains(&sibling));
+        assert!(policy.read_only_paths.contains(&git.join("config")));
+        assert!(policy.read_only_paths.contains(&git.join("hooks")));
     }
 
     #[test]

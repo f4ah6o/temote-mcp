@@ -855,6 +855,121 @@
     },
     {
       "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "branch": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch"
+        ],
+        "type": "object"
+      },
+      "name": "git_branch_create"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch"
+        ],
+        "type": "object"
+      },
+      "name": "git_switch"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "branch": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "name",
+          "branch"
+        ],
+        "type": "object"
+      },
+      "name": "git_worktree_add"
+    },
+    {
+      "annotations": {
         "destructiveHint": true,
         "idempotentHint": false,
         "openWorldHint": true,

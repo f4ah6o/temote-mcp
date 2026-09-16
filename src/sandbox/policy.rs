@@ -19,6 +19,20 @@ const GIT_READ_ONLY_PATHS: &[&str] = &[
     "objects/pack",
 ];
 
+const GIT_WORKTREE_ADD_READ_ONLY_PATHS: &[&str] = &[
+    "config",
+    "hooks",
+    "info",
+    "attributes",
+    "description",
+    "packed-refs",
+    "shallow",
+    "refs/tags",
+    "refs/remotes",
+    "objects/info",
+    "objects/pack",
+];
+
 #[derive(Debug, Clone)]
 pub(super) struct SandboxSpec {
     writable_roots: Vec<PathBuf>,
@@ -241,6 +255,47 @@ impl SandboxSpec {
         Ok(spec)
     }
 
+    pub(super) fn git_worktree_add(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        git_metadata_roots: &[PathBuf],
+        protected_worktree_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let mut spec = Self::command(cwd, writable_roots)?;
+        let mut common_git_roots = Vec::new();
+        for root in git_metadata_roots {
+            let root = canonical_existing_root(root)?;
+            spec.writable_roots.push(root.clone());
+            spec.discovered_protected_metadata_paths
+                .retain(|path| path != &root);
+            if root.join("gitdir").is_file() {
+                spec.read_only_overrides.push(root.join("gitdir"));
+                spec.read_only_overrides.push(root.join("commondir"));
+            } else {
+                common_git_roots.push(root.clone());
+                spec.read_only_overrides.extend(
+                    GIT_WORKTREE_ADD_READ_ONLY_PATHS
+                        .iter()
+                        .map(|suffix| root.join(suffix)),
+                );
+            }
+        }
+        for protected in protected_worktree_roots {
+            let protected = canonical_existing_root(protected)?;
+            anyhow::ensure!(
+                common_git_roots.iter().any(|common| {
+                    protected.parent() == Some(common.join("worktrees").as_path())
+                }),
+                "protected worktree metadata root is not a direct child of a validated common Git worktrees directory: {}",
+                protected.display()
+            );
+            spec.read_only_overrides.push(protected);
+        }
+        normalize_roots(&mut spec.writable_roots);
+        normalize_paths(&mut spec.read_only_overrides);
+        Ok(spec)
+    }
+
     pub(super) fn writable_roots(&self) -> &[PathBuf] {
         &self.writable_roots
     }
@@ -433,5 +488,30 @@ mod tests {
         assert!(spec.read_only_overrides().contains(&git.join("hooks")));
         assert!(!spec.read_only_overrides().contains(&git.join("index")));
         assert!(!spec.read_only_overrides().contains(&git.join("objects")));
+    }
+
+    #[test]
+    fn git_worktree_add_spec_opens_parent_but_masks_existing_sibling_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let git = workspace.join(".git");
+        let sibling = git.join("worktrees").join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let spec = SandboxSpec::git_worktree_add(
+            &workspace,
+            std::slice::from_ref(&workspace),
+            std::slice::from_ref(&git),
+            std::slice::from_ref(&sibling),
+        )
+        .unwrap();
+
+        let git = std::fs::canonicalize(&git).unwrap();
+        let sibling = std::fs::canonicalize(&sibling).unwrap();
+        assert!(spec.writable_roots().contains(&git));
+        assert!(!spec.read_only_overrides().contains(&git.join("worktrees")));
+        assert!(spec.read_only_overrides().contains(&sibling));
+        assert!(spec.read_only_overrides().contains(&git.join("config")));
+        assert!(spec.read_only_overrides().contains(&git.join("hooks")));
     }
 }

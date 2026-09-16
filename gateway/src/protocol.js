@@ -452,6 +452,51 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "git_branch_create",
+    "Create a local Git branch",
+    "Create one validated local branch without switching the current worktree.",
+    { ...mutation, destructiveHint: false },
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        branch: { type: "string", minLength: 1, maxLength: 255 },
+        base: { type: "string", minLength: 1, maxLength: 512 },
+      },
+      ["session_id", "branch"],
+    ),
+  ),
+  tool(
+    "git_switch",
+    "Switch to an existing local Git branch",
+    "Switch the current worktree without force/reset/stash.",
+    mutation,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        branch: { type: "string", minLength: 1, maxLength: 255 },
+      },
+      ["session_id", "branch"],
+    ),
+  ),
+  tool(
+    "git_worktree_add",
+    "Create a repository-owned Git worktree",
+    "Create a linked worktree only at <repository>/.wt/<name>.",
+    { ...mutation, destructiveHint: false },
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        name: { type: "string", minLength: 1, maxLength: 64 },
+        branch: { type: "string", minLength: 1, maxLength: 255 },
+        base: { type: "string", minLength: 1, maxLength: 512 },
+      },
+      ["session_id", "name", "branch"],
+    ),
+  ),
+  tool(
     "github_workflow_dispatch",
     "Dispatch a GitHub Actions workflow",
     "Dispatch one workflow/ref pair using the configured repository's managed Git credential mapping.",

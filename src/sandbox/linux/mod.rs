@@ -25,6 +25,27 @@ pub fn command(
     Ok(process)
 }
 
+pub fn git_worktree_add_command(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    git_metadata_roots: &[PathBuf],
+    protected_worktree_roots: &[PathBuf],
+) -> Result<Command> {
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+    let policy = LinuxSandboxPolicy::for_git_worktree_add(
+        cwd,
+        writable_roots,
+        git_metadata_roots,
+        protected_worktree_roots,
+    )?;
+    let executable = helper_executable()?;
+    let args = helper::command_args(&policy, command)?;
+    let mut process = Command::new(executable);
+    process.args(args);
+    Ok(process)
+}
+
 pub fn developer_tool_command(
     command: &[String],
     cwd: &Path,
