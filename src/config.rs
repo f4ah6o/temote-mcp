@@ -524,7 +524,11 @@ pub async fn forget_session_artifacts(id: &str) -> Result<ForgottenSessionArtifa
     })
 }
 
-async fn remove_owned_session_entry(path: &Path, kind: &str, allow_socket: bool) -> Result<bool> {
+pub(crate) async fn remove_owned_session_entry(
+    path: &Path,
+    kind: &str,
+    allow_socket: bool,
+) -> Result<bool> {
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),

@@ -126,6 +126,11 @@ enum ControlRequest {
     Forget {
         session_id: String,
     },
+    Gc {
+        #[serde(default)]
+        apply: bool,
+        limit: usize,
+    },
     Restart {
         session_id: String,
         #[serde(default)]
@@ -218,6 +223,8 @@ pub(crate) struct SessionMetadataDiagnostics {
     pub retained_terminal_count: usize,
     pub safely_prunable_count: usize,
     pub invalid_orphan_count: usize,
+    pub missing_json_count: usize,
+    pub missing_state_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +238,56 @@ struct TerminalMetadataCandidate {
 struct RetentionPlan {
     diagnostics: SessionMetadataDiagnostics,
     prune_candidates: Vec<TerminalMetadataCandidate>,
+}
+
+/// Grace period before a lone metadata half is considered an orphan rather
+/// than a partial durable write or an in-flight lifecycle transition.
+pub(crate) const SESSION_ORPHAN_GRACE_SECONDS: u64 = 24 * 60 * 60;
+pub(crate) const MAX_SESSION_GC_LIMIT: usize = 1000;
+pub(crate) const SESSION_GC_MIN_LIMIT: usize = 1;
+
+/// Initial reviewed orphan classes eligible for maintenance GC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionGcReason {
+    /// Only the `.state` lifecycle half exists.
+    MissingJson,
+    /// Only the `.json` metadata half exists.
+    MissingState,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionGcEntry {
+    pub session_id: String,
+    pub reason: SessionGcReason,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionGcReport {
+    pub dry_run: bool,
+    pub grace_seconds: u64,
+    pub limit: usize,
+    pub missing_json_orphans: usize,
+    pub missing_state_orphans: usize,
+    pub ineligible_orphans: usize,
+    pub candidates: Vec<SessionGcEntry>,
+    pub removed: Vec<SessionGcEntry>,
+    pub skipped: Vec<SessionGcEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SessionGcCandidate {
+    id: String,
+    reason: SessionGcReason,
+    modified_secs: u64,
+    kind: &'static str,
+}
+
+#[derive(Debug)]
+struct SessionGcPlan {
+    report: SessionGcReport,
+    candidates: Vec<SessionGcCandidate>,
 }
 
 #[derive(Clone)]
@@ -876,6 +933,11 @@ pub async fn forget(session_id: String) -> Result<()> {
     print_json(&result)
 }
 
+pub async fn gc(apply: bool, limit: usize) -> Result<()> {
+    let result = request(ControlRequest::Gc { apply, limit }).await?;
+    print_json(&result)
+}
+
 pub async fn restart(session_id: String) -> Result<()> {
     let result = request(ControlRequest::Restart {
         session_id,
@@ -1136,6 +1198,9 @@ async fn dispatch_request(
         }
         ControlRequest::Forget { session_id } => Ok(serde_json::to_value(
             supervisor.forget_session(&session_id).await?,
+        )?),
+        ControlRequest::Gc { apply, limit } => Ok(serde_json::to_value(
+            supervisor.gc_session_metadata(!apply, limit).await?,
         )?),
         ControlRequest::Restart {
             session_id,
@@ -3783,7 +3848,22 @@ async fn build_retention_plan(owned: &HashSet<String>) -> Result<RetentionPlan> 
 
     let mut terminal = Vec::new();
     for (id, (has_json, has_state)) in pairs {
-        if !has_json || !has_state || config::validate_session_id(&id).is_err() {
+        if !has_json || !has_state {
+            diagnostics.invalid_orphan_count = diagnostics.invalid_orphan_count.saturating_add(1);
+            match (has_json, has_state) {
+                (false, true) => {
+                    diagnostics.missing_json_count =
+                        diagnostics.missing_json_count.saturating_add(1);
+                }
+                (true, false) => {
+                    diagnostics.missing_state_count =
+                        diagnostics.missing_state_count.saturating_add(1);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if config::validate_session_id(&id).is_err() {
             diagnostics.invalid_orphan_count = diagnostics.invalid_orphan_count.saturating_add(1);
             continue;
         }
@@ -3924,6 +4004,269 @@ async fn prune_terminal_metadata_pair(id: &str) -> Result<()> {
         .await
         .with_context(|| format!("failed to prune terminal metadata for {id}"))?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionGcPresence {
+    json: bool,
+    state: bool,
+    json_regular_secs: Option<u64>,
+    state_regular_secs: Option<u64>,
+}
+
+/// Modification time of a regular file only; symlinks, directories, sockets,
+/// and special files yield `None` so they are never GC candidates.
+async fn regular_file_modified_secs(path: &Path) -> Result<Option<u64>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("cannot read modification time for {}", path.display()))?;
+    let secs = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => return Ok(Some(0)),
+    };
+    Ok(Some(secs))
+}
+
+/// Whether the lone half may be removed: lifecycle halves must be terminal,
+/// metadata halves must be readable with a matching ID, and the session socket
+/// must not answer a liveness probe.
+async fn session_gc_orphan_is_safe(id: &str, reason: SessionGcReason) -> Result<bool> {
+    match reason {
+        SessionGcReason::MissingJson => {
+            let lifecycle = match config::read_session_lifecycle(id).await {
+                Ok(Some(lifecycle)) => lifecycle,
+                _ => return Ok(false),
+            };
+            if !matches!(
+                lifecycle.status,
+                LifecycleStatus::Stopped | LifecycleStatus::Crashed
+            ) || lifecycle.stopped_at.is_none()
+            {
+                return Ok(false);
+            }
+        }
+        SessionGcReason::MissingState => {
+            if config::read_session_metadata(id).await.is_err() {
+                return Ok(false);
+            }
+        }
+    }
+    match config::session_is_active(id).await {
+        Ok(false) => Ok(true),
+        Ok(true) | Err(_) => Ok(false),
+    }
+}
+
+/// Build the dry-run plan for the initial reviewed orphan classes
+/// (`missing_json`, `missing_state`).
+///
+/// Only lone regular-file halves older than the grace period are eligible.
+/// Live, supervisor-owned, upgrade-protected, symlinked, special-file,
+/// ID-mismatched, and malformed entries are excluded. Ordering is deterministic
+/// (oldest modification first, then ID) so the bounded limit is stable.
+async fn build_session_gc_plan(owned: &HashSet<String>, limit: usize) -> Result<SessionGcPlan> {
+    let protected = protected_upgrade_session_ids()?;
+    let mut report = SessionGcReport {
+        dry_run: true,
+        grace_seconds: SESSION_ORPHAN_GRACE_SECONDS,
+        limit,
+        missing_json_orphans: 0,
+        missing_state_orphans: 0,
+        ineligible_orphans: 0,
+        candidates: Vec::new(),
+        removed: Vec::new(),
+        skipped: Vec::new(),
+        truncated: false,
+    };
+    let directory = config::sessions_dir()?;
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SessionGcPlan {
+                report,
+                candidates: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error).context("failed to read session metadata directory"),
+    };
+    let now = config::unix_time();
+    let grace_cutoff = now.saturating_sub(SESSION_ORPHAN_GRACE_SECONDS);
+    let mut presence: HashMap<String, SessionGcPresence> = HashMap::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let modified = regular_file_modified_secs(&path).await?;
+        let slot = presence.entry(id.to_owned()).or_default();
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("json") => {
+                slot.json = true;
+                slot.json_regular_secs = modified;
+            }
+            Some("state") => {
+                slot.state = true;
+                slot.state_regular_secs = modified;
+            }
+            _ => {}
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (id, presence) in presence {
+        let reason = match (presence.json, presence.state) {
+            (true, false) => SessionGcReason::MissingState,
+            (false, true) => SessionGcReason::MissingJson,
+            _ => continue,
+        };
+        match reason {
+            SessionGcReason::MissingJson => {
+                report.missing_json_orphans = report.missing_json_orphans.saturating_add(1);
+            }
+            SessionGcReason::MissingState => {
+                report.missing_state_orphans = report.missing_state_orphans.saturating_add(1);
+            }
+        }
+        let (modified_secs, kind) = match reason {
+            SessionGcReason::MissingJson => (presence.state_regular_secs, "lifecycle"),
+            SessionGcReason::MissingState => (presence.json_regular_secs, "metadata"),
+        };
+        let Some(modified_secs) = modified_secs else {
+            report.ineligible_orphans = report.ineligible_orphans.saturating_add(1);
+            continue;
+        };
+        if modified_secs > grace_cutoff {
+            report.ineligible_orphans = report.ineligible_orphans.saturating_add(1);
+            continue;
+        }
+        if config::validate_session_id(&id).is_err() {
+            report.ineligible_orphans = report.ineligible_orphans.saturating_add(1);
+            continue;
+        }
+        if owned.contains(&id) || protected.contains(&id) {
+            report.ineligible_orphans = report.ineligible_orphans.saturating_add(1);
+            continue;
+        }
+        if !session_gc_orphan_is_safe(&id, reason).await? {
+            report.ineligible_orphans = report.ineligible_orphans.saturating_add(1);
+            continue;
+        }
+        candidates.push(SessionGcCandidate {
+            id,
+            reason,
+            modified_secs,
+            kind,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.modified_secs
+            .cmp(&right.modified_secs)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    report.truncated = candidates.len() > limit;
+    let candidates = candidates.into_iter().take(limit).collect::<Vec<_>>();
+    report.candidates = candidates
+        .iter()
+        .map(|candidate| SessionGcEntry {
+            session_id: candidate.id.clone(),
+            reason: candidate.reason,
+        })
+        .collect();
+    Ok(SessionGcPlan { report, candidates })
+}
+
+/// Re-check one planned candidate immediately before deletion. Any drift (the
+/// counterpart appeared, the file was replaced or touched, the session became
+/// live or owned, a restore plan appeared) skips the candidate instead of
+/// failing the whole run.
+async fn revalidate_session_gc_candidate(
+    owned: &HashSet<String>,
+    candidate: &SessionGcCandidate,
+) -> Result<bool> {
+    if owned.contains(&candidate.id) {
+        return Ok(false);
+    }
+    if protected_upgrade_session_ids()?.contains(&candidate.id) {
+        return Ok(false);
+    }
+    let (orphan_path, counterpart_path) = match candidate.reason {
+        SessionGcReason::MissingJson => (
+            config::session_lifecycle_path(&candidate.id)?,
+            config::session_path(&candidate.id)?,
+        ),
+        SessionGcReason::MissingState => (
+            config::session_path(&candidate.id)?,
+            config::session_lifecycle_path(&candidate.id)?,
+        ),
+    };
+    match tokio::fs::symlink_metadata(&counterpart_path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Ok(false),
+    }
+    if regular_file_modified_secs(&orphan_path).await? != Some(candidate.modified_secs) {
+        return Ok(false);
+    }
+    session_gc_orphan_is_safe(&candidate.id, candidate.reason).await
+}
+
+/// Apply a previously built plan under the caller's supervisor transition lock.
+async fn apply_session_gc_plan(
+    owned: &HashSet<String>,
+    plan: &SessionGcPlan,
+) -> Result<(Vec<SessionGcEntry>, Vec<SessionGcEntry>)> {
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    for candidate in &plan.candidates {
+        let entry = SessionGcEntry {
+            session_id: candidate.id.clone(),
+            reason: candidate.reason,
+        };
+        if !revalidate_session_gc_candidate(owned, candidate).await? {
+            skipped.push(entry);
+            continue;
+        }
+        let path = match candidate.reason {
+            SessionGcReason::MissingJson => config::session_lifecycle_path(&candidate.id)?,
+            SessionGcReason::MissingState => config::session_path(&candidate.id)?,
+        };
+        if config::remove_owned_session_entry(&path, candidate.kind, false).await? {
+            removed.push(entry);
+        } else {
+            skipped.push(entry);
+        }
+    }
+    Ok((removed, skipped))
+}
+
+/// Build and optionally apply a session orphan GC plan.
+pub(crate) async fn run_session_gc(
+    owned: &HashSet<String>,
+    dry_run: bool,
+    limit: usize,
+) -> Result<SessionGcReport> {
+    anyhow::ensure!(
+        (SESSION_GC_MIN_LIMIT..=MAX_SESSION_GC_LIMIT).contains(&limit),
+        "session gc limit must be between {SESSION_GC_MIN_LIMIT} and {MAX_SESSION_GC_LIMIT}"
+    );
+    let plan = build_session_gc_plan(owned, limit).await?;
+    let mut report = plan.report.clone();
+    report.dry_run = dry_run;
+    if !dry_run {
+        let (removed, skipped) = apply_session_gc_plan(owned, &plan).await?;
+        report.removed = removed;
+        report.skipped = skipped;
+    }
+    Ok(report)
 }
 
 fn status_name(status: LifecycleStatus) -> &'static str {
@@ -5877,5 +6220,432 @@ mod tests {
             validate_planned_upgrade_session_identities(&planned, &replacement, true).unwrap_err();
         assert!(error.to_string().contains("session instance changed"));
         validate_planned_upgrade_session_identities(&planned, &replacement, false).unwrap();
+    }
+
+    const GC_TEST_CWD: &str = "/tmp";
+    static GC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn gc_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        GC_TEST_LOCK.lock().await
+    }
+
+    fn gc_test_id(prefix: &str) -> String {
+        format!("{prefix}-{}", Uuid::new_v4())
+    }
+
+    async fn cleanup_gc_paths(ids: &[String]) {
+        for id in ids {
+            if let Ok(path) = config::session_path(id) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            if let Ok(path) = config::session_lifecycle_path(id) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            if let Ok(path) = config::socket_path(id) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+    }
+
+    async fn write_gc_metadata(id: &str) -> PathBuf {
+        let cwd = config::canonical_directory(Path::new(GC_TEST_CWD)).unwrap();
+        let session = config::Session {
+            id: id.to_owned(),
+            cwd,
+            permitted_directories: vec![PathBuf::from(GC_TEST_CWD)],
+            started_at: 10,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        config::save_session(&session).await.unwrap();
+        config::session_path(id).unwrap()
+    }
+
+    async fn write_gc_terminal_lifecycle(id: &str, stopped_at: u64) -> PathBuf {
+        let mut lifecycle = SessionLifecycle::starting(10, None);
+        lifecycle.status = LifecycleStatus::Stopped;
+        lifecycle.stopped_at = Some(stopped_at);
+        config::save_session_lifecycle(id, &lifecycle)
+            .await
+            .unwrap();
+        config::session_lifecycle_path(id).unwrap()
+    }
+
+    fn backdate_file(path: &Path, age_secs: u64) {
+        let modified = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(age_secs))
+            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+
+    async fn spawn_active_session_socket(id: &str) -> tokio::task::JoinHandle<()> {
+        let path = config::socket_path(id).unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut line = String::new();
+                let mut reader = BufReader::new(&mut stream);
+                if reader.read_line(&mut line).await.is_ok() {
+                    let _ = stream.write_all(b"active\n").await;
+                }
+            }
+        })
+    }
+
+    struct GcFixture {
+        missing_json: String,
+        missing_state: String,
+        owned: String,
+        live: String,
+        pair: String,
+        fresh: String,
+        symlinked: String,
+        malformed: String,
+        mismatched: String,
+    }
+
+    impl GcFixture {
+        fn all_ids(&self) -> Vec<String> {
+            vec![
+                self.missing_json.clone(),
+                self.missing_state.clone(),
+                self.owned.clone(),
+                self.live.clone(),
+                self.pair.clone(),
+                self.fresh.clone(),
+                self.symlinked.clone(),
+                self.malformed.clone(),
+                self.mismatched.clone(),
+            ]
+        }
+    }
+
+    async fn gc_fixture() -> GcFixture {
+        let old = SESSION_ORPHAN_GRACE_SECONDS + 3600;
+        let missing_json = gc_test_id("gc-missing-json");
+        let state = write_gc_terminal_lifecycle(&missing_json, 20).await;
+        backdate_file(&state, old);
+
+        let missing_state = gc_test_id("gc-missing-state");
+        let metadata = write_gc_metadata(&missing_state).await;
+        backdate_file(&metadata, old);
+
+        let owned = gc_test_id("gc-owned");
+        let owned_state = write_gc_terminal_lifecycle(&owned, 20).await;
+        backdate_file(&owned_state, old);
+
+        let live = gc_test_id("gc-live");
+        let live_state = write_gc_terminal_lifecycle(&live, 20).await;
+        backdate_file(&live_state, old);
+
+        let pair = gc_test_id("gc-pair");
+        let pair_metadata = write_gc_metadata(&pair).await;
+        let pair_state = write_gc_terminal_lifecycle(&pair, 20).await;
+        backdate_file(&pair_metadata, old);
+        backdate_file(&pair_state, old);
+
+        let fresh = gc_test_id("gc-fresh");
+        let _fresh_state = write_gc_terminal_lifecycle(&fresh, 20).await;
+
+        let symlinked = gc_test_id("gc-symlink");
+        let symlink_path = config::session_path(&symlinked).unwrap();
+        std::os::unix::fs::symlink(&pair_metadata, &symlink_path).unwrap();
+
+        let malformed = gc_test_id("gc-malformed");
+        let malformed_state = config::session_lifecycle_path(&malformed).unwrap();
+        std::fs::write(&malformed_state, b"not json").unwrap();
+        backdate_file(&malformed_state, old);
+
+        let mismatched = gc_test_id("gc-mismatch");
+        let mismatched_metadata = config::session_path(&mismatched).unwrap();
+        let foreign = config::Session {
+            id: gc_test_id("gc-foreign"),
+            cwd: config::canonical_directory(Path::new(GC_TEST_CWD)).unwrap(),
+            permitted_directories: vec![PathBuf::from(GC_TEST_CWD)],
+            started_at: 10,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        std::fs::write(&mismatched_metadata, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        backdate_file(&mismatched_metadata, old);
+
+        GcFixture {
+            missing_json,
+            missing_state,
+            owned,
+            live,
+            pair,
+            fresh,
+            symlinked,
+            malformed,
+            mismatched,
+        }
+    }
+
+    fn gc_candidate_ids(entries: &[SessionGcEntry]) -> BTreeSet<String> {
+        entries
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_gc_dry_run_reports_reviewed_orphans_and_mutates_nothing() {
+        let _guard = gc_test_lock().await;
+        let fixture = gc_fixture().await;
+        let live_socket = spawn_active_session_socket(&fixture.live).await;
+        let mut owned = HashSet::new();
+        owned.insert(fixture.owned.clone());
+
+        let report = run_session_gc(&owned, true, 100).await.unwrap();
+
+        let candidates = gc_candidate_ids(&report.candidates);
+        assert!(candidates.contains(&fixture.missing_json));
+        assert!(candidates.contains(&fixture.missing_state));
+        for excluded in [
+            &fixture.owned,
+            &fixture.live,
+            &fixture.pair,
+            &fixture.fresh,
+            &fixture.symlinked,
+            &fixture.malformed,
+            &fixture.mismatched,
+        ] {
+            assert!(
+                !candidates.contains(excluded),
+                "{excluded} must not be eligible"
+            );
+        }
+        assert!(report.dry_run);
+        assert!(report.removed.is_empty());
+        assert!(report.skipped.is_empty());
+        assert!(!report.truncated);
+        assert!(report.missing_json_orphans >= 1);
+        assert!(report.missing_state_orphans >= 1);
+
+        // dry-run leaves every file in place
+        assert!(
+            config::session_lifecycle_path(&fixture.missing_json)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            config::session_path(&fixture.missing_state)
+                .unwrap()
+                .exists()
+        );
+        assert!(!config::session_path(&fixture.owned).unwrap().exists());
+        assert!(
+            config::session_lifecycle_path(&fixture.owned)
+                .unwrap()
+                .exists()
+        );
+        live_socket.abort();
+        cleanup_gc_paths(&fixture.all_ids()).await;
+    }
+
+    #[tokio::test]
+    async fn session_gc_apply_removes_only_reviewed_orphans() {
+        let _guard = gc_test_lock().await;
+        let fixture = gc_fixture().await;
+        let live_socket = spawn_active_session_socket(&fixture.live).await;
+        let mut owned = HashSet::new();
+        owned.insert(fixture.owned.clone());
+
+        let report = run_session_gc(&owned, false, 100).await.unwrap();
+
+        assert!(!report.dry_run);
+        let removed = gc_candidate_ids(&report.removed);
+        assert!(removed.contains(&fixture.missing_json));
+        assert!(removed.contains(&fixture.missing_state));
+        assert!(report.skipped.is_empty());
+
+        assert!(
+            !config::session_lifecycle_path(&fixture.missing_json)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !config::session_path(&fixture.missing_state)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            config::session_lifecycle_path(&fixture.owned)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            config::session_lifecycle_path(&fixture.live)
+                .unwrap()
+                .exists()
+        );
+        assert!(config::session_path(&fixture.pair).unwrap().exists());
+        assert!(
+            config::session_lifecycle_path(&fixture.pair)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            config::session_lifecycle_path(&fixture.fresh)
+                .unwrap()
+                .exists()
+        );
+        assert!(config::session_path(&fixture.symlinked).unwrap().exists());
+        assert!(
+            config::session_lifecycle_path(&fixture.malformed)
+                .unwrap()
+                .exists()
+        );
+        assert!(config::session_path(&fixture.mismatched).unwrap().exists());
+        live_socket.abort();
+        cleanup_gc_paths(&fixture.all_ids()).await;
+    }
+
+    #[tokio::test]
+    async fn session_gc_grace_period_boundary_is_respected() {
+        let _guard = gc_test_lock().await;
+        let inside = gc_test_id("gc-inside-grace");
+        let inside_state = write_gc_terminal_lifecycle(&inside, 20).await;
+        backdate_file(
+            &inside_state,
+            SESSION_ORPHAN_GRACE_SECONDS.saturating_sub(3600),
+        );
+
+        let outside = gc_test_id("gc-outside-grace");
+        let outside_state = write_gc_terminal_lifecycle(&outside, 20).await;
+        backdate_file(&outside_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+
+        let report = run_session_gc(&HashSet::new(), true, 100).await.unwrap();
+        let candidates = gc_candidate_ids(&report.candidates);
+
+        assert!(!candidates.contains(&inside));
+        assert!(candidates.contains(&outside));
+        cleanup_gc_paths(&[inside, outside]).await;
+    }
+
+    #[tokio::test]
+    async fn session_gc_ordering_and_limit_are_deterministic() {
+        let _guard = gc_test_lock().await;
+        let mut expected = Vec::new();
+        let mut ids = Vec::new();
+        for age in [
+            7200_u64 + SESSION_ORPHAN_GRACE_SECONDS,
+            3600 + SESSION_ORPHAN_GRACE_SECONDS,
+            60 + SESSION_ORPHAN_GRACE_SECONDS,
+        ] {
+            let id = gc_test_id("gc-order");
+            let state = write_gc_terminal_lifecycle(&id, 20).await;
+            backdate_file(&state, age);
+            expected.push(id.clone());
+            ids.push(id);
+        }
+
+        let report = run_session_gc(&HashSet::new(), true, 2).await.unwrap();
+        assert!(report.truncated);
+        assert_eq!(report.candidates.len(), 2);
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .map(|entry| &entry.session_id)
+                .collect::<Vec<_>>(),
+            vec![&expected[0], &expected[1]]
+        );
+        assert!(
+            report
+                .candidates
+                .iter()
+                .all(|entry| { entry.reason == SessionGcReason::MissingJson })
+        );
+
+        let repeat = run_session_gc(&HashSet::new(), true, 2).await.unwrap();
+        assert_eq!(
+            gc_candidate_ids(&repeat.candidates),
+            gc_candidate_ids(&report.candidates)
+        );
+
+        let limited = run_session_gc(&HashSet::new(), true, 1).await.unwrap();
+        assert_eq!(limited.candidates.first().unwrap().session_id, expected[0]);
+        cleanup_gc_paths(&ids).await;
+    }
+
+    #[tokio::test]
+    async fn session_gc_apply_skips_drift_and_concurrent_start() {
+        let _guard = gc_test_lock().await;
+        let drift = gc_test_id("gc-drift");
+        let drift_state = write_gc_terminal_lifecycle(&drift, 20).await;
+        backdate_file(&drift_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+        let drifted_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
+        assert!(gc_candidate_ids(&drifted_plan.report.candidates).contains(&drift));
+
+        // drift: the orphan file is touched after the plan was built
+        backdate_file(&drift_state, SESSION_ORPHAN_GRACE_SECONDS + 60);
+        let (removed, skipped) = apply_session_gc_plan(&HashSet::new(), &drifted_plan)
+            .await
+            .unwrap();
+        assert!(!gc_candidate_ids(&removed).contains(&drift));
+        assert!(gc_candidate_ids(&skipped).contains(&drift));
+        assert!(drift_state.exists());
+
+        // drift: the counterpart appears after the plan was built
+        let counterpart = gc_test_id("gc-counterpart");
+        let counterpart_state = write_gc_terminal_lifecycle(&counterpart, 20).await;
+        backdate_file(&counterpart_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+        let counterpart_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
+        assert!(gc_candidate_ids(&counterpart_plan.report.candidates).contains(&counterpart));
+        write_gc_metadata(&counterpart).await;
+        let (removed, skipped) = apply_session_gc_plan(&HashSet::new(), &counterpart_plan)
+            .await
+            .unwrap();
+        assert!(!gc_candidate_ids(&removed).contains(&counterpart));
+        assert!(gc_candidate_ids(&skipped).contains(&counterpart));
+        assert!(counterpart_state.exists());
+
+        // concurrent start: the session became supervisor-owned after the plan
+        let starting = gc_test_id("gc-starting");
+        let starting_state = write_gc_terminal_lifecycle(&starting, 20).await;
+        backdate_file(&starting_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+        let starting_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
+        assert!(gc_candidate_ids(&starting_plan.report.candidates).contains(&starting));
+        let owned = HashSet::from([starting.clone()]);
+        let (removed, skipped) = apply_session_gc_plan(&owned, &starting_plan).await.unwrap();
+        assert!(!gc_candidate_ids(&removed).contains(&starting));
+        assert!(gc_candidate_ids(&skipped).contains(&starting));
+        assert!(starting_state.exists());
+        cleanup_gc_paths(&[drift, counterpart, starting]).await;
+    }
+
+    #[tokio::test]
+    async fn session_gc_metadata_diagnostics_explain_orphan_classes() {
+        let _guard = gc_test_lock().await;
+        let missing_json = gc_test_id("gc-diag-missing-json");
+        let state = write_gc_terminal_lifecycle(&missing_json, 20).await;
+        backdate_file(&state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+        let missing_state = gc_test_id("gc-diag-missing-state");
+        let metadata = write_gc_metadata(&missing_state).await;
+        backdate_file(&metadata, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+
+        let diagnostics = session_metadata_diagnostics().await.unwrap();
+        assert!(diagnostics.missing_json_count >= 1);
+        assert!(diagnostics.missing_state_count >= 1);
+        assert!(
+            diagnostics.invalid_orphan_count
+                >= diagnostics.missing_json_count + diagnostics.missing_state_count
+        );
+        cleanup_gc_paths(&[missing_json, missing_state]).await;
+    }
+
+    #[test]
+    fn session_gc_limit_is_bounded() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let too_small = runtime.block_on(run_session_gc(&HashSet::new(), true, 0));
+        assert!(too_small.is_err());
+        let too_large = runtime.block_on(run_session_gc(&HashSet::new(), true, 1001));
+        assert!(too_large.is_err());
     }
 }

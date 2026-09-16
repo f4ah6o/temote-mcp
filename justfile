@@ -31,6 +31,7 @@ sandboxed-test:
     cargo test --bin temote-mcp --all-features --locked activity_coverage
     cargo test --bin temote-mcp --all-features --locked upgrade_transaction::tests::
     cargo test --bin temote-mcp --all-features --locked upgrade_coordinator::tests::
+    cargo test --bin temote-mcp --all-features --locked session_gc
     @echo "NOT RUN (host/CI gate): Linux nested sandbox runtime tests (sandbox::linux_tests)"
     @echo "NOT RUN (host/CI gate): full binary/local Unix-socket integration suite"
     @echo "NOT RUN (host/CI gate): ignored supervisor/process-boundary E2E"

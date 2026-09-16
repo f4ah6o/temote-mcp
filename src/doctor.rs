@@ -255,19 +255,29 @@ pub async fn run(options: Options) -> Result<()> {
     }
 
     match crate::session_control::session_metadata_diagnostics().await {
-        Ok(diagnostics) => report.add(Check::pass(
-            "session metadata",
-            format!(
-                "entries={} json={} state={} other={} retained_terminal={} safely_prunable={} invalid_orphan={}",
+        Ok(diagnostics) => {
+            let detail = format!(
+                "entries={} json={} state={} other={} retained_terminal={} safely_prunable={} invalid_orphan={} missing_json={} missing_state={}",
                 diagnostics.total_entries,
                 diagnostics.json_entries,
                 diagnostics.state_entries,
                 diagnostics.other_entries,
                 diagnostics.retained_terminal_count,
                 diagnostics.safely_prunable_count,
-                diagnostics.invalid_orphan_count
-            ),
-        )),
+                diagnostics.invalid_orphan_count,
+                diagnostics.missing_json_count,
+                diagnostics.missing_state_count
+            );
+            if diagnostics.invalid_orphan_count > 0 {
+                report.add(Check::warn(
+                    "session metadata",
+                    detail,
+                    "Review a bounded orphan plan with `temote-mcp session gc` (dry-run by default) before applying it.",
+                ));
+            } else {
+                report.add(Check::pass("session metadata", detail));
+            }
+        }
         Err(_) => report.add(Check::fail(
             "session metadata",
             "session metadata diagnostics could not be completed safely",

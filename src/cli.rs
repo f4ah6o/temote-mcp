@@ -111,6 +111,10 @@ pub enum SessionCommand {
     Forget {
         session_id: String,
     },
+    Gc {
+        apply: bool,
+        limit: usize,
+    },
     Restart {
         session_id: String,
     },
@@ -485,6 +489,29 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
             .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
         return Ok(SessionCommand::Forget { session_id });
     }
+    if noargs::cmd("gc")
+        .doc("Plan or apply bounded maintenance GC for reviewed orphan session metadata (dry-run by default)")
+        .take(args)
+        .is_present()
+    {
+        let apply = noargs::flag("apply")
+            .doc("Delete the planned orphan halves instead of only reporting them")
+            .take(args)
+            .is_present();
+        let limit = noargs::opt("limit")
+            .ty("N")
+            .doc("Maximum number of orphan entries to plan or delete (1-1000, default 100)")
+            .default("100")
+            .take(args)
+            .then(|opt| opt.value().parse::<usize>())?;
+        if !(1..=1000).contains(&limit) {
+            return Err(noargs::Error::other(
+                args,
+                "session gc limit must be an integer from 1 to 1000",
+            ));
+        }
+        return Ok(SessionCommand::Gc { apply, limit });
+    }
     if noargs::cmd("restart")
         .doc("Restart a stopped, crashed, or active supervisor-owned session")
         .take(args)
@@ -595,7 +622,7 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
     }
     Err(noargs::Error::other(
         args,
-        "session command is not specified (expected start, list, info, stop, forget, restart, restart-policy, permission, or console)",
+        "session command is not specified (expected start, list, info, stop, forget, gc, restart, restart-policy, permission, or console)",
     ))
 }
 
@@ -1094,6 +1121,35 @@ mod tests {
         };
         assert!(help.contains("forget"));
         assert!(help.contains("stop keeps metadata"));
+    }
+
+    #[test]
+    fn session_gc_defaults_to_dry_run_and_bounds_the_limit() {
+        assert!(matches!(
+            command(&["temote-mcp", "session", "gc"]),
+            Command::Session {
+                command: SessionCommand::Gc {
+                    apply: false,
+                    limit: 100,
+                },
+            }
+        ));
+        assert!(matches!(
+            command(&["temote-mcp", "session", "gc", "--apply", "--limit", "5"]),
+            Command::Session {
+                command: SessionCommand::Gc {
+                    apply: true,
+                    limit: 5,
+                },
+            }
+        ));
+        for values in [
+            vec!["temote-mcp", "session", "gc", "--limit", "0"],
+            vec!["temote-mcp", "session", "gc", "--limit", "1001"],
+            vec!["temote-mcp", "session", "gc", "--limit", "not-a-number"],
+        ] {
+            assert!(parse(argv(&values)).is_err(), "accepted {values:?}");
+        }
     }
 
     #[test]

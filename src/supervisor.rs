@@ -669,6 +669,31 @@ impl SessionSupervisor {
         result
     }
 
+    /// Bounded maintenance GC for reviewed session metadata orphan classes.
+    ///
+    /// The supervisor transition lock is held for the whole plan/apply so a
+    /// concurrent managed session start cannot race a deletion. Applying the
+    /// plan additionally requires session mutations to be allowed.
+    pub async fn gc_session_metadata(
+        &self,
+        dry_run: bool,
+        limit: usize,
+    ) -> Result<crate::session_control::SessionGcReport> {
+        let _transition = self.transitions.lock().await;
+        self.reap_finished().await;
+        if !dry_run {
+            self.ensure_mutations_allowed()?;
+        }
+        let owned = self
+            .sessions
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        crate::session_control::run_session_gc(&owned, dry_run, limit).await
+    }
+
     pub async fn set_permission_mode(
         &self,
         session_id: &str,

@@ -25,6 +25,8 @@ session discovery は active-first です。running supervisor が所有する s
 
 `temote-mcp session forget <id>` は、terminal で non-live な1 session の Temote-owned durable state（metadata、lifecycle state、stale と確認済みの socket entry）を削除します。`stop` は後から `session list` / `session info` で参照できるよう metadata を保持し、`forget` は意図的に削除します。runtime socket probe が live を返した場合は無条件で拒否し、supervisor の lifecycle transition と直列化され、symlink や非 regular file の metadata target を拒否し、workspace、cwd、worktree には触れません。1 session の forget は他 session の retention policy を変更しません。
 
+`temote-mcp session gc` は滞留した orphan metadata 半身のための bounded maintenance path です。既定は dry-run plan（`--apply` で削除）で、`--limit 1..=1000`（既定 100）を受け付けます。初期レビュー済み class だけが対象です: 24時間の grace period より古い、regular で symlink ではない、supervisor-owned でも upgrade-protected でもなく、live session socket probe が応答しない、lone `.state` lifecycle 半身（`missing_json`）または lone `.json` metadata 半身（`missing_state`）。後者の metadata は session ID が一致して読める必要があります。malformed、ID mismatch、symlink、special file、grace 内の entry は報告のみで削除しません。plan は deterministic な bounded limit のため oldest-first で並び、`--apply` は削除直前に各 candidate を再検証し、drift や concurrent start があった entry は skip します。cleanup は Temote-owned session metadata file に限定され、workspace、cwd、worktree には触れません。
+
 互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。current directory を起動し、必要なら同じ local supervisor も自動起動します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。
 
 相対 path は session の working directory を基準に解決されます。

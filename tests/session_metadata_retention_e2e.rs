@@ -734,3 +734,135 @@ fn cli_mcp_active_session_parity() {
     assert!(supervisor.wait_for_exit(SHUTDOWN_TIMEOUT).success());
     client.shutdown();
 }
+
+fn backdate(path: &Path, age: Duration) {
+    let modified = std::time::SystemTime::now().checked_sub(age).unwrap();
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(modified).unwrap();
+}
+
+fn gc_candidate_ids(report: &Value) -> BTreeSet<String> {
+    report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["session_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn gc_removed_ids(report: &Value) -> BTreeSet<String> {
+    report["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["session_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn session_gc_dry_run_and_apply_remove_only_old_orphans_and_survive_restart() {
+    let fixture = Fixture::new();
+    let directory = fixture.metadata_dir();
+    let cwd = fixture.canonical_project();
+    fs::create_dir_all(&directory).unwrap();
+
+    // The supervisor materializes a lifecycle half for discovered metadata at
+    // startup, so create the orphan halves only after it is running.
+    let mut supervisor = fixture.spawn_supervisor();
+    fixture.wait_for_supervisor();
+
+    let missing_json = "gc-e2e-missing-json";
+    fs::write(
+        directory.join(format!("{missing_json}.state")),
+        serde_json::to_vec(&json!({
+            "status": "stopped",
+            "started_at": 1,
+            "stopped_at": 2,
+            "exit_reason": "fixture",
+            "last_error": null,
+            "logical_path": null,
+            "restart_policy": "never"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let missing_state = "gc-e2e-missing-state";
+    fs::write(
+        directory.join(format!("{missing_state}.json")),
+        serde_json::to_vec(&json!({
+            "id": missing_state,
+            "cwd": cwd,
+            "permitted_directories": [cwd],
+            "started_at": 1,
+            "process_id": 0,
+            "yolo": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let fresh = "gc-e2e-fresh";
+    fs::write(
+        directory.join(format!("{fresh}.state")),
+        serde_json::to_vec(&json!({
+            "status": "stopped",
+            "started_at": 1,
+            "stopped_at": 2,
+            "exit_reason": "fixture",
+            "last_error": null,
+            "logical_path": null,
+            "restart_policy": "never"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let pair = "gc-e2e-terminal-pair";
+    write_terminal_pair(&directory, &cwd, pair, 1, 2);
+
+    let old = Duration::from_secs(25 * 60 * 60);
+    backdate(&directory.join(format!("{missing_json}.state")), old);
+    backdate(&directory.join(format!("{missing_state}.json")), old);
+
+    let dry_run_output = fixture.run_cli(&["session", "gc"]);
+    assert!(
+        dry_run_output.status.success(),
+        "session gc dry-run failed: {}",
+        String::from_utf8_lossy(&dry_run_output.stderr)
+    );
+    let dry_run: Value = serde_json::from_slice(&dry_run_output.stdout).unwrap();
+    assert_eq!(dry_run["dry_run"], true);
+    let candidates = gc_candidate_ids(&dry_run);
+    assert!(candidates.contains(missing_json));
+    assert!(candidates.contains(missing_state));
+    assert!(!candidates.contains(fresh));
+    assert!(!candidates.contains(pair));
+    assert!(directory.join(format!("{missing_json}.state")).exists());
+    assert!(directory.join(format!("{missing_state}.json")).exists());
+
+    let apply_output = fixture.run_cli(&["session", "gc", "--apply", "--limit", "10"]);
+    assert!(
+        apply_output.status.success(),
+        "session gc apply failed: {}",
+        String::from_utf8_lossy(&apply_output.stderr)
+    );
+    let applied: Value = serde_json::from_slice(&apply_output.stdout).unwrap();
+    assert_eq!(applied["dry_run"], false);
+    let removed = gc_removed_ids(&applied);
+    assert!(removed.contains(missing_json));
+    assert!(removed.contains(missing_state));
+    assert!(!directory.join(format!("{missing_json}.state")).exists());
+    assert!(!directory.join(format!("{missing_state}.json")).exists());
+    assert!(directory.join(format!("{fresh}.state")).exists());
+    assert!(directory.join(format!("{pair}.json")).exists());
+    assert!(directory.join(format!("{pair}.state")).exists());
+
+    assert!(fixture.run_cli(&["session", "list"]).status.success());
+    assert!(fixture.run_cli(&["session", "info", pair]).status.success());
+
+    supervisor.interrupt();
+    assert!(supervisor.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+    let mut supervisor = fixture.spawn_supervisor();
+    fixture.wait_for_supervisor();
+    assert!(fixture.run_cli(&["session", "list"]).status.success());
+    supervisor.interrupt();
+    assert!(supervisor.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+}

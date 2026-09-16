@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
             cli::SessionCommand::Info { session_id } => session_control::info(session_id).await,
             cli::SessionCommand::Stop { session_id } => session_control::stop(session_id).await,
             cli::SessionCommand::Forget { session_id } => session_control::forget(session_id).await,
+            cli::SessionCommand::Gc { apply, limit } => session_control::gc(apply, limit).await,
             cli::SessionCommand::Restart { session_id } => {
                 session_control::restart(session_id).await
             }
