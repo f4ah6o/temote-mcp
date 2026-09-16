@@ -1,6 +1,6 @@
 # Gateway の deployment target を明示・文書化する
 
-Status: open / umbrella; repository-local residue split to bounded child
+Status: done / repository-local slices complete; live verification tracked in the live acceptance matrix
 Model: deepseek-v4.1-flash
 Created: 2026-09-11
 Updated: 2026-09-16
@@ -180,3 +180,11 @@ Cloudflare route/domain verification remains Slice C live acceptance.
 ## 2026-09-16 polishing update
 
 Do not assign this full historical issue to an implementation agent. The sole repository-local residue is now `issues/polished/20260916-gateway-target-missing-cli.md`; Cloudflare live verification remains in the live acceptance matrix.
+
+## 2026-09-16 completion
+
+The bounded child `issues/polished/20260916-gateway-target-missing-cli.md` is implemented and verified on `main`: the CLI no longer exits with usage code 2 when a valid hostname/config is supplied without `--route`/`--custom-domain`, so the evaluator reaches `target_missing`, and a command-level regression test covers both the missing-target output and the both-flags usage error. Evidence and gate results are recorded in that packet (moved to `issues/done/`).
+
+The only remaining acceptance item is external: applying and read-only verifying the chosen Cloudflare deployment target (custom domain or existing-DNS Worker route with `workers_dev = false`) on a real account. That requirement is now a row in the Cloudflare Worker section of `issues/open/20260908-live-acceptance-matrix.md`, so this tracker no longer keeps the implementation issue open.
+
+No `CHANGES.md` entry was added by the bounded packet; the gateway target operational contract was already documented in Slice A and the CLI fix is an operator-facing bug fix that can be recorded at changelog time under the existing gateway deployment item.

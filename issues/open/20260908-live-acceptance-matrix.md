@@ -37,6 +37,7 @@ The source issues are archived under `issues/done/` after this consolidation.
 - [ ] Durable Object exports/configuration and required secrets are applied to a real Cloudflare account.
 - [ ] At least two concurrent gateway sessions are exercised through one external MCP endpoint.
 - [ ] Reconnect/generation fencing is observed live; stale generations are rejected and non-idempotent calls are not auto-replayed.
+- [ ] On a real account, the chosen gateway deployment target (custom domain binding or existing-DNS Worker route) is applied with `workers_dev = false`, deploy output is checked so `No targets deployed` is not treated as success, and the route/domain binding is verified read-only (from `issues/done/20260911-gateway-deployment-target.md`).
 
 ### Connection profile matrix
 
