@@ -4,12 +4,10 @@
 
 ## Sessions
 
-For local work, start one Temote lifecycle supervisor and then create named-root sessions from another terminal:
+For local work, create the session directly. If the lifecycle supervisor is not already running, the local CLI starts the exact current Temote binary as the supervisor and waits until its control socket is ready. New sessions default to sandboxed, approval-free `agent` mode:
 
 ```sh
 export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp supervisor
-
 temote-mcp session start my-project --path src/my-project
 temote-mcp session list
 temote-mcp session info my-project
@@ -25,7 +23,7 @@ Session discovery is active-first: sessions owned by the running supervisor are 
 
 Use `temote-mcp session forget <id>` to remove Temote-owned durable state for one terminal, non-live session: its metadata, lifecycle state, and a confirmed-stale socket entry. `stop` keeps that metadata for later `session list` / `session info`; `forget` intentionally removes it. The command refuses an unconditional live runtime socket probe, is serialized with supervisor lifecycle transitions, rejects symlink or non-regular metadata targets, and never touches the workspace, cwd, or worktree. Removing one session does not change the retention policy for other sessions.
 
-For compatibility, `cd ~/src/my-project && temote-mcp start my-project` asks the running local supervisor to start the current directory. `temote-mcp start my-project --yolo` remains the deliberately unrestricted local-only form.
+For compatibility, `cd ~/src/my-project && temote-mcp start my-project` starts the current directory and bootstraps the same local supervisor when needed. `temote-mcp start my-project --yolo` remains the deliberately unrestricted local-only form.
 
 Relative paths resolve from the session working directory.
 

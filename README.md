@@ -76,13 +76,10 @@ session_info(session_id="my-project")
 
 Managed sessions are always normal sandboxed sessions. `session_start` accepts only named-root-relative paths and cannot enable yolo mode. HTTP `serve/up` delegates session ownership and Tailscale OAuth approval to the local lifecycle supervisor over its owner-only Unix socket. Use `temote-mcp session console` for approvals. `temote-mcp down` stops only the HTTP origin/managed ingress; the lifecycle supervisor and its sessions remain alive.
 
-For local sessions, run one Temote session supervisor and manage runtimes through it:
+For local development, the first `session start` automatically starts the local lifecycle supervisor when it is not already running. New sessions default to sandboxed, approval-free `agent` mode:
 
 ```sh
 export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp supervisor
-
-# From another terminal:
 temote-mcp session start my-project --path src/my-project
 temote-mcp session list
 temote-mcp session info my-project
@@ -95,7 +92,7 @@ temote-mcp session stop my-project
 
 The approval console is an attachment, not the runtime owner. Closing its terminal or sending stdin EOF leaves session runtimes alive; approval-required operations fail closed until a console reconnects. Lifecycle metadata records `starting`, `active`, `stopping`, `stopped`, and `crashed`, including crash reason and last error. `session list` probes the socket and never reports dead runtime metadata as `active`. Detached permission changes use the owner-only supervisor socket and do not restart the runtime. Restart policy defaults to `never`; explicit `on-failure` uses bounded exponential backoff with a five-attempt limit and records restart count/timestamps/limit reason. Captured start credentials remain memory-only, so a supervisor process restart never silently resumes credential-bearing automatic restarts; use explicit `session restart` after such a supervisor restart.
 
-For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains a local-supervisor shorthand for starting the current directory. It requires `temote-mcp supervisor` to be running. `--yolo` remains available only on this local CLI path; remote MCP `session_start` cannot create yolo sessions. Local stdio clients can launch `temote-mcp mcp`.
+For compatibility, `cd ~/src/my-project && temote-mcp start my-project` remains a shorthand for starting the current directory and also bootstraps the local supervisor when needed. `--yolo` remains available only on this local CLI path; remote MCP `session_start` cannot create yolo sessions. Local stdio clients can launch `temote-mcp mcp`.
 
 ## Codex plugin and Agent Skill
 
@@ -111,7 +108,7 @@ The installer writes the plugin under `CODEX_HOME` (or `~/.codex`), enables `tem
 
 The repository root remains a directly inspectable local Codex plugin for development: `.codex-plugin/plugin.json` exposes the existing `skills/temote-mcp` guidance and `.mcp.json` launches `temote-mcp mcp` from `PATH`.
 
-The plugin is intentionally thin: session lifecycle, named-root resolution, sandboxing, approvals, OAuth, and ingress remain owned by the native Temote binary. Start `temote-mcp supervisor` normally before using local managed sessions. ChatGPT and other remote clients continue to use the Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel profiles rather than the local stdio plugin path.
+The plugin is intentionally thin: session lifecycle, named-root resolution, sandboxing, approvals, OAuth, and ingress remain owned by the native Temote binary. Local CLI session start bootstraps the supervisor when needed; always-on HTTP/gateway deployments still run the supervisor explicitly as shown above. ChatGPT and other remote clients continue to use the Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel profiles rather than the local stdio plugin path.
 
 For coding agents that consume Agent Skills without Codex plugins, install the same bundled Skill directly:
 

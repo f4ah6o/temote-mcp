@@ -4,12 +4,10 @@
 
 ## session
 
-local work では Temote の lifecycle supervisor を1つ起動し、別 terminal から named-root session を作成します。
+local work では session を直接作成します。lifecycle supervisor が未起動なら、local CLI が現在の Temote binary 自身を supervisor として起動し、control socket が ready になるまで待ちます。新規 session は sandbox を維持した approval-free の `agent` mode が既定です。
 
 ```sh
 export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp supervisor
-
 temote-mcp session start my-project --path src/my-project
 temote-mcp session list
 temote-mcp session info my-project
@@ -25,7 +23,7 @@ session discovery は active-first です。running supervisor が所有する s
 
 `temote-mcp session forget <id>` は、terminal で non-live な1 session の Temote-owned durable state（metadata、lifecycle state、stale と確認済みの socket entry）を削除します。`stop` は後から `session list` / `session info` で参照できるよう metadata を保持し、`forget` は意図的に削除します。runtime socket probe が live を返した場合は無条件で拒否し、supervisor の lifecycle transition と直列化され、symlink や非 regular file の metadata target を拒否し、workspace、cwd、worktree には触れません。1 session の forget は他 session の retention policy を変更しません。
 
-互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。これは起動中の local supervisor に current directory の session 作成を依頼します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。
+互換用に `cd ~/src/my-project && temote-mcp start my-project` も利用できます。current directory を起動し、必要なら同じ local supervisor も自動起動します。`temote-mcp start my-project --yolo` は意図的に制限を外す local-only form として残します。
 
 相対 path は session の working directory を基準に解決されます。
 

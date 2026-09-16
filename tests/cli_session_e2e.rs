@@ -253,6 +253,56 @@ fn wait_for_supervisor(binary: &Path, cwd: &Path, state_home: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn supervisor_socket_path() -> PathBuf {
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from("/tmp")
+        .join(format!("tmcp-{uid}-{}", socket_namespace()))
+        .join("supervisor.sock")
+}
+
+#[cfg(unix)]
+fn running_supervisor_pid() -> u32 {
+    use std::os::unix::net::UnixStream;
+
+    let socket = supervisor_socket_path();
+    let mut stream =
+        UnixStream::connect(&socket).expect("failed to connect to bootstrapped supervisor");
+    writeln!(stream, "{}", json!({"command": "ping"})).expect("failed to write supervisor ping");
+    stream.flush().expect("failed to flush supervisor ping");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("failed to finish supervisor ping request");
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .expect("failed to read supervisor ping response");
+    let response: Value =
+        serde_json::from_str(line.trim()).expect("invalid supervisor ping response");
+    assert_eq!(response["ok"], true, "supervisor ping failed: {response}");
+    response["result"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("supervisor ping did not return a valid pid")
+}
+
+#[cfg(unix)]
+struct BootstrappedSupervisorGuard {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for BootstrappedSupervisorGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGINT) };
+        let socket = supervisor_socket_path();
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        while socket.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 fn upgrade_failure_reports(state_home: &Path) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     let directory = state_home
@@ -457,6 +507,55 @@ fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
     supervisor.interrupt();
     let status = supervisor.wait_for_exit(SHUTDOWN_TIMEOUT);
     assert!(status.success(), "supervisor exited with {status}");
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "process-boundary E2E; run explicitly on Linux and macOS"]
+fn legacy_start_bootstraps_agent_supervisor_without_manual_socket_setup() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));
+    let project = TempDir::new().expect("failed to create E2E project directory");
+    let state = TempDir::new().expect("failed to create isolated state directory");
+    initialize_git_repository(project.path());
+    let session_id = format!("bootstrap-e2e-{}", std::process::id());
+    let socket = supervisor_socket_path();
+    let _ = fs::remove_file(&socket);
+
+    let start = run_cli(
+        &binary,
+        &["start", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&start, "legacy start with automatic supervisor bootstrap");
+
+    let supervisor = BootstrappedSupervisorGuard {
+        pid: running_supervisor_pid(),
+    };
+    let info = run_cli(
+        &binary,
+        &["session", "info", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&info, "session info after automatic supervisor bootstrap");
+    let info: Value = serde_json::from_slice(&info.stdout).expect("invalid session info JSON");
+    assert_eq!(info["status"], "active");
+    assert_eq!(info["permission_mode"], "agent");
+    assert_eq!(info["yolo"], false);
+
+    let stop = run_cli(
+        &binary,
+        &["session", "stop", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&stop, "session stop after automatic supervisor bootstrap");
+    drop(supervisor);
+    assert!(
+        !socket.exists(),
+        "bootstrapped supervisor socket remained after SIGINT"
+    );
 }
 
 #[test]

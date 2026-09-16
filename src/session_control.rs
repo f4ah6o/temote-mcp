@@ -3,8 +3,9 @@ use std::io::{Read as _, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,8 @@ const MAX_SESSION_CONTROL_LIST_BYTES: usize = 56 * 1024;
 const TERMINAL_SESSION_RETENTION: usize = 512;
 const RETENTION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_BOOTSTRAP_POLL: Duration = Duration::from_millis(50);
 const MAX_CONSOLE_QUEUE: usize = 1;
 pub(crate) const CONTROL_PROTOCOL_VERSION: u64 = 2;
 const LIFECYCLE_SCHEMA_VERSION: u64 = 1;
@@ -438,6 +441,7 @@ pub async fn run_supervisor(restore_plan_path: Option<PathBuf>) -> Result<()> {
 }
 
 pub async fn start_named(session_id: String, path: String) -> Result<()> {
+    ensure_supervisor_for_start().await?;
     let result = request(ControlRequest::Start {
         path,
         session_id,
@@ -450,6 +454,7 @@ pub async fn start_named(session_id: String, path: String) -> Result<()> {
 
 pub async fn start_legacy(session_id: Option<String>, yolo: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    ensure_supervisor_for_start().await?;
     let result = request(ControlRequest::StartLocal {
         cwd,
         session_id,
@@ -1677,6 +1682,75 @@ async fn connect_supervisor() -> Result<UnixStream> {
             path.display()
         )
     })
+}
+
+async fn ensure_supervisor_for_start() -> Result<()> {
+    let path = config::supervisor_socket_path()?;
+    match UnixStream::connect(&path).await {
+        Ok(stream) => {
+            drop(stream);
+            return Ok(());
+        }
+        Err(error) if supervisor_socket_unavailable(&error) => {}
+        Err(error) => {
+            return Err(error).context("failed to connect to the Temote session supervisor");
+        }
+    }
+
+    let executable = std::env::current_exe().context("cannot locate the Temote executable")?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("supervisor")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .context("failed to start the Temote session supervisor automatically")?;
+
+    let deadline = Instant::now() + SUPERVISOR_BOOTSTRAP_TIMEOUT;
+    let mut bootstrap_exit = None;
+    loop {
+        match UnixStream::connect(&path).await {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(error) if supervisor_socket_unavailable(&error) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("automatic Temote supervisor startup failed");
+            }
+        }
+
+        if bootstrap_exit.is_none() {
+            bootstrap_exit = child
+                .try_wait()
+                .context("failed to inspect automatic Temote supervisor startup")?;
+        }
+        if Instant::now() >= deadline {
+            if let Some(status) = bootstrap_exit {
+                anyhow::bail!(
+                    "automatic Temote supervisor startup exited before becoming ready ({status})"
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("automatic Temote supervisor startup did not become ready");
+        }
+        tokio::time::sleep(SUPERVISOR_BOOTSTRAP_POLL).await;
+    }
+}
+
+fn supervisor_socket_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 async fn prepare_supervisor_socket(path: &Path) -> Result<()> {

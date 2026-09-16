@@ -75,13 +75,10 @@ session_info(session_id="my-project")
 
 managed session は常に通常の sandbox session です。`session_start` は named root からの相対 path のみ受け付け、yolo mode は指定できません。HTTP `serve/up` は owner-only Unix socket 経由で local lifecycle supervisor に session ownership と Tailscale OAuth approval を委譲します。承認は `temote-mcp session console` で行います。`temote-mcp down` が停止するのは HTTP origin / managed ingress だけで、lifecycle supervisor と session runtime は生存します。
 
-local session は Temote の session supervisor を1つ起動し、その配下で runtime を管理します。
+local development では、`session start` 実行時に local lifecycle supervisor が未起動なら自動起動します。新規 session は sandbox を維持した approval-free の `agent` mode が既定です。
 
 ```sh
 export TEMOTE_MCP_ROOTS='src=~/src'
-temote-mcp supervisor
-
-# 別 terminal から:
 temote-mcp session start my-project --path src/my-project
 temote-mcp session list
 temote-mcp session info my-project
@@ -94,7 +91,7 @@ temote-mcp session stop my-project
 
 approval console は runtime owner ではなく attachment です。terminal close / stdin EOF でも session runtime は生存し、console 不在中の approval-required operation は fail closed します。console は再接続できます。lifecycle metadata には `starting` / `active` / `stopping` / `stopped` / `crashed` と crash reason / last error を保存します。`session list` は socket を probe するため、死んだ runtime を `active` と表示しません。detached permission 変更は owner-only supervisor socket 経由で行い、runtime を再起動しません。restart policy の既定値は `never` で、明示的な `on-failure` は bounded exponential backoff と最大5回の restart limit を使い、restart count / timestamp / limit reason を保存します。start 時に capture した credential は memory-only のため、supervisor process 自体の再起動後に credential-bearing auto restart を暗黙再開しません。その場合は明示的な `session restart` を使います。
 
-互換用に `cd ~/src/my-project && temote-mcp start my-project` は current directory を local supervisor 配下で起動する shorthand として残します。先に `temote-mcp supervisor` が必要です。`--yolo` はこの local CLI path だけで利用でき、remote MCP `session_start` から yolo session は作成できません。local stdio client は `temote-mcp mcp` を起動します。
+互換用に `cd ~/src/my-project && temote-mcp start my-project` は current directory を起動する shorthand として残し、必要なら local supervisor も自動起動します。`--yolo` はこの local CLI path だけで利用でき、remote MCP `session_start` から yolo session は作成できません。local stdio client は `temote-mcp mcp` を起動します。
 
 ## Codex Plugin と Agent Skill
 
@@ -110,7 +107,7 @@ installer は Plugin を `CODEX_HOME`（未指定時は `~/.codex`）配下へ�
 
 repository root 自体も開発・確認用の local Codex Plugin として利用できます。`.codex-plugin/plugin.json` が既存の `skills/temote-mcp` を公開し、`.mcp.json` は `PATH` 上の `temote-mcp mcp` を起動します。
 
-Plugin は意図的に薄く保ちます。session lifecycle、named-root resolution、sandbox、approval、OAuth、ingress は native Temote binary が引き続き所有します。local managed session を使う前に `temote-mcp supervisor` は通常どおり起動します。ChatGPT やその他の remote client は local stdio Plugin 経路ではなく、Cloudflare / Tailscale / OpenAI Secure MCP Tunnel profile を利用します。
+Plugin は意図的に薄く保ちます。session lifecycle、named-root resolution、sandbox、approval、OAuth、ingress は native Temote binary が引き続き所有します。local CLI の session start は必要に応じて supervisor を自動起動し、常駐 HTTP / gateway deployment は上記のとおり supervisor を明示起動します。ChatGPT やその他の remote client は local stdio Plugin 経路ではなく、Cloudflare / Tailscale / OpenAI Secure MCP Tunnel profile を利用します。
 
 Codex Plugin を利用しない Agent Skill 対応 coding agent には、同じ同梱 Skill を直接導入できます。
 
