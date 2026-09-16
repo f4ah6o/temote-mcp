@@ -5,6 +5,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -477,11 +480,14 @@ async fn run_with_metadata_roots(
     let mut process =
         { anyhow::bail!("sandboxed execution is currently implemented for Linux and macOS only") };
 
+    let command_cache = CommandCacheDir::create()?;
+    let environment = safe_environment(command_cache.path())?;
+
     process
         .kill_on_drop(true)
         .current_dir(&cwd)
         .env_clear()
-        .envs(safe_environment())
+        .envs(environment)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -1272,7 +1278,42 @@ fn developer_tool_environment(environment: &HashMap<String, String>) -> HashMap<
     environment
 }
 
-fn safe_environment() -> HashMap<String, String> {
+struct CommandCacheDir {
+    path: PathBuf,
+}
+
+impl CommandCacheDir {
+    fn create() -> Result<Self> {
+        let temp_root = std::fs::canonicalize(std::env::temp_dir())
+            .context("failed to resolve system temporary directory for sandbox cache")?;
+        let path = temp_root.join(format!(
+            "temote-mcp-command-cache-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).with_context(|| {
+            format!(
+                "failed to create private sandbox command cache {}",
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CommandCacheDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn safe_environment(cache_root: &Path) -> Result<HashMap<String, String>> {
     let mut environment = ["PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "HOME"]
         .into_iter()
         .filter_map(|name| {
@@ -1282,7 +1323,37 @@ fn safe_environment() -> HashMap<String, String> {
         })
         .collect::<HashMap<_, _>>();
     environment.insert("TEMOTE_MCP_SANDBOX".to_owned(), "1".to_owned());
-    environment
+    apply_standard_cache_environment(&mut environment, cache_root)?;
+    Ok(environment)
+}
+
+fn standard_cache_environment_paths(cache_root: &Path) -> [(String, PathBuf); 2] {
+    [
+        ("XDG_CACHE_HOME".to_owned(), cache_root.join("xdg")),
+        ("GOCACHE".to_owned(), cache_root.join("go-build")),
+    ]
+}
+
+fn apply_standard_cache_environment(
+    environment: &mut HashMap<String, String>,
+    cache_root: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        cache_root.is_absolute(),
+        "sandbox cache root must be absolute"
+    );
+    for (name, path) in standard_cache_environment_paths(cache_root) {
+        std::fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "failed to create sandbox cache directory {}",
+                path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        environment.insert(name, path.to_string_lossy().into_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1414,18 +1485,57 @@ mod generic_tests {
 
     #[test]
     fn preserves_home_for_login_shells() {
+        let cache = tempfile::tempdir().unwrap();
+        let environment = safe_environment(cache.path()).unwrap();
         if let Ok(home) = std::env::var("HOME") {
             assert_eq!(
-                safe_environment().get("HOME").map(String::as_str),
+                environment.get("HOME").map(String::as_str),
                 Some(home.as_str())
             );
         }
         assert_eq!(
-            safe_environment()
-                .get("TEMOTE_MCP_SANDBOX")
-                .map(String::as_str),
+            environment.get("TEMOTE_MCP_SANDBOX").map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            environment.get("XDG_CACHE_HOME").map(PathBuf::from),
+            Some(cache.path().join("xdg"))
+        );
+        assert_eq!(
+            environment.get("GOCACHE").map(PathBuf::from),
+            Some(cache.path().join("go-build"))
+        );
+        assert!(!environment.contains_key("GOMODCACHE"));
+    }
+
+    #[test]
+    fn command_cache_directory_is_private_and_removed_on_drop() {
+        let cache = CommandCacheDir::create().unwrap();
+        let path = cache.path().to_path_buf();
+        assert!(path.is_absolute());
+        assert!(path.is_dir());
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        drop(cache);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn generated_standard_cache_paths_stay_below_private_root() -> noprop::TestResult {
+        test_support::run(0x4341_4348_4552_4f4f, 1024, |ctx| {
+            let root = PathBuf::from(format!(
+                "/tmp/temote-cache-{:016x}",
+                noprop::sample_u64(ctx)
+            ));
+            for (name, path) in standard_cache_environment_paths(&root) {
+                assert!(path.starts_with(&root), "{name} escaped private cache root");
+                assert!(path.is_absolute(), "{name} cache path is not absolute");
+            }
+            Ok(())
+        })
     }
 
     #[test]
