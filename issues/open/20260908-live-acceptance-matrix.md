@@ -71,6 +71,10 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 - [ ] In a rebuilt normal `agent` session, ordinary `execute`/`start_command` reach outbound HTTPS, a localhost client/server pair, and a reachable LAN HTTP/TCP fixture (RTSP where a fixture exists) with sandbox and path containment intact, while an `ask` session stays network-disabled (from `issues/open/20260915-agent-development-network-access.md`).
 
+### Agent-mode Git shim
+
+- [ ] On a rebuilt runtime, an installed Codex/OpenCode `local_agent_run` invokes ordinary `git switch` / `git switch -c` through the private shim and completes the branch change while direct `.git` writes remain denied (from `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`).
+
 ## Evidence requirements
 
 For each checked item record enough evidence to identify:
