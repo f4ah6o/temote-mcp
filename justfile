@@ -27,6 +27,7 @@ sandboxed-check: fmt-check sandboxed-test clippy sandboxed-no-default gateway-te
 
 sandboxed-test:
     cargo test --lib --all-features --locked -- --skip sandbox::linux_tests
+    cargo test --bin temote-mcp --all-features --locked agent_git
     cargo test --bin temote-mcp --all-features --locked activity_job
     cargo test --bin temote-mcp --all-features --locked activity_coverage
     cargo test --bin temote-mcp --all-features --locked upgrade_transaction::tests::

@@ -106,6 +106,8 @@ struct AgentState {
     root: PathBuf,
     hidden_roots: Vec<PathBuf>,
     read_only_paths: Vec<PathBuf>,
+    broker_directory: PathBuf,
+    git_shim_target: PathBuf,
 }
 
 impl AgentState {
@@ -188,10 +190,14 @@ impl AgentState {
         hidden_roots.sort();
         hidden_roots.dedup();
 
+        let broker_directory = root.join("git-broker");
+        let git_shim_target = canonical_current_executable()?;
         let mut state = Self {
             root,
             hidden_roots,
             read_only_paths: Vec::new(),
+            broker_directory,
+            git_shim_target,
         };
         let directories = match agent {
             Agent::Codex => ["tmp", "home", "codex"].as_slice(),
@@ -204,6 +210,11 @@ impl AgentState {
             })?;
             set_private_permissions(&path)?;
         }
+        let bin = state.root.join("bin");
+        fs::create_dir(&bin)
+            .with_context(|| format!("could not create local agent directory {}", bin.display()))?;
+        set_private_permissions(&bin)?;
+        create_git_shim(&bin, &state.git_shim_target)?;
         let read_only_paths = source_home
             .map(|home| {
                 import_authentication_file(
@@ -228,7 +239,11 @@ impl AgentState {
         )
     }
 
-    fn apply_to_environment(&self, agent: Agent, environment: &mut HashMap<String, String>) {
+    fn apply_to_environment(
+        &self,
+        agent: Agent,
+        environment: &mut HashMap<String, String>,
+    ) -> Result<()> {
         let temporary = self.root.join("tmp").to_string_lossy().into_owned();
         environment.insert(
             "HOME".to_owned(),
@@ -237,6 +252,22 @@ impl AgentState {
         environment.insert("TMPDIR".to_owned(), temporary.clone());
         environment.insert("TMP".to_owned(), temporary.clone());
         environment.insert("TEMP".to_owned(), temporary);
+
+        let mut path_entries = vec![self.root.join("bin")];
+        if let Some(path) = environment.get("PATH") {
+            path_entries.extend(env::split_paths(path));
+        }
+        environment.insert(
+            "PATH".to_owned(),
+            env::join_paths(path_entries)
+                .context("could not build the local agent PATH")?
+                .to_string_lossy()
+                .into_owned(),
+        );
+        environment.insert(
+            crate::agent_git::BROKER_ENVIRONMENT_VARIABLE.to_owned(),
+            self.broker_directory.to_string_lossy().into_owned(),
+        );
 
         match agent {
             Agent::Codex => {
@@ -266,6 +297,7 @@ impl AgentState {
                 );
             }
         }
+        Ok(())
     }
 
     fn temporary_root(&self) -> PathBuf {
@@ -278,6 +310,14 @@ impl AgentState {
 
     fn read_only_paths(&self) -> &[PathBuf] {
         &self.read_only_paths
+    }
+
+    fn broker_directory(&self) -> &Path {
+        &self.broker_directory
+    }
+
+    fn git_shim_target(&self) -> &Path {
+        &self.git_shim_target
     }
 }
 
@@ -295,6 +335,42 @@ fn set_private_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn canonical_current_executable() -> Result<PathBuf> {
+    let executable = env::current_exe().context("could not determine the temote-mcp executable")?;
+    fs::canonicalize(&executable).with_context(|| {
+        format!(
+            "could not resolve the temote-mcp executable {}",
+            executable.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn create_git_shim(bin: &Path, target: &Path) -> Result<()> {
+    let link = bin.join("git");
+    match fs::symlink_metadata(&link) {
+        Ok(_) => anyhow::bail!("local agent Git shim already exists: {}", link.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("could not inspect local agent Git shim {}", link.display())
+            });
+        }
+    }
+    std::os::unix::fs::symlink(target, &link).with_context(|| {
+        format!(
+            "could not create local agent Git shim {} -> {}",
+            link.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn create_git_shim(_bin: &Path, _target: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -419,6 +495,7 @@ pub(crate) struct PreparedRun {
     dependency_files: Vec<PathBuf>,
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
+    session: config::Session,
     task: String,
     task_bytes: usize,
     task_sha256: String,
@@ -626,7 +703,7 @@ where
         source_codex_home.as_deref(),
         source_xdg_data_home.as_deref(),
     )?;
-    state.apply_to_environment(agent, &mut environment);
+    state.apply_to_environment(agent, &mut environment)?;
     let executable_runtime = path_argument(&executable.runtime, "agent executable")?;
     let executable_target = executable.canonical;
     let cwd_argument = path_argument(&cwd, "agent cwd")?;
@@ -669,6 +746,7 @@ where
         dependency_files: executable.files,
         environment,
         session_roots: canonical_session_roots(session)?,
+        session: session.clone(),
         task: task.to_owned(),
         task_bytes: task.len(),
         task_sha256: task_sha256(task.as_bytes()),
@@ -679,6 +757,11 @@ where
 
 pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     let state_root = prepared.state.root.clone();
+    let _broker = crate::agent_git::GitBroker::start(
+        prepared.state.broker_directory().to_path_buf(),
+        prepared.session.clone(),
+        prepared.session_roots.clone(),
+    )?;
     let mut writable_roots = Vec::new();
     if prepared.access == Access::WorkspaceWrite {
         // `session_roots` authorizes cwd selection and is revalidated across
@@ -694,6 +777,18 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     }
     read_only_roots.sort();
     read_only_roots.dedup();
+    let mut read_only_files = prepared.dependency_files.clone();
+    let git_shim_target = prepared.state.git_shim_target().to_path_buf();
+    let git_shim_target_in_visible_root = writable_roots
+        .iter()
+        .chain(temporary_roots.iter())
+        .chain(read_only_roots.iter())
+        .any(|root| git_shim_target.starts_with(root));
+    if !git_shim_target_in_visible_root {
+        // Keep the canonical shim target readable when the agent executable
+        // roots are hidden (for example a binary installed below HOME).
+        read_only_files.push(git_shim_target);
+    }
     let stdin = (prepared.agent == Agent::Codex).then_some(prepared.task.as_bytes());
     sandbox::run_local_agent(
         &prepared.command,
@@ -705,7 +800,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
             read_only_roots: &read_only_roots,
             read_only_symlinks: &prepared.dependency_symlinks,
             read_only_scaffold_directories: &prepared.dependency_directories,
-            read_only_files: &prepared.dependency_files,
+            read_only_files: &read_only_files,
             hidden_roots: prepared.state.hidden_roots(),
         },
         stdin,
@@ -1996,6 +2091,17 @@ mod tests {
         }
     }
 
+    fn literal_session(cwd: &Path) -> config::Session {
+        config::Session {
+            id: "local-agent-test".to_owned(),
+            cwd: cwd.to_owned(),
+            permitted_directories: vec![cwd.to_owned()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Ask,
+        }
+    }
+
     fn args(agent: &str, access: &str) -> Value {
         json!({
             "session_id": "local-agent-test",
@@ -2151,11 +2257,14 @@ mod tests {
             dependency_files: Vec::new(),
             environment: {
                 let mut environment = HashMap::new();
-                state.apply_to_environment(Agent::Codex, &mut environment);
+                state
+                    .apply_to_environment(Agent::Codex, &mut environment)
+                    .unwrap();
                 environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
                 environment
             },
             session_roots: Vec::new(),
+            session: session(&root.path().canonicalize().unwrap()),
             task: task.clone(),
             task_bytes: task.len(),
             task_sha256: task_sha.clone(),
@@ -2310,6 +2419,7 @@ mod tests {
             dependency_files: Vec::new(),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             session_roots: Vec::new(),
+            session: literal_session(Path::new("/workspace")),
             task: String::new(),
             task_bytes: task.len(),
             task_sha256: task_sha256(task.as_bytes()),
@@ -2420,7 +2530,9 @@ mod tests {
             ("HOME".to_owned(), "/unused".to_owned()),
             ("PATH".to_owned(), "/usr/bin".to_owned()),
         ]);
-        state.apply_to_environment(Agent::Codex, &mut environment);
+        state
+            .apply_to_environment(Agent::Codex, &mut environment)
+            .unwrap();
 
         let private_auth = state.root.join("codex/auth.json");
         assert_eq!(
@@ -2459,7 +2571,9 @@ mod tests {
             ("HOME".to_owned(), "/unused".to_owned()),
             ("PATH".to_owned(), "/usr/bin".to_owned()),
         ]);
-        opencode_state.apply_to_environment(Agent::OpenCode, &mut opencode_environment);
+        opencode_state
+            .apply_to_environment(Agent::OpenCode, &mut opencode_environment)
+            .unwrap();
         let private_opencode_auth = opencode_state.root.join("data/opencode/auth.json");
         assert_eq!(
             fs::read(&private_opencode_auth).unwrap(),
@@ -2546,6 +2660,7 @@ mod tests {
             dependency_directories: Vec::new(),
             dependency_files: Vec::new(),
             session_roots: Vec::new(),
+            session: literal_session(&root.path().canonicalize().unwrap()),
             task: String::new(),
             task_bytes: 0,
             task_sha256: String::new(),
@@ -2624,7 +2739,9 @@ mod tests {
                 AgentState::create_with_source_home(Agent::Codex, &[], Some(fixture_parent.path()))
                     .unwrap();
             let mut environment = HashMap::new();
-            state.apply_to_environment(Agent::Codex, &mut environment);
+            state
+                .apply_to_environment(Agent::Codex, &mut environment)
+                .unwrap();
             PreparedRun {
                 agent: Agent::Codex,
                 access,
@@ -2639,6 +2756,7 @@ mod tests {
                     root_a.path().canonicalize().unwrap(),
                     root_b.path().canonicalize().unwrap(),
                 ],
+                session: session(&selected),
                 command: vec![
                     executable.to_string_lossy().into_owned(),
                     access.as_str().to_owned(),
@@ -2699,7 +2817,7 @@ mod tests {
         let state =
             AgentState::create_with_source_home(Agent::Codex, &[], Some(fixture_parent.path()))?;
         let mut environment = HashMap::new();
-        state.apply_to_environment(Agent::Codex, &mut environment);
+        state.apply_to_environment(Agent::Codex, &mut environment)?;
         environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
         let dependency_symlinks =
             launcher_dependency_closure(&bin.join("codex"), &target, &[])?.symlinks;
@@ -2722,6 +2840,7 @@ mod tests {
             dependency_files: Vec::new(),
             environment,
             session_roots: Vec::new(),
+            session: session(&workspace.canonicalize()?),
             task: "test".to_owned(),
             task_bytes: 4,
             task_sha256: task_sha256(b"test"),
@@ -2778,7 +2897,7 @@ mod tests {
         let state =
             AgentState::create_with_source_home(Agent::Codex, &[], Some(fixture_parent.path()))?;
         let mut environment = HashMap::new();
-        state.apply_to_environment(Agent::Codex, &mut environment);
+        state.apply_to_environment(Agent::Codex, &mut environment)?;
         environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
         let closure = launcher_dependency_closure(&bin.join("codex"), &target, &[])?;
         let dependency_symlinks = closure.symlinks;
@@ -2795,6 +2914,7 @@ mod tests {
             dependency_files: closure.files,
             environment,
             session_roots: Vec::new(),
+            session: session(&workspace.canonicalize()?),
             task: "test".to_owned(),
             task_bytes: 4,
             task_sha256: task_sha256(b"test"),

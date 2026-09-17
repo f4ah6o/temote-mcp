@@ -47,6 +47,9 @@ pub enum Command {
         command: SessionCommand,
     },
     Mcp,
+    GitShim {
+        argv: Vec<String>,
+    },
     #[cfg(feature = "network")]
     Serve {
         profile: profile::Profile,
@@ -159,6 +162,15 @@ where
     I: Iterator<Item = String>,
 {
     let raw = raw.collect::<Vec<_>>();
+    if raw.get(1).map(String::as_str) == Some("git-shim") {
+        // Internal entry point used by local-agent Git shim tests. Everything
+        // after the subcommand is forwarded to the shim unchanged.
+        return Ok(ParseOutcome::Run(Cli {
+            command: Some(Command::GitShim {
+                argv: raw[2..].to_vec(),
+            }),
+        }));
+    }
     if matches!(raw.get(1).map(String::as_str), Some("--version" | "-V")) {
         return Ok(ParseOutcome::Print(format!(
             "{} {}\n",

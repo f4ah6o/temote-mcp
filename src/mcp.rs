@@ -2817,7 +2817,7 @@ async fn approve_local_git_mutation(
     .await
 }
 
-async fn validate_git_branch_name(
+pub(crate) async fn validate_git_branch_name(
     session: &config::Session,
     cwd: &Path,
     branch: &str,
@@ -2875,7 +2875,7 @@ fn validate_git_base_ref(base: &str) -> Result<()> {
     Ok(())
 }
 
-async fn resolve_git_base_commit(
+pub(crate) async fn resolve_git_base_commit(
     session: &config::Session,
     cwd: &Path,
     base: &str,
@@ -2902,7 +2902,7 @@ async fn resolve_git_base_commit(
     Ok(resolved.to_ascii_lowercase())
 }
 
-async fn ensure_local_branch_absent(
+pub(crate) async fn ensure_local_branch_absent(
     session: &config::Session,
     cwd: &Path,
     branch: &str,
@@ -2912,7 +2912,7 @@ async fn ensure_local_branch_absent(
     Ok(())
 }
 
-async fn ensure_local_branch_exists(
+pub(crate) async fn ensure_local_branch_exists(
     session: &config::Session,
     cwd: &Path,
     branch: &str,
@@ -3016,7 +3016,7 @@ fn ensure_git_worktree_root_exists(repository_root: &Path) -> Result<()> {
     }
 }
 
-fn build_git_branch_create_command(branch: &str, base_sha: &str) -> Vec<String> {
+pub(crate) fn build_git_branch_create_command(branch: &str, base_sha: &str) -> Vec<String> {
     vec![
         "git".to_owned(),
         "-c".to_owned(),
@@ -3028,7 +3028,7 @@ fn build_git_branch_create_command(branch: &str, base_sha: &str) -> Vec<String> 
     ]
 }
 
-fn build_git_switch_command(branch: &str) -> Vec<String> {
+pub(crate) fn build_git_switch_command(branch: &str) -> Vec<String> {
     vec![
         "git".to_owned(),
         "-c".to_owned(),
