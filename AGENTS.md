@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Temote MCP is a Rust MCP server for operating local machines through explicit sessions. Normal sessions are path-scoped, command execution is sandboxed with network disabled, and the default `agent` permission mode is sandboxed but approval-free for validated structured operations. `ask` keeps the local approval console for host/network-sensitive operations, and `--yolo` intentionally removes those Temote MCP boundaries.
+Temote MCP is a Rust MCP server for operating local machines through explicit sessions. Normal sessions are path-scoped and command execution is sandboxed; `ask` keeps ordinary commands network-disabled while the default `agent` permission mode uses the network-enabled development sandbox profile and is approval-free for validated structured operations. `ask` keeps the local approval console for host/network-sensitive operations, and `--yolo` intentionally removes those Temote MCP boundaries.
 
 ## Repository rules
 
@@ -26,7 +26,7 @@ Do not weaken these without an explicit issue describing the security model chan
 - `host_id` is a non-secret routing identity, not a credential; authenticated host identity must stay bound to configured credentials and generation state.
 - Public tools must not inherit unrestricted local `--yolo` semantics merely because a local host/session uses yolo mode.
 - Normal-session filesystem access must remain inside permitted roots, including symlink resolution and command `cwd`.
-- Normal `execute` / `start_command` run in the sandbox with network disabled.
+- Normal `execute` / `start_command` run in the sandbox. `ask` keeps them network-disabled; `agent` keeps the same sandbox and path containment with the network-enabled development profile. Neither may widen filesystem/path containment, and public HTTP must not expose `without_sandbox` or create/promote `yolo`.
 - Ordinary sandboxed commands must not gain write access to Git metadata. Use the dedicated Git tools for index/commit/remote operations.
 - `git_pull` stays fast-forward-only; `git_push` must not expose force or arbitrary URL/refspec input.
 - Public HTTP must not expose `without_sandbox`.

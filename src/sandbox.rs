@@ -22,6 +22,27 @@ mod policy;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_POINTER_BYTES: u64 = 64 * 1024;
 pub(crate) const PROTECTED_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
+
+/// Network policy for ordinary sandboxed commands (`execute` / `start_command`).
+///
+/// This is the single typed decision shared by both tools. It is deliberately
+/// not a caller-selectable policy: the session permission mode selects it, and
+/// no MCP input can widen it. `Restricted` denies outbound network in the
+/// sandbox; `Development` reuses the existing network-enabled sandbox profile
+/// so ordinary development commands can reach localhost, LAN, and Internet
+/// endpoints while filesystem/path containment stays in force.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandNetworkPolicy {
+    Restricted,
+    Development,
+}
+
+impl CommandNetworkPolicy {
+    pub const fn development_enabled(self) -> bool {
+        matches!(self, Self::Development)
+    }
+}
+
 const MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_ENTRIES: usize = 2_000_000;
 const MAX_LOCAL_AGENT_PROTECTED_METADATA_SCAN_DEPTH: usize = 64;
 const MAX_LOCAL_AGENT_PROTECTED_METADATA_PATHS: usize = 1024;
@@ -308,7 +329,29 @@ pub async fn run(
     writable_roots: &[PathBuf],
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
-    run_with_metadata_roots(command, cwd, writable_roots, &[], None, stdin).await
+    run_with_network_policy(
+        command,
+        cwd,
+        writable_roots,
+        CommandNetworkPolicy::Restricted,
+        stdin,
+    )
+    .await
+}
+
+/// Runs an ordinary sandboxed command with an explicit network policy.
+///
+/// Callers pass the decision produced by the session permission mode; the
+/// filesystem/path containment and protected-metadata handling are identical
+/// for both network policies.
+pub async fn run_with_network_policy(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    network: CommandNetworkPolicy,
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_with_metadata_roots(command, cwd, writable_roots, &[], None, network, stdin).await
 }
 
 /// Runs the structured local-agent broker profile.
@@ -474,7 +517,16 @@ pub async fn run_git(
             git_root.display()
         );
     }
-    run_with_metadata_roots(command, &cwd, writable_roots, &validated_roots, None, stdin).await
+    run_with_metadata_roots(
+        command,
+        &cwd,
+        writable_roots,
+        &validated_roots,
+        None,
+        CommandNetworkPolicy::Restricted,
+        stdin,
+    )
+    .await
 }
 
 /// Runs the exact structured `git worktree add` command with the common
@@ -521,6 +573,7 @@ pub async fn run_git_worktree_add(
         writable_roots,
         &validated_roots,
         Some(&protected_worktree_roots),
+        CommandNetworkPolicy::Restricted,
         stdin,
     )
     .await
@@ -532,6 +585,7 @@ async fn run_with_metadata_roots(
     writable_roots: &[PathBuf],
     git_metadata_roots: &[PathBuf],
     protected_worktree_roots: Option<&[PathBuf]>,
+    network: CommandNetworkPolicy,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
@@ -540,7 +594,7 @@ async fn run_with_metadata_roots(
     validate_writable_scope(&cwd, writable_roots)?;
     #[cfg(target_os = "macos")]
     let spec = if git_metadata_roots.is_empty() {
-        policy::SandboxSpec::command(&cwd, writable_roots)?
+        policy::SandboxSpec::command(&cwd, writable_roots, network.development_enabled())?
     } else if let Some(protected_worktree_roots) = protected_worktree_roots {
         policy::SandboxSpec::git_worktree_add(
             &cwd,
@@ -562,7 +616,7 @@ async fn run_with_metadata_roots(
             protected_worktree_roots,
         )?
     } else {
-        linux::command(command, &cwd, writable_roots, git_metadata_roots)?
+        linux::command(command, &cwd, writable_roots, git_metadata_roots, network)?
     };
 
     #[cfg(target_os = "macos")]
@@ -3343,6 +3397,55 @@ done
         )
         .await?;
         assert_ne!(network.status, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_ordinary_command_network_policy_controls_host_loopback() -> Result<()> {
+        let root = test_root();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        let accept = tokio::spawn(async move {
+            for _ in 0..2 {
+                let _ = listener.accept().await;
+            }
+        });
+        let connect = command(
+            "/bin/bash",
+            &["-c", &format!("exec 3<>/dev/tcp/127.0.0.1/{port}")],
+        );
+
+        let development = run_with_network_policy(
+            &connect,
+            &workspace,
+            &[],
+            CommandNetworkPolicy::Development,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            development.status, 0,
+            "development profile must reach host loopback: {}",
+            development.stderr
+        );
+
+        let restricted = run_with_network_policy(
+            &connect,
+            &workspace,
+            &[],
+            CommandNetworkPolicy::Restricted,
+            None,
+        )
+        .await?;
+        assert_ne!(
+            restricted.status, 0,
+            "restricted profile must not reach host loopback"
+        );
+
+        accept.abort();
         Ok(())
     }
 

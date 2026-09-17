@@ -4406,7 +4406,7 @@ where
     let command = required_command(args)?;
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
-    let yolo = session.yolo();
+    let permission_mode = session.permission_mode;
     let slot = reserve_job_slot(&session.id)?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
@@ -4423,7 +4423,7 @@ where
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
         let (result, outcome) = tokio::select! {
-            result = run_session_command(&command, &cwd, &roots, yolo) => {
+            result = run_session_command(&command, &cwd, &roots, permission_mode) => {
                 match result {
                     Ok(output) => {
                         let result = render_output(output);
@@ -4530,12 +4530,11 @@ async fn run_session_command(
     command: &[String],
     cwd: &Path,
     roots: &[PathBuf],
-    yolo: bool,
+    permission_mode: config::PermissionMode,
 ) -> Result<sandbox::Output> {
-    if yolo {
-        sandbox::run_unrestricted(command, cwd, None).await
-    } else {
-        sandbox::run(command, cwd, roots, None).await
+    match permission_mode.command_network_policy() {
+        Some(network) => sandbox::run_with_network_policy(command, cwd, roots, network, None).await,
+        None => sandbox::run_unrestricted(command, cwd, None).await,
     }
 }
 
@@ -8483,7 +8482,7 @@ mod tests {
             &command,
             workspace.path(),
             &[workspace.path().to_path_buf()],
-            true,
+            config::PermissionMode::Yolo,
         )
         .await
         .unwrap();
@@ -9958,7 +9957,7 @@ mod tests {
             &command,
             workspace.path(),
             &[workspace.path().to_path_buf()],
-            false,
+            config::PermissionMode::Agent,
         )
         .await
         .unwrap();

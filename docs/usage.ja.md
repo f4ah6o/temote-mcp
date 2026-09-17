@@ -78,7 +78,7 @@ migration は legacy state file を安全に検証し、signal 前に live PID �
 
 ## command
 
-`execute` は shell を介さず argv を実行します。通常 session では network 無効の sandbox 内で動きます。foreground timeout 内に終了すれば結果を直接返し、それ以上かかる場合は `job_id` を返します。
+`execute` は shell を介さず argv を実行します。`ask` では network 無効の sandbox 内で動き、既定の `agent` では同じ sandbox と path containment を維持したまま localhost / LAN / Internet の開発通信を許可する network-enabled development profile を使います。`yolo` は host 上で制限なく実行する local-only path のままです。foreground timeout 内に終了すれば結果を直接返し、それ以上かかる場合は `job_id` を返します。
 
 最初から background 実行する場合は `start_command` を使います。`poll_job` で完了を確認し、`stop_job` で停止できます。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。1 session あたり同時に8 jobまで実行できます。
 

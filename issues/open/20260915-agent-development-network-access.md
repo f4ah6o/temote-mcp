@@ -228,3 +228,14 @@ yes
 ## 2026-09-16 polishing update
 
 Do not assign this whole issue to an implementation agent. Repository-local implementation is narrowed to `issues/polished/20260916-agent-network-mode-policy.md`; live outbound/listen/LAN evidence belongs to the live acceptance matrix.
+
+## Repository-local completion (2026-09-16)
+
+The bounded child `issues/polished/20260916-agent-network-mode-policy.md` is implemented and verified on `main`:
+
+- `PermissionMode::command_network_policy()` is the single typed decision: `ask` -> `Restricted`, `agent` -> `Development` (the existing network-enabled sandbox profile), `yolo` -> `None` (the local-only unrestricted path).
+- `execute` and `start_command` share `spawn_sandboxed_command_with_controls` -> `run_session_command`, which now selects `sandbox::run_with_network_policy` or `run_unrestricted` from that decision. Filesystem/path containment, protected metadata handling, and the public `without_sandbox` / yolo denials are unchanged.
+- Deterministic tests cover the mode matrix, Linux policy/bwrap/seccomp construction, a macOS profile construction test (host/CI-only), and a live Linux sandbox loopback test proving `Development` reaches host loopback while `Restricted` does not.
+- Docs updated: `docs/usage.md` / `.ja`, `docs/public-http.md` / `.ja`, `skills/temote-mcp/SKILL.md`, `AGENTS.md` safety invariant, and `CHANGES.md`.
+
+Live outbound HTTPS / LAN / RTSP evidence cannot be established in this environment and is now a row in the `Agent-mode development network` section of `issues/open/20260908-live-acceptance-matrix.md`. This umbrella therefore stays open until Phase 4 resolves that live row.

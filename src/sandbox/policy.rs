@@ -47,8 +47,12 @@ pub(super) struct SandboxSpec {
 }
 
 impl SandboxSpec {
-    pub(super) fn command(cwd: &Path, writable_roots: &[PathBuf]) -> Result<Self> {
-        Self::scoped_command(cwd, writable_roots, false)
+    pub(super) fn command(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        network_access: bool,
+    ) -> Result<Self> {
+        Self::scoped_command(cwd, writable_roots, network_access)
     }
 
     /// Developer-tool profile: workspace plus narrowly scoped tool

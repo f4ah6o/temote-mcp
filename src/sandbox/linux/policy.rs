@@ -87,7 +87,27 @@ impl LinuxSandboxPolicy {
         writable_roots: &[PathBuf],
         git_metadata_roots: &[PathBuf],
     ) -> Result<Self> {
-        Self::for_scoped_command(cwd, writable_roots, git_metadata_roots, None)
+        Self::for_command_with_network(
+            cwd,
+            writable_roots,
+            git_metadata_roots,
+            LinuxNetworkPolicy::Restricted,
+        )
+    }
+
+    /// Ordinary-command profile with an explicit permission-mode-selected
+    /// network policy. Filesystem/path containment is identical to
+    /// `for_command`; only the network mode changes.
+    pub fn for_command_with_network(
+        cwd: &Path,
+        writable_roots: &[PathBuf],
+        git_metadata_roots: &[PathBuf],
+        network: LinuxNetworkPolicy,
+    ) -> Result<Self> {
+        let mut policy = Self::for_scoped_command(cwd, writable_roots, git_metadata_roots, None)?;
+        policy.network = network;
+        policy.validate()?;
+        Ok(policy)
     }
 
     pub fn for_git_worktree_add(

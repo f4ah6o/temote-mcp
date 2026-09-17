@@ -82,6 +82,22 @@ impl PermissionMode {
     pub fn is_yolo(self) -> bool {
         matches!(self, Self::Yolo)
     }
+
+    /// Network policy for ordinary sandboxed `execute` / `start_command` runs.
+    ///
+    /// This is the single permission-mode decision both tools share. `None`
+    /// means the session uses the local-only unrestricted path (`yolo`), which
+    /// is not a sandbox network policy at all. `ask` stays restricted; `agent`
+    /// uses the existing network-enabled development sandbox profile while
+    /// keeping filesystem/path containment.
+    pub const fn command_network_policy(self) -> Option<temote_mcp::sandbox::CommandNetworkPolicy> {
+        use temote_mcp::sandbox::CommandNetworkPolicy;
+        match self {
+            Self::Ask => Some(CommandNetworkPolicy::Restricted),
+            Self::Agent => Some(CommandNetworkPolicy::Development),
+            Self::Yolo => None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1279,6 +1295,23 @@ mod tests {
         assert!(serde_json::from_str::<PermissionMode>("\"root\"").is_err());
         assert!(!PermissionMode::Ask.is_yolo() && !PermissionMode::Agent.is_yolo());
         assert!(PermissionMode::Yolo.is_yolo());
+    }
+
+    #[test]
+    fn permission_modes_select_the_ordinary_command_network_policy() {
+        use temote_mcp::sandbox::CommandNetworkPolicy;
+        for (mode, expected) in [
+            (PermissionMode::Ask, Some(CommandNetworkPolicy::Restricted)),
+            (
+                PermissionMode::Agent,
+                Some(CommandNetworkPolicy::Development),
+            ),
+            (PermissionMode::Yolo, None),
+        ] {
+            assert_eq!(mode.command_network_policy(), expected, "{mode:?}");
+        }
+        assert!(!CommandNetworkPolicy::Restricted.development_enabled());
+        assert!(CommandNetworkPolicy::Development.development_enabled());
     }
 
     fn session_with_mode(id: &str, permission_mode: PermissionMode) -> Session {

@@ -50,7 +50,7 @@ In normal sessions, stay within permitted roots. If a required path is outside t
 
 ## Commands and jobs
 
-Use `execute` for normal commands. It takes argv, not a shell command string. Normal `ask`/`agent` sessions run commands in the Temote MCP sandbox with network disabled; yolo sessions run with the local user's host permissions.
+Use `execute` for normal commands. It takes argv, not a shell command string. `ask` sessions run commands in the Temote MCP sandbox with network disabled; the default `agent` mode keeps the same sandbox and path containment with the network-enabled development profile; yolo sessions run with the local user's host permissions.
 
 If `execute` returns a `job_id`, the work is still running. Poll it with `poll_job` until it finishes when completion is needed for the user's current task. Use `start_command` when backgrounding immediately is intentional. Use `stop_job` when the running command is no longer needed or must be cancelled.
 

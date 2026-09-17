@@ -81,16 +81,16 @@ The legacy inline `/permission ...` terminal command UI is not the owner of deta
 An explicit session permission mode controls the Temote-local approval layer:
 
 - `ask` keeps the strictest policy: sandbox and path containment stay in force, and host/network-sensitive structured operations require the local approval console.
-- `agent` is the default for newly created sessions, including authenticated public `session_start`. It keeps the same sandbox, path containment, network restriction for ordinary commands, and tool-specific validation, but does not require the local approval console for otherwise-valid structured operations: Git fetch/pull/branch-push/tag-push, `local_agent_run`, `dev_tool_run`, checkpoints, patches, and the structured 1Password/kintone integrations.
+- `agent` is the default for newly created sessions, including authenticated public `session_start`. It keeps the same sandbox, path containment, and tool-specific validation, and its ordinary `execute`/`start_command` runs use the network-enabled development sandbox profile, but it does not require the local approval console for otherwise-valid structured operations: Git fetch/pull/branch-push/tag-push, `local_agent_run`, `dev_tool_run`, checkpoints, patches, and the structured 1Password/kintone integrations.
 - `yolo` remains the local-only unrestricted mode and cannot be created or promoted through public HTTP.
 
-`agent` is not a weaker spelling of `yolo`: ordinary `execute`/`start_command` remain sandboxed with network disabled, public `without_sandbox` remains unavailable, force-push and arbitrary Git URLs/refspecs remain rejected, and integrations keep their own authentication and capability boundaries.
+`agent` is not a weaker spelling of `yolo`: ordinary `execute`/`start_command` remain sandboxed and path-contained (`ask` restricted, `agent` development-network-enabled), public `without_sandbox` remains unavailable, force-push and arbitrary Git URLs/refspecs remain rejected, and integrations keep their own authentication and capability boundaries.
 
 Use `temote-mcp session permission <id> status|ask|agent|yolo` to inspect or intentionally change a running managed session. Existing persisted sessions keep their stored mode across restart, automatic restart, restore, and upgrade handoff; an explicit `ask` session is not silently migrated to `agent`.
 
 ## Commands
 
-`execute` runs argv without a shell. In normal sessions it runs inside Temote MCP's sandbox with network disabled. If the command completes within the foreground timeout, the result is returned immediately; otherwise it returns a `job_id`.
+`execute` runs argv without a shell. In `ask` sessions it runs inside Temote MCP's sandbox with network disabled; in the default `agent` mode it keeps the same sandbox and path containment but uses the network-enabled development profile for localhost/LAN/Internet development traffic. `yolo` remains the local-only unrestricted host path. If the command completes within the foreground timeout, the result is returned immediately; otherwise it returns a `job_id`.
 
 Use `start_command` when work should be backgrounded immediately, then `poll_job` until completion or `stop_job` to cancel it. Jobs belong to their session, have a two-hour lifetime limit, and are cancelled when the session stops. A session can have up to eight active sandbox jobs.
 

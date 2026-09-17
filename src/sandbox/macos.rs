@@ -220,7 +220,7 @@ mod tests {
                 .filter(|_| noprop::sample_bool(ctx))
                 .cloned()
                 .collect::<Vec<_>>();
-            let spec = SandboxSpec::command(&workspace, &requested).unwrap();
+            let spec = SandboxSpec::command(&workspace, &requested, false).unwrap();
             let (policy, definitions) = build_write_policy(&spec).unwrap();
 
             let defined_paths = definitions
@@ -419,7 +419,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let workspace = fixture.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let spec = SandboxSpec::command(&workspace, &[]).unwrap();
+        let spec = SandboxSpec::command(&workspace, &[], false).unwrap();
 
         test_support::run(0x4d41_434f_5341_5247, 512, |ctx| {
             let count = noprop::sample_usize_in(ctx, 1..=8);
@@ -451,7 +451,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let spec = SandboxSpec::command(&workspace, &[]).unwrap();
+        let spec = SandboxSpec::command(&workspace, &[], false).unwrap();
         let (policy, definitions) = build_write_policy(&spec).unwrap();
 
         assert!(policy.contains("(param \"WRITABLE_ROOT_"));
@@ -463,5 +463,36 @@ mod tests {
         );
         assert!(!BASE_POLICY.contains("allow network-outbound"));
         assert!(!BASE_POLICY.contains("allow network-inbound"));
+    }
+
+    #[test]
+    fn ordinary_command_network_policy_is_rendered_in_the_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let restricted = SandboxSpec::command(&workspace, &[], false).unwrap();
+        let development = SandboxSpec::command(&workspace, &[], true).unwrap();
+        assert!(!restricted.network_access());
+        assert!(development.network_access());
+
+        let profile_args = |spec: &SandboxSpec| {
+            command(spec, &["/bin/true".to_owned()])
+                .unwrap()
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !profile_args(&restricted)
+                .iter()
+                .any(|arg| arg.contains("(allow network-outbound)"))
+        );
+        assert!(
+            profile_args(&development)
+                .iter()
+                .any(|arg| arg.contains("(allow network-outbound)"))
+        );
     }
 }

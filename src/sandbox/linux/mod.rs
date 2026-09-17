@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use self::policy::LinuxSandboxPolicy;
+use self::policy::{LinuxNetworkPolicy, LinuxSandboxPolicy};
+use crate::sandbox::CommandNetworkPolicy;
 
 const HELPER_BINARY_NAME: &str = "temote-linux-sandbox";
 
@@ -15,9 +16,19 @@ pub fn command(
     cwd: &Path,
     writable_roots: &[PathBuf],
     git_metadata_roots: &[PathBuf],
+    network: CommandNetworkPolicy,
 ) -> Result<Command> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
-    let policy = LinuxSandboxPolicy::for_command(cwd, writable_roots, git_metadata_roots)?;
+    let network = match network {
+        CommandNetworkPolicy::Restricted => LinuxNetworkPolicy::Restricted,
+        CommandNetworkPolicy::Development => LinuxNetworkPolicy::LocalAgent,
+    };
+    let policy = LinuxSandboxPolicy::for_command_with_network(
+        cwd,
+        writable_roots,
+        git_metadata_roots,
+        network,
+    )?;
     let executable = helper_executable()?;
     let args = helper::command_args(&policy, command)?;
     let mut process = Command::new(executable);

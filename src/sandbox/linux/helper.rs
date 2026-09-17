@@ -727,6 +727,47 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_command_network_policy_controls_network_namespace_and_seccomp() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let restricted = LinuxSandboxPolicy::for_command_with_network(
+            &workspace,
+            &[],
+            &[],
+            LinuxNetworkPolicy::Restricted,
+        )
+        .unwrap();
+        let development = LinuxSandboxPolicy::for_command_with_network(
+            &workspace,
+            &[],
+            &[],
+            LinuxNetworkPolicy::LocalAgent,
+        )
+        .unwrap();
+        assert_eq!(restricted.network, LinuxNetworkPolicy::Restricted);
+        assert_eq!(development.network, LinuxNetworkPolicy::LocalAgent);
+
+        let restricted_args =
+            build_bwrap_args(&restricted, vec!["/bin/true".to_owned()], 42).unwrap();
+        let development_args =
+            build_bwrap_args(&development, vec!["/bin/true".to_owned()], 42).unwrap();
+        assert!(restricted_args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(!development_args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(
+            !build_seccomp_filter(LinuxNetworkPolicy::Restricted)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !build_seccomp_filter(LinuxNetworkPolicy::LocalAgent)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn local_agent_policy_recreates_only_verified_symlinks() {
         use std::os::unix::fs::symlink;
