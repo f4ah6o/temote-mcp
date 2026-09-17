@@ -1,0 +1,1021 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+pub(crate) const MANAGED_WORKTREE_ROOT_NAME: &str = "worktrees";
+pub(crate) const MANAGED_SRC_ROOT_NAME: &str = "src";
+pub(crate) const MAX_MANAGED_TASK_BYTES: usize = 64;
+pub(crate) const MAX_MANAGED_REPOSITORY_BYTES: usize = 255;
+
+/// Classification for one registered Git worktree of the selected repository.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorktreeClassification {
+    Primary,
+    Managed,
+    Legacy,
+}
+
+impl WorktreeClassification {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Managed => "managed",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+/// Canonical identity of the selected repository and its Temote-managed
+/// worktree namespace.
+///
+/// The namespace is anchored to the configured `src` named root: the canonical
+/// primary checkout must be exactly `<src-root>/<repo>` and the managed root is
+/// always `<src-root>/worktrees/<repo>`. The checkout basename alone never
+/// grants authority, and neither `HOME` nor a caller-supplied path is used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedRepository {
+    src_root: PathBuf,
+    primary_checkout: PathBuf,
+    repository_name: String,
+    managed_root: PathBuf,
+}
+
+impl ManagedRepository {
+    /// Resolves the managed namespace for one canonical primary checkout.
+    ///
+    /// Only the exact `<src-root>/<repo>` shape is accepted. Nested checkouts
+    /// such as `<src-root>/group/repo`, checkouts below other named roots or
+    /// outside any root (`/tmp/repo`), the reserved `worktrees` namespace and
+    /// relative paths all fail closed. Filesystem authority (both directories
+    /// exist, are not symlinks and are not swapped) is verified by
+    /// [`Self::inspect_target_available`] and [`Self::prepare_target`], not by
+    /// this pure path-shape resolution.
+    pub(crate) fn resolve(primary_checkout: &Path, src_root: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            src_root.is_absolute(),
+            "configured {MANAGED_SRC_ROOT_NAME} root must be an absolute path: {}",
+            src_root.display()
+        );
+        anyhow::ensure!(
+            primary_checkout.is_absolute(),
+            "canonical repository checkout must be an absolute path: {}",
+            primary_checkout.display()
+        );
+        let repository_name = primary_checkout
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("canonical repository checkout has no usable directory name")?
+            .to_owned();
+        anyhow::ensure!(
+            repository_name != MANAGED_WORKTREE_ROOT_NAME,
+            "canonical repository checkout must not use the reserved {MANAGED_WORKTREE_ROOT_NAME} name"
+        );
+        anyhow::ensure!(
+            primary_checkout.parent() == Some(src_root),
+            "canonical repository checkout must be exactly one directory below the configured \
+             {MANAGED_SRC_ROOT_NAME} root: {} (src root {})",
+            primary_checkout.display(),
+            src_root.display()
+        );
+        let managed_root = src_root
+            .join(MANAGED_WORKTREE_ROOT_NAME)
+            .join(&repository_name);
+        Ok(Self {
+            src_root: src_root.to_path_buf(),
+            primary_checkout: primary_checkout.to_path_buf(),
+            repository_name,
+            managed_root,
+        })
+    }
+
+    pub(crate) fn primary_checkout(&self) -> &Path {
+        &self.primary_checkout
+    }
+
+    pub(crate) fn repository_name(&self) -> &str {
+        &self.repository_name
+    }
+
+    pub(crate) fn managed_root(&self) -> &Path {
+        &self.managed_root
+    }
+
+    fn namespace_parent(&self) -> PathBuf {
+        self.src_root.join(MANAGED_WORKTREE_ROOT_NAME)
+    }
+
+    /// Cross-checks an optional caller-supplied repository name against the
+    /// canonical identity. The input never contributes path components.
+    pub(crate) fn ensure_requested_repository(&self, requested: &str) -> Result<()> {
+        ensure_requested_repository(requested, &self.repository_name)
+    }
+
+    pub(crate) fn target(&self, task: &str) -> Result<PathBuf> {
+        validate_task_name(task)?;
+        Ok(self.managed_root.join(task))
+    }
+
+    /// Read-only pre-approval inspection. Verifies repository authority, the
+    /// target shape, the existing managed namespace and target collisions
+    /// without creating, moving or deleting anything.
+    pub(crate) fn inspect_target_available(&self, target: &Path) -> Result<()> {
+        self.ensure_authority()?;
+        self.ensure_target_shape(target)?;
+        inspect_existing_normal_directory(&self.namespace_parent(), "managed worktree namespace")?;
+        inspect_existing_normal_directory(&self.managed_root, "managed worktree root")?;
+        self.ensure_target_absent(target)
+    }
+
+    /// Mutating preparation performed only after approval. Creates the managed
+    /// namespace and re-verifies repository authority and target collision so a
+    /// pre-approval inspection result is never trusted across the approval
+    /// boundary.
+    pub(crate) fn prepare_target(&self, target: &Path) -> Result<()> {
+        self.ensure_authority()?;
+        self.ensure_target_shape(target)?;
+        create_normal_directory(&self.namespace_parent(), "managed worktree namespace")?;
+        create_normal_directory(&self.managed_root, "managed worktree root")?;
+        self.ensure_target_absent(target)
+    }
+
+    fn ensure_authority(&self) -> Result<()> {
+        ensure_normal_directory(&self.src_root, "configured src root")?;
+        ensure_normal_directory(&self.primary_checkout, "canonical repository checkout")
+    }
+
+    fn ensure_target_shape(&self, target: &Path) -> Result<()> {
+        anyhow::ensure!(
+            target.parent() == Some(self.managed_root.as_path())
+                && target
+                    .file_name()
+                    .is_some_and(|name| name.to_str().is_some()),
+            "managed worktree target must be a direct child of {}",
+            self.managed_root.display()
+        );
+        Ok(())
+    }
+
+    fn ensure_target_absent(&self, target: &Path) -> Result<()> {
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => anyhow::bail!(
+                "managed worktree target already exists; choose a different task or reuse it explicitly: {}",
+                target.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to inspect managed worktree target {}",
+                    target.display()
+                )
+            }),
+        }
+    }
+}
+
+/// Cross-checks an optional caller-supplied repository name against the
+/// canonical repository identity without granting it path authority.
+pub(crate) fn ensure_requested_repository(requested: &str, canonical: &str) -> Result<()> {
+    anyhow::ensure!(!requested.is_empty(), "repository must not be empty");
+    anyhow::ensure!(
+        requested.len() <= MAX_MANAGED_REPOSITORY_BYTES,
+        "repository must be at most {MAX_MANAGED_REPOSITORY_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !requested.chars().any(char::is_control),
+        "repository must not contain control characters"
+    );
+    anyhow::ensure!(
+        !requested.contains('/') && !requested.contains('\\'),
+        "repository must not contain path separators"
+    );
+    anyhow::ensure!(
+        requested == canonical,
+        "requested repository {requested:?} does not match the selected canonical repository {canonical:?}"
+    );
+    Ok(())
+}
+
+/// Rejects every unsafe task directory input, including absolute paths,
+/// traversal, separators, option-like values and control characters. The task
+/// is a filesystem-safe single path component, never a path.
+pub(crate) fn validate_task_name(task: &str) -> Result<()> {
+    anyhow::ensure!(!task.is_empty(), "managed worktree task must not be empty");
+    anyhow::ensure!(
+        task.len() <= MAX_MANAGED_TASK_BYTES,
+        "managed worktree task must be at most {MAX_MANAGED_TASK_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !task.chars().any(char::is_control),
+        "managed worktree task must not contain control characters"
+    );
+    anyhow::ensure!(
+        task != "." && task != ".." && !task.contains(".."),
+        "managed worktree task must not contain path traversal"
+    );
+    anyhow::ensure!(
+        !task.contains('/') && !task.contains('\\'),
+        "managed worktree task must be a single path component"
+    );
+    anyhow::ensure!(
+        !task.starts_with('-'),
+        "managed worktree task must not look like a command option"
+    );
+    anyhow::ensure!(
+        task.chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric()),
+        "managed worktree task must start with an ASCII letter or digit"
+    );
+    anyhow::ensure!(
+        !task.ends_with('.'),
+        "managed worktree task must not end with '.'"
+    );
+    anyhow::ensure!(
+        task.chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.')),
+        "managed worktree task must use only ASCII letters, digits, '.', '_' and '-'"
+    );
+    Ok(())
+}
+
+/// Derives a deterministic task directory from a validated branch name. A
+/// branch `/` never becomes directory hierarchy; it is flattened to `-`.
+pub(crate) fn derive_task_name(branch: &str) -> Result<String> {
+    anyhow::ensure!(!branch.is_empty(), "branch must not be empty");
+    let derived = branch.replace('/', "-");
+    validate_task_name(&derived).with_context(|| {
+        format!(
+            "branch {branch:?} does not produce a safe managed task directory; pass task explicitly"
+        )
+    })?;
+    Ok(derived)
+}
+
+/// Read-only authority check for an existing managed root.
+///
+/// Returns the canonical managed root only when it is a normal directory at the
+/// exact derived path. A missing, symlinked or swapped root yields `None`, and
+/// callers must not classify anything as managed.
+pub(crate) fn trusted_canonical_managed_root(repository: &ManagedRepository) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(repository.managed_root()).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(repository.managed_root()).ok()?;
+    (canonical == repository.managed_root()).then_some(canonical)
+}
+
+/// Facts observed after the Git worktree mutation. Plain values keep the
+/// verification predicate testable without a repository fixture.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CreatedTargetObservation {
+    pub(crate) canonical_target: Option<PathBuf>,
+    pub(crate) canonical_managed_root: Option<PathBuf>,
+    pub(crate) managed_root_is_normal_directory: bool,
+    pub(crate) target_is_symlink: bool,
+    pub(crate) observed_common_dir: Option<PathBuf>,
+    pub(crate) observed_primary_checkout: Option<PathBuf>,
+}
+
+/// Post-create verification. Git success alone is never enough: the created
+/// target must resolve as a direct child of the exact trusted managed root with
+/// the expected task component, and it must belong to the selected repository
+/// identity (common Git directory plus primary checkout).
+pub(crate) fn verify_created_managed_target(
+    repository: &ManagedRepository,
+    task: &str,
+    selected_common_dir: &Path,
+    selected_primary_checkout: &Path,
+    observation: &CreatedTargetObservation,
+) -> Result<()> {
+    validate_task_name(task)?;
+    anyhow::ensure!(
+        observation.managed_root_is_normal_directory,
+        "managed worktree root is not a normal directory after creation: {}",
+        repository.managed_root().display()
+    );
+    let canonical_managed_root = observation
+        .canonical_managed_root
+        .as_deref()
+        .context("cannot resolve the managed worktree root after creation")?;
+    anyhow::ensure!(
+        canonical_managed_root == repository.managed_root(),
+        "managed worktree root does not match the trusted managed root after creation: {}",
+        canonical_managed_root.display()
+    );
+    anyhow::ensure!(
+        !observation.target_is_symlink,
+        "created managed worktree target must not be a symbolic link: {}",
+        repository.managed_root().join(task).display()
+    );
+    let canonical_target = observation
+        .canonical_target
+        .as_deref()
+        .context("cannot resolve the created managed worktree target")?;
+    anyhow::ensure!(
+        canonical_target.parent() == Some(canonical_managed_root),
+        "created managed worktree is not a direct child of the trusted managed root: {}",
+        canonical_target.display()
+    );
+    anyhow::ensure!(
+        canonical_target.file_name() == Some(std::ffi::OsStr::new(task)),
+        "created managed worktree component does not match task {task:?}: {}",
+        canonical_target.display()
+    );
+    anyhow::ensure!(
+        observation.observed_common_dir.as_deref() == Some(selected_common_dir),
+        "created managed worktree does not belong to the selected repository (common Git directory mismatch): {}",
+        canonical_target.display()
+    );
+    anyhow::ensure!(
+        observation.observed_primary_checkout.as_deref() == Some(selected_primary_checkout),
+        "created managed worktree primary checkout mismatch: {}",
+        canonical_target.display()
+    );
+    Ok(())
+}
+
+/// Identity facts for one registered worktree used by list classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegisteredWorktreeIdentity<'a> {
+    pub(crate) canonical_path: Option<&'a Path>,
+    pub(crate) common_dir: Option<&'a Path>,
+    pub(crate) primary_checkout: Option<&'a Path>,
+}
+
+/// Classifies one registered worktree using direct-child containment of the
+/// canonical managed root plus the canonical common Git directory and primary
+/// checkout as repository identity. The managed root itself and nested
+/// descendants are never managed. Anything that cannot be verified fails closed
+/// as legacy. A `None` managed root means the managed root authority is
+/// unavailable, so nothing is managed.
+pub(crate) fn classify_registered_worktree(
+    registered: RegisteredWorktreeIdentity<'_>,
+    selected_primary_checkout: &Path,
+    canonical_managed_root: Option<&Path>,
+    selected_common_dir: &Path,
+) -> WorktreeClassification {
+    let Some(canonical_path) = registered.canonical_path else {
+        return WorktreeClassification::Legacy;
+    };
+    if canonical_path == selected_primary_checkout {
+        return WorktreeClassification::Primary;
+    }
+    let (Some(canonical_managed_root), Some(common_dir), Some(primary_checkout)) = (
+        canonical_managed_root,
+        registered.common_dir,
+        registered.primary_checkout,
+    ) else {
+        return WorktreeClassification::Legacy;
+    };
+    if common_dir != selected_common_dir || primary_checkout != selected_primary_checkout {
+        return WorktreeClassification::Legacy;
+    }
+    if canonical_path.parent() != Some(canonical_managed_root) {
+        return WorktreeClassification::Legacy;
+    }
+    WorktreeClassification::Managed
+}
+
+/// One entry of `git worktree list --porcelain`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RegisteredWorktree {
+    pub(crate) path: PathBuf,
+    pub(crate) head: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) bare: bool,
+    pub(crate) detached: bool,
+    pub(crate) prunable: bool,
+}
+
+pub(crate) fn parse_worktree_list(porcelain: &str) -> Result<Vec<RegisteredWorktree>> {
+    let mut entries = Vec::new();
+    let mut current: Option<RegisteredWorktree> = None;
+    for line in porcelain.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            anyhow::ensure!(
+                !path.starts_with('"'),
+                "quoted Git worktree paths are not supported"
+            );
+            anyhow::ensure!(
+                !path.is_empty() && Path::new(path).is_absolute(),
+                "Git worktree listing contains an invalid path: {path:?}"
+            );
+            current = Some(RegisteredWorktree {
+                path: PathBuf::from(path),
+                head: None,
+                branch: None,
+                bare: false,
+                detached: false,
+                prunable: false,
+            });
+            continue;
+        }
+        let entry = current
+            .as_mut()
+            .context("Git worktree listing field appeared before any worktree entry")?;
+        if let Some(head) = line.strip_prefix("HEAD ") {
+            entry.head = Some(head.to_owned());
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            entry.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_owned(),
+            );
+        } else if line == "bare" {
+            entry.bare = true;
+        } else if line == "detached" {
+            entry.detached = true;
+        } else if line == "locked" || line.starts_with("locked ") {
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            entry.prunable = true;
+        } else {
+            anyhow::bail!("unsupported Git worktree listing line: {line:?}");
+        }
+    }
+    if let Some(entry) = current.take() {
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn inspect_existing_normal_directory(path: &Path, label: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => ensure_normal_directory_metadata(path, label, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to inspect {label} {}", path.display()))
+        }
+    }
+}
+
+fn ensure_normal_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    ensure_normal_directory_metadata(path, label, &metadata)
+}
+
+fn ensure_normal_directory_metadata(
+    path: &Path,
+    label: &str,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "{label} must be a normal directory: {}",
+        path.display()
+    );
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("cannot resolve {label} {}", path.display()))?;
+    anyhow::ensure!(
+        canonical == path,
+        "{label} must not be a symbolic link or swapped path: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn create_normal_directory(path: &Path, label: &str) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create {label} {}", path.display()));
+        }
+    }
+    ensure_normal_directory(path, label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+
+    fn src_root() -> PathBuf {
+        PathBuf::from("/home/user/src")
+    }
+
+    fn primary_checkout(name: &str) -> PathBuf {
+        src_root().join(name)
+    }
+
+    fn resolve(name: &str) -> Result<ManagedRepository> {
+        ManagedRepository::resolve(&primary_checkout(name), &src_root())
+    }
+
+    #[test]
+    fn managed_repository_root_is_derived_from_the_exact_src_root_child() {
+        let repository = resolve("local-mcp").unwrap();
+        assert_eq!(repository.repository_name(), "local-mcp");
+        assert_eq!(repository.primary_checkout(), primary_checkout("local-mcp"));
+        assert_eq!(
+            repository.managed_root(),
+            PathBuf::from("/home/user/src/worktrees/local-mcp")
+        );
+        assert_eq!(
+            repository.target("issue-123-worktree-broker").unwrap(),
+            PathBuf::from("/home/user/src/worktrees/local-mcp/issue-123-worktree-broker")
+        );
+    }
+
+    #[test]
+    fn exact_src_root_shape_fails_closed_for_every_other_layout() {
+        let root = PathBuf::from("/home/user/src");
+        for (checkout, src) in [
+            (PathBuf::from("/home/user/src/nested/repo"), root.clone()),
+            (PathBuf::from("/tmp/repo"), root.clone()),
+            (PathBuf::from("/home/user/work/repo"), root.clone()),
+            (PathBuf::from("/home/user/src/worktrees/repo"), root.clone()),
+            (PathBuf::from("/home/user/src/worktrees"), root.clone()),
+            (
+                PathBuf::from("/home/user/src/repo"),
+                PathBuf::from("/home/user/work"),
+            ),
+            (PathBuf::from("relative/repo"), root.clone()),
+            (
+                PathBuf::from("/home/user/src/repo"),
+                PathBuf::from("relative/src"),
+            ),
+        ] {
+            assert!(
+                ManagedRepository::resolve(&checkout, &src).is_err(),
+                "{checkout:?} under {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn src_root_and_checkout_must_be_normal_directories() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        let checkout = root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let repository = ManagedRepository::resolve(&checkout, &root).unwrap();
+        let target = repository.target("task").unwrap();
+        repository.inspect_target_available(&target).unwrap();
+        assert!(repository.prepare_target(&target).is_ok());
+
+        let missing = ManagedRepository::resolve(&root.join("missing"), &root).unwrap();
+        assert!(
+            missing
+                .inspect_target_available(&missing.target("task").unwrap())
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let link = root.join("linked");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let linked = ManagedRepository::resolve(&link, &root).unwrap();
+            assert!(
+                linked
+                    .inspect_target_available(&linked.target("task").unwrap())
+                    .is_err()
+            );
+            assert!(
+                linked
+                    .prepare_target(&linked.target("task").unwrap())
+                    .is_err()
+            );
+            assert!(!outside.join("worktrees").exists());
+        }
+    }
+
+    #[test]
+    fn requested_repository_must_match_the_canonical_identity() {
+        let repository = resolve("local-mcp").unwrap();
+        repository.ensure_requested_repository("local-mcp").unwrap();
+        for requested in ["", "other-repo", "../local-mcp", "local/mcp"] {
+            assert!(
+                repository.ensure_requested_repository(requested).is_err(),
+                "{requested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_validation_rejects_injection_and_unsafe_names() {
+        for task in ["feature", "task-123", "app1274-detail-sort", "r1.2", "a_b"] {
+            validate_task_name(task).unwrap_or_else(|error| panic!("{task:?}: {error}"));
+        }
+        for task in [
+            "",
+            ".",
+            "..",
+            "a..b",
+            "/tmp/x",
+            "../x",
+            "a/../../b",
+            "nested/bad",
+            "back\\slash",
+            "-option",
+            "--force",
+            ".hidden",
+            "trailing.",
+            "bad\nname",
+            "unicode-\u{65e5}\u{672c}",
+        ] {
+            assert!(validate_task_name(task).is_err(), "{task:?}");
+        }
+        let oversized = "a".repeat(MAX_MANAGED_TASK_BYTES + 1);
+        assert!(validate_task_name(&oversized).is_err());
+        validate_task_name(&"a".repeat(MAX_MANAGED_TASK_BYTES)).unwrap();
+    }
+
+    #[test]
+    fn branch_slashes_never_create_directory_hierarchy() {
+        assert_eq!(
+            derive_task_name("feature/foo/bar").unwrap(),
+            "feature-foo-bar"
+        );
+        assert_eq!(
+            derive_task_name("feat/20260916-worktree-broker").unwrap(),
+            "feat-20260916-worktree-broker"
+        );
+        for branch in ["feature/../escape", "-option", "release/v1.0.0-rc.1"] {
+            let derived = derive_task_name(branch);
+            if let Ok(task) = derived {
+                assert!(!task.contains('/') && !task.contains('\\'));
+                assert!(validate_task_name(&task).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn pre_approval_inspection_is_read_only_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let repository =
+            ManagedRepository::resolve(&std::fs::canonicalize(&checkout).unwrap(), &canonical)
+                .unwrap();
+
+        let target = repository.target("task-one").unwrap();
+        repository.inspect_target_available(&target).unwrap();
+        assert!(!repository.namespace_parent().exists());
+        assert!(!repository.managed_root().exists());
+        assert!(!target.exists());
+
+        std::fs::create_dir_all(&target).unwrap();
+        repository.inspect_target_available(&target).unwrap_err();
+
+        let file_target = repository.target("task-file").unwrap();
+        std::fs::write(&file_target, b"unrelated").unwrap();
+        let error = repository
+            .inspect_target_available(&file_target)
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        std::fs::remove_file(&file_target).unwrap();
+
+        let escaped = target.parent().unwrap().join("nested").join("task");
+        assert!(repository.inspect_target_available(&escaped).is_err());
+    }
+
+    #[test]
+    fn post_approval_preparation_creates_the_namespace_and_rechecks_collisions() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let repository =
+            ManagedRepository::resolve(&std::fs::canonicalize(&checkout).unwrap(), &canonical)
+                .unwrap();
+
+        let target = repository.target("task-one").unwrap();
+        repository.prepare_target(&target).unwrap();
+        assert!(repository.namespace_parent().is_dir());
+        assert!(repository.managed_root().is_dir());
+        assert!(!target.exists());
+
+        // A target that appears after the pre-approval inspection is rejected.
+        std::fs::create_dir(&target).unwrap();
+        assert!(repository.prepare_target(&target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_managed_parents_fail_closed_before_and_after_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let repository =
+            ManagedRepository::resolve(&std::fs::canonicalize(&checkout).unwrap(), &canonical)
+                .unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        std::os::unix::fs::symlink(&outside, repository.namespace_parent()).unwrap();
+        let target = repository.target("task").unwrap();
+        let error = repository.inspect_target_available(&target).unwrap_err();
+        assert!(error.to_string().contains("normal directory"), "{error:#}");
+        assert!(repository.prepare_target(&target).is_err());
+        assert!(!outside.join("repo").exists());
+
+        std::fs::remove_file(repository.namespace_parent()).unwrap();
+        std::fs::create_dir(repository.namespace_parent()).unwrap();
+        std::os::unix::fs::symlink(&outside, repository.managed_root()).unwrap();
+        let error = repository.inspect_target_available(&target).unwrap_err();
+        assert!(error.to_string().contains("normal directory"), "{error:#}");
+        assert!(repository.prepare_target(&target).is_err());
+        assert!(!outside.join("task").exists());
+        assert!(!outside.join("repo").exists());
+    }
+
+    #[test]
+    fn trusted_managed_root_requires_a_normal_directory_at_the_exact_path() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let repository =
+            ManagedRepository::resolve(&std::fs::canonicalize(&checkout).unwrap(), &canonical)
+                .unwrap();
+        assert_eq!(trusted_canonical_managed_root(&repository), None);
+
+        std::fs::create_dir_all(repository.managed_root()).unwrap();
+        assert_eq!(
+            trusted_canonical_managed_root(&repository),
+            Some(repository.managed_root().to_path_buf())
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(repository.managed_root()).unwrap();
+            let outside = root.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, repository.managed_root()).unwrap();
+            assert_eq!(trusted_canonical_managed_root(&repository), None);
+        }
+    }
+
+    #[test]
+    fn created_target_verification_requires_exact_containment_and_identity() {
+        let repository = resolve("repo").unwrap();
+        let selected_common = PathBuf::from("/home/user/src/repo/.git");
+        let selected_primary = primary_checkout("repo");
+        let observation = CreatedTargetObservation {
+            canonical_target: Some(PathBuf::from("/home/user/src/worktrees/repo/task")),
+            canonical_managed_root: Some(PathBuf::from("/home/user/src/worktrees/repo")),
+            managed_root_is_normal_directory: true,
+            target_is_symlink: false,
+            observed_common_dir: Some(selected_common.clone()),
+            observed_primary_checkout: Some(selected_primary.clone()),
+        };
+        verify_created_managed_target(
+            &repository,
+            "task",
+            &selected_common,
+            &selected_primary,
+            &observation,
+        )
+        .unwrap();
+
+        fn symlinked_managed_root(observation: &mut CreatedTargetObservation) {
+            observation.managed_root_is_normal_directory = false;
+        }
+        fn swapped_managed_root(observation: &mut CreatedTargetObservation) {
+            observation.canonical_managed_root =
+                Some(PathBuf::from("/home/user/src/worktrees/other"));
+        }
+        fn symlinked_target(observation: &mut CreatedTargetObservation) {
+            observation.target_is_symlink = true;
+        }
+        fn nested_target(observation: &mut CreatedTargetObservation) {
+            observation.canonical_target =
+                Some(PathBuf::from("/home/user/src/worktrees/repo/nested/task"));
+        }
+        fn task_mismatch(observation: &mut CreatedTargetObservation) {
+            observation.canonical_target =
+                Some(PathBuf::from("/home/user/src/worktrees/repo/other-task"));
+        }
+        fn missing_target(observation: &mut CreatedTargetObservation) {
+            observation.canonical_target = None;
+        }
+        fn wrong_common_dir(observation: &mut CreatedTargetObservation) {
+            observation.observed_common_dir = Some(PathBuf::from("/home/user/src/other/.git"));
+        }
+        fn wrong_primary_checkout(observation: &mut CreatedTargetObservation) {
+            observation.observed_primary_checkout = Some(PathBuf::from("/home/user/src/other"));
+        }
+        type ObservationMutation = fn(&mut CreatedTargetObservation);
+        let mutations: [(&str, ObservationMutation); 8] = [
+            ("symlinked managed root", symlinked_managed_root),
+            ("swapped managed root", swapped_managed_root),
+            ("symlinked target", symlinked_target),
+            ("nested target", nested_target),
+            ("task mismatch", task_mismatch),
+            ("missing target", missing_target),
+            ("wrong common dir", wrong_common_dir),
+            ("wrong primary checkout", wrong_primary_checkout),
+        ];
+        for (label, mutate) in mutations {
+            let mut mutated = observation.clone();
+            mutate(&mut mutated);
+            assert!(
+                verify_created_managed_target(
+                    &repository,
+                    "task",
+                    &selected_common,
+                    &selected_primary,
+                    &mutated,
+                )
+                .is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_requires_canonical_containment_and_identity() {
+        let primary = PathBuf::from("/src/repo");
+        let managed_root = PathBuf::from("/src/worktrees/repo");
+        let identity = PathBuf::from("/src/repo/.git");
+        fn identity_for<'a>(
+            path: &'a Path,
+            common: Option<&'a Path>,
+            primary: &'a Path,
+        ) -> RegisteredWorktreeIdentity<'a> {
+            RegisteredWorktreeIdentity {
+                canonical_path: Some(path),
+                common_dir: common,
+                primary_checkout: Some(primary),
+            }
+        }
+
+        assert_eq!(
+            classify_registered_worktree(
+                identity_for(&primary, Some(&identity), &primary),
+                &primary,
+                Some(&managed_root),
+                &identity,
+            ),
+            WorktreeClassification::Primary
+        );
+        assert_eq!(
+            classify_registered_worktree(
+                identity_for(
+                    Path::new("/src/worktrees/repo/task"),
+                    Some(&identity),
+                    &primary
+                ),
+                &primary,
+                Some(&managed_root),
+                &identity,
+            ),
+            WorktreeClassification::Managed
+        );
+        let managed_path = Path::new("/src/worktrees/repo/task");
+        for (path, common) in [
+            (
+                Some(Path::new("/src/repo/.wt/legacy")),
+                Some(identity.as_path()),
+            ),
+            (Some(Path::new("/tmp/legacy")), Some(identity.as_path())),
+            (Some(managed_path), Some(Path::new("/other/repo/.git"))),
+            (
+                Some(Path::new("/src/worktrees/other/task")),
+                Some(identity.as_path()),
+            ),
+            (Some(Path::new("/src/worktrees/repo/missing")), None),
+            (None, None),
+            // Direct-child containment is the contract: the managed root
+            // itself and nested descendants are legacy even with a matching
+            // common Git directory and primary checkout.
+            (
+                Some(Path::new("/src/worktrees/repo")),
+                Some(identity.as_path()),
+            ),
+            (
+                Some(Path::new("/src/worktrees/repo/task/nested")),
+                Some(identity.as_path()),
+            ),
+        ] {
+            assert_eq!(
+                classify_registered_worktree(
+                    RegisteredWorktreeIdentity {
+                        canonical_path: path,
+                        common_dir: common,
+                        primary_checkout: Some(&primary),
+                    },
+                    &primary,
+                    Some(&managed_root),
+                    &identity,
+                ),
+                WorktreeClassification::Legacy,
+                "{path:?} {common:?}"
+            );
+        }
+        // A matching common directory with a different primary checkout is a
+        // different repository identity and must not be adopted.
+        assert_eq!(
+            classify_registered_worktree(
+                RegisteredWorktreeIdentity {
+                    canonical_path: Some(managed_path),
+                    common_dir: Some(&identity),
+                    primary_checkout: Some(Path::new("/src/other")),
+                },
+                &primary,
+                Some(&managed_root),
+                &identity,
+            ),
+            WorktreeClassification::Legacy
+        );
+        // Managed root authority unavailable (missing, symlinked or swapped
+        // root) or equal to the entry itself: nothing may be managed.
+        for canonical_managed_root in [None, Some(managed_path)] {
+            assert_eq!(
+                classify_registered_worktree(
+                    identity_for(managed_path, Some(&identity), &primary),
+                    &primary,
+                    canonical_managed_root,
+                    &identity,
+                ),
+                WorktreeClassification::Legacy,
+                "{canonical_managed_root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn porcelain_listing_is_parsed_without_losing_legacy_metadata() {
+        let porcelain = "\
+worktree /src/repo
+HEAD 0123456789abcdef0123456789abcdef01234567
+branch refs/heads/main
+
+worktree /src/worktrees/repo/task
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/feature/foo
+locked maintenance
+
+worktree /src/repo/.wt/legacy
+HEAD 2222222222222222222222222222222222222222
+detached
+prunable gitdir file points to non-existent location
+
+";
+        let entries = parse_worktree_list(porcelain).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, PathBuf::from("/src/repo"));
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert_eq!(
+            entries[0].head.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(entries[1].branch.as_deref(), Some("feature/foo"));
+        assert!(entries[2].detached);
+        assert!(entries[2].prunable);
+        assert!(entries[2].branch.is_none());
+
+        for invalid in [
+            "HEAD abc\n",
+            "worktree relative/path\n",
+            "worktree \"/quoted path\"\n",
+            "worktree /src/repo\nunknown attribute\n",
+        ] {
+            assert!(parse_worktree_list(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn generated_task_inputs_never_escape_the_managed_root() -> noprop::TestResult {
+        test_support::run(0x4d41_4e41_4745_4457, 1024, |ctx| {
+            let src = PathBuf::from("/src");
+            let checkout =
+                PathBuf::from(format!("/src/repository-{:016x}", noprop::sample_u64(ctx)));
+            let repository = ManagedRepository::resolve(&checkout, &src).unwrap();
+            let len = noprop::sample_usize_in(ctx, 0..=MAX_MANAGED_TASK_BYTES + 4);
+            let candidate = (0..len)
+                .map(|_| match noprop::sample_usize_in(ctx, 0..=6) {
+                    0 => '/',
+                    1 => '.',
+                    2 => '-',
+                    3 => '_',
+                    4 => '\\',
+                    5 => 'a',
+                    _ => char::from_u32(0x20 + noprop::sample_u32(ctx) % 95).unwrap(),
+                })
+                .collect::<String>();
+            if validate_task_name(&candidate).is_ok() {
+                let target = repository.target(&candidate).unwrap();
+                assert!(target.parent() == Some(repository.managed_root()));
+                assert!(target.starts_with(repository.managed_root()));
+                assert!(!candidate.contains('/') && !candidate.contains('\\'));
+            }
+            Ok(())
+        })
+    }
+}

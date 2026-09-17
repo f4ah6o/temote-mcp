@@ -695,10 +695,61 @@ fn protected_git_worktree_metadata_roots(git_metadata_roots: &[PathBuf]) -> Resu
     Ok(protected)
 }
 
+struct GitMetadataPaths {
+    worktree_root: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    dot_git_is_directory: bool,
+}
+
 /// Resolves the worktree's private Git directory and its common repository
 /// directory. The latter is needed for linked worktrees, whose `.git` file
 /// points below the common repository metadata directory.
 pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let metadata = resolve_git_metadata_paths(cwd)?;
+    let mut roots = vec![metadata.git_dir, metadata.common_dir];
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Canonical common Git directory for the repository that contains `cwd`.
+///
+/// This is the repository identity anchor: two checkouts are the same
+/// repository only when they resolve to the same canonical common directory.
+pub fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
+    Ok(resolve_git_metadata_paths(cwd)?.common_dir)
+}
+
+/// Canonical primary checkout (main worktree) for the repository that contains
+/// `cwd`.
+///
+/// Only Git's standard layouts are supported: either `cwd` itself is inside the
+/// primary checkout, or a linked worktree's common directory is the primary
+/// checkout's `.git` directory. Anything else fails closed.
+pub fn git_primary_checkout(cwd: &Path) -> Result<PathBuf> {
+    let metadata = resolve_git_metadata_paths(cwd)?;
+    if metadata.dot_git_is_directory {
+        return Ok(metadata.worktree_root);
+    }
+    anyhow::ensure!(
+        metadata.common_dir.file_name() == Some(std::ffi::OsStr::new(".git")),
+        "unsupported Git common directory layout: {}",
+        metadata.common_dir.display()
+    );
+    let primary = metadata
+        .common_dir
+        .parent()
+        .context("Git common directory has no parent")?;
+    anyhow::ensure!(
+        primary.is_dir(),
+        "Git primary checkout is not a directory: {}",
+        primary.display()
+    );
+    Ok(primary.to_path_buf())
+}
+
+fn resolve_git_metadata_paths(cwd: &Path) -> Result<GitMetadataPaths> {
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
     let worktree_root = git_worktree_root(&cwd)?;
@@ -784,10 +835,12 @@ pub fn git_metadata_roots(cwd: &Path) -> Result<Vec<PathBuf>> {
         );
     }
 
-    let mut roots = vec![git_dir, common_dir];
-    roots.sort();
-    roots.dedup();
-    Ok(roots)
+    Ok(GitMetadataPaths {
+        worktree_root,
+        git_dir,
+        common_dir,
+        dot_git_is_directory,
+    })
 }
 
 pub fn git_worktree_root(cwd: &Path) -> Result<PathBuf> {
@@ -2553,6 +2606,92 @@ mod generic_tests {
                 std::fs::canonicalize(private).unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn resolves_primary_checkout_and_common_dir_for_standard_layouts() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let canonical_repository = std::fs::canonicalize(repository.path()).unwrap();
+        assert_eq!(
+            git_primary_checkout(&canonical_repository).unwrap(),
+            canonical_repository
+        );
+        assert_eq!(
+            git_common_dir(&canonical_repository).unwrap(),
+            canonical_repository.join(".git")
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let common = repository.join(".git");
+        let private = common.join("worktrees").join("feature");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            git_common_dir(&worktree).unwrap(),
+            std::fs::canonicalize(&common).unwrap()
+        );
+        assert_eq!(
+            git_primary_checkout(&worktree).unwrap(),
+            std::fs::canonicalize(&repository).unwrap()
+        );
+    }
+
+    #[test]
+    fn primary_checkout_fails_closed_on_unsupported_common_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let common = repository.join("metadata");
+        let private = common.join("worktrees").join("feature");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            git_common_dir(&worktree).unwrap(),
+            std::fs::canonicalize(&common).unwrap()
+        );
+        assert!(git_primary_checkout(&worktree).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_paths_reject_symlinked_dot_git() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, repository.join(".git")).unwrap();
+
+        assert!(git_metadata_roots(&repository).is_err());
+        assert!(git_common_dir(&repository).is_err());
+        assert!(git_primary_checkout(&repository).is_err());
     }
 
     #[test]

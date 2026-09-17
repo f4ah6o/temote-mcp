@@ -103,6 +103,15 @@ impl NamedRoots {
         Ok(target)
     }
 
+    /// Canonical physical path of the configured named root called `name`.
+    ///
+    /// Callers use this for policy anchors (for example the managed-worktree
+    /// `src` root) so the physical root always comes from `TEMOTE_MCP_ROOTS`
+    /// rather than from `HOME` or a client-supplied path.
+    pub fn canonical_root(&self, name: &str) -> Option<&Path> {
+        self.roots.get(name).map(PathBuf::as_path)
+    }
+
     #[cfg(test)]
     pub fn from_canonical_roots(roots: BTreeMap<String, PathBuf>) -> Result<Self> {
         for (name, root) in &roots {
@@ -328,6 +337,27 @@ mod tests {
     fn empty_configuration_fails_closed_on_resolution() {
         let roots = NamedRoots::default();
         assert!(roots.resolve("src").is_err());
+    }
+
+    #[test]
+    fn exposes_the_configured_physical_root_by_exact_name() {
+        let fixture = tempfile::tempdir().unwrap();
+        let src = fixture.path().join("src");
+        let work = fixture.path().join("work");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let canonical_src = std::fs::canonicalize(&src).unwrap();
+        let canonical_work = std::fs::canonicalize(&work).unwrap();
+        let roots = NamedRoots::from_canonical_roots(BTreeMap::from([
+            ("src".to_owned(), canonical_src.clone()),
+            ("work".to_owned(), canonical_work.clone()),
+        ]))
+        .unwrap();
+
+        assert_eq!(roots.canonical_root("src"), Some(canonical_src.as_path()));
+        assert_eq!(roots.canonical_root("work"), Some(canonical_work.as_path()));
+        assert_eq!(roots.canonical_root("other"), None);
+        assert_eq!(NamedRoots::default().canonical_root("src"), None);
     }
 
     #[test]

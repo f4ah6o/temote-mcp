@@ -542,6 +542,34 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "git_worktree_create",
+    "Create a Temote-managed Git worktree",
+    "Create a linked worktree only below the selected repository's exact managed root.",
+    { ...mutation, destructiveHint: false },
+    schema(
+      {
+        ...sessionProperty,
+        repository: { type: "string", minLength: 1, maxLength: 255 },
+        branch: { type: "string", minLength: 1, maxLength: 255 },
+        task: { type: "string", minLength: 1, maxLength: 64 },
+      },
+      ["session_id", "branch"],
+    ),
+  ),
+  tool(
+    "git_worktree_list",
+    "List repository worktrees by Temote classification",
+    "List the selected repository's registered worktrees as primary, managed or legacy.",
+    readOnly,
+    schema(
+      {
+        ...sessionProperty,
+        repository: { type: "string", minLength: 1, maxLength: 255 },
+      },
+      ["session_id"],
+    ),
+  ),
+  tool(
     "github_workflow_dispatch",
     "Dispatch a GitHub Actions workflow",
     "Dispatch one workflow/ref pair using the configured repository's managed Git credential mapping.",

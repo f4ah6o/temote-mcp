@@ -84,6 +84,8 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::GitBranchCreate => "git_branch_create",
         ActivityOperation::GitSwitch => "git_switch",
         ActivityOperation::GitWorktreeAdd => "git_worktree_add",
+        ActivityOperation::GitWorktreeCreate => "git_worktree_create",
+        ActivityOperation::GitWorktreeList => "git_worktree_list",
         ActivityOperation::GithubWorkflowDispatch => "github_workflow_dispatch",
         ActivityOperation::GithubWorkflowRunGet => "github_workflow_run_get",
         ActivityOperation::Execute => "execute",

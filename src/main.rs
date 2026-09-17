@@ -32,6 +32,7 @@ mod line_protocol;
 mod local_agent;
 #[cfg(feature = "network")]
 mod local_oauth;
+mod managed_worktree;
 mod mcp;
 mod named_roots;
 mod onepassword_cli;

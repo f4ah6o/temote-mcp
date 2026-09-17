@@ -16,8 +16,8 @@ use crate::line_protocol::{
 };
 use crate::{
     activity_runtime, apply_patch, approvals, checkpoints, child_env, codex_app_server, config,
-    dev_tool, evidence, friction, local_agent, onepassword_cli, onepassword_mcp, onepassword_sdk,
-    recall, sandbox, session_control::SessionBackend, work_handoff,
+    dev_tool, evidence, friction, local_agent, managed_worktree, onepassword_cli, onepassword_mcp,
+    onepassword_sdk, recall, sandbox, session_control::SessionBackend, work_handoff,
 };
 use temote_mcp::activity::contract::{
     ActivityCancellationReason, ActivityErrorKind, ActivityOperation, ActivityRemote,
@@ -44,6 +44,7 @@ const MAX_GIT_TAG_NAME_BYTES: usize = 255;
 const MAX_GIT_BRANCH_NAME_BYTES: usize = 255;
 const MAX_GIT_BASE_REF_BYTES: usize = 512;
 const MAX_GIT_WORKTREE_NAME_BYTES: usize = 64;
+const MAX_MANAGED_WORKTREE_LIST_ENTRIES: usize = 128;
 const MAX_GITHUB_WORKFLOW_BYTES: usize = 255;
 const MAX_GITHUB_REF_BYTES: usize = 255;
 const MAX_GITHUB_REMOTE_URL_BYTES: usize = 2048;
@@ -185,6 +186,16 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         "git_worktree_add",
         ActivityOperation::GitWorktreeAdd,
         "Git worktree",
+    ),
+    activity_tool(
+        "git_worktree_create",
+        ActivityOperation::GitWorktreeCreate,
+        "Git worktree",
+    ),
+    activity_tool(
+        "git_worktree_list",
+        ActivityOperation::GitWorktreeList,
+        "Git worktree list",
     ),
     activity_tool(
         "github_workflow_dispatch",
@@ -1038,6 +1049,8 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_branch_create","title":"Create a local Git branch","description":"Create one validated local branch from HEAD or a validated local/fetched repository ref. The operation exposes no force/reset/refspec/URL input and does not switch the current worktree.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_switch","title":"Switch to an existing local Git branch","description":"Switch the current worktree to one validated existing local branch without force/reset/stash. Git refuses an unsafe switch when dirty files would be overwritten.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_worktree_add","title":"Create a repository-owned Git worktree","description":"Create a linked worktree only at <repository>/.wt/<name>. If base is provided, create the validated branch from that local/fetched repository ref; otherwise attach an existing validated local branch. Arbitrary paths and force options are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","name","branch"],"additionalProperties":false}},
+        {"name":"git_worktree_create","title":"Create a Temote-managed Git worktree","description":"Create a linked worktree only below the selected repository's exact managed root (<configured src root>/worktrees/<repository>/<task>, normally ~/src/worktrees/<repo>/<task>). Only one validated existing local branch can be attached; create a new branch with git_branch_create first. The task directory is derived from the branch when task is omitted; branch '/' never becomes directory hierarchy. Callers cannot choose a filesystem path, cwd or base, and legacy worktrees such as <repository>/.wt/<name> are never moved, adopted or deleted.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255},"branch":{"type":"string","minLength":1,"maxLength":255},"task":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","branch"],"additionalProperties":false}},
+        {"name":"git_worktree_list","title":"List repository worktrees by Temote classification","description":"List the selected repository's registered worktrees as primary, managed (canonically contained below the exact trusted managed root with matching repository identity) or legacy. Read-only; legacy worktrees are reported but never moved, adopted or deleted.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id"],"additionalProperties":false}},
         {"name":"github_workflow_dispatch","title":"Dispatch a GitHub Actions workflow","description":"Dispatch an exact workflow file or numeric workflow ID at an exact branch/tag ref for the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping, never the ambient active gh account, and returns the created workflow run ID without exposing tokens.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"workflow":{"type":"string","minLength":1,"maxLength":255},"ref":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","workflow","ref"],"additionalProperties":false}},
         {"name":"github_workflow_run_get","title":"Read a GitHub Actions workflow run","description":"Read bounded status for one exact workflow run ID in the GitHub repository resolved from a configured remote. Requires the same repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"run_id":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","run_id"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
@@ -1332,8 +1345,17 @@ async fn call_tool_with_local_agent_executable(
                 }
                 text_result(serde_json::to_string_pretty(&outcome)?)
             }
-            name @ ("git_add" | "git_commit" | "git_fetch" | "git_pull" | "git_push"
-            | "git_push_tag" | "git_branch_create" | "git_switch" | "git_worktree_add") => {
+            name @ ("git_add"
+            | "git_commit"
+            | "git_fetch"
+            | "git_pull"
+            | "git_push"
+            | "git_push_tag"
+            | "git_branch_create"
+            | "git_switch"
+            | "git_worktree_add"
+            | "git_worktree_create"
+            | "git_worktree_list") => {
                 let operation =
                     git_activity_operation(name).expect("matched Git activity operation");
                 match operation {
@@ -1361,6 +1383,12 @@ async fn call_tool_with_local_agent_executable(
                     }
                     ActivityOperation::GitWorktreeAdd => {
                         git_worktree_add(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitWorktreeCreate => {
+                        git_worktree_create(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitWorktreeList => {
+                        git_worktree_list(&args, &session, activity.as_ref()).await
                     }
                     _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
@@ -2514,6 +2542,8 @@ fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
         "git_branch_create" => Some(ActivityOperation::GitBranchCreate),
         "git_switch" => Some(ActivityOperation::GitSwitch),
         "git_worktree_add" => Some(ActivityOperation::GitWorktreeAdd),
+        "git_worktree_create" => Some(ActivityOperation::GitWorktreeCreate),
+        "git_worktree_list" => Some(ActivityOperation::GitWorktreeList),
         _ => None,
     }
 }
@@ -2778,6 +2808,373 @@ async fn git_worktree_add(
     approve_local_git_mutation(session, &cwd, "git_worktree_add", action, activity).await?;
     ensure_git_worktree_root_exists(&repository_root)?;
     run_git_worktree_add_and_report(session, cwd, command, "Create Git worktree", activity).await
+}
+
+/// Resolves the configured `src` named root from `TEMOTE_MCP_ROOTS`. The
+/// physical src root always comes from the named-root authority, never from
+/// `HOME` and never from a caller-supplied path.
+fn configured_src_root() -> Result<PathBuf> {
+    crate::named_roots::NamedRoots::from_env()
+        .context("cannot resolve TEMOTE_MCP_ROOTS for the managed worktree policy")?
+        .canonical_root(managed_worktree::MANAGED_SRC_ROOT_NAME)
+        .map(Path::to_path_buf)
+        .with_context(|| {
+            format!(
+                "managed worktrees require the configured {} named root in TEMOTE_MCP_ROOTS; \
+                 the managed root is always <{}-root>/worktrees/<repo>",
+                managed_worktree::MANAGED_SRC_ROOT_NAME,
+                managed_worktree::MANAGED_SRC_ROOT_NAME
+            )
+        })
+}
+
+fn optional_configured_src_root() -> Option<PathBuf> {
+    crate::named_roots::NamedRoots::from_env()
+        .ok()?
+        .canonical_root(managed_worktree::MANAGED_SRC_ROOT_NAME)
+        .map(Path::to_path_buf)
+}
+
+/// Managed-worktree tools accept only the session-selected repository. A
+/// caller-supplied `cwd` or `base` is rejected instead of silently ignored so
+/// no client can select a nested repository or a creation base.
+fn reject_removed_managed_worktree_arguments(args: &Value, removed: &[&str]) -> Result<()> {
+    for name in removed {
+        anyhow::ensure!(
+            args.get(*name).is_none(),
+            "git_worktree tools do not accept {name}; the repository and target are derived from the selected session"
+        );
+    }
+    Ok(())
+}
+
+/// Resolves the canonical repository identity and its Temote-managed worktree
+/// namespace for one session request. Callers never supply a filesystem path;
+/// the optional repository input is only cross-checked against the identity.
+fn managed_repository_for_request(
+    args: &Value,
+    session: &config::Session,
+    cwd: &Path,
+    src_root: &Path,
+) -> Result<managed_worktree::ManagedRepository> {
+    let primary_checkout = sandbox::git_primary_checkout(cwd)?;
+    config::ensure_permitted(session, &primary_checkout)
+        .context("Git repository root must be inside a permitted session root")?;
+    let repository = managed_worktree::ManagedRepository::resolve(&primary_checkout, src_root)?;
+    if let Some(requested) = args.get("repository") {
+        repository.ensure_requested_repository(
+            requested.as_str().context("repository must be a string")?,
+        )?;
+    }
+    Ok(repository)
+}
+
+async fn git_worktree_create(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let src_root = configured_src_root()?;
+    git_worktree_create_in_src_root(args, session, &src_root, activity).await
+}
+
+async fn git_worktree_create_in_src_root(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    reject_removed_managed_worktree_arguments(args, &["cwd", "base"])?;
+    let cwd = config::resolve_cwd(session, None)?;
+    let repository = managed_repository_for_request(args, session, &cwd, src_root)?;
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("missing or non-string branch")?;
+    validate_git_branch_name(session, &cwd, branch).await?;
+    ensure_local_branch_exists(session, &cwd, branch).await?;
+    let task = match args.get("task") {
+        Some(value) => value.as_str().context("task must be a string")?.to_owned(),
+        None => managed_worktree::derive_task_name(branch)?,
+    };
+    let target = repository.target(&task)?;
+    // Everything above and the inspection below are read-only. Nothing is
+    // created before the approval, and the pre-approval inspection result is
+    // re-verified after it.
+    repository.inspect_target_available(&target)?;
+    let selected_common_dir = sandbox::git_common_dir(&cwd)?;
+    let selected_primary_checkout = repository.primary_checkout().to_path_buf();
+    let command = build_git_worktree_add_existing_command(&target, branch);
+    let action = format!(
+        "repository={} task={task} branch={branch}",
+        repository.repository_name()
+    );
+    approve_local_git_mutation(
+        session,
+        repository.primary_checkout(),
+        "git_worktree_create",
+        action,
+        activity,
+    )
+    .await?;
+    repository.prepare_target(&target)?;
+    run_managed_git_worktree_create_and_report(
+        session,
+        repository,
+        selected_common_dir,
+        selected_primary_checkout,
+        target,
+        task,
+        branch.to_owned(),
+        command,
+        activity,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn managed_worktree_create_result(
+    status: &str,
+    repository: &managed_worktree::ManagedRepository,
+    target: &Path,
+    task: &str,
+    branch: &str,
+    output: &sandbox::Output,
+    identity_verified: bool,
+    mutation_committed: bool,
+    verification_error: Option<&str>,
+) -> String {
+    let mut value = json!({
+        "status": status,
+        "repository": repository.repository_name(),
+        "path": target.to_string_lossy(),
+        "task": task,
+        "branch": branch,
+        "identity_verified": identity_verified,
+        "mutation_committed": mutation_committed,
+        "exit_code": output.status,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "truncated": output.truncated,
+    });
+    if let Some(error) = verification_error {
+        value["verification_error"] = json!(error);
+    }
+    value.to_string()
+}
+
+fn observe_created_managed_target(
+    repository: &managed_worktree::ManagedRepository,
+    target: &Path,
+) -> managed_worktree::CreatedTargetObservation {
+    let managed_root_metadata = std::fs::symlink_metadata(repository.managed_root());
+    managed_worktree::CreatedTargetObservation {
+        canonical_target: std::fs::canonicalize(target).ok(),
+        canonical_managed_root: std::fs::canonicalize(repository.managed_root()).ok(),
+        managed_root_is_normal_directory: managed_root_metadata
+            .as_ref()
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink()),
+        target_is_symlink: std::fs::symlink_metadata(target)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        observed_common_dir: sandbox::git_common_dir(target).ok(),
+        observed_primary_checkout: sandbox::git_primary_checkout(target).ok(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_managed_git_worktree_create_and_report(
+    session: &config::Session,
+    repository: managed_worktree::ManagedRepository,
+    selected_common_dir: PathBuf,
+    selected_primary_checkout: PathBuf,
+    target: PathBuf,
+    task: String,
+    branch: String,
+    command: Vec<String>,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let rendered_command = render_command(&command);
+    approvals::activity(
+        &session.id,
+        "Create managed Git worktree",
+        Some(rendered_command.clone()),
+    )
+    .await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let output = sandbox::run_unrestricted_with_env(
+        &command,
+        repository.primary_checkout(),
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await;
+    let result = match output {
+        Ok(output) => {
+            let mutation_committed = output.status == 0;
+            let verification = if mutation_committed {
+                let observation = observe_created_managed_target(&repository, &target);
+                managed_worktree::verify_created_managed_target(
+                    &repository,
+                    &task,
+                    &selected_common_dir,
+                    &selected_primary_checkout,
+                    &observation,
+                )
+                .map_err(|error| format!("{error:#}"))
+            } else {
+                Err("Git worktree add did not complete successfully".to_owned())
+            };
+            match verification {
+                Ok(()) => Ok(managed_worktree_create_result(
+                    "created",
+                    &repository,
+                    &target,
+                    &task,
+                    &branch,
+                    &output,
+                    true,
+                    true,
+                    None,
+                )),
+                Err(error) => Err(anyhow::anyhow!(managed_worktree_create_result(
+                    if mutation_committed {
+                        "verification_failed"
+                    } else {
+                        "failed"
+                    },
+                    &repository,
+                    &target,
+                    &task,
+                    &branch,
+                    &output,
+                    false,
+                    mutation_committed,
+                    Some(&error),
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
+    text_result(result?)
+}
+
+async fn git_worktree_list(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    git_worktree_list_with_src_root(
+        args,
+        session,
+        optional_configured_src_root().as_deref(),
+        activity,
+    )
+    .await
+}
+
+async fn git_worktree_list_with_src_root(
+    args: &Value,
+    session: &config::Session,
+    src_root: Option<&Path>,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    reject_removed_managed_worktree_arguments(args, &["cwd", "base"])?;
+    let cwd = config::resolve_cwd(session, None)?;
+    let primary_checkout = sandbox::git_primary_checkout(&cwd)?;
+    config::ensure_permitted(session, &primary_checkout)
+        .context("Git repository root must be inside a permitted session root")?;
+    let repository_name = primary_checkout
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .context("canonical repository checkout has no usable directory name")?;
+    if let Some(requested) = args.get("repository") {
+        managed_worktree::ensure_requested_repository(
+            requested.as_str().context("repository must be a string")?,
+            &repository_name,
+        )?;
+    }
+    // Managed classification requires the exact configured src-root authority.
+    // A missing named root or a non-exact repository layout only disables
+    // managed classification; it never errors the read-only listing.
+    let repository = src_root.and_then(|src_root| {
+        managed_worktree::ManagedRepository::resolve(&primary_checkout, src_root).ok()
+    });
+    let canonical_managed_root = repository
+        .as_ref()
+        .and_then(managed_worktree::trusted_canonical_managed_root);
+    let identity = sandbox::git_common_dir(&cwd)?;
+    let command = vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "worktree".to_owned(),
+        "list".to_owned(),
+        "--porcelain".to_owned(),
+    ];
+    let output = run_host_git_inspection(session, &primary_checkout, &command).await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "git worktree list failed: {}",
+        output.stderr.trim()
+    );
+    anyhow::ensure!(
+        !output.truncated,
+        "git worktree list output was truncated before classification"
+    );
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let registered = managed_worktree::parse_worktree_list(&output.stdout)?;
+    let truncated = registered.len() > MAX_MANAGED_WORKTREE_LIST_ENTRIES;
+    let entries = registered
+        .iter()
+        .take(MAX_MANAGED_WORKTREE_LIST_ENTRIES)
+        .map(|entry| {
+            let canonical_path = std::fs::canonicalize(&entry.path).ok();
+            let registered_common_dir = canonical_path
+                .as_deref()
+                .and_then(|path| sandbox::git_common_dir(path).ok());
+            let registered_primary_checkout = canonical_path
+                .as_deref()
+                .and_then(|path| sandbox::git_primary_checkout(path).ok());
+            let classification = managed_worktree::classify_registered_worktree(
+                managed_worktree::RegisteredWorktreeIdentity {
+                    canonical_path: canonical_path.as_deref(),
+                    common_dir: registered_common_dir.as_deref(),
+                    primary_checkout: registered_primary_checkout.as_deref(),
+                },
+                &primary_checkout,
+                canonical_managed_root.as_deref(),
+                &identity,
+            );
+            json!({
+                "path": entry.path.to_string_lossy(),
+                "head": entry.head,
+                "branch": entry.branch,
+                "classification": classification.as_str(),
+                "bare": entry.bare,
+                "detached": entry.detached,
+                "prunable": entry.prunable,
+            })
+        })
+        .collect::<Vec<_>>();
+    text_result(
+        json!({
+            "repository": repository_name,
+            "primary_checkout": primary_checkout.to_string_lossy(),
+            "managed_root": canonical_managed_root
+                .as_ref()
+                .map(|root| json!(root.to_string_lossy()))
+                .unwrap_or(Value::Null),
+            "worktrees": entries,
+            "truncated": truncated,
+        })
+        .to_string(),
+    )
 }
 
 async fn approve_local_git_mutation(
@@ -7516,7 +7913,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 54);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -7541,6 +7938,12 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_branch_create"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_switch"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_worktree_add"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "git_worktree_create")
+        );
+        assert!(tools.iter().any(|tool| tool["name"] == "git_worktree_list"));
         assert!(
             tools
                 .iter()
@@ -9203,6 +9606,518 @@ mod tests {
         );
     }
 
+    fn init_git_repository(path: &Path) {
+        run_git_fixture(path, &["init", "--quiet"]);
+        run_git_fixture(path, &["config", "user.name", "Temote Test"]);
+        run_git_fixture(
+            path,
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(path.join("tracked.txt"), "base\n").unwrap();
+        run_git_fixture(path, &["add", "tracked.txt"]);
+        run_git_fixture(path, &["commit", "--quiet", "-m", "initial"]);
+        run_git_fixture(path, &["branch", "-M", "main"]);
+    }
+
+    fn managed_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, config::Session) {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let checkout = canonical_root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        init_git_repository(&checkout);
+        std::fs::create_dir(checkout.join(".wt")).unwrap();
+        run_git_fixture(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                ".wt/legacy",
+                "-b",
+                "legacy-branch",
+            ],
+        );
+        let sibling = canonical_root.join("repo-legacy-linked");
+        run_git_fixture(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                sibling.to_str().unwrap(),
+                "-b",
+                "sibling-branch",
+            ],
+        );
+        std::fs::write(checkout.join("untracked.txt"), "keep me\n").unwrap();
+        let checkout = std::fs::canonicalize(&checkout).unwrap();
+        let session = config::Session {
+            id: format!("managed-worktree-{}", Uuid::new_v4()),
+            cwd: checkout.clone(),
+            permitted_directories: vec![checkout.clone()],
+            started_at: 1,
+            process_id: 1,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        (root, canonical_root, checkout, session)
+    }
+
+    fn worktree_snapshot(path: &Path) -> (String, String, String) {
+        (
+            git_fixture_stdout(path, &["branch", "--show-current"]),
+            git_fixture_stdout(path, &["rev-parse", "HEAD"]),
+            git_fixture_stdout(path, &["status", "--porcelain"]),
+        )
+    }
+
+    fn result_text(result: &Value) -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn managed_worktree_list_value(value: &Value, path: &Path) -> Option<String> {
+        let canonical = std::fs::canonicalize(path).unwrap();
+        value["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                std::fs::canonicalize(entry["path"].as_str().unwrap()).unwrap() == canonical
+            })
+            .map(|entry| entry["classification"].as_str().unwrap().to_owned())
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_lands_under_managed_root_and_classifies_legacy() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        let legacy = checkout.join(".wt/legacy");
+        let sibling = canonical_root.join("repo-legacy-linked");
+        let before = [
+            worktree_snapshot(&checkout),
+            worktree_snapshot(&legacy),
+            worktree_snapshot(&sibling),
+        ];
+
+        let result = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "feature/foo/bar"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap();
+        let value = result_text(&result);
+        assert_eq!(value["status"], "created");
+        assert_eq!(value["repository"], "repo");
+        assert_eq!(value["task"], "feature-foo-bar");
+        assert_eq!(value["identity_verified"], true);
+        assert_eq!(value["mutation_committed"], true);
+        assert!(value.get("verification_error").is_none());
+        let target = canonical_root.join("worktrees/repo/feature-foo-bar");
+        assert_eq!(value["path"], target.to_string_lossy().as_ref());
+        assert!(target.join(".git").exists());
+        assert!(!canonical_root.join("worktrees/repo/feature").exists());
+        assert_eq!(
+            git_fixture_stdout(&target, &["branch", "--show-current"]),
+            "feature/foo/bar"
+        );
+
+        assert!(
+            git_fixture_stdout(&checkout, &["status", "--porcelain"]).contains("?? untracked.txt")
+        );
+        assert_eq!(worktree_snapshot(&checkout), before[0]);
+        assert_eq!(worktree_snapshot(&legacy), before[1]);
+        assert_eq!(worktree_snapshot(&sibling), before[2]);
+
+        let listed = git_worktree_list_with_src_root(
+            &json!({"session_id": session.id}),
+            &session,
+            Some(&canonical_root),
+            None,
+        )
+        .await
+        .unwrap();
+        let listed = result_text(&listed);
+        assert_eq!(listed["repository"], "repo");
+        assert_eq!(
+            listed["managed_root"],
+            canonical_root
+                .join("worktrees/repo")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            managed_worktree_list_value(&listed, &checkout).as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            managed_worktree_list_value(&listed, &target).as_deref(),
+            Some("managed")
+        );
+        assert_eq!(
+            managed_worktree_list_value(&listed, &legacy).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            managed_worktree_list_value(&listed, &sibling).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(listed["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_denied_approval_has_zero_side_effects() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        // The Ask-mode session has no approval console, so the existing
+        // approval framework fails closed without a real host prompt.
+        let ask_session = config::Session {
+            permission_mode: config::PermissionMode::Ask,
+            ..session
+        };
+        let branches_before =
+            git_fixture_stdout(&checkout, &["branch", "--format=%(refname:short)"]);
+        let worktrees_before = git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
+
+        let error = git_worktree_create_in_src_root(
+            &json!({"session_id": ask_session.id, "branch": "main", "task": "denied-task"}),
+            &ask_session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not running"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!canonical_root.join("worktrees").exists());
+        assert!(!canonical_root.join("worktrees/repo").exists());
+        assert!(!canonical_root.join("worktrees/repo/denied-task").exists());
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["branch", "--format=%(refname:short)"]),
+            branches_before
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
+            worktrees_before
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_attaches_only_an_existing_local_branch() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        let branches_before =
+            git_fixture_stdout(&checkout, &["branch", "--format=%(refname:short)"]);
+        let worktrees_before = git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
+
+        let error = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "missing-branch", "task": "missing-task"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error:#}");
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["branch", "--format=%(refname:short)"]),
+            branches_before
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
+            worktrees_before
+        );
+        assert!(!canonical_root.join("worktrees").exists());
+        assert!(!canonical_root.join("worktrees/repo/missing-task").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_rejects_removed_cwd_and_base_arguments() {
+        let (_root, canonical_root, _checkout, session) = managed_worktree_fixture();
+
+        let cwd_error = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "main", "cwd": "/tmp"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(cwd_error.to_string().contains("cwd"), "{cwd_error:#}");
+        let base_error = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "main", "base": "HEAD"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(base_error.to_string().contains("base"), "{base_error:#}");
+        assert!(!canonical_root.join("worktrees").exists());
+    }
+
+    async fn assert_layout_rejected(checkout: PathBuf, src_root: &Path, session: &config::Session) {
+        let checkout = std::fs::canonicalize(&checkout).unwrap();
+        let layout_session = config::Session {
+            cwd: checkout.clone(),
+            permitted_directories: vec![checkout.clone()],
+            ..session.clone()
+        };
+        let worktrees_before = git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
+        let error = git_worktree_create_in_src_root(
+            &json!({"session_id": layout_session.id, "branch": "main"}),
+            &layout_session,
+            src_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("exactly one directory"),
+            "{checkout:?}: {error:#}"
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
+            worktrees_before
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_requires_the_exact_src_root_layout() {
+        let (_root, canonical_root, _checkout, session) = managed_worktree_fixture();
+
+        // Nested checkout below the src root.
+        let nested = canonical_root.join("nested/repo");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_git_repository(&nested);
+        assert_layout_rejected(nested, &canonical_root, &session).await;
+
+        // A repository below another named root is never redirected into the
+        // `src` namespace.
+        let other_checkout = canonical_root.join("work/repo");
+        std::fs::create_dir_all(&other_checkout).unwrap();
+        init_git_repository(&other_checkout);
+        assert_layout_rejected(other_checkout, &canonical_root, &session).await;
+
+        // A repository outside any configured root fails closed as well.
+        let outside = tempfile::tempdir().unwrap();
+        init_git_repository(outside.path());
+        assert_layout_rejected(outside.path().to_path_buf(), &canonical_root, &session).await;
+
+        assert!(!canonical_root.join("worktrees").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_rejects_a_checkout_inside_the_reserved_namespace() {
+        let (_root, canonical_root, _checkout, session) = managed_worktree_fixture();
+        let checkout = canonical_root.join("worktrees/repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        init_git_repository(&checkout);
+        assert_layout_rejected(checkout.clone(), &canonical_root, &session).await;
+        assert!(!checkout.join("task").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_create_rejects_collisions_injection_and_wrong_repository() {
+        let (root, canonical_root, _checkout, session) = managed_worktree_fixture();
+
+        for task in ["/tmp/x", "../x", ".", "a/../../b", "-option", "bad\nname"] {
+            let error = git_worktree_create_in_src_root(
+                &json!({"session_id": session.id, "branch": "main", "task": task}),
+                &session,
+                &canonical_root,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(!error.to_string().is_empty());
+        }
+        assert!(!root.path().join("x").exists());
+        assert!(!canonical_root.join("worktrees/repo/option").exists());
+
+        let mismatch = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "main", "repository": "other-repo"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("does not match"),
+            "{mismatch:#}"
+        );
+
+        let occupied = canonical_root.join("worktrees/repo/task-occupied");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("unrelated.txt"), "keep\n").unwrap();
+        let wrong_task = canonical_root.join("worktrees/repo/task-wrong");
+        std::fs::create_dir_all(wrong_task.parent().unwrap()).unwrap();
+        let other = canonical_root.join("other-repo");
+        std::fs::create_dir(&other).unwrap();
+        init_git_repository(&other);
+        run_git_fixture(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wrong_task.to_str().unwrap(),
+                "-b",
+                "other-branch",
+            ],
+        );
+        let wrong_before = worktree_snapshot(&wrong_task);
+
+        for task in ["task-occupied", "task-wrong"] {
+            let error = git_worktree_create_in_src_root(
+                &json!({"session_id": session.id, "branch": "main", "task": task}),
+                &session,
+                &canonical_root,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{error:#}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("unrelated.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(worktree_snapshot(&wrong_task), wrong_before);
+        assert!(git_fixture_stdout(&wrong_task, &["branch", "--show-current"]) == "other-branch");
+
+        #[cfg(unix)]
+        {
+            let link = canonical_root.join("worktrees/repo/task-link");
+            std::os::unix::fs::symlink(canonical_root.join("outside/escape"), &link).unwrap();
+            let error = git_worktree_create_in_src_root(
+                &json!({"session_id": session.id, "branch": "main", "task": "task-link"}),
+                &session,
+                &canonical_root,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{error:#}");
+            assert!(!canonical_root.join("outside/escape").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_worktree_create_rejects_symlinked_managed_root() {
+        let (root, canonical_root, _checkout, session) = managed_worktree_fixture();
+        let outside = canonical_root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        assert!(!canonical_root.join("worktrees").exists());
+        std::os::unix::fs::symlink(&outside, canonical_root.join("worktrees")).unwrap();
+
+        let error = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "main", "task": "task-one"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("normal directory"), "{error:#}");
+        assert!(!outside.join("repo").exists());
+        assert!(!outside.join("repo/task-one").exists());
+        drop(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_worktree_list_never_classifies_below_a_symlinked_managed_root() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "task-branch"]);
+        let created = git_worktree_create_in_src_root(
+            &json!({"session_id": session.id, "branch": "task-branch", "task": "task-symlink"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap();
+        let created = result_text(&created);
+        assert_eq!(created["status"], "created");
+        let target = canonical_root.join("worktrees/repo/task-symlink");
+
+        // Without the configured src root nothing may be classified managed.
+        let unconfigured = git_worktree_list_with_src_root(
+            &json!({"session_id": session.id}),
+            &session,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let unconfigured = result_text(&unconfigured);
+        assert_eq!(unconfigured["managed_root"], Value::Null);
+        assert_eq!(
+            managed_worktree_list_value(&unconfigured, &target).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            managed_worktree_list_value(&unconfigured, &checkout).as_deref(),
+            Some("primary")
+        );
+
+        // A swapped managed root (here a symlink) must disable managed
+        // classification instead of adopting paths that resolve below it.
+        let outside = canonical_root.join("outside-repo");
+        std::fs::rename(canonical_root.join("worktrees/repo"), &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, canonical_root.join("worktrees/repo")).unwrap();
+
+        let listed = git_worktree_list_with_src_root(
+            &json!({"session_id": session.id}),
+            &session,
+            Some(&canonical_root),
+            None,
+        )
+        .await
+        .unwrap();
+        let listed = result_text(&listed);
+        assert_eq!(listed["managed_root"], Value::Null);
+        assert_eq!(
+            managed_worktree_list_value(&listed, &target).as_deref(),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn managed_worktree_tools_do_not_expose_cwd_or_base() {
+        let tools = tools(true, true).as_array().unwrap().to_owned();
+        for name in ["git_worktree_create", "git_worktree_list"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+            for removed in ["cwd", "base"] {
+                assert!(
+                    !properties.contains_key(removed),
+                    "{name} must not expose {removed}"
+                );
+            }
+        }
+        let create = tools
+            .iter()
+            .find(|tool| tool["name"] == "git_worktree_create")
+            .unwrap();
+        assert_eq!(
+            create["inputSchema"]["required"],
+            json!(["session_id", "branch"])
+        );
+        assert!(create["inputSchema"]["properties"]["task"].is_object());
+        let list = tools
+            .iter()
+            .find(|tool| tool["name"] == "git_worktree_list")
+            .unwrap();
+        assert_eq!(list["inputSchema"]["required"], json!(["session_id"]));
+    }
+
     #[test]
     fn github_repository_and_workflow_inputs_are_bounded_and_repo_scoped() {
         for (remote, owner, repo) in [
@@ -9663,6 +10578,8 @@ mod tests {
             ("git_branch_create", ActivityOperation::GitBranchCreate),
             ("git_switch", ActivityOperation::GitSwitch),
             ("git_worktree_add", ActivityOperation::GitWorktreeAdd),
+            ("git_worktree_create", ActivityOperation::GitWorktreeCreate),
+            ("git_worktree_list", ActivityOperation::GitWorktreeList),
         ] {
             assert_eq!(git_activity_operation(name), Some(expected));
         }
