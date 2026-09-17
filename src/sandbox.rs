@@ -480,14 +480,80 @@ pub async fn run_developer_tool(
     wait_with_limited_output(child, stdin).await
 }
 
+/// Metadata authorization for one validated Git command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitMetadataScope {
+    /// Every metadata root validated for the command `cwd` must be contained by
+    /// the command `cwd` or one of the writable roots.
+    Contained,
+    /// The caller pinned and re-validated this exact repository identity before
+    /// the request, so the metadata roots validated for the command `cwd` may
+    /// lie below the primary checkout of a linked worktree.
+    PinnedWorktree,
+}
+
 /// Runs a narrowly validated Git operation with write access to the repository
 /// metadata needed by `git add` and `git commit`. Ordinary sandboxed commands
 /// continue to keep `.git` read-only.
+///
+/// Every metadata root validated for `cwd` must be contained by the command
+/// `cwd` or one of `writable_roots`. A linked worktree, whose metadata lives
+/// below the primary checkout, must use
+/// [`run_git_with_pinned_worktree_metadata`] instead.
 pub async fn run_git(
     command: &[String],
     cwd: &Path,
     writable_roots: &[PathBuf],
     provided_git_metadata_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_git_with_metadata_scope(
+        command,
+        cwd,
+        writable_roots,
+        provided_git_metadata_roots,
+        GitMetadataScope::Contained,
+        stdin,
+    )
+    .await
+}
+
+/// Runs one narrowly validated Git mutation for a linked worktree whose
+/// repository identity the caller pinned before the request.
+///
+/// The local agent Git broker captures the canonical selected workspace and its
+/// validated `git_worktree_root` / `git_metadata_roots` identity at broker
+/// start and re-validates that identity for every request, so the private
+/// worktree metadata and the common repository directory below the primary
+/// checkout are authorized here without widening any writable workspace scope.
+/// The sandbox still derives the metadata roots from `cwd` itself and rejects
+/// any mismatch, so no caller can authorize an arbitrary path, and the
+/// repository metadata policy (`config`/`hooks`/`refs` protection) is
+/// unchanged.
+pub async fn run_git_with_pinned_worktree_metadata(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    provided_git_metadata_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_git_with_metadata_scope(
+        command,
+        cwd,
+        writable_roots,
+        provided_git_metadata_roots,
+        GitMetadataScope::PinnedWorktree,
+        stdin,
+    )
+    .await
+}
+
+async fn run_git_with_metadata_scope(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    provided_git_metadata_roots: &[PathBuf],
+    scope: GitMetadataScope,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
     let validated_roots = git_metadata_roots(cwd)?;
@@ -498,25 +564,7 @@ pub async fn run_git(
     );
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
-    let mut permitted_roots = vec![cwd.clone()];
-    permitted_roots.extend(
-        writable_roots
-            .iter()
-            .map(|path| {
-                std::fs::canonicalize(path)
-                    .with_context(|| format!("cannot resolve writable root {}", path.display()))
-            })
-            .collect::<Result<Vec<_>>>()?,
-    );
-    for git_root in &validated_roots {
-        anyhow::ensure!(
-            permitted_roots
-                .iter()
-                .any(|permitted| git_root.starts_with(permitted)),
-            "Git metadata root is outside the permitted session roots: {}",
-            git_root.display()
-        );
-    }
+    verify_git_metadata_scope(scope, &cwd, writable_roots, &validated_roots)?;
     run_with_metadata_roots(
         command,
         &cwd,
@@ -527,6 +575,43 @@ pub async fn run_git(
         stdin,
     )
     .await
+}
+
+/// Applies the metadata containment rule for one validated command scope.
+///
+/// `validated_roots` always comes from [`git_metadata_roots`] for the canonical
+/// command `cwd`, so the pinned scope can only ever authorize that exact
+/// identity: the caller cannot inject a root, and the repository metadata
+/// policy still protects `config`, `hooks` and remote/tag refs.
+fn verify_git_metadata_scope(
+    scope: GitMetadataScope,
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    validated_roots: &[PathBuf],
+) -> Result<()> {
+    if scope == GitMetadataScope::PinnedWorktree {
+        return Ok(());
+    }
+    let mut permitted_roots = vec![cwd.to_path_buf()];
+    permitted_roots.extend(
+        writable_roots
+            .iter()
+            .map(|path| {
+                std::fs::canonicalize(path)
+                    .with_context(|| format!("cannot resolve writable root {}", path.display()))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    for git_root in validated_roots {
+        anyhow::ensure!(
+            permitted_roots
+                .iter()
+                .any(|permitted| git_root.starts_with(permitted)),
+            "Git metadata root is outside the permitted session roots: {}",
+            git_root.display()
+        );
+    }
+    Ok(())
 }
 
 /// Runs the exact structured `git worktree add` command with the common
@@ -2695,6 +2780,72 @@ mod generic_tests {
     }
 
     #[test]
+    fn linked_worktree_metadata_requires_the_pinned_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let common = repository.join(".git");
+        let private = common.join("worktrees").join("feature");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+
+        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let validated = git_metadata_roots(&canonical_worktree).unwrap();
+        let writable = [canonical_worktree.clone()];
+
+        // The contained scope used by ordinary structured Git tools rejects a
+        // linked worktree whose metadata is below the primary checkout.
+        let error = verify_git_metadata_scope(
+            GitMetadataScope::Contained,
+            &canonical_worktree,
+            &writable,
+            &validated,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the permitted session roots"),
+            "{error:#}"
+        );
+
+        // The pinned scope used by the broker authorizes exactly the validated
+        // metadata roots; the async entry point still requires the caller's
+        // roots to equal `git_metadata_roots(cwd)`, so no other path can be
+        // authorized.
+        verify_git_metadata_scope(
+            GitMetadataScope::PinnedWorktree,
+            &canonical_worktree,
+            &writable,
+            &validated,
+        )
+        .unwrap();
+
+        // A primary checkout stays contained and keeps using the contained
+        // scope.
+        let canonical_repository = std::fs::canonicalize(&repository).unwrap();
+        let primary_roots = git_metadata_roots(&canonical_repository).unwrap();
+        verify_git_metadata_scope(
+            GitMetadataScope::Contained,
+            &canonical_repository,
+            std::slice::from_ref(&canonical_repository),
+            &primary_roots,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn worktree_add_scope_protects_siblings_but_not_current_private_metadata() {
         let root = tempfile::tempdir().unwrap();
         let repository = root.path().join("repository");
@@ -2986,6 +3137,20 @@ mod linux_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(())
+    }
+
+    fn host_git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(cwd)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "host git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
     fn proc_environ_contains(pid: u32, marker: &[u8]) -> Result<bool> {
@@ -3417,6 +3582,237 @@ done
             "{}",
             String::from_utf8_lossy(&head.stderr)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_missing_protected_metadata_files_stay_readable() -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        host_git(&repository, &["init", "-q"])?;
+        std::fs::write(repository.join("base.txt"), b"base\n")?;
+        host_git(&repository, &["add", "--", "base.txt"])?;
+        host_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=temote-mcp test",
+                "-c",
+                "user.email=temote-mcp@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )?;
+        let common = repository.join(".git");
+        assert!(!common.join("packed-refs").exists());
+        let git_roots = git_metadata_roots(&repository)?;
+
+        // `git branch` reads the (missing) `packed-refs` file. The mask must
+        // stay readable as an empty file instead of failing closed with EACCES.
+        let branch = run_git(
+            &command("/usr/bin/git", &["branch", "readable-mask", "HEAD"]),
+            &repository,
+            std::slice::from_ref(&repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(branch.status, 0, "{}", branch.stderr);
+        assert_eq!(
+            host_git_stdout(&repository, &["rev-parse", "readable-mask"])?,
+            host_git_stdout(&repository, &["rev-parse", "HEAD"])?
+        );
+
+        // The mask still cannot inject metadata content. A write either fails
+        // closed (existing placeholder bound read-only) or is discarded by the
+        // /dev/null mask; the placeholder never gains content.
+        let _ = run_git(
+            &command(
+                "/usr/bin/sh",
+                &["-c", "printf corrupted > .git/packed-refs"],
+            ),
+            &repository,
+            std::slice::from_ref(&repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        let content = std::fs::read_to_string(common.join("packed-refs")).unwrap_or_default();
+        assert!(content.is_empty(), "{content:?}");
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_linked_worktree_pinned_metadata_scope_serves_git_mutations() -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        let sibling = root.path().join("sibling");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&repository)?;
+        host_git(&repository, &["init", "-q"])?;
+        std::fs::write(repository.join("base.txt"), b"base\n")?;
+        host_git(&repository, &["add", "--", "base.txt"])?;
+        host_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=temote-mcp test",
+                "-c",
+                "user.email=temote-mcp@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        )?;
+        host_git(&repository, &["branch", "-M", "main"])?;
+        host_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        )?;
+        host_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        )?;
+        std::fs::write(repository.join("primary-untracked.txt"), b"keep\n")?;
+        let primary_before = (
+            host_git_stdout(&repository, &["rev-parse", "HEAD"])?,
+            host_git_stdout(&repository, &["status", "--porcelain"])?,
+        );
+        let sibling_before = (
+            host_git_stdout(&sibling, &["branch", "--show-current"])?,
+            host_git_stdout(&sibling, &["rev-parse", "HEAD"])?,
+        );
+
+        let worktree = std::fs::canonicalize(&worktree)?;
+        let git_roots = git_metadata_roots(&worktree)?;
+        assert_eq!(git_roots.len(), 2);
+        let writable = [worktree.clone()];
+
+        // The contained scope used by ordinary structured Git tools still
+        // fails closed for this linked worktree.
+        let denied = run_git(
+            &command("/usr/bin/git", &["switch", "-c", "agent/denied"]),
+            &worktree,
+            &writable,
+            &git_roots,
+            None,
+        )
+        .await;
+        let error = denied.expect_err("the contained scope must reject linked metadata");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the permitted session roots"),
+            "{error:#}"
+        );
+
+        // The pinned scope used by the broker serves switch/add/commit with
+        // only the linked worktree writable.
+        let switch = run_git_with_pinned_worktree_metadata(
+            &command("/usr/bin/git", &["switch", "-c", "agent/pinned"]),
+            &worktree,
+            &writable,
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(switch.status, 0, "{}", switch.stderr);
+        std::fs::write(worktree.join("agent.txt"), b"agent\n")?;
+        let add = run_git_with_pinned_worktree_metadata(
+            &command("/usr/bin/git", &["add", "--", "agent.txt"]),
+            &worktree,
+            &writable,
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(add.status, 0, "{}", add.stderr);
+        let commit = run_git_with_pinned_worktree_metadata(
+            &command(
+                "/usr/bin/git",
+                &[
+                    "-c",
+                    "user.name=temote-mcp test",
+                    "-c",
+                    "user.email=temote-mcp@example.invalid",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "--no-verify",
+                    "--no-gpg-sign",
+                    "-m",
+                    "linked worktree pinned metadata",
+                ],
+            ),
+            &worktree,
+            &writable,
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(commit.status, 0, "{}", commit.stderr);
+
+        assert_eq!(
+            host_git_stdout(&worktree, &["branch", "--show-current"])?,
+            "agent/pinned"
+        );
+        assert_eq!(
+            host_git_stdout(&worktree, &["show", "HEAD:agent.txt"])?,
+            "agent"
+        );
+        assert_eq!(
+            (
+                host_git_stdout(&repository, &["rev-parse", "HEAD"])?,
+                host_git_stdout(&repository, &["status", "--porcelain"])?,
+            ),
+            primary_before
+        );
+        assert_eq!(
+            (
+                host_git_stdout(&sibling, &["branch", "--show-current"])?,
+                host_git_stdout(&sibling, &["rev-parse", "HEAD"])?,
+            ),
+            sibling_before
+        );
+        assert_eq!(
+            host_git_stdout(&repository, &["branch", "--show-current"])?,
+            "main"
+        );
+
+        // The metadata policy still protects sensitive common-directory paths
+        // through the pinned scope.
+        let protected = git_roots[0].join("config");
+        let denied = run_git_with_pinned_worktree_metadata(
+            &command("/usr/bin/touch", &[protected.to_str().unwrap()]),
+            &worktree,
+            &writable,
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_ne!(denied.status, 0);
+
+        std::fs::remove_dir_all(root.path())?;
         Ok(())
     }
 

@@ -497,6 +497,10 @@ fn resolve_shim_add_path(workspace: &Path, cwd: &Path, path: &str) -> Result<Str
 struct RepositoryIdentity {
     worktree_root: PathBuf,
     metadata_roots: Vec<PathBuf>,
+    /// `true` for a linked worktree whose validated private metadata and common
+    /// repository directory live below the primary checkout instead of the
+    /// selected workspace.
+    linked_worktree: bool,
 }
 
 /// The fixed per-run Git operation scope: the canonical selected workspace and,
@@ -524,9 +528,13 @@ impl BrokerScope {
         let repository = match (
             sandbox::git_worktree_root(&workspace),
             sandbox::git_metadata_roots(&workspace),
+            sandbox::git_primary_checkout(&workspace),
         ) {
-            (Ok(worktree_root), Ok(metadata_roots)) if worktree_root == workspace => {
+            (Ok(worktree_root), Ok(metadata_roots), Ok(primary_checkout))
+                if worktree_root == workspace =>
+            {
                 Some(RepositoryIdentity {
+                    linked_worktree: primary_checkout != worktree_root,
                     worktree_root,
                     metadata_roots,
                 })
@@ -652,14 +660,30 @@ async fn run_git_command(
         .repository
         .as_ref()
         .context("the selected workspace has no pinned Git repository identity")?;
-    sandbox::run_git(
-        &command,
-        cwd,
-        std::slice::from_ref(&identity.worktree_root),
-        &identity.metadata_roots,
-        None,
-    )
-    .await
+    if identity.linked_worktree {
+        // The selected workspace is a linked worktree whose validated metadata
+        // lives below the primary checkout. `BrokerScope` pinned this exact
+        // identity at broker start and `resolve_cwd` re-validated it for this
+        // request, so the sandbox may authorize exactly those derived metadata
+        // roots without widening the writable workspace scope.
+        sandbox::run_git_with_pinned_worktree_metadata(
+            &command,
+            cwd,
+            std::slice::from_ref(&identity.worktree_root),
+            &identity.metadata_roots,
+            None,
+        )
+        .await
+    } else {
+        sandbox::run_git(
+            &command,
+            cwd,
+            std::slice::from_ref(&identity.worktree_root),
+            &identity.metadata_roots,
+            None,
+        )
+        .await
+    }
 }
 
 /// The Git broker queue pair.
@@ -2136,6 +2160,243 @@ mod tests {
             std::fs::read_to_string(selected.join("tracked.txt")).unwrap(),
             "base\n"
         );
+    }
+
+    fn repository_snapshot(path: &Path) -> (String, String, String) {
+        (
+            run_host_git(path, &["branch", "--show-current"]),
+            run_host_git(path, &["rev-parse", "HEAD"]),
+            run_host_git(path, &["status", "--porcelain"]),
+        )
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_scope_pins_metadata_below_the_primary_checkout() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("selected")).unwrap();
+        let selected = std::fs::canonicalize(fixture.path().join("selected")).unwrap();
+        init_repository(&selected);
+        let worktree = fixture.path().join("linked");
+        run_host_git(
+            &selected,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+        );
+        let linked = std::fs::canonicalize(&worktree).unwrap();
+
+        let scope = BrokerScope::for_workspace(&linked).unwrap();
+        let identity = scope.repository.as_ref().unwrap();
+        assert!(identity.linked_worktree);
+        assert_eq!(identity.worktree_root, linked);
+        assert!(
+            identity
+                .metadata_roots
+                .iter()
+                .all(|root| !root.starts_with(&linked)),
+            "{:?}",
+            identity.metadata_roots
+        );
+        assert_eq!(
+            sandbox::git_primary_checkout(&linked).unwrap(),
+            selected,
+            "the primary checkout stays the repository identity anchor"
+        );
+        assert_eq!(
+            sandbox::git_common_dir(&linked).unwrap(),
+            selected.join(".git")
+        );
+
+        scope.resolve_cwd(&linked).unwrap();
+        let error = scope.resolve_cwd(&selected).unwrap_err();
+        assert!(
+            error.to_string().contains("outside the selected workspace"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broker_rejects_swapped_and_symlinked_linked_worktree_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("primary")).unwrap();
+        let primary = std::fs::canonicalize(fixture.path().join("primary")).unwrap();
+        init_repository(&primary);
+        let worktree = fixture.path().join("linked");
+        run_host_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+        );
+        let linked = std::fs::canonicalize(&worktree).unwrap();
+        let broker_state = state(&linked, Access::WorkspaceWrite);
+
+        // A swapped `.git` pointer to another repository's structurally valid
+        // private metadata must fail closed on the pinned identity. The other
+        // repository's back-pointer is rewritten so only the identity check can
+        // reject this.
+        std::fs::create_dir_all(fixture.path().join("other")).unwrap();
+        let other = std::fs::canonicalize(fixture.path().join("other")).unwrap();
+        init_repository(&other);
+        let other_worktree = fixture.path().join("other-linked");
+        run_host_git(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                other_worktree.to_str().unwrap(),
+                "-b",
+                "other",
+            ],
+        );
+        let other_private = other.join(".git").join("worktrees").join("other-linked");
+        std::fs::write(
+            other_private.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )
+        .unwrap();
+        let primary_before = repository_snapshot(&primary);
+        let other_before = repository_snapshot(&other);
+        let linked_pointer = std::fs::read_to_string(linked.join(".git")).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", other_private.display()),
+        )
+        .unwrap();
+
+        let error = handle_request(
+            &broker_state,
+            request(&linked, &["switch", "-c", "feature/swapped"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("different Git metadata"),
+            "{error}"
+        );
+
+        std::fs::write(linked.join(".git"), &linked_pointer).unwrap();
+        assert_eq!(repository_snapshot(&primary), primary_before);
+        assert_eq!(repository_snapshot(&other), other_before);
+
+        // A symlinked `.git` pointer fails closed before any Git process runs.
+        std::fs::remove_file(linked.join(".git")).unwrap();
+        symlink(primary.join(".git"), linked.join(".git")).unwrap();
+        let error = handle_request(
+            &broker_state,
+            request(&linked, &["switch", "-c", "feature/symlinked"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("symbolic-link"), "{error}");
+        assert_eq!(repository_snapshot(&primary), primary_before);
+        assert_eq!(repository_snapshot(&other), other_before);
+    }
+
+    /// Host acceptance (nested Linux sandbox required). The linked-worktree
+    /// metadata scope fix must serve the same mutations in the default `agent`
+    /// mode that the yolo path already served, while the primary checkout and
+    /// every sibling worktree stay unchanged.
+    #[tokio::test]
+    #[ignore = "host acceptance: requires the nested Linux sandbox helper"]
+    async fn agent_mode_linked_worktree_mutations_use_only_the_pinned_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("selected")).unwrap();
+        let selected = std::fs::canonicalize(fixture.path().join("selected")).unwrap();
+        init_repository(&selected);
+        std::fs::write(selected.join("primary-untracked.txt"), "keep\n").unwrap();
+        let worktree = fixture.path().join("linked");
+        let sibling = fixture.path().join("sibling");
+        run_host_git(
+            &selected,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+        );
+        run_host_git(
+            &selected,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                sibling.to_str().unwrap(),
+                "-b",
+                "sibling",
+            ],
+        );
+        let linked = std::fs::canonicalize(&worktree).unwrap();
+        let sibling = std::fs::canonicalize(&sibling).unwrap();
+        let primary_before = repository_snapshot(&selected);
+        let sibling_before = repository_snapshot(&sibling);
+
+        let session = config::Session {
+            permission_mode: config::PermissionMode::Agent,
+            ..session(&linked)
+        };
+        let broker_state = BrokerState {
+            session,
+            access: Access::WorkspaceWrite,
+            scope: BrokerScope::for_workspace(&linked).unwrap(),
+        };
+        assert!(
+            broker_state
+                .scope
+                .repository
+                .as_ref()
+                .unwrap()
+                .linked_worktree
+        );
+
+        let created = handle_request(
+            &broker_state,
+            request(&linked, &["switch", "-c", "feature/agent"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status, 0, "{}", created.stderr);
+
+        std::fs::write(linked.join("tracked.txt"), "agent-update\n").unwrap();
+        let added = handle_request(&broker_state, request(&linked, &["add", "tracked.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(added.status, 0, "{}", added.stderr);
+        let committed = handle_request(
+            &broker_state,
+            request(&linked, &["commit", "-m", "agent linked update"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed.status, 0, "{}", committed.stderr);
+
+        assert_eq!(
+            run_host_git(&linked, &["branch", "--show-current"]),
+            "feature/agent"
+        );
+        assert_eq!(
+            run_host_git(&linked, &["show", "HEAD:tracked.txt"]),
+            "agent-update"
+        );
+        assert_eq!(repository_snapshot(&selected), primary_before);
+        assert_eq!(repository_snapshot(&sibling), sibling_before);
     }
 
     #[tokio::test]

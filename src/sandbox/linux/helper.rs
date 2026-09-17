@@ -337,9 +337,13 @@ fn append_missing_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
             path_to_string(path)?,
         ]);
     } else {
-        // A read-only /dev/null bind prevents creation of a missing metadata
-        // file without exposing a writable mountpoint.
-        append_pair(args, "--ro-bind", Path::new("/dev/null"), path)?;
+        // A bind of the host /dev/null prevents creation of a missing metadata
+        // file without exposing a writable mountpoint. `--dev-bind` is
+        // required: the read-only bind mounts of bubblewrap are `nodev`, so
+        // reading a plain `--ro-bind /dev/null` mask fails with EACCES instead
+        // of yielding the empty content Git expects from optional files such
+        // as `packed-refs` or `shallow`.
+        append_pair(args, "--dev-bind", Path::new("/dev/null"), path)?;
     }
     Ok(())
 }
