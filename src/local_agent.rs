@@ -544,6 +544,7 @@ pub(crate) struct PreparedRun {
     environment: HashMap<String, String>,
     session_roots: Vec<PathBuf>,
     session: config::Session,
+    workspace: Option<crate::managed_worktree::SessionWorkspace>,
     task: String,
     task_bytes: usize,
     task_sha256: String,
@@ -553,7 +554,7 @@ pub(crate) struct PreparedRun {
 
 impl PreparedRun {
     pub(crate) fn approval_detail(&self) -> String {
-        let detail = format!(
+        let mut detail = format!(
             "agent: {}\ncwd: {}\naccess: {}\ntask_bytes: {}\ntask_sha256: {}\ntask_preview:\n{}",
             self.agent.as_str(),
             self.cwd.display(),
@@ -562,6 +563,23 @@ impl PreparedRun {
             self.task_sha256,
             self.task_preview,
         );
+        if let Some(workspace) = &self.workspace {
+            detail.push_str(&format!(
+                "\nworkspace_type: {}\nrepository_root: {}\nworkspace_root: {}",
+                workspace.workspace_type.as_str(),
+                workspace.repository_root.display(),
+                workspace.workspace_root.display(),
+            ));
+            if let Some(repository) = &workspace.repository {
+                detail.push_str(&format!("\nrepository: {repository}"));
+            }
+            if let Some(branch) = &workspace.branch {
+                detail.push_str(&format!("\nbranch: {branch}"));
+            }
+            if let Some(task) = &workspace.task {
+                detail.push_str(&format!("\ntask: {task}"));
+            }
+        }
         debug_assert!(detail.len() <= MAX_APPROVAL_DETAIL_BYTES);
         detail
     }
@@ -578,7 +596,7 @@ impl PreparedRun {
     }
 
     pub(crate) fn approval_metadata(&self) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::from([
+        let mut metadata = std::collections::BTreeMap::from([
             ("provenance".to_owned(), "local_agent_run".to_owned()),
             ("source".to_owned(), "local_agent_run".to_owned()),
             ("agent".to_owned(), self.agent.as_str().to_owned()),
@@ -587,7 +605,31 @@ impl PreparedRun {
             ("scope".to_owned(), "session_cwd".to_owned()),
             ("task_bytes".to_owned(), self.task_bytes.to_string()),
             ("task_sha256".to_owned(), self.task_sha256.clone()),
-        ])
+        ]);
+        if let Some(workspace) = &self.workspace {
+            metadata.insert(
+                "workspace_type".to_owned(),
+                workspace.workspace_type.as_str().to_owned(),
+            );
+            metadata.insert(
+                "repository_root".to_owned(),
+                workspace.repository_root.display().to_string(),
+            );
+            metadata.insert(
+                "workspace_root".to_owned(),
+                workspace.workspace_root.display().to_string(),
+            );
+            if let Some(repository) = &workspace.repository {
+                metadata.insert("repository".to_owned(), repository.clone());
+            }
+            if let Some(branch) = &workspace.branch {
+                metadata.insert("branch".to_owned(), branch.clone());
+            }
+            if let Some(task) = &workspace.task {
+                metadata.insert("task".to_owned(), task.clone());
+            }
+        }
+        metadata
     }
 
     pub(crate) fn revalidate(&self, session: &config::Session) -> Result<()> {
@@ -716,6 +758,13 @@ where
         agent == Agent::Codex || effort.is_none(),
         "effort is supported only for the codex local agent"
     );
+    // Workspace identity is derived from the canonical selected cwd. For a
+    // managed-worktree binding this is the Temote-derived worktree root; a
+    // caller-supplied cwd cannot reach here together with a worktree intent.
+    let workspace = crate::managed_worktree::inspect_session_workspace(
+        &cwd,
+        crate::managed_worktree::configured_src_root_from_env().as_deref(),
+    );
 
     let mut environment = filtered_environment()?;
     let executable = resolve(agent, &environment, session)?;
@@ -795,6 +844,7 @@ where
         environment,
         session_roots: canonical_session_roots(session)?,
         session: session.clone(),
+        workspace,
         task: task.to_owned(),
         task_bytes: task.len(),
         task_sha256: task_sha256(task.as_bytes()),
@@ -2334,6 +2384,7 @@ mod tests {
                 environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
                 environment
             },
+            workspace: None,
             session_roots: Vec::new(),
             session: session(&root.path().canonicalize().unwrap()),
             task: task.clone(),
@@ -2489,6 +2540,7 @@ mod tests {
             dependency_directories: Vec::new(),
             dependency_files: Vec::new(),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
+            workspace: None,
             session_roots: Vec::new(),
             session: literal_session(Path::new("/workspace")),
             task: String::new(),
@@ -2730,6 +2782,7 @@ mod tests {
             dependency_symlinks: Vec::new(),
             dependency_directories: Vec::new(),
             dependency_files: Vec::new(),
+            workspace: None,
             session_roots: Vec::new(),
             session: literal_session(&root.path().canonicalize().unwrap()),
             task: String::new(),
@@ -2823,6 +2876,7 @@ mod tests {
                 dependency_directories: Vec::new(),
                 dependency_files: Vec::new(),
                 environment,
+                workspace: None,
                 session_roots: vec![
                     root_a.path().canonicalize().unwrap(),
                     root_b.path().canonicalize().unwrap(),
@@ -2939,6 +2993,7 @@ exit 9
                 dependency_directories: Vec::new(),
                 dependency_files: Vec::new(),
                 environment,
+                workspace: None,
                 session_roots: vec![repository.clone()],
                 session: session(&repository),
                 command: vec![
@@ -3079,6 +3134,7 @@ exit 8
                 dependency_directories: Vec::new(),
                 dependency_files: Vec::new(),
                 environment,
+                workspace: None,
                 session_roots: vec![repository.clone()],
                 session: session(&repository),
                 command: vec![
@@ -3194,6 +3250,7 @@ exit 8
             dependency_directories: Vec::new(),
             dependency_files: Vec::new(),
             environment,
+            workspace: None,
             session_roots: Vec::new(),
             session: session(&workspace.canonicalize()?),
             task: "test".to_owned(),
@@ -3268,6 +3325,7 @@ exit 8
             dependency_directories: closure.directories,
             dependency_files: closure.files,
             environment,
+            workspace: None,
             session_roots: Vec::new(),
             session: session(&workspace.canonicalize()?),
             task: "test".to_owned(),

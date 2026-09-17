@@ -157,6 +157,15 @@ function localAgentSchema() {
       agent: { type: "string", enum: ["codex", "opencode"] },
       task: { type: "string", minLength: 1, maxLength: MAX_CODEX_TASK_BYTES },
       cwd: { type: "string" },
+      worktree: {
+        type: "object",
+        properties: {
+          branch: { type: "string", minLength: 1, maxLength: 255 },
+          task: { type: "string", minLength: 1, maxLength: 64 },
+        },
+        required: ["branch"],
+        additionalProperties: false,
+      },
       access: { type: "string", enum: ["read_only", "workspace_write"] },
       model: { type: "string", minLength: 1, maxLength: 256 },
       effort: { type: "string", minLength: 1, maxLength: 128 },
@@ -365,7 +374,7 @@ export const PUBLIC_TOOLS = [
   tool(
     "local_agent_run",
     "Run a local coding agent",
-    "Run a verified Codex or OpenCode non-interactive agent in the selected host session with canonical workspace scope, bounded task/output, isolated agent state, and local approval.",
+    "Run a verified Codex or OpenCode non-interactive agent in the selected host session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. With worktree.branch, Temote derives and validates the repository's managed worktree itself and rejects cwd combined with worktree.",
     networkMutation,
     localAgentSchema(),
   ),

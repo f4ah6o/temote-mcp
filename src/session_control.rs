@@ -207,6 +207,11 @@ pub struct SessionView {
     pub permission_mode: config::PermissionMode,
     pub yolo: bool,
     pub logical_path: Option<String>,
+    /// Bounded non-secret workspace identity derived from the canonical session
+    /// working directory. `None` when the workspace is not a supported standard
+    /// Git worktree or no longer resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::managed_worktree::SessionWorkspace>,
     pub restart_policy: String,
     pub restart_count: u32,
     pub last_restart_at: Option<u64>,
@@ -3583,6 +3588,16 @@ async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<Sessi
     };
     let permission_mode = session.permission_mode;
     let yolo = session.yolo();
+    // Workspace identity is derived from the canonical cwd and the configured
+    // `src` named root; an unresolvable workspace reports none.
+    let workspace = if workspace_resolved {
+        crate::managed_worktree::inspect_session_workspace(
+            &session.cwd,
+            crate::managed_worktree::configured_src_root_from_env().as_deref(),
+        )
+    } else {
+        None
+    };
 
     Ok(SessionView {
         host_id: host_identity::resolve()?,
@@ -3600,6 +3615,7 @@ async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<Sessi
         permission_mode,
         yolo,
         logical_path: inferred.logical_path,
+        workspace,
         restart_policy: inferred.restart_policy,
         restart_count: inferred.restart_count,
         last_restart_at: inferred.last_restart_at,
@@ -5566,6 +5582,45 @@ mod tests {
         assert!(dead.pid.is_none());
         assert!(config::session_path(&id).unwrap().exists());
         assert!(config::session_lifecycle_path(&id).unwrap().exists());
+        cleanup(&id).await;
+    }
+
+    #[tokio::test]
+    async fn session_view_reports_the_derived_workspace_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let cwd = config::canonical_directory(&cwd).unwrap();
+        let id = format!("workspace-view-{}", uuid::Uuid::new_v4());
+        cleanup(&id).await;
+        config::save_session(&config::Session {
+            id: id.clone(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        })
+        .await
+        .unwrap();
+
+        let view = inspect_session_read_only(&id).await.unwrap();
+        let workspace = view.workspace.expect("workspace identity");
+        assert_eq!(workspace.workspace_type.as_str(), "canonical_checkout");
+        assert_eq!(workspace.repository_root, cwd);
+        assert_eq!(workspace.workspace_root, cwd);
+        assert_eq!(workspace.branch.as_deref(), Some("main"));
+        assert_eq!(workspace.task, None);
+
+        // A session whose workspace no longer resolves reports no workspace
+        // identity instead of a stale one.
+        std::fs::remove_dir_all(&cwd).unwrap();
+        let degraded = inspect_session_read_only(&id).await.unwrap();
+        assert_eq!(degraded.status, SESSION_STATUS_DEGRADED);
+        assert!(degraded.workspace.is_none());
+
         cleanup(&id).await;
     }
 

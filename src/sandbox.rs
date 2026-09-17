@@ -834,6 +834,29 @@ pub fn git_primary_checkout(cwd: &Path) -> Result<PathBuf> {
     Ok(primary.to_path_buf())
 }
 
+/// Current branch of the worktree that contains `cwd`.
+///
+/// Reads the worktree's own bounded `HEAD` control file, so a linked worktree
+/// reports its own branch, never the primary checkout's. A detached HEAD or any
+/// unsupported ref shape yields `None`.
+pub fn git_current_branch(cwd: &Path) -> Result<Option<String>> {
+    const MAX_BRANCH_BYTES: usize = 255;
+    let metadata = resolve_git_metadata_paths(cwd)?;
+    let Some(head) = read_git_control_file(&metadata.git_dir.join("HEAD"), "Git HEAD")? else {
+        return Ok(None);
+    };
+    let Some(branch) = head.trim().strip_prefix("ref: refs/heads/") else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !branch.is_empty()
+            && branch.len() <= MAX_BRANCH_BYTES
+            && !branch.chars().any(char::is_control),
+        "Git HEAD contains an unsupported branch name"
+    );
+    Ok(Some(branch.to_owned()))
+}
+
 fn resolve_git_metadata_paths(cwd: &Path) -> Result<GitMetadataPaths> {
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
@@ -2734,6 +2757,49 @@ mod generic_tests {
             git_primary_checkout(&worktree).unwrap(),
             std::fs::canonicalize(&repository).unwrap()
         );
+    }
+
+    #[test]
+    fn current_branch_reads_the_worktree_own_head() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let common = repository.join(".git");
+        let private = common.join("worktrees").join("feature");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+
+        std::fs::write(
+            private.join("HEAD"),
+            "ref: refs/heads/feature/nested-name\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_current_branch(&worktree).unwrap().as_deref(),
+            Some("feature/nested-name")
+        );
+        assert_eq!(
+            git_current_branch(&repository).unwrap().as_deref(),
+            Some("main")
+        );
+
+        std::fs::write(private.join("HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(git_current_branch(&worktree).unwrap(), None);
+
+        std::fs::write(private.join("HEAD"), "ref: refs/heads/bad\nname\n").unwrap();
+        assert!(git_current_branch(&worktree).is_err());
     }
 
     #[test]

@@ -470,6 +470,25 @@
             "maxLength": 1048576,
             "minLength": 1,
             "type": "string"
+          },
+          "worktree": {
+            "additionalProperties": false,
+            "properties": {
+              "branch": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "task": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "branch"
+            ],
+            "type": "object"
           }
         },
         "required": [

@@ -985,6 +985,15 @@ fn local_agent_input_schema() -> Value {
             "agent":{"type":"string","enum":["codex","opencode"]},
             "task":{"type":"string","minLength":1,"maxLength":local_agent::MAX_TASK_BYTES},
             "cwd":{"type":"string"},
+            "worktree":{
+                "type":"object",
+                "properties":{
+                    "branch":{"type":"string","minLength":1,"maxLength":MAX_GIT_BRANCH_NAME_BYTES},
+                    "task":{"type":"string","minLength":1,"maxLength":managed_worktree::MAX_MANAGED_TASK_BYTES}
+                },
+                "required":["branch"],
+                "additionalProperties":false
+            },
             "access":{"type":"string","enum":["read_only","workspace_write"]},
             "model":{"type":"string","minLength":1,"maxLength":256},
             "effort":{"type":"string","minLength":1,"maxLength":128},
@@ -1034,7 +1043,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
         {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
-        {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
+        {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy. With worktree.branch, Temote binds the run to the selected repository's managed worktree (<configured src root>/worktrees/<repo>/<task>) and derives the path itself: it reuses only a verified managed worktree of that repository and branch, otherwise creates one through the approved path, and rejects cwd combined with worktree.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
         {"name":"dev_tool_run","title":"Run a structured developer tool operation","description":"Run a validated Cargo, Vite+, uv, npm, pnpm, or Go operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. Package-manager operations use a narrow fixed subcommand contract and do not expose arbitrary executables or raw host commands.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":dev_tool_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
@@ -2814,25 +2823,18 @@ async fn git_worktree_add(
 /// physical src root always comes from the named-root authority, never from
 /// `HOME` and never from a caller-supplied path.
 fn configured_src_root() -> Result<PathBuf> {
-    crate::named_roots::NamedRoots::from_env()
-        .context("cannot resolve TEMOTE_MCP_ROOTS for the managed worktree policy")?
-        .canonical_root(managed_worktree::MANAGED_SRC_ROOT_NAME)
-        .map(Path::to_path_buf)
-        .with_context(|| {
-            format!(
-                "managed worktrees require the configured {} named root in TEMOTE_MCP_ROOTS; \
-                 the managed root is always <{}-root>/worktrees/<repo>",
-                managed_worktree::MANAGED_SRC_ROOT_NAME,
-                managed_worktree::MANAGED_SRC_ROOT_NAME
-            )
-        })
+    managed_worktree::configured_src_root_from_env().with_context(|| {
+        format!(
+            "managed worktrees require the configured {} named root in TEMOTE_MCP_ROOTS; \
+             the managed root is always <{}-root>/worktrees/<repo>",
+            managed_worktree::MANAGED_SRC_ROOT_NAME,
+            managed_worktree::MANAGED_SRC_ROOT_NAME
+        )
+    })
 }
 
 fn optional_configured_src_root() -> Option<PathBuf> {
-    crate::named_roots::NamedRoots::from_env()
-        .ok()?
-        .canonical_root(managed_worktree::MANAGED_SRC_ROOT_NAME)
-        .map(Path::to_path_buf)
+    managed_worktree::configured_src_root_from_env()
 }
 
 /// Managed-worktree tools accept only the session-selected repository. A
@@ -2851,8 +2853,8 @@ fn reject_removed_managed_worktree_arguments(args: &Value, removed: &[&str]) -> 
 /// Resolves the canonical repository identity and its Temote-managed worktree
 /// namespace for one session request. Callers never supply a filesystem path;
 /// the optional repository input is only cross-checked against the identity.
-fn managed_repository_for_request(
-    args: &Value,
+fn managed_repository_for_requested(
+    requested: Option<&str>,
     session: &config::Session,
     cwd: &Path,
     src_root: &Path,
@@ -2861,10 +2863,8 @@ fn managed_repository_for_request(
     config::ensure_permitted(session, &primary_checkout)
         .context("Git repository root must be inside a permitted session root")?;
     let repository = managed_worktree::ManagedRepository::resolve(&primary_checkout, src_root)?;
-    if let Some(requested) = args.get("repository") {
-        repository.ensure_requested_repository(
-            requested.as_str().context("repository must be a string")?,
-        )?;
+    if let Some(requested) = requested {
+        repository.ensure_requested_repository(requested)?;
     }
     Ok(repository)
 }
@@ -2878,6 +2878,73 @@ async fn git_worktree_create(
     git_worktree_create_in_src_root(args, session, &src_root, activity).await
 }
 
+/// One verified managed worktree bound to a session request.
+///
+/// The repository identity, target, task and branch are pinned from Temote's
+/// own canonical resolution; no caller-supplied path participates.
+#[derive(Clone, Debug)]
+struct ManagedWorktreeBinding {
+    repository: managed_worktree::ManagedRepository,
+    target: PathBuf,
+    branch: String,
+}
+
+impl ManagedWorktreeBinding {
+    fn repository_name(&self) -> &str {
+        self.repository.repository_name()
+    }
+
+    fn repository_root(&self) -> &Path {
+        self.repository.primary_checkout()
+    }
+
+    fn workspace_root(&self) -> &Path {
+        &self.target
+    }
+
+    /// Derives the sandbox session for this run.
+    ///
+    /// The selected session already permits the repository's canonical
+    /// checkout (`managed_repository_for_requested`). The only addition is the
+    /// validated managed worktree this run is bound to, so ordinary session
+    /// tools keep their exact on-disk scope and no caller-supplied path can
+    /// widen it.
+    fn run_session(&self, session: &config::Session) -> config::Session {
+        let mut run = session.clone();
+        if !run
+            .permitted_directories
+            .iter()
+            .any(|root| self.target == *root || self.target.starts_with(root))
+        {
+            run.permitted_directories.push(self.target.clone());
+            run.permitted_directories.sort();
+            run.permitted_directories.dedup();
+        }
+        run
+    }
+
+    /// Re-derives and re-verifies this binding from the configured `src` root.
+    ///
+    /// Used immediately before a local agent launch so neither the pre-run
+    /// resolution nor model prompt compliance is the enforcement mechanism.
+    fn revalidate(&self, src_root: &Path) -> Result<()> {
+        let repository =
+            managed_worktree::ManagedRepository::resolve(self.repository_root(), src_root)?;
+        anyhow::ensure!(
+            repository.repository_name() == self.repository_name(),
+            "managed worktree repository identity changed while approval was pending"
+        );
+        let selected_common_dir = sandbox::git_common_dir(self.repository_root())?;
+        managed_worktree::verify_reusable_managed_worktree(
+            &repository,
+            &self.target,
+            &self.branch,
+            &selected_common_dir,
+            self.repository_root(),
+        )
+    }
+}
+
 async fn git_worktree_create_in_src_root(
     args: &Value,
     session: &config::Session,
@@ -2885,16 +2952,51 @@ async fn git_worktree_create_in_src_root(
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     reject_removed_managed_worktree_arguments(args, &["cwd", "base"])?;
-    let cwd = config::resolve_cwd(session, None)?;
-    let repository = managed_repository_for_request(args, session, &cwd, src_root)?;
     let branch = args
         .get("branch")
         .and_then(Value::as_str)
         .context("missing or non-string branch")?;
+    let task = match args.get("task") {
+        Some(value) => Some(value.as_str().context("task must be a string")?),
+        None => None,
+    };
+    let requested_repository = match args.get("repository") {
+        Some(value) => Some(value.as_str().context("repository must be a string")?),
+        None => None,
+    };
+    let (_, value) = create_managed_worktree(
+        session,
+        src_root,
+        branch,
+        task,
+        requested_repository,
+        activity,
+    )
+    .await?;
+    Ok(value)
+}
+
+/// Creates one managed worktree through the approved host-side path and returns
+/// the verified binding plus the tool result document.
+///
+/// Every pre-approval step is read-only, the caller can never supply a path,
+/// and the created target is re-verified against the trusted managed root and
+/// repository identity before it is reported as created.
+async fn create_managed_worktree(
+    session: &config::Session,
+    src_root: &Path,
+    branch: &str,
+    task: Option<&str>,
+    requested_repository: Option<&str>,
+    activity: Option<&ActivityScope>,
+) -> Result<(ManagedWorktreeBinding, Value)> {
+    let cwd = config::resolve_cwd(session, None)?;
+    let repository =
+        managed_repository_for_requested(requested_repository, session, &cwd, src_root)?;
     validate_git_branch_name(session, &cwd, branch).await?;
     ensure_local_branch_exists(session, &cwd, branch).await?;
-    let task = match args.get("task") {
-        Some(value) => value.as_str().context("task must be a string")?.to_owned(),
+    let task = match task {
+        Some(task) => task.to_owned(),
         None => managed_worktree::derive_task_name(branch)?,
     };
     let target = repository.target(&task)?;
@@ -2992,7 +3094,7 @@ async fn run_managed_git_worktree_create_and_report(
     branch: String,
     command: Vec<String>,
     activity: Option<&ActivityScope>,
-) -> Result<Value> {
+) -> Result<(ManagedWorktreeBinding, Value)> {
     let rendered_command = render_command(&command);
     approvals::activity(
         &session.id,
@@ -3059,7 +3161,13 @@ async fn run_managed_git_worktree_create_and_report(
         Err(error) => Err(error),
     };
     report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
-    text_result(result?)
+    let value = text_result(result?)?;
+    let binding = ManagedWorktreeBinding {
+        repository,
+        target,
+        branch,
+    };
+    Ok((binding, value))
 }
 
 async fn git_worktree_list(
@@ -4506,15 +4614,140 @@ async fn start_command(
     .await
 }
 
+/// Resolves the optional managed-worktree workspace for one `local_agent_run`.
+///
+/// The caller supplies only an existing local branch and an optional task name;
+/// Temote derives the managed path, reuses only a verified managed worktree of
+/// the selected repository and branch, and otherwise creates one through the
+/// approved `git_worktree_create` path. A caller-supplied `cwd` together with
+/// `worktree` is rejected, so no request can inject a path around the managed
+/// workspace authority.
+async fn local_agent_managed_worktree_binding(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Option<ManagedWorktreeBinding>> {
+    let src_root = configured_src_root()?;
+    local_agent_managed_worktree_binding_with_src_root(args, session, &src_root, activity).await
+}
+
+async fn local_agent_managed_worktree_binding_with_src_root(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+) -> Result<Option<ManagedWorktreeBinding>> {
+    let Some(request) = args.get("worktree") else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        args.get("cwd").is_none(),
+        "local_agent_run accepts cwd or worktree, not both; the managed worktree path is always derived by Temote"
+    );
+    let request = request.as_object().context("worktree must be an object")?;
+    anyhow::ensure!(
+        request
+            .keys()
+            .all(|key| matches!(key.as_str(), "branch" | "task")),
+        "worktree accepts only branch and task"
+    );
+    let branch = request
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("worktree.branch is required")?;
+    let task = match request.get("task") {
+        Some(value) => Some(value.as_str().context("worktree.task must be a string")?),
+        None => None,
+    };
+
+    let cwd = config::resolve_cwd(session, None)?;
+    let repository = managed_repository_for_requested(None, session, &cwd, src_root)?;
+    validate_git_branch_name(session, repository.primary_checkout(), branch).await?;
+    ensure_local_branch_exists(session, repository.primary_checkout(), branch).await?;
+    let task = match task {
+        Some(task) => task.to_owned(),
+        None => managed_worktree::derive_task_name(branch)?,
+    };
+    let target = repository.target(&task)?;
+
+    if std::fs::symlink_metadata(&target).is_ok() {
+        // Reuse is allowed only for the selected repository's own managed
+        // worktree on the requested branch. Legacy, wrong-repository or
+        // wrong-branch targets fail closed instead of being adopted.
+        let selected_common_dir = sandbox::git_common_dir(repository.primary_checkout())?;
+        managed_worktree::verify_reusable_managed_worktree(
+            &repository,
+            &target,
+            branch,
+            &selected_common_dir,
+            repository.primary_checkout(),
+        )
+        .context("the existing managed worktree target cannot be reused")?;
+        return Ok(Some(ManagedWorktreeBinding {
+            repository,
+            target,
+            branch: branch.to_owned(),
+        }));
+    }
+
+    let (binding, _) =
+        create_managed_worktree(session, src_root, branch, Some(&task), None, activity).await?;
+    Ok(Some(binding))
+}
+
 async fn local_agent_run(
     args: &Value,
     session: &config::Session,
     executable: Option<&Path>,
     activity: Option<ActivityScope>,
 ) -> Result<Value> {
+    local_agent_run_with_src_root(args, session, executable, activity, None).await
+}
+
+async fn local_agent_run_with_src_root(
+    args: &Value,
+    session: &config::Session,
+    executable: Option<&Path>,
+    activity: Option<ActivityScope>,
+    src_root: Option<&Path>,
+) -> Result<Value> {
+    let binding = match src_root {
+        Some(src_root) => {
+            local_agent_managed_worktree_binding_with_src_root(
+                args,
+                session,
+                src_root,
+                activity.as_ref(),
+            )
+            .await?
+        }
+        None => local_agent_managed_worktree_binding(args, session, activity.as_ref()).await?,
+    };
+    let effective_args = match &binding {
+        Some(binding) => {
+            let mut value = args.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("worktree");
+                object.insert(
+                    "cwd".to_owned(),
+                    json!(binding.workspace_root().to_string_lossy().into_owned()),
+                );
+            }
+            value
+        }
+        None => args.clone(),
+    };
+    // The managed binding adds exactly the validated workspace root to this
+    // run's sandbox session; the on-disk session keeps its own scope.
+    let run_session = match &binding {
+        Some(binding) => binding.run_session(session),
+        None => session.clone(),
+    };
     let prepared = match executable {
-        Some(executable) => local_agent::prepare_with_executable(args, session, executable)?,
-        None => local_agent::prepare(args, session)?,
+        Some(executable) => {
+            local_agent::prepare_with_executable(&effective_args, &run_session, executable)?
+        }
+        None => local_agent::prepare(&effective_args, &run_session)?,
     };
     if approvals::local_approval(
         session.permission_mode,
@@ -4548,9 +4781,27 @@ async fn local_agent_run(
             && current_session.process_id == session.process_id,
         "session instance changed while local agent approval was pending"
     );
+    // The on-disk session must keep its exact scope; only this run's derived
+    // session may include the validated managed workspace root.
+    anyhow::ensure!(
+        current_session.cwd == session.cwd
+            && current_session.permitted_directories == session.permitted_directories,
+        "session workspace changed while local agent approval was pending"
+    );
     match executable {
-        Some(executable) => prepared.revalidate_with_executable(&current_session, executable)?,
-        None => prepared.revalidate(&current_session)?,
+        Some(executable) => prepared.revalidate_with_executable(&run_session, executable)?,
+        None => prepared.revalidate(&run_session)?,
+    }
+    if let Some(binding) = &binding {
+        anyhow::ensure!(
+            prepared.cwd == binding.workspace_root(),
+            "local agent workspace changed while approval was pending"
+        );
+        let src_root = match src_root {
+            Some(src_root) => src_root.to_path_buf(),
+            None => configured_src_root()?,
+        };
+        binding.revalidate(&src_root)?;
     }
     let (description, mut handle, completion) =
         spawn_local_agent(prepared, &current_session, activity).await?;
@@ -10116,6 +10367,272 @@ mod tests {
             .find(|tool| tool["name"] == "git_worktree_list")
             .unwrap();
         assert_eq!(list["inputSchema"]["required"], json!(["session_id"]));
+    }
+
+    #[test]
+    fn local_agent_worktree_input_is_bounded_and_path_free() {
+        let tools = tools(true, true).as_array().unwrap().to_owned();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "local_agent_run")
+            .unwrap();
+        let worktree = &tool["inputSchema"]["properties"]["worktree"];
+        assert_eq!(worktree["type"], "object");
+        assert_eq!(worktree["required"], json!(["branch"]));
+        assert_eq!(worktree["additionalProperties"], false);
+        assert_eq!(
+            worktree["properties"]["branch"]["maxLength"],
+            json!(MAX_GIT_BRANCH_NAME_BYTES)
+        );
+        assert_eq!(
+            worktree["properties"]["task"]["maxLength"],
+            json!(managed_worktree::MAX_MANAGED_TASK_BYTES)
+        );
+        assert!(
+            !worktree["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("cwd")
+        );
+        assert!(
+            !worktree["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("path")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_agent_worktree_binding_reuses_and_creates_verified_managed_worktrees() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        let target = canonical_root.join("worktrees/repo/feature-foo-bar");
+
+        // Absent target: Temote creates the managed worktree through the
+        // approved broker path without any caller-supplied path.
+        let created = local_agent_managed_worktree_binding_with_src_root(
+            &json!({"session_id": session.id, "worktree": {"branch": "feature/foo/bar"}}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("managed worktree binding");
+        assert_eq!(created.workspace_root(), target);
+        assert_eq!(created.branch, "feature/foo/bar");
+        assert_eq!(created.repository_name(), "repo");
+        assert_eq!(
+            git_fixture_stdout(&target, &["branch", "--show-current"]),
+            "feature/foo/bar"
+        );
+
+        // The run session gains exactly the validated managed workspace root;
+        // the on-disk session keeps its own scope.
+        let run_session = created.run_session(&session);
+        assert_eq!(
+            run_session.permitted_directories.len(),
+            session.permitted_directories.len() + 1
+        );
+        assert!(run_session.permitted_directories.contains(&target));
+        assert_eq!(session.permitted_directories, vec![checkout.clone()]);
+
+        // Existing target: reuse only the verified managed worktree.
+        let reused = local_agent_managed_worktree_binding_with_src_root(
+            &json!({"session_id": session.id, "worktree": {"branch": "feature/foo/bar"}}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("managed worktree binding");
+        assert_eq!(reused.workspace_root(), target);
+
+        // Primary working tree, dirty sentinel and legacy worktrees stay
+        // untouched.
+        assert!(
+            git_fixture_stdout(&checkout, &["status", "--porcelain"]).contains("?? untracked.txt")
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout.join(".wt/legacy"), &["branch", "--show-current"]),
+            "legacy-branch"
+        );
+        assert_eq!(
+            git_fixture_stdout(
+                &canonical_root.join("repo-legacy-linked"),
+                &["branch", "--show-current"]
+            ),
+            "sibling-branch"
+        );
+
+        // Immediate pre-launch revalidation succeeds for the verified target
+        // and fails closed once the workspace identity changes.
+        created.revalidate(&canonical_root).unwrap();
+        std::fs::rename(&target, canonical_root.join("worktrees/repo/moved")).unwrap();
+        assert!(created.revalidate(&canonical_root).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_agent_worktree_binding_rejects_path_injection_and_wrong_reuse() {
+        let (_root, canonical_root, _checkout, session) = managed_worktree_fixture();
+
+        let injection = local_agent_managed_worktree_binding_with_src_root(
+            &json!({
+                "session_id": session.id,
+                "cwd": "/tmp",
+                "worktree": {"branch": "main"}
+            }),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(injection.to_string().contains("not both"), "{injection:#}");
+
+        let unknown = local_agent_managed_worktree_binding_with_src_root(
+            &json!({
+                "session_id": session.id,
+                "worktree": {"branch": "main", "path": "/tmp/escape"}
+            }),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            unknown.to_string().contains("only branch and task"),
+            "{unknown:#}"
+        );
+
+        // A legacy worktree is never adopted through the derived task path.
+        #[cfg(unix)]
+        {
+            let legacy_target = canonical_root.join("worktrees/repo/legacy-task");
+            std::fs::create_dir_all(legacy_target.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(canonical_root.join("repo-legacy-linked"), &legacy_target)
+                .unwrap();
+            let legacy = local_agent_managed_worktree_binding_with_src_root(
+                &json!({
+                    "session_id": session.id,
+                    "worktree": {"branch": "sibling-branch", "task": "legacy-task"}
+                }),
+                &session,
+                &canonical_root,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                legacy.to_string().contains("cannot be reused"),
+                "{legacy:#}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&legacy_target)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_agent_worktree_binding_denied_approval_creates_nothing() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        let ask_session = config::Session {
+            permission_mode: config::PermissionMode::Ask,
+            ..session
+        };
+        let worktrees_before = git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
+
+        let error = local_agent_managed_worktree_binding_with_src_root(
+            &json!({"session_id": ask_session.id, "worktree": {"branch": "main", "task": "denied"}}),
+            &ask_session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not running"), "{error:#}");
+        assert!(!canonical_root.join("worktrees/repo/denied").exists());
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
+            worktrees_before
+        );
+    }
+
+    /// Host acceptance (nested Linux/macOS sandbox required): the structured
+    /// local agent run must start inside the Temote-derived managed worktree
+    /// with no caller-supplied path, while the primary checkout is unchanged.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn local_agent_run_binds_a_managed_worktree_without_a_caller_path() {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let checkout = src_root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        init_git_repository(&checkout);
+        std::fs::write(checkout.join("untracked.txt"), "keep\n").unwrap();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+
+        let id = format!("local-agent-worktree-{}", Uuid::new_v4());
+        let (sender, _receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            &checkout,
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake_agent = activity_delegated_job_executable(
+            fake_dir.path(),
+            "codex",
+            "#!/bin/sh\npwd > ran-in.txt\nprintf 'managed-worktree-agent\\n'\n",
+        );
+        let result = local_agent_run_with_src_root(
+            &json!({
+                "session_id": id,
+                "agent": "codex",
+                "task": "implement the managed worktree task",
+                "access": "workspace_write",
+                "worktree": {"branch": "feature/foo/bar"}
+            }),
+            &session,
+            Some(&fake_agent),
+            None,
+            Some(&src_root),
+        )
+        .await
+        .unwrap();
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("managed-worktree-agent")
+        );
+
+        let target = src_root.join("worktrees/repo/feature-foo-bar");
+        assert_eq!(
+            std::fs::read_to_string(target.join("ran-in.txt"))
+                .unwrap()
+                .trim(),
+            target.to_string_lossy()
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["branch", "--show-current"]),
+            "main"
+        );
+        assert!(
+            git_fixture_stdout(&checkout, &["status", "--porcelain"]).contains("?? untracked.txt")
+        );
+        runtime.shutdown().await.unwrap();
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 pub(crate) const MANAGED_WORKTREE_ROOT_NAME: &str = "worktrees";
 pub(crate) const MANAGED_SRC_ROOT_NAME: &str = "src";
@@ -23,6 +24,115 @@ impl WorktreeClassification {
             Self::Legacy => "legacy",
         }
     }
+}
+
+/// Workspace type of one Temote session, derived from its canonical working
+/// directory with the same repository identity rules as the managed-worktree
+/// broker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionWorkspaceType {
+    /// The session workspace is the canonical primary checkout of a repository.
+    CanonicalCheckout,
+    /// The session workspace is an exact direct child of the trusted managed
+    /// root of the selected repository.
+    ManagedWorktree,
+    /// Any other Git worktree: for example `<repository>/.wt/<name>`,
+    /// `<src>/<repo>-*` or a linked worktree outside the managed root. Legacy
+    /// worktrees are reported, never adopted, moved or deleted.
+    LegacyWorktree,
+}
+
+impl SessionWorkspaceType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalCheckout => "canonical_checkout",
+            Self::ManagedWorktree => "managed_worktree",
+            Self::LegacyWorktree => "legacy_worktree",
+        }
+    }
+}
+
+/// Bounded, non-secret session workspace identity.
+///
+/// Every field is derived from the canonical session working directory and the
+/// configured `src` named root; no caller-supplied path and no `HOME` value
+/// participates. `workspace_root` is always the canonical Git worktree root,
+/// which may be an ancestor of the session working directory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SessionWorkspace {
+    pub(crate) workspace_type: SessionWorkspaceType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repository: Option<String>,
+    pub(crate) repository_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task: Option<String>,
+}
+
+/// Derives the bounded session workspace identity for one canonical working
+/// directory.
+///
+/// Returns `None` when the directory is not inside a supported standard Git
+/// worktree. Managed classification requires the exact trusted managed root and
+/// direct-child containment, so a swapped or symlinked managed root, a
+/// subdirectory of the namespace, a nested path and every out-of-root worktree
+/// resolve to `legacy_worktree` instead of being adopted.
+pub(crate) fn inspect_session_workspace(
+    cwd: &Path,
+    src_root: Option<&Path>,
+) -> Option<SessionWorkspace> {
+    let workspace_root = crate::sandbox::git_worktree_root(cwd).ok()?;
+    let repository_root = crate::sandbox::git_primary_checkout(&workspace_root).ok()?;
+    let branch = crate::sandbox::git_current_branch(&workspace_root)
+        .ok()
+        .flatten();
+    let repository = repository_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+
+    let managed = src_root
+        .and_then(|src_root| ManagedRepository::resolve(&repository_root, src_root).ok())
+        .filter(|repository| {
+            trusted_canonical_managed_root(repository).as_deref() == Some(repository.managed_root())
+                && workspace_root.parent() == Some(repository.managed_root())
+        });
+    let (workspace_type, task) = match managed {
+        Some(_) => (
+            SessionWorkspaceType::ManagedWorktree,
+            workspace_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        ),
+        None if workspace_root == repository_root => {
+            (SessionWorkspaceType::CanonicalCheckout, None)
+        }
+        None => (SessionWorkspaceType::LegacyWorktree, None),
+    };
+
+    Some(SessionWorkspace {
+        workspace_type,
+        repository,
+        repository_root,
+        workspace_root,
+        branch,
+        task,
+    })
+}
+
+/// Resolves the configured `src` named root from `TEMOTE_MCP_ROOTS`.
+///
+/// The physical root always comes from the named-root authority, never from
+/// `HOME` and never from a caller-supplied path.
+pub(crate) fn configured_src_root_from_env() -> Option<PathBuf> {
+    crate::named_roots::NamedRoots::from_env()
+        .ok()?
+        .canonical_root(MANAGED_SRC_ROOT_NAME)
+        .map(Path::to_path_buf)
 }
 
 /// Canonical identity of the selected repository and its Temote-managed
@@ -264,6 +374,64 @@ pub(crate) fn trusted_canonical_managed_root(repository: &ManagedRepository) -> 
     }
     let canonical = std::fs::canonicalize(repository.managed_root()).ok()?;
     (canonical == repository.managed_root()).then_some(canonical)
+}
+
+/// Verifies that an existing target may be reused as the selected repository's
+/// managed worktree for `branch`.
+///
+/// Reuse never adopts legacy or unrelated state: the target must be a normal
+/// canonical directory at the exact direct-child path below the trusted managed
+/// root, and its canonical common Git directory, primary checkout and current
+/// branch must equal the selected repository identity. Anything else fails
+/// closed, so `<repository>/.wt/<name>`, `<src>/<repo>-*`, `/tmp` worktrees and
+/// wrong-repository collisions are never adopted.
+pub(crate) fn verify_reusable_managed_worktree(
+    repository: &ManagedRepository,
+    target: &Path,
+    branch: &str,
+    selected_common_dir: &Path,
+    selected_primary_checkout: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        trusted_canonical_managed_root(repository).as_deref() == Some(repository.managed_root()),
+        "managed worktree root is not a trusted normal directory: {}",
+        repository.managed_root().display()
+    );
+    let metadata = std::fs::symlink_metadata(target)
+        .with_context(|| format!("cannot inspect managed worktree {}", target.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "existing managed worktree target is not a normal directory: {}",
+        target.display()
+    );
+    let canonical_target = std::fs::canonicalize(target)
+        .with_context(|| format!("cannot resolve managed worktree {}", target.display()))?;
+    anyhow::ensure!(
+        canonical_target == target,
+        "existing managed worktree target must be canonical and not a swapped path: {}",
+        target.display()
+    );
+    anyhow::ensure!(
+        target.parent() == Some(repository.managed_root()),
+        "existing managed worktree target must be a direct child of {}",
+        repository.managed_root().display()
+    );
+    anyhow::ensure!(
+        crate::sandbox::git_common_dir(&canonical_target)? == selected_common_dir,
+        "existing worktree does not belong to the selected repository (common Git directory mismatch): {}",
+        target.display()
+    );
+    anyhow::ensure!(
+        crate::sandbox::git_primary_checkout(&canonical_target)? == selected_primary_checkout,
+        "existing worktree primary checkout mismatch: {}",
+        target.display()
+    );
+    anyhow::ensure!(
+        crate::sandbox::git_current_branch(&canonical_target)?.as_deref() == Some(branch),
+        "existing managed worktree is not attached to the requested branch {branch:?}: {}",
+        target.display()
+    );
+    Ok(())
 }
 
 /// Facts observed after the Git worktree mutation. Plain values keep the
@@ -945,6 +1113,195 @@ mod tests {
                 ),
                 WorktreeClassification::Legacy,
                 "{canonical_managed_root:?}"
+            );
+        }
+    }
+
+    fn fake_repository(repository: &Path) -> PathBuf {
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        std::fs::write(
+            repository.join(".git").join("HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::canonicalize(repository).unwrap()
+    }
+
+    fn fake_linked_worktree(repository: &Path, name: &str, worktree: &Path, branch: &str) {
+        let private = repository.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+    }
+
+    #[test]
+    fn session_workspace_identity_uses_the_exact_managed_authority() {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let repository = fake_repository(&src_root.join("repo"));
+        let managed_root = src_root.join("worktrees").join("repo");
+        let managed = managed_root.join("task");
+        let legacy_sibling = src_root.join("repo-legacy");
+        let legacy_inside = repository.join(".wt").join("legacy");
+        let subdirectory = repository.join("sub");
+        std::fs::create_dir_all(&subdirectory).unwrap();
+        fake_linked_worktree(&repository, "task", &managed, "feature/x");
+        fake_linked_worktree(&repository, "legacy-linked", &legacy_sibling, "legacy");
+        fake_linked_worktree(&repository, "wt-legacy", &legacy_inside, "wt");
+
+        let canonical =
+            inspect_session_workspace(&repository, Some(&src_root)).expect("canonical workspace");
+        assert_eq!(
+            canonical.workspace_type,
+            SessionWorkspaceType::CanonicalCheckout
+        );
+        assert_eq!(canonical.repository.as_deref(), Some("repo"));
+        assert_eq!(canonical.workspace_root, repository);
+        assert_eq!(canonical.repository_root, repository);
+        assert_eq!(canonical.branch.as_deref(), Some("main"));
+        assert_eq!(canonical.task, None);
+
+        let managed_view = inspect_session_workspace(&managed, Some(&src_root)).expect("managed");
+        assert_eq!(
+            managed_view.workspace_type,
+            SessionWorkspaceType::ManagedWorktree
+        );
+        assert_eq!(managed_view.repository.as_deref(), Some("repo"));
+        assert_eq!(managed_view.repository_root, repository);
+        assert_eq!(managed_view.workspace_root, managed);
+        assert_eq!(managed_view.branch.as_deref(), Some("feature/x"));
+        assert_eq!(managed_view.task.as_deref(), Some("task"));
+
+        // A subdirectory reports the enclosing worktree root, not the cwd.
+        let sub = inspect_session_workspace(&subdirectory, Some(&src_root)).expect("subdirectory");
+        assert_eq!(sub.workspace_type, SessionWorkspaceType::CanonicalCheckout);
+        assert_eq!(sub.workspace_root, repository);
+
+        // Legacy worktrees are reported but never adopted.
+        for (path, label) in [(&legacy_sibling, "src sibling"), (&legacy_inside, ".wt")] {
+            let workspace = inspect_session_workspace(path, Some(&src_root))
+                .unwrap_or_else(|| panic!("{label}"));
+            assert_eq!(
+                workspace.workspace_type,
+                SessionWorkspaceType::LegacyWorktree,
+                "{label}"
+            );
+            assert_eq!(workspace.task, None, "{label}");
+        }
+
+        // The managed namespace directory itself is never classified managed.
+        assert!(
+            inspect_session_workspace(&managed_root, Some(&src_root)).is_none_or(|workspace| {
+                workspace.workspace_type != SessionWorkspaceType::ManagedWorktree
+            })
+        );
+
+        // Without the configured src authority nothing may be managed.
+        let unconfigured = inspect_session_workspace(&managed, None).expect("managed unconfigured");
+        assert_eq!(
+            unconfigured.workspace_type,
+            SessionWorkspaceType::LegacyWorktree
+        );
+        assert_eq!(unconfigured.task, None);
+
+        // A directory whose `.git` pointer cannot be resolved has no workspace
+        // identity at all.
+        let plain = src_root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join(".git"), "not a gitdir pointer\n").unwrap();
+        assert_eq!(inspect_session_workspace(&plain, Some(&src_root)), None);
+
+        #[cfg(unix)]
+        {
+            std::fs::rename(&managed_root, src_root.join("swapped")).unwrap();
+            std::os::unix::fs::symlink(src_root.join("swapped"), &managed_root).unwrap();
+            let swapped = inspect_session_workspace(&managed, Some(&src_root)).expect("swapped");
+            assert_eq!(swapped.workspace_type, SessionWorkspaceType::LegacyWorktree);
+            assert_eq!(swapped.task, None);
+        }
+    }
+
+    #[test]
+    fn reusable_managed_worktree_requires_identity_and_branch() {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let repository = fake_repository(&src_root.join("repo"));
+        let managed_root = src_root.join("worktrees").join("repo");
+        let managed = managed_root.join("task");
+        let legacy_inside = repository.join(".wt").join("legacy");
+        fake_linked_worktree(&repository, "task", &managed, "feature/x");
+        fake_linked_worktree(&repository, "wt-legacy", &legacy_inside, "feature/x");
+        let other = fake_repository(&src_root.join("other"));
+
+        let managed_repository = ManagedRepository::resolve(&repository, &src_root).unwrap();
+        let common = crate::sandbox::git_common_dir(&repository).unwrap();
+        let primary = crate::sandbox::git_primary_checkout(&repository).unwrap();
+
+        verify_reusable_managed_worktree(
+            &managed_repository,
+            &managed,
+            "feature/x",
+            &common,
+            &primary,
+        )
+        .unwrap();
+
+        // Wrong branch, wrong repository identity and a legacy location fail
+        // closed.
+        assert!(
+            verify_reusable_managed_worktree(
+                &managed_repository,
+                &managed,
+                "feature/other",
+                &common,
+                &primary,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_reusable_managed_worktree(
+                &managed_repository,
+                &managed,
+                "feature/x",
+                &crate::sandbox::git_common_dir(&other).unwrap(),
+                &primary,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_reusable_managed_worktree(
+                &managed_repository,
+                &repository.join(".wt").join("legacy"),
+                "feature/x",
+                &common,
+                &primary,
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let symlinked = managed_root.join("symlinked");
+            std::os::unix::fs::symlink(&managed, &symlinked).unwrap();
+            assert!(
+                verify_reusable_managed_worktree(
+                    &managed_repository,
+                    &symlinked,
+                    "feature/x",
+                    &common,
+                    &primary,
+                )
+                .is_err()
             );
         }
     }
