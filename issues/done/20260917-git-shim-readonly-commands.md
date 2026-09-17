@@ -94,3 +94,8 @@ Focused tests (PASS):
 
 NOT RUN: macOS host execution; a real Codex/OpenCode invoking `git status` through the installed
 shim on a rebuilt runtime (live matrix row).
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+remaining NOT RUN rows above stay host/CI or live-matrix gates.

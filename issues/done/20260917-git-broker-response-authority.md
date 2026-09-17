@@ -3,7 +3,7 @@
 Status: polished
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`
-Depends on: `issues/polished/20260917-git-broker-atomic-response-outcome.md`
+Depends on: `issues/done/20260917-git-broker-atomic-response-outcome.md`
 
 ## Current code and contract
 
@@ -118,3 +118,8 @@ superseded by this two-root layout.
   write into the parent-owned response root, cannot alter broker mutations, and cannot change the
   repository state that the parent observes. The filesystem authority, not a shared secret or a
   filename guess, is what makes broker outcomes authoritative.
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+remaining NOT RUN rows above stay host/CI or live-matrix gates.

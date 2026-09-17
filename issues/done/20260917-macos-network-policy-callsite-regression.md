@@ -78,3 +78,8 @@ Verification:
 - `just sandboxed-check`: exit 0.
 
 Status: repository-local fix complete; macOS CI re-run is the remaining evidence.
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+macOS CI re-run stays the remaining host gate.

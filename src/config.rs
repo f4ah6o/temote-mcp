@@ -388,6 +388,35 @@ pub async fn load_session(id: &str) -> Result<Session> {
 }
 
 pub async fn read_session_metadata(id: &str) -> Result<Session> {
+    let session = load_session_metadata(id).await?;
+    validate_loaded_session(id, &session)?;
+    Ok(session)
+}
+
+/// Session metadata plus whether every canonical workspace path still resolves.
+#[derive(Clone)]
+pub(crate) struct SessionViewMetadata {
+    pub session: Session,
+    pub workspace_resolved: bool,
+}
+
+/// Reads session metadata for read-only session views.
+///
+/// Metadata that resolves is held to the same canonical invariants as
+/// `read_session_metadata`. Workspace paths that no longer exist are returned
+/// as an explicit unresolvable workspace instead of failing the caller, so one
+/// stale session cannot abort session enumeration. This never deletes or
+/// repairs metadata and is not a metadata validation bypass.
+pub(crate) async fn read_session_metadata_for_view(id: &str) -> Result<SessionViewMetadata> {
+    let session = load_session_metadata(id).await?;
+    let workspace_resolved = validate_loaded_session_for_view(id, &session)?;
+    Ok(SessionViewMetadata {
+        session,
+        workspace_resolved,
+    })
+}
+
+async fn load_session_metadata(id: &str) -> Result<Session> {
     let path = session_path(id)?;
     let file = open_session_metadata_nofollow(&path)
         .with_context(|| format!("session {id} was not found or could not be opened safely"))?;
@@ -417,7 +446,6 @@ pub async fn read_session_metadata(id: &str) -> Result<Session> {
         path.display()
     );
     let session: Session = serde_json::from_slice(&bytes).context("invalid temote-mcp session")?;
-    validate_loaded_session(id, &session)?;
     Ok(session)
 }
 
@@ -697,13 +725,7 @@ pub async fn save_session(session: &Session) -> Result<()> {
 }
 
 fn validate_loaded_session(requested_id: &str, session: &Session) -> Result<()> {
-    validate_session_id(requested_id)?;
-    anyhow::ensure!(
-        session.id == requested_id,
-        "session metadata ID mismatch: requested {requested_id}, found {}",
-        session.id
-    );
-    validate_session_id(&session.id)?;
+    validate_loaded_session_identity(requested_id, session)?;
 
     let canonical_cwd = canonical_directory(&session.cwd)?;
     anyhow::ensure!(
@@ -734,6 +756,134 @@ fn validate_loaded_session(requested_id: &str, session: &Session) -> Result<()> 
         seen.contains(&session.cwd),
         "session cwd is missing from permitted directories"
     );
+    Ok(())
+}
+
+fn validate_loaded_session_identity(requested_id: &str, session: &Session) -> Result<()> {
+    validate_session_id(requested_id)?;
+    anyhow::ensure!(
+        session.id == requested_id,
+        "session metadata ID mismatch: requested {requested_id}, found {}",
+        session.id
+    );
+    validate_session_id(&session.id)?;
+    Ok(())
+}
+
+/// Validates session metadata for a read-only session view.
+///
+/// Returns whether every stored workspace path still resolves. Stored paths
+/// that resolve are required to stay canonical and to be directories; paths
+/// that no longer exist are tolerated as an explicit unresolvable workspace.
+/// Every other `validate_loaded_session` invariant still applies, so
+/// missing-worktree tolerance is never a metadata validation bypass.
+fn validate_loaded_session_for_view(requested_id: &str, session: &Session) -> Result<bool> {
+    validate_loaded_session_identity(requested_id, session)?;
+    anyhow::ensure!(
+        !session.permitted_directories.is_empty(),
+        "session metadata has no permitted directories"
+    );
+
+    let mut seen = BTreeSet::new();
+    let mut workspace_resolved = true;
+    for root in &session.permitted_directories {
+        anyhow::ensure!(
+            seen.insert(root.clone()),
+            "duplicate session permitted root: {}",
+            root.display()
+        );
+        workspace_resolved &= session_path_resolves(root)?;
+    }
+    anyhow::ensure!(
+        seen.contains(&session.cwd),
+        "session cwd is missing from permitted directories"
+    );
+    workspace_resolved &= session_path_resolves(&session.cwd)?;
+    Ok(workspace_resolved)
+}
+
+/// Resolves a stored session path for a read-only view.
+///
+/// `Ok(true)` means the path resolves canonically to itself and is a
+/// directory. `Ok(false)` means the path no longer exists while every existing
+/// ancestor is still canonical. Relative paths, `..` components, symlinks that
+/// resolve elsewhere, non-directory targets, and probe errors are rejected
+/// rather than tolerated.
+fn session_path_resolves(path: &Path) -> Result<bool> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "session path is not absolute: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        !path.components().any(|component| matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )),
+        "session path is not normalized: {}",
+        path.display()
+    );
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => {
+            anyhow::ensure!(
+                resolved == *path,
+                "session path is not canonical: {}",
+                path.display()
+            );
+            anyhow::ensure!(
+                resolved.is_dir(),
+                "session path is not a directory: {}",
+                path.display()
+            );
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            verify_existing_ancestor_is_canonical(path)?;
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| format!("cannot resolve {}", path.display())),
+    }
+}
+
+/// Requires every existing ancestor of a missing session path to resolve
+/// canonically to itself and to be a directory.
+///
+/// A component that exists but cannot be resolved (a broken symlink) or that is
+/// not a directory fails closed: missing-worktree tolerance must not accept a
+/// workspace that has been replaced by a symlink or a file. Once a component is
+/// missing, every deeper component is missing too.
+fn verify_existing_ancestor_is_canonical(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                let resolved = std::fs::canonicalize(&current).with_context(|| {
+                    format!("cannot resolve session path ancestor {}", current.display())
+                })?;
+                anyhow::ensure!(
+                    resolved == current,
+                    "session path ancestor is not canonical: {}",
+                    current.display()
+                );
+                anyhow::ensure!(
+                    metadata.is_dir(),
+                    "session path ancestor is not a directory: {}",
+                    current.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect session path {}", path.display()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1162,6 +1312,228 @@ mod tests {
         let error = read_session_metadata(&id).await.err().unwrap();
         assert!(error.to_string().contains("could not be opened safely"));
         tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    async fn save_view_session(id: &str, session: &Session) {
+        save_session(session).await.unwrap();
+        assert_eq!(
+            session_path(id).unwrap(),
+            session_path(&session.id).unwrap()
+        );
+    }
+
+    fn view_session(id: &str, cwd: PathBuf, roots: Vec<PathBuf>) -> Session {
+        Session {
+            id: id.to_owned(),
+            cwd,
+            permitted_directories: roots,
+            started_at: 1_700_000_000,
+            process_id: 4242,
+            permission_mode: PermissionMode::Agent,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_view_metadata_tolerates_a_removed_workspace() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("cwd");
+        let extra = fixture.path().join("extra");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        let cwd = canonical_directory(&cwd).unwrap();
+        let extra = canonical_directory(&extra).unwrap();
+        let id = format!("view-removed-{}", Uuid::new_v4());
+        let session = view_session(&id, cwd.clone(), vec![cwd.clone(), extra.clone()]);
+        save_view_session(&id, &session).await;
+
+        std::fs::remove_dir(&extra).unwrap();
+        std::fs::remove_dir(&cwd).unwrap();
+
+        let read = read_session_metadata_for_view(&id).await.unwrap();
+        assert!(!read.workspace_resolved);
+        assert_eq!(read.session.id, id);
+        assert_eq!(read.session.cwd, session.cwd);
+        assert_eq!(
+            read.session.permitted_directories,
+            session.permitted_directories
+        );
+
+        let error = read_session_metadata(&id).await.err().unwrap();
+        assert!(error.to_string().contains("cannot resolve"), "{error:#}");
+
+        let _ = tokio::fs::remove_file(session_path(&id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn session_view_metadata_degrades_when_one_permitted_root_is_gone() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("cwd");
+        let gone = fixture.path().join("gone");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&gone).unwrap();
+        let cwd = canonical_directory(&cwd).unwrap();
+        let gone = canonical_directory(&gone).unwrap();
+        let id = format!("view-root-{}", Uuid::new_v4());
+        save_view_session(
+            &id,
+            &view_session(&id, cwd.clone(), vec![cwd, gone.clone()]),
+        )
+        .await;
+
+        std::fs::remove_dir(&gone).unwrap();
+
+        let read = read_session_metadata_for_view(&id).await.unwrap();
+        assert!(
+            !read.workspace_resolved,
+            "a removed permitted root must not be reported as a resolved workspace"
+        );
+
+        let _ = tokio::fs::remove_file(session_path(&id).unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn session_view_metadata_rejects_malformed_and_unsafe_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("cwd");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let cwd = canonical_directory(&cwd).unwrap();
+        let outside = canonical_directory(&outside).unwrap();
+        let file = fixture.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let canonical_file = canonical_directory(fixture.path()).unwrap().join("file");
+        let malformed = PathBuf::from("relative/cwd");
+
+        let cases: [(&str, Session); 5] = [
+            (
+                "relative cwd",
+                view_session("view-relative", malformed, vec![cwd.clone()]),
+            ),
+            (
+                "parent component",
+                view_session("view-parent", cwd.join("..").join("cwd"), vec![cwd.clone()]),
+            ),
+            (
+                "cwd outside permitted roots",
+                view_session("view-outside", outside.clone(), vec![cwd.clone()]),
+            ),
+            (
+                "duplicate permitted root",
+                view_session(
+                    "view-duplicate",
+                    cwd.clone(),
+                    vec![cwd.clone(), cwd.clone()],
+                ),
+            ),
+            (
+                "cwd is not a directory",
+                view_session("view-file", canonical_file, vec![cwd.clone()]),
+            ),
+        ];
+        for (label, session) in cases {
+            save_view_session(&session.id, &session).await;
+            let error = read_session_metadata_for_view(&session.id)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label} must not be tolerated"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("session path")
+                    || error.contains("session cwd")
+                    || error.contains("session permitted root"),
+                "{label}: {error}"
+            );
+            let _ = tokio::fs::remove_file(session_path(&session.id).unwrap()).await;
+        }
+
+        let requested = format!("view-id-mismatch-{}", Uuid::new_v4());
+        let mismatched = view_session(&format!("other-{}", Uuid::new_v4()), cwd.clone(), vec![cwd]);
+        tokio::fs::write(
+            session_path(&requested).unwrap(),
+            serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .await
+        .unwrap();
+        let error = read_session_metadata_for_view(&requested)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("ID mismatch"), "{error:#}");
+        let _ = tokio::fs::remove_file(session_path(&requested).unwrap()).await;
+
+        let malformed_id = format!("view-json-{}", Uuid::new_v4());
+        tokio::fs::write(session_path(&malformed_id).unwrap(), b"not json")
+            .await
+            .unwrap();
+        let error = read_session_metadata_for_view(&malformed_id)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("invalid temote-mcp session"),
+            "{error:#}"
+        );
+        let _ = tokio::fs::remove_file(session_path(&malformed_id).unwrap()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_view_metadata_rejects_symlinked_workspace_paths() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let real = fixture.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let real = canonical_directory(&real).unwrap();
+        let link = fixture.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        let resolved_id = format!("view-symlink-file-{}", Uuid::new_v4());
+        let resolved = view_session(&resolved_id, link.clone(), vec![link.clone()]);
+        save_view_session(&resolved_id, &resolved).await;
+        let error = read_session_metadata_for_view(&resolved_id)
+            .await
+            .err()
+            .expect("a symlinked stored path that resolves elsewhere must be rejected");
+        assert!(format!("{error:#}").contains("not canonical"), "{error:#}");
+        let _ = tokio::fs::remove_file(session_path(&resolved_id).unwrap()).await;
+
+        let ancestor_id = format!("view-symlink-ancestor-{}", Uuid::new_v4());
+        let stored = link.join("missing-child");
+        let ancestor = view_session(&ancestor_id, stored.clone(), vec![stored]);
+        save_view_session(&ancestor_id, &ancestor).await;
+        let error = read_session_metadata_for_view(&ancestor_id)
+            .await
+            .err()
+            .expect("a symlinked existing ancestor must not be tolerated");
+        assert!(
+            format!("{error:#}").contains("ancestor is not canonical"),
+            "{error:#}"
+        );
+        let _ = tokio::fs::remove_file(session_path(&ancestor_id).unwrap()).await;
+
+        let broken = fixture.path().join("broken");
+        symlink(fixture.path().join("missing-target"), &broken).unwrap();
+        let broken_ids = [
+            format!("view-broken-leaf-{}", Uuid::new_v4()),
+            format!("view-broken-ancestor-{}", Uuid::new_v4()),
+        ];
+        for (id, stored) in [
+            (broken_ids[0].clone(), broken.clone()),
+            (broken_ids[1].clone(), broken.join("missing-child")),
+        ] {
+            save_view_session(&id, &view_session(&id, stored.clone(), vec![stored])).await;
+            let error = read_session_metadata_for_view(&id)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{id} must fail closed on a broken symlink"));
+            assert!(
+                format!("{error:#}").contains("cannot resolve session path ancestor"),
+                "{id}: {error:#}"
+            );
+            let _ = tokio::fs::remove_file(session_path(&id).unwrap()).await;
+        }
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 Status: polished
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-temote-managed-worktree-broker.md`
-Depends on: `issues/polished/20260917-git-broker-selected-workspace-scope.md`
+Depends on: `issues/done/20260917-git-broker-selected-workspace-scope.md`
 
 ## Observed on current main + repair round (2026-09-17)
 

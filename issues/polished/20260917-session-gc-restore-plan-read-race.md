@@ -30,7 +30,7 @@ observes a partially-written file fails the whole session-GC plan instead of tol
 concurrent writer.
 
 This is a test-isolation defect (parallel tests sharing one state root), not a sandbox/socket
-issue; it is distinct from `issues/polished/20260917-session-list-supervisor-owned-missing-cwd.md`.
+issue; it is distinct from `issues/done/20260917-session-list-supervisor-owned-missing-cwd.md`.
 
 ## The one responsibility to change
 

@@ -87,3 +87,9 @@ Measured:
 - host full gateway suite (`npm test`) is part of `just check`/CI and unchanged.
 - inside a real normal Temote agent session: NOT RUN locally (this worker is on an unsandboxed X11
   host); the review session is the acceptance environment for requirement A.
+
+## 2026-09-17 completion
+
+The repair round above passed independent review in the documented normal Temote agent session;
+`just sandboxed-check` stays the deterministic gate, and the explicit host/CI-only rows remain
+NOT RUN there by design.

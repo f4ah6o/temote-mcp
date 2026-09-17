@@ -3,7 +3,7 @@
 Status: polished
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`
-Depends on: `issues/polished/20260917-git-broker-queue-filesystem-boundary.md`
+Depends on: `issues/done/20260917-git-broker-queue-filesystem-boundary.md`
 
 ## Current code and contract
 
@@ -95,4 +95,9 @@ NOT RUN: real agent observing exit 70 live; macOS host execution.
 Response cleanup moved to the broker/parent: the sandboxed shim can no longer delete response
 files (they live in a read-only root). The `Completed`/`Rejected`/`Indeterminate` semantics and
 atomic publish are unchanged; see
-`issues/polished/20260917-git-broker-response-authority.md`.
+`issues/done/20260917-git-broker-response-authority.md`.
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+remaining NOT RUN rows above stay host/CI or live-matrix gates.

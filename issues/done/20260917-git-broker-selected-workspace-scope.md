@@ -100,3 +100,10 @@ its supported mutations in the yolo path. In ask/agent mode the git command stil
 `sandbox::run_git` because the primary repository's common metadata is outside `[worktree_root]`;
 that limitation is owned by `issues/polished/20260917-linked-worktree-broker-metadata-scope.md`.
 The earlier statement that a linked worktree run cwd is rejected was inaccurate.
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+remaining NOT RUN rows above stay host/CI or live-matrix gates. The unrelated linked-worktree
+metadata limitation stays open in
+`issues/polished/20260917-linked-worktree-broker-metadata-scope.md`.

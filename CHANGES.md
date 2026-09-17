@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- `session_list` no longer fails when a supervisor-owned session's working directory is gone, and `session_info` reports the same bounded `degraded` view while leaving the stale metadata untouched. ([session list missing cwd](issues/done/20260917-session-list-supervisor-owned-missing-cwd.md))
 - Codex task cleanup and recovery now preserve accepted operations through process and session transitions without replaying uncertain side effects.
 
 ### Deprecated

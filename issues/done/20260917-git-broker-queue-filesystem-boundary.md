@@ -103,4 +103,9 @@ link-count stop and held-descriptor model.
 The single queue root became two roots: `requests` stays under the agent-writable state root and
 `responses` moved to a parent-owned read-only root. The symlink/special-file/bounded-read/atomic
 rename protections apply to both roots; see
-`issues/polished/20260917-git-broker-response-authority.md`.
+`issues/done/20260917-git-broker-response-authority.md`.
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+remaining NOT RUN rows above stay host/CI or live-matrix gates.

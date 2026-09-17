@@ -3480,9 +3480,27 @@ async fn persist_crash(
     config::save_session_lifecycle(id, &lifecycle).await
 }
 
+/// Status for a session whose durable metadata is intact but whose canonical
+/// workspace paths (cwd and permitted roots) no longer all resolve. The view
+/// keeps the stored identity, lifecycle, and liveness facts instead of
+/// relabeling them as stopped, crashed, or active.
+const SESSION_STATUS_DEGRADED: &str = "degraded";
+const SESSION_WORKSPACE_DEGRADED: &str = "session workspace is missing or not resolvable";
+const SESSION_LIVENESS_UNKNOWN: &str = "session liveness could not be determined safely";
+
 pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
-    config::validate_session_id(id)?;
-    let session = config::read_session_metadata(id).await?;
+    build_session_view(id, true).await
+}
+
+/// Builds one bounded session view.
+///
+/// `reconcile_lifecycle` matches the session_info/reporting behavior that
+/// persists a crash when durable metadata claims a live runtime whose socket
+/// is not active. Read-only enumeration passes `false` and never writes.
+async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<SessionView> {
+    let metadata = config::read_session_metadata_for_view(id).await?;
+    let workspace_resolved = metadata.workspace_resolved;
+    let session = metadata.session;
     let mut lifecycle = config::read_session_lifecycle(id).await?;
     let liveness = config::session_is_active(id).await;
 
@@ -3492,7 +3510,7 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
             LifecycleStatus::Starting | LifecycleStatus::Active | LifecycleStatus::Stopping
         )
     });
-    if matches!(liveness, Ok(false)) && claims_live_runtime {
+    if reconcile_lifecycle && matches!(liveness, Ok(false)) && claims_live_runtime {
         persist_crash(
             id,
             lifecycle.take(),
@@ -3513,27 +3531,56 @@ pub(crate) async fn inspect_session(id: &str) -> Result<SessionView> {
         state
     });
 
-    let (status, last_error) = match liveness {
-        Ok(true) => {
-            let status = match inferred.status {
-                LifecycleStatus::Starting => "starting",
-                LifecycleStatus::Stopping => "stopping",
-                _ => "active",
-            };
-            (status.to_owned(), inferred.last_error.clone())
+    let (status, last_error) = if !workspace_resolved {
+        let last_error = match inferred.last_error.as_deref() {
+            Some(existing) => {
+                format!("{SESSION_WORKSPACE_DEGRADED}; last durable error: {existing}")
+            }
+            None => SESSION_WORKSPACE_DEGRADED.to_owned(),
+        };
+        (SESSION_STATUS_DEGRADED.to_owned(), Some(last_error))
+    } else {
+        match &liveness {
+            Ok(true) => {
+                let status = match inferred.status {
+                    LifecycleStatus::Starting => "starting",
+                    LifecycleStatus::Stopping => "stopping",
+                    _ => "active",
+                };
+                (status.to_owned(), inferred.last_error.clone())
+            }
+            Ok(false) if !reconcile_lifecycle && claims_live_runtime => (
+                "unknown".to_owned(),
+                Some(
+                    inferred
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "session socket is not active".to_owned()),
+                ),
+            ),
+            Ok(false) => (
+                status_name(inferred.status).to_owned(),
+                inferred.last_error.clone(),
+            ),
+            Err(_) => (
+                "unknown".to_owned(),
+                Some(SESSION_LIVENESS_UNKNOWN.to_owned()),
+            ),
         }
-        Ok(false) => (
-            status_name(inferred.status).to_owned(),
-            inferred.last_error.clone(),
-        ),
-        Err(error) => (
-            "unknown".to_owned(),
-            Some(format!("liveness probe failed: {error:#}")),
-        ),
     };
-    let pid = matches!(status.as_str(), "starting" | "active" | "stopping")
-        .then_some(session.process_id)
-        .filter(|pid| *pid != 0);
+    let pid = if workspace_resolved {
+        matches!(status.as_str(), "starting" | "active" | "stopping")
+            .then_some(session.process_id)
+            .filter(|pid| *pid != 0)
+    } else {
+        // A missing workspace says nothing about liveness: keep the process
+        // identity only when the socket probe actually observed a live session.
+        liveness
+            .as_ref()
+            .is_ok_and(|live| *live)
+            .then_some(session.process_id)
+            .filter(|pid| *pid != 0)
+    };
     let permission_mode = session.permission_mode;
     let yolo = session.yolo();
 
@@ -3576,7 +3623,13 @@ async fn list_session_views(supervisor: &SessionSupervisor) -> Result<Vec<Sessio
     let history_ids = bounded_history_session_ids(&owned).await?;
     let mut history = Vec::new();
     for id in history_ids {
-        if let Ok(session) = inspect_session_read_only(&id).await {
+        // Bounded history stays limited to sessions whose workspace still
+        // resolves so accumulated removed worktrees cannot crowd out healthy
+        // entries. Stale metadata is neither deleted nor forgotten; owned
+        // sessions are always surfaced, degraded when their cwd is gone.
+        if let Ok(session) = inspect_session_read_only(&id).await
+            && session.status != SESSION_STATUS_DEGRADED
+        {
             history.push(session);
         }
     }
@@ -3629,7 +3682,9 @@ async fn filesystem_session_views_read_only() -> Result<Vec<SessionView>> {
     let ids = bounded_history_session_ids(&HashSet::new()).await?;
     let mut sessions = Vec::new();
     for id in ids {
-        if let Ok(session) = inspect_session_read_only(&id).await {
+        if let Ok(session) = inspect_session_read_only(&id).await
+            && session.status != SESSION_STATUS_DEGRADED
+        {
             sessions.push(session);
         }
     }
@@ -3644,6 +3699,26 @@ async fn filesystem_session_views_read_only() -> Result<Vec<SessionView>> {
 }
 
 async fn bounded_history_session_ids(excluded: &HashSet<String>) -> Result<Vec<String>> {
+    collect_bounded_history_session_ids(
+        excluded,
+        MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED,
+        MAX_SESSION_HISTORY_CANDIDATES,
+    )
+    .await
+}
+
+/// Collects bounded history candidates, excluding entries whose workspace no
+/// longer resolves before the candidate bound is applied.
+///
+/// Filtering after the bound would let accumulated removed worktrees consume
+/// the whole candidate budget and push healthy history out of the list. Stale
+/// metadata is neither deleted nor forgotten here; it stays addressable through
+/// `session_info` and explicit lifecycle commands.
+async fn collect_bounded_history_session_ids(
+    excluded: &HashSet<String>,
+    max_scanned_entries: usize,
+    max_candidates: usize,
+) -> Result<Vec<String>> {
     let directory = config::sessions_dir()?;
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
@@ -3652,7 +3727,7 @@ async fn bounded_history_session_ids(excluded: &HashSet<String>) -> Result<Vec<S
     };
     let mut scanned = 0usize;
     let mut ids = BTreeSet::new();
-    while scanned < MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED {
+    while scanned < max_scanned_entries {
         let Some(entry) = entries.next_entry().await? else {
             break;
         };
@@ -3667,8 +3742,12 @@ async fn bounded_history_session_ids(excluded: &HashSet<String>) -> Result<Vec<S
         if excluded.contains(id) || config::validate_session_id(id).is_err() {
             continue;
         }
+        match config::read_session_metadata_for_view(id).await {
+            Ok(metadata) if metadata.workspace_resolved => {}
+            _ => continue,
+        }
         ids.insert(id.to_owned());
-        if ids.len() > MAX_SESSION_HISTORY_CANDIDATES {
+        if ids.len() > max_candidates {
             let last = ids.iter().next_back().cloned();
             if let Some(last) = last {
                 ids.remove(&last);
@@ -3715,77 +3794,7 @@ fn push_control_session_view(
 }
 
 pub(crate) async fn inspect_session_read_only(id: &str) -> Result<SessionView> {
-    config::validate_session_id(id)?;
-    let session = config::read_session_metadata(id).await?;
-    let lifecycle = config::read_session_lifecycle(id).await?;
-    let liveness = config::session_is_active(id).await;
-    let inferred = lifecycle.unwrap_or_else(|| {
-        let mut state = SessionLifecycle::starting(session.started_at, None);
-        state.status = if session.process_id == 0 {
-            LifecycleStatus::Stopped
-        } else {
-            LifecycleStatus::Active
-        };
-        state
-    });
-    let claims_live_runtime = matches!(
-        inferred.status,
-        LifecycleStatus::Starting | LifecycleStatus::Active | LifecycleStatus::Stopping
-    );
-    let (status, last_error) = match liveness {
-        Ok(true) => {
-            let status = match inferred.status {
-                LifecycleStatus::Starting => "starting",
-                LifecycleStatus::Stopping => "stopping",
-                _ => "active",
-            };
-            (status.to_owned(), inferred.last_error.clone())
-        }
-        Ok(false) if claims_live_runtime => (
-            "unknown".to_owned(),
-            Some(
-                inferred
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "session socket is not active".to_owned()),
-            ),
-        ),
-        Ok(false) => (
-            status_name(inferred.status).to_owned(),
-            inferred.last_error.clone(),
-        ),
-        Err(_) => (
-            "unknown".to_owned(),
-            Some("session liveness could not be determined safely".to_owned()),
-        ),
-    };
-    let pid = matches!(status.as_str(), "starting" | "active" | "stopping")
-        .then_some(session.process_id)
-        .filter(|pid| *pid != 0);
-    let permission_mode = session.permission_mode;
-    let yolo = session.yolo();
-    Ok(SessionView {
-        host_id: host_identity::resolve()?,
-        id: session.id.clone(),
-        session_id: session.id,
-        status,
-        pid,
-        process_id: session.process_id,
-        cwd: session.cwd,
-        permitted_directories: session.permitted_directories,
-        started_at: inferred.started_at,
-        stopped_at: inferred.stopped_at,
-        exit_reason: inferred.exit_reason,
-        last_error,
-        permission_mode,
-        yolo,
-        logical_path: inferred.logical_path,
-        restart_policy: inferred.restart_policy,
-        restart_count: inferred.restart_count,
-        last_restart_at: inferred.last_restart_at,
-        next_restart_at: inferred.next_restart_at,
-        restart_limit_reason: inferred.restart_limit_reason,
-    })
+    build_session_view(id, false).await
 }
 
 pub(crate) async fn session_metadata_diagnostics() -> Result<SessionMetadataDiagnostics> {
@@ -5336,6 +5345,227 @@ mod tests {
         assert!(inspect_session(&id).await.is_err());
 
         supervisor.shutdown().await.unwrap();
+        cleanup(&id).await;
+    }
+
+    fn named_root_fixture(paths: &[&str]) -> (tempfile::TempDir, NamedRoots, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let volume = temp.path().join("volume");
+        for path in paths {
+            std::fs::create_dir_all(volume.join(path)).unwrap();
+        }
+        let canonical = std::fs::canonicalize(&volume).unwrap();
+        let roots =
+            NamedRoots::from_canonical_roots(BTreeMap::from([("src".to_owned(), canonical)]))
+                .unwrap();
+        (temp, roots, volume)
+    }
+
+    #[tokio::test]
+    async fn session_list_survives_an_owned_session_with_a_removed_workspace() {
+        let (_temp, roots, volume) = named_root_fixture(&["healthy", "stale"]);
+        let (supervisor, _approvals) = SessionSupervisor::new(roots);
+        let healthy_id = format!("list-healthy-{}", uuid::Uuid::new_v4());
+        let stale_id = format!("list-stale-{}", uuid::Uuid::new_v4());
+        supervisor
+            .start("src/healthy", Some(&healthy_id))
+            .await
+            .unwrap();
+        supervisor
+            .start("src/stale", Some(&stale_id))
+            .await
+            .unwrap();
+
+        let stale_cwd = config::read_session_metadata(&stale_id).await.unwrap().cwd;
+        assert_eq!(
+            stale_cwd,
+            std::fs::canonicalize(volume.join("stale")).unwrap()
+        );
+        std::fs::remove_dir_all(&stale_cwd).unwrap();
+        assert!(!stale_cwd.exists());
+
+        let listed = list_session_views(&supervisor)
+            .await
+            .expect("one removed workspace must not fail the whole listing");
+        let healthy = listed
+            .iter()
+            .find(|view| view.session_id == healthy_id)
+            .expect("healthy owned session missing from list");
+        assert_eq!(healthy.status, "active");
+        let stale = listed
+            .iter()
+            .find(|view| view.session_id == stale_id)
+            .expect("stale owned session missing from list");
+        assert_eq!(stale.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(stale.cwd, stale_cwd);
+        assert_ne!(stale.status, "stopped");
+        assert_ne!(stale.status, "crashed");
+        assert_ne!(stale.status, "active");
+        assert!(
+            config::session_path(&stale_id).unwrap().exists(),
+            "listing must not delete stale metadata"
+        );
+        assert!(
+            config::session_lifecycle_path(&stale_id).unwrap().exists(),
+            "listing must not delete stale lifecycle state"
+        );
+
+        let info = inspect_session(&stale_id).await.unwrap();
+        assert_eq!(info.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(info.session_id, stale_id);
+        assert_eq!(info.cwd, stale_cwd);
+        assert!(
+            info.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains(SESSION_WORKSPACE_DEGRADED))
+        );
+        assert_eq!(inspect_session(&healthy_id).await.unwrap().status, "active");
+
+        supervisor.stop(&stale_id).await.unwrap();
+        supervisor.stop(&healthy_id).await.unwrap();
+        let after_stop = list_session_views(&supervisor).await.unwrap();
+        assert!(
+            !after_stop.iter().any(|view| view.session_id == stale_id),
+            "bounded history keeps omitting sessions whose workspace no longer resolves"
+        );
+        supervisor.shutdown().await.unwrap();
+        cleanup(&healthy_id).await;
+        cleanup(&stale_id).await;
+    }
+
+    #[tokio::test]
+    async fn degraded_history_is_excluded_before_the_candidate_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = format!("history-bound-{}", uuid::Uuid::new_v4());
+        let mut excluded = HashSet::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(config::sessions_dir().unwrap()).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && let Some(id) = path.file_stem().and_then(|value| value.to_str())
+                {
+                    excluded.insert(id.to_owned());
+                }
+            }
+        }
+
+        let healthy_dir = root.path().join("healthy");
+        std::fs::create_dir(&healthy_dir).unwrap();
+        let healthy_cwd = config::canonical_directory(&healthy_dir).unwrap();
+        let healthy_id = format!("{prefix}-healthy");
+        config::save_session(&config::Session {
+            id: healthy_id.clone(),
+            cwd: healthy_cwd.clone(),
+            permitted_directories: vec![healthy_cwd],
+            started_at: 2,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        })
+        .await
+        .unwrap();
+
+        let mut degraded_ids = Vec::new();
+        for index in 0..10 {
+            let id = format!("{prefix}-{index:02}-degraded");
+            let directory = root.path().join(format!("gone-{index:02}"));
+            std::fs::create_dir(&directory).unwrap();
+            let cwd = config::canonical_directory(&directory).unwrap();
+            config::save_session(&config::Session {
+                id: id.clone(),
+                cwd: cwd.clone(),
+                permitted_directories: vec![cwd],
+                started_at: 1,
+                process_id: 0,
+                permission_mode: config::PermissionMode::Agent,
+            })
+            .await
+            .unwrap();
+            std::fs::remove_dir(&directory).unwrap();
+            degraded_ids.push(id);
+        }
+
+        let candidates = collect_bounded_history_session_ids(
+            &excluded,
+            MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED,
+            8,
+        )
+        .await
+        .unwrap();
+        assert!(
+            candidates.contains(&healthy_id),
+            "degraded entries must not consume the candidate bound: {candidates:?}"
+        );
+        for id in &degraded_ids {
+            assert!(
+                !candidates.contains(id),
+                "degraded history must be excluded before the bound: {id}"
+            );
+            assert!(
+                config::session_path(id).unwrap().exists(),
+                "exclusion must not delete stale metadata"
+            );
+        }
+
+        let _ = tokio::fs::remove_file(config::session_path(&healthy_id).unwrap()).await;
+        for id in &degraded_ids {
+            let _ = tokio::fs::remove_file(config::session_path(id).unwrap()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_is_never_reported_as_a_liveness_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = config::canonical_directory(&cwd).unwrap();
+        let id = format!("degraded-lived-{}", uuid::Uuid::new_v4());
+        cleanup(&id).await;
+        let session = config::Session {
+            id: id.clone(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
+            started_at: 1_700_000_000,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        config::save_session(&session).await.unwrap();
+        let mut lifecycle =
+            SessionLifecycle::starting(session.started_at, Some("src/workspace".to_owned()));
+        lifecycle.status = LifecycleStatus::Active;
+        config::save_session_lifecycle(&id, &lifecycle)
+            .await
+            .unwrap();
+        let socket_server = spawn_active_session_socket(&id).await;
+        std::fs::remove_dir_all(&session.cwd).unwrap();
+
+        let live = inspect_session_read_only(&id).await.unwrap();
+        assert_eq!(live.status, SESSION_STATUS_DEGRADED);
+        assert_eq!(
+            live.pid,
+            Some(std::process::id()),
+            "a live socket must keep the process identity visible"
+        );
+        assert!(live.last_error.is_some());
+        assert_eq!(
+            inspect_session(&id).await.unwrap().status,
+            SESSION_STATUS_DEGRADED
+        );
+        let durable = config::read_session_lifecycle(&id).await.unwrap().unwrap();
+        assert_eq!(
+            durable.status,
+            LifecycleStatus::Active,
+            "a resolved live socket must not rewrite lifecycle state"
+        );
+        socket_server.abort();
+        let _ = tokio::fs::remove_file(config::socket_path(&id).unwrap()).await;
+
+        let dead = inspect_session_read_only(&id).await.unwrap();
+        assert_eq!(dead.status, SESSION_STATUS_DEGRADED);
+        assert_ne!(dead.status, "crashed");
+        assert_ne!(dead.status, "stopped");
+        assert!(dead.pid.is_none());
+        assert!(config::session_path(&id).unwrap().exists());
+        assert!(config::session_lifecycle_path(&id).unwrap().exists());
         cleanup(&id).await;
     }
 

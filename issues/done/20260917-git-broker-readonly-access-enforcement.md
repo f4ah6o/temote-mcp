@@ -74,3 +74,8 @@ Focused tests:
 - `cargo test --bin temote-mcp --all-features --locked agent_git`: 26/26 PASS, 10 consecutive runs.
 
 NOT RUN: macOS host execution, live Codex/OpenCode end-to-end.
+
+## 2026-09-17 completion
+
+Repository-local acceptance is met and the repair round above passed independent review; the
+remaining NOT RUN rows above stay host/CI or live-matrix gates.

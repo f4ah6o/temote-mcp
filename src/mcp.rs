@@ -1012,7 +1012,7 @@ fn dev_tool_input_schema() -> Value {
 
 fn tools(public: bool, managed_sessions: bool) -> Value {
     let mut tools = json!([
-        {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness cannot be safely determined. Returns session IDs, working directories, start times, status, and permission mode (ask/agent/yolo).","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"session_list","title":"List Temote MCP sessions","description":"List active temote-mcp sessions and surface sessions whose liveness or workspace cannot be safely determined (status degraded). Returns session IDs, working directories, start times, status, and permission mode (ask/agent/yolo).","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"session_start","title":"Start a managed Temote MCP session","description":"Start a normal sandboxed session under a host-configured named root. Path must be <root-name> or <root-name>/<relative-path>; absolute paths and yolo creation are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"path":{"type":"string"},"session_id":{"type":"string"}},"required":["path"],"additionalProperties":false}},
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
@@ -7686,6 +7686,52 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::remove_file(socket).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_info_renders_a_missing_workspace_as_degraded() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let cwd = config::canonical_directory(&workspace).unwrap();
+        let id = format!("info-degraded-{}", Uuid::new_v4());
+        let session = config::Session {
+            id: id.clone(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        config::save_session(&session).await.unwrap();
+        let mut lifecycle = config::SessionLifecycle::starting(session.started_at, None);
+        lifecycle.status = config::LifecycleStatus::Stopped;
+        lifecycle.stopped_at = Some(config::unix_time());
+        config::save_session_lifecycle(&id, &lifecycle)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&cwd).unwrap();
+
+        let result = call_tool(
+            &json!({"name": "session_info", "arguments": {"session_id": id}}),
+            false,
+            None,
+        )
+        .await
+        .expect("a missing workspace must not fail session_info");
+        let rendered: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(rendered["session_id"], id);
+        assert_eq!(rendered["status"], "degraded");
+        assert_eq!(rendered["cwd"], serde_json::to_value(&cwd).unwrap());
+        assert!(rendered["server_contract_fingerprint"].is_string());
+        assert!(
+            config::session_path(&id).unwrap().exists(),
+            "session_info must not delete stale metadata"
+        );
+
+        let _ = tokio::fs::remove_file(config::session_path(&id).unwrap()).await;
+        let _ = tokio::fs::remove_file(config::session_lifecycle_path(&id).unwrap()).await;
     }
 
     #[test]
