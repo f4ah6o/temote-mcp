@@ -31,7 +31,7 @@ const MAX_JOB_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const COMPLETED_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_COMPLETED_JOBS_PER_SESSION: usize = 128;
 const MAX_COMPLETED_JOBS_TOTAL: usize = 1024;
-const MAX_GIT_ADD_PATHS: usize = 256;
+pub(crate) const MAX_GIT_ADD_PATHS: usize = 256;
 const MAX_PATH_ARGUMENT_BYTES: usize = 4096;
 const MAX_RPC_METHOD_BYTES: usize = 256;
 const MAX_RPC_ID_STRING_BYTES: usize = 256;
@@ -39,7 +39,7 @@ const MAX_MCP_TOOL_NAME_BYTES: usize = 256;
 const MAX_COMMAND_ARGUMENTS: usize = 256;
 const MAX_COMMAND_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_COMMAND_TOTAL_BYTES: usize = 128 * 1024;
-const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_GIT_TAG_NAME_BYTES: usize = 255;
 const MAX_GIT_BRANCH_NAME_BYTES: usize = 255;
 const MAX_GIT_BASE_REF_BYTES: usize = 512;
@@ -2548,25 +2548,10 @@ async fn git_commit(
         .get("message")
         .and_then(Value::as_str)
         .context("missing message")?;
-    anyhow::ensure!(!message.trim().is_empty(), "message must not be empty");
-    anyhow::ensure!(
-        message.len() <= MAX_GIT_COMMIT_MESSAGE_BYTES,
-        "message must be at most {MAX_GIT_COMMIT_MESSAGE_BYTES} bytes"
-    );
+    validate_git_commit_message(message)?;
     ensure_staged_paths_are_permitted(session, &cwd).await?;
 
-    let command = vec![
-        "git".to_owned(),
-        "-c".to_owned(),
-        "core.hooksPath=/dev/null".to_owned(),
-        "-c".to_owned(),
-        "commit.gpgSign=false".to_owned(),
-        "commit".to_owned(),
-        "--no-verify".to_owned(),
-        "--no-gpg-sign".to_owned(),
-        "-m".to_owned(),
-        message.to_owned(),
-    ];
+    let command = build_git_commit_command(message);
     run_git_and_report(session, cwd, command, "Create Git commit", activity).await
 }
 
@@ -3036,6 +3021,21 @@ pub(crate) fn build_git_switch_command(branch: &str) -> Vec<String> {
         "switch".to_owned(),
         "--no-guess".to_owned(),
         branch.to_owned(),
+    ]
+}
+
+pub(crate) fn build_git_commit_command(message: &str) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "commit.gpgSign=false".to_owned(),
+        "commit".to_owned(),
+        "--no-verify".to_owned(),
+        "--no-gpg-sign".to_owned(),
+        "-m".to_owned(),
+        message.to_owned(),
     ]
 }
 
@@ -3895,7 +3895,9 @@ fn resolve_git_add_path(session: &config::Session, path: &str) -> Result<String>
     Ok(validate_git_path(session, path)?.display().to_string())
 }
 
-fn validate_git_path(session: &config::Session, path: &str) -> Result<PathBuf> {
+/// Bounded, option-free Git path syntax shared by the structured `git_add`
+/// tool and the local-agent Git broker.
+pub(crate) fn validate_git_path_syntax(path: &str) -> Result<()> {
     validate_path_argument(path, "Git path")?;
     anyhow::ensure!(!path.is_empty(), "Git path must not be empty");
     anyhow::ensure!(
@@ -3906,6 +3908,22 @@ fn validate_git_path(session: &config::Session, path: &str) -> Result<PathBuf> {
         !path.starts_with(':') && !path.chars().any(|character| "*?[]".contains(character)),
         "Git pathspecs and glob patterns are not supported: {path:?}"
     );
+    Ok(())
+}
+
+/// Commit message bounds shared by the structured `git_commit` tool and the
+/// local-agent Git broker.
+pub(crate) fn validate_git_commit_message(message: &str) -> Result<()> {
+    anyhow::ensure!(!message.trim().is_empty(), "message must not be empty");
+    anyhow::ensure!(
+        message.len() <= MAX_GIT_COMMIT_MESSAGE_BYTES,
+        "message must be at most {MAX_GIT_COMMIT_MESSAGE_BYTES} bytes"
+    );
+    Ok(())
+}
+
+fn validate_git_path(session: &config::Session, path: &str) -> Result<PathBuf> {
+    validate_git_path_syntax(path)?;
 
     let path = PathBuf::from(path);
     match config::resolve_existing_path(session, &path) {
@@ -3922,21 +3940,23 @@ fn validate_git_path(session: &config::Session, path: &str) -> Result<PathBuf> {
     Ok(candidate)
 }
 
-async fn ensure_staged_paths_are_permitted(session: &config::Session, cwd: &Path) -> Result<()> {
-    let output = sandbox::run(
-        &[
-            "git".to_owned(),
-            "diff".to_owned(),
-            "--cached".to_owned(),
-            "--name-only".to_owned(),
-            "-z".to_owned(),
-            "--no-renames".to_owned(),
-        ],
-        cwd,
-        &session.permitted_directories,
-        None,
-    )
-    .await?;
+pub(crate) async fn ensure_staged_paths_are_permitted(
+    session: &config::Session,
+    cwd: &Path,
+) -> Result<()> {
+    let command = [
+        "git".to_owned(),
+        "diff".to_owned(),
+        "--cached".to_owned(),
+        "--name-only".to_owned(),
+        "-z".to_owned(),
+        "--no-renames".to_owned(),
+    ];
+    let output = if session.yolo() {
+        sandbox::run_unrestricted(&command, cwd, None).await?
+    } else {
+        sandbox::run(&command, cwd, &session.permitted_directories, None).await?
+    };
     anyhow::ensure!(
         output.status == 0,
         "cannot inspect the Git index: {}",

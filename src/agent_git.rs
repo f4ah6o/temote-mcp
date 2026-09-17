@@ -4,9 +4,9 @@
 //! private `bin/git` symlink. It forwards one bounded JSON request through a
 //! private request/response directory under the agent's own state root, and a
 //! broker runs for the duration of `local_agent::run`. The broker accepts only
-//! the two bounded branch-switch forms implemented here and validates every
-//! path and ref again on the parent side; everything else fails closed with a
-//! fixed message.
+//! the bounded `switch`, `add`, and `commit` forms implemented here and
+//! validates every path, message, and ref again on the parent side; everything
+//! else fails closed with a fixed message.
 //!
 //! A directory transport is used instead of a Unix-domain socket on purpose:
 //! the Linux local-agent seccomp profile denies `socket(AF_UNIX, ...)` so a
@@ -27,8 +27,7 @@ use crate::{config, mcp, sandbox};
 
 pub(crate) const BROKER_ENVIRONMENT_VARIABLE: &str = "TEMOTE_MCP_GIT_BROKER_DIR";
 pub(crate) const SHIM_EXIT_REJECTED: i32 = 128;
-pub(crate) const SHIM_REJECTION_MESSAGE: &str =
-    "git shim supports only: switch <existing-branch>, switch -c <new-branch>";
+pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>";
 const BROKER_SCHEMA: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = sandbox::MAX_COMMAND_OUTPUT_BYTES * 8;
@@ -49,13 +48,18 @@ struct GitShimRequest {
 enum ShimCommand {
     SwitchExisting,
     SwitchCreate,
+    Add,
+    Commit,
 }
 
 /// Classifies the raw shim argv.
 ///
-/// Only `switch <branch>` and `switch -c|--create <branch>` are accepted. Any
-/// global option, extra argument, option-like branch, or other subcommand is
-/// rejected here, before any Git process runs.
+/// Only `switch <branch>`, `switch -c|--create <branch>`, `add <path>...`, and
+/// `commit -m|--message <message>` are accepted. Any global option, extra
+/// argument, option-like path or branch, unsupported option, or other
+/// subcommand is rejected here, before any Git process runs. Filesystem
+/// containment for `add` paths is re-checked by the broker against the
+/// prepared session roots.
 fn classify_argv(argv: &[String]) -> Result<ShimCommand> {
     match argv {
         [command, branch] if command.as_str() == "switch" => {
@@ -68,6 +72,16 @@ fn classify_argv(argv: &[String]) -> Result<ShimCommand> {
             validate_shim_branch(branch)?;
             Ok(ShimCommand::SwitchCreate)
         }
+        [command, paths @ ..] if command.as_str() == "add" => {
+            validate_shim_add_paths(paths)?;
+            Ok(ShimCommand::Add)
+        }
+        [command, option, message]
+            if command.as_str() == "commit" && matches!(option.as_str(), "-m" | "--message") =>
+        {
+            mcp::validate_git_commit_message(message)?;
+            Ok(ShimCommand::Commit)
+        }
         _ => anyhow::bail!("unsupported Git shim command"),
     }
 }
@@ -76,6 +90,66 @@ fn validate_shim_branch(branch: &str) -> Result<()> {
     anyhow::ensure!(!branch.is_empty(), "branch must not be empty");
     anyhow::ensure!(!branch.starts_with('-'), "branch must not start with '-'");
     Ok(())
+}
+
+fn validate_shim_add_paths(paths: &[String]) -> Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "Git shim add requires at least one path");
+    anyhow::ensure!(
+        paths.len() <= mcp::MAX_GIT_ADD_PATHS,
+        "Git shim add supports at most {} paths",
+        mcp::MAX_GIT_ADD_PATHS
+    );
+    for path in paths {
+        validate_shim_add_path(path)?;
+    }
+    Ok(())
+}
+
+fn validate_shim_add_path(path: &str) -> Result<()> {
+    mcp::validate_git_path_syntax(path)?;
+    let candidate = Path::new(path);
+    anyhow::ensure!(
+        candidate.is_relative(),
+        "Git shim add path must be relative: {path:?}"
+    );
+    let mut components = candidate.components().peekable();
+    anyhow::ensure!(
+        components.peek().is_some(),
+        "Git shim add path must not be empty"
+    );
+    for component in components {
+        anyhow::ensure!(
+            matches!(component, std::path::Component::Normal(_)),
+            "Git shim add path must not contain '.' or '..' components: {path:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Re-checks one classified `add` path on the parent side. The path must
+/// resolve inside the prepared session roots; the returned string is the
+/// absolute path handed to Git, mirroring the structured `git_add` command
+/// shape.
+fn resolve_shim_add_path(roots: &[PathBuf], cwd: &Path, path: &str) -> Result<String> {
+    let candidate = cwd.join(path);
+    let resolved = if candidate.exists() || std::fs::symlink_metadata(&candidate).is_ok() {
+        std::fs::canonicalize(&candidate)
+            .with_context(|| format!("cannot resolve Git shim add path {}", candidate.display()))?
+    } else {
+        let parent = candidate
+            .parent()
+            .context("Git shim add path has no parent directory")?;
+        std::fs::canonicalize(parent)
+            .with_context(|| format!("cannot resolve Git shim add path {}", candidate.display()))?
+    };
+    anyhow::ensure!(
+        roots
+            .iter()
+            .any(|root| resolved == *root || resolved.starts_with(root)),
+        "Git shim add path is outside the permitted session roots: {}",
+        candidate.display()
+    );
+    Ok(candidate.to_string_lossy().into_owned())
 }
 
 fn validate_request_cwd(roots: &[PathBuf], cwd: &Path) -> Result<()> {
@@ -126,6 +200,24 @@ async fn handle_request(
             }
             let switch = mcp::build_git_switch_command(&request.argv[2]);
             run_git_command(session, &request.cwd, switch).await
+        }
+        ShimCommand::Add => {
+            let mut command = vec![
+                "git".to_owned(),
+                "-c".to_owned(),
+                "core.hooksPath=/dev/null".to_owned(),
+                "add".to_owned(),
+                "--".to_owned(),
+            ];
+            for path in &request.argv[1..] {
+                command.push(resolve_shim_add_path(roots, &request.cwd, path)?);
+            }
+            run_git_command(session, &request.cwd, command).await
+        }
+        ShimCommand::Commit => {
+            mcp::ensure_staged_paths_are_permitted(session, &request.cwd).await?;
+            let command = mcp::build_git_commit_command(&request.argv[2]);
+            run_git_command(session, &request.cwd, command).await
         }
     }
 }
@@ -455,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_accepts_only_the_two_bounded_switch_forms() {
+    fn classifier_accepts_only_the_bounded_switch_add_and_commit_forms() {
         assert_eq!(
             classify_argv(&argv(&["switch", "main"])).unwrap(),
             ShimCommand::SwitchExisting
@@ -471,6 +563,22 @@ mod tests {
         assert_eq!(
             classify_argv(&argv(&["switch", "--create", "feature/x"])).unwrap(),
             ShimCommand::SwitchCreate
+        );
+        assert_eq!(
+            classify_argv(&argv(&["add", "tracked.txt"])).unwrap(),
+            ShimCommand::Add
+        );
+        assert_eq!(
+            classify_argv(&argv(&["add", "src/main.rs", "docs/usage.md"])).unwrap(),
+            ShimCommand::Add
+        );
+        assert_eq!(
+            classify_argv(&argv(&["commit", "-m", "message"])).unwrap(),
+            ShimCommand::Commit
+        );
+        assert_eq!(
+            classify_argv(&argv(&["commit", "--message", "message"])).unwrap(),
+            ShimCommand::Commit
         );
     }
 
@@ -492,9 +600,43 @@ mod tests {
             vec!["branch"],
             vec!["checkout", "main"],
             vec!["worktree", "add", "feature"],
-            vec!["commit", "-m", "message"],
             vec!["-c", "core.hooksPath=/tmp"],
             vec!["--config-env", "x=y", "true"],
+        ] {
+            assert!(classify_argv(&argv(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn classifier_rejects_unbounded_add_and_commit_forms() {
+        let overly_long_message = "x".repeat(mcp::MAX_GIT_COMMIT_MESSAGE_BYTES + 1);
+        for values in [
+            vec!["add"],
+            vec!["add", "-A"],
+            vec!["add", "--all"],
+            vec!["add", "."],
+            vec!["add", ".."],
+            vec!["add", "/abs/path"],
+            vec!["add", "-p"],
+            vec!["add", "--", "path"],
+            vec!["add", "../outside.txt"],
+            vec!["add", "dir/../../outside.txt"],
+            vec!["add", "tracked.txt", "/abs/other.txt"],
+            vec!["add", "-tracked.txt"],
+            vec!["add", "tracked*txt"],
+            vec!["add", ":tracked.txt"],
+            vec!["commit"],
+            vec!["commit", "-m"],
+            vec!["commit", "--message"],
+            vec!["commit", "-a", "-m", "x"],
+            vec!["commit", "--amend", "-m", "x"],
+            vec!["commit", "-m", "x", "-m", "y"],
+            vec!["commit", "--no-verify", "-m", "x"],
+            vec!["commit", "-S", "-m", "x"],
+            vec!["commit", "-m", "x", "--", "path"],
+            vec!["commit", "-m", ""],
+            vec!["commit", "--message", "   "],
+            vec!["commit", "-m", overly_long_message.as_str()],
         ] {
             assert!(classify_argv(&argv(&values)).is_err(), "{values:?}");
         }
@@ -532,6 +674,115 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("unsupported Git shim command"));
+    }
+
+    #[tokio::test]
+    async fn broker_adds_and_commits_only_the_named_paths() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        run_host_git(&repository, &["init", "--quiet"]);
+        run_host_git(&repository, &["config", "user.name", "Temote Test"]);
+        run_host_git(
+            &repository,
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+        std::fs::write(repository.join("other.txt"), "base\n").unwrap();
+        run_host_git(&repository, &["add", "tracked.txt", "other.txt"]);
+        run_host_git(&repository, &["commit", "--quiet", "-m", "initial"]);
+        run_host_git(&repository, &["branch", "-M", "main"]);
+
+        std::fs::write(repository.join("tracked.txt"), "updated\n").unwrap();
+        std::fs::write(repository.join("other.txt"), "unrelated\n").unwrap();
+        std::fs::write(repository.join("untracked.txt"), "new\n").unwrap();
+
+        let roots = std::slice::from_ref(&repository);
+        let session = session(&repository);
+
+        let added = handle_request(
+            &session,
+            roots,
+            request(&repository, &["add", "tracked.txt"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(added.status, 0, "{}", added.stderr);
+
+        let committed = handle_request(
+            &session,
+            roots,
+            request(&repository, &["commit", "-m", "update tracked only"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed.status, 0, "{}", committed.stderr);
+
+        assert_eq!(
+            run_host_git(
+                &repository,
+                &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            ),
+            "tracked.txt"
+        );
+        assert_eq!(
+            run_host_git(&repository, &["show", "HEAD:tracked.txt"]),
+            "updated"
+        );
+
+        let status = run_host_git(&repository, &["status", "--porcelain"]);
+        let status_lines = status
+            .lines()
+            .map(|line| line.trim_start().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            status_lines.iter().any(|line| line == "M other.txt"),
+            "{status_lines:?}"
+        );
+        assert!(
+            status_lines.iter().any(|line| line == "?? untracked.txt"),
+            "{status_lines:?}"
+        );
+        assert!(
+            !status_lines
+                .iter()
+                .any(|line| line.ends_with(" tracked.txt")),
+            "{status_lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("other.txt")).unwrap(),
+            "unrelated\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("untracked.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broker_rejects_add_paths_that_resolve_outside_the_prepared_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        run_host_git(&repository, &["init", "--quiet"]);
+        let outside = tempfile::tempdir().unwrap();
+        let outside = std::fs::canonicalize(outside.path()).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), repository.join("link.txt"))
+            .unwrap();
+
+        let error = handle_request(
+            &session(&repository),
+            std::slice::from_ref(&repository),
+            request(&repository, &["add", "link.txt"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the permitted session roots"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
