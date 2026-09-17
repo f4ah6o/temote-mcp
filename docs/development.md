@@ -78,9 +78,16 @@ Use the bounded deterministic developer gate instead:
 just sandboxed-check
 ```
 
-It runs format/check/clippy, library tests except the host-only `sandbox::linux_tests`, focused binary state-machine/coverage tests, the no-default-features check, gateway tests, and the diff check. It then prints the coverage that is **NOT RUN** in this environment: nested Linux sandbox runtime acceptance, the full local Unix-socket/binary integration suite, and process-boundary E2E.
+It runs format/check/clippy, library tests except the host-only `sandbox::linux_tests`, focused binary state-machine/coverage tests, the pure session-GC policy tests, the no-default-features check, the gateway evaluator tests (`npm run test:sandbox`), and the diff check. It then prints the coverage that is **NOT RUN** in this environment:
 
-`just sandboxed-check` is not a substitute for `just check` or CI. GitHub CI runs on an unsandboxed runner, installs/configures the Linux bubblewrap/AppArmor runtime, executes `sandbox::linux_tests`, runs the complete all-target test suite (including local Unix-socket integration), and runs the ignored supervisor/process-boundary E2E. On a suitable Linux development host, the sandbox-specific acceptance can also be run explicitly with:
+- session-GC socket liveness acceptance (`session_control::tests::host_liveness_tests`);
+- nested Linux sandbox runtime acceptance (`sandbox::linux_tests`);
+- `local_agent` real-wiring tests that need a nested Linux sandbox;
+- deployment-preflight CLI subprocess tests that spawn a nested `node` process;
+- the full local Unix-socket/binary integration suite and process-boundary E2E;
+- macOS native Seatbelt tests.
+
+`just sandboxed-check` is not a substitute for `just check` or CI. GitHub CI runs on an unsandboxed runner, installs/configures the Linux bubblewrap/AppArmor runtime, executes `sandbox::linux_tests`, runs the complete all-target test suite (including local Unix-socket integration and the host-liveness session-GC tests), and runs the ignored supervisor/process-boundary E2E. On a suitable Linux development host, the sandbox-specific acceptance can also be run explicitly with:
 
 ```sh
 just linux-sandbox-acceptance

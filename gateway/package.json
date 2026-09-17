@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
+    "test:sandbox": "node --test test/protocol.test.mjs",
     "dev": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "deploy:preflight": "node scripts/deployment-preflight.mjs",

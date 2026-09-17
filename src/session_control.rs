@@ -6394,233 +6394,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_gc_dry_run_reports_reviewed_orphans_and_mutates_nothing() {
-        let _guard = gc_test_lock().await;
-        let fixture = gc_fixture().await;
-        let live_socket = spawn_active_session_socket(&fixture.live).await;
-        let mut owned = HashSet::new();
-        owned.insert(fixture.owned.clone());
-
-        let report = run_session_gc(&owned, true, 100).await.unwrap();
-
-        let candidates = gc_candidate_ids(&report.candidates);
-        assert!(candidates.contains(&fixture.missing_json));
-        assert!(candidates.contains(&fixture.missing_state));
-        for excluded in [
-            &fixture.owned,
-            &fixture.live,
-            &fixture.pair,
-            &fixture.fresh,
-            &fixture.symlinked,
-            &fixture.malformed,
-            &fixture.mismatched,
-        ] {
-            assert!(
-                !candidates.contains(excluded),
-                "{excluded} must not be eligible"
-            );
-        }
-        assert!(report.dry_run);
-        assert!(report.removed.is_empty());
-        assert!(report.skipped.is_empty());
-        assert!(!report.truncated);
-        assert!(report.missing_json_orphans >= 1);
-        assert!(report.missing_state_orphans >= 1);
-
-        // dry-run leaves every file in place
-        assert!(
-            config::session_lifecycle_path(&fixture.missing_json)
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            config::session_path(&fixture.missing_state)
-                .unwrap()
-                .exists()
-        );
-        assert!(!config::session_path(&fixture.owned).unwrap().exists());
-        assert!(
-            config::session_lifecycle_path(&fixture.owned)
-                .unwrap()
-                .exists()
-        );
-        live_socket.abort();
-        cleanup_gc_paths(&fixture.all_ids()).await;
-    }
-
-    #[tokio::test]
-    async fn session_gc_apply_removes_only_reviewed_orphans() {
-        let _guard = gc_test_lock().await;
-        let fixture = gc_fixture().await;
-        let live_socket = spawn_active_session_socket(&fixture.live).await;
-        let mut owned = HashSet::new();
-        owned.insert(fixture.owned.clone());
-
-        let report = run_session_gc(&owned, false, 100).await.unwrap();
-
-        assert!(!report.dry_run);
-        let removed = gc_candidate_ids(&report.removed);
-        assert!(removed.contains(&fixture.missing_json));
-        assert!(removed.contains(&fixture.missing_state));
-        assert!(report.skipped.is_empty());
-
-        assert!(
-            !config::session_lifecycle_path(&fixture.missing_json)
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            !config::session_path(&fixture.missing_state)
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            config::session_lifecycle_path(&fixture.owned)
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            config::session_lifecycle_path(&fixture.live)
-                .unwrap()
-                .exists()
-        );
-        assert!(config::session_path(&fixture.pair).unwrap().exists());
-        assert!(
-            config::session_lifecycle_path(&fixture.pair)
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            config::session_lifecycle_path(&fixture.fresh)
-                .unwrap()
-                .exists()
-        );
-        assert!(config::session_path(&fixture.symlinked).unwrap().exists());
-        assert!(
-            config::session_lifecycle_path(&fixture.malformed)
-                .unwrap()
-                .exists()
-        );
-        assert!(config::session_path(&fixture.mismatched).unwrap().exists());
-        live_socket.abort();
-        cleanup_gc_paths(&fixture.all_ids()).await;
-    }
-
-    #[tokio::test]
-    async fn session_gc_grace_period_boundary_is_respected() {
-        let _guard = gc_test_lock().await;
-        let inside = gc_test_id("gc-inside-grace");
-        let inside_state = write_gc_terminal_lifecycle(&inside, 20).await;
-        backdate_file(
-            &inside_state,
-            SESSION_ORPHAN_GRACE_SECONDS.saturating_sub(3600),
-        );
-
-        let outside = gc_test_id("gc-outside-grace");
-        let outside_state = write_gc_terminal_lifecycle(&outside, 20).await;
-        backdate_file(&outside_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
-
-        let report = run_session_gc(&HashSet::new(), true, 100).await.unwrap();
-        let candidates = gc_candidate_ids(&report.candidates);
-
-        assert!(!candidates.contains(&inside));
-        assert!(candidates.contains(&outside));
-        cleanup_gc_paths(&[inside, outside]).await;
-    }
-
-    #[tokio::test]
-    async fn session_gc_ordering_and_limit_are_deterministic() {
-        let _guard = gc_test_lock().await;
-        let mut expected = Vec::new();
-        let mut ids = Vec::new();
-        for age in [
-            7200_u64 + SESSION_ORPHAN_GRACE_SECONDS,
-            3600 + SESSION_ORPHAN_GRACE_SECONDS,
-            60 + SESSION_ORPHAN_GRACE_SECONDS,
-        ] {
-            let id = gc_test_id("gc-order");
-            let state = write_gc_terminal_lifecycle(&id, 20).await;
-            backdate_file(&state, age);
-            expected.push(id.clone());
-            ids.push(id);
-        }
-
-        let report = run_session_gc(&HashSet::new(), true, 2).await.unwrap();
-        assert!(report.truncated);
-        assert_eq!(report.candidates.len(), 2);
-        assert_eq!(
-            report
-                .candidates
-                .iter()
-                .map(|entry| &entry.session_id)
-                .collect::<Vec<_>>(),
-            vec![&expected[0], &expected[1]]
-        );
-        assert!(
-            report
-                .candidates
-                .iter()
-                .all(|entry| { entry.reason == SessionGcReason::MissingJson })
-        );
-
-        let repeat = run_session_gc(&HashSet::new(), true, 2).await.unwrap();
-        assert_eq!(
-            gc_candidate_ids(&repeat.candidates),
-            gc_candidate_ids(&report.candidates)
-        );
-
-        let limited = run_session_gc(&HashSet::new(), true, 1).await.unwrap();
-        assert_eq!(limited.candidates.first().unwrap().session_id, expected[0]);
-        cleanup_gc_paths(&ids).await;
-    }
-
-    #[tokio::test]
-    async fn session_gc_apply_skips_drift_and_concurrent_start() {
-        let _guard = gc_test_lock().await;
-        let drift = gc_test_id("gc-drift");
-        let drift_state = write_gc_terminal_lifecycle(&drift, 20).await;
-        backdate_file(&drift_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
-        let drifted_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
-        assert!(gc_candidate_ids(&drifted_plan.report.candidates).contains(&drift));
-
-        // drift: the orphan file is touched after the plan was built
-        backdate_file(&drift_state, SESSION_ORPHAN_GRACE_SECONDS + 60);
-        let (removed, skipped) = apply_session_gc_plan(&HashSet::new(), &drifted_plan)
-            .await
-            .unwrap();
-        assert!(!gc_candidate_ids(&removed).contains(&drift));
-        assert!(gc_candidate_ids(&skipped).contains(&drift));
-        assert!(drift_state.exists());
-
-        // drift: the counterpart appears after the plan was built
-        let counterpart = gc_test_id("gc-counterpart");
-        let counterpart_state = write_gc_terminal_lifecycle(&counterpart, 20).await;
-        backdate_file(&counterpart_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
-        let counterpart_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
-        assert!(gc_candidate_ids(&counterpart_plan.report.candidates).contains(&counterpart));
-        write_gc_metadata(&counterpart).await;
-        let (removed, skipped) = apply_session_gc_plan(&HashSet::new(), &counterpart_plan)
-            .await
-            .unwrap();
-        assert!(!gc_candidate_ids(&removed).contains(&counterpart));
-        assert!(gc_candidate_ids(&skipped).contains(&counterpart));
-        assert!(counterpart_state.exists());
-
-        // concurrent start: the session became supervisor-owned after the plan
-        let starting = gc_test_id("gc-starting");
-        let starting_state = write_gc_terminal_lifecycle(&starting, 20).await;
-        backdate_file(&starting_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
-        let starting_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
-        assert!(gc_candidate_ids(&starting_plan.report.candidates).contains(&starting));
-        let owned = HashSet::from([starting.clone()]);
-        let (removed, skipped) = apply_session_gc_plan(&owned, &starting_plan).await.unwrap();
-        assert!(!gc_candidate_ids(&removed).contains(&starting));
-        assert!(gc_candidate_ids(&skipped).contains(&starting));
-        assert!(starting_state.exists());
-        cleanup_gc_paths(&[drift, counterpart, starting]).await;
-    }
-
-    #[tokio::test]
     async fn session_gc_metadata_diagnostics_explain_orphan_classes() {
         let _guard = gc_test_lock().await;
         let missing_json = gc_test_id("gc-diag-missing-json");
@@ -6647,5 +6420,242 @@ mod tests {
         assert!(too_small.is_err());
         let too_large = runtime.block_on(run_session_gc(&HashSet::new(), true, 1001));
         assert!(too_large.is_err());
+    }
+
+    /// Host/CI-only session-GC liveness acceptance.
+    ///
+    /// These tests bind and probe Unix-domain sockets (`session_is_active`), which
+    /// the local-agent sandbox denies. They are deliberately separated from the
+    /// pure policy tests so `just sandboxed-check` can skip the whole module and
+    /// report it as NOT RUN instead of faking a PASS.
+    mod host_liveness_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn session_gc_dry_run_reports_reviewed_orphans_and_mutates_nothing() {
+            let _guard = gc_test_lock().await;
+            let fixture = gc_fixture().await;
+            let live_socket = spawn_active_session_socket(&fixture.live).await;
+            let mut owned = HashSet::new();
+            owned.insert(fixture.owned.clone());
+
+            let report = run_session_gc(&owned, true, 100).await.unwrap();
+
+            let candidates = gc_candidate_ids(&report.candidates);
+            assert!(candidates.contains(&fixture.missing_json));
+            assert!(candidates.contains(&fixture.missing_state));
+            for excluded in [
+                &fixture.owned,
+                &fixture.live,
+                &fixture.pair,
+                &fixture.fresh,
+                &fixture.symlinked,
+                &fixture.malformed,
+                &fixture.mismatched,
+            ] {
+                assert!(
+                    !candidates.contains(excluded),
+                    "{excluded} must not be eligible"
+                );
+            }
+            assert!(report.dry_run);
+            assert!(report.removed.is_empty());
+            assert!(report.skipped.is_empty());
+            assert!(!report.truncated);
+            assert!(report.missing_json_orphans >= 1);
+            assert!(report.missing_state_orphans >= 1);
+
+            // dry-run leaves every file in place
+            assert!(
+                config::session_lifecycle_path(&fixture.missing_json)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(
+                config::session_path(&fixture.missing_state)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(!config::session_path(&fixture.owned).unwrap().exists());
+            assert!(
+                config::session_lifecycle_path(&fixture.owned)
+                    .unwrap()
+                    .exists()
+            );
+            live_socket.abort();
+            cleanup_gc_paths(&fixture.all_ids()).await;
+        }
+
+        #[tokio::test]
+        async fn session_gc_apply_removes_only_reviewed_orphans() {
+            let _guard = gc_test_lock().await;
+            let fixture = gc_fixture().await;
+            let live_socket = spawn_active_session_socket(&fixture.live).await;
+            let mut owned = HashSet::new();
+            owned.insert(fixture.owned.clone());
+
+            let report = run_session_gc(&owned, false, 100).await.unwrap();
+
+            assert!(!report.dry_run);
+            let removed = gc_candidate_ids(&report.removed);
+            assert!(removed.contains(&fixture.missing_json));
+            assert!(removed.contains(&fixture.missing_state));
+            assert!(report.skipped.is_empty());
+
+            assert!(
+                !config::session_lifecycle_path(&fixture.missing_json)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(
+                !config::session_path(&fixture.missing_state)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(
+                config::session_lifecycle_path(&fixture.owned)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(
+                config::session_lifecycle_path(&fixture.live)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(config::session_path(&fixture.pair).unwrap().exists());
+            assert!(
+                config::session_lifecycle_path(&fixture.pair)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(
+                config::session_lifecycle_path(&fixture.fresh)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(config::session_path(&fixture.symlinked).unwrap().exists());
+            assert!(
+                config::session_lifecycle_path(&fixture.malformed)
+                    .unwrap()
+                    .exists()
+            );
+            assert!(config::session_path(&fixture.mismatched).unwrap().exists());
+            live_socket.abort();
+            cleanup_gc_paths(&fixture.all_ids()).await;
+        }
+
+        #[tokio::test]
+        async fn session_gc_grace_period_boundary_is_respected() {
+            let _guard = gc_test_lock().await;
+            let inside = gc_test_id("gc-inside-grace");
+            let inside_state = write_gc_terminal_lifecycle(&inside, 20).await;
+            backdate_file(
+                &inside_state,
+                SESSION_ORPHAN_GRACE_SECONDS.saturating_sub(3600),
+            );
+
+            let outside = gc_test_id("gc-outside-grace");
+            let outside_state = write_gc_terminal_lifecycle(&outside, 20).await;
+            backdate_file(&outside_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+
+            let report = run_session_gc(&HashSet::new(), true, 100).await.unwrap();
+            let candidates = gc_candidate_ids(&report.candidates);
+
+            assert!(!candidates.contains(&inside));
+            assert!(candidates.contains(&outside));
+            cleanup_gc_paths(&[inside, outside]).await;
+        }
+
+        #[tokio::test]
+        async fn session_gc_ordering_and_limit_are_deterministic() {
+            let _guard = gc_test_lock().await;
+            let mut expected = Vec::new();
+            let mut ids = Vec::new();
+            for age in [
+                7200_u64 + SESSION_ORPHAN_GRACE_SECONDS,
+                3600 + SESSION_ORPHAN_GRACE_SECONDS,
+                60 + SESSION_ORPHAN_GRACE_SECONDS,
+            ] {
+                let id = gc_test_id("gc-order");
+                let state = write_gc_terminal_lifecycle(&id, 20).await;
+                backdate_file(&state, age);
+                expected.push(id.clone());
+                ids.push(id);
+            }
+
+            let report = run_session_gc(&HashSet::new(), true, 2).await.unwrap();
+            assert!(report.truncated);
+            assert_eq!(report.candidates.len(), 2);
+            assert_eq!(
+                report
+                    .candidates
+                    .iter()
+                    .map(|entry| &entry.session_id)
+                    .collect::<Vec<_>>(),
+                vec![&expected[0], &expected[1]]
+            );
+            assert!(
+                report
+                    .candidates
+                    .iter()
+                    .all(|entry| { entry.reason == SessionGcReason::MissingJson })
+            );
+
+            let repeat = run_session_gc(&HashSet::new(), true, 2).await.unwrap();
+            assert_eq!(
+                gc_candidate_ids(&repeat.candidates),
+                gc_candidate_ids(&report.candidates)
+            );
+
+            let limited = run_session_gc(&HashSet::new(), true, 1).await.unwrap();
+            assert_eq!(limited.candidates.first().unwrap().session_id, expected[0]);
+            cleanup_gc_paths(&ids).await;
+        }
+
+        #[tokio::test]
+        async fn session_gc_apply_skips_drift_and_concurrent_start() {
+            let _guard = gc_test_lock().await;
+            let drift = gc_test_id("gc-drift");
+            let drift_state = write_gc_terminal_lifecycle(&drift, 20).await;
+            backdate_file(&drift_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+            let drifted_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
+            assert!(gc_candidate_ids(&drifted_plan.report.candidates).contains(&drift));
+
+            // drift: the orphan file is touched after the plan was built
+            backdate_file(&drift_state, SESSION_ORPHAN_GRACE_SECONDS + 60);
+            let (removed, skipped) = apply_session_gc_plan(&HashSet::new(), &drifted_plan)
+                .await
+                .unwrap();
+            assert!(!gc_candidate_ids(&removed).contains(&drift));
+            assert!(gc_candidate_ids(&skipped).contains(&drift));
+            assert!(drift_state.exists());
+
+            // drift: the counterpart appears after the plan was built
+            let counterpart = gc_test_id("gc-counterpart");
+            let counterpart_state = write_gc_terminal_lifecycle(&counterpart, 20).await;
+            backdate_file(&counterpart_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+            let counterpart_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
+            assert!(gc_candidate_ids(&counterpart_plan.report.candidates).contains(&counterpart));
+            write_gc_metadata(&counterpart).await;
+            let (removed, skipped) = apply_session_gc_plan(&HashSet::new(), &counterpart_plan)
+                .await
+                .unwrap();
+            assert!(!gc_candidate_ids(&removed).contains(&counterpart));
+            assert!(gc_candidate_ids(&skipped).contains(&counterpart));
+            assert!(counterpart_state.exists());
+
+            // concurrent start: the session became supervisor-owned after the plan
+            let starting = gc_test_id("gc-starting");
+            let starting_state = write_gc_terminal_lifecycle(&starting, 20).await;
+            backdate_file(&starting_state, SESSION_ORPHAN_GRACE_SECONDS + 3600);
+            let starting_plan = build_session_gc_plan(&HashSet::new(), 100).await.unwrap();
+            assert!(gc_candidate_ids(&starting_plan.report.candidates).contains(&starting));
+            let owned = HashSet::from([starting.clone()]);
+            let (removed, skipped) = apply_session_gc_plan(&owned, &starting_plan).await.unwrap();
+            assert!(!gc_candidate_ids(&removed).contains(&starting));
+            assert!(gc_candidate_ids(&skipped).contains(&starting));
+            assert!(starting_state.exists());
+            cleanup_gc_paths(&[drift, counterpart, starting]).await;
+        }
     }
 }

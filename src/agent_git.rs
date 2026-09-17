@@ -1,20 +1,31 @@
 //! Local-agent `git` shim and the parent-side Git broker.
 //!
 //! The shim is the temote-mcp binary itself, exposed to a local agent as a
-//! private `bin/git` symlink. It forwards one bounded JSON request through a
-//! private request/response directory under the agent's own state root, and a
-//! broker runs for the duration of `local_agent::run`. The broker accepts only
-//! the bounded `switch`, `add`, and `commit` forms implemented here and
-//! validates every path, message, and ref again on the parent side; everything
-//! else fails closed with a fixed message.
+//! private `bin/git` symlink. Mutating commands (`switch`, `add`, `commit`) are
+//! forwarded as one bounded JSON request through a private request/response
+//! directory under the agent's own state root, and a broker runs for the
+//! duration of `local_agent::run`. The broker revalidates every path, message,
+//! and ref against the selected workspace on the parent side, enforces the
+//! per-run `Access`, and fails closed with a fixed message for everything else.
+//!
+//! Bounded read-only commands (`status`, `diff`, `log`, `show`, `rev-parse`,
+//! `ls-files`) run the trusted Git executable inside the same agent sandbox and
+//! never enter the mutation broker.
 //!
 //! A directory transport is used instead of a Unix-domain socket on purpose:
 //! the Linux local-agent seccomp profile denies `socket(AF_UNIX, ...)` so a
 //! socket would be unreachable, and macOS `sun_path` is too short for the
 //! private state root. File operations are already part of the agent profile.
+//!
+//! The queue directories are writable by the agent, so the broker treats every
+//! entry as untrusted: directory handles are opened with `O_NOFOLLOW` and kept
+//! for the broker lifetime, entries are opened with `openat(O_NOFOLLOW)` and
+//! checked as bounded regular files, responses are published by atomic rename,
+//! and enumeration/fan-out are capped.
 
-use std::io::Write;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,18 +34,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
+use crate::local_agent::Access;
 use crate::{config, mcp, sandbox};
 
 pub(crate) const BROKER_ENVIRONMENT_VARIABLE: &str = "TEMOTE_MCP_GIT_BROKER_DIR";
+/// Parent-owned response queue exposed to the sandbox read-only. The agent can
+/// read broker outcomes but can never author them.
+pub(crate) const BROKER_RESPONSES_ENVIRONMENT_VARIABLE: &str =
+    "TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR";
+pub(crate) const GIT_EXECUTABLE_ENVIRONMENT_VARIABLE: &str = "TEMOTE_MCP_GIT_EXECUTABLE";
 pub(crate) const SHIM_EXIT_REJECTED: i32 = 128;
-pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>";
+pub(crate) const SHIM_EXIT_INDETERMINATE: i32 = 70;
+pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, and the read-only commands status, diff, log, show, rev-parse, ls-files";
+pub(crate) const SHIM_INDETERMINATE_MESSAGE: &str = "git shim could not confirm the operation result; the operation may still be running; inspect the repository before retrying";
 const BROKER_SCHEMA: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = sandbox::MAX_COMMAND_OUTPUT_BYTES * 8;
 const REQUESTS_DIRECTORY: &str = "requests";
-const RESPONSES_DIRECTORY: &str = "responses";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_QUEUE_ENTRIES_SCANNED: usize = 4096;
+const MAX_REQUESTS_PER_TICK: usize = 16;
+const MAX_READ_ONLY_PATHS: usize = 256;
+const MAX_READ_ONLY_REVISION_BYTES: usize = 128;
+const MAX_READ_ONLY_COUNT: u64 = 10_000;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,14 +75,28 @@ enum ShimCommand {
     Commit,
 }
 
-/// Classifies the raw shim argv.
+#[derive(Debug, Eq, PartialEq)]
+enum ShimOutcome {
+    Completed(ShimResult),
+    Rejected,
+    Indeterminate,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ShimResult {
+    status: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Classifies the raw shim argv for the mutation broker.
 ///
 /// Only `switch <branch>`, `switch -c|--create <branch>`, `add <path>...`, and
 /// `commit -m|--message <message>` are accepted. Any global option, extra
 /// argument, option-like path or branch, unsupported option, or other
 /// subcommand is rejected here, before any Git process runs. Filesystem
 /// containment for `add` paths is re-checked by the broker against the
-/// prepared session roots.
+/// selected workspace.
 fn classify_argv(argv: &[String]) -> Result<ShimCommand> {
     match argv {
         [command, branch] if command.as_str() == "switch" => {
@@ -126,11 +163,317 @@ fn validate_shim_add_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ReadOnlySpec {
+    flags: &'static [&'static str],
+    revisions: usize,
+    paths: bool,
+    counts: bool,
+}
+
+const READ_ONLY_STATUS: ReadOnlySpec = ReadOnlySpec {
+    flags: &[
+        "--porcelain",
+        "--porcelain=v1",
+        "--porcelain=v2",
+        "--short",
+        "--branch",
+        "--long",
+        "--no-color",
+        "--color=never",
+        "--untracked-files=no",
+        "--untracked-files=normal",
+        "--untracked-files=all",
+    ],
+    revisions: 0,
+    paths: false,
+    counts: false,
+};
+
+const READ_ONLY_DIFF: ReadOnlySpec = ReadOnlySpec {
+    flags: &[
+        "--stat",
+        "--shortstat",
+        "--name-only",
+        "--name-status",
+        "--numstat",
+        "--cached",
+        "--staged",
+        "--no-color",
+        "--color=never",
+        "--no-renames",
+        "--no-ext-diff",
+    ],
+    revisions: 2,
+    paths: true,
+    counts: false,
+};
+
+const READ_ONLY_LOG: ReadOnlySpec = ReadOnlySpec {
+    flags: &[
+        "--oneline",
+        "--stat",
+        "--shortstat",
+        "--name-only",
+        "--name-status",
+        "--decorate",
+        "--no-decorate",
+        "--graph",
+        "--all",
+        "--first-parent",
+        "--no-color",
+        "--color=never",
+        "--no-renames",
+        "--no-ext-diff",
+    ],
+    revisions: 2,
+    paths: true,
+    counts: true,
+};
+
+const READ_ONLY_SHOW: ReadOnlySpec = ReadOnlySpec {
+    flags: &[
+        "--stat",
+        "--shortstat",
+        "--name-only",
+        "--name-status",
+        "--oneline",
+        "--no-color",
+        "--color=never",
+        "--no-renames",
+        "--no-ext-diff",
+    ],
+    revisions: 1,
+    paths: true,
+    counts: false,
+};
+
+const READ_ONLY_REV_PARSE: ReadOnlySpec = ReadOnlySpec {
+    flags: &[
+        "--verify",
+        "--short",
+        "--abbrev-ref",
+        "--symbolic",
+        "--show-toplevel",
+        "--show-prefix",
+        "--is-inside-work-tree",
+        "--is-bare-repository",
+        "--git-dir",
+        "--absolute-git-dir",
+        "--show-cdup",
+        "--end-of-options",
+        "--no-color",
+        "--color=never",
+    ],
+    revisions: 1,
+    paths: false,
+    counts: false,
+};
+
+const READ_ONLY_LS_FILES: ReadOnlySpec = ReadOnlySpec {
+    flags: &[
+        "--cached",
+        "--deleted",
+        "--modified",
+        "--others",
+        "--ignored",
+        "--stage",
+        "--unmerged",
+        "--exclude-standard",
+        "--no-empty-directory",
+        "--directory",
+        "--error-unmatch",
+        "--full-name",
+        "--no-color",
+        "--color=never",
+    ],
+    revisions: 0,
+    paths: true,
+    counts: false,
+};
+
+fn read_only_spec(subcommand: &str) -> Result<ReadOnlySpec> {
+    match subcommand {
+        "status" => Ok(READ_ONLY_STATUS),
+        "diff" => Ok(READ_ONLY_DIFF),
+        "log" => Ok(READ_ONLY_LOG),
+        "show" => Ok(READ_ONLY_SHOW),
+        "rev-parse" => Ok(READ_ONLY_REV_PARSE),
+        "ls-files" => Ok(READ_ONLY_LS_FILES),
+        _ => anyhow::bail!("unsupported read-only Git shim command"),
+    }
+}
+
+/// Validates one bounded read-only Git argv.
+///
+/// Only the six documented subcommands with the fixed flag sets above are
+/// accepted. Revisions are restricted to plain local revision syntax, option
+/// values must be bounded decimal counts, and paths after `--` must be
+/// repository-relative without `.`/`..`, globs, or pathspec magic. `-c`,
+/// `--config*`, `--git-dir`, `--work-tree`, `--exec-path`, `--output`,
+/// `--ext-diff`, aliases, hooks, and every other shape are rejected.
+fn validate_read_only_git_argv(argv: &[String]) -> Result<()> {
+    let (subcommand, args) = argv
+        .split_first()
+        .context("Git shim read-only command is missing")?;
+    let spec = read_only_spec(subcommand)?;
+    let mut index = 0usize;
+    let mut revisions = 0usize;
+    let mut paths = 0usize;
+    let mut after_separator = false;
+    while index < args.len() {
+        let token = args[index].as_str();
+        if after_separator {
+            validate_read_only_path(token)?;
+            paths += 1;
+            anyhow::ensure!(
+                paths <= MAX_READ_ONLY_PATHS,
+                "Git shim read-only path list exceeds the limit"
+            );
+            index += 1;
+            continue;
+        }
+        if token == "--" && spec.paths {
+            after_separator = true;
+            index += 1;
+            continue;
+        }
+        if token == "-n" && spec.counts {
+            let value = args
+                .get(index + 1)
+                .context("Git shim -n requires a numeric count")?;
+            validate_read_only_count(value)?;
+            index += 2;
+            continue;
+        }
+        if spec.counts
+            && let Some(value) = token.strip_prefix("--max-count=")
+        {
+            validate_read_only_count(value)?;
+            index += 1;
+            continue;
+        }
+        if spec.flags.contains(&token) {
+            index += 1;
+            continue;
+        }
+        if !token.starts_with('-') && revisions < spec.revisions {
+            validate_read_only_revision(token)?;
+            revisions += 1;
+            index += 1;
+            continue;
+        }
+        anyhow::bail!("unsupported read-only Git shim argument");
+    }
+    Ok(())
+}
+
+fn validate_read_only_count(value: &str) -> Result<()> {
+    let count: u64 = value
+        .parse()
+        .context("Git shim count must be a decimal number")?;
+    anyhow::ensure!(
+        (1..=MAX_READ_ONLY_COUNT).contains(&count),
+        "Git shim count is outside the supported range"
+    );
+    Ok(())
+}
+
+fn validate_read_only_revision(revision: &str) -> Result<()> {
+    anyhow::ensure!(!revision.is_empty(), "Git revision must not be empty");
+    anyhow::ensure!(
+        revision.len() <= MAX_READ_ONLY_REVISION_BYTES,
+        "Git revision exceeds the size limit"
+    );
+    anyhow::ensure!(
+        !revision.starts_with('-'),
+        "Git revision must not start with '-'"
+    );
+    anyhow::ensure!(
+        revision
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '.' | '_' | '/' | '~' | '^' | '-' | '{' | '}' | '@'
+                )),
+        "Git revision contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn validate_read_only_path(path: &str) -> Result<()> {
+    validate_shim_add_path(path).context("unsupported read-only Git path")
+}
+
+/// Runs one validated read-only Git command inside the current sandbox with a
+/// sanitized environment. The trusted executable is selected by the parent;
+/// no agent-provided environment can redirect Git state or execution.
+fn run_read_only_git(git: &Path, argv: &[String], cwd: &Path) -> i32 {
+    let mut command = Command::new(git);
+    command
+        .arg("--no-pager")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .args(argv)
+        .current_dir(cwd);
+    for (key, _) in std::env::vars_os() {
+        if let Some(name) = key.to_str()
+            && (name.starts_with("GIT_") || matches!(name, "PAGER" | "GIT_PAGER"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat");
+    match command.status() {
+        Ok(status) => status.code().unwrap_or(SHIM_EXIT_REJECTED),
+        Err(_) => reject(),
+    }
+}
+
+/// Resolves the trusted Git executable from a pre-shim `PATH`, skipping the
+/// private shim itself so read-only commands can never recurse.
+pub(crate) fn resolve_trusted_git(path: Option<&str>, shim_target: &Path) -> Option<PathBuf> {
+    let path = path?;
+    for entry in std::env::split_paths(path) {
+        let candidate = entry.join("git");
+        let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        let Ok(canonical) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if canonical == shim_target {
+            continue;
+        }
+        return Some(canonical);
+    }
+    None
+}
+
 /// Re-checks one classified `add` path on the parent side. The path must
-/// resolve inside the prepared session roots; the returned string is the
+/// resolve inside the selected workspace; the returned string is the
 /// absolute path handed to Git, mirroring the structured `git_add` command
 /// shape.
-fn resolve_shim_add_path(roots: &[PathBuf], cwd: &Path, path: &str) -> Result<String> {
+fn resolve_shim_add_path(workspace: &Path, cwd: &Path, path: &str) -> Result<String> {
     let candidate = cwd.join(path);
     let resolved = if candidate.exists() || std::fs::symlink_metadata(&candidate).is_ok() {
         std::fs::canonicalize(&candidate)
@@ -143,63 +486,129 @@ fn resolve_shim_add_path(roots: &[PathBuf], cwd: &Path, path: &str) -> Result<St
             .with_context(|| format!("cannot resolve Git shim add path {}", candidate.display()))?
     };
     anyhow::ensure!(
-        roots
-            .iter()
-            .any(|root| resolved == *root || resolved.starts_with(root)),
-        "Git shim add path is outside the permitted session roots: {}",
+        resolved == workspace || resolved.starts_with(workspace),
+        "Git shim add path is outside the selected workspace: {}",
         candidate.display()
     );
     Ok(candidate.to_string_lossy().into_owned())
 }
 
-fn validate_request_cwd(roots: &[PathBuf], cwd: &Path) -> Result<()> {
-    anyhow::ensure!(!roots.is_empty(), "Git broker has no permitted roots");
-    anyhow::ensure!(cwd.is_absolute(), "Git broker cwd must be absolute");
-    let canonical = std::fs::canonicalize(cwd)
-        .with_context(|| format!("cannot resolve Git broker cwd {}", cwd.display()))?;
-    anyhow::ensure!(
-        canonical.is_dir(),
-        "Git broker cwd is not a directory: {}",
-        canonical.display()
-    );
-    anyhow::ensure!(
-        roots
-            .iter()
-            .any(|root| canonical == *root || canonical.starts_with(root)),
-        "Git broker cwd is outside the permitted session roots: {}",
-        canonical.display()
-    );
-    Ok(())
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryIdentity {
+    worktree_root: PathBuf,
+    metadata_roots: Vec<PathBuf>,
 }
 
-async fn handle_request(
-    session: &config::Session,
-    roots: &[PathBuf],
-    request: GitShimRequest,
-) -> Result<sandbox::Output> {
+/// The fixed per-run Git operation scope: the canonical selected workspace and,
+/// when that workspace is itself a Git worktree root, its pinned repository
+/// identity. Request content never changes this scope.
+#[derive(Clone, Debug)]
+struct BrokerScope {
+    workspace: PathBuf,
+    repository: Option<RepositoryIdentity>,
+}
+
+impl BrokerScope {
+    fn for_workspace(workspace: &Path) -> Result<Self> {
+        let workspace = std::fs::canonicalize(workspace).with_context(|| {
+            format!(
+                "cannot resolve Git broker workspace {}",
+                workspace.display()
+            )
+        })?;
+        anyhow::ensure!(
+            workspace.is_dir(),
+            "Git broker workspace is not a directory: {}",
+            workspace.display()
+        );
+        let repository = match (
+            sandbox::git_worktree_root(&workspace),
+            sandbox::git_metadata_roots(&workspace),
+        ) {
+            (Ok(worktree_root), Ok(metadata_roots)) if worktree_root == workspace => {
+                Some(RepositoryIdentity {
+                    worktree_root,
+                    metadata_roots,
+                })
+            }
+            _ => None,
+        };
+        Ok(Self {
+            workspace,
+            repository,
+        })
+    }
+
+    /// Resolves a request `cwd` against the fixed scope. The canonical target
+    /// must be the selected workspace or a descendant, and its re-resolved
+    /// repository identity must equal the identity captured at broker start.
+    /// A different workspace, a symlinked target, a nested repository, or a
+    /// swapped linked worktree fails closed.
+    fn resolve_cwd(&self, requested: &Path) -> Result<PathBuf> {
+        anyhow::ensure!(requested.is_absolute(), "Git broker cwd must be absolute");
+        let canonical = std::fs::canonicalize(requested)
+            .with_context(|| format!("cannot resolve Git broker cwd {}", requested.display()))?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "Git broker cwd is not a directory: {}",
+            canonical.display()
+        );
+        anyhow::ensure!(
+            canonical == self.workspace || canonical.starts_with(&self.workspace),
+            "Git broker cwd is outside the selected workspace: {}",
+            canonical.display()
+        );
+        let identity = self
+            .repository
+            .as_ref()
+            .context("the selected workspace is not a Git worktree root")?;
+        anyhow::ensure!(
+            sandbox::git_worktree_root(&canonical)? == identity.worktree_root,
+            "Git broker cwd belongs to a different repository than the selected workspace"
+        );
+        anyhow::ensure!(
+            sandbox::git_metadata_roots(&canonical)? == identity.metadata_roots,
+            "Git broker cwd resolves to different Git metadata than the selected workspace"
+        );
+        Ok(canonical)
+    }
+}
+
+struct BrokerState {
+    session: config::Session,
+    access: Access,
+    scope: BrokerScope,
+}
+
+async fn handle_request(state: &BrokerState, request: GitShimRequest) -> Result<sandbox::Output> {
     anyhow::ensure!(
         request.schema == BROKER_SCHEMA,
         "unsupported Git broker schema"
     );
-    validate_request_cwd(roots, &request.cwd)?;
+    anyhow::ensure!(
+        state.access == Access::WorkspaceWrite,
+        "Git broker mutations require workspace_write access"
+    );
+    let cwd = state.scope.resolve_cwd(&request.cwd)?;
+    let workspace = state.scope.workspace.clone();
     match classify_argv(&request.argv)? {
         ShimCommand::SwitchExisting => {
-            mcp::validate_git_branch_name(session, &request.cwd, &request.argv[1]).await?;
-            mcp::ensure_local_branch_exists(session, &request.cwd, &request.argv[1]).await?;
+            mcp::validate_git_branch_name(&state.session, &cwd, &request.argv[1]).await?;
+            mcp::ensure_local_branch_exists(&state.session, &cwd, &request.argv[1]).await?;
             let command = mcp::build_git_switch_command(&request.argv[1]);
-            run_git_command(session, &request.cwd, command).await
+            run_git_command(state, &workspace, command).await
         }
         ShimCommand::SwitchCreate => {
-            mcp::validate_git_branch_name(session, &request.cwd, &request.argv[2]).await?;
-            mcp::ensure_local_branch_absent(session, &request.cwd, &request.argv[2]).await?;
-            let base = mcp::resolve_git_base_commit(session, &request.cwd, "HEAD").await?;
+            mcp::validate_git_branch_name(&state.session, &cwd, &request.argv[2]).await?;
+            mcp::ensure_local_branch_absent(&state.session, &cwd, &request.argv[2]).await?;
+            let base = mcp::resolve_git_base_commit(&state.session, &cwd, "HEAD").await?;
             let create = mcp::build_git_branch_create_command(&request.argv[2], &base);
-            let created = run_git_command(session, &request.cwd, create).await?;
+            let created = run_git_command(state, &workspace, create).await?;
             if created.status != 0 {
                 return Ok(created);
             }
             let switch = mcp::build_git_switch_command(&request.argv[2]);
-            run_git_command(session, &request.cwd, switch).await
+            run_git_command(state, &workspace, switch).await
         }
         ShimCommand::Add => {
             let mut command = vec![
@@ -210,132 +619,280 @@ async fn handle_request(
                 "--".to_owned(),
             ];
             for path in &request.argv[1..] {
-                command.push(resolve_shim_add_path(roots, &request.cwd, path)?);
+                command.push(resolve_shim_add_path(&workspace, &cwd, path)?);
             }
-            run_git_command(session, &request.cwd, command).await
+            run_git_command(state, &workspace, command).await
         }
         ShimCommand::Commit => {
-            mcp::ensure_staged_paths_are_permitted(session, &request.cwd).await?;
+            let narrowed = narrowed_session(&state.session, &workspace);
+            mcp::ensure_staged_paths_are_permitted(&narrowed, &workspace).await?;
             let command = mcp::build_git_commit_command(&request.argv[2]);
-            run_git_command(session, &request.cwd, command).await
+            run_git_command(state, &workspace, command).await
         }
     }
+}
+
+fn narrowed_session(session: &config::Session, workspace: &Path) -> config::Session {
+    let mut narrowed = session.clone();
+    narrowed.cwd = workspace.to_owned();
+    narrowed.permitted_directories = vec![workspace.to_owned()];
+    narrowed
 }
 
 async fn run_git_command(
-    session: &config::Session,
+    state: &BrokerState,
     cwd: &Path,
     command: Vec<String>,
 ) -> Result<sandbox::Output> {
-    if session.yolo() {
-        sandbox::run_unrestricted(&command, cwd, None).await
-    } else {
-        let git_roots = sandbox::git_metadata_roots(cwd)?;
-        sandbox::run_git(
-            &command,
-            cwd,
-            &session.permitted_directories,
-            &git_roots,
-            None,
-        )
-        .await
+    if state.session.yolo() {
+        return sandbox::run_unrestricted(&command, cwd, None).await;
+    }
+    let identity = state
+        .scope
+        .repository
+        .as_ref()
+        .context("the selected workspace has no pinned Git repository identity")?;
+    sandbox::run_git(
+        &command,
+        cwd,
+        std::slice::from_ref(&identity.worktree_root),
+        &identity.metadata_roots,
+        None,
+    )
+    .await
+}
+
+/// The Git broker queue pair.
+///
+/// The request queue lives under the agent-writable state root. The response
+/// queue lives in a separate parent-owned root that the sandbox exposes only as
+/// a read-only visible root, so the agent can read broker outcomes but can
+/// never author, replace, unlink, or rename one. Both roots are held open with
+/// `O_NOFOLLOW` for the broker lifetime; relative entry operations go through
+/// the held descriptors.
+struct BrokerQueue {
+    requests: std::fs::File,
+    responses: std::fs::File,
+    #[cfg(not(unix))]
+    requests_path: PathBuf,
+}
+
+impl BrokerQueue {
+    fn create(requests_root: &Path, responses_root: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            requests_root.is_absolute() && responses_root.is_absolute(),
+            "Git broker directories must be absolute paths"
+        );
+        anyhow::ensure!(
+            requests_root != responses_root,
+            "Git broker request and response roots must differ"
+        );
+        create_directory_private(requests_root)?;
+        let requests_root_directory =
+            open_directory_no_follow(requests_root).with_context(|| {
+                format!(
+                    "cannot open Git broker request directory {}",
+                    requests_root.display()
+                )
+            })?;
+        validate_queue_directory(requests_root, &requests_root_directory)?;
+        let requests = create_subdirectory(&requests_root_directory, REQUESTS_DIRECTORY)?;
+        create_directory_private(responses_root)?;
+        let responses = open_directory_no_follow(responses_root).with_context(|| {
+            format!(
+                "cannot open Git broker response directory {}",
+                responses_root.display()
+            )
+        })?;
+        validate_queue_directory(responses_root, &responses)?;
+        Ok(Self::from_handles(requests_root, requests, responses))
+    }
+
+    fn open_existing(requests_root: &Path, responses_root: &Path) -> Result<Self> {
+        anyhow::ensure!(
+            requests_root.is_absolute() && responses_root.is_absolute(),
+            "Git broker directories must be absolute paths"
+        );
+        let requests_root_directory =
+            open_directory_no_follow(requests_root).with_context(|| {
+                format!(
+                    "cannot open Git broker request directory {}",
+                    requests_root.display()
+                )
+            })?;
+        validate_queue_directory(requests_root, &requests_root_directory)?;
+        let requests = open_subdirectory(&requests_root_directory, REQUESTS_DIRECTORY)?;
+        let responses = open_directory_no_follow(responses_root).with_context(|| {
+            format!(
+                "cannot open Git broker response directory {}",
+                responses_root.display()
+            )
+        })?;
+        validate_queue_directory(responses_root, &responses)?;
+        Ok(Self::from_handles(requests_root, requests, responses))
+    }
+
+    fn from_handles(
+        requests_root: &Path,
+        requests: std::fs::File,
+        responses: std::fs::File,
+    ) -> Self {
+        #[cfg(unix)]
+        let _ = requests_root;
+        Self {
+            requests,
+            responses,
+            #[cfg(not(unix))]
+            requests_path: requests_root.join(REQUESTS_DIRECTORY),
+        }
+    }
+
+    fn enumerate_requests(&self) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            enumerate_json_entries(&self.requests, MAX_QUEUE_ENTRIES_SCANNED)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut names = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&self.requests_path) else {
+                return names;
+            };
+            for entry in entries.flatten().take(MAX_QUEUE_ENTRIES_SCANNED) {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name.ends_with(".json") {
+                    names.push(name);
+                }
+            }
+            names.sort();
+            names
+        }
+    }
+
+    fn requests_alive(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.requests
+                .metadata()
+                .map(|m| m.nlink() > 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::symlink_metadata(&self.requests_path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        }
+    }
+
+    /// Reads one request entry. Only a bounded regular file is accepted;
+    /// symlinks, FIFOs, devices, directories, and oversized files are errors.
+    fn read_request(&self, name: &str) -> Result<Vec<u8>> {
+        read_entry_bounded(&self.requests, name, MAX_REQUEST_BYTES)
+    }
+
+    /// Reads one response entry, returning `Ok(None)` when it does not exist.
+    fn read_response(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match read_entry_bounded(&self.responses, name, MAX_RESPONSE_BYTES) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error_is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Publishes a response through an exclusive temp entry and atomic rename.
+    /// An existing final entry (including a planted symlink) is replaced, never
+    /// followed.
+    fn publish_response(&self, name: &str, payload: &[u8]) -> Result<()> {
+        write_entry_atomic(&self.responses, name, payload)
+    }
+
+    fn remove_request(&self, name: &str) {
+        remove_entry(&self.requests, name);
     }
 }
 
-struct BrokerState {
-    session: config::Session,
-    roots: Vec<PathBuf>,
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .map(|error| error.kind() == std::io::ErrorKind::NotFound)
+        .unwrap_or(false)
 }
 
 /// A running Git broker queue. Dropping it aborts the serve loop and removes
-/// the private request/response directory.
+/// both parent-owned queue roots.
 pub(crate) struct GitBroker {
-    directory: PathBuf,
+    requests_directory: PathBuf,
+    responses_directory: PathBuf,
     task: JoinHandle<()>,
 }
 
 impl GitBroker {
     pub(crate) fn start(
-        directory: PathBuf,
+        requests_directory: PathBuf,
+        responses_directory: PathBuf,
         session: config::Session,
-        roots: Vec<PathBuf>,
+        workspace: PathBuf,
+        access: Access,
     ) -> Result<Self> {
-        let requests = directory.join(REQUESTS_DIRECTORY);
-        let responses = directory.join(RESPONSES_DIRECTORY);
-        std::fs::create_dir_all(&requests).with_context(|| {
-            format!(
-                "cannot create the Git broker request queue {}",
-                requests.display()
-            )
-        })?;
-        std::fs::create_dir_all(&responses).with_context(|| {
-            format!(
-                "cannot create the Git broker response queue {}",
-                responses.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for path in [&directory, &requests, &responses] {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-                    .with_context(|| format!("cannot protect {}", path.display()))?;
-            }
-        }
-        let state = Arc::new(BrokerState { session, roots });
-        let task = tokio::spawn(serve(directory.clone(), state));
-        Ok(Self { directory, task })
+        let queue = BrokerQueue::create(&requests_directory, &responses_directory)?;
+        let state = Arc::new(BrokerState {
+            session,
+            access,
+            scope: BrokerScope::for_workspace(&workspace)?,
+        });
+        let task = tokio::spawn(serve(queue, state));
+        Ok(Self {
+            requests_directory,
+            responses_directory,
+            task,
+        })
     }
 }
 
 impl Drop for GitBroker {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_dir_all(&self.directory);
+        let _ = std::fs::remove_dir_all(&self.requests_directory);
+        let _ = std::fs::remove_dir_all(&self.responses_directory);
     }
 }
 
-async fn serve(directory: PathBuf, state: Arc<BrokerState>) {
-    let requests = directory.join(REQUESTS_DIRECTORY);
-    let responses = directory.join(RESPONSES_DIRECTORY);
+async fn serve(queue: BrokerQueue, state: Arc<BrokerState>) {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
-        let Ok(entries) = std::fs::read_dir(&requests) else {
-            continue;
-        };
-        let mut names = entries
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-            .filter(|name| name.ends_with(".json"))
+        if !queue.requests_alive() {
+            break;
+        }
+        let names = queue
+            .enumerate_requests()
+            .into_iter()
+            .take(MAX_REQUESTS_PER_TICK)
             .collect::<Vec<_>>();
-        names.sort();
         for name in names {
             let id = name.trim_end_matches(".json").to_owned();
-            let request_path = requests.join(&name);
-            let response_path = responses.join(format!("{id}.json"));
-            let payload = if !valid_request_id(&id) {
-                error_payload()
-            } else {
-                match std::fs::read(&request_path) {
-                    Ok(bytes) if bytes.len() <= MAX_REQUEST_BYTES => {
-                        match serde_json::from_slice::<GitShimRequest>(&bytes) {
-                            Ok(request) => {
-                                match handle_request(&state.session, &state.roots, request).await {
-                                    Ok(output) => success_payload(&output),
-                                    Err(_) => error_payload(),
-                                }
-                            }
-                            Err(_) => error_payload(),
-                        }
-                    }
-                    _ => error_payload(),
-                }
+            if !valid_request_id(&id) {
+                queue.remove_request(&name);
+                continue;
+            }
+            let payload = match queue.read_request(&name) {
+                Ok(bytes) => match serde_json::from_slice::<GitShimRequest>(&bytes) {
+                    Ok(request) => match handle_request(&state, request).await {
+                        Ok(output) => success_payload(&output),
+                        Err(_) => error_payload(),
+                    },
+                    Err(_) => error_payload(),
+                },
+                Err(_) => error_payload(),
             };
             if payload.len() <= MAX_RESPONSE_BYTES {
-                let _ = std::fs::write(&response_path, payload);
+                let _ = queue.publish_response(&format!("{id}.json"), &payload);
             }
-            let _ = std::fs::remove_file(&request_path);
+            queue.remove_request(&name);
         }
     }
 }
@@ -379,23 +936,95 @@ pub(crate) fn maybe_run_as_git_shim() -> Option<i32> {
 }
 
 pub(crate) fn run_shim(argv: Vec<String>) -> i32 {
-    let Some(directory) = std::env::var_os(BROKER_ENVIRONMENT_VARIABLE).map(PathBuf::from) else {
-        return reject();
+    let broker = std::env::var_os(BROKER_ENVIRONMENT_VARIABLE).map(PathBuf::from);
+    let responses = std::env::var_os(BROKER_RESPONSES_ENVIRONMENT_VARIABLE).map(PathBuf::from);
+    let git = std::env::var_os(GIT_EXECUTABLE_ENVIRONMENT_VARIABLE).map(PathBuf::from);
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return reject(),
     };
-    let Ok(cwd) = std::env::current_dir() else {
-        return reject();
-    };
-    match request_broker(&directory, &cwd, &argv) {
-        Ok(result) => {
-            let mut stdout = std::io::stdout().lock();
-            let _ = stdout.write_all(result.stdout.as_bytes());
-            let _ = stdout.flush();
-            let mut stderr = std::io::stderr().lock();
-            let _ = stderr.write_all(result.stderr.as_bytes());
-            let _ = stderr.flush();
-            result.status
+    run_shim_with(
+        broker.as_deref(),
+        responses.as_deref(),
+        git.as_deref(),
+        &cwd,
+        &argv,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShimRoute {
+    Mutation,
+    ReadOnly,
+    Reject,
+}
+
+/// Routes one shim argv without side effects. Mutation forms go to the broker,
+/// the documented read-only forms go to the trusted Git executable, and
+/// everything else is rejected. Mutations require both the writable request
+/// queue and the read-only response queue.
+fn shim_route(
+    broker: Option<&Path>,
+    responses: Option<&Path>,
+    git: Option<&Path>,
+    argv: &[String],
+) -> ShimRoute {
+    if classify_argv(argv).is_ok() {
+        return if broker.is_some() && responses.is_some() {
+            ShimRoute::Mutation
+        } else {
+            ShimRoute::Reject
+        };
+    }
+    if validate_read_only_git_argv(argv).is_ok() {
+        return if git.is_some() {
+            ShimRoute::ReadOnly
+        } else {
+            ShimRoute::Reject
+        };
+    }
+    ShimRoute::Reject
+}
+
+fn run_shim_with(
+    broker: Option<&Path>,
+    responses: Option<&Path>,
+    git: Option<&Path>,
+    cwd: &Path,
+    argv: &[String],
+) -> i32 {
+    match shim_route(broker, responses, git, argv) {
+        ShimRoute::Reject => reject(),
+        ShimRoute::ReadOnly => {
+            let Some(git) = git else {
+                return reject();
+            };
+            run_read_only_git(git, argv, cwd)
         }
-        Err(_) => reject(),
+        ShimRoute::Mutation => {
+            let (Some(requests_directory), Some(responses_directory)) = (broker, responses) else {
+                return reject();
+            };
+            match request_broker_with_timeout(
+                requests_directory,
+                responses_directory,
+                cwd,
+                argv,
+                REQUEST_TIMEOUT,
+            ) {
+                Ok(ShimOutcome::Completed(result)) => {
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(result.stdout.as_bytes());
+                    let _ = stdout.flush();
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = stderr.write_all(result.stderr.as_bytes());
+                    let _ = stderr.flush();
+                    result.status
+                }
+                Ok(ShimOutcome::Rejected) | Err(_) => reject(),
+                Ok(ShimOutcome::Indeterminate) => indeterminate(),
+            }
+        }
     }
 }
 
@@ -404,16 +1033,21 @@ fn reject() -> i32 {
     SHIM_EXIT_REJECTED
 }
 
-struct ShimResult {
-    status: i32,
-    stdout: String,
-    stderr: String,
+fn indeterminate() -> i32 {
+    eprintln!("{SHIM_INDETERMINATE_MESSAGE}");
+    SHIM_EXIT_INDETERMINATE
 }
 
-fn request_broker(directory: &Path, cwd: &Path, argv: &[String]) -> Result<ShimResult> {
+fn request_broker_with_timeout(
+    requests_directory: &Path,
+    responses_directory: &Path,
+    cwd: &Path,
+    argv: &[String],
+    timeout: Duration,
+) -> Result<ShimOutcome> {
     anyhow::ensure!(
-        directory.is_absolute(),
-        "Git broker directory must be an absolute path"
+        requests_directory.is_absolute() && responses_directory.is_absolute(),
+        "Git broker directories must be absolute paths"
     );
     anyhow::ensure!(cwd.is_absolute(), "Git shim cwd must be absolute");
     let request = GitShimRequest {
@@ -427,8 +1061,7 @@ fn request_broker(directory: &Path, cwd: &Path, argv: &[String]) -> Result<ShimR
         "Git broker request exceeds the size limit"
     );
 
-    let requests = directory.join(REQUESTS_DIRECTORY);
-    let responses = directory.join(RESPONSES_DIRECTORY);
+    let queue = BrokerQueue::open_existing(requests_directory, responses_directory)?;
     let id = format!(
         "{}-{}",
         std::process::id(),
@@ -437,69 +1070,470 @@ fn request_broker(directory: &Path, cwd: &Path, argv: &[String]) -> Result<ShimR
             .map(|duration| duration.as_nanos())
             .unwrap_or(0)
     );
-    let staged = requests.join(format!("{id}.tmp"));
-    let queued = requests.join(format!("{id}.json"));
-    std::fs::write(&staged, &encoded).context("cannot stage the Git broker request")?;
-    std::fs::rename(&staged, &queued).context("cannot queue the Git broker request")?;
+    let staged = format!("{id}.tmp");
+    let queued = format!("{id}.json");
+    write_entry_exclusive(&queue.requests, &staged, &encoded)
+        .context("cannot stage the Git broker request")?;
+    rename_entry(&queue.requests, &staged, &queued)
+        .context("cannot queue the Git broker request")?;
 
-    let response_path = responses.join(format!("{id}.json"));
-    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let response_name = queued.clone();
+    let deadline = Instant::now() + timeout;
     loop {
-        match std::fs::read(&response_path) {
-            Ok(bytes) => {
-                let _ = std::fs::remove_file(&response_path);
-                let _ = std::fs::remove_file(&queued);
-                anyhow::ensure!(
-                    bytes.len() <= MAX_RESPONSE_BYTES,
-                    "Git broker response exceeds the size limit"
-                );
-                return decode_response(&bytes);
+        match queue.read_response(&response_name) {
+            Ok(Some(bytes)) => {
+                return match decode_response(&bytes) {
+                    // Responses are parent-owned: the shim never deletes them,
+                    // so its cleanup does not require agent write access.
+                    Ok(DecodedResponse::Completed(result)) => {
+                        queue.remove_request(&queued);
+                        Ok(ShimOutcome::Completed(result))
+                    }
+                    Ok(DecodedResponse::Rejected) => {
+                        queue.remove_request(&queued);
+                        Ok(ShimOutcome::Rejected)
+                    }
+                    Err(_) => Ok(ShimOutcome::Indeterminate),
+                };
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("cannot read the Git broker response"),
+            Ok(None) => {}
+            Err(_) => return Ok(ShimOutcome::Indeterminate),
         }
         if Instant::now() >= deadline {
-            let _ = std::fs::remove_file(&queued);
-            anyhow::bail!("timed out waiting for the Git broker response");
+            return Ok(ShimOutcome::Indeterminate);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-fn decode_response(bytes: &[u8]) -> Result<ShimResult> {
+enum DecodedResponse {
+    Completed(ShimResult),
+    Rejected,
+}
+
+/// Strict response shapes. Only the exact broker-authored payloads decode; any
+/// other document (including an `error` document with a different shape) is a
+/// protocol error and never becomes `Rejected`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectedResponse {
+    schema: u32,
+    error: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedResponse {
+    schema: u32,
+    status: i64,
+    stdout: String,
+    stderr: String,
+}
+
+fn decode_response(bytes: &[u8]) -> Result<DecodedResponse> {
     let response: Value = serde_json::from_slice(bytes).context("invalid Git broker response")?;
+    if let Ok(rejected) = serde_json::from_value::<RejectedResponse>(response.clone()) {
+        anyhow::ensure!(
+            rejected.schema == BROKER_SCHEMA && rejected.error == SHIM_REJECTION_MESSAGE,
+            "unexpected Git broker error response"
+        );
+        return Ok(DecodedResponse::Rejected);
+    }
+    let completed: CompletedResponse =
+        serde_json::from_value(response).context("invalid Git broker response")?;
     anyhow::ensure!(
-        response.get("schema").and_then(Value::as_u64) == Some(BROKER_SCHEMA as u64),
+        completed.schema == BROKER_SCHEMA,
         "unexpected Git broker schema"
     );
-    anyhow::ensure!(
-        response.get("error").is_none(),
-        "Git broker rejected the request"
-    );
-    let status = response
-        .get("status")
-        .and_then(Value::as_i64)
-        .context("missing Git broker status")?;
-    let status = i32::try_from(status).context("invalid Git broker status")?;
-    let stdout = response
-        .get("stdout")
-        .and_then(Value::as_str)
-        .context("missing Git broker stdout")?;
-    let stderr = response
-        .get("stderr")
-        .and_then(Value::as_str)
-        .context("missing Git broker stderr")?;
-    Ok(ShimResult {
+    let status = i32::try_from(completed.status).context("invalid Git broker status")?;
+    Ok(DecodedResponse::Completed(ShimResult {
         status,
-        stdout: stdout.to_owned(),
-        stderr: stderr.to_owned(),
-    })
+        stdout: completed.stdout,
+        stderr: completed.stderr,
+    }))
+}
+
+fn create_directory_private(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot create Git broker directory {}", path.display()));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot protect Git broker directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .context("Git broker directory path contains a NUL byte")?;
+    let descriptor = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot open Git broker directory {}", path.display()));
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(not(unix))]
+fn open_directory_no_follow(path: &Path) -> Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect Git broker directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "Git broker path is not a real directory: {}",
+        path.display()
+    );
+    std::fs::File::open(path)
+        .with_context(|| format!("cannot open Git broker directory {}", path.display()))
+}
+
+fn validate_queue_directory(path: &Path, directory: &std::fs::File) -> Result<()> {
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("cannot inspect Git broker directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "Git broker path is not a directory: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "Git broker directory is not owned by the current user: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            metadata.mode() & 0o077 == 0,
+            "Git broker directory is not private: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_subdirectory(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let name = std::ffi::CString::new(name).context("Git broker directory name contains a NUL")?;
+    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if created != 0 {
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.kind() == std::io::ErrorKind::AlreadyExists,
+            "cannot create Git broker queue directory: {error}"
+        );
+    }
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot open Git broker queue directory");
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    validate_queue_directory(Path::new(name.to_str().unwrap_or_default()), &directory)?;
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn create_subdirectory(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    let _ = parent;
+    anyhow::bail!("unsupported platform for Git broker queue: {name}")
+}
+
+#[cfg(unix)]
+fn open_subdirectory(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let name = std::ffi::CString::new(name).context("Git broker directory name contains a NUL")?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot open Git broker queue directory");
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    validate_queue_directory(Path::new(name.to_str().unwrap_or_default()), &directory)?;
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_subdirectory(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    let _ = parent;
+    anyhow::bail!("unsupported platform for Git broker queue: {name}")
+}
+
+#[cfg(unix)]
+fn read_entry_bounded(directory: &std::fs::File, name: &str, maximum: usize) -> Result<Vec<u8>> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let name = std::ffi::CString::new(name).context("Git broker entry name contains a NUL")?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot open Git broker entry");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let metadata = file.metadata().context("cannot inspect Git broker entry")?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "Git broker entry is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= maximum as u64,
+        "Git broker entry exceeds the size limit"
+    );
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(maximum));
+    std::io::Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("cannot read Git broker entry")?;
+    anyhow::ensure!(
+        bytes.len() <= maximum,
+        "Git broker entry exceeds the size limit"
+    );
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_entry_bounded(directory: &std::fs::File, name: &str, maximum: usize) -> Result<Vec<u8>> {
+    let path = path_for_entry(directory, name)?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("cannot inspect Git broker entry {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "Git broker entry is not a regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= maximum as u64,
+        "Git broker entry exceeds the size limit: {}",
+        path.display()
+    );
+    let mut file = std::fs::File::open(&path)
+        .with_context(|| format!("cannot open Git broker entry {}", path.display()))?;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(maximum));
+    std::io::Read::by_ref(&mut file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("cannot read Git broker entry")?;
+    anyhow::ensure!(
+        bytes.len() <= maximum,
+        "Git broker entry exceeds the size limit"
+    );
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn path_for_entry(_directory: &std::fs::File, _name: &str) -> Result<PathBuf> {
+    anyhow::bail!("unsupported platform for Git broker queue entries")
+}
+
+#[cfg(unix)]
+fn write_entry_exclusive(directory: &std::fs::File, name: &str, payload: &[u8]) -> Result<()> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let name = std::ffi::CString::new(name).context("Git broker entry name contains a NUL")?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot create Git broker entry");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.write_all(payload)
+        .context("cannot write Git broker entry")?;
+    file.flush().context("cannot flush Git broker entry")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_entry_exclusive(directory: &std::fs::File, name: &str, payload: &[u8]) -> Result<()> {
+    let _ = directory;
+    let _ = name;
+    let _ = payload;
+    anyhow::bail!("unsupported platform for Git broker queue entries")
+}
+
+#[cfg(unix)]
+fn write_entry_atomic(directory: &std::fs::File, name: &str, payload: &[u8]) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_name = format!(".{name}.{}-{nonce}.tmp", std::process::id());
+    write_entry_exclusive(directory, &temp_name, payload)?;
+    let temp = std::ffi::CString::new(temp_name.clone()).context("invalid Git broker temp name")?;
+    let final_name = std::ffi::CString::new(name).context("invalid Git broker entry name")?;
+    let renamed = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            directory.as_raw_fd(),
+            final_name.as_ptr(),
+        )
+    };
+    if renamed != 0 {
+        let error = std::io::Error::last_os_error();
+        remove_entry(directory, &temp_name);
+        return Err(error).context("cannot publish Git broker entry");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_entry_atomic(directory: &std::fs::File, name: &str, payload: &[u8]) -> Result<()> {
+    let _ = directory;
+    let _ = name;
+    let _ = payload;
+    anyhow::bail!("unsupported platform for Git broker queue entries")
+}
+
+#[cfg(unix)]
+fn rename_entry(directory: &std::fs::File, from: &str, to: &str) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let from = std::ffi::CString::new(from).context("invalid Git broker entry name")?;
+    let to = std::ffi::CString::new(to).context("invalid Git broker entry name")?;
+    let renamed = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    if renamed != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot rename Git broker entry");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn rename_entry(directory: &std::fs::File, from: &str, to: &str) -> Result<()> {
+    let _ = directory;
+    let _ = from;
+    let _ = to;
+    anyhow::bail!("unsupported platform for Git broker queue entries")
+}
+
+#[cfg(unix)]
+fn remove_entry(directory: &std::fs::File, name: &str) {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return;
+    };
+    unsafe {
+        libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_entry(directory: &std::fs::File, name: &str) {
+    let _ = directory;
+    let _ = name;
+}
+
+#[cfg(unix)]
+fn enumerate_json_entries(directory: &std::fs::File, maximum: usize) -> Vec<String> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut names = Vec::new();
+    // Open a fresh descriptor for the directory. `dup` would share the file
+    // offset with the held descriptor, so the second enumeration would start
+    // at the previous end and miss every new entry.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return names;
+    }
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        unsafe {
+            libc::close(descriptor);
+        }
+        return names;
+    }
+    let mut scanned = 0usize;
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        scanned += 1;
+        if scanned > maximum {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let Ok(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".json") && name != "." && name != ".." {
+            names.push(name.to_owned());
+        }
+    }
+    unsafe {
+        libc::closedir(stream);
+    }
+    names.sort();
+    names
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     fn argv(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -524,6 +1558,14 @@ mod tests {
         }
     }
 
+    fn state(repository: &Path, access: Access) -> BrokerState {
+        BrokerState {
+            session: session(repository),
+            access,
+            scope: BrokerScope::for_workspace(repository).unwrap(),
+        }
+    }
+
     fn run_host_git(repository: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args([
@@ -544,6 +1586,23 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn broker_roots(root: &Path) -> (PathBuf, PathBuf) {
+        (root.join("queue"), root.join("responses"))
+    }
+
+    fn init_repository(repository: &Path) {
+        run_host_git(repository, &["init", "--quiet"]);
+        run_host_git(repository, &["config", "user.name", "Temote Test"]);
+        run_host_git(
+            repository,
+            &["config", "user.email", "temote-test@example.invalid"],
+        );
+        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+        run_host_git(repository, &["add", "tracked.txt"]);
+        run_host_git(repository, &["commit", "--quiet", "-m", "initial"]);
+        run_host_git(repository, &["branch", "-M", "main"]);
     }
 
     #[test]
@@ -642,33 +1701,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_only_classifier_accepts_only_the_documented_forms() {
+        for values in [
+            vec!["status"],
+            vec!["status", "--porcelain"],
+            vec!["status", "--short", "--branch"],
+            vec!["diff"],
+            vec!["diff", "--stat"],
+            vec!["diff", "--cached", "--name-only"],
+            vec!["diff", "HEAD", "--", "src/lib.rs"],
+            vec!["log"],
+            vec!["log", "--oneline", "-n", "5"],
+            vec!["log", "--max-count=10", "--stat"],
+            vec!["show", "HEAD"],
+            vec!["show", "--stat", "HEAD~1"],
+            vec!["rev-parse", "HEAD"],
+            vec!["rev-parse", "--verify", "HEAD^{commit}"],
+            vec!["ls-files"],
+            vec!["ls-files", "--others", "--exclude-standard"],
+            vec!["ls-files", "--", "src"],
+        ] {
+            assert!(
+                validate_read_only_git_argv(&argv(&values)).is_ok(),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_classifier_rejects_mutation_and_injection_shapes() {
+        for values in [
+            vec![],
+            vec!["add", "tracked.txt"],
+            vec!["commit", "-m", "x"],
+            vec!["status", "--output=/tmp/x"],
+            vec!["status", "-c"],
+            vec!["diff", "--ext-diff"],
+            vec!["diff", "--output=out.patch"],
+            vec!["log", "--exec-path=/tmp"],
+            vec!["show", "--git-dir=/tmp/other"],
+            vec!["rev-parse", "--parseopt"],
+            vec!["rev-parse", "-x"],
+            vec!["ls-files", "/abs/path"],
+            vec!["ls-files", "../outside"],
+            vec!["ls-files", "--", "src/*.rs"],
+            vec!["status", "extra"],
+            vec!["log", "-n", "0"],
+            vec!["log", "-n", "100000"],
+            vec!["log", "--max-count=abc"],
+            vec!["diff", "-c", "core.pager=less"],
+            vec!["diff", "--config-env=x=y"],
+            vec!["alias"],
+            vec!["config", "user.name"],
+            vec!["push"],
+        ] {
+            assert!(
+                validate_read_only_git_argv(&argv(&values)).is_err(),
+                "{values:?}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn broker_rejects_cwd_outside_the_prepared_session_roots() {
+    async fn broker_rejects_cwd_outside_the_selected_workspace() {
         let repository = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let repository = std::fs::canonicalize(repository.path()).unwrap();
         let outside = std::fs::canonicalize(outside.path()).unwrap();
         let error = handle_request(
-            &session(&repository),
-            std::slice::from_ref(&repository),
+            &state(&repository, Access::WorkspaceWrite),
             request(&outside, &["switch", "main"]),
         )
         .await
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("outside the permitted session roots")
-        );
+        assert!(error.to_string().contains("outside the selected workspace"));
     }
 
     #[tokio::test]
     async fn broker_rejects_unsupported_argv_before_touching_a_repository() {
         let repository = tempfile::tempdir().unwrap();
         let repository = std::fs::canonicalize(repository.path()).unwrap();
+        init_repository(&repository);
         let error = handle_request(
-            &session(&repository),
-            std::slice::from_ref(&repository),
+            &state(&repository, Access::WorkspaceWrite),
             request(&repository, &["checkout", "main"]),
         )
         .await
@@ -677,40 +1793,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broker_rejects_mutations_for_read_only_access_and_preserves_the_repository() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        init_repository(&repository);
+        let head_before = run_host_git(&repository, &["rev-parse", "HEAD"]);
+        let branch_before = run_host_git(&repository, &["branch", "--show-current"]);
+        let index_before =
+            std::fs::read(repository.join(".git/index")).expect("index must exist after commit");
+
+        for values in [
+            vec!["switch", "-c", "feature/read-only"],
+            vec!["switch", "main"],
+            vec!["add", "tracked.txt"],
+            vec!["commit", "-m", "read-only"],
+        ] {
+            let error = handle_request(
+                &state(&repository, Access::ReadOnly),
+                request(&repository, &values),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("workspace_write access"),
+                "{values:?}: {error}"
+            );
+        }
+
+        assert_eq!(
+            run_host_git(&repository, &["rev-parse", "HEAD"]),
+            head_before
+        );
+        assert_eq!(
+            run_host_git(&repository, &["branch", "--show-current"]),
+            branch_before
+        );
+        assert_eq!(
+            std::fs::read(repository.join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("tracked.txt")).unwrap(),
+            "base\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_requests_for_a_different_workspace_and_preserves_its_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("selected")).unwrap();
+        std::fs::create_dir_all(fixture.path().join("sibling")).unwrap();
+        let selected = std::fs::canonicalize(fixture.path().join("selected")).unwrap();
+        let sibling = std::fs::canonicalize(fixture.path().join("sibling")).unwrap();
+        init_repository(&selected);
+        init_repository(&sibling);
+        std::fs::write(sibling.join("tracked.txt"), "sibling-dirty\n").unwrap();
+        let sibling_head = run_host_git(&sibling, &["rev-parse", "HEAD"]);
+        let sibling_branch = run_host_git(&sibling, &["branch", "--show-current"]);
+        let sibling_index = std::fs::read(sibling.join(".git/index")).unwrap();
+
+        let mut session = session(&selected);
+        session.permitted_directories = vec![selected.clone(), sibling.clone()];
+        let broker_state = BrokerState {
+            access: Access::WorkspaceWrite,
+            scope: BrokerScope::for_workspace(&selected).unwrap(),
+            session,
+        };
+
+        let error = handle_request(
+            &broker_state,
+            request(&sibling, &["switch", "-c", "feature/other"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("outside the selected workspace"));
+
+        assert_eq!(run_host_git(&sibling, &["rev-parse", "HEAD"]), sibling_head);
+        assert_eq!(
+            run_host_git(&sibling, &["branch", "--show-current"]),
+            sibling_branch
+        );
+        assert_eq!(
+            std::fs::read(sibling.join(".git/index")).unwrap(),
+            sibling_index
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling.join("tracked.txt")).unwrap(),
+            "sibling-dirty\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broker_rejects_symlinked_cwd_and_paths_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("selected")).unwrap();
+        std::fs::create_dir_all(fixture.path().join("sibling")).unwrap();
+        let selected = std::fs::canonicalize(fixture.path().join("selected")).unwrap();
+        let sibling = std::fs::canonicalize(fixture.path().join("sibling")).unwrap();
+        init_repository(&selected);
+        init_repository(&sibling);
+        symlink(&sibling, selected.join("escape")).unwrap();
+        std::fs::write(sibling.join("secret.txt"), "secret\n").unwrap();
+
+        let error = handle_request(
+            &state(&selected, Access::WorkspaceWrite),
+            request(&selected.join("escape"), &["switch", "main"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("outside the selected workspace"));
+
+        let error = handle_request(
+            &state(&selected, Access::WorkspaceWrite),
+            request(&selected, &["add", "escape/secret.txt"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("outside the selected workspace"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling.join("secret.txt")).unwrap(),
+            "secret\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_nested_repositories_and_linked_worktrees() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("selected")).unwrap();
+        let selected = std::fs::canonicalize(fixture.path().join("selected")).unwrap();
+        let nested = selected.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repository(&selected);
+        init_repository(&nested);
+
+        let error = handle_request(
+            &state(&selected, Access::WorkspaceWrite),
+            request(&nested, &["switch", "-c", "feature/nested"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different repository than the selected workspace"),
+            "{error}"
+        );
+
+        let worktree = fixture.path().join("linked");
+        run_host_git(
+            &selected,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+        );
+        let linked = std::fs::canonicalize(&worktree).unwrap();
+        let linked_head = run_host_git(&linked, &["rev-parse", "HEAD"]);
+        let error = handle_request(
+            &state(&selected, Access::WorkspaceWrite),
+            request(&linked, &["switch", "-c", "feature/linked"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("outside the selected workspace"));
+        assert_eq!(run_host_git(&linked, &["rev-parse", "HEAD"]), linked_head);
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_a_workspace_that_is_not_a_git_worktree_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        init_repository(&repository);
+        let subdirectory = repository.join("sub");
+        std::fs::create_dir(&subdirectory).unwrap();
+
+        let error = handle_request(
+            &state(&subdirectory, Access::WorkspaceWrite),
+            request(&subdirectory, &["switch", "-c", "feature/sub"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not a Git worktree root"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn broker_adds_and_commits_only_the_named_paths() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = std::fs::canonicalize(fixture.path()).unwrap();
-        run_host_git(&repository, &["init", "--quiet"]);
-        run_host_git(&repository, &["config", "user.name", "Temote Test"]);
-        run_host_git(
-            &repository,
-            &["config", "user.email", "temote-test@example.invalid"],
-        );
-        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
-        std::fs::write(repository.join("other.txt"), "base\n").unwrap();
-        run_host_git(&repository, &["add", "tracked.txt", "other.txt"]);
-        run_host_git(&repository, &["commit", "--quiet", "-m", "initial"]);
-        run_host_git(&repository, &["branch", "-M", "main"]);
+        init_repository(&repository);
 
+        std::fs::write(repository.join("other.txt"), "base\n").unwrap();
+        run_host_git(&repository, &["add", "other.txt"]);
+        run_host_git(&repository, &["commit", "--quiet", "-m", "add other"]);
         std::fs::write(repository.join("tracked.txt"), "updated\n").unwrap();
         std::fs::write(repository.join("other.txt"), "unrelated\n").unwrap();
         std::fs::write(repository.join("untracked.txt"), "new\n").unwrap();
 
-        let roots = std::slice::from_ref(&repository);
-        let session = session(&repository);
+        let broker_state = state(&repository, Access::WorkspaceWrite);
 
-        let added = handle_request(
-            &session,
-            roots,
-            request(&repository, &["add", "tracked.txt"]),
-        )
-        .await
-        .unwrap();
+        let added = handle_request(&broker_state, request(&repository, &["add", "tracked.txt"]))
+            .await
+            .unwrap();
         assert_eq!(added.status, 0, "{}", added.stderr);
 
         let committed = handle_request(
-            &session,
-            roots,
+            &broker_state,
             request(&repository, &["commit", "-m", "update tracked only"]),
         )
         .await
@@ -760,10 +2060,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn broker_rejects_add_paths_that_resolve_outside_the_prepared_roots() {
+    async fn broker_rejects_add_paths_that_resolve_outside_the_selected_workspace() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = std::fs::canonicalize(fixture.path()).unwrap();
-        run_host_git(&repository, &["init", "--quiet"]);
+        init_repository(&repository);
         let outside = tempfile::tempdir().unwrap();
         let outside = std::fs::canonicalize(outside.path()).unwrap();
         std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
@@ -771,17 +2071,70 @@ mod tests {
             .unwrap();
 
         let error = handle_request(
-            &session(&repository),
-            std::slice::from_ref(&repository),
+            &state(&repository, Access::WorkspaceWrite),
             request(&repository, &["add", "link.txt"]),
         )
         .await
         .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("outside the permitted session roots"),
+            error.to_string().contains("outside the selected workspace"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_root_accepts_scope_and_serves_supported_mutations() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("selected")).unwrap();
+        let selected = std::fs::canonicalize(fixture.path().join("selected")).unwrap();
+        init_repository(&selected);
+        let worktree = fixture.path().join("linked");
+        run_host_git(
+            &selected,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "linked",
+            ],
+        );
+        let linked = std::fs::canonicalize(&worktree).unwrap();
+
+        let broker_state = state(&linked, Access::WorkspaceWrite);
+        let created = handle_request(
+            &broker_state,
+            request(&linked, &["switch", "-c", "feature/linked"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status, 0, "{}", created.stderr);
+
+        std::fs::write(linked.join("tracked.txt"), "linked-update\n").unwrap();
+        let added = handle_request(&broker_state, request(&linked, &["add", "tracked.txt"]))
+            .await
+            .unwrap();
+        assert_eq!(added.status, 0, "{}", added.stderr);
+        let committed = handle_request(
+            &broker_state,
+            request(&linked, &["commit", "-m", "linked update"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(committed.status, 0, "{}", committed.stderr);
+
+        assert_eq!(
+            run_host_git(&linked, &["branch", "--show-current"]),
+            "feature/linked"
+        );
+        assert_eq!(
+            run_host_git(&selected, &["branch", "--show-current"]),
+            "main"
+        );
+        assert_eq!(
+            std::fs::read_to_string(selected.join("tracked.txt")).unwrap(),
+            "base\n"
         );
     }
 
@@ -789,18 +2142,11 @@ mod tests {
     async fn broker_creates_switches_and_preserves_a_dirty_worktree() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = std::fs::canonicalize(fixture.path()).unwrap();
-        run_host_git(&repository, &["init", "--quiet"]);
-        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
-        run_host_git(&repository, &["add", "tracked.txt"]);
-        run_host_git(&repository, &["commit", "--quiet", "-m", "initial"]);
-        run_host_git(&repository, &["branch", "-M", "main"]);
-
-        let roots = std::slice::from_ref(&repository);
-        let session = session(&repository);
+        init_repository(&repository);
+        let broker_state = state(&repository, Access::WorkspaceWrite);
 
         let created = handle_request(
-            &session,
-            roots,
+            &broker_state,
             request(&repository, &["switch", "-c", "feature/x"]),
         )
         .await
@@ -811,7 +2157,7 @@ mod tests {
             "feature/x"
         );
 
-        let switched = handle_request(&session, roots, request(&repository, &["switch", "main"]))
+        let switched = handle_request(&broker_state, request(&repository, &["switch", "main"]))
             .await
             .unwrap();
         assert_eq!(switched.status, 0, "{}", switched.stderr);
@@ -827,15 +2173,14 @@ mod tests {
         std::fs::write(repository.join("tracked.txt"), "feature\n").unwrap();
         run_host_git(&repository, &["add", "tracked.txt"]);
         run_host_git(&repository, &["commit", "--quiet", "-m", "feature"]);
-        let switched = handle_request(&session, roots, request(&repository, &["switch", "main"]))
+        let switched = handle_request(&broker_state, request(&repository, &["switch", "main"]))
             .await
             .unwrap();
         assert_eq!(switched.status, 0, "{}", switched.stderr);
 
         std::fs::write(repository.join("tracked.txt"), "dirty-main\n").unwrap();
         let conflicted = handle_request(
-            &session,
-            roots,
+            &broker_state,
             request(&repository, &["switch", "feature/conflict"]),
         )
         .await
@@ -855,50 +2200,477 @@ mod tests {
     async fn shim_and_broker_round_trip_over_the_private_directory() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = std::fs::canonicalize(fixture.path()).unwrap();
-        run_host_git(&repository, &["init", "--quiet"]);
-        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
-        run_host_git(&repository, &["add", "tracked.txt"]);
-        run_host_git(&repository, &["commit", "--quiet", "-m", "initial"]);
-        run_host_git(&repository, &["branch", "-M", "main"]);
+        init_repository(&repository);
 
         let broker_root = tempfile::tempdir().unwrap();
-        let broker_directory = std::fs::canonicalize(broker_root.path()).unwrap();
+        let broker_root = std::fs::canonicalize(broker_root.path()).unwrap();
+        let (request_directory, response_directory) = broker_roots(&broker_root);
         let _broker = GitBroker::start(
-            broker_directory.clone(),
+            request_directory.clone(),
+            response_directory.clone(),
             session(&repository),
-            vec![repository.clone()],
+            repository.clone(),
+            Access::WorkspaceWrite,
         )
         .unwrap();
 
-        let request_directory = broker_directory.clone();
+        let requests = request_directory.clone();
+        let responses = response_directory.clone();
         let request_repository = repository.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            request_broker(
-                &request_directory,
+        let outcome = tokio::task::spawn_blocking(move || {
+            request_broker_with_timeout(
+                &requests,
+                &responses,
                 &request_repository,
                 &argv(&["switch", "-c", "feature/round-trip"]),
+                REQUEST_TIMEOUT,
             )
         })
         .await
         .unwrap()
         .unwrap();
+        let ShimOutcome::Completed(result) = outcome else {
+            panic!("expected a completed round trip");
+        };
         assert_eq!(result.status, 0, "{}", result.stderr);
         assert_eq!(
             run_host_git(&repository, &["branch", "--show-current"]),
             "feature/round-trip"
         );
 
-        let request_directory = broker_directory.clone();
+        let requests = request_directory.clone();
+        let responses = response_directory.clone();
         let request_repository = repository.clone();
-        let rejected = tokio::task::spawn_blocking(move || {
-            request_broker(
-                &request_directory,
+        let outcome = tokio::task::spawn_blocking(move || {
+            request_broker_with_timeout(
+                &requests,
+                &responses,
                 &request_repository,
                 &argv(&["checkout", "main"]),
+                REQUEST_TIMEOUT,
             )
         })
         .await
+        .unwrap()
         .unwrap();
-        assert!(rejected.is_err());
+        assert!(matches!(outcome, ShimOutcome::Rejected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_rejects_symlinked_and_special_entries_without_touching_sentinels() {
+        use std::os::unix::fs::symlink;
+
+        let queue_root = tempfile::tempdir().unwrap();
+        let queue_root = std::fs::canonicalize(queue_root.path()).unwrap();
+        let (queue_directory, response_directory) = broker_roots(&queue_root);
+        let queue = BrokerQueue::create(&queue_directory, &response_directory).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "sentinel\n").unwrap();
+
+        symlink(
+            &sentinel,
+            queue_directory.join(REQUESTS_DIRECTORY).join("link.json"),
+        )
+        .unwrap();
+        let error = queue.read_request("link.json").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot open Git broker entry"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
+
+        let fifo = queue_directory.join(REQUESTS_DIRECTORY).join("fifo.json");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let error = queue.read_request("fifo.json").unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+
+        let oversized = queue_directory.join(REQUESTS_DIRECTORY).join("big.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_REQUEST_BYTES + 1]).unwrap();
+        let error = queue.read_request("big.json").unwrap_err();
+        assert!(error.to_string().contains("size limit"));
+
+        symlink(&sentinel, response_directory.join("target.json")).unwrap();
+        queue
+            .publish_response("target.json", br#"{"schema":1,"status":0}"#)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "sentinel\n");
+        assert_eq!(
+            queue.read_response("target.json").unwrap().unwrap(),
+            br#"{"schema":1,"status":0}"#
+        );
+        let response_metadata =
+            std::fs::symlink_metadata(response_directory.join("target.json")).unwrap();
+        assert!(response_metadata.file_type().is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_survives_malformed_and_special_queue_entries() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        init_repository(&repository);
+
+        let broker_root = tempfile::tempdir().unwrap();
+        let broker_root = std::fs::canonicalize(broker_root.path()).unwrap();
+        let (request_directory, response_directory) = broker_roots(&broker_root);
+        let _broker = GitBroker::start(
+            request_directory.clone(),
+            response_directory.clone(),
+            session(&repository),
+            repository.clone(),
+            Access::WorkspaceWrite,
+        )
+        .unwrap();
+
+        let requests = request_directory.join(REQUESTS_DIRECTORY);
+        let fifo = requests.join("aaaa.json");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        std::fs::write(requests.join("bbbb.json"), b"not json").unwrap();
+        std::fs::write(
+            requests.join("cccc.json"),
+            vec![b'x'; MAX_REQUEST_BYTES + 1],
+        )
+        .unwrap();
+
+        let requests = request_directory.clone();
+        let responses = response_directory.clone();
+        let request_repository = repository.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            request_broker_with_timeout(
+                &requests,
+                &responses,
+                &request_repository,
+                &argv(&["switch", "-c", "feature/after-malformed"]),
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(outcome, ShimOutcome::Completed(_)));
+        assert_eq!(
+            run_host_git(&repository, &["branch", "--show-current"]),
+            "feature/after-malformed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_enumerates_a_bounded_number_of_entries() {
+        let queue_root = tempfile::tempdir().unwrap();
+        let queue_root = std::fs::canonicalize(queue_root.path()).unwrap();
+        let (queue_directory, response_directory) = broker_roots(&queue_root);
+        let queue = BrokerQueue::create(&queue_directory, &response_directory).unwrap();
+        let requests = queue_directory.join(REQUESTS_DIRECTORY);
+        for index in 0..(MAX_QUEUE_ENTRIES_SCANNED + 8) {
+            std::fs::write(requests.join(format!("r{index:05}.json")), b"{}").unwrap();
+        }
+        let names = queue.enumerate_requests();
+        assert!(names.len() <= MAX_QUEUE_ENTRIES_SCANNED);
+        assert!(!names.is_empty());
+    }
+
+    #[test]
+    fn published_responses_are_never_partially_visible() {
+        let queue_root = tempfile::tempdir().unwrap();
+        let queue_root = std::fs::canonicalize(queue_root.path()).unwrap();
+        let (queue_directory, response_directory) = broker_roots(&queue_root);
+        let queue = std::sync::Arc::new(
+            BrokerQueue::create(&queue_directory, &response_directory).unwrap(),
+        );
+        let first = vec![b'a'; 1024 * 1024];
+        let second = vec![b'b'; 512 * 1024];
+        let names = [
+            first.clone(),
+            second.clone(),
+            first.clone(),
+            second.clone(),
+            first.clone(),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_queue = std::sync::Arc::clone(&queue);
+        let reader_barrier = std::sync::Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            reader_barrier.wait();
+            for _ in 0..2_000 {
+                if let Ok(Some(bytes)) = reader_queue.read_response("target.json") {
+                    seen.push(bytes);
+                }
+            }
+            seen
+        });
+        barrier.wait();
+        for payload in &names {
+            queue.publish_response("target.json", payload).unwrap();
+        }
+        let seen = reader.join().unwrap();
+        assert!(
+            seen.iter().all(|bytes| bytes == &first || bytes == &second),
+            "a reader observed a partial response"
+        );
+    }
+
+    #[test]
+    fn shim_outcome_distinguishes_rejection_from_indeterminate() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = std::fs::canonicalize(directory.path()).unwrap();
+        let (queue_directory, response_directory) = broker_roots(&directory);
+        let queue = BrokerQueue::create(&queue_directory, &response_directory).unwrap();
+        let cwd = std::env::temp_dir();
+        let outcome = request_broker_with_timeout(
+            &queue_directory,
+            &response_directory,
+            &cwd,
+            &argv(&["switch", "main"]),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(outcome, Ok(ShimOutcome::Indeterminate)));
+        let queued = std::fs::read_dir(queue_directory.join(REQUESTS_DIRECTORY))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert_eq!(
+            queued, 1,
+            "an indeterminate request must not be re-labeled as not executed"
+        );
+        drop(queue);
+    }
+
+    #[test]
+    fn decode_response_accepts_only_the_fixed_broker_shapes() {
+        let completed = br#"{"schema":1,"status":2,"stdout":"out","stderr":"err"}"#;
+        match decode_response(completed).unwrap() {
+            DecodedResponse::Completed(result) => {
+                assert_eq!(result.status, 2);
+                assert_eq!(result.stdout, "out");
+                assert_eq!(result.stderr, "err");
+            }
+            DecodedResponse::Rejected => panic!("completed payload decoded as rejected"),
+        }
+
+        let rejected = serde_json::to_vec(&json!({
+            "schema": BROKER_SCHEMA,
+            "error": SHIM_REJECTION_MESSAGE,
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_response(&rejected).unwrap(),
+            DecodedResponse::Rejected
+        ));
+
+        for payload in [
+            json!({"schema": 1, "error": "forged"}),
+            json!({"schema": 1, "error": SHIM_REJECTION_MESSAGE, "status": 0}),
+            json!({"schema": 1, "status": "0", "stdout": "", "stderr": ""}),
+            json!({"schema": 2, "status": 0, "stdout": "", "stderr": ""}),
+            json!({"schema": 1, "status": 0, "stdout": "", "stderr": "", "extra": true}),
+            json!({"schema": 1, "error": SHIM_REJECTION_MESSAGE, "extra": true}),
+        ] {
+            assert!(
+                decode_response(&serde_json::to_vec(&payload).unwrap()).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_trusted_git_skips_the_private_shim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let shim = bin.join("git");
+        std::fs::write(&shim, "shim").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_dir = root.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real = real_dir.join("git");
+        std::fs::write(&real, "real").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::env::join_paths([bin.as_os_str(), real_dir.as_os_str()]).unwrap();
+        let path = path.to_str().unwrap();
+        let shim_target = std::fs::canonicalize(&shim).unwrap();
+        assert_eq!(
+            resolve_trusted_git(Some(path), &shim_target),
+            Some(std::fs::canonicalize(&real).unwrap())
+        );
+    }
+
+    #[test]
+    fn shim_routes_mutations_to_the_broker_and_read_only_commands_to_git() {
+        let git = Path::new("/usr/bin/git");
+        let broker = Path::new("/run/git-broker");
+        let responses = Path::new("/run/git-responses");
+        for values in [
+            vec!["switch", "main"],
+            vec!["switch", "-c", "feature/x"],
+            vec!["add", "tracked.txt"],
+            vec!["commit", "-m", "x"],
+        ] {
+            assert_eq!(
+                shim_route(Some(broker), Some(responses), Some(git), &argv(&values)),
+                ShimRoute::Mutation,
+                "{values:?}"
+            );
+        }
+        for values in [
+            vec!["status"],
+            vec!["status", "--porcelain"],
+            vec!["diff", "--stat"],
+            vec!["log", "--oneline", "-n", "3"],
+            vec!["show", "HEAD"],
+            vec!["rev-parse", "HEAD"],
+            vec!["ls-files"],
+        ] {
+            assert_eq!(
+                shim_route(Some(broker), Some(responses), Some(git), &argv(&values)),
+                ShimRoute::ReadOnly,
+                "{values:?}"
+            );
+        }
+        assert_eq!(
+            shim_route(None, None, Some(git), &argv(&["status"])),
+            ShimRoute::ReadOnly,
+            "read-only commands must not require a broker"
+        );
+        assert_eq!(
+            shim_route(Some(broker), Some(responses), None, &argv(&["status"])),
+            ShimRoute::Reject
+        );
+        assert_eq!(
+            shim_route(None, None, Some(git), &argv(&["switch", "main"])),
+            ShimRoute::Reject,
+            "mutations require the broker queues"
+        );
+        assert_eq!(
+            shim_route(Some(broker), None, Some(git), &argv(&["switch", "main"])),
+            ShimRoute::Reject,
+            "mutations require the response queue"
+        );
+        assert_eq!(
+            shim_route(None, Some(responses), Some(git), &argv(&["switch", "main"])),
+            ShimRoute::Reject,
+            "mutations require the request queue"
+        );
+        for values in [
+            vec!["push"],
+            vec!["fetch"],
+            vec!["config", "user.name"],
+            vec!["status", "--output=/tmp/x"],
+            vec!["diff", "--ext-diff"],
+        ] {
+            assert_eq!(
+                shim_route(Some(broker), Some(responses), Some(git), &argv(&values)),
+                ShimRoute::Reject,
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_shim_executes_read_only_git_without_touching_the_broker() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        init_repository(&repository);
+        std::fs::write(repository.join("tracked.txt"), "changed\n").unwrap();
+
+        let broker_root = tempfile::tempdir().unwrap();
+        let broker_root = std::fs::canonicalize(broker_root.path()).unwrap();
+        let (request_directory, response_directory) = broker_roots(&broker_root);
+        let queue = BrokerQueue::create(&request_directory, &response_directory).unwrap();
+        let git = resolve_trusted_git(
+            std::env::var("PATH").ok().as_deref(),
+            Path::new("/nonexistent-shim-target"),
+        )
+        .expect("host git must be resolvable for this test");
+
+        let status = run_shim_with(
+            Some(&request_directory),
+            Some(&response_directory),
+            Some(&git),
+            &repository,
+            &argv(&["status", "--porcelain"]),
+        );
+        assert_eq!(status, 0);
+        assert!(
+            std::fs::read_dir(request_directory.join(REQUESTS_DIRECTORY))
+                .unwrap()
+                .next()
+                .is_none(),
+            "read-only command must not enqueue a broker request"
+        );
+
+        assert_eq!(
+            run_shim_with(
+                Some(&request_directory),
+                Some(&response_directory),
+                None,
+                &repository,
+                &argv(&["rev-parse", "HEAD"])
+            ),
+            SHIM_EXIT_REJECTED
+        );
+        assert_eq!(
+            run_shim_with(
+                Some(&request_directory),
+                Some(&response_directory),
+                Some(&git),
+                &repository,
+                &argv(&["push"])
+            ),
+            SHIM_EXIT_REJECTED
+        );
+        assert_eq!(
+            run_shim_with(None, None, Some(&git), &repository, &argv(&["status"])),
+            0,
+            "read-only commands must not require a broker"
+        );
+        drop(queue);
+    }
+
+    #[test]
+    fn read_only_git_executes_real_repository_commands() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = std::fs::canonicalize(fixture.path()).unwrap();
+        init_repository(&repository);
+        std::fs::write(repository.join("tracked.txt"), "changed\n").unwrap();
+
+        let git = resolve_trusted_git(
+            std::env::var("PATH").ok().as_deref(),
+            Path::new("/nonexistent-shim-target"),
+        )
+        .expect("host git must be resolvable for this test");
+
+        assert_eq!(
+            run_read_only_git(&git, &argv(&["status", "--porcelain"]), &repository),
+            0
+        );
+        assert_eq!(
+            run_read_only_git(&git, &argv(&["diff", "--name-only"]), &repository),
+            0
+        );
+        assert_eq!(
+            run_read_only_git(&git, &argv(&["log", "--oneline", "-n", "1"]), &repository),
+            0
+        );
+        assert_eq!(
+            run_read_only_git(&git, &argv(&["show", "HEAD"]), &repository),
+            0
+        );
+        assert_eq!(
+            run_read_only_git(&git, &argv(&["rev-parse", "HEAD"]), &repository),
+            0
+        );
+        assert_eq!(
+            run_read_only_git(&git, &argv(&["ls-files"]), &repository),
+            0
+        );
     }
 }

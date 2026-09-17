@@ -240,7 +240,9 @@ impl SandboxSpec {
         writable_roots: &[PathBuf],
         git_metadata_roots: &[PathBuf],
     ) -> Result<Self> {
-        let mut spec = Self::command(cwd, writable_roots)?;
+        // Git profiles are always network-restricted; their callers pass
+        // `CommandNetworkPolicy::Restricted` on every platform.
+        let mut spec = Self::command(cwd, writable_roots, false)?;
         for root in git_metadata_roots {
             let root = canonical_existing_root(root)?;
             spec.writable_roots.push(root.clone());
@@ -265,7 +267,9 @@ impl SandboxSpec {
         git_metadata_roots: &[PathBuf],
         protected_worktree_roots: &[PathBuf],
     ) -> Result<Self> {
-        let mut spec = Self::command(cwd, writable_roots)?;
+        // Git profiles are always network-restricted; their callers pass
+        // `CommandNetworkPolicy::Restricted` on every platform.
+        let mut spec = Self::command(cwd, writable_roots, false)?;
         let mut common_git_roots = Vec::new();
         for root in git_metadata_roots {
             let root = canonical_existing_root(root)?;
@@ -401,7 +405,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("not-a-directory");
         std::fs::write(&file, b"x").unwrap();
-        assert!(SandboxSpec::command(root.path(), &[file]).is_err());
+        assert!(SandboxSpec::command(root.path(), &[file], false).is_err());
     }
 
     #[test]
@@ -427,7 +431,7 @@ mod tests {
             "fixture must exceed the injected local-agent scan budget"
         );
 
-        let spec = SandboxSpec::command(&workspace, &[]).unwrap();
+        let spec = SandboxSpec::command(&workspace, &[], false).unwrap();
         for name in PROTECTED_METADATA_NAMES {
             assert!(
                 spec.protected_metadata_paths(&workspace)
@@ -455,7 +459,7 @@ mod tests {
             let requested = (0..count)
                 .map(|_| roots[noprop::sample_usize_in(ctx, 0..roots.len())].clone())
                 .collect::<Vec<_>>();
-            let spec = SandboxSpec::command(&cwd, &requested).unwrap();
+            let spec = SandboxSpec::command(&cwd, &requested, false).unwrap();
 
             assert!(spec.writable_roots().contains(&cwd));
             assert!(

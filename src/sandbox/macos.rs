@@ -338,6 +338,56 @@ mod tests {
     }
 
     #[test]
+    fn local_agent_response_root_is_read_only_and_visible() {
+        let fixture = tempfile::tempdir().unwrap();
+        let hidden = fixture.path().join("hidden");
+        let workspace = hidden.join("workspace");
+        let state = hidden.join("state");
+        let responses = hidden.join("responses");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&responses).unwrap();
+        let hidden = std::fs::canonicalize(hidden).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let state = std::fs::canonicalize(state).unwrap();
+        let responses = std::fs::canonicalize(responses).unwrap();
+
+        let spec = SandboxSpec::local_agent(
+            &workspace,
+            &[workspace.clone(), state],
+            &[],
+            &[],
+            std::slice::from_ref(&responses),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&hidden),
+        )
+        .unwrap();
+
+        let (read_policy, read_definitions) = build_read_policy(&spec).unwrap();
+        assert!(
+            read_definitions.iter().any(|(_, path)| path == &responses),
+            "response root must be re-exposed for reading: {read_definitions:?}"
+        );
+        assert!(read_policy.contains("(allow file-read* (subpath"));
+
+        let (write_policy, write_definitions) = build_write_policy(&spec).unwrap();
+        assert!(
+            !spec.writable_roots().contains(&responses),
+            "response root must never be a writable root"
+        );
+        assert!(
+            !write_definitions.iter().any(|(_, path)| path == &responses),
+            "response root must not appear in the write policy: {write_definitions:?}"
+        );
+        assert!(
+            !write_policy.contains(responses.to_string_lossy().as_ref()),
+            "raw response root leaked into the write policy"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn generated_read_policy_allows_verified_symlink_literals_below_hidden_roots() {
         use std::os::unix::fs::symlink;

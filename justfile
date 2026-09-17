@@ -21,9 +21,10 @@ check: fmt-check test clippy gateway-test diff-check
 
 # Run the deterministic subset that is valid from inside an already-sandboxed
 # normal Temote developer session. This is intentionally not a replacement for
-# `just check` or CI: nested Linux sandbox and local socket/process acceptance
-# remain host-level gates and are reported as NOT RUN here.
-sandboxed-check: fmt-check sandboxed-test clippy sandboxed-no-default gateway-test diff-check
+# `just check` or CI: tests that need Unix-socket syscalls, a nested bubblewrap
+# namespace, nested process spawning, or a macOS Seatbelt host remain host/CI
+# gates and are reported as NOT RUN here.
+sandboxed-check: fmt-check sandboxed-test clippy sandboxed-no-default gateway-sandbox-test diff-check
 
 sandboxed-test:
     cargo test --lib --all-features --locked -- --skip sandbox::linux_tests
@@ -32,13 +33,28 @@ sandboxed-test:
     cargo test --bin temote-mcp --all-features --locked activity_coverage
     cargo test --bin temote-mcp --all-features --locked upgrade_transaction::tests::
     cargo test --bin temote-mcp --all-features --locked upgrade_coordinator::tests::
-    cargo test --bin temote-mcp --all-features --locked session_gc
+    cargo test --bin temote-mcp --all-features --locked session_control::tests::session_gc
+    @echo "NOT RUN (host/CI gate): session_gc socket liveness acceptance (session_control::tests::host_liveness_tests)"
     @echo "NOT RUN (host/CI gate): Linux nested sandbox runtime tests (sandbox::linux_tests)"
+    @echo "NOT RUN (host/CI gate): local_agent real-wiring tests (nested Linux sandbox required)"
+    @echo "NOT RUN (host/CI gate): deployment-preflight CLI subprocess tests (nested process spawn required)"
     @echo "NOT RUN (host/CI gate): full binary/local Unix-socket integration suite"
     @echo "NOT RUN (host/CI gate): ignored supervisor/process-boundary E2E"
+    @echo "NOT RUN (macOS/CI gate): macOS native Seatbelt tests"
 
 sandboxed-no-default:
     cargo check --no-default-features --all-targets --locked
+
+# The complete gateway suite, including the deployment-preflight CLI subprocess
+# tests. Host/CI only: nested `node` process spawning can fail with EPERM inside
+# the local-agent sandbox.
+gateway-test:
+    npm test --prefix gateway
+
+# Gateway evaluator tests that do not spawn nested processes. Safe for
+# `just sandboxed-check`.
+gateway-sandbox-test:
+    npm run test:sandbox --prefix gateway
 
 # Host-level Linux acceptance. This requires a production-shaped bubblewrap /
 # AppArmor/userns environment and is expected to fail when invoked from inside
@@ -55,9 +71,6 @@ test:
 
 clippy:
     cargo clippy --all-targets -- -D warnings
-
-gateway-test:
-    npm test --prefix gateway
 
 diff-check:
     git diff --check

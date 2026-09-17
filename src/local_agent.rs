@@ -36,6 +36,9 @@ const MAX_LAUNCHER_PATH_STEPS: usize = 256;
 const MAX_PACKAGE_INSTALL_ENTRIES: usize = 64;
 const MAX_PACKAGE_METADATA_BYTES: u64 = 1024 * 1024;
 const AGENT_STATE_DIRECTORY_PREFIX: &str = "temote-mcp-local-agent-";
+/// Broker responses live outside the agent-writable state root so the sandboxed
+/// agent can read, but never author, the authoritative broker outcome.
+const AGENT_RESPONSES_DIRECTORY_PREFIX: &str = "temote-mcp-git-responses-";
 const CODEX_PERMISSION_PROFILE_NAME: &str = "temote_local_agent";
 
 const SAFE_ENV_NAMES: &[&str] = &[
@@ -107,6 +110,7 @@ struct AgentState {
     hidden_roots: Vec<PathBuf>,
     read_only_paths: Vec<PathBuf>,
     broker_directory: PathBuf,
+    broker_responses_directory: PathBuf,
     git_shim_target: PathBuf,
 }
 
@@ -153,7 +157,7 @@ impl AgentState {
         })?;
         set_private_permissions(&root)?;
 
-        let mut hidden_roots = vec![base];
+        let mut hidden_roots = vec![base.clone()];
         if let Some(home) = source_home {
             anyhow::ensure!(
                 home != Path::new("/"),
@@ -191,12 +195,29 @@ impl AgentState {
         hidden_roots.dedup();
 
         let broker_directory = root.join("git-broker");
+        let broker_responses_directory = base.join(format!(
+            "{AGENT_RESPONSES_DIRECTORY_PREFIX}{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&broker_responses_directory).with_context(|| {
+            format!(
+                "could not create Git broker responses directory {}",
+                broker_responses_directory.display()
+            )
+        })?;
+        set_private_permissions(&broker_responses_directory)?;
+        ensure_outside_permitted_roots(
+            &broker_responses_directory,
+            forbidden_roots,
+            "local agent Git broker responses directory is inside a permitted session root",
+        )?;
         let git_shim_target = canonical_current_executable()?;
         let mut state = Self {
             root,
             hidden_roots,
             read_only_paths: Vec::new(),
             broker_directory,
+            broker_responses_directory,
             git_shim_target,
         };
         let directories = match agent {
@@ -253,6 +274,22 @@ impl AgentState {
         environment.insert("TMP".to_owned(), temporary.clone());
         environment.insert("TEMP".to_owned(), temporary);
 
+        let trusted_git = crate::agent_git::resolve_trusted_git(
+            environment.get("PATH").map(String::as_str),
+            &self.git_shim_target,
+        );
+        match trusted_git {
+            Some(git) => {
+                environment.insert(
+                    crate::agent_git::GIT_EXECUTABLE_ENVIRONMENT_VARIABLE.to_owned(),
+                    git.to_string_lossy().into_owned(),
+                );
+            }
+            None => {
+                environment.remove(crate::agent_git::GIT_EXECUTABLE_ENVIRONMENT_VARIABLE);
+            }
+        }
+
         let mut path_entries = vec![self.root.join("bin")];
         if let Some(path) = environment.get("PATH") {
             path_entries.extend(env::split_paths(path));
@@ -267,6 +304,12 @@ impl AgentState {
         environment.insert(
             crate::agent_git::BROKER_ENVIRONMENT_VARIABLE.to_owned(),
             self.broker_directory.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            crate::agent_git::BROKER_RESPONSES_ENVIRONMENT_VARIABLE.to_owned(),
+            self.broker_responses_directory
+                .to_string_lossy()
+                .into_owned(),
         );
 
         match agent {
@@ -316,6 +359,10 @@ impl AgentState {
         &self.broker_directory
     }
 
+    fn broker_responses_directory(&self) -> &Path {
+        &self.broker_responses_directory
+    }
+
     fn git_shim_target(&self) -> &Path {
         &self.git_shim_target
     }
@@ -324,6 +371,7 @@ impl AgentState {
 impl Drop for AgentState {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.broker_responses_directory);
     }
 }
 
@@ -757,10 +805,13 @@ where
 
 pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     let state_root = prepared.state.root.clone();
+    let broker_responses_root = prepared.state.broker_responses_directory().to_path_buf();
     let _broker = crate::agent_git::GitBroker::start(
         prepared.state.broker_directory().to_path_buf(),
+        broker_responses_root.clone(),
         prepared.session.clone(),
-        prepared.session_roots.clone(),
+        prepared.cwd.clone(),
+        prepared.access,
     )?;
     let mut writable_roots = Vec::new();
     if prepared.access == Access::WorkspaceWrite {
@@ -775,6 +826,10 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     if prepared.access == Access::ReadOnly {
         read_only_roots.push(prepared.cwd.clone());
     }
+    // Response authority: the broker's response queue is visible read-only to
+    // the agent so the shim can read it, but the agent cannot author, replace,
+    // unlink, or rename an outcome.
+    read_only_roots.push(broker_responses_root.clone());
     read_only_roots.sort();
     read_only_roots.dedup();
     let mut read_only_files = prepared.dependency_files.clone();
@@ -788,6 +843,22 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
         // Keep the canonical shim target readable when the agent executable
         // roots are hidden (for example a binary installed below HOME).
         read_only_files.push(git_shim_target);
+    }
+    if let Some(trusted_git) = prepared
+        .environment
+        .get(crate::agent_git::GIT_EXECUTABLE_ENVIRONMENT_VARIABLE)
+        .map(PathBuf::from)
+    {
+        let trusted_git_visible = writable_roots
+            .iter()
+            .chain(temporary_roots.iter())
+            .chain(read_only_roots.iter())
+            .any(|root| trusted_git.starts_with(root));
+        if !trusted_git_visible && !read_only_files.contains(&trusted_git) {
+            // Read-only Git commands run in this sandbox; keep the trusted Git
+            // executable readable when it lives under a hidden root.
+            read_only_files.push(trusted_git);
+        }
     }
     let stdin = (prepared.agent == Agent::Codex).then_some(prepared.task.as_bytes());
     sandbox::run_local_agent(
@@ -2781,6 +2852,290 @@ mod tests {
         assert!(!selected_marker.exists());
         assert!(!sibling_marker.exists());
         assert!(!extra_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_agent_broker_enforces_the_per_run_access_through_the_real_wiring() {
+        const BROKER_AGENT_SCRIPT: &str = r#"#!/bin/sh
+dir="$TEMOTE_MCP_GIT_BROKER_DIR"
+resp="$TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR"
+id="agent-$$"
+if [ "$1" = read_only ]; then
+  argv='["switch","-c","feature/wired"]'
+else
+  argv='["add","tracked.txt"]'
+fi
+printf '{"schema":1,"cwd":"%s","argv":%s}' "$PWD" "$argv" > "$dir/requests/$id.tmp" || exit 20
+/bin/mv "$dir/requests/$id.tmp" "$dir/requests/$id.json" || exit 21
+i=0
+while [ "$i" -lt 1000 ]; do
+  if [ -f "$resp/$id.json" ]; then
+    if /bin/grep -q '"error"' "$resp/$id.json"; then
+      test "$1" = read_only && exit 0
+      exit 8
+    fi
+    test "$1" = workspace_write || exit 7
+    /bin/cat "$resp/$id.json"
+    exit 0
+  fi
+  i=$((i+1))
+  sleep 0.01
+done
+exit 9
+"#;
+
+        let fixture_parent = tempfile::tempdir().unwrap();
+        let repository_parent = tempfile::tempdir().unwrap();
+        let repository = repository_parent.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let repository = fs::canonicalize(&repository).unwrap();
+        let host_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("host git must be installed for this test");
+            assert!(
+                output.status.success(),
+                "host git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        host_git(&["init", "--quiet"]);
+        host_git(&["config", "user.name", "Temote Test"]);
+        host_git(&["config", "user.email", "temote-test@example.invalid"]);
+        fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+        host_git(&["add", "tracked.txt"]);
+        host_git(&["commit", "--quiet", "-m", "initial"]);
+        host_git(&["branch", "-M", "main"]);
+
+        let executable_dir = tempfile::tempdir().unwrap();
+        let executable = executable_dir.path().join("agent");
+        make_executable_with_contents(&executable, BROKER_AGENT_SCRIPT);
+
+        let prepare = |access| {
+            let state = AgentState::create_with_source_home(
+                Agent::Codex,
+                std::slice::from_ref(&repository),
+                Some(fixture_parent.path()),
+            )
+            .unwrap();
+            let mut environment = HashMap::new();
+            environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+            state
+                .apply_to_environment(Agent::Codex, &mut environment)
+                .unwrap();
+            PreparedRun {
+                agent: Agent::Codex,
+                access,
+                cwd: repository.clone(),
+                executable_target: executable.canonicalize().unwrap(),
+                dependency_roots: Vec::new(),
+                dependency_symlinks: Vec::new(),
+                dependency_directories: Vec::new(),
+                dependency_files: Vec::new(),
+                environment,
+                session_roots: vec![repository.clone()],
+                session: session(&repository),
+                command: vec![
+                    executable.to_string_lossy().into_owned(),
+                    access.as_str().to_owned(),
+                ],
+                task: "test".to_owned(),
+                task_bytes: 4,
+                task_sha256: task_sha256(b"test"),
+                task_preview: task_preview("test"),
+                state,
+            }
+        };
+
+        let output = run(prepare(Access::ReadOnly)).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert!(
+            !host_git(&["branch", "--list", "feature/wired"]).contains("feature/wired"),
+            "a read-only run mutated the repository"
+        );
+
+        fs::write(repository.join("tracked.txt"), "updated\n").unwrap();
+        let output = run(prepare(Access::WorkspaceWrite)).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert!(
+            host_git(&["diff", "--cached", "--name-only"]).contains("tracked.txt"),
+            "a workspace-write run could not stage through the broker: {}",
+            output.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_agent_sandbox_cannot_forge_broker_responses() {
+        const FORGERY_AGENT_SCRIPT: &str = r#"#!/bin/sh
+set -u
+dir="$TEMOTE_MCP_GIT_BROKER_DIR"
+resp="$TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR"
+report="$TMPDIR/broker-attack-report.txt"
+: > "$report"
+record() { echo "$1" >> "$report"; }
+id="agent-$$"
+if [ "$1" = read_only ]; then
+  argv='["switch","-c","feature/forged"]'
+else
+  argv='["add","tracked.txt"]'
+fi
+if printf '{"schema":1,"cwd":"%s","argv":%s}' "$PWD" "$argv" > "$dir/requests/$id.tmp" && /bin/mv "$dir/requests/$id.tmp" "$dir/requests/$id.json"; then
+  record enqueue=allowed
+else
+  record enqueue=denied
+  /bin/cat "$report"
+  exit 21
+fi
+if /bin/echo '{"schema":1,"status":0,"stdout":"","stderr":""}' > "$resp/$id.json" 2>/dev/null; then record forge_completed=allowed; else record forge_completed=denied; fi
+if /bin/echo '{"schema":1,"error":"forged"}' > "$resp/$id.json" 2>/dev/null; then record forge_rejected=allowed; else record forge_rejected=denied; fi
+if /bin/mkdir "$resp/forged" 2>/dev/null; then record mkdir_response_dir=allowed; else record mkdir_response_dir=denied; fi
+i=0
+while [ "$i" -lt 1000 ]; do
+  if [ -f "$resp/$id.json" ]; then break; fi
+  i=$((i+1))
+  sleep 0.01
+done
+if [ ! -f "$resp/$id.json" ]; then
+  record outcome=timeout
+  /bin/cat "$report"
+  exit 9
+fi
+if /bin/rm "$resp/$id.json" 2>/dev/null; then record unlink_response=allowed; else record unlink_response=denied; fi
+if /bin/mv "$resp/$id.json" "$resp/$id.renamed" 2>/dev/null; then record rename_response=allowed; else record rename_response=denied; fi
+if /bin/mv "$resp" "$resp.moved" 2>/dev/null; then record rename_response_dir=allowed; else record rename_response_dir=denied; fi
+if /bin/grep -q '"error"' "$resp/$id.json"; then
+  record outcome=rejected
+  /bin/cat "$report"
+  test "$1" = read_only && exit 0
+  exit 8
+fi
+record outcome=completed
+/bin/cat "$report"
+test "$1" = workspace_write && exit 0
+exit 8
+"#;
+
+        let fixture_parent = tempfile::tempdir().unwrap();
+        let repository_parent = tempfile::tempdir().unwrap();
+        let repository = repository_parent.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let repository = fs::canonicalize(&repository).unwrap();
+        let host_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("host git must be installed for this test");
+            assert!(
+                output.status.success(),
+                "host git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        host_git(&["init", "--quiet"]);
+        host_git(&["config", "user.name", "Temote Test"]);
+        host_git(&["config", "user.email", "temote-test@example.invalid"]);
+        fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+        host_git(&["add", "tracked.txt"]);
+        host_git(&["commit", "--quiet", "-m", "initial"]);
+        host_git(&["branch", "-M", "main"]);
+
+        let executable_dir = tempfile::tempdir().unwrap();
+        let executable = executable_dir.path().join("agent");
+        make_executable_with_contents(&executable, FORGERY_AGENT_SCRIPT);
+
+        let prepare = |access| {
+            let state = AgentState::create_with_source_home(
+                Agent::Codex,
+                std::slice::from_ref(&repository),
+                Some(fixture_parent.path()),
+            )
+            .unwrap();
+            let state_root = state.root.clone();
+            let requests_root = state.broker_directory().to_path_buf();
+            let responses_root = state.broker_responses_directory().to_path_buf();
+            let mut environment = HashMap::new();
+            environment.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+            state
+                .apply_to_environment(Agent::Codex, &mut environment)
+                .unwrap();
+            let prepared = PreparedRun {
+                agent: Agent::Codex,
+                access,
+                cwd: repository.clone(),
+                executable_target: executable.canonicalize().unwrap(),
+                dependency_roots: Vec::new(),
+                dependency_symlinks: Vec::new(),
+                dependency_directories: Vec::new(),
+                dependency_files: Vec::new(),
+                environment,
+                session_roots: vec![repository.clone()],
+                session: session(&repository),
+                command: vec![
+                    executable.to_string_lossy().into_owned(),
+                    access.as_str().to_owned(),
+                ],
+                task: "test".to_owned(),
+                task_bytes: 4,
+                task_sha256: task_sha256(b"test"),
+                task_preview: task_preview("test"),
+                state,
+            };
+            (prepared, state_root, requests_root, responses_root)
+        };
+
+        let denied = |report: &[&str]| {
+            for line in [
+                "enqueue=allowed",
+                "forge_completed=denied",
+                "forge_rejected=denied",
+                "unlink_response=denied",
+                "rename_response=denied",
+                "rename_response_dir=denied",
+                "mkdir_response_dir=denied",
+            ] {
+                assert!(report.contains(&line), "missing {line}: {report:?}");
+            }
+        };
+
+        let (prepared, state_root, requests_root, responses_root) = prepare(Access::ReadOnly);
+        assert!(
+            !responses_root.starts_with(&state_root),
+            "response authority must live outside the agent-writable state root"
+        );
+        assert_ne!(requests_root, responses_root);
+        assert!(!requests_root.join("responses").exists());
+        let output = run(prepared).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        let report = output.stdout.lines().collect::<Vec<_>>();
+        denied(&report);
+        assert!(report.contains(&"outcome=rejected"), "{report:?}");
+        assert!(
+            !host_git(&["branch", "--list", "feature/forged"]).contains("feature/forged"),
+            "a read-only run mutated the repository"
+        );
+
+        fs::write(repository.join("tracked.txt"), "updated\n").unwrap();
+        let (prepared, _, _, _) = prepare(Access::WorkspaceWrite);
+        let output = run(prepared).await.unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        let report = output.stdout.lines().collect::<Vec<_>>();
+        denied(&report);
+        assert!(report.contains(&"outcome=completed"), "{report:?}");
+        assert!(
+            host_git(&["diff", "--cached", "--name-only"]).contains("tracked.txt"),
+            "a workspace-write run could not stage through the broker"
+        );
     }
 
     #[tokio::test]

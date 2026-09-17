@@ -63,7 +63,7 @@ git diff --check
 
 `just check` covers the normal Rust format/test/clippy/diff gates. Run gateway tests when gateway code or shared protocol behavior changes.
 
-When Temote MCP itself is being developed from inside an already-sandboxed normal Temote session, use `just sandboxed-check` for the deterministic repository-local subset. Treat every host-only line it prints as `NOT RUN`, not PASS. Nested Linux bubblewrap/userns acceptance, local Unix-socket integration, and process-boundary E2E remain host/CI gates; do not weaken the current session sandbox or mark those tests successful merely because the outer sandbox prevents them from starting. `just linux-sandbox-acceptance` is the explicit Linux host gate when running on a suitable unsandboxed development host.
+When Temote MCP itself is being developed from inside an already-sandboxed normal Temote session, use `just sandboxed-check` for the deterministic repository-local subset. Treat every host-only line it prints as `NOT RUN`, not PASS. Nested Linux bubblewrap/userns acceptance, session-GC Unix-socket liveness (`session_control::tests::host_liveness_tests`), local-agent real-wiring, gateway deployment-preflight CLI subprocess tests, local Unix-socket integration, and process-boundary E2E remain host/CI gates; do not weaken the current session sandbox or mark those tests successful merely because the outer sandbox prevents them from starting. `just linux-sandbox-acceptance` is the explicit Linux host gate when running on a suitable unsandboxed development host.
 
 ## Documentation map
 

@@ -3743,7 +3743,7 @@ done
         let host_bin = root.path().join("host-bin");
         let broker = state.join("git-broker");
         let requests = broker.join("requests");
-        let responses = broker.join("responses");
+        let responses = root.path().join("responses");
         std::fs::create_dir_all(&workspace)?;
         std::fs::create_dir_all(&state_tmp)?;
         std::fs::create_dir_all(&state_bin)?;
@@ -3753,10 +3753,13 @@ done
 
         // The production shim is a symlink from the private state bin directory
         // to the host binary, which the policy re-exposes as a read-only file.
+        // The response queue is re-exposed read-only: the shim can read a
+        // broker response, but the sandboxed process cannot forge, replace, or
+        // remove one.
         let target = host_bin.join("git-target");
         std::fs::write(
             &target,
-            "#!/bin/sh\nset -eu\nprintf '{\"schema\":1}' > \"$TEMOTE_MCP_GIT_BROKER_DIR/requests/probe.json\"\ncat \"$TEMOTE_MCP_GIT_BROKER_DIR/responses/probe.json\"\n",
+            "#!/bin/sh\nset -eu\nprintf '{\"schema\":1}' > \"$TEMOTE_MCP_GIT_BROKER_DIR/requests/probe.json\"\nif /bin/echo forged > \"$TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR/forged.json\" 2>/dev/null; then echo allowed > \"$TMPDIR/forgery-report.txt\"; else echo denied > \"$TMPDIR/forgery-report.txt\"; fi\nif /bin/rm \"$TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR/probe.json\" 2>/dev/null; then echo removed > \"$TMPDIR/unlink-report.txt\"; else echo kept > \"$TMPDIR/unlink-report.txt\"; fi\ncat \"$TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR/probe.json\"\n",
         )?;
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))?;
         let target = std::fs::canonicalize(&target)?;
@@ -3774,6 +3777,10 @@ done
                 "TEMOTE_MCP_GIT_BROKER_DIR".to_owned(),
                 broker.to_string_lossy().into_owned(),
             ),
+            (
+                "TEMOTE_MCP_GIT_BROKER_RESPONSES_DIR".to_owned(),
+                responses.to_string_lossy().into_owned(),
+            ),
         ]);
         let hidden_root = root.path().to_path_buf();
         let shim = state_bin.join("git");
@@ -3786,7 +3793,7 @@ done
                 writable_roots: &[workspace.clone(), state.clone()],
                 temporary_roots: std::slice::from_ref(&state_tmp),
                 read_only_paths: &[],
-                read_only_roots: &[],
+                read_only_roots: std::slice::from_ref(&responses),
                 read_only_symlinks: &[],
                 read_only_scaffold_directories: &[],
                 read_only_files: std::slice::from_ref(&target),
@@ -3801,6 +3808,18 @@ done
         assert_eq!(
             std::fs::read_to_string(requests.join("probe.json"))?,
             "{\"schema\":1}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_tmp.join("forgery-report.txt"))?.trim(),
+            "denied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_tmp.join("unlink-report.txt"))?.trim(),
+            "kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(responses.join("probe.json"))?,
+            "{\"ok\":true}"
         );
         Ok(())
     }
