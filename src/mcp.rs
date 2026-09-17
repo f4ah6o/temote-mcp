@@ -4627,6 +4627,9 @@ async fn local_agent_managed_worktree_binding(
     session: &config::Session,
     activity: Option<&ActivityScope>,
 ) -> Result<Option<ManagedWorktreeBinding>> {
+    if args.get("worktree").is_none() {
+        return Ok(None);
+    }
     let src_root = configured_src_root()?;
     local_agent_managed_worktree_binding_with_src_root(args, session, &src_root, activity).await
 }
@@ -10471,6 +10474,22 @@ mod tests {
         created.revalidate(&canonical_root).unwrap();
         std::fs::rename(&target, canonical_root.join("worktrees/repo/moved")).unwrap();
         assert!(created.revalidate(&canonical_root).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_agent_without_worktree_intent_needs_no_managed_root_configuration() {
+        let (_root, _canonical_root, checkout, session) = managed_worktree_fixture();
+        let binding = local_agent_managed_worktree_binding(
+            &json!({
+                "session_id": session.id,
+                "cwd": checkout.to_string_lossy()
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(binding.is_none());
     }
 
     #[tokio::test]
