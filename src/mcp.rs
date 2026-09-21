@@ -1063,9 +1063,9 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"apply_patch","title":"Apply a bounded multi-file patch","description":"Parse a Codex-style *** Begin Patch patch, preflight every source and destination inside the session roots, request approval once for normal sessions, then apply add/update/move/delete operations without invoking a shell parser. Partial I/O failure reports the exact committed operations.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"patch":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","patch"],"additionalProperties":false}},
         {"name":"git_add","title":"Stage files with Git","description":"Stage existing files or directories in the session repository with git add. Only the specified paths are staged; Git hooks and network access are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"cwd":{"type":"string"}},"required":["session_id","paths"],"additionalProperties":false}},
         {"name":"git_commit","title":"Create a local Git commit","description":"Create a local commit from the current Git index. This does not push, hooks and signing are disabled, and network access is unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":16384},"cwd":{"type":"string"}},"required":["session_id","message"],"additionalProperties":false}},
-        {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. A GitHub HTTPS upstream additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push_tag","title":"Push an exact Git tag ref","description":"Push one exact commit SHA to refs/tags/<tag> on a configured remote using force-with-lease safety. Omitting expected_remote_sha is create-only; supplying it permits an update only when the remote tag still equals that exact SHA. Arbitrary refspecs, URLs, and unconditional force are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"tag":{"type":"string","minLength":1,"maxLength":255},"source_sha":{"type":"string","minLength":40,"maxLength":64},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","tag","source_sha"],"additionalProperties":false}},
         {"name":"git_branch_create","title":"Create a local Git branch","description":"Create one validated local branch from HEAD or a validated local/fetched repository ref. The operation exposes no force/reset/refspec/URL input and does not switch the current worktree.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_switch","title":"Switch to an existing local Git branch","description":"Switch the current worktree to one validated existing local branch without force/reset/stash. Git refuses an unsafe switch when dirty files would be overwritten.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","branch"],"additionalProperties":false}},
@@ -2624,19 +2624,25 @@ async fn git_fetch(
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let cwd = cwd(args, session)?;
-    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    let remote = optional_git_remote(args)?;
+    let output = git_fetch_output(session, cwd, remote, activity).await?;
+    text_result(render_output(output)?)
+}
+
+/// Runs the validated `fetch --prune` contract and returns the raw process
+/// outcome. Shared by the structured `git_fetch` tool and the local-agent Git
+/// broker so both surfaces use exactly one authority.
+pub(crate) async fn git_fetch_output(
+    session: &config::Session,
+    cwd: PathBuf,
+    remote: Option<String>,
+    activity: Option<&ActivityScope>,
+) -> Result<sandbox::Output> {
+    let remote = remote.unwrap_or_else(|| "origin".to_owned());
     ensure_configured_git_remote(session, &cwd, &remote).await?;
-    let command = vec![
-        "git".to_owned(),
-        "-c".to_owned(),
-        "core.hooksPath=/dev/null".to_owned(),
-        "-c".to_owned(),
-        "fetch.recurseSubmodules=false".to_owned(),
-        "fetch".to_owned(),
-        "--prune".to_owned(),
-        remote,
-    ];
-    run_approved_git_command(session, cwd, command, "git_fetch", activity).await
+    ensure_github_https_remote_credential_mapping(session, &cwd, &remote).await?;
+    let command = build_git_fetch_command(&remote);
+    run_approved_git_output(session, cwd, command, "git_fetch", activity).await
 }
 
 async fn git_pull(
@@ -2645,17 +2651,168 @@ async fn git_pull(
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let cwd = cwd(args, session)?;
-    let command = vec![
-        "git".to_owned(),
-        "-c".to_owned(),
-        "core.hooksPath=/dev/null".to_owned(),
-        "-c".to_owned(),
-        "fetch.recurseSubmodules=false".to_owned(),
-        "pull".to_owned(),
-        "--ff-only".to_owned(),
-        "--recurse-submodules=no".to_owned(),
-    ];
-    run_approved_git_command(session, cwd, command, "git_pull", activity).await
+    let output = git_pull_output(session, cwd, activity).await?;
+    text_result(render_output(output)?)
+}
+
+/// Runs the validated `pull --ff-only` contract and returns the raw process
+/// outcome. Shared by the structured `git_pull` tool and the local-agent Git
+/// broker.
+pub(crate) async fn git_pull_output(
+    session: &config::Session,
+    cwd: PathBuf,
+    activity: Option<&ActivityScope>,
+) -> Result<sandbox::Output> {
+    let remote = git_current_upstream_remote(session, &cwd).await?;
+    if let Some(remote) = &remote {
+        ensure_github_https_remote_credential_mapping(session, &cwd, remote).await?;
+    }
+    let command = build_git_pull_command();
+    run_approved_git_output(session, cwd, command, "git_pull", activity).await
+}
+
+/// Resolves the configured upstream remote of the current branch, if any.
+///
+/// Used only to decide whether a repo-local GitHub credential mapping is
+/// required; the pull command itself never receives a caller-supplied remote.
+async fn git_current_upstream_remote(
+    session: &config::Session,
+    cwd: &Path,
+) -> Result<Option<String>> {
+    git_remote_for_symbolic_rev(session, cwd, "@{upstream}").await
+}
+
+/// Resolves the effective push remote of the current branch, if any.
+///
+/// Mirrors Git's own destination selection order (`@{push}`, `pushRemote`,
+/// `remote.pushDefault`, `branch.<name>.remote`, then `origin`) so the
+/// repository-local credential gate is applied to the same remote Git would
+/// contact. A local destination (`"."`) needs no credential. When nothing
+/// resolves, the existing structured `git push` behavior is unchanged and Git
+/// itself decides.
+async fn git_current_push_remote(session: &config::Session, cwd: &Path) -> Result<Option<String>> {
+    if let Some(remote) = git_remote_for_symbolic_rev(session, cwd, "@{push}").await? {
+        return Ok(Some(remote));
+    }
+    if let Some(branch) = git_current_branch_name(session, cwd).await? {
+        for key in [
+            format!("branch.{branch}.pushRemote"),
+            "remote.pushDefault".to_owned(),
+            format!("branch.{branch}.remote"),
+        ] {
+            let Some(remote) = git_config_value(session, cwd, &key).await? else {
+                continue;
+            };
+            if remote == "." {
+                // A local destination never contacts a remote.
+                return Ok(None);
+            }
+            validate_git_remote(&remote)?;
+            return Ok(Some(remote));
+        }
+    }
+    let origin = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "origin".to_owned(),
+        ],
+    )
+    .await?;
+    if origin.status == 0 && !origin.stdout.trim().is_empty() {
+        return Ok(Some("origin".to_owned()));
+    }
+    Ok(None)
+}
+
+async fn git_current_branch_name(session: &config::Session, cwd: &Path) -> Result<Option<String>> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "symbolic-ref".to_owned(),
+            "--quiet".to_owned(),
+            "--short".to_owned(),
+            "HEAD".to_owned(),
+        ],
+    )
+    .await?;
+    if output.status != 0 {
+        return Ok(None);
+    }
+    let branch = output.stdout.trim();
+    if branch.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        branch.len() <= MAX_GIT_BRANCH_NAME_BYTES && !branch.chars().any(char::is_control),
+        "current Git branch name is invalid"
+    );
+    Ok(Some(branch.to_owned()))
+}
+
+async fn git_config_value(
+    session: &config::Session,
+    cwd: &Path,
+    key: &str,
+) -> Result<Option<String>> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--get".to_owned(),
+            key.to_owned(),
+        ],
+    )
+    .await?;
+    if output.status != 0 {
+        return Ok(None);
+    }
+    let value = output.stdout.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// Resolves `<remote>/<ref>` for one symbolic revision to a validated remote
+/// name without exposing the revision to the caller.
+async fn git_remote_for_symbolic_rev(
+    session: &config::Session,
+    cwd: &Path,
+    rev: &str,
+) -> Result<Option<String>> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "rev-parse".to_owned(),
+            "--abbrev-ref".to_owned(),
+            rev.to_owned(),
+        ],
+    )
+    .await?;
+    if output.status != 0 {
+        return Ok(None);
+    }
+    let resolved = output.stdout.trim();
+    let (remote, _) = match resolved.split_once('/') {
+        Some(parts) => parts,
+        None => return Ok(None),
+    };
+    if remote.is_empty() || remote == "." {
+        // A local destination never contacts a network remote.
+        return Ok(None);
+    }
+    validate_git_remote(remote)?;
+    Ok(Some(remote.to_owned()))
 }
 
 async fn git_push(
@@ -2669,14 +2826,70 @@ async fn git_push(
         .get("set_upstream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let output = git_push_output(session, cwd, remote, set_upstream, activity).await?;
+    text_result(render_output(output)?)
+}
+
+/// Runs the validated current-branch push contract and returns the raw process
+/// outcome. Shared by the structured `git_push` tool and the local-agent Git
+/// broker. Force, refspecs and arbitrary URLs stay unavailable.
+pub(crate) async fn git_push_output(
+    session: &config::Session,
+    cwd: PathBuf,
+    remote: Option<String>,
+    set_upstream: bool,
+    activity: Option<&ActivityScope>,
+) -> Result<sandbox::Output> {
     let selected_remote = if set_upstream {
         Some(remote.clone().unwrap_or_else(|| "origin".to_owned()))
-    } else {
+    } else if remote.is_some() {
         remote.clone()
+    } else {
+        // No explicit remote: resolve the effective push remote only to decide
+        // whether the repository-local managed credential mapping is required.
+        // The command itself stays `git push` and never receives this value.
+        git_current_push_remote(session, &cwd).await?
     };
     if let Some(remote) = &selected_remote {
         ensure_configured_git_remote(session, &cwd, remote).await?;
+        ensure_github_https_remote_credential_mapping(session, &cwd, remote).await?;
     }
+    let command = build_git_push_command(remote, set_upstream);
+    run_approved_git_output(session, cwd, command, "git_push", activity).await
+}
+
+/// The exact non-force fetch shape: fixed hooks/submodule hardening plus the
+/// validated configured remote name.
+pub(crate) fn build_git_fetch_command(remote: &str) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "fetch.recurseSubmodules=false".to_owned(),
+        "fetch".to_owned(),
+        "--prune".to_owned(),
+        remote.to_owned(),
+    ]
+}
+
+/// The exact fast-forward-only pull shape.
+pub(crate) fn build_git_pull_command() -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "fetch.recurseSubmodules=false".to_owned(),
+        "pull".to_owned(),
+        "--ff-only".to_owned(),
+        "--recurse-submodules=no".to_owned(),
+    ]
+}
+
+/// The exact current-branch push shape. `HEAD` is the only refspec and no force
+/// option exists.
+pub(crate) fn build_git_push_command(remote: Option<String>, set_upstream: bool) -> Vec<String> {
     let mut command = vec![
         "git".to_owned(),
         "-c".to_owned(),
@@ -2687,13 +2900,83 @@ async fn git_push(
     ];
     if set_upstream {
         command.push("--set-upstream".to_owned());
-        command.push(selected_remote.expect("set_upstream selects a remote"));
+        command.push(remote.unwrap_or_else(|| "origin".to_owned()));
         command.push("HEAD".to_owned());
     } else if let Some(remote) = remote {
         command.push(remote);
         command.push("HEAD".to_owned());
     }
-    run_approved_git_command(session, cwd, command, "git_push", activity).await
+    command
+}
+
+/// Requires the repository-local managed GitHub credential mapping before any
+/// network Git command may use a GitHub HTTPS remote.
+///
+/// Non-GitHub and non-HTTPS remotes carry no GitHub credential and are left to
+/// the existing configured-remote validation. The mapping is always read from
+/// the selected repository's own local config, so concurrent repositories can
+/// never borrow each other's identity.
+pub(crate) async fn ensure_github_https_remote_credential_mapping(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+) -> Result<()> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            remote.to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "configured Git remote is unavailable");
+    let remote_url = output.stdout.trim();
+    anyhow::ensure!(
+        !remote_url.is_empty() && remote_url.len() <= MAX_GITHUB_REMOTE_URL_BYTES,
+        "configured Git remote URL is invalid"
+    );
+    if !remote_url.starts_with("https://github.com/") {
+        return Ok(());
+    }
+    let local_helpers = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--local".to_owned(),
+            "--includes".to_owned(),
+            "--get-all".to_owned(),
+            "credential.helper".to_owned(),
+        ],
+    )
+    .await?;
+    let local_use_http_path = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--local".to_owned(),
+            "--includes".to_owned(),
+            "--get".to_owned(),
+            "credential.useHttpPath".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        local_helpers.status == 0
+            && local_use_http_path.status == 0
+            && repo_scoped_github_credential_mapping_valid(
+                &local_helpers.stdout,
+                &local_use_http_path.stdout,
+            ),
+        "GitHub repository credential mapping is unavailable"
+    );
+    Ok(())
 }
 
 async fn git_push_tag(
@@ -5302,6 +5585,17 @@ async fn run_approved_git_command(
     operation: &str,
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
+    let output = run_approved_git_output(session, cwd, command, operation, activity).await?;
+    text_result(render_output(output)?)
+}
+
+async fn run_approved_git_output(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    operation: &str,
+    activity: Option<&ActivityScope>,
+) -> Result<sandbox::Output> {
     let repository_root = sandbox::git_worktree_root(&cwd)?;
     config::ensure_permitted(session, &repository_root)
         .context("Git repository root must be inside a permitted session root")?;
@@ -5335,9 +5629,12 @@ async fn run_approved_git_command(
         child_env::SENSITIVE_ENV_NAMES,
     )
     .await;
-    let result = output.and_then(render_output);
-    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
-    text_result(result?)
+    let reported = match &output {
+        Ok(output) => render_output(output.clone()),
+        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+    };
+    report_command_finished(session.id.clone(), "git", &rendered_command, &reported).await;
+    output
 }
 
 fn required_string_array(args: &Value, name: &str) -> Result<Vec<String>> {
@@ -11823,6 +12120,398 @@ mod tests {
             existing_paths: Vec::new(),
         };
         assert!(verify_managed_worktree_prune(&before, &after).is_err());
+    }
+
+    #[tokio::test]
+    async fn github_https_credential_mapping_is_repository_local_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(root.path()).unwrap();
+        let make_repo = |name: &str| {
+            let path = src_root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            init_git_repository(&path);
+            run_git_fixture(
+                &path,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://github.com/example/{name}.git"),
+                ],
+            );
+            path
+        };
+        let managed = make_repo("managed");
+        // The managed contract is a helper reset followed by the managed helper.
+        // `git config --add` preserves the empty reset entry that the repo-local
+        // gh-git binding writes into its included config file.
+        run_git_fixture(
+            &managed,
+            &["config", "--local", "--add", "credential.helper", ""],
+        );
+        run_git_fixture(
+            &managed,
+            &[
+                "config",
+                "--local",
+                "--add",
+                "credential.helper",
+                "!gh git credential --managed",
+            ],
+        );
+        run_git_fixture(
+            &managed,
+            &["config", "--local", "credential.useHttpPath", "true"],
+        );
+        let unmanaged = make_repo("unmanaged");
+        run_git_fixture(
+            &unmanaged,
+            &["config", "--local", "credential.helper", "store"],
+        );
+        run_git_fixture(
+            &unmanaged,
+            &["config", "--local", "credential.useHttpPath", "true"],
+        );
+        let missing = make_repo("missing");
+        let local_remote = src_root.join("local-remote.git");
+        run_git_fixture(
+            &src_root,
+            &["init", "--quiet", "--bare", local_remote.to_str().unwrap()],
+        );
+        let plain = src_root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        init_git_repository(&plain);
+        run_git_fixture(
+            &plain,
+            &["remote", "add", "origin", local_remote.to_str().unwrap()],
+        );
+
+        let session = config::Session {
+            id: format!("github-credential-{}", Uuid::new_v4()),
+            cwd: managed.clone(),
+            permitted_directories: vec![
+                src_root.clone(),
+                managed.clone(),
+                unmanaged.clone(),
+                missing.clone(),
+                plain.clone(),
+            ],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        ensure_github_https_remote_credential_mapping(&session, &managed, "origin")
+            .await
+            .unwrap();
+        for (path, label) in [
+            (&unmanaged, "unmanaged helper"),
+            (&missing, "missing mapping"),
+        ] {
+            let error = ensure_github_https_remote_credential_mapping(&session, path, "origin")
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("credential mapping is unavailable"),
+                "{label}: {error:#}"
+            );
+        }
+        // A non-GitHub remote carries no GitHub credential and is left to the
+        // configured-remote contract.
+        ensure_github_https_remote_credential_mapping(&session, &plain, "origin")
+            .await
+            .unwrap();
+        // An unknown remote name fails closed before any credential work.
+        assert!(
+            ensure_github_https_remote_credential_mapping(&session, &managed, "upstream")
+                .await
+                .is_err()
+        );
+
+        // The managed credential command is a read-only `gh git credential`
+        // lookup; no `gh auth` state is ever touched.
+        assert_eq!(
+            github_managed_credential_command(),
+            vec![
+                "gh".to_owned(),
+                "git".to_owned(),
+                "credential".to_owned(),
+                "--managed".to_owned(),
+                "get".to_owned()
+            ]
+        );
+        assert!(
+            !github_managed_credential_command()
+                .iter()
+                .any(|token| token == "auth")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_https_credential_mapping_stays_repository_local_across_concurrent_repositories()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(root.path()).unwrap();
+        let make_github_repo = |name: &str| {
+            let path = src_root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            init_git_repository(&path);
+            run_git_fixture(
+                &path,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("https://github.com/example/{name}.git"),
+                ],
+            );
+            path
+        };
+        // Repository "bound" stores the managed mapping in an included file below
+        // its own .git directory, the same shape the repo-local gh-git binding
+        // writes. Repository "unmanaged" has a non-managed helper.
+        let bound = make_github_repo("bound");
+        let include_path = bound.join(".git/gh-git.conf");
+        std::fs::write(
+            &include_path,
+            "[credential]\n\thelper =\n\thelper = !gh git credential --managed\n\tuseHttpPath = true\n",
+        )
+        .unwrap();
+        run_git_fixture(
+            &bound,
+            &["config", "--local", "include.path", "gh-git.conf"],
+        );
+        let unmanaged = make_github_repo("unmanaged");
+        run_git_fixture(
+            &unmanaged,
+            &["config", "--local", "credential.helper", "store"],
+        );
+        run_git_fixture(
+            &unmanaged,
+            &["config", "--local", "credential.useHttpPath", "true"],
+        );
+
+        let session_for = |name: &str, cwd: &Path| config::Session {
+            id: format!("{name}-{}", Uuid::new_v4()),
+            cwd: cwd.to_owned(),
+            permitted_directories: vec![src_root.clone(), bound.clone(), unmanaged.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let bound_session = session_for("bound", &bound);
+        let unmanaged_session = session_for("unmanaged", &unmanaged);
+
+        // Interleaved concurrent selections stay bound to the working
+        // repository: session identity never supplies credential state.
+        let (bound_ok, unmanaged_err) = tokio::join!(
+            ensure_github_https_remote_credential_mapping(&bound_session, &bound, "origin"),
+            ensure_github_https_remote_credential_mapping(&unmanaged_session, &unmanaged, "origin"),
+        );
+        bound_ok.unwrap();
+        let error = unmanaged_err.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("credential mapping is unavailable"),
+            "{error:#}"
+        );
+
+        // Cross-selection keeps following the repository, not the session.
+        let (cross_unmanaged, cross_bound) = tokio::join!(
+            ensure_github_https_remote_credential_mapping(&bound_session, &unmanaged, "origin"),
+            ensure_github_https_remote_credential_mapping(&unmanaged_session, &bound, "origin"),
+        );
+        let error = cross_unmanaged.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("credential mapping is unavailable"),
+            "{error:#}"
+        );
+        cross_bound.unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_https_network_git_requires_the_repository_local_mapping() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(root.path()).unwrap();
+        let repository = src_root.join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        init_git_repository(&repository);
+        run_git_fixture(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/repo.git",
+            ],
+        );
+        // An upstream makes the effective push remote resolvable; without the
+        // managed mapping neither fetch nor push may start a Git network process.
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "branch.main.remote", "origin"],
+        );
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "branch.main.merge", "refs/heads/main"],
+        );
+        let session = config::Session {
+            id: format!("github-network-{}", Uuid::new_v4()),
+            cwd: repository.clone(),
+            permitted_directories: vec![repository.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        // Without the managed mapping the validated network commands fail
+        // closed before any Git network process starts.
+        let error = git_fetch_output(&session, repository.clone(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("credential mapping is unavailable"),
+            "{error:#}"
+        );
+        let error = git_push_output(&session, repository.clone(), None, false, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("credential mapping is unavailable"),
+            "{error:#}"
+        );
+
+        // With the exact managed mapping the credential gate passes; the fixed
+        // remote name is still the only network argument and never a URL. The
+        // network commands themselves are not executed here (live GitHub
+        // credential acceptance is Phase 4).
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "--add", "credential.helper", ""],
+        );
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "--add",
+                "credential.helper",
+                "!gh git credential --managed",
+            ],
+        );
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "credential.useHttpPath", "true"],
+        );
+        ensure_github_https_remote_credential_mapping(&session, &repository, "origin")
+            .await
+            .unwrap();
+        assert_eq!(
+            build_git_fetch_command("origin").last().map(String::as_str),
+            Some("origin")
+        );
+        assert_eq!(
+            build_git_push_command(None, false),
+            vec![
+                "git".to_owned(),
+                "-c".to_owned(),
+                "core.hooksPath=/dev/null".to_owned(),
+                "-c".to_owned(),
+                "push.recurseSubmodules=off".to_owned(),
+                "push".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_push_remote_resolution_stays_bounded_and_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(root.path()).unwrap();
+        let repository = src_root.join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        init_git_repository(&repository);
+        let session = config::Session {
+            id: format!("push-remote-{}", Uuid::new_v4()),
+            cwd: repository.clone(),
+            permitted_directories: vec![repository.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        // No remote at all: nothing to gate.
+        assert_eq!(
+            git_current_push_remote(&session, &repository)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Git's documented default destination is origin when it is configured.
+        let bare = src_root.join("bare.git");
+        run_git_fixture(
+            &src_root,
+            &["init", "--quiet", "--bare", bare.to_str().unwrap()],
+        );
+        run_git_fixture(
+            &repository,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        assert_eq!(
+            git_current_push_remote(&session, &repository)
+                .await
+                .unwrap(),
+            Some("origin".to_owned())
+        );
+
+        // A local destination never contacts a remote.
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "branch.main.remote", "."],
+        );
+        assert_eq!(
+            git_current_push_remote(&session, &repository)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // A configured branch remote wins over the origin default.
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "branch.main.pushRemote", "mirror"],
+        );
+        assert_eq!(
+            git_current_push_remote(&session, &repository)
+                .await
+                .unwrap(),
+            Some("mirror".to_owned())
+        );
+
+        // Malformed names fail closed instead of reaching any Git command.
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "branch.main.pushRemote",
+                "origin;touch /tmp/pwned",
+            ],
+        );
+        assert!(
+            git_current_push_remote(&session, &repository)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

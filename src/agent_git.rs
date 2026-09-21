@@ -45,7 +45,7 @@ pub(crate) const BROKER_RESPONSES_ENVIRONMENT_VARIABLE: &str =
 pub(crate) const GIT_EXECUTABLE_ENVIRONMENT_VARIABLE: &str = "TEMOTE_MCP_GIT_EXECUTABLE";
 pub(crate) const SHIM_EXIT_REJECTED: i32 = 128;
 pub(crate) const SHIM_EXIT_INDETERMINATE: i32 = 70;
-pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, worktree list [--porcelain], worktree add [-b <new-branch>] <broker-derived-managed-path> [<existing-branch>], worktree remove <broker-derived-managed-path>, and the read-only commands status, diff, log, show, rev-parse, ls-files";
+pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, worktree list [--porcelain], worktree add [-b <new-branch>] <broker-derived-managed-path> [<existing-branch>], worktree remove <broker-derived-managed-path>, fetch [--prune] [<configured-remote>], pull [--ff-only], push [-u] [<configured-remote>], and the read-only commands status, diff, log, show, rev-parse, ls-files";
 pub(crate) const SHIM_INDETERMINATE_MESSAGE: &str = "git shim could not confirm the operation result; the operation may still be running; inspect the repository before retrying";
 const BROKER_SCHEMA: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -87,6 +87,17 @@ enum ShimCommand {
     /// `worktree remove` — delegated to the structured managed-worktree remove.
     WorktreeRemove {
         path: String,
+    },
+    /// `fetch [--prune] [<configured-remote>]`.
+    Fetch {
+        remote: Option<String>,
+    },
+    /// `pull [--ff-only]` for the current branch's configured upstream.
+    Pull,
+    /// `push [<configured-remote>]`, optionally setting the upstream.
+    Push {
+        remote: Option<String>,
+        set_upstream: bool,
     },
 }
 
@@ -137,8 +148,93 @@ fn classify_argv(argv: &[String]) -> Result<ShimCommand> {
         [command, subcommand, rest @ ..] if command.as_str() == "worktree" => {
             classify_worktree_argv(subcommand, rest)
         }
+        [command, rest @ ..] if command.as_str() == "fetch" => classify_fetch(rest),
+        [command, rest @ ..] if command.as_str() == "pull" => classify_pull(rest),
+        [command, rest @ ..] if command.as_str() == "push" => classify_push(rest),
         _ => anyhow::bail!("unsupported Git shim command"),
     }
+}
+
+/// Classifies the bounded network allowlist.
+///
+/// Only the configured remote name (or its absence) may appear. URLs, refspecs,
+/// `--force`, `-c`, hooks, filters and every other injection shape are rejected
+/// here; the broker re-validates that the remote is actually configured and, for
+/// GitHub HTTPS remotes, that the repository-local managed credential mapping is
+/// present.
+fn classify_fetch(rest: &[String]) -> Result<ShimCommand> {
+    let mut remote = None;
+    let mut seen_prune = false;
+    for token in rest {
+        if token == "--prune" && !seen_prune {
+            seen_prune = true;
+            continue;
+        }
+        if remote.is_none() {
+            validate_shim_remote(token)?;
+            remote = Some(token.clone());
+            continue;
+        }
+        anyhow::bail!("unsupported git fetch arguments");
+    }
+    Ok(ShimCommand::Fetch { remote })
+}
+
+fn classify_pull(rest: &[String]) -> Result<ShimCommand> {
+    for token in rest {
+        anyhow::ensure!(
+            token == "--ff-only",
+            "unsupported git pull arguments; only the fast-forward-only form is available"
+        );
+    }
+    Ok(ShimCommand::Pull)
+}
+
+fn classify_push(rest: &[String]) -> Result<ShimCommand> {
+    let mut remote = None;
+    let mut set_upstream = false;
+    for token in rest {
+        if matches!(token.as_str(), "-u" | "--set-upstream") && !set_upstream {
+            set_upstream = true;
+            continue;
+        }
+        if remote.is_none() {
+            validate_shim_remote(token)?;
+            remote = Some(token.clone());
+            continue;
+        }
+        anyhow::bail!("unsupported git push arguments");
+    }
+    anyhow::ensure!(
+        !set_upstream || remote.is_some(),
+        "git push --set-upstream requires a configured remote name"
+    );
+    Ok(ShimCommand::Push {
+        remote,
+        set_upstream,
+    })
+}
+
+/// Bounded syntax check for one remote argument. The broker still requires the
+/// name to resolve to a configured remote; this never accepts a URL or refspec.
+fn validate_shim_remote(remote: &str) -> Result<()> {
+    anyhow::ensure!(!remote.is_empty(), "remote must not be empty");
+    anyhow::ensure!(remote.len() <= 255, "remote must be at most 255 bytes");
+    anyhow::ensure!(
+        !remote.starts_with('-'),
+        "remote must not look like a command option"
+    );
+    anyhow::ensure!(
+        !remote.contains('@') && !remote.contains(':') && !remote.contains("//"),
+        "remote must be a configured name, not a URL or refspec"
+    );
+    anyhow::ensure!(
+        remote
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character)),
+        "remote must be a configured name, not a URL or refspec"
+    );
+    Ok(())
 }
 
 /// Classifies the narrow `worktree` allowlist.
@@ -728,22 +824,35 @@ fn structured_shim_output(result: Result<Value>) -> sandbox::Output {
             stderr: String::new(),
             truncated: false,
         },
-        Err(error) => {
-            let mut message = format!("{error:#}");
-            if message.len() > MAX_SHIM_POLICY_MESSAGE_BYTES {
-                let mut boundary = MAX_SHIM_POLICY_MESSAGE_BYTES;
-                while !message.is_char_boundary(boundary) {
-                    boundary -= 1;
-                }
-                message.truncate(boundary);
-            }
-            sandbox::Output {
-                status: 1,
-                stdout: String::new(),
-                stderr: message,
-                truncated: false,
-            }
+        Err(error) => bounded_error_output(error),
+    }
+}
+
+/// Renders one failed broker operation as a bounded shim process outcome with
+/// the specific policy message on stderr.
+fn bounded_error_output(error: anyhow::Error) -> sandbox::Output {
+    let mut message = format!("{error:#}");
+    if message.len() > MAX_SHIM_POLICY_MESSAGE_BYTES {
+        let mut boundary = MAX_SHIM_POLICY_MESSAGE_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
         }
+        message.truncate(boundary);
+    }
+    sandbox::Output {
+        status: 1,
+        stdout: String::new(),
+        stderr: message,
+        truncated: false,
+    }
+}
+
+/// Relays one raw network Git process outcome, converting a validation failure
+/// into the same bounded stderr shape.
+fn shim_output_or_error(result: Result<sandbox::Output>) -> sandbox::Output {
+    match result {
+        Ok(output) => output,
+        Err(error) => bounded_error_output(error),
     }
 }
 
@@ -899,6 +1008,27 @@ async fn handle_request(state: &BrokerState, request: GitShimRequest) -> Result<
             )
             .await;
             Ok(structured_shim_output(result))
+        }
+        ShimCommand::Fetch { remote } => {
+            let operation = state.operation_session(&cwd);
+            Ok(shim_output_or_error(
+                mcp::git_fetch_output(&operation, cwd, remote, None).await,
+            ))
+        }
+        ShimCommand::Pull => {
+            let operation = state.operation_session(&cwd);
+            Ok(shim_output_or_error(
+                mcp::git_pull_output(&operation, cwd, None).await,
+            ))
+        }
+        ShimCommand::Push {
+            remote,
+            set_upstream,
+        } => {
+            let operation = state.operation_session(&cwd);
+            Ok(shim_output_or_error(
+                mcp::git_push_output(&operation, cwd, remote, set_upstream, None).await,
+            ))
         }
     }
 }
@@ -2217,6 +2347,246 @@ mod tests {
     }
 
     #[test]
+    fn network_classifier_accepts_only_configured_remote_forms() {
+        assert_eq!(
+            classify_argv(&argv(&["fetch"])).unwrap(),
+            ShimCommand::Fetch { remote: None }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["fetch", "--prune"])).unwrap(),
+            ShimCommand::Fetch { remote: None }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["fetch", "--prune", "origin"])).unwrap(),
+            ShimCommand::Fetch {
+                remote: Some("origin".to_owned())
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["fetch", "upstream"])).unwrap(),
+            ShimCommand::Fetch {
+                remote: Some("upstream".to_owned())
+            }
+        );
+        assert_eq!(classify_argv(&argv(&["pull"])).unwrap(), ShimCommand::Pull);
+        assert_eq!(
+            classify_argv(&argv(&["pull", "--ff-only"])).unwrap(),
+            ShimCommand::Pull
+        );
+        assert_eq!(
+            classify_argv(&argv(&["push"])).unwrap(),
+            ShimCommand::Push {
+                remote: None,
+                set_upstream: false
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["push", "origin"])).unwrap(),
+            ShimCommand::Push {
+                remote: Some("origin".to_owned()),
+                set_upstream: false
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["push", "-u", "origin"])).unwrap(),
+            ShimCommand::Push {
+                remote: Some("origin".to_owned()),
+                set_upstream: true
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["push", "--set-upstream", "origin"])).unwrap(),
+            ShimCommand::Push {
+                remote: Some("origin".to_owned()),
+                set_upstream: true
+            }
+        );
+
+        for values in [
+            vec!["fetch", "--all"],
+            vec!["fetch", "--tags"],
+            vec!["fetch", "--prune", "--prune"],
+            vec!["fetch", "https://github.com/example/repo.git"],
+            vec!["fetch", "git@github.com:example/repo.git"],
+            vec!["fetch", "origin", "main"],
+            vec!["fetch", "origin", "refs/heads/main:refs/heads/main"],
+            vec!["fetch", "--depth", "1"],
+            vec!["fetch", "-c", "core.hooksPath=/tmp"],
+            vec!["pull", "--rebase"],
+            vec!["pull", "--no-ff"],
+            vec!["pull", "origin"],
+            vec!["pull", "--ff-only", "--ff-only", "extra"],
+            vec!["push", "--force"],
+            vec!["push", "-f"],
+            vec!["push", "--force-with-lease"],
+            vec!["push", "--all"],
+            vec!["push", "--tags"],
+            vec!["push", "--delete", "origin", "branch"],
+            vec!["push", "origin", "main"],
+            vec!["push", "origin", "HEAD:refs/heads/other"],
+            vec!["push", "-u"],
+            vec!["push", "--set-upstream"],
+            vec!["push", "-u", "origin", "extra"],
+            vec!["push", "--mirror"],
+            vec!["push", "-c", "push.default=matching"],
+            vec!["push", "https://github.com/example/repo.git"],
+            vec!["fetch", "-origin"],
+            vec!["push", "-u", "-origin"],
+        ] {
+            assert!(classify_argv(&argv(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    fn network_shim_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let remote = src_root.join("remote.git");
+        run_host_git(
+            &src_root,
+            &["init", "--quiet", "--bare", remote.to_str().unwrap()],
+        );
+        let repository = src_root.join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        init_repository(&repository);
+        run_host_git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_host_git(&repository, &["push", "--quiet", "-u", "origin", "main"]);
+        run_host_git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let repository = std::fs::canonicalize(&repository).unwrap();
+        (fixture, src_root, repository, remote)
+    }
+
+    #[tokio::test]
+    async fn shim_network_forms_use_the_configured_remote_contract() {
+        let (_fixture, src_root, repository, remote) = network_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let state = BrokerState {
+            src_root: None,
+            ..broker_state
+        };
+
+        // push publishes only the current branch.
+        std::fs::write(repository.join("tracked.txt"), "local-push\n").unwrap();
+        run_host_git(&repository, &["add", "tracked.txt"]);
+        run_host_git(&repository, &["commit", "--quiet", "-m", "local push"]);
+        let pushed = handle_request(&state, request(&repository, &["push"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "main"]),
+            run_host_git(&repository, &["rev-parse", "HEAD"])
+        );
+
+        // A new branch can set its upstream through ordinary syntax.
+        run_host_git(&repository, &["switch", "--quiet", "-c", "feature/network"]);
+        std::fs::write(repository.join("feature.txt"), "feature\n").unwrap();
+        run_host_git(&repository, &["add", "feature.txt"]);
+        run_host_git(&repository, &["commit", "--quiet", "-m", "feature"]);
+        let pushed = handle_request(&state, request(&repository, &["push", "-u", "origin"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(
+                &repository,
+                &["rev-parse", "--abbrev-ref", "feature/network@{upstream}"]
+            ),
+            "origin/feature/network"
+        );
+        run_host_git(&repository, &["switch", "--quiet", "main"]);
+
+        // fetch --prune observes a concurrent update without changing local work.
+        let other = src_root.join("other");
+        run_host_git(
+            &src_root,
+            &[
+                "clone",
+                "--quiet",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(other.join("remote-only.txt"), "remote-update\n").unwrap();
+        run_host_git(&other, &["add", "remote-only.txt"]);
+        run_host_git(&other, &["commit", "--quiet", "-m", "remote update"]);
+        run_host_git(&other, &["push", "--quiet", "origin", "main"]);
+        let remote_tip = run_host_git(&other, &["rev-parse", "HEAD"]);
+        std::fs::write(repository.join("tracked.txt"), "local-dirty\n").unwrap();
+
+        let fetched = handle_request(&state, request(&repository, &["fetch", "--prune"]))
+            .await
+            .unwrap();
+        assert_eq!(fetched.status, 0, "{}", fetched.stderr);
+        assert_eq!(
+            run_host_git(&repository, &["rev-parse", "refs/remotes/origin/main"]),
+            remote_tip
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("tracked.txt")).unwrap(),
+            "local-dirty\n",
+            "fetch must never touch the working tree"
+        );
+
+        // An unconfigured remote name fails closed with the configured-remote
+        // contract and no network access.
+        let rejected = handle_request(
+            &state,
+            request(&repository, &["fetch", "--prune", "upstream"]),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert!(
+            rejected.stderr.contains("not configured"),
+            "{}",
+            rejected.stderr
+        );
+
+        // pull --ff-only fast-forwards the current branch from its upstream
+        // while the local dirty file stays untouched.
+        let pulled = handle_request(&state, request(&repository, &["pull", "--ff-only"]))
+            .await
+            .unwrap();
+        assert_eq!(pulled.status, 0, "{}", pulled.stderr);
+        assert_eq!(
+            run_host_git(&repository, &["rev-parse", "HEAD"]),
+            remote_tip
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("tracked.txt")).unwrap(),
+            "local-dirty\n"
+        );
+    }
+
+    #[test]
+    fn network_command_shapes_never_carry_force_refspecs_or_urls() {
+        let fetch = mcp::build_git_fetch_command("origin");
+        assert_eq!(fetch.last().map(String::as_str), Some("origin"));
+        assert!(fetch.iter().any(|token| token == "--prune"));
+        let pull = mcp::build_git_pull_command();
+        assert!(pull.iter().any(|token| token == "--ff-only"));
+        let push = mcp::build_git_push_command(Some("origin".to_owned()), false);
+        assert_eq!(
+            push.iter().rev().take(2).cloned().collect::<Vec<_>>(),
+            vec!["HEAD".to_owned(), "origin".to_owned()]
+        );
+        let push_upstream = mcp::build_git_push_command(Some("origin".to_owned()), true);
+        assert!(push_upstream.iter().any(|token| token == "--set-upstream"));
+        for command in [&fetch, &pull, &push, &push_upstream] {
+            let rendered = command.join(" ");
+            assert!(!rendered.contains("--force"), "{rendered}");
+            assert!(!rendered.contains("--all"), "{rendered}");
+            assert!(!rendered.contains("--tags"), "{rendered}");
+            assert!(!rendered.contains("https://"), "{rendered}");
+            assert!(!rendered.contains("refs/heads"), "{rendered}");
+            assert!(!rendered.contains("--delete"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn classifier_accepts_only_the_bounded_switch_add_and_commit_forms() {
         assert_eq!(
             classify_argv(&argv(&["switch", "main"])).unwrap(),
@@ -3363,6 +3733,12 @@ mod tests {
             vec!["switch", "-c", "feature/x"],
             vec!["add", "tracked.txt"],
             vec!["commit", "-m", "x"],
+            vec!["fetch", "--prune"],
+            vec!["pull", "--ff-only"],
+            vec!["push"],
+            vec!["push", "-u", "origin"],
+            vec!["worktree", "list"],
+            vec!["worktree", "remove", "/src/worktrees/repo/task"],
         ] {
             assert_eq!(
                 shim_route(Some(broker), Some(responses), Some(git), &argv(&values)),
@@ -3410,8 +3786,9 @@ mod tests {
             "mutations require the request queue"
         );
         for values in [
-            vec!["push"],
-            vec!["fetch"],
+            vec!["push", "--force"],
+            vec!["fetch", "--tags"],
+            vec!["fetch", "https://github.com/example/repo.git"],
             vec!["config", "user.name"],
             vec!["status", "--output=/tmp/x"],
             vec!["diff", "--ext-diff"],
@@ -3473,7 +3850,17 @@ mod tests {
                 Some(&response_directory),
                 Some(&git),
                 &repository,
-                &argv(&["push"])
+                &argv(&["merge", "main"])
+            ),
+            SHIM_EXIT_REJECTED
+        );
+        assert_eq!(
+            run_shim_with(
+                Some(&request_directory),
+                Some(&response_directory),
+                Some(&git),
+                &repository,
+                &argv(&["push", "--force"])
             ),
             SHIM_EXIT_REJECTED
         );
