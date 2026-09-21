@@ -887,6 +887,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
         prepared.cwd.clone(),
         prepared.access,
         prepared.expected_repository.as_ref(),
+        crate::managed_worktree::configured_src_root_from_env(),
     )?;
     let mut writable_roots = Vec::new();
     if prepared.access == Access::WorkspaceWrite {

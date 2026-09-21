@@ -45,7 +45,7 @@ pub(crate) const BROKER_RESPONSES_ENVIRONMENT_VARIABLE: &str =
 pub(crate) const GIT_EXECUTABLE_ENVIRONMENT_VARIABLE: &str = "TEMOTE_MCP_GIT_EXECUTABLE";
 pub(crate) const SHIM_EXIT_REJECTED: i32 = 128;
 pub(crate) const SHIM_EXIT_INDETERMINATE: i32 = 70;
-pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, and the read-only commands status, diff, log, show, rev-parse, ls-files";
+pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, worktree list [--porcelain], worktree add [-b <new-branch>] <broker-derived-managed-path> [<existing-branch>], worktree remove <broker-derived-managed-path>, and the read-only commands status, diff, log, show, rev-parse, ls-files";
 pub(crate) const SHIM_INDETERMINATE_MESSAGE: &str = "git shim could not confirm the operation result; the operation may still be running; inspect the repository before retrying";
 const BROKER_SCHEMA: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -58,6 +58,8 @@ const MAX_REQUESTS_PER_TICK: usize = 16;
 const MAX_READ_ONLY_PATHS: usize = 256;
 const MAX_READ_ONLY_REVISION_BYTES: usize = 128;
 const MAX_READ_ONLY_COUNT: u64 = 10_000;
+const MAX_SHIM_WORKTREE_PATH_BYTES: usize = 4096;
+const MAX_SHIM_POLICY_MESSAGE_BYTES: usize = 4096;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -67,12 +69,25 @@ struct GitShimRequest {
     argv: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ShimCommand {
     SwitchExisting,
     SwitchCreate,
     Add,
     Commit,
+    /// `worktree list [--porcelain]` — served from the managed inventory.
+    WorktreeList,
+    /// `worktree add` — the destination must be the broker-derived managed
+    /// path; the caller never chooses filesystem placement.
+    WorktreeAdd {
+        branch: String,
+        path: String,
+        create_branch: bool,
+    },
+    /// `worktree remove` — delegated to the structured managed-worktree remove.
+    WorktreeRemove {
+        path: String,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -119,8 +134,80 @@ fn classify_argv(argv: &[String]) -> Result<ShimCommand> {
             mcp::validate_git_commit_message(message)?;
             Ok(ShimCommand::Commit)
         }
+        [command, subcommand, rest @ ..] if command.as_str() == "worktree" => {
+            classify_worktree_argv(subcommand, rest)
+        }
         _ => anyhow::bail!("unsupported Git shim command"),
     }
+}
+
+/// Classifies the narrow `worktree` allowlist.
+///
+/// Only `list [--porcelain]`, `add` with a branch (new via `-b`, or an existing
+/// trailing branch) and `remove <path>` are accepted. The path is never
+/// authoritative: the broker requires it to equal the Temote-derived managed
+/// path before any Git metadata mutation. Force, `--detach`, `--lock`, prune,
+/// move, repair and every other worktree shape stay rejected.
+fn classify_worktree_argv(subcommand: &str, rest: &[String]) -> Result<ShimCommand> {
+    match subcommand {
+        "list" => {
+            anyhow::ensure!(
+                rest.is_empty() || (rest.len() == 1 && rest[0] == "--porcelain"),
+                "unsupported git worktree list arguments"
+            );
+            Ok(ShimCommand::WorktreeList)
+        }
+        "add" => classify_worktree_add(rest),
+        "remove" => {
+            let [path] = rest else {
+                anyhow::bail!("git worktree remove requires exactly one managed path")
+            };
+            validate_shim_worktree_path(path)?;
+            Ok(ShimCommand::WorktreeRemove { path: path.clone() })
+        }
+        _ => anyhow::bail!("unsupported git worktree subcommand"),
+    }
+}
+
+fn classify_worktree_add(rest: &[String]) -> Result<ShimCommand> {
+    let (branch, path, create_branch) = match rest {
+        [option, branch, path] if matches!(option.as_str(), "-b" | "--create") => {
+            (branch, path, true)
+        }
+        [path, option, branch] if matches!(option.as_str(), "-b" | "--create") => {
+            (branch, path, true)
+        }
+        [path, branch] => (branch, path, false),
+        _ => anyhow::bail!(
+            "git worktree add requires -b <new-branch> <path> or <path> <existing-branch>; the destination is always the Temote-derived managed path"
+        ),
+    };
+    validate_shim_branch(branch)?;
+    validate_shim_worktree_path(path)?;
+    Ok(ShimCommand::WorktreeAdd {
+        branch: branch.clone(),
+        path: path.clone(),
+        create_branch,
+    })
+}
+
+/// Bounded syntax check for one worktree path argument. Authority is not
+/// granted here: the broker re-resolves and requires the exact managed path.
+fn validate_shim_worktree_path(path: &str) -> Result<()> {
+    anyhow::ensure!(!path.is_empty(), "worktree path must not be empty");
+    anyhow::ensure!(
+        path.len() <= MAX_SHIM_WORKTREE_PATH_BYTES,
+        "worktree path is too long"
+    );
+    anyhow::ensure!(
+        !path.starts_with('-'),
+        "worktree path must not look like a command option"
+    );
+    anyhow::ensure!(
+        !path.chars().any(char::is_control),
+        "worktree path must not contain control characters"
+    );
+    Ok(())
 }
 
 fn validate_shim_branch(branch: &str) -> Result<()> {
@@ -594,6 +681,92 @@ struct BrokerState {
     session: config::Session,
     access: Access,
     scope: BrokerScope,
+    /// The configured managed-worktree `src` named root, resolved by the parent
+    /// at broker start. `None` disables every managed-worktree shim form.
+    src_root: Option<PathBuf>,
+}
+
+impl BrokerState {
+    /// The session used for one structured managed-worktree operation.
+    ///
+    /// `cwd` is the already-validated broker request directory. Only the
+    /// working directory changes; the permitted roots stay exactly the ones the
+    /// parent authorized, so no request can widen filesystem scope.
+    fn operation_session(&self, cwd: &Path) -> config::Session {
+        let mut session = self.session.clone();
+        session.cwd = cwd.to_path_buf();
+        session
+    }
+
+    fn managed_src_root(&self) -> Result<PathBuf> {
+        self.src_root
+            .clone()
+            .context("managed worktrees require the configured src named root in TEMOTE_MCP_ROOTS")
+    }
+}
+
+/// Resolves the managed `src` root or returns the bounded shim outcome that the
+/// agent should see. A missing named root never becomes a broker protocol error
+/// so the agent receives a correctable policy message on stderr.
+fn managed_src_root_or_output(
+    state: &BrokerState,
+) -> std::result::Result<PathBuf, sandbox::Output> {
+    state
+        .managed_src_root()
+        .map_err(|error| structured_shim_output(Err(error)))
+}
+
+/// Renders one structured tool result as a bounded shim process outcome.
+///
+/// Structured failures keep their specific bounded policy message on stderr so
+/// the agent can correct its intent, instead of the fixed generic rejection.
+fn structured_shim_output(result: Result<Value>) -> sandbox::Output {
+    match result {
+        Ok(value) => sandbox::Output {
+            status: 0,
+            stdout: structured_result_text(&value),
+            stderr: String::new(),
+            truncated: false,
+        },
+        Err(error) => {
+            let mut message = format!("{error:#}");
+            if message.len() > MAX_SHIM_POLICY_MESSAGE_BYTES {
+                let mut boundary = MAX_SHIM_POLICY_MESSAGE_BYTES;
+                while !message.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                message.truncate(boundary);
+            }
+            sandbox::Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: message,
+                truncated: false,
+            }
+        }
+    }
+}
+
+fn structured_result_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// Resolves one shim worktree path argument against the validated request
+/// directory. The result is a lexical path; it never grants authority.
+fn resolve_shim_worktree_path(cwd: &Path, path: &str) -> PathBuf {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        cwd.join(candidate)
+    }
 }
 
 async fn handle_request(state: &BrokerState, request: GitShimRequest) -> Result<sandbox::Output> {
@@ -644,6 +817,88 @@ async fn handle_request(state: &BrokerState, request: GitShimRequest) -> Result<
             mcp::ensure_staged_paths_are_permitted(&narrowed, &workspace).await?;
             let command = mcp::build_git_commit_command(&request.argv[2]);
             run_git_command(state, &workspace, command).await
+        }
+        ShimCommand::WorktreeList => {
+            let src_root = match managed_src_root_or_output(state) {
+                Ok(src_root) => src_root,
+                Err(output) => return Ok(output),
+            };
+            let operation = state.operation_session(&cwd);
+            let result =
+                mcp::git_worktree_list_with_src_root(&json!({}), &operation, Some(&src_root), None)
+                    .await;
+            Ok(structured_shim_output(result))
+        }
+        ShimCommand::WorktreeAdd {
+            branch,
+            path,
+            create_branch,
+        } => {
+            let src_root = match managed_src_root_or_output(state) {
+                Ok(src_root) => src_root,
+                Err(output) => return Ok(output),
+            };
+            let operation = state.operation_session(&cwd);
+            let result = async {
+                let repository = mcp::managed_repository_for_requested(
+                    None,
+                    &operation,
+                    &cwd,
+                    &src_root,
+                )?;
+                let task = crate::managed_worktree::derive_task_name(&branch)?;
+                let target = repository.target(&task)?;
+                let requested = resolve_shim_worktree_path(&cwd, &path);
+                anyhow::ensure!(
+                    requested == target,
+                    "Temote workspace policy: worktree destination is derived by Temote and must be {}; no worktree was created",
+                    target.display()
+                );
+                if create_branch {
+                    mcp::validate_git_branch_name(&operation, &cwd, &branch).await?;
+                    mcp::ensure_local_branch_absent(&operation, &cwd, &branch).await?;
+                    let base = mcp::resolve_git_base_commit(&operation, &cwd, "HEAD").await?;
+                    let created = run_git_command(
+                        state,
+                        &workspace,
+                        mcp::build_git_branch_create_command(&branch, &base),
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        created.status == 0,
+                        "cannot create the managed worktree branch: {}",
+                        created.stderr.trim()
+                    );
+                }
+                let (_, value) = mcp::create_managed_worktree(
+                    &operation,
+                    &src_root,
+                    &branch,
+                    Some(&task),
+                    None,
+                    None,
+                )
+                .await?;
+                Ok(value)
+            }
+            .await;
+            Ok(structured_shim_output(result))
+        }
+        ShimCommand::WorktreeRemove { path } => {
+            let src_root = match managed_src_root_or_output(state) {
+                Ok(src_root) => src_root,
+                Err(output) => return Ok(output),
+            };
+            let operation = state.operation_session(&cwd);
+            let requested = resolve_shim_worktree_path(&cwd, &path);
+            let result = mcp::git_worktree_remove_in_src_root(
+                &json!({"path": requested.to_string_lossy()}),
+                &operation,
+                &src_root,
+                None,
+            )
+            .await;
+            Ok(structured_shim_output(result))
         }
     }
 }
@@ -878,6 +1133,7 @@ impl GitBroker {
             workspace,
             access,
             None,
+            None,
         )
     }
 
@@ -888,6 +1144,9 @@ impl GitBroker {
     /// closed unless it equals `expected_identity`; it never adopts a
     /// different observed repository as a new valid identity. Every later
     /// request is re-validated against this pinned scope as before.
+    ///
+    /// `src_root` is the configured managed-worktree `src` named root resolved
+    /// by the parent. `None` disables every managed-worktree shim form.
     pub(crate) fn start_with_expected(
         requests_directory: PathBuf,
         responses_directory: PathBuf,
@@ -895,12 +1154,14 @@ impl GitBroker {
         workspace: PathBuf,
         access: Access,
         expected_identity: Option<&sandbox::WorkspaceRepositoryIdentity>,
+        src_root: Option<PathBuf>,
     ) -> Result<Self> {
         let queue = BrokerQueue::create(&requests_directory, &responses_directory)?;
         let state = Arc::new(BrokerState {
             session,
             access,
             scope: BrokerScope::for_workspace_with_expected(&workspace, expected_identity)?,
+            src_root,
         });
         let task = tokio::spawn(serve(queue, state));
         Ok(Self {
@@ -1621,6 +1882,16 @@ mod tests {
             session: session(repository),
             access,
             scope: BrokerScope::for_workspace(repository).unwrap(),
+            src_root: None,
+        }
+    }
+
+    fn state_with_src_root(repository: &Path, src_root: &Path) -> BrokerState {
+        BrokerState {
+            session: session(repository),
+            access: Access::WorkspaceWrite,
+            scope: BrokerScope::for_workspace(repository).unwrap(),
+            src_root: Some(src_root.to_path_buf()),
         }
     }
 
@@ -1661,6 +1932,288 @@ mod tests {
         run_host_git(repository, &["add", "tracked.txt"]);
         run_host_git(repository, &["commit", "--quiet", "-m", "initial"]);
         run_host_git(repository, &["branch", "-M", "main"]);
+    }
+
+    #[test]
+    fn worktree_classifier_accepts_only_the_managed_allowlist() {
+        let managed = "/src/worktrees/repo/feat-x";
+        assert_eq!(
+            classify_argv(&argv(&["worktree", "list"])).unwrap(),
+            ShimCommand::WorktreeList
+        );
+        assert_eq!(
+            classify_argv(&argv(&["worktree", "list", "--porcelain"])).unwrap(),
+            ShimCommand::WorktreeList
+        );
+        assert_eq!(
+            classify_argv(&argv(&["worktree", "add", "-b", "feat/x", managed])).unwrap(),
+            ShimCommand::WorktreeAdd {
+                branch: "feat/x".to_owned(),
+                path: managed.to_owned(),
+                create_branch: true,
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["worktree", "add", managed, "-b", "feat/x"])).unwrap(),
+            ShimCommand::WorktreeAdd {
+                branch: "feat/x".to_owned(),
+                path: managed.to_owned(),
+                create_branch: true,
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["worktree", "add", managed, "existing"])).unwrap(),
+            ShimCommand::WorktreeAdd {
+                branch: "existing".to_owned(),
+                path: managed.to_owned(),
+                create_branch: false,
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["worktree", "remove", managed])).unwrap(),
+            ShimCommand::WorktreeRemove {
+                path: managed.to_owned()
+            }
+        );
+
+        for values in [
+            vec!["worktree"],
+            vec!["worktree", "prune"],
+            vec!["worktree", "move", "a", "b"],
+            vec!["worktree", "repair"],
+            vec!["worktree", "lock", managed],
+            vec!["worktree", "unlock", managed],
+            vec!["worktree", "list", "--verbose"],
+            vec!["worktree", "list", "extra"],
+            vec!["worktree", "add"],
+            vec!["worktree", "add", managed],
+            vec!["worktree", "add", "-b", "feat/x"],
+            vec!["worktree", "add", "--detach", managed],
+            vec!["worktree", "add", "--force", managed, "existing"],
+            vec!["worktree", "add", "-b", "feat/x", managed, "extra"],
+            vec!["worktree", "add", "-b", "-x", managed],
+            vec!["worktree", "add", "-b", "feat/x", "-x"],
+            vec!["worktree", "remove"],
+            vec!["worktree", "remove", "--force", managed],
+            vec!["worktree", "remove", managed, "extra"],
+            vec!["worktree", "remove", "-x"],
+            vec!["worktree", "add", "-b", "feat/x", ""],
+            vec!["worktree", "add", "-b", "feat/x", "a\nb"],
+        ] {
+            assert!(classify_argv(&argv(&values)).is_err(), "{values:?}");
+        }
+        // The path is never authoritative and never becomes a Git option.
+        let overly_long = format!("/src/{}", "a".repeat(MAX_SHIM_WORKTREE_PATH_BYTES));
+        assert!(classify_argv(&argv(&["worktree", "remove", &overly_long])).is_err());
+    }
+
+    fn managed_shim_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let repository = src_root.join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        init_repository(&repository);
+        let repository = std::fs::canonicalize(&repository).unwrap();
+        let managed_root = src_root.join("worktrees").join("repo");
+        std::fs::create_dir_all(&managed_root).unwrap();
+        let legacy = repository.join(".wt").join("legacy");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        run_host_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                legacy.to_str().unwrap(),
+                "-b",
+                "legacy-branch",
+            ],
+        );
+        (fixture, src_root, repository, managed_root)
+    }
+
+    #[tokio::test]
+    async fn shim_worktree_forms_delegate_to_the_managed_broker() {
+        let (_fixture, src_root, repository, managed_root) = managed_shim_fixture();
+        let state = state_with_src_root(&repository, &src_root);
+        let legacy = repository.join(".wt").join("legacy");
+        let legacy_before = repository_snapshot(&legacy);
+
+        // list: the managed inventory, without touching any worktree.
+        let listed = handle_request(&state, request(&repository, &["worktree", "list"]))
+            .await
+            .unwrap();
+        assert_eq!(listed.status, 0, "{}", listed.stderr);
+        let inventory: Value = serde_json::from_str(&listed.stdout).unwrap();
+        assert_eq!(inventory["repository"], "repo");
+        assert_eq!(
+            inventory["managed_root"],
+            managed_root.to_string_lossy().as_ref()
+        );
+
+        // add: the destination must be the broker-derived managed path.
+        let target = managed_root.join("feat-task");
+        let created = handle_request(
+            &state,
+            request(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/task",
+                    target.to_str().unwrap(),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status, 0, "{}", created.stderr);
+        assert_eq!(
+            run_host_git(&target, &["branch", "--show-current"]),
+            "feat/task"
+        );
+
+        // add: an arbitrary destination is rejected before any mutation.
+        let escape = src_root.join("escape");
+        let rejected = handle_request(
+            &state,
+            request(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/escape",
+                    escape.to_str().unwrap(),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert!(
+            rejected.stderr.contains("Temote workspace policy"),
+            "{}",
+            rejected.stderr
+        );
+        assert!(!escape.exists());
+        assert!(run_host_git(&repository, &["branch", "--list", "feat/escape"]).is_empty());
+
+        // add: a managed-root path whose component does not match the branch
+        // is rejected too.
+        let mismatched = managed_root.join("other-task");
+        let rejected = handle_request(
+            &state,
+            request(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/task2",
+                    mismatched.to_str().unwrap(),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert!(!mismatched.exists());
+
+        // remove: delegated to the structured managed remove.
+        let removed = handle_request(
+            &state,
+            request(
+                &repository,
+                &["worktree", "remove", target.to_str().unwrap()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed.status, 0, "{}", removed.stderr);
+        assert!(!target.exists());
+        assert!(
+            !run_host_git(&repository, &["branch", "--list", "feat/task"]).is_empty(),
+            "the branch ref must survive the shim worktree remove"
+        );
+
+        // Legacy and out-of-root worktrees are never adopted or removed.
+        let rejected = handle_request(
+            &state,
+            request(
+                &repository,
+                &["worktree", "remove", legacy.to_str().unwrap()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert_eq!(repository_snapshot(&legacy), legacy_before);
+        assert!(legacy.join("tracked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn shim_worktree_remove_rejects_dirty_worktrees_and_missing_src_authority() {
+        let (_fixture, src_root, repository, managed_root) = managed_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let target = managed_root.join("dirty-task");
+        let created = handle_request(
+            &broker_state,
+            request(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "dirty/task",
+                    target.to_str().unwrap(),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status, 0, "{}", created.stderr);
+        std::fs::write(target.join("unrelated.txt"), "keep\n").unwrap();
+
+        let rejected = handle_request(
+            &broker_state,
+            request(
+                &repository,
+                &["worktree", "remove", target.to_str().unwrap()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert!(
+            rejected.stderr.contains("modified or untracked"),
+            "{}",
+            rejected.stderr
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("unrelated.txt")).unwrap(),
+            "keep\n"
+        );
+
+        // Without the configured src authority every managed form fails closed.
+        let unconfigured = state(&repository, Access::WorkspaceWrite);
+        for values in [
+            vec!["worktree", "list"],
+            vec!["worktree", "add", "-b", "feat/x", "/tmp/x"],
+            vec!["worktree", "remove", target.to_str().unwrap()],
+        ] {
+            let rejected = handle_request(&unconfigured, request(&repository, &values))
+                .await
+                .unwrap();
+            assert_ne!(rejected.status, 0, "{values:?}");
+            assert!(
+                rejected.stderr.contains("src named root"),
+                "{values:?}: {}",
+                rejected.stderr
+            );
+        }
+        assert!(target.exists());
     }
 
     #[test]
@@ -1916,6 +2469,7 @@ mod tests {
             access: Access::WorkspaceWrite,
             scope: BrokerScope::for_workspace(&selected).unwrap(),
             session,
+            src_root: None,
         };
 
         let error = handle_request(
@@ -2390,6 +2944,7 @@ mod tests {
             session,
             access: Access::WorkspaceWrite,
             scope: BrokerScope::for_workspace(&linked).unwrap(),
+            src_root: None,
         };
         assert!(
             broker_state

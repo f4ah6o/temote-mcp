@@ -2877,7 +2877,7 @@ fn reject_removed_managed_worktree_arguments(args: &Value, removed: &[&str]) -> 
 /// Resolves the canonical repository identity and its Temote-managed worktree
 /// namespace for one session request. Callers never supply a filesystem path;
 /// the optional repository input is only cross-checked against the identity.
-fn managed_repository_for_requested(
+pub(crate) fn managed_repository_for_requested(
     requested: Option<&str>,
     session: &config::Session,
     cwd: &Path,
@@ -2907,7 +2907,7 @@ async fn git_worktree_create(
 /// The repository identity, target, task and branch are pinned from Temote's
 /// own canonical resolution; no caller-supplied path participates.
 #[derive(Clone, Debug)]
-struct ManagedWorktreeBinding {
+pub(crate) struct ManagedWorktreeBinding {
     repository: managed_worktree::ManagedRepository,
     target: PathBuf,
     branch: String,
@@ -3022,7 +3022,7 @@ async fn git_worktree_create_in_src_root(
 /// Every pre-approval step is read-only, the caller can never supply a path,
 /// and the created target is re-verified against the trusted managed root and
 /// repository identity before it is reported as created.
-async fn create_managed_worktree(
+pub(crate) async fn create_managed_worktree(
     session: &config::Session,
     src_root: &Path,
     branch: &str,
@@ -3224,7 +3224,7 @@ async fn git_worktree_list(
     .await
 }
 
-async fn git_worktree_list_with_src_root(
+pub(crate) async fn git_worktree_list_with_src_root(
     args: &Value,
     session: &config::Session,
     src_root: Option<&Path>,
@@ -3852,7 +3852,7 @@ async fn git_worktree_remove(
     git_worktree_remove_in_src_root(args, session, &src_root, activity).await
 }
 
-async fn git_worktree_remove_in_src_root(
+pub(crate) async fn git_worktree_remove_in_src_root(
     args: &Value,
     session: &config::Session,
     src_root: &Path,
