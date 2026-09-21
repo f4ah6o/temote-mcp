@@ -2923,11 +2923,14 @@ impl ManagedWorktreeBinding {
         run
     }
 
-    /// Re-derives and re-verifies this binding from the configured `src` root.
+    /// Re-derives and re-verifies this binding from the configured `src` root
+    /// and returns the canonical repository identity that was validated.
     ///
     /// Used immediately before a local agent launch so neither the pre-run
     /// resolution nor model prompt compliance is the enforcement mechanism.
-    fn revalidate(&self, src_root: &Path) -> Result<()> {
+    /// The returned identity is carried to the Git broker and the sandbox
+    /// launch, which fail closed unless they re-observe exactly this identity.
+    fn revalidate(&self, src_root: &Path) -> Result<sandbox::WorkspaceRepositoryIdentity> {
         let repository =
             managed_worktree::ManagedRepository::resolve(self.repository_root(), src_root)?;
         anyhow::ensure!(
@@ -2941,7 +2944,20 @@ impl ManagedWorktreeBinding {
             &self.branch,
             &selected_common_dir,
             self.repository_root(),
-        )
+        )?;
+        let expected = sandbox::WorkspaceRepositoryIdentity::for_workspace(&self.target)
+            .context("managed worktree target is no longer a supported Git worktree root")?;
+        anyhow::ensure!(
+            expected.worktree_root == self.target,
+            "managed worktree target is no longer the validated direct child: {}",
+            self.target.display()
+        );
+        anyhow::ensure!(
+            expected.common_dir == selected_common_dir
+                && expected.primary_checkout == self.repository_root(),
+            "managed worktree repository identity changed while approval was pending"
+        );
+        Ok(expected)
     }
 }
 
@@ -4714,6 +4730,28 @@ async fn local_agent_run_with_src_root(
     activity: Option<ActivityScope>,
     src_root: Option<&Path>,
 ) -> Result<Value> {
+    local_agent_run_with_src_root_at_boundary(args, session, executable, activity, src_root, || {})
+        .await
+}
+
+/// Internal variant of [`local_agent_run_with_src_root`] used by the
+/// launch-boundary regression tests.
+///
+/// `boundary` runs after the final managed-worktree identity validation has
+/// been attached to the prepared run and before the local agent task is
+/// spawned. Production always passes a no-op; the callback observes the same
+/// authority state, so it cannot bypass or weaken any validation.
+async fn local_agent_run_with_src_root_at_boundary<F>(
+    args: &Value,
+    session: &config::Session,
+    executable: Option<&Path>,
+    activity: Option<ActivityScope>,
+    src_root: Option<&Path>,
+    boundary: F,
+) -> Result<Value>
+where
+    F: FnOnce(),
+{
     let binding = match src_root {
         Some(src_root) => {
             local_agent_managed_worktree_binding_with_src_root(
@@ -4746,7 +4784,7 @@ async fn local_agent_run_with_src_root(
         Some(binding) => binding.run_session(session),
         None => session.clone(),
     };
-    let prepared = match executable {
+    let mut prepared = match executable {
         Some(executable) => {
             local_agent::prepare_with_executable(&effective_args, &run_session, executable)?
         }
@@ -4804,8 +4842,13 @@ async fn local_agent_run_with_src_root(
             Some(src_root) => src_root.to_path_buf(),
             None => configured_src_root()?,
         };
-        binding.revalidate(&src_root)?;
+        let expected_identity = binding.revalidate(&src_root)?;
+        prepared.bind_managed_worktree_identity(expected_identity)?;
     }
+    // The broker and the sandbox launch compare against the identity above,
+    // so the final validation and the actual spawn target cannot diverge into
+    // a different repository that happens to live at the same path.
+    boundary();
     let (description, mut handle, completion) =
         spawn_local_agent(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
@@ -10652,6 +10695,820 @@ mod tests {
             git_fixture_stdout(&checkout, &["status", "--porcelain"]).contains("?? untracked.txt")
         );
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_agent_worktree_binding_requires_the_primary_checkout_authority() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        // The session only permits a legacy worktree, so it has no authority
+        // over the canonical primary checkout that anchors the managed root.
+        let legacy = canonical_root.join("repo-legacy-linked");
+        let legacy_session = config::Session {
+            cwd: legacy.clone(),
+            permitted_directories: vec![legacy.clone()],
+            ..session.clone()
+        };
+
+        let error = local_agent_managed_worktree_binding_with_src_root(
+            &json!({
+                "session_id": legacy_session.id,
+                "worktree": {"branch": "feature/foo/bar"}
+            }),
+            &legacy_session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("permitted session root"),
+            "{error:#}"
+        );
+        assert!(!canonical_root.join("worktrees").exists());
+    }
+
+    /// The managed binding is re-derived from filesystem state immediately
+    /// before launch: a swapped target, managed root, `.git` pointer or
+    /// repository identity must fail closed instead of spawning in an
+    /// unauthorized workspace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_agent_worktree_binding_revalidates_swapped_workspace_identity() {
+        use std::os::unix::fs::symlink;
+
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        let managed_root = canonical_root.join("worktrees").join("repo");
+        let target = managed_root.join("feature-foo-bar");
+        let binding = local_agent_managed_worktree_binding_with_src_root(
+            &json!({"session_id": session.id, "worktree": {"branch": "feature/foo/bar"}}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("managed worktree binding");
+        binding.revalidate(&canonical_root).unwrap();
+
+        // A target swapped for a symbolic link is never trusted again.
+        let moved = managed_root.join("moved-away");
+        std::fs::rename(&target, &moved).unwrap();
+        symlink(&moved, &target).unwrap();
+        let error = binding.revalidate(&canonical_root).unwrap_err();
+        assert!(error.to_string().contains("normal directory"), "{error:#}");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::rename(&moved, &target).unwrap();
+        binding.revalidate(&canonical_root).unwrap();
+
+        // A swapped managed root is no longer the trusted authority.
+        let real_root = canonical_root.join("worktrees").join("repo-real");
+        std::fs::rename(&managed_root, &real_root).unwrap();
+        symlink(&real_root, &managed_root).unwrap();
+        let error = binding.revalidate(&canonical_root).unwrap_err();
+        assert!(
+            error.to_string().contains("trusted normal directory"),
+            "{error:#}"
+        );
+        std::fs::remove_file(&managed_root).unwrap();
+        std::fs::rename(&real_root, &managed_root).unwrap();
+        binding.revalidate(&canonical_root).unwrap();
+
+        // A `.git` pointer swapped to another repository's structurally valid
+        // private metadata keeps the target path but changes the identity.
+        let other = canonical_root.join("other-repo");
+        std::fs::create_dir(&other).unwrap();
+        init_git_repository(&other);
+        let other_linked = canonical_root.join("other-linked");
+        run_git_fixture(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                other_linked.to_str().unwrap(),
+                "-b",
+                "other-branch",
+            ],
+        );
+        let other_private = other.join(".git").join("worktrees").join("other-linked");
+        let original_pointer = std::fs::read_to_string(target.join(".git")).unwrap();
+        let original_other_gitdir = std::fs::read_to_string(other_private.join("gitdir")).unwrap();
+        std::fs::write(
+            target.join(".git"),
+            format!("gitdir: {}\n", other_private.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            other_private.join("gitdir"),
+            format!("{}\n", target.join(".git").display()),
+        )
+        .unwrap();
+        let error = binding.revalidate(&canonical_root).unwrap_err();
+        assert!(
+            error.to_string().contains("common Git directory mismatch"),
+            "{error:#}"
+        );
+        std::fs::write(target.join(".git"), &original_pointer).unwrap();
+        std::fs::write(other_private.join("gitdir"), &original_other_gitdir).unwrap();
+        binding.revalidate(&canonical_root).unwrap();
+
+        // Another repository's worktree moved into the expected path is a
+        // different repository identity, not a reusable managed worktree.
+        let backup = managed_root.join("backup");
+        std::fs::rename(&target, &backup).unwrap();
+        run_git_fixture(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "-b",
+                "other-replacement",
+            ],
+        );
+        let error = binding.revalidate(&canonical_root).unwrap_err();
+        assert!(
+            error.to_string().contains("common Git directory mismatch"),
+            "{error:#}"
+        );
+        run_git_fixture(
+            &other,
+            &["worktree", "remove", "--force", target.to_str().unwrap()],
+        );
+        std::fs::rename(&backup, &target).unwrap();
+        binding.revalidate(&canonical_root).unwrap();
+    }
+
+    /// A rejected managed-worktree binding must fail before the agent is
+    /// prepared or spawned, even when a wrong-branch managed target already
+    /// exists at the derived path.
+    #[tokio::test]
+    async fn local_agent_run_worktree_binding_failure_starts_no_agent() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        run_git_fixture(&checkout, &["branch", "wrong-branch"]);
+        let target = canonical_root.join("worktrees/repo/feature-foo-bar");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        run_git_fixture(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "wrong-branch",
+            ],
+        );
+        let target_before = worktree_snapshot(&target);
+        let checkout_before = worktree_snapshot(&checkout);
+
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake_agent = activity_delegated_job_executable(
+            fake_dir.path(),
+            "codex",
+            "#!/bin/sh\npwd > ran-in.txt\nprintf 'must-not-run\\n'\n",
+        );
+        let error = local_agent_run_with_src_root(
+            &json!({
+                "session_id": session.id,
+                "agent": "codex",
+                "task": "must not start",
+                "access": "workspace_write",
+                "worktree": {"branch": "feature/foo/bar"}
+            }),
+            &session,
+            Some(&fake_agent),
+            None,
+            Some(&canonical_root),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be reused"), "{error:#}");
+        assert!(!target.join("ran-in.txt").exists());
+        assert!(!checkout.join("ran-in.txt").exists());
+        assert_eq!(worktree_snapshot(&target), target_before);
+        assert_eq!(worktree_snapshot(&checkout), checkout_before);
+    }
+
+    /// The approval boundary is not an authority transfer: the workspace
+    /// identity is re-derived and re-verified after approval, so a target whose
+    /// `.git` pointer is swapped while the approval is pending fails closed and
+    /// the agent never starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_agent_run_worktree_binding_swapped_during_approval_starts_no_agent() {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let checkout = src_root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        init_git_repository(&checkout);
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        std::fs::write(checkout.join("untracked.txt"), "keep\n").unwrap();
+        let managed_root = src_root.join("worktrees").join("repo");
+        std::fs::create_dir_all(&managed_root).unwrap();
+        let target = managed_root.join("feature-foo-bar");
+        run_git_fixture(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "feature/foo/bar",
+            ],
+        );
+
+        // A structurally valid private metadata directory of another
+        // repository, prepared before the run so the swap itself is a pair of
+        // bounded writes while approval is pending.
+        let other = src_root.join("other-repo");
+        std::fs::create_dir(&other).unwrap();
+        init_git_repository(&other);
+        let other_linked = src_root.join("other-linked");
+        run_git_fixture(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                other_linked.to_str().unwrap(),
+                "-b",
+                "other-branch",
+            ],
+        );
+        let other_private = other.join(".git").join("worktrees").join("other-linked");
+
+        let id = format!("wt-approval-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            &checkout,
+            Some(&id),
+            config::PermissionMode::Ask,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake_agent = activity_delegated_job_executable(
+            fake_dir.path(),
+            "codex",
+            "#!/bin/sh\npwd > ran-in.txt\nprintf 'must-not-run\\n'\n",
+        );
+        let args = json!({
+            "session_id": id,
+            "agent": "codex",
+            "task": "approval-time identity swap",
+            "access": "workspace_write",
+            "worktree": {"branch": "feature/foo/bar"}
+        });
+        let run_root = src_root.clone();
+        let run_session = session.clone();
+        let task = tokio::spawn(async move {
+            let _fixture = fixture;
+            let _fake_dir = fake_dir;
+            local_agent_run_with_src_root(
+                &args,
+                &run_session,
+                Some(&fake_agent),
+                None,
+                Some(&run_root),
+            )
+            .await
+        });
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("local_agent_run did not request approval")
+            .expect("approval channel closed before local_agent_run request");
+        assert_eq!(prompt.request.operation, "local_agent_run");
+        // The approval identifies the Temote-derived managed workspace, never a
+        // caller-supplied path. Workspace classification reads the configured
+        // named root from the environment, which the `_with_src_root` test seam
+        // intentionally bypasses, so only the identity fields are asserted.
+        assert!(
+            prompt
+                .request
+                .detail
+                .contains(&format!("workspace_root: {}", target.display())),
+            "{}",
+            prompt.request.detail
+        );
+        assert!(
+            prompt.request.detail.contains("repository: repo"),
+            "{}",
+            prompt.request.detail
+        );
+        assert!(
+            prompt.request.detail.contains("branch: feature/foo/bar"),
+            "{}",
+            prompt.request.detail
+        );
+
+        std::fs::write(
+            target.join(".git"),
+            format!("gitdir: {}\n", other_private.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            other_private.join("gitdir"),
+            format!("{}\n", target.join(".git").display()),
+        )
+        .unwrap();
+        prompt.respond(true);
+
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("swapped workspace unexpectedly started the agent");
+        assert!(
+            error.to_string().contains("common Git directory mismatch"),
+            "{error:#}"
+        );
+        assert!(!target.join("ran-in.txt").exists());
+        assert!(!checkout.join("ran-in.txt").exists());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    const R3_APPROVAL_IDENTITY_TEST_NAME: &str =
+        "mcp::tests::local_agent_worktree_approval_identity_uses_the_configured_src_named_root";
+
+    /// Child-process body for the configured named-root integration test.
+    ///
+    /// Runs the production authority path (`local_agent_managed_worktree_binding`
+    /// reads `TEMOTE_MCP_ROOTS` from the environment) and asserts the approval
+    /// detail and metadata identity derived from it.
+    #[cfg(unix)]
+    fn run_r3_approval_identity_fixture() -> Result<()> {
+        const SRC: &str = "TEMOTE_TEST_R3_SRC_ROOT";
+        let src_root = PathBuf::from(std::env::var(SRC).context("missing src root")?);
+        let src_root = std::fs::canonicalize(&src_root)?;
+        let checkout = src_root.join("repo");
+        let session = config::Session {
+            id: format!("r3-{}", Uuid::new_v4()),
+            cwd: checkout.clone(),
+            permitted_directories: vec![checkout.clone()],
+            started_at: 1,
+            process_id: 1,
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("cannot start the R3 child runtime")?;
+        runtime.block_on(async move {
+            let binding = local_agent_managed_worktree_binding(
+                &json!({"session_id": session.id, "worktree": {"branch": "feature/r3"}}),
+                &session,
+                None,
+            )
+            .await?
+            .expect("managed worktree binding");
+            let target = src_root.join("worktrees").join("repo").join("feature-r3");
+            assert_eq!(binding.workspace_root(), target);
+
+            // The classification uses the same configured named root as the
+            // production binding resolution.
+            let workspace = managed_worktree::inspect_session_workspace(
+                binding.workspace_root(),
+                managed_worktree::configured_src_root_from_env().as_deref(),
+            )
+            .expect("workspace identity");
+            assert_eq!(
+                workspace.workspace_type,
+                managed_worktree::SessionWorkspaceType::ManagedWorktree
+            );
+            assert_eq!(workspace.repository_root, checkout);
+            assert_eq!(workspace.workspace_root, target);
+            assert_eq!(workspace.repository.as_deref(), Some("repo"));
+            assert_eq!(workspace.branch.as_deref(), Some("feature/r3"));
+            assert_eq!(workspace.task.as_deref(), Some("feature-r3"));
+
+            // The branch comes from the linked worktree's own HEAD, never from
+            // the primary checkout's HEAD.
+            assert_eq!(
+                sandbox::git_current_branch(&target)?.as_deref(),
+                Some("feature/r3")
+            );
+            assert_eq!(
+                sandbox::git_current_branch(&checkout)?.as_deref(),
+                Some("main")
+            );
+
+            let run_session = binding.run_session(&session);
+            assert_eq!(
+                run_session.permitted_directories,
+                vec![checkout.clone(), target.clone()]
+            );
+            assert_eq!(session.cwd, checkout);
+            assert_eq!(session.permitted_directories, vec![checkout.clone()]);
+
+            let fake_dir = tempfile::tempdir()?;
+            let fake_agent = activity_delegated_job_executable(
+                fake_dir.path(),
+                "codex",
+                "#!/bin/sh\nprintf 'r3\\n'\n",
+            );
+            let effective_args = json!({
+                "session_id": session.id,
+                "agent": "codex",
+                "task": "r3 identity",
+                "access": "workspace_write",
+                "cwd": target.to_string_lossy(),
+            });
+            let prepared =
+                local_agent::prepare_with_executable(&effective_args, &run_session, &fake_agent)?;
+            assert_eq!(prepared.cwd, target);
+
+            let detail = prepared.approval_detail();
+            assert!(
+                detail.contains("workspace_type: managed_worktree"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains(&format!("repository_root: {}", checkout.display())),
+                "{detail}"
+            );
+            assert!(
+                detail.contains(&format!("workspace_root: {}", target.display())),
+                "{detail}"
+            );
+            assert!(detail.contains("repository: repo"), "{detail}");
+            assert!(detail.contains("branch: feature/r3"), "{detail}");
+            assert!(detail.contains("task: feature-r3"), "{detail}");
+
+            let metadata = prepared.approval_metadata();
+            let keys = metadata.keys().cloned().collect::<Vec<_>>();
+            assert_eq!(
+                keys,
+                vec![
+                    "access",
+                    "agent",
+                    "branch",
+                    "cwd",
+                    "provenance",
+                    "repository",
+                    "repository_root",
+                    "scope",
+                    "source",
+                    "task",
+                    "task_bytes",
+                    "task_sha256",
+                    "workspace_root",
+                    "workspace_type",
+                ]
+            );
+            assert_eq!(metadata["workspace_type"], "managed_worktree");
+            assert_eq!(
+                metadata["repository_root"],
+                checkout.to_string_lossy().as_ref()
+            );
+            assert_eq!(
+                metadata["workspace_root"],
+                target.to_string_lossy().as_ref()
+            );
+            assert_eq!(metadata["repository"], "repo");
+            assert_eq!(metadata["branch"], "feature/r3");
+            assert_eq!(metadata["task"], "feature-r3");
+            assert!(
+                !metadata
+                    .values()
+                    .any(|value| value.contains("TEMOTE_MCP") || value.contains("keep me")),
+                "{metadata:?}"
+            );
+            Ok(())
+        })
+    }
+
+    /// R3: the configured `TEMOTE_MCP_ROOTS` production path must classify the
+    /// derived workspace as a managed worktree and report the validated
+    /// identity in the approval detail/metadata. The child process isolates the
+    /// process-global environment from parallel tests.
+    #[cfg(unix)]
+    #[test]
+    fn local_agent_worktree_approval_identity_uses_the_configured_src_named_root() {
+        const ROLE: &str = "TEMOTE_TEST_R3_APPROVAL_IDENTITY_ROLE";
+        const SRC: &str = "TEMOTE_TEST_R3_SRC_ROOT";
+
+        if std::env::var(ROLE).as_deref() == Ok("fixture") {
+            run_r3_approval_identity_fixture().expect("R3 child fixture failed");
+            println!("R3-APPROVAL-IDENTITY-OK");
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let checkout = src_root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        init_git_repository(&checkout);
+        run_git_fixture(&checkout, &["branch", "feature/r3"]);
+        std::fs::write(checkout.join("untracked.txt"), "keep me\n").unwrap();
+
+        let current_exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(current_exe)
+            .arg("--exact")
+            .arg(R3_APPROVAL_IDENTITY_TEST_NAME)
+            .arg("--nocapture")
+            .env(ROLE, "fixture")
+            .env(SRC, src_root.to_string_lossy().into_owned())
+            .env("TEMOTE_MCP_ROOTS", format!("src={}", src_root.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("R3-APPROVAL-IDENTITY-OK"),
+            "child did not complete\nstdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Observable state of one repository after the attacker-equivalent swap
+    /// and immediately before the launch boundary for a regression case.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Clone, Debug, PartialEq)]
+    struct RepositorySnapshot {
+        head: String,
+        refs: String,
+        status: String,
+        config: String,
+        worktrees: String,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn repository_snapshot(worktree: &Path) -> RepositorySnapshot {
+        let common = sandbox::git_common_dir(worktree).unwrap();
+        RepositorySnapshot {
+            head: git_fixture_stdout(worktree, &["rev-parse", "HEAD"]),
+            refs: git_fixture_stdout(
+                worktree,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ),
+            status: git_fixture_stdout(worktree, &["status", "--porcelain"]),
+            config: std::fs::read_to_string(common.join("config")).unwrap(),
+            worktrees: git_fixture_stdout(worktree, &["worktree", "list", "--porcelain"]),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct BoundaryRun {
+        result: Result<Value>,
+        _root: tempfile::TempDir,
+        canonical_root: PathBuf,
+        checkout: PathBuf,
+        target: PathBuf,
+        session: config::Session,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl BoundaryRun {
+        /// The launch must fail before any child result exists: the tool
+        /// reports the bounded sandbox-setup failure and never the fake
+        /// agent's stdout.
+        fn assert_launch_failed_before_child(&self) {
+            let error = self
+                .result
+                .as_ref()
+                .expect_err("a swapped managed-worktree identity must not start the agent");
+            let text = error.to_string();
+            assert!(text.contains("sandbox_setup_failed"), "{text}");
+            assert!(
+                text.contains("local agent failed before a child result was available"),
+                "{text}"
+            );
+            assert!(!text.contains("boundary-agent"), "{text}");
+        }
+    }
+
+    /// Runs the production `local_agent_run` path with a managed worktree and
+    /// invokes `swap` at the last validation boundary: after the validated
+    /// repository identity has been attached to the prepared run and before
+    /// the local agent task starts.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn run_managed_worktree_at_launch_boundary<F>(swap: F) -> BoundaryRun
+    where
+        F: FnOnce(&Path, &Path),
+    {
+        let (root, canonical_root, checkout, _fixture_session) = managed_worktree_fixture();
+        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
+        let target = canonical_root
+            .join("worktrees")
+            .join("repo")
+            .join("feature-foo-bar");
+        let id = format!("wt-boundary-{}", Uuid::new_v4());
+        let (sender, _receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
+            &checkout,
+            Some(&id),
+            config::PermissionMode::Agent,
+            sender,
+            None,
+            approvals::CapturedStartEnvironment::default(),
+        )
+        .await
+        .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+        let fake_dir = tempfile::tempdir().unwrap();
+        let fake_agent = activity_delegated_job_executable(
+            fake_dir.path(),
+            "codex",
+            "#!/bin/sh\npwd > ran-in.txt\nprintf 'boundary-agent\\n'\n",
+        );
+        let args = json!({
+            "session_id": id,
+            "agent": "codex",
+            "task": "launch boundary swap",
+            "access": "workspace_write",
+            "worktree": {"branch": "feature/foo/bar"}
+        });
+        let swap_target = target.clone();
+        let swap_root = canonical_root.clone();
+        let result = local_agent_run_with_src_root_at_boundary(
+            &args,
+            &session,
+            Some(&fake_agent),
+            None,
+            Some(&canonical_root),
+            move || swap(&swap_target, &swap_root),
+        )
+        .await;
+        runtime.shutdown().await.unwrap();
+        BoundaryRun {
+            result,
+            _root: root,
+            canonical_root,
+            checkout,
+            target,
+            session,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn local_agent_worktree_binding_runs_in_the_validated_workspace() {
+        let run = run_managed_worktree_at_launch_boundary(|_target, _canonical_root| {}).await;
+        let result = run
+            .result
+            .expect("a validated managed worktree must start the agent");
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("boundary-agent")
+        );
+        assert!(run.target.join("ran-in.txt").is_file());
+        assert_eq!(
+            git_fixture_stdout(&run.target, &["branch", "--show-current"]),
+            "feature/foo/bar"
+        );
+        assert!(!run.checkout.join("ran-in.txt").exists());
+        assert_eq!(
+            run.session.permitted_directories,
+            vec![run.checkout.clone()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn local_agent_worktree_identity_swap_to_other_repository_metadata_starts_no_agent() {
+        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorded = std::rc::Rc::clone(&snapshot);
+        let run = run_managed_worktree_at_launch_boundary(move |target, canonical_root| {
+            let other = canonical_root.join("other-repo");
+            std::fs::create_dir(&other).unwrap();
+            init_git_repository(&other);
+            let other_linked = canonical_root.join("other-linked");
+            run_git_fixture(
+                &other,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    other_linked.to_str().unwrap(),
+                    "-b",
+                    "other-branch",
+                ],
+            );
+            let other_private = other.join(".git").join("worktrees").join("other-linked");
+            std::fs::write(
+                target.join(".git"),
+                format!("gitdir: {}\n", other_private.display()),
+            )
+            .unwrap();
+            std::fs::write(
+                other_private.join("gitdir"),
+                format!("{}\n", target.join(".git").display()),
+            )
+            .unwrap();
+            *recorded.borrow_mut() = Some(repository_snapshot(&other));
+        })
+        .await;
+
+        run.assert_launch_failed_before_child();
+        assert!(!run.target.join("ran-in.txt").exists());
+        assert!(!run.checkout.join("ran-in.txt").exists());
+        let other = run.canonical_root.join("other-repo");
+        let before = snapshot.borrow().clone().expect("recorded B snapshot");
+        assert_eq!(repository_snapshot(&other), before);
+        assert_eq!(
+            run.session.permitted_directories,
+            vec![run.checkout.clone()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn local_agent_worktree_identity_swap_to_other_repository_worktree_starts_no_agent() {
+        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorded = std::rc::Rc::clone(&snapshot);
+        let run = run_managed_worktree_at_launch_boundary(move |target, canonical_root| {
+            let other = canonical_root.join("other-repo");
+            std::fs::create_dir(&other).unwrap();
+            init_git_repository(&other);
+            run_git_fixture(&other, &["branch", "other-replacement"]);
+            std::fs::rename(target, canonical_root.join("worktrees/repo/backup")).unwrap();
+            run_git_fixture(
+                &other,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    target.to_str().unwrap(),
+                    "other-replacement",
+                ],
+            );
+            *recorded.borrow_mut() = Some(repository_snapshot(&other));
+        })
+        .await;
+
+        run.assert_launch_failed_before_child();
+        assert!(!run.target.join("ran-in.txt").exists());
+        assert!(
+            !run.canonical_root
+                .join("worktrees/repo/backup/ran-in.txt")
+                .exists()
+        );
+        assert!(!run.checkout.join("ran-in.txt").exists());
+        let other = run.canonical_root.join("other-repo");
+        let before = snapshot.borrow().clone().expect("recorded B snapshot");
+        assert_eq!(repository_snapshot(&other), before);
+        assert_eq!(
+            run.session.permitted_directories,
+            vec![run.checkout.clone()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn local_agent_worktree_identity_symlink_target_swap_starts_no_agent() {
+        let run = run_managed_worktree_at_launch_boundary(move |target, canonical_root| {
+            let moved = canonical_root.join("worktrees/repo/moved");
+            std::fs::rename(target, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, target).unwrap();
+        })
+        .await;
+
+        run.assert_launch_failed_before_child();
+        let moved = run.canonical_root.join("worktrees/repo/moved");
+        assert!(!moved.join("ran-in.txt").exists());
+        assert!(!run.target.join("ran-in.txt").exists());
+        assert!(!run.checkout.join("ran-in.txt").exists());
+        assert_eq!(
+            run.session.permitted_directories,
+            vec![run.checkout.clone()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn local_agent_worktree_identity_symlink_managed_root_swap_starts_no_agent() {
+        let run = run_managed_worktree_at_launch_boundary(move |_target, canonical_root| {
+            let managed_root = canonical_root.join("worktrees/repo");
+            let real_root = canonical_root.join("worktrees/repo-real");
+            std::fs::rename(&managed_root, &real_root).unwrap();
+            std::os::unix::fs::symlink(&real_root, &managed_root).unwrap();
+        })
+        .await;
+
+        run.assert_launch_failed_before_child();
+        let real_root = run.canonical_root.join("worktrees/repo-real");
+        assert!(!real_root.join("feature-foo-bar/ran-in.txt").exists());
+        assert!(!run.target.join("ran-in.txt").exists());
+        assert!(!run.checkout.join("ran-in.txt").exists());
+        assert_eq!(
+            run.session.permitted_directories,
+            vec![run.checkout.clone()]
+        );
     }
 
     #[test]

@@ -1,0 +1,105 @@
+--- a/src/sandbox.rs
++++ b/src/sandbox.rs
+@@ -5895,3 +5895,80 @@
+         Ok(())
+     }
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++mod phase24_astra_independent_tests {
++    use super::*;
++    fn repository(base: &Path, name: &str) -> PathBuf {
++        let p = base.join(name);
++        std::fs::create_dir(&p).unwrap();
++        let result = std::process::Command::new("/usr/bin/git").args(["init", "--quiet"]).current_dir(&p).output().unwrap();
++        assert!(result.status.success());
++        p
++    }
++    #[test]
++    fn phase24_astra_head_lock_collision_preserves_other_lock_and_releases_own_index_lock() {
++        let fixture = tempfile::tempdir().unwrap();
++        let repo = repository(fixture.path(), "repository");
++        let common = repo.join(".git");
++        std::fs::write(common.join("HEAD.lock"), b"other-worker-lock").unwrap();
++        let result = GitWorktreeStaging::prepare(&repo, &[common.clone()]);
++        assert!(result.is_err());
++        assert_eq!(std::fs::read(common.join("HEAD.lock")).unwrap(), b"other-worker-lock");
++        assert!(!common.join("index.lock").exists(), "prepare failure leaked its index.lock");
++    }
++    #[test]
++    fn phase24_astra_drop_removes_private_staging_directory() {
++        let fixture = tempfile::tempdir().unwrap();
++        let repo = repository(fixture.path(), "repository");
++        let staged = GitWorktreeStaging::prepare(&repo, &[repo.join(".git")]).unwrap().unwrap();
++        let directory = staged.directory_path().to_owned();
++        drop(staged);
++        let leaked = directory.exists();
++        if leaked { std::fs::remove_dir_all(&directory).unwrap(); }
++        assert!(!leaked, "staging directory remains after Drop");
++    }
++    #[test]
++    fn phase24_astra_apply_rejects_retargeted_common_directory() {
++        let fixture = tempfile::tempdir().unwrap();
++        let repo_a = repository(fixture.path(), "repository-a");
++        let repo_b = repository(fixture.path(), "repository-b");
++        let common_a = repo_a.join(".git");
++        let common_b = repo_b.join(".git");
++        let before = std::fs::read(common_b.join("HEAD")).unwrap();
++        let staged = GitWorktreeStaging::prepare(&repo_a, &[common_a.clone()]).unwrap().unwrap();
++        std::fs::write(staged.directory_path().join("HEAD"), b"ref: refs/heads/astra-probe\n").unwrap();
++        std::fs::write(common_b.join("index.lock"), b"other-repository-lock").unwrap();
++        std::fs::rename(&common_a, repo_a.join("saved-git")).unwrap();
++        std::os::unix::fs::symlink(&common_b, &common_a).unwrap();
++        let result = staged.apply();
++        let after = std::fs::read(common_b.join("HEAD")).unwrap();
++        let directory = staged.directory_path().to_owned();
++        drop(staged);
++        println!("apply_returned_error={} unrelated_HEAD_changed={} unrelated_index_lock_removed={}", result.is_err(), before != after, !common_b.join("index.lock").exists());
++        let _ = std::fs::remove_dir_all(directory);
++        assert!(result.is_err(), "apply accepted a substituted common Git directory");
++        assert_eq!(before, after, "apply mutated unrelated repository");
++        assert!(common_b.join("index.lock").exists(), "Drop removed unrelated lock");
++    }
++    #[test]
++    fn phase24_astra_apply_rejects_symlinked_reflog_parent() {
++        let fixture = tempfile::tempdir().unwrap();
++        let repo = repository(fixture.path(), "repository");
++        let common = repo.join(".git");
++        let outside = fixture.path().join("outside-metadata");
++        std::fs::create_dir(&outside).unwrap();
++        std::fs::write(outside.join("HEAD"), b"sentinel").unwrap();
++        let staged = GitWorktreeStaging::prepare(&repo, &[common.clone()]).unwrap().unwrap();
++        std::fs::write(staged.directory_path().join("logs/HEAD"), b"staged-reflog").unwrap();
++        std::os::unix::fs::symlink(&outside, common.join("logs")).unwrap();
++        let result = staged.apply();
++        let after = std::fs::read(outside.join("HEAD")).unwrap();
++        let directory = staged.directory_path().to_owned();
++        drop(staged);
++        let _ = std::fs::remove_dir_all(directory);
++        println!("apply_returned_error={} outside_sentinel_changed={}", result.is_err(), after != b"sentinel");
++        assert!(result.is_err(), "apply followed a symlinked reflog parent");
++        assert_eq!(after, b"sentinel");
++    }
++}
+--- a/src/sandbox/linux/helper.rs
++++ b/src/sandbox/linux/helper.rs
+@@ -1202,3 +1202,19 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod phase24_astra_independent_tests {
++    use super::*;
++    #[test]
++    fn phase24_astra_missing_top_level_metadata_is_not_silently_omitted() {
++        let fixture = tempfile::tempdir().unwrap();
++        let cwd = std::fs::canonicalize(fixture.path()).unwrap();
++        let policy = LinuxSandboxPolicy::for_command(&cwd, &[cwd.clone()], &[]).unwrap();
++        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 999, None).unwrap();
++        for name in [".git", ".agents", ".codex"] {
++            let path = cwd.join(name).display().to_string();
++            assert!(args.contains(&path), "writable workspace protection omitted missing {name}: {args:?}");
++        }
++    }
++}

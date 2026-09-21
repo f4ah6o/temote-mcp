@@ -493,27 +493,30 @@ fn resolve_shim_add_path(workspace: &Path, cwd: &Path, path: &str) -> Result<Str
     Ok(candidate.to_string_lossy().into_owned())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RepositoryIdentity {
-    worktree_root: PathBuf,
-    metadata_roots: Vec<PathBuf>,
-    /// `true` for a linked worktree whose validated private metadata and common
-    /// repository directory live below the primary checkout instead of the
-    /// selected workspace.
-    linked_worktree: bool,
-}
-
 /// The fixed per-run Git operation scope: the canonical selected workspace and,
 /// when that workspace is itself a Git worktree root, its pinned repository
 /// identity. Request content never changes this scope.
+///
+/// When the caller supplies the expected identity that a managed-worktree
+/// authority resolution already validated, the broker fails closed unless the
+/// workspace presents exactly that identity at start. A freshly observed
+/// different repository is never adopted as a new valid identity.
 #[derive(Clone, Debug)]
 struct BrokerScope {
     workspace: PathBuf,
-    repository: Option<RepositoryIdentity>,
+    repository: Option<sandbox::WorkspaceRepositoryIdentity>,
 }
 
 impl BrokerScope {
+    #[cfg(test)]
     fn for_workspace(workspace: &Path) -> Result<Self> {
+        Self::for_workspace_with_expected(workspace, None)
+    }
+
+    fn for_workspace_with_expected(
+        workspace: &Path,
+        expected: Option<&sandbox::WorkspaceRepositoryIdentity>,
+    ) -> Result<Self> {
         let workspace = std::fs::canonicalize(workspace).with_context(|| {
             format!(
                 "cannot resolve Git broker workspace {}",
@@ -525,22 +528,27 @@ impl BrokerScope {
             "Git broker workspace is not a directory: {}",
             workspace.display()
         );
-        let repository = match (
-            sandbox::git_worktree_root(&workspace),
-            sandbox::git_metadata_roots(&workspace),
-            sandbox::git_primary_checkout(&workspace),
-        ) {
-            (Ok(worktree_root), Ok(metadata_roots), Ok(primary_checkout))
-                if worktree_root == workspace =>
-            {
-                Some(RepositoryIdentity {
-                    linked_worktree: primary_checkout != worktree_root,
-                    worktree_root,
-                    metadata_roots,
-                })
+        let repository = match sandbox::WorkspaceRepositoryIdentity::for_workspace(&workspace) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                if expected.is_some() {
+                    return Err(error).context(
+                        "validated managed worktree identity is no longer a supported Git worktree root",
+                    );
+                }
+                None
             }
-            _ => None,
         };
+        if let Some(expected) = expected {
+            let observed = repository
+                .as_ref()
+                .context("validated managed worktree identity is missing")?;
+            anyhow::ensure!(
+                observed == expected,
+                "Git broker workspace managed worktree identity does not match the validated identity: {}",
+                workspace.display()
+            );
+        }
         Ok(Self {
             workspace,
             repository,
@@ -660,7 +668,7 @@ async fn run_git_command(
         .repository
         .as_ref()
         .context("the selected workspace has no pinned Git repository identity")?;
-    if identity.linked_worktree {
+    if identity.linked_worktree() {
         // The selected workspace is a linked worktree whose validated metadata
         // lives below the primary checkout. `BrokerScope` pinned this exact
         // identity at broker start and `resolve_cwd` re-validated it for this
@@ -855,6 +863,7 @@ pub(crate) struct GitBroker {
 }
 
 impl GitBroker {
+    #[cfg(test)]
     pub(crate) fn start(
         requests_directory: PathBuf,
         responses_directory: PathBuf,
@@ -862,11 +871,36 @@ impl GitBroker {
         workspace: PathBuf,
         access: Access,
     ) -> Result<Self> {
+        Self::start_with_expected(
+            requests_directory,
+            responses_directory,
+            session,
+            workspace,
+            access,
+            None,
+        )
+    }
+
+    /// Starts the broker pinned to a repository identity that an earlier
+    /// managed-worktree authority resolution already validated.
+    ///
+    /// The broker re-derives the workspace identity once at start and fails
+    /// closed unless it equals `expected_identity`; it never adopts a
+    /// different observed repository as a new valid identity. Every later
+    /// request is re-validated against this pinned scope as before.
+    pub(crate) fn start_with_expected(
+        requests_directory: PathBuf,
+        responses_directory: PathBuf,
+        session: config::Session,
+        workspace: PathBuf,
+        access: Access,
+        expected_identity: Option<&sandbox::WorkspaceRepositoryIdentity>,
+    ) -> Result<Self> {
         let queue = BrokerQueue::create(&requests_directory, &responses_directory)?;
         let state = Arc::new(BrokerState {
             session,
             access,
-            scope: BrokerScope::for_workspace(&workspace)?,
+            scope: BrokerScope::for_workspace_with_expected(&workspace, expected_identity)?,
         });
         let task = tokio::spawn(serve(queue, state));
         Ok(Self {
@@ -2192,7 +2226,7 @@ mod tests {
 
         let scope = BrokerScope::for_workspace(&linked).unwrap();
         let identity = scope.repository.as_ref().unwrap();
-        assert!(identity.linked_worktree);
+        assert!(identity.linked_worktree());
         assert_eq!(identity.worktree_root, linked);
         assert!(
             identity
@@ -2363,7 +2397,7 @@ mod tests {
                 .repository
                 .as_ref()
                 .unwrap()
-                .linked_worktree
+                .linked_worktree()
         );
 
         let created = handle_request(

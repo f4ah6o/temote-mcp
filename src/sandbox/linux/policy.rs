@@ -12,35 +12,6 @@ use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths
 
 const MAX_ROOTS: usize = 128;
 const MAX_READ_ONLY_PATHS: usize = 1024;
-const GIT_READ_ONLY_PATHS: &[&str] = &[
-    "config",
-    "hooks",
-    "info",
-    "attributes",
-    "description",
-    "packed-refs",
-    "shallow",
-    "worktrees",
-    "refs/tags",
-    "refs/remotes",
-    "objects/info",
-    "objects/pack",
-];
-
-const GIT_WORKTREE_ADD_READ_ONLY_PATHS: &[&str] = &[
-    "config",
-    "hooks",
-    "info",
-    "attributes",
-    "description",
-    "packed-refs",
-    "shallow",
-    "refs/tags",
-    "refs/remotes",
-    "objects/info",
-    "objects/pack",
-];
-
 /// Network modes supported by the Temote Linux helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,6 +29,25 @@ pub enum LinuxNetworkPolicy {
 pub struct LinuxReadOnlySymlink {
     pub link: PathBuf,
     pub target: PathBuf,
+}
+
+/// A workspace whose repository identity was validated before the helper
+/// started.
+///
+/// The helper opens `path` without following symbolic links, verifies that the
+/// opened directory still presents exactly this repository identity, and only
+/// then binds that directory descriptor as the workspace (and cwd). The
+/// verified entity is therefore the entity the agent runs in, not whatever the
+/// path resolves to at bind time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxPinnedWorkspace {
+    pub path: PathBuf,
+    pub writable: bool,
+    pub worktree_root: PathBuf,
+    pub metadata_roots: Vec<PathBuf>,
+    pub common_dir: PathBuf,
+    pub primary_checkout: PathBuf,
 }
 
 /// Minimal Temote-specific policy passed across the helper process boundary.
@@ -78,6 +68,8 @@ pub struct LinuxSandboxPolicy {
     pub read_only_scaffold_directories: Vec<PathBuf>,
     pub read_only_files: Vec<PathBuf>,
     pub hidden_roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_workspace: Option<LinuxPinnedWorkspace>,
     pub network: LinuxNetworkPolicy,
 }
 
@@ -153,13 +145,6 @@ impl LinuxSandboxPolicy {
                 .map(|path| canonical_existing_directory(path, "writable root"))
                 .collect::<Result<Vec<_>>>()?,
         );
-        writable.extend(
-            git_metadata_roots
-                .iter()
-                .map(|path| canonical_existing_directory(path, "Git metadata root"))
-                .collect::<Result<Vec<_>>>()?,
-        );
-        normalize_paths(&mut writable);
         let canonical_git_roots = git_metadata_roots
             .iter()
             .map(|path| canonical_existing_directory(path, "Git metadata root"))
@@ -174,13 +159,15 @@ impl LinuxSandboxPolicy {
         }
         normalize_paths(&mut temporary_roots);
 
+        // Protected metadata under ordinary writable roots keeps its read-only
+        // mask. Metadata roots themselves are handled below: the whole
+        // metadata root is bound read-only so missing protected entries stay
+        // missing (no mount-point artifacts, no empty placeholder changing Git
+        // semantics) and only the exact writable paths Git needs are re-exposed.
         let mut read_only_paths = Vec::new();
         for root in &writable {
             for name in PROTECTED_METADATA_NAMES {
                 let path = root.join(name);
-                // A validated run_git operation may write the repository's
-                // own metadata root. Its narrower config/hooks/etc. masks are
-                // added below instead.
                 if canonical_git_roots.iter().any(|git_root| git_root == &path) {
                     continue;
                 }
@@ -188,27 +175,46 @@ impl LinuxSandboxPolicy {
             }
         }
 
-        let mut common_git_roots = Vec::new();
+        // `cwd` and explicit writable roots remain writable.
+        let mut read_only_roots = Vec::new();
+        let mut writable_metadata = Vec::new();
         for git_root in &canonical_git_roots {
             if is_linked_worktree_metadata_root(git_root) {
+                // The selected worktree's private metadata directory is
+                // writable as a whole so HEAD/index lock+rename persist; its
+                // pointer files stay read-only.
+                writable_metadata.push(git_root.clone());
                 read_only_paths.extend([git_root.join("gitdir"), git_root.join("commondir")]);
             } else {
-                common_git_roots.push(git_root.clone());
-                let protected_paths = if protected_worktree_roots.is_some() {
-                    GIT_WORKTREE_ADD_READ_ONLY_PATHS
-                } else {
-                    GIT_READ_ONLY_PATHS
-                };
-                read_only_paths.extend(protected_paths.iter().map(|suffix| git_root.join(suffix)));
+                read_only_roots.push(git_root.clone());
+                // The common repository directory is read-only. Only the paths
+                // that structured mutation needs to create or update stay
+                // writable; they are host-backed directory entries, so Git's
+                // lock-then-rename protocol persists to the host.
+                for suffix in ["refs/heads", "objects", "logs"] {
+                    let path = git_root.join(suffix);
+                    if path.is_dir() {
+                        writable_metadata.push(path);
+                    }
+                }
+                if protected_worktree_roots.is_some() {
+                    let worktrees = git_root.join("worktrees");
+                    if worktrees.is_dir() {
+                        writable_metadata.push(worktrees);
+                    }
+                }
+                read_only_paths.push(git_root.join("objects/info"));
+                read_only_paths.push(git_root.join("objects/pack"));
             }
         }
+        writable.extend(writable_metadata);
 
         if let Some(protected_worktree_roots) = protected_worktree_roots {
             for protected in protected_worktree_roots {
                 let protected =
                     canonical_existing_directory(protected, "protected worktree metadata root")?;
                 anyhow::ensure!(
-                    common_git_roots.iter().any(|common| {
+                    canonical_git_roots.iter().any(|common| {
                         protected.parent() == Some(common.join("worktrees").as_path())
                     }),
                     "protected worktree metadata root is not a direct child of a validated common Git worktrees directory: {}",
@@ -218,18 +224,21 @@ impl LinuxSandboxPolicy {
             }
         }
 
+        normalize_paths(&mut writable);
         normalize_paths(&mut read_only_paths);
+        normalize_paths(&mut read_only_roots);
         let policy = Self {
             version: 1,
             cwd,
             writable_roots: writable,
             temporary_roots,
             read_only_paths,
-            read_only_roots: Vec::new(),
+            read_only_roots,
             read_only_symlinks: Vec::new(),
             read_only_scaffold_directories: Vec::new(),
             read_only_files: Vec::new(),
             hidden_roots: Vec::new(),
+            pinned_workspace: None,
             network: LinuxNetworkPolicy::Restricted,
         };
         policy.validate()?;
@@ -247,6 +256,7 @@ impl LinuxSandboxPolicy {
         read_only_scaffold_directories: &[PathBuf],
         read_only_files: &[PathBuf],
         hidden_roots: &[PathBuf],
+        expected_repository: Option<&crate::sandbox::WorkspaceRepositoryIdentity>,
     ) -> Result<Self> {
         let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
         let mut writable = writable_roots
@@ -297,6 +307,23 @@ impl LinuxSandboxPolicy {
         let mut files = read_only_files.to_vec();
         normalize_paths(&mut files);
 
+        let pinned_workspace = match expected_repository {
+            Some(expected) => {
+                anyhow::ensure!(
+                    expected.worktree_root == cwd,
+                    "pinned workspace identity does not match the local agent cwd"
+                );
+                Some(LinuxPinnedWorkspace {
+                    path: cwd.clone(),
+                    writable: writable.contains(&cwd),
+                    worktree_root: expected.worktree_root.clone(),
+                    metadata_roots: expected.metadata_roots.clone(),
+                    common_dir: expected.common_dir.clone(),
+                    primary_checkout: expected.primary_checkout.clone(),
+                })
+            }
+            None => None,
+        };
         let policy = Self {
             version: 1,
             cwd,
@@ -308,6 +335,7 @@ impl LinuxSandboxPolicy {
             read_only_scaffold_directories: scaffold_directories,
             read_only_files: files,
             hidden_roots: hidden,
+            pinned_workspace,
             network: LinuxNetworkPolicy::LocalAgent,
         };
         policy.validate()?;
@@ -319,6 +347,35 @@ impl LinuxSandboxPolicy {
             self.version == 1,
             "unsupported Linux sandbox policy version"
         );
+        if let Some(pinned) = &self.pinned_workspace {
+            anyhow::ensure!(
+                pinned.path == self.cwd,
+                "pinned workspace path must equal the sandbox cwd: {}",
+                pinned.path.display()
+            );
+            anyhow::ensure!(
+                pinned.worktree_root == pinned.path,
+                "pinned workspace root must be the sandbox cwd: {}",
+                pinned.worktree_root.display()
+            );
+            anyhow::ensure!(
+                !pinned.metadata_roots.is_empty(),
+                "pinned workspace metadata roots must not be empty"
+            );
+            anyhow::ensure!(
+                pinned.common_dir.is_absolute()
+                    && pinned.primary_checkout.is_absolute()
+                    && pinned.metadata_roots.iter().all(|root| root.is_absolute()),
+                "pinned workspace identity paths must be absolute"
+            );
+            let writable = self.writable_roots.iter().any(|root| root == &pinned.path);
+            let read_only = self.read_only_roots.iter().any(|root| root == &pinned.path);
+            anyhow::ensure!(
+                (pinned.writable && writable) || (!pinned.writable && read_only),
+                "pinned workspace path must appear as its matching sandbox root: {}",
+                pinned.path.display()
+            );
+        }
         anyhow::ensure!(
             self.writable_roots.len() <= MAX_ROOTS,
             "too many writable roots"
@@ -637,28 +694,6 @@ pub(super) fn is_linked_worktree_metadata_root(path: &Path) -> bool {
         && path.join("commondir").is_file()
 }
 
-/// Whether a missing protected path should be materialized as a directory
-/// mask rather than an empty read-only file.
-pub fn missing_path_is_directory(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    matches!(
-        name,
-        ".git"
-            | ".agents"
-            | ".codex"
-            | "hooks"
-            | "info"
-            | "objects"
-            | "refs"
-            | "worktrees"
-            | "tags"
-            | "remotes"
-            | "pack"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +759,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         )
         .unwrap();
 
@@ -754,6 +790,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
         )
         .unwrap();
 
@@ -823,19 +860,27 @@ mod tests {
 
             assert!(policy.validate().is_ok());
             assert!(policy.writable_roots.contains(&cwd));
-            assert!(policy.writable_roots.contains(&git));
+            // The whole metadata root is read-only; only the paths Git must
+            // update stay writable, and missing protected entries keep no
+            // placeholder at all.
+            assert!(policy.read_only_roots.contains(&git));
+            assert!(!policy.writable_roots.contains(&git));
+            for suffix in ["refs/heads", "objects", "logs"] {
+                let path = git.join(suffix);
+                assert_eq!(
+                    policy.writable_roots.contains(&path),
+                    path.is_dir(),
+                    "unexpected writable Git path {suffix}"
+                );
+            }
             assert!(
                 policy
                     .writable_roots
                     .windows(2)
                     .all(|pair| pair[0] < pair[1])
             );
-            for suffix in GIT_READ_ONLY_PATHS {
-                assert!(
-                    policy.read_only_paths.contains(&git.join(suffix)),
-                    "missing Git protection for {suffix}"
-                );
-            }
+            assert!(policy.read_only_paths.contains(&git.join("objects/info")));
+            assert!(policy.read_only_paths.contains(&git.join("objects/pack")));
             Ok(())
         })
     }
@@ -860,11 +905,15 @@ mod tests {
         .unwrap();
 
         assert!(policy.validate().is_ok());
-        assert!(policy.writable_roots.contains(&git));
+        // The metadata root itself is read-only; only `worktrees` (to create
+        // the new private metadata) is writable, and existing sibling metadata
+        // stays read-only.
+        assert!(policy.read_only_roots.contains(&git));
+        assert!(policy.writable_roots.contains(&git.join("worktrees")));
         assert!(!policy.read_only_paths.contains(&git.join("worktrees")));
         assert!(policy.read_only_paths.contains(&sibling));
-        assert!(policy.read_only_paths.contains(&git.join("config")));
-        assert!(policy.read_only_paths.contains(&git.join("hooks")));
+        assert!(!policy.writable_roots.contains(&git.join("config")));
+        assert!(!policy.writable_roots.contains(&git.join("hooks")));
     }
 
     #[test]

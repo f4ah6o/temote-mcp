@@ -16,10 +16,7 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
-use super::policy::{
-    LinuxNetworkPolicy, LinuxSandboxPolicy, is_linked_worktree_metadata_root,
-    missing_path_is_directory,
-};
+use super::policy::{LinuxNetworkPolicy, LinuxPinnedWorkspace, LinuxSandboxPolicy};
 
 #[derive(Debug)]
 struct HelperArgs {
@@ -81,7 +78,31 @@ pub(super) fn run_main() -> ! {
         Ok(fd) => fd,
         Err(error) => fail(error.context("failed to prepare Linux seccomp filter fd")),
     };
-    let bwrap_args = match build_bwrap_args(&args.policy, args.command, seccomp_fd.as_raw_fd()) {
+    let pinned_workspace_fd = match &args.policy.pinned_workspace {
+        Some(pinned) => match pin_policy_workspace(pinned) {
+            Ok(fd) => Some(fd),
+            Err(error) => fail(anyhow::anyhow!(
+                "failed to pin the validated managed workspace: {error:#}"
+            )),
+        },
+        None => None,
+    };
+    let pinned_read_only_paths = match pinned_workspace_fd.as_ref() {
+        Some(fd) => match pin_workspace_read_only_paths(&args.policy, fd) {
+            Ok(paths) => paths,
+            Err(error) => fail(anyhow::anyhow!(
+                "failed to pin protected paths in the validated managed workspace: {error:#}"
+            )),
+        },
+        None => Vec::new(),
+    };
+    let bwrap_args = match build_bwrap_args(
+        &args.policy,
+        args.command,
+        seccomp_fd.as_raw_fd(),
+        pinned_workspace_fd.as_ref().map(AsRawFd::as_raw_fd),
+        &pinned_read_only_paths,
+    ) {
         Ok(args) => args,
         Err(error) => fail(error.context("failed to construct bubblewrap sandbox")),
     };
@@ -115,12 +136,333 @@ fn validate_command(command: &[String]) -> Result<()> {
     Ok(())
 }
 
+const MAX_PINNED_GIT_POINTER_BYTES: usize = 8192;
+
+#[derive(Debug)]
+enum PinnedReadOnlySource {
+    Existing(OwnedFd),
+    Missing(PathBuf),
+}
+
+#[derive(Debug)]
+struct PinnedReadOnlyPath {
+    target: PathBuf,
+    source: PinnedReadOnlySource,
+}
+
+/// Opens the validated workspace without following symbolic links and verifies
+/// that the opened directory entity still presents exactly the validated
+/// repository identity.
+///
+/// The descriptor intentionally has no `O_CLOEXEC` flag: bubblewrap inherits it
+/// and uses it as the `--bind-fd` source, so the workspace and writable scope
+/// are bound from the verified entity instead of the (re-resolved) path.
+fn pin_policy_workspace(pinned: &LinuxPinnedWorkspace) -> Result<OwnedFd> {
+    let path = pinned
+        .path
+        .to_str()
+        .context("pinned workspace path is not valid UTF-8")?;
+    let path =
+        CString::new(path.as_bytes()).context("pinned workspace path contains a NUL byte")?;
+    // SAFETY: `path` is a valid NUL-terminated path and the returned descriptor
+    // is owned by this process. `O_PATH | O_NOFOLLOW` pins the directory entity
+    // itself and refuses a symbolic link at the workspace path.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot open pinned workspace {}", pinned.path.display()));
+    }
+    // SAFETY: `fd` is a freshly opened descriptor owned by this scope.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    verify_pinned_workspace(&fd, pinned)?;
+    Ok(fd)
+}
+
+fn pin_workspace_read_only_paths(
+    policy: &LinuxSandboxPolicy,
+    workspace_fd: &OwnedFd,
+) -> Result<Vec<PinnedReadOnlyPath>> {
+    let pinned = policy
+        .pinned_workspace
+        .as_ref()
+        .context("protected path pinning requires a pinned workspace policy")?;
+    let mut paths = Vec::new();
+    for target in &policy.read_only_paths {
+        if !target.starts_with(&pinned.path) || target == &pinned.path {
+            continue;
+        }
+        let relative = target
+            .strip_prefix(&pinned.path)
+            .context("protected path escaped the pinned workspace")?;
+        let source = pin_relative_workspace_path(workspace_fd, &pinned.path, relative)
+            .with_context(|| format!("cannot pin protected path {}", target.display()))?;
+        paths.push(PinnedReadOnlyPath {
+            target: target.clone(),
+            source,
+        });
+    }
+    Ok(paths)
+}
+
+fn pin_relative_workspace_path(
+    workspace_fd: &OwnedFd,
+    workspace: &Path,
+    relative: &Path,
+) -> Result<PinnedReadOnlySource> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name.to_owned()),
+            _ => anyhow::bail!("protected workspace path is not relative and normalized"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !components.is_empty(),
+        "protected workspace path must name a descendant"
+    );
+
+    let mut opened = Vec::<OwnedFd>::new();
+    let mut current_fd = workspace_fd.as_raw_fd();
+    let mut absolute = workspace.to_owned();
+    for (index, component) in components.iter().enumerate() {
+        absolute.push(component);
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            libc::O_PATH
+        } else {
+            libc::O_PATH | libc::O_DIRECTORY
+        };
+        let Some(next) = openat_component_optional(current_fd, component, flags)? else {
+            return Ok(PinnedReadOnlySource::Missing(absolute));
+        };
+        if final_component {
+            let metadata = fstat(next.as_raw_fd())?;
+            anyhow::ensure!(
+                metadata.st_mode & libc::S_IFMT != libc::S_IFLNK,
+                "protected workspace path became a symbolic link: {}",
+                absolute.display()
+            );
+            return Ok(PinnedReadOnlySource::Existing(next));
+        }
+        opened.push(next);
+        current_fd = opened
+            .last()
+            .context("protected path descriptor disappeared")?
+            .as_raw_fd();
+    }
+    unreachable!("non-empty protected path has a final component")
+}
+
+fn openat_component_optional(
+    directory: i32,
+    name: &std::ffi::OsStr,
+    flags: i32,
+) -> Result<Option<OwnedFd>> {
+    let name = CString::new(name.as_bytes()).context("descriptor name contains a NUL byte")?;
+    // SAFETY: `directory` is a live directory descriptor, `name` is a valid
+    // NUL-terminated relative component and the returned descriptor is owned
+    // by this scope.
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags | libc::O_NOFOLLOW) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).context("cannot open protected workspace path component");
+    }
+    // SAFETY: `fd` is a freshly opened descriptor owned by this scope.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+fn verify_pinned_workspace(fd: &OwnedFd, pinned: &LinuxPinnedWorkspace) -> Result<()> {
+    let metadata = fstat(fd.as_raw_fd())?;
+    anyhow::ensure!(
+        metadata.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        "pinned workspace is not a directory: {}",
+        pinned.path.display()
+    );
+    let dot_git = openat_no_follow(fd.as_raw_fd(), ".git", libc::O_PATH)?;
+    let dot_git_metadata = fstat(dot_git.as_raw_fd())?;
+    match dot_git_metadata.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => {
+            anyhow::ensure!(
+                pinned.worktree_root == pinned.primary_checkout,
+                "pinned workspace is not the validated primary checkout: {}",
+                pinned.path.display()
+            );
+            let dot_git_path = read_descriptor_path(dot_git.as_raw_fd())?;
+            let canonical = std::fs::canonicalize(&dot_git_path)
+                .with_context(|| format!("cannot resolve {}", dot_git_path.display()))?;
+            anyhow::ensure!(
+                canonical == pinned.common_dir,
+                "pinned workspace common Git directory changed: {}",
+                canonical.display()
+            );
+        }
+        libc::S_IFREG => {
+            anyhow::ensure!(
+                pinned.worktree_root != pinned.primary_checkout,
+                "pinned workspace is not the validated linked worktree: {}",
+                pinned.path.display()
+            );
+            let contents = openat_no_follow(fd.as_raw_fd(), ".git", libc::O_RDONLY)?;
+            let contents = read_descriptor(&contents, MAX_PINNED_GIT_POINTER_BYTES)?;
+            let contents = String::from_utf8(contents)
+                .context("pinned workspace .git pointer is not valid UTF-8")?;
+            let pointer = parse_gitdir_pointer(&contents)?;
+            let workspace_dir = read_descriptor_path(fd.as_raw_fd())?;
+            let private = canonical_pointer_target(&workspace_dir.join(".git"), &pointer)?;
+            let expected_private = pinned
+                .metadata_roots
+                .iter()
+                .find(|root| {
+                    root.parent().and_then(Path::file_name)
+                        == Some(std::ffi::OsStr::new("worktrees"))
+                })
+                .context("pinned workspace has no validated private metadata root")?;
+            anyhow::ensure!(
+                &private == expected_private,
+                "pinned workspace belongs to a different repository identity: {}",
+                private.display()
+            );
+            let commondir_file = private.join("commondir");
+            let commondir_pointer =
+                std::fs::read_to_string(&commondir_file).with_context(|| {
+                    format!(
+                        "cannot read Git common directory pointer {}",
+                        commondir_file.display()
+                    )
+                })?;
+            let commondir_pointer = commondir_pointer
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("Git common directory pointer is empty")?;
+            let commondir =
+                canonical_pointer_target(&commondir_file, Path::new(commondir_pointer))?;
+            anyhow::ensure!(
+                commondir == pinned.common_dir,
+                "pinned workspace common Git directory changed: {}",
+                commondir.display()
+            );
+        }
+        _ => anyhow::bail!(
+            "pinned workspace .git metadata is neither a directory nor a file: {}",
+            pinned.path.display()
+        ),
+    }
+    Ok(())
+}
+
+fn openat_no_follow(directory: i32, name: &str, flags: i32) -> Result<OwnedFd> {
+    let name = CString::new(name.as_bytes()).context("descriptor name contains a NUL byte")?;
+    // SAFETY: `directory` is a live directory descriptor, `name` is a valid
+    // NUL-terminated relative path and the returned descriptor is owned here.
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags | libc::O_NOFOLLOW) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot open workspace metadata");
+    }
+    // SAFETY: `fd` is a freshly opened descriptor owned by this scope.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn fstat(fd: i32) -> Result<libc::stat> {
+    // SAFETY: the zeroed `stat` is fully initialized by a successful `fstat`.
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    let result = unsafe { libc::fstat(fd, &mut metadata) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot inspect workspace descriptor");
+    }
+    Ok(metadata)
+}
+
+fn read_descriptor(fd: &OwnedFd, maximum: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        // SAFETY: `buffer` is a valid writable buffer for its length.
+        let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("cannot read workspace metadata");
+        }
+        if read == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            bytes.len() + read as usize <= maximum,
+            "workspace metadata exceeds {maximum} bytes"
+        );
+        bytes.extend_from_slice(&buffer[..read as usize]);
+    }
+    Ok(bytes)
+}
+
+fn read_descriptor_path(fd: i32) -> Result<PathBuf> {
+    let link = PathBuf::from(format!("/proc/self/fd/{fd}"));
+    let target = std::fs::read_link(&link)
+        .with_context(|| format!("cannot resolve descriptor path {}", link.display()))?;
+    let text = target.to_string_lossy();
+    let path = text.strip_suffix(" (deleted)").unwrap_or(&text);
+    Ok(PathBuf::from(path))
+}
+
+fn parse_gitdir_pointer(contents: &str) -> Result<PathBuf> {
+    let mut lines = contents.lines();
+    let pointer = lines
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("pinned workspace .git pointer has no gitdir path")?;
+    anyhow::ensure!(
+        lines.all(|line| line.trim().is_empty()),
+        "pinned workspace .git pointer has unexpected extra content"
+    );
+    Ok(PathBuf::from(pointer))
+}
+
+fn canonical_pointer_target(pointer_file: &Path, value: &Path) -> Result<PathBuf> {
+    let target = if value.is_absolute() {
+        value.to_owned()
+    } else {
+        pointer_file
+            .parent()
+            .context("pinned workspace .git pointer has no parent")?
+            .join(value)
+    };
+    std::fs::canonicalize(&target)
+        .with_context(|| format!("cannot resolve Git directory {}", target.display()))
+}
+
 fn build_bwrap_args(
     policy: &LinuxSandboxPolicy,
     command: Vec<String>,
     seccomp_fd: i32,
+    pinned_workspace_fd: Option<i32>,
+    pinned_read_only_paths: &[PinnedReadOnlyPath],
 ) -> Result<Vec<String>> {
     policy.validate()?;
+    if policy.pinned_workspace.is_some() {
+        anyhow::ensure!(
+            pinned_workspace_fd.is_some(),
+            "pinned workspace policy requires a verified directory descriptor"
+        );
+    } else {
+        anyhow::ensure!(
+            pinned_workspace_fd.is_none(),
+            "a pinned workspace descriptor requires a pinned workspace policy"
+        );
+    }
     let mut args = vec![
         "--new-session".to_owned(),
         "--die-with-parent".to_owned(),
@@ -199,62 +541,100 @@ fn build_bwrap_args(
         &visible_roots,
         &symlink_scaffold_paths,
     )?;
-    for root in writable_roots {
-        append_pair(&mut args, "--bind", &root, &root)?;
+    // Mounts are emitted shallowest-first: a later mount of a descendant wins
+    // over an earlier ancestor mount, so writable subpaths inside a read-only
+    // metadata root stay writable while the rest of the root stays read-only.
+    let pinned_path = policy
+        .pinned_workspace
+        .as_ref()
+        .map(|pinned| pinned.path.clone());
+    let mut ordered_binds: Vec<(PathBuf, bool)> = writable_roots
+        .into_iter()
+        .map(|root| (root, true))
+        .chain(
+            policy
+                .read_only_roots
+                .iter()
+                .map(|root| (root.clone(), false)),
+        )
+        .collect();
+    ordered_binds.sort_by(|left, right| {
+        path_depth(&left.0)
+            .cmp(&path_depth(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    for (root, writable) in ordered_binds {
+        if pinned_path.as_deref() == Some(root.as_path()) {
+            continue;
+        }
+        let flag = if writable { "--bind" } else { "--ro-bind" };
+        append_pair(&mut args, flag, &root, &root)?;
     }
-    for root in &policy.read_only_roots {
-        append_pair(&mut args, "--ro-bind", root, root)?;
+    if let (Some(fd), Some(pinned)) = (pinned_workspace_fd, policy.pinned_workspace.as_ref()) {
+        // The verified directory descriptor is the only source for the
+        // workspace binding: a path swap after verification cannot redirect
+        // the cwd or the writable scope to another directory entity.
+        let flag = if pinned.writable {
+            "--bind-fd"
+        } else {
+            "--ro-bind-fd"
+        };
+        args.push(flag.to_owned());
+        args.push(fd.to_string());
+        args.push(path_to_string(&pinned.path)?);
     }
     for file in &policy.read_only_files {
         append_pair(&mut args, "--ro-bind", file, file)?;
     }
 
+    // Protected paths below a pinned workspace use descriptor-pinned sources,
+    // never a re-resolved host pathname. Missing paths are masked only when the
+    // effective parent mount is writable. A missing path below an actually
+    // read-only mount needs no placeholder, preserving Git absence semantics
+    // while still protecting missing top-level metadata and descendants
+    // re-exposed by writable overlays.
     let mut masked_paths = Vec::new();
     let mut read_only_paths = policy.read_only_paths.clone();
     read_only_paths.sort_by_key(|path| path_depth(path));
     for path in read_only_paths {
-        let mask = first_missing_component(&path).unwrap_or(path);
         if masked_paths
             .iter()
-            .any(|ancestor: &PathBuf| mask.starts_with(ancestor))
+            .any(|ancestor: &PathBuf| path.starts_with(ancestor))
         {
             continue;
         }
-        append_read_only_mask(&mut args, &mask)?;
-        masked_paths.push(mask);
-    }
 
-    // The common Git metadata root protects its entire `worktrees` directory.
-    // A validated linked worktree has one private metadata directory nested
-    // below that read-only mount. Re-overlay only that validated private root
-    // as writable, then restore every narrower read-only mask below it. This
-    // keeps sibling worktree metadata protected while allowing Git to create
-    // index.lock and other per-worktree state.
-    let mut linked_worktree_roots = policy
-        .writable_roots
-        .iter()
-        .filter(|root| is_linked_worktree_metadata_root(root))
-        .cloned()
-        .collect::<Vec<_>>();
-    linked_worktree_roots.sort_by_key(|path| path_depth(path));
-    for root in linked_worktree_roots {
-        append_pair(&mut args, "--bind", &root, &root)?;
-        let mut remasked = Vec::<PathBuf>::new();
-        let mut descendants = policy
-            .read_only_paths
+        if let Some(pinned) = pinned_read_only_paths
             .iter()
-            .filter(|path| path.starts_with(&root) && *path != &root)
-            .cloned()
-            .collect::<Vec<_>>();
-        descendants.sort_by_key(|path| path_depth(path));
-        for path in descendants {
-            let mask = first_missing_component(&path).unwrap_or(path);
-            if remasked.iter().any(|ancestor| mask.starts_with(ancestor)) {
-                continue;
+            .find(|pinned| pinned.target == path)
+        {
+            match &pinned.source {
+                PinnedReadOnlySource::Existing(fd) => {
+                    append_read_only_fd(&mut args, fd.as_raw_fd(), &path)?;
+                    masked_paths.push(path);
+                }
+                PinnedReadOnlySource::Missing(mask) => {
+                    if effective_mount_is_read_only(policy, mask) {
+                        continue;
+                    }
+                    append_verified_missing_mask(&mut args, mask)?;
+                    masked_paths.push(mask.clone());
+                }
             }
-            append_read_only_mask(&mut args, &mask)?;
-            remasked.push(mask);
+            continue;
         }
+
+        if path.exists() {
+            append_read_only_mask(&mut args, &path)?;
+            masked_paths.push(path);
+            continue;
+        }
+        let mask = first_missing_component(&path).unwrap_or(path);
+        if effective_mount_is_read_only(policy, &mask) {
+            continue;
+        }
+        append_missing_mask(&mut args, &mask)?;
+        masked_paths.push(mask);
     }
 
     // Recreate only verified intermediate launcher symlinks that were hidden
@@ -312,12 +692,20 @@ fn append_pair(args: &mut Vec<String>, flag: &str, source: &Path, target: &Path)
     Ok(())
 }
 
+fn append_read_only_fd(args: &mut Vec<String>, fd: i32, target: &Path) -> Result<()> {
+    args.push("--ro-bind-fd".to_owned());
+    args.push(fd.to_string());
+    args.push(path_to_string(target)?);
+    Ok(())
+}
+
 fn append_read_only_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
-    if path.exists() {
-        append_pair(args, "--ro-bind", path, path)
-    } else {
-        append_missing_mask(args, path)
-    }
+    anyhow::ensure!(
+        path.exists(),
+        "read-only mask target must exist: {}",
+        path.display()
+    );
+    append_pair(args, "--ro-bind", path, path)
 }
 
 fn append_missing_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
@@ -329,6 +717,10 @@ fn append_missing_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
         "missing read-only path parent is not a directory: {}",
         parent.display()
     );
+    append_verified_missing_mask(args, path)
+}
+
+fn append_verified_missing_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
     if missing_path_is_directory(path) {
         args.extend([
             "--tmpfs".to_owned(),
@@ -337,12 +729,6 @@ fn append_missing_mask(args: &mut Vec<String>, path: &Path) -> Result<()> {
             path_to_string(path)?,
         ]);
     } else {
-        // A bind of the host /dev/null prevents creation of a missing metadata
-        // file without exposing a writable mountpoint. `--dev-bind` is
-        // required: the read-only bind mounts of bubblewrap are `nodev`, so
-        // reading a plain `--ro-bind /dev/null` mask fails with EACCES instead
-        // of yielding the empty content Git expects from optional files such
-        // as `packed-refs` or `shallow`.
         append_pair(args, "--dev-bind", Path::new("/dev/null"), path)?;
     }
     Ok(())
@@ -360,6 +746,53 @@ fn first_missing_component(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn missing_path_is_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git"
+            | ".agents"
+            | ".codex"
+            | "hooks"
+            | "info"
+            | "objects"
+            | "refs"
+            | "worktrees"
+            | "tags"
+            | "remotes"
+            | "pack"
+    )
+}
+
+fn effective_mount_is_read_only(policy: &LinuxSandboxPolicy, path: &Path) -> bool {
+    let mut effective = None::<(usize, bool)>;
+    for root in &policy.read_only_roots {
+        if path.starts_with(root) {
+            let depth = path_depth(root);
+            if effective
+                .is_none_or(|(current, writable)| depth > current || (depth == current && writable))
+            {
+                effective = Some((depth, false));
+            }
+        }
+    }
+    for root in policy
+        .writable_roots
+        .iter()
+        .chain(policy.temporary_roots.iter())
+    {
+        if path.starts_with(root) {
+            let depth = path_depth(root);
+            if effective.is_none_or(|(current, _)| depth >= current) {
+                effective = Some((depth, true));
+            }
+        }
+    }
+    matches!(effective, Some((_, false)))
 }
 
 fn path_to_string(path: &Path) -> Result<String> {
@@ -574,6 +1007,313 @@ fn fail(error: impl Display) -> ! {
 mod tests {
     use super::*;
 
+    fn run_git_fixture(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+    }
+
+    fn linked_worktree_identity(path: &Path) -> crate::sandbox::WorkspaceRepositoryIdentity {
+        crate::sandbox::WorkspaceRepositoryIdentity::for_workspace(path).unwrap()
+    }
+
+    fn pinned_workspace_policy(
+        target: &Path,
+        temporary: &Path,
+        identity: &crate::sandbox::WorkspaceRepositoryIdentity,
+    ) -> LinuxSandboxPolicy {
+        LinuxSandboxPolicy {
+            version: 1,
+            cwd: target.to_path_buf(),
+            writable_roots: vec![target.to_path_buf(), temporary.to_path_buf()],
+            temporary_roots: vec![temporary.to_path_buf()],
+            read_only_paths: Vec::new(),
+            read_only_roots: Vec::new(),
+            read_only_symlinks: Vec::new(),
+            read_only_scaffold_directories: Vec::new(),
+            read_only_files: Vec::new(),
+            hidden_roots: Vec::new(),
+            pinned_workspace: Some(LinuxPinnedWorkspace {
+                path: target.to_path_buf(),
+                writable: true,
+                worktree_root: identity.worktree_root.clone(),
+                metadata_roots: identity.metadata_roots.clone(),
+                common_dir: identity.common_dir.clone(),
+                primary_checkout: identity.primary_checkout.clone(),
+            }),
+            network: LinuxNetworkPolicy::Restricted,
+        }
+    }
+
+    #[test]
+    fn missing_protected_paths_are_masked_only_when_the_effective_mount_is_writable() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+
+        let policy = LinuxSandboxPolicy::for_command(&workspace, &[], &[]).unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
+        for name in [".git", ".agents", ".codex"] {
+            let target = workspace.join(name).display().to_string();
+            assert!(
+                args.contains(&target),
+                "missing top-level protected path was omitted: {name}"
+            );
+        }
+
+        let git = workspace.join(".git");
+        let objects = git.join("objects");
+        std::fs::create_dir_all(&objects).unwrap();
+        let git = std::fs::canonicalize(git).unwrap();
+        let policy =
+            LinuxSandboxPolicy::for_command(&workspace, &[], std::slice::from_ref(&git)).unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
+        for name in ["info", "pack"] {
+            let target = objects.join(name).display().to_string();
+            assert!(
+                args.contains(&target),
+                "missing protected object child was omitted below writable objects: {name}"
+            );
+        }
+        assert!(
+            !effective_mount_is_read_only(&policy, &objects.join("info")),
+            "writable objects overlay must remain the effective mount"
+        );
+        assert!(
+            effective_mount_is_read_only(&policy, &git.join("shallow")),
+            "missing entries outside writable overlays must remain protected by the read-only Git root"
+        );
+    }
+
+    #[test]
+    fn pinned_workspace_protected_overlays_keep_the_pinned_source_after_path_swap() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(fixture.path()).unwrap();
+        let repository_a = base.join("repo-a");
+        let repository_b = base.join("repo-b");
+        for repository in [&repository_a, &repository_b] {
+            std::fs::create_dir(repository).unwrap();
+            run_git_fixture(repository, &["init", "--quiet"]);
+            std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+            run_git_fixture(repository, &["add", "tracked.txt"]);
+            run_git_fixture(
+                repository,
+                &[
+                    "-c",
+                    "user.name=temote-mcp test",
+                    "-c",
+                    "user.email=temote-mcp@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "base",
+                ],
+            );
+        }
+
+        let target = base.join("target");
+        run_git_fixture(
+            &repository_a,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        std::fs::create_dir(target.join(".agents")).unwrap();
+        let identity = linked_worktree_identity(&target);
+        let temporary = base.join("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        let mut policy = pinned_workspace_policy(&target, &temporary, &identity);
+        policy.read_only_paths = vec![
+            target.join(".git"),
+            target.join(".agents"),
+            target.join(".codex"),
+        ];
+        policy.read_only_paths.sort();
+        policy.validate().unwrap();
+
+        let pinned_fd = pin_policy_workspace(policy.pinned_workspace.as_ref().unwrap()).unwrap();
+        let pinned_paths = pin_workspace_read_only_paths(&policy, &pinned_fd).unwrap();
+        assert!(matches!(
+            pinned_paths
+                .iter()
+                .find(|entry| entry.target == target.join(".codex"))
+                .map(|entry| &entry.source),
+            Some(PinnedReadOnlySource::Missing(_))
+        ));
+
+        std::fs::rename(&target, base.join("moved-a")).unwrap();
+        run_git_fixture(
+            &repository_b,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "-b",
+                "other",
+            ],
+        );
+        std::fs::create_dir(target.join(".agents")).unwrap();
+        std::fs::create_dir(target.join(".codex")).unwrap();
+
+        let args = build_bwrap_args(
+            &policy,
+            vec!["/bin/true".to_owned()],
+            42,
+            Some(pinned_fd.as_raw_fd()),
+            &pinned_paths,
+        )
+        .unwrap();
+
+        for name in [".git", ".agents"] {
+            let target_path = target.join(name);
+            let pinned = pinned_paths
+                .iter()
+                .find(|entry| entry.target == target_path)
+                .unwrap();
+            let PinnedReadOnlySource::Existing(fd) = &pinned.source else {
+                panic!("expected existing pinned source for {name}");
+            };
+            let target_text = target_path.display().to_string();
+            assert!(
+                args.windows(3).any(|window| {
+                    window[0] == "--ro-bind-fd"
+                        && window[1] == fd.as_raw_fd().to_string()
+                        && window[2] == target_text
+                }),
+                "protected overlay did not use its pinned descriptor: {name}"
+            );
+        }
+        let missing_target = target.join(".codex").display().to_string();
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--tmpfs" && window[1] == missing_target),
+            "metadata absent from the pinned workspace must stay a protected missing entry"
+        );
+        assert!(
+            !args.windows(3).any(|window| {
+                window[0] == "--ro-bind"
+                    && window[1] == missing_target
+                    && window[2] == missing_target
+            }),
+            "swapped workspace metadata must not become a protected overlay source"
+        );
+        assert!(
+            pin_policy_workspace(policy.pinned_workspace.as_ref().unwrap()).is_err(),
+            "pinning the substituted worktree must fail closed"
+        );
+    }
+
+    /// R1: the verified directory descriptor is the bound workspace even after
+    /// the host path is swapped to another valid repository worktree, and
+    /// pinning that path after the swap fails closed.
+    #[test]
+    #[ignore = "host acceptance: requires production-shaped bubblewrap/userns support"]
+    fn pinned_workspace_descriptor_survives_a_path_swap_host_acceptance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(fixture.path()).unwrap();
+        let repository_a = base.join("repo-a");
+        let repository_b = base.join("repo-b");
+        for repository in [&repository_a, &repository_b] {
+            std::fs::create_dir(repository).unwrap();
+            run_git_fixture(repository, &["init", "--quiet"]);
+            std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
+            run_git_fixture(repository, &["add", "tracked.txt"]);
+            run_git_fixture(
+                repository,
+                &[
+                    "-c",
+                    "user.name=temote-mcp test",
+                    "-c",
+                    "user.email=temote-mcp@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "base",
+                ],
+            );
+        }
+        let target = base.join("target");
+        run_git_fixture(
+            &repository_a,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        std::fs::write(target.join("marker.txt"), "pinned-a").unwrap();
+        let identity = linked_worktree_identity(&target);
+        let temporary = base.join("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        let policy = pinned_workspace_policy(&target, &temporary, &identity);
+        policy.validate().unwrap();
+
+        let pinned_fd = pin_policy_workspace(policy.pinned_workspace.as_ref().unwrap())
+            .expect("pin the validated workspace");
+        let seccomp = build_seccomp_filter(policy.network).unwrap();
+        let seccomp_fd = create_sealed_seccomp_memfd(&seccomp).unwrap();
+        let args = build_bwrap_args(
+            &policy,
+            vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "cat marker.txt".to_owned(),
+            ],
+            seccomp_fd.as_raw_fd(),
+            Some(pinned_fd.as_raw_fd()),
+            &[],
+        )
+        .unwrap();
+
+        // Swap the target path to another repository's valid worktree *after*
+        // the verified descriptor was pinned.
+        std::fs::rename(&target, base.join("moved-a")).unwrap();
+        run_git_fixture(
+            &repository_b,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                target.to_str().unwrap(),
+                "-b",
+                "other",
+            ],
+        );
+        std::fs::write(target.join("marker.txt"), "swapped-b").unwrap();
+
+        let bwrap = crate::sandbox::trusted_service_account_bwrap().unwrap();
+        let output = std::process::Command::new(bwrap)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pinned sandbox failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "pinned-a");
+
+        // Pinning the swapped path is refused: the entity no longer presents
+        // the validated repository identity.
+        assert!(
+            pin_policy_workspace(policy.pinned_workspace.as_ref().unwrap()).is_err(),
+            "pinning another repository's worktree must fail closed"
+        );
+    }
+
     #[test]
     fn generated_local_agent_socketpair_type_allowlist_matches_reference() -> noprop::TestResult {
         crate::test_support::run(0x534f_434b_5041_4952, 1024, |ctx| {
@@ -659,7 +1399,7 @@ mod tests {
     fn bwrap_policy_has_read_only_root_writable_temp_and_isolated_network() {
         let root = tempfile::tempdir().unwrap();
         let policy = LinuxSandboxPolicy::for_command(root.path(), &[], &[]).unwrap();
-        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
 
         assert!(
             args.windows(3)
@@ -699,9 +1439,10 @@ mod tests {
             &[],
             &[],
             std::slice::from_ref(&hidden),
+            None,
         )
         .unwrap();
-        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
 
         assert!(!args.iter().any(|arg| arg == "--unshare-net"));
         assert!(
@@ -754,9 +1495,9 @@ mod tests {
         assert_eq!(development.network, LinuxNetworkPolicy::LocalAgent);
 
         let restricted_args =
-            build_bwrap_args(&restricted, vec!["/bin/true".to_owned()], 42).unwrap();
+            build_bwrap_args(&restricted, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
         let development_args =
-            build_bwrap_args(&development, vec!["/bin/true".to_owned()], 42).unwrap();
+            build_bwrap_args(&development, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
         assert!(restricted_args.iter().any(|arg| arg == "--unshare-net"));
         assert!(!development_args.iter().any(|arg| arg == "--unshare-net"));
         assert!(
@@ -814,9 +1555,10 @@ mod tests {
             std::slice::from_ref(&scratch),
             std::slice::from_ref(&metadata_file),
             std::slice::from_ref(&hidden),
+            None,
         )
         .unwrap();
-        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42).unwrap();
+        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
 
         assert!(args.windows(3).any(|window| {
             window

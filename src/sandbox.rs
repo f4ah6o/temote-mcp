@@ -312,6 +312,10 @@ pub struct LocalAgentScope<'a> {
     /// inside one of its read-only directory roots.
     pub read_only_files: &'a [PathBuf],
     pub hidden_roots: &'a [PathBuf],
+    /// When set, `run_local_agent` re-derives the repository identity of the
+    /// canonical cwd immediately before spawning the child and fails closed
+    /// unless it equals this validated expected identity.
+    pub expected_repository: Option<&'a WorkspaceRepositoryIdentity>,
 }
 
 /// Filesystem/network scope for the structured developer-tool broker
@@ -351,7 +355,7 @@ pub async fn run_with_network_policy(
     network: CommandNetworkPolicy,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
-    run_with_metadata_roots(command, cwd, writable_roots, &[], None, network, stdin).await
+    run_with_metadata_roots(command, cwd, writable_roots, &[], None, network, stdin, &[]).await
 }
 
 /// Runs the structured local-agent broker profile.
@@ -422,6 +426,20 @@ pub async fn run_local_agent(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The sandbox command and its policy are fully constructed above. If this
+    // launch is bound to a validated managed worktree, re-derive the canonical
+    // repository identity of the canonical cwd at the last possible point and
+    // refuse to spawn when the filesystem no longer presents that identity.
+    if let Some(expected) = scope.expected_repository {
+        let observed = WorkspaceRepositoryIdentity::for_workspace(&cwd).context(
+            "validated managed worktree identity is no longer a supported Git worktree root",
+        )?;
+        anyhow::ensure!(
+            observed == *expected,
+            "local agent workspace managed worktree identity changed before spawn: {}",
+            cwd.display()
+        );
+    }
     let child = process.spawn().map_err(LocalAgentSpawnError::new)?;
     wait_with_limited_output(child, stdin).await
 }
@@ -478,6 +496,983 @@ pub async fn run_developer_tool(
         .spawn()
         .context("failed to start bounded developer-tool command")?;
     wait_with_limited_output(child, stdin).await
+}
+
+/// No-follow filesystem primitives for host-backed Git staging.
+///
+/// Every staging operation is anchored to an already-held directory
+/// descriptor and uses descriptor-relative calls, so a pathname swap cannot
+/// redirect a write or a lock removal to an unrelated directory. Symlinks,
+/// special files and unexpected entry types fail closed instead of being
+/// followed.
+#[cfg(target_os = "linux")]
+mod staging_fs {
+    use super::*;
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    pub(super) struct RegularEntry {
+        pub(super) bytes: Vec<u8>,
+        pub(super) mode: u32,
+    }
+
+    fn cstring(value: &str, label: &str) -> Result<CString> {
+        CString::new(value).with_context(|| format!("{label} contains a NUL byte"))
+    }
+
+    fn path_cstring(path: &Path, label: &str) -> Result<CString> {
+        CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("{label} contains a NUL byte: {}", path.display()))
+    }
+
+    pub(super) fn stat_is_directory(stat: &libc::stat) -> bool {
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    pub(super) fn stat_is_regular_file(stat: &libc::stat) -> bool {
+        stat.st_mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    pub(super) fn file_identity(file: &File) -> Result<(u64, u64)> {
+        let metadata = file
+            .metadata()
+            .context("cannot inspect an open staging directory")?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    fn stat_descriptor(
+        parent: libc::c_int,
+        name: &CString,
+        label: &str,
+    ) -> Result<Option<libc::stat>> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller, `name` is a valid NUL-terminated name, and `stat` points to
+        // writable memory of the exact type the kernel fills in.
+        let result = unsafe {
+            libc::fstatat(
+                parent,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            // SAFETY: a successful `fstatat` initialized the whole structure.
+            return Ok(Some(unsafe { stat.assume_init() }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        Err(error).with_context(|| format!("cannot inspect {label}"))
+    }
+
+    pub(super) fn stat_entry_at(
+        parent: &File,
+        name: &str,
+        label: &str,
+    ) -> Result<Option<libc::stat>> {
+        let name = cstring(name, label)?;
+        stat_descriptor(parent.as_raw_fd(), &name, label)
+    }
+
+    pub(super) fn stat_path_no_follow(path: &Path, label: &str) -> Result<Option<libc::stat>> {
+        let name = path_cstring(path, label)?;
+        stat_descriptor(
+            libc::AT_FDCWD,
+            &name,
+            &format!("{label} {}", path.display()),
+        )
+    }
+
+    pub(super) fn open_directory_no_follow(path: &Path, label: &str) -> Result<File> {
+        let name = path_cstring(path, label)?;
+        // SAFETY: `name` is a valid NUL-terminated path and the returned
+        // descriptor is immediately wrapped in an owning `File`.
+        let descriptor = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot open {label} {}", path.display()));
+        }
+        // SAFETY: `descriptor` is a fresh, owned descriptor from `open`.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("cannot inspect {label} {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "{label} is not a directory: {}",
+            path.display()
+        );
+        Ok(file)
+    }
+
+    pub(super) fn open_directory_at(
+        parent: &File,
+        name: &str,
+        label: &str,
+    ) -> Result<Option<File>> {
+        let c_name = cstring(name, label)?;
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller, `name` is a valid NUL-terminated entry name, and the
+        // returned descriptor is immediately wrapped in an owning `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("cannot open {label} {name:?}"));
+        }
+        // SAFETY: `descriptor` is a fresh, owned descriptor from `openat`.
+        Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> Result<()> {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path).with_context(|| {
+            format!(
+                "cannot create private Git staging directory {}",
+                path.display()
+            )
+        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "cannot protect private Git staging directory {}",
+                path.display()
+            )
+        })
+    }
+
+    pub(super) fn create_directory_at(
+        parent: &File,
+        name: &str,
+        mode: u32,
+        label: &str,
+    ) -> Result<()> {
+        let c_name = cstring(name, label)?;
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller and `name` is a valid NUL-terminated entry name.
+        let created =
+            unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), mode as libc::mode_t) };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            anyhow::ensure!(
+                error.kind() == std::io::ErrorKind::AlreadyExists,
+                "cannot create {label}: {error}"
+            );
+        }
+        let directory = open_directory_at(parent, name, label)?
+            .with_context(|| format!("{label} disappeared after creation"))?;
+        drop(directory);
+        Ok(())
+    }
+
+    pub(super) fn open_lock_file(parent: &File, name: &str) -> std::io::Result<File> {
+        let Ok(name) = cstring(name, "Git lock name") else {
+            return Err(std::io::Error::other("Git lock name contains a NUL byte"));
+        };
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller, `name` is a valid NUL-terminated entry name, and the
+        // returned descriptor is immediately wrapped in an owning `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is a fresh, owned descriptor from `openat`.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    pub(super) fn read_regular_entry_at(
+        parent: &File,
+        name: &str,
+        label: &str,
+    ) -> Result<Option<RegularEntry>> {
+        let name = cstring(name, label)?;
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller, `name` is a valid NUL-terminated entry name, and the
+        // returned descriptor is immediately wrapped in an owning `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("cannot open {label}"));
+        }
+        // SAFETY: `descriptor` is a fresh, owned descriptor from `openat`.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("cannot inspect {label}"))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "{label} is not a regular file"
+        );
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read {label}"))?;
+        Ok(Some(RegularEntry {
+            bytes,
+            mode: metadata.mode() & 0o7777,
+        }))
+    }
+
+    fn set_file_mode(file: &File, mode: u32, label: &str) -> Result<()> {
+        // SAFETY: `file` is an open descriptor owned by the caller.
+        let result = unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot set permissions for {label}"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_new_regular_entry_at(
+        parent: &File,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+        label: &str,
+    ) -> Result<()> {
+        let name = cstring(name, label)?;
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller, `name` is a valid NUL-terminated entry name, and the
+        // returned descriptor is immediately wrapped in an owning `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::mode_t,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot create {label}"));
+        }
+        // SAFETY: `descriptor` is a fresh, owned descriptor from `openat`.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        file.write_all(bytes)
+            .with_context(|| format!("cannot write {label}"))?;
+        file.flush()
+            .with_context(|| format!("cannot flush {label}"))?;
+        set_file_mode(&file, mode, label)
+    }
+
+    pub(super) fn replace_regular_entry_atomic_at(
+        parent: &File,
+        name: &str,
+        bytes: &[u8],
+        mode: u32,
+        label: &str,
+        inject_failure: bool,
+    ) -> Result<()> {
+        let temporary = format!(".temote-git-sync-{}", uuid::Uuid::new_v4());
+        let temporary_name = cstring(&temporary, "staged Git temporary name")?;
+        let target_name = cstring(name, label)?;
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller, both names are valid NUL-terminated entry names, and the
+        // returned descriptor is immediately wrapped in an owning `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temporary_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("cannot create a temporary file for {label}"));
+        }
+        // SAFETY: `descriptor` is a fresh, owned descriptor from `openat`.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)
+                .with_context(|| format!("cannot write a temporary file for {label}"))?;
+            file.flush()
+                .with_context(|| format!("cannot flush a temporary file for {label}"))?;
+            set_file_mode(&file, mode, label)?;
+            if inject_failure {
+                anyhow::bail!("injected staged Git apply failure for {label}");
+            }
+            // SAFETY: both descriptors are open directories owned by the
+            // caller and both names are valid NUL-terminated entry names in
+            // the target directory; `renameat` replaces atomically.
+            let renamed = unsafe {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    temporary_name.as_ptr(),
+                    parent.as_raw_fd(),
+                    target_name.as_ptr(),
+                )
+            };
+            if renamed != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("cannot publish {label}"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // SAFETY: the temporary descriptor directory is still open and
+            // the name is a valid NUL-terminated entry name.
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temporary_name.as_ptr(), 0);
+            }
+        }
+        result
+    }
+
+    pub(super) fn unlink_entry_if_identity(
+        parent: &File,
+        name: &str,
+        device: u64,
+        inode: u64,
+        label: &str,
+    ) -> bool {
+        let Ok(Some(stat)) = stat_entry_at(parent, name, label) else {
+            return false;
+        };
+        if !stat_is_regular_file(&stat) || stat.st_dev != device || stat.st_ino != inode {
+            return false;
+        }
+        let Ok(name) = cstring(name, label) else {
+            return false;
+        };
+        // SAFETY: `parent` is an open directory descriptor owned by the
+        // caller and `name` is a valid NUL-terminated entry name whose
+        // identity was just verified.
+        unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) == 0 }
+    }
+
+    fn read_directory_names(directory: &File) -> Vec<(CString, bool)> {
+        let mut names = Vec::new();
+        // SAFETY: `directory` is an open directory descriptor owned by the
+        // caller; `fcntl` duplicates it with close-on-exec.
+        let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return names;
+        }
+        // SAFETY: `duplicate` is a fresh descriptor whose ownership is
+        // transferred to the directory stream.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            // SAFETY: `duplicate` was not consumed and is still owned here.
+            unsafe {
+                libc::close(duplicate);
+            }
+            return names;
+        }
+        loop {
+            // SAFETY: `stream` is a valid directory stream until `closedir`.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `readdir` returned a non-null entry with a
+            // NUL-terminated name valid until the next `readdir`.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let Ok(name) = name.to_str() else {
+                continue;
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            let Ok(c_name) = cstring(name, "private staging entry") else {
+                continue;
+            };
+            let is_directory =
+                match stat_descriptor(directory.as_raw_fd(), &c_name, "private staging entry") {
+                    Ok(Some(stat)) => stat_is_directory(&stat),
+                    _ => false,
+                };
+            names.push((c_name, is_directory));
+        }
+        // SAFETY: `stream` is a valid directory stream and is not used after.
+        unsafe {
+            libc::closedir(stream);
+        }
+        names
+    }
+
+    fn remove_tree_contents(directory: &File) {
+        for (name, is_directory) in read_directory_names(directory) {
+            if is_directory {
+                // SAFETY: `directory` is an open descriptor and `name` is a
+                // valid NUL-terminated entry name; the child descriptor is
+                // immediately wrapped in an owning `File`.
+                let descriptor = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if descriptor >= 0 {
+                    // SAFETY: `descriptor` is a fresh, owned descriptor.
+                    let child = unsafe { File::from_raw_fd(descriptor) };
+                    remove_tree_contents(&child);
+                }
+                // SAFETY: `directory` is open and `name` is a valid entry
+                // name; a failure is ignored because cleanup is best effort.
+                unsafe {
+                    libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+                }
+            } else {
+                // SAFETY: see above; a non-directory entry, including a
+                // symbolic link, is unlinked without being followed.
+                unsafe {
+                    libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
+                }
+            }
+        }
+    }
+
+    /// Removes the private staging tree and the staging directory itself.
+    ///
+    /// Contents are removed through the held descriptor without following
+    /// symlinks. The directory is only unlinked when its pathname still
+    /// refers to the held directory, so a replaced path is left untouched.
+    pub(super) fn remove_private_staging_directory(path: &Path, directory: &File) -> bool {
+        remove_tree_contents(directory);
+        let Ok(Some(stat)) = stat_path_no_follow(path, "private Git staging directory") else {
+            return false;
+        };
+        let Ok((device, inode)) = file_identity(directory) else {
+            return false;
+        };
+        if !stat_is_directory(&stat) || stat.st_dev != device || stat.st_ino != inode {
+            return false;
+        }
+        let Ok(path) = path_cstring(path, "private Git staging directory") else {
+            return false;
+        };
+        // SAFETY: the descriptor-relative identity was just verified; the
+        // path is valid and NUL-terminated.
+        unsafe { libc::unlinkat(libc::AT_FDCWD, path.as_ptr(), libc::AT_REMOVEDIR) == 0 }
+    }
+}
+
+/// Host-backed staging state for a primary checkout's per-worktree files.
+///
+/// The sandbox exposes the repository metadata root read-only, so the primary
+/// checkout's per-worktree state (`HEAD`, `index`, `COMMIT_EDITMSG`,
+/// `ORIG_HEAD` and the HEAD reflog) cannot be written in place without also
+/// exposing the protected entries to creation. Git is therefore run with
+/// `GIT_DIR` pointing at this private staging directory and `GIT_COMMON_DIR`
+/// pointing at the real read-only-protected metadata root: shared state
+/// (refs, objects, logs, config) is written directly to the host, while the
+/// per-worktree files are staged and atomically applied back after the command
+/// finishes.
+///
+/// The repository's own locks are acquired before the host snapshot is read,
+/// and every host-side read, write and lock removal is anchored to the
+/// descriptor of the verified metadata directory that was opened during
+/// preparation. Pathnames are only used to re-verify that the verified
+/// directory is still in place; they are never re-resolved to obtain write or
+/// lock-removal authority.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct GitWorktreeStaging {
+    directory: PathBuf,
+    directory_file: std::fs::File,
+    common_dir: PathBuf,
+    common_dir_file: std::fs::File,
+    worktree_root: PathBuf,
+    locks: Vec<OwnedGitLock>,
+    baseline: Vec<Option<Vec<u8>>>,
+    reflog_directory_present: bool,
+    #[cfg(test)]
+    fail_before_rename: Option<&'static str>,
+}
+
+/// One repository lock owned by a staging run.
+///
+/// The open descriptor pins the inode for the lifetime of the run, and
+/// release only unlinks the pathname while it still refers to that exact
+/// regular file. An existing lock of another worker, or a lock replaced after
+/// acquisition, is therefore never removed.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct OwnedGitLock {
+    name: &'static str,
+    _file: std::fs::File,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl OwnedGitLock {
+    fn acquire(common_dir: &std::fs::File, common_path: &Path, name: &'static str) -> Result<Self> {
+        let path = common_path.join(name);
+        let file = match staging_fs::open_lock_file(common_dir, name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!(
+                    "another Git operation is in progress: {} exists",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot lock Git worktree state {}", path.display()));
+            }
+        };
+        let (device, inode) = staging_fs::file_identity(&file)
+            .with_context(|| format!("cannot inspect Git lock {}", path.display()))?;
+        Ok(Self {
+            name,
+            _file: file,
+            device,
+            inode,
+        })
+    }
+
+    fn release(&self, common_dir: &std::fs::File) {
+        staging_fs::unlink_entry_if_identity(
+            common_dir,
+            self.name,
+            self.device,
+            self.inode,
+            "owned Git lock",
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct StagedGitEntry {
+    /// Path relative to the metadata root, used in diagnostics.
+    path: &'static str,
+    /// Final component below its parent directory.
+    name: &'static str,
+    /// Whether the entry lives under the common `logs` directory.
+    in_logs: bool,
+}
+
+#[cfg(target_os = "linux")]
+const STAGED_GIT_ENTRIES: &[StagedGitEntry] = &[
+    StagedGitEntry {
+        path: "HEAD",
+        name: "HEAD",
+        in_logs: false,
+    },
+    StagedGitEntry {
+        path: "index",
+        name: "index",
+        in_logs: false,
+    },
+    StagedGitEntry {
+        path: "ORIG_HEAD",
+        name: "ORIG_HEAD",
+        in_logs: false,
+    },
+    StagedGitEntry {
+        path: "COMMIT_EDITMSG",
+        name: "COMMIT_EDITMSG",
+        in_logs: false,
+    },
+    StagedGitEntry {
+        path: "logs/HEAD",
+        name: "HEAD",
+        in_logs: true,
+    },
+];
+
+#[cfg(target_os = "linux")]
+impl GitWorktreeStaging {
+    /// Prepares staging only for a validated primary checkout. Linked
+    /// worktrees keep their private metadata directory writable and are never
+    /// staged.
+    ///
+    /// The verified common directory is opened first and every later step is
+    /// bound to that descriptor. Repository locks are acquired before the
+    /// host snapshot is read, so the baseline cannot be stale with respect to
+    /// the lock-protected metadata. Any failure drops the partially-built
+    /// value: only locks this run actually acquired are released and only the
+    /// private staging directory is removed.
+    fn prepare(cwd: &Path, metadata_roots: &[PathBuf]) -> Result<Option<Self>> {
+        if metadata_roots.len() != 1 {
+            return Ok(None);
+        }
+        let metadata_root = &metadata_roots[0];
+        let metadata = std::fs::symlink_metadata(metadata_root).with_context(|| {
+            format!(
+                "cannot inspect Git metadata root {}",
+                metadata_root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "symbolic-link Git metadata roots cannot be staged: {}",
+            metadata_root.display()
+        );
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "Git metadata root is not a directory: {}",
+            metadata_root.display()
+        );
+        let common_dir = std::fs::canonicalize(metadata_root).with_context(|| {
+            format!(
+                "cannot resolve Git metadata root {}",
+                metadata_root.display()
+            )
+        })?;
+        let worktree_root = git_worktree_root(cwd)?;
+        anyhow::ensure!(
+            git_primary_checkout(cwd)? == worktree_root,
+            "staged Git state requires a primary checkout"
+        );
+        let common_dir_file =
+            staging_fs::open_directory_no_follow(&common_dir, "Git metadata directory")?;
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .context("cannot resolve the system temporary directory for Git staging")?;
+        let directory = base.join(format!("temote-git-stage-{}", uuid::Uuid::new_v4()));
+        staging_fs::create_private_directory(&directory)?;
+        let directory_file =
+            match staging_fs::open_directory_no_follow(&directory, "private Git staging directory")
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = std::fs::remove_dir(&directory);
+                    return Err(error);
+                }
+            };
+        let mut staging = Self {
+            directory,
+            directory_file,
+            common_dir,
+            common_dir_file,
+            worktree_root,
+            locks: Vec::new(),
+            baseline: Vec::new(),
+            reflog_directory_present: false,
+            #[cfg(test)]
+            fail_before_rename: None,
+        };
+        staging.verify_metadata_authority()?;
+        staging.acquire_locks()?;
+        staging.capture_and_seed()?;
+        Ok(Some(staging))
+    }
+
+    /// Re-verifies that the stored pathname still refers to the exact
+    /// directory entity that was opened during preparation. A replaced,
+    /// symlinked or removed metadata directory fails closed.
+    fn verify_metadata_authority(&self) -> Result<()> {
+        let (device, inode) = staging_fs::file_identity(&self.common_dir_file)?;
+        match staging_fs::stat_path_no_follow(&self.common_dir, "Git metadata directory")? {
+            Some(stat)
+                if staging_fs::stat_is_directory(&stat)
+                    && stat.st_dev == device
+                    && stat.st_ino == inode =>
+            {
+                Ok(())
+            }
+            _ => anyhow::bail!(
+                "Git metadata directory was replaced after staging was prepared: {}",
+                self.common_dir.display()
+            ),
+        }
+    }
+
+    fn acquire_locks(&mut self) -> Result<()> {
+        for name in ["index.lock", "HEAD.lock"] {
+            let lock = OwnedGitLock::acquire(&self.common_dir_file, &self.common_dir, name)?;
+            self.locks.push(lock);
+        }
+        Ok(())
+    }
+
+    /// Reads the lock-time host snapshot and seeds the private staging
+    /// directory from it. The common `logs` directory is validated with a
+    /// no-follow open: a symlinked or special entry fails closed instead of
+    /// directing the later apply outside the metadata root.
+    fn capture_and_seed(&mut self) -> Result<()> {
+        let common_logs =
+            staging_fs::open_directory_at(&self.common_dir_file, "logs", "Git reflog directory")?;
+        self.reflog_directory_present = common_logs.is_some();
+        staging_fs::create_directory_at(
+            &self.directory_file,
+            "logs",
+            0o700,
+            "private staging reflog directory",
+        )?;
+        let staging_logs = staging_fs::open_directory_at(
+            &self.directory_file,
+            "logs",
+            "private staging reflog directory",
+        )?
+        .context("private staging reflog directory disappeared after creation")?;
+        staging_fs::write_new_regular_entry_at(
+            &self.directory_file,
+            "commondir",
+            format!("{}\n", self.common_dir.display()).as_bytes(),
+            0o600,
+            "staged Git common directory pointer",
+        )?;
+        for entry in STAGED_GIT_ENTRIES {
+            let contents = if entry.in_logs {
+                match &common_logs {
+                    Some(common_logs) => staging_fs::read_regular_entry_at(
+                        common_logs,
+                        entry.name,
+                        &format!("Git worktree state {}", entry.path),
+                    )?,
+                    None => None,
+                }
+            } else {
+                staging_fs::read_regular_entry_at(
+                    &self.common_dir_file,
+                    entry.name,
+                    &format!("Git worktree state {}", entry.path),
+                )?
+            };
+            self.baseline
+                .push(contents.as_ref().map(|entry| entry.bytes.clone()));
+            if let Some(contents) = contents {
+                let target = if entry.in_logs {
+                    &staging_logs
+                } else {
+                    &self.directory_file
+                };
+                staging_fs::write_new_regular_entry_at(
+                    target,
+                    entry.name,
+                    &contents.bytes,
+                    contents.mode,
+                    &format!("staged Git worktree state {}", entry.path),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn directory_path(&self) -> &Path {
+        &self.directory
+    }
+
+    fn extra_environment(&self) -> Vec<(String, String)> {
+        let mut environment = vec![
+            ("GIT_DIR".to_owned(), self.directory.display().to_string()),
+            (
+                "GIT_COMMON_DIR".to_owned(),
+                self.common_dir.display().to_string(),
+            ),
+            (
+                "GIT_WORK_TREE".to_owned(),
+                self.worktree_root.display().to_string(),
+            ),
+        ];
+        if !self.reflog_directory_present {
+            // The common reflog directory did not exist when the locks were
+            // acquired and cannot be created inside the read-only metadata
+            // root; keep reflogs disabled exactly like a repository that has
+            // no reflog directory yet.
+            environment.extend([
+                ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+                (
+                    "GIT_CONFIG_KEY_0".to_owned(),
+                    "core.logAllRefUpdates".to_owned(),
+                ),
+                ("GIT_CONFIG_VALUE_0".to_owned(), "false".to_owned()),
+            ]);
+        }
+        environment
+    }
+
+    fn open_staging_parent(&self, in_logs: bool) -> Result<std::fs::File> {
+        if in_logs {
+            staging_fs::open_directory_at(
+                &self.directory_file,
+                "logs",
+                "private staging reflog directory",
+            )?
+            .context("private staging reflog directory is missing")
+        } else {
+            self.directory_file
+                .try_clone()
+                .context("cannot duplicate the private Git staging directory handle")
+        }
+    }
+
+    /// Applies exactly the staged entries the command changed relative to the
+    /// lock-time snapshot.
+    ///
+    /// The metadata authority, target parents, target entries and staged
+    /// files are all validated before the first mutation. Each mutation is an
+    /// exclusive temporary file renamed descriptor-relative over the target,
+    /// preserving the staged file permissions. An entry the command did not
+    /// change is never restored to the old snapshot, and a command that
+    /// removed staged state fails closed instead of deleting host state.
+    ///
+    /// This is not a transaction: entries are atomic individually, and shared
+    /// refs or objects the command already wrote to the common directory are
+    /// not rolled back.
+    fn apply(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.baseline.len() == STAGED_GIT_ENTRIES.len(),
+            "staged Git baseline is incomplete"
+        );
+        self.verify_metadata_authority()?;
+        let mut planned = Vec::new();
+        for (index, entry) in STAGED_GIT_ENTRIES.iter().enumerate() {
+            let staged_parent = self.open_staging_parent(entry.in_logs)?;
+            let staged = staging_fs::read_regular_entry_at(
+                &staged_parent,
+                entry.name,
+                &format!("staged Git state {}", entry.path),
+            )?;
+            let Some(staged) = staged else {
+                if self.baseline[index].is_some() {
+                    anyhow::bail!(
+                        "the command removed staged Git state {}; refusing to delete metadata state",
+                        entry.path
+                    );
+                }
+                continue;
+            };
+            if self.baseline[index].as_deref() == Some(staged.bytes.as_slice()) {
+                continue;
+            }
+            let mut create_reflog_directory = false;
+            let target_parent = if entry.in_logs {
+                match staging_fs::open_directory_at(
+                    &self.common_dir_file,
+                    "logs",
+                    "Git reflog directory",
+                )? {
+                    Some(directory) => directory,
+                    None => {
+                        create_reflog_directory = true;
+                        self.common_dir_file
+                            .try_clone()
+                            .context("cannot duplicate the Git metadata directory handle")?
+                    }
+                }
+            } else {
+                self.common_dir_file
+                    .try_clone()
+                    .context("cannot duplicate the Git metadata directory handle")?
+            };
+            if !create_reflog_directory {
+                let target_label = format!("Git state {}", entry.path);
+                match staging_fs::stat_entry_at(&target_parent, entry.name, &target_label)? {
+                    Some(stat) if staging_fs::stat_is_regular_file(&stat) => {}
+                    Some(_) => anyhow::bail!("refusing to replace non-regular {target_label}"),
+                    None => {}
+                }
+            }
+            planned.push(StagedApplyEntry {
+                index,
+                bytes: staged.bytes,
+                mode: staged.mode,
+                create_reflog_directory,
+            });
+        }
+        if planned.is_empty() {
+            return Ok(());
+        }
+        if planned.iter().any(|entry| entry.create_reflog_directory) {
+            staging_fs::create_directory_at(
+                &self.common_dir_file,
+                "logs",
+                0o777,
+                "Git reflog directory",
+            )?;
+        }
+        for (position, entry) in planned.iter().enumerate() {
+            let definition = &STAGED_GIT_ENTRIES[entry.index];
+            let target_parent = if definition.in_logs {
+                staging_fs::open_directory_at(
+                    &self.common_dir_file,
+                    "logs",
+                    "Git reflog directory",
+                )?
+                .context("Git reflog directory is missing")?
+            } else {
+                self.common_dir_file
+                    .try_clone()
+                    .context("cannot duplicate the Git metadata directory handle")?
+            };
+            #[cfg(test)]
+            let inject_failure = self.fail_before_rename == Some(definition.path);
+            #[cfg(not(test))]
+            let inject_failure = false;
+            staging_fs::replace_regular_entry_atomic_at(
+                &target_parent,
+                definition.name,
+                &entry.bytes,
+                entry.mode,
+                &format!("Git state {}", definition.path),
+                inject_failure,
+            )
+            .map_err(|error| {
+                let applied = planned[..position]
+                    .iter()
+                    .map(|entry| STAGED_GIT_ENTRIES[entry.index].path)
+                    .collect::<Vec<_>>();
+                let applied = if applied.is_empty() {
+                    "none".to_owned()
+                } else {
+                    applied.join(", ")
+                };
+                error.context(format!(
+                    "failed to apply staged Git state to {} (already applied: {applied})",
+                    definition.path
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct StagedApplyEntry {
+    index: usize,
+    bytes: Vec<u8>,
+    mode: u32,
+    create_reflog_directory: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GitWorktreeStaging {
+    fn drop(&mut self) {
+        for lock in &self.locks {
+            lock.release(&self.common_dir_file);
+        }
+        staging_fs::remove_private_staging_directory(&self.directory, &self.directory_file);
+    }
 }
 
 /// Metadata authorization for one validated Git command.
@@ -565,14 +1560,89 @@ async fn run_git_with_metadata_scope(
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
     verify_git_metadata_scope(scope, &cwd, writable_roots, &validated_roots)?;
-    run_with_metadata_roots(
+    run_git_with_metadata_roots_platform(command, &cwd, writable_roots, &validated_roots, stdin)
+        .await
+}
+
+/// Platform-specific Git command execution for one validated metadata scope.
+///
+/// A primary checkout keeps its per-worktree files in the metadata root that
+/// the sandbox exposes read-only. On Linux those files are staged in a private
+/// host-backed directory so Git's lock-and-rename protocol works, while the
+/// protected (and missing) entries stay untouched.
+#[cfg(target_os = "linux")]
+async fn run_git_with_metadata_roots_platform(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    validated_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    let staging = GitWorktreeStaging::prepare(cwd, validated_roots)?;
+    let mut staged_roots = writable_roots.to_vec();
+    let mut environment = Vec::new();
+    if let Some(staging) = &staging {
+        staged_roots.push(staging.directory_path().to_path_buf());
+        environment = staging.extra_environment();
+    }
+    let output = run_with_metadata_roots(
         command,
-        &cwd,
-        writable_roots,
-        &validated_roots,
+        cwd,
+        &staged_roots,
+        validated_roots,
         None,
         CommandNetworkPolicy::Restricted,
         stdin,
+        &environment,
+    )
+    .await;
+    finalize_staged_git_state(staging.as_ref(), &output)?;
+    output
+}
+
+/// Persists the staged per-worktree state only when the command produced a
+/// result.
+///
+/// A failed sandbox setup or spawn means no child ran, so the lock-time
+/// snapshot must not be applied and the original error is propagated
+/// unchanged. A completed command applies exactly the entries the child
+/// changed, including on a non-zero exit status: Git can make legitimate
+/// partial updates before reporting failure. Shared state the child already
+/// wrote directly to the common directory is not rolled back; this is not a
+/// transaction.
+#[cfg(target_os = "linux")]
+fn finalize_staged_git_state(
+    staging: Option<&GitWorktreeStaging>,
+    result: &Result<Output>,
+) -> Result<()> {
+    if result.is_err() {
+        return Ok(());
+    }
+    if let Some(staging) = staging {
+        staging
+            .apply()
+            .context("failed to persist staged Git worktree state")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_git_with_metadata_roots_platform(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    validated_roots: &[PathBuf],
+    stdin: Option<&[u8]>,
+) -> Result<Output> {
+    run_with_metadata_roots(
+        command,
+        cwd,
+        writable_roots,
+        validated_roots,
+        None,
+        CommandNetworkPolicy::Restricted,
+        stdin,
+        &[],
     )
     .await
 }
@@ -652,6 +1722,36 @@ pub async fn run_git_worktree_add(
         );
     }
     let protected_worktree_roots = protected_git_worktree_metadata_roots(&validated_roots)?;
+    // The common metadata root is read-only in the sandbox and only existing
+    // directories can be re-exposed as writable. Creating the `worktrees`
+    // namespace is the command's own first-use effect, so prepare the empty
+    // directory host-side and keep the command itself sandboxed.
+    if let Some(common) = validated_roots.first() {
+        let worktrees = common.join("worktrees");
+        if !worktrees.exists() {
+            std::fs::create_dir(&worktrees).with_context(|| {
+                format!(
+                    "cannot prepare the Git worktrees namespace {}",
+                    worktrees.display()
+                )
+            })?;
+        }
+    }
+    let mut environment = Vec::new();
+    if let Some(common) = validated_roots.first()
+        && !common.join("logs").is_dir()
+    {
+        // A missing common reflog directory cannot be created inside the
+        // read-only metadata root; keep reflogs disabled for this command.
+        environment.extend([
+            ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+            (
+                "GIT_CONFIG_KEY_0".to_owned(),
+                "core.logAllRefUpdates".to_owned(),
+            ),
+            ("GIT_CONFIG_VALUE_0".to_owned(), "false".to_owned()),
+        ]);
+    }
     run_with_metadata_roots(
         command,
         &cwd,
@@ -660,10 +1760,12 @@ pub async fn run_git_worktree_add(
         Some(&protected_worktree_roots),
         CommandNetworkPolicy::Restricted,
         stdin,
+        &environment,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_metadata_roots(
     command: &[String],
     cwd: &Path,
@@ -672,6 +1774,7 @@ async fn run_with_metadata_roots(
     protected_worktree_roots: Option<&[PathBuf]>,
     network: CommandNetworkPolicy,
     stdin: Option<&[u8]>,
+    extra_environment: &[(String, String)],
 ) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
@@ -712,7 +1815,8 @@ async fn run_with_metadata_roots(
         { anyhow::bail!("sandboxed execution is currently implemented for Linux and macOS only") };
 
     let command_cache = CommandCacheDir::create()?;
-    let environment = safe_environment(command_cache.path())?;
+    let mut environment = safe_environment(command_cache.path())?;
+    environment.extend(extra_environment.iter().cloned());
 
     process
         .kill_on_drop(true)
@@ -855,6 +1959,60 @@ pub fn git_current_branch(cwd: &Path) -> Result<Option<String>> {
         "Git HEAD contains an unsupported branch name"
     );
     Ok(Some(branch.to_owned()))
+}
+
+/// Canonical repository identity of one Git worktree root.
+///
+/// The managed-worktree authority resolution captures this value after it has
+/// validated a workspace and carries it to the Git broker and the local-agent
+/// sandbox launch, so those later stages compare against the exact identity
+/// that was validated instead of adopting a freshly observed one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRepositoryIdentity {
+    pub worktree_root: PathBuf,
+    pub metadata_roots: Vec<PathBuf>,
+    pub common_dir: PathBuf,
+    pub primary_checkout: PathBuf,
+}
+
+impl WorkspaceRepositoryIdentity {
+    /// Resolves the repository identity only when `workspace` is itself a
+    /// canonical Git worktree root.
+    ///
+    /// A subdirectory, a symlinked or swapped path, a nested repository and
+    /// every unsupported Git layout fail closed instead of yielding a partial
+    /// identity.
+    pub fn for_workspace(workspace: &Path) -> Result<Self> {
+        let canonical = std::fs::canonicalize(workspace).with_context(|| {
+            format!(
+                "cannot resolve Git worktree workspace {}",
+                workspace.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "Git worktree workspace is not a directory: {}",
+            canonical.display()
+        );
+        let worktree_root = git_worktree_root(&canonical)?;
+        anyhow::ensure!(
+            worktree_root == canonical,
+            "Git workspace is not a worktree root: {}",
+            canonical.display()
+        );
+        Ok(Self {
+            worktree_root,
+            metadata_roots: git_metadata_roots(&canonical)?,
+            common_dir: git_common_dir(&canonical)?,
+            primary_checkout: git_primary_checkout(&canonical)?,
+        })
+    }
+
+    /// `true` for a linked worktree whose private metadata and common
+    /// repository directory live below the primary checkout.
+    pub fn linked_worktree(&self) -> bool {
+        self.primary_checkout != self.worktree_root
+    }
 }
 
 fn resolve_git_metadata_paths(cwd: &Path) -> Result<GitMetadataPaths> {
@@ -3563,6 +4721,32 @@ done
             "{}",
             String::from_utf8_lossy(&head.stderr)
         );
+        assert_eq!(host_git_stdout(&workspace, &["status", "--porcelain"])?, "");
+        assert_eq!(
+            host_git_stdout(&workspace, &["log", "-1", "--format=%s"])?,
+            "linux sandbox acceptance"
+        );
+
+        // Staging applies the primary checkout's per-worktree state back to
+        // the host: a branch switch must persist its HEAD and index.
+        let switched = run_git(
+            &command("/usr/bin/git", &["switch", "-c", "staged-branch"]),
+            &workspace,
+            std::slice::from_ref(&writable_root),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(switched.status, 0, "{}", switched.stderr);
+        assert_eq!(
+            host_git_stdout(&workspace, &["branch", "--show-current"])?,
+            "staged-branch"
+        );
+        assert_eq!(host_git_stdout(&workspace, &["status", "--porcelain"])?, "");
+        assert!(
+            std::fs::read_to_string(workspace.join(".git").join("HEAD"))?
+                .contains("refs/heads/staged-branch")
+        );
         Ok(())
     }
 
@@ -3651,16 +4835,45 @@ done
         Ok(())
     }
 
-    #[tokio::test]
-    async fn linux_missing_protected_metadata_files_stay_readable() -> Result<()> {
-        let root = test_root();
-        let repository = root.path().join("repository");
-        std::fs::create_dir_all(&repository)?;
-        host_git(&repository, &["init", "-q"])?;
+    #[derive(Debug)]
+    enum HostEntry {
+        Missing,
+        RegularFile(Vec<u8>),
+        Symlink,
+        Directory,
+        Other,
+    }
+
+    /// Inspects a host path without collapsing non-NotFound I/O errors into an
+    /// empty value. Only an explicit NotFound becomes [`HostEntry::Missing`].
+    fn host_entry(path: &Path) -> Result<HostEntry> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_file() {
+                    Ok(HostEntry::RegularFile(std::fs::read(path)?))
+                } else if file_type.is_symlink() {
+                    Ok(HostEntry::Symlink)
+                } else if file_type.is_dir() {
+                    Ok(HostEntry::Directory)
+                } else {
+                    Ok(HostEntry::Other)
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HostEntry::Missing),
+            Err(error) => {
+                Err(error).with_context(|| format!("cannot inspect host path {}", path.display()))
+            }
+        }
+    }
+
+    fn init_metadata_repository(repository: &Path) -> Result<()> {
+        std::fs::create_dir_all(repository)?;
+        host_git(repository, &["init", "-q"])?;
         std::fs::write(repository.join("base.txt"), b"base\n")?;
-        host_git(&repository, &["add", "--", "base.txt"])?;
+        host_git(repository, &["add", "--", "base.txt"])?;
         host_git(
-            &repository,
+            repository,
             &[
                 "-c",
                 "user.name=temote-mcp test",
@@ -3672,33 +4885,54 @@ done
                 "base",
             ],
         )?;
-        let common = repository.join(".git");
-        assert!(!common.join("packed-refs").exists());
-        let git_roots = git_metadata_roots(&repository)?;
+        Ok(())
+    }
 
-        // `git branch` reads the (missing) `packed-refs` file. The mask must
-        // stay readable as an empty file instead of failing closed with EACCES.
-        let branch = run_git(
-            &command("/usr/bin/git", &["branch", "readable-mask", "HEAD"]),
-            &repository,
-            std::slice::from_ref(&repository),
-            &git_roots,
-            None,
+    fn add_metadata_worktree(repository: &Path, worktree: &Path, branch: &str) -> Result<()> {
+        host_git(
+            repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                worktree
+                    .to_str()
+                    .context("worktree path is not valid UTF-8")?,
+            ],
         )
-        .await?;
-        assert_eq!(branch.status, 0, "{}", branch.stderr);
+    }
+
+    #[tokio::test]
+    async fn linux_missing_protected_metadata_stays_missing_in_a_primary_checkout() -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        init_metadata_repository(&repository)?;
+        let missing = repository.join(".git").join("shallow");
+        let packed_refs = repository.join(".git").join("packed-refs");
+        assert!(matches!(host_entry(&missing)?, HostEntry::Missing));
+        assert!(matches!(host_entry(&packed_refs)?, HostEntry::Missing));
         assert_eq!(
-            host_git_stdout(&repository, &["rev-parse", "readable-mask"])?,
-            host_git_stdout(&repository, &["rev-parse", "HEAD"])?
+            host_git_stdout(&repository, &["rev-parse", "--is-shallow-repository"])?,
+            "false"
         );
 
-        // The mask still cannot inject metadata content. A write either fails
-        // closed (existing placeholder bound read-only) or is discarded by the
-        // /dev/null mask; the placeholder never gains content.
-        let _ = run_git(
+        let git_roots = git_metadata_roots(&repository)?;
+        let output = run_git(
             &command(
                 "/usr/bin/sh",
-                &["-c", "printf corrupted > .git/packed-refs"],
+                &[
+                    "-c",
+                    "if test -e .git/shallow; then echo shallow-exists; else echo shallow-absent; fi; \
+                     if test -e .git/packed-refs; then echo packed-refs-exists; else echo packed-refs-absent; fi; \
+                     printf 'shallow-before='; git rev-parse --is-shallow-repository; \
+                     if printf corrupted > .git/shallow 2>/dev/null; then echo write-shallow-ok; \
+                     else echo write-shallow-denied; fi; \
+                     if printf corrupted > .git/packed-refs 2>/dev/null; then echo write-packed-refs-ok; \
+                     else echo write-packed-refs-denied; fi; \
+                     printf 'shallow-after='; git rev-parse --is-shallow-repository",
+                ],
             ),
             &repository,
             std::slice::from_ref(&repository),
@@ -3706,8 +4940,254 @@ done
             None,
         )
         .await?;
-        let content = std::fs::read_to_string(common.join("packed-refs")).unwrap_or_default();
-        assert!(content.is_empty(), "{content:?}");
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            "shallow-absent\npacked-refs-absent\nshallow-before=false\n\
+             write-shallow-denied\nwrite-packed-refs-denied\nshallow-after=false\n"
+        );
+        // The host path stayed exactly missing: no empty placeholder and no
+        // mount-point artifact.
+        assert!(matches!(host_entry(&missing)?, HostEntry::Missing));
+        assert!(matches!(host_entry(&packed_refs)?, HostEntry::Missing));
+        assert_eq!(
+            host_git_stdout(&repository, &["rev-parse", "--is-shallow-repository"])?,
+            "false"
+        );
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_missing_protected_metadata_stays_missing_in_a_linked_worktree() -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        let linked = root.path().join("linked");
+        init_metadata_repository(&repository)?;
+        add_metadata_worktree(&repository, &linked, "feature")?;
+        let missing = repository.join(".git").join("shallow");
+        assert!(matches!(host_entry(&missing)?, HostEntry::Missing));
+        assert_eq!(
+            host_git_stdout(&repository, &["rev-parse", "--is-shallow-repository"])?,
+            "false"
+        );
+
+        let linked = std::fs::canonicalize(&linked)?;
+        let git_roots = git_metadata_roots(&linked)?;
+        let script = format!(
+            "if test -e {0}; then echo shallow-exists; else echo shallow-absent; fi; \
+             printf 'shallow-before='; git rev-parse --is-shallow-repository; \
+             if printf corrupted > {0} 2>/dev/null; then echo write-shallow-ok; \
+             else echo write-shallow-denied; fi; \
+             printf 'shallow-after='; git rev-parse --is-shallow-repository",
+            missing.display()
+        );
+        let output = run_git_with_pinned_worktree_metadata(
+            &command("/usr/bin/sh", &["-c", &script]),
+            &linked,
+            std::slice::from_ref(&linked),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(
+            output.stdout,
+            "shallow-absent\nshallow-before=false\nwrite-shallow-denied\nshallow-after=false\n"
+        );
+        assert!(matches!(host_entry(&missing)?, HostEntry::Missing));
+        assert_eq!(
+            host_git_stdout(&repository, &["rev-parse", "--is-shallow-repository"])?,
+            "false"
+        );
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    /// Even a read-only sandbox invocation must not materialize a mount-point
+    /// artifact for a missing protected path.
+    #[tokio::test]
+    async fn linux_missing_protected_metadata_leaves_no_artifact_after_read_only_use() -> Result<()>
+    {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        init_metadata_repository(&repository)?;
+        let missing = repository.join(".git").join("shallow");
+        assert!(matches!(host_entry(&missing)?, HostEntry::Missing));
+
+        let git_roots = git_metadata_roots(&repository)?;
+        let output = run_git(
+            &command(
+                "/usr/bin/sh",
+                &[
+                    "-c",
+                    "printf 'inside='; git rev-parse --is-shallow-repository",
+                ],
+            ),
+            &repository,
+            std::slice::from_ref(&repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "inside=false\n");
+
+        assert!(matches!(host_entry(&missing)?, HostEntry::Missing));
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    /// An existing shallow repository keeps its shallow state and shallow file
+    /// inside the sandbox, and the protected file stays immutable.
+    #[tokio::test]
+    async fn linux_existing_shallow_repository_keeps_its_shallow_state() -> Result<()> {
+        let root = test_root();
+        let source = root.path().join("source");
+        init_metadata_repository(&source)?;
+        let shallow_repository = root.path().join("shallow-repository");
+        let clone = std::process::Command::new("/usr/bin/git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--quiet",
+                &format!("file://{}", source.display()),
+                shallow_repository
+                    .to_str()
+                    .context("shallow path is not UTF-8")?,
+            ])
+            .current_dir(root.path())
+            .output()?;
+        anyhow::ensure!(
+            clone.status.success(),
+            "shallow clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        let shallow_file = shallow_repository.join(".git").join("shallow");
+        let sentinel = std::fs::read(&shallow_file)?;
+        assert!(!sentinel.is_empty());
+        assert_eq!(
+            host_git_stdout(
+                &shallow_repository,
+                &["rev-parse", "--is-shallow-repository"]
+            )?,
+            "true"
+        );
+
+        let git_roots = git_metadata_roots(&shallow_repository)?;
+        let output = run_git(
+            &command(
+                "/usr/bin/sh",
+                &[
+                    "-c",
+                    "printf 'inside='; git rev-parse --is-shallow-repository; \
+                     if printf corrupted > .git/shallow 2>/dev/null; then echo write-ok; \
+                     else echo write-denied; fi",
+                ],
+            ),
+            &shallow_repository,
+            std::slice::from_ref(&shallow_repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, "inside=true\nwrite-denied\n");
+        match host_entry(&shallow_file)? {
+            HostEntry::RegularFile(content) => assert_eq!(content, sentinel),
+            other => panic!("shallow file has an unexpected host type: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_existing_metadata_sentinel_is_readable_and_immutable_in_a_primary_checkout()
+    -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        init_metadata_repository(&repository)?;
+        let sentinel = "0000000000000000000000000000000000000000 refs/heads/sentinel\n";
+        let sentinel_path = repository.join(".git").join("packed-refs");
+        std::fs::write(&sentinel_path, sentinel)?;
+        assert!(matches!(
+            host_entry(&sentinel_path)?,
+            HostEntry::RegularFile(_)
+        ));
+
+        let git_roots = git_metadata_roots(&repository)?;
+        let output = run_git(
+            &command(
+                "/usr/bin/sh",
+                &[
+                    "-c",
+                    "cat .git/packed-refs; \
+                     if printf corrupted > .git/packed-refs 2>/dev/null; then printf 'write-ok\\n'; \
+                     else printf 'write-denied\\n'; fi; \
+                     cat .git/packed-refs",
+                ],
+            ),
+            &repository,
+            std::slice::from_ref(&repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, format!("{sentinel}write-denied\n{sentinel}"));
+        match host_entry(&sentinel_path)? {
+            HostEntry::RegularFile(content) => {
+                assert_eq!(String::from_utf8(content)?, sentinel);
+            }
+            other => panic!("unexpected sentinel host type: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_existing_metadata_sentinel_is_readable_and_immutable_in_a_linked_worktree()
+    -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        let linked = root.path().join("linked");
+        init_metadata_repository(&repository)?;
+        add_metadata_worktree(&repository, &linked, "feature")?;
+        let sentinel = "0000000000000000000000000000000000000000 refs/heads/sentinel\n";
+        let sentinel_path = repository.join(".git").join("packed-refs");
+        std::fs::write(&sentinel_path, sentinel)?;
+
+        let linked = std::fs::canonicalize(&linked)?;
+        let git_roots = git_metadata_roots(&linked)?;
+        let script = format!(
+            "cat {0}; \
+             if printf corrupted > {0} 2>/dev/null; then printf 'write-ok\\n'; \
+             else printf 'write-denied\\n'; fi; \
+             cat {0}",
+            sentinel_path.display()
+        );
+        let output = run_git_with_pinned_worktree_metadata(
+            &command("/usr/bin/sh", &["-c", &script]),
+            &linked,
+            std::slice::from_ref(&linked),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, format!("{sentinel}write-denied\n{sentinel}"));
+        match host_entry(&sentinel_path)? {
+            HostEntry::RegularFile(content) => {
+                assert_eq!(String::from_utf8(content)?, sentinel);
+            }
+            other => panic!("unexpected sentinel host type: {other:?}"),
+        }
 
         std::fs::remove_dir_all(root.path())?;
         Ok(())
@@ -3883,6 +5363,104 @@ done
     }
 
     #[tokio::test]
+    async fn linux_local_agent_scope_rejects_a_swapped_worktree_identity_before_spawn() -> Result<()>
+    {
+        let root = test_root();
+        let primary = root.path().join("primary");
+        let linked = root.path().join("linked");
+        let other = root.path().join("other");
+        let other_linked = root.path().join("other-linked");
+        for repository in [&primary, &other] {
+            std::fs::create_dir_all(repository)?;
+            host_git(repository, &["init", "-q"])?;
+            std::fs::write(repository.join("base.txt"), b"base\n")?;
+            host_git(repository, &["add", "--", "base.txt"])?;
+            host_git(
+                repository,
+                &[
+                    "-c",
+                    "user.name=temote-mcp test",
+                    "-c",
+                    "user.email=temote-mcp@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "base",
+                ],
+            )?;
+        }
+        host_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        )?;
+        host_git(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other-branch",
+                other_linked.to_str().unwrap(),
+            ],
+        )?;
+
+        let linked = std::fs::canonicalize(&linked)?;
+        let expected = WorkspaceRepositoryIdentity::for_workspace(&linked)?;
+        assert!(expected.linked_worktree());
+
+        // Swap the validated target's `.git` pointer to the other
+        // repository's structurally valid private metadata.
+        let other_private =
+            std::fs::canonicalize(other.join(".git").join("worktrees").join("other-linked"))?;
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", other_private.display()),
+        )?;
+        std::fs::write(
+            other_private.join("gitdir"),
+            format!("{}\n", linked.join(".git").display()),
+        )?;
+
+        let command = command("/bin/sh", &["-c", "pwd > ran-in.txt"]);
+        let temporary = root.path().to_path_buf();
+        let error = run_local_agent(
+            &command,
+            &linked,
+            LocalAgentScope {
+                writable_roots: std::slice::from_ref(&linked),
+                temporary_roots: std::slice::from_ref(&temporary),
+                read_only_paths: &[],
+                read_only_roots: &[],
+                read_only_symlinks: &[],
+                read_only_scaffold_directories: &[],
+                read_only_files: &[],
+                hidden_roots: &[],
+                expected_repository: Some(&expected),
+            },
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .expect_err("a swapped worktree identity must fail before spawn");
+        assert!(
+            error.to_string().contains("managed worktree identity"),
+            "{error:#}"
+        );
+        assert!(!linked.join("ran-in.txt").exists());
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn linux_structured_worktree_add_can_create_without_sibling_metadata_write() -> Result<()>
     {
         let root = test_root();
@@ -3966,6 +5544,51 @@ done
         );
         assert!(sibling_metadata.is_dir());
         assert!(!sibling_marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn linux_structured_worktree_add_creates_the_namespace_on_first_use() -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        let destination = repository.join(".wt").join("first");
+        std::fs::create_dir_all(destination.parent().unwrap())?;
+        init_metadata_repository(&repository)?;
+        assert!(!repository.join(".git").join("worktrees").exists());
+
+        let git_roots = git_metadata_roots(&repository)?;
+        let add = vec![
+            "/usr/bin/git".to_owned(),
+            "-c".to_owned(),
+            "core.hooksPath=/dev/null".to_owned(),
+            "worktree".to_owned(),
+            "add".to_owned(),
+            "-b".to_owned(),
+            "first".to_owned(),
+            destination.to_string_lossy().into_owned(),
+            "HEAD".to_owned(),
+        ];
+        let output = run_git_worktree_add(
+            &add,
+            &repository,
+            std::slice::from_ref(&root.path().to_path_buf()),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(output.status, 0, "{}", output.stderr);
+        assert!(repository.join(".git").join("worktrees").is_dir());
+        assert!(destination.join(".git").is_file());
+        assert_eq!(
+            std::process::Command::new("/usr/bin/git")
+                .args(["branch", "--show-current"])
+                .current_dir(&destination)
+                .output()?
+                .stdout,
+            b"first\n"
+        );
+
+        std::fs::remove_dir_all(root.path())?;
         Ok(())
     }
 
@@ -4150,6 +5773,7 @@ done
                 read_only_scaffold_directories: &[],
                 read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
+                expected_repository: None,
             },
             None,
             &environment,
@@ -4219,6 +5843,7 @@ done
                 read_only_scaffold_directories: &[],
                 read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
+                expected_repository: None,
             },
             None,
             &environment,
@@ -4254,6 +5879,7 @@ done
                 read_only_scaffold_directories: &[],
                 read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
+                expected_repository: None,
             },
             None,
             &environment,
@@ -4284,6 +5910,7 @@ done
                 read_only_scaffold_directories: &[],
                 read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
+                expected_repository: None,
             },
             None,
             &environment,
@@ -4323,6 +5950,7 @@ done
                 read_only_scaffold_directories: &[],
                 read_only_files: &[],
                 hidden_roots: std::slice::from_ref(&hidden_root),
+                expected_repository: None,
             },
             None,
             &environment,
@@ -4399,6 +6027,7 @@ done
                 read_only_scaffold_directories: &[],
                 read_only_files: std::slice::from_ref(&target),
                 hidden_roots: std::slice::from_ref(&hidden_root),
+                expected_repository: None,
             },
             None,
             &environment,
@@ -5075,5 +6704,489 @@ mod tests {
 
         std::fs::remove_dir_all(workspace)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod phase24_staging_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    fn disposable_repository(base: &Path, name: &str) -> PathBuf {
+        let repository = base.join(name);
+        std::fs::create_dir(&repository).unwrap();
+        let output = std::process::Command::new("/usr/bin/git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .output()
+            .expect("host git is required for the staging tests");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        repository
+    }
+
+    fn prepare_staging(repository: &Path) -> GitWorktreeStaging {
+        let common = repository.join(".git");
+        GitWorktreeStaging::prepare(repository, std::slice::from_ref(&common))
+            .expect("staging preparation must succeed")
+            .expect("a primary checkout must be staged")
+    }
+
+    fn read(path: &Path) -> Vec<u8> {
+        std::fs::read(path).unwrap()
+    }
+
+    fn make_fifo(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path and the file is
+        // created inside the disposable fixture.
+        let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    fn temporary_sync_files(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".temote-git-sync-"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn phase24_staging_head_lock_collision_preserves_other_lock_and_releases_own_index_lock() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        std::fs::write(common.join("HEAD.lock"), b"other-worker-lock").unwrap();
+        let error = GitWorktreeStaging::prepare(&repository, std::slice::from_ref(&common))
+            .expect_err("preparation must fail while another HEAD lock exists");
+        assert!(
+            error
+                .to_string()
+                .contains("another Git operation is in progress"),
+            "{error}"
+        );
+        assert_eq!(read(&common.join("HEAD.lock")), b"other-worker-lock");
+        assert!(
+            !common.join("index.lock").exists(),
+            "preparation failure leaked its own index.lock"
+        );
+    }
+
+    #[test]
+    fn phase24_staging_index_lock_collision_preserves_other_lock() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        std::fs::write(common.join("index.lock"), b"other-worker-lock").unwrap();
+        let error = GitWorktreeStaging::prepare(&repository, std::slice::from_ref(&common))
+            .expect_err("preparation must fail while another index lock exists");
+        assert!(
+            error
+                .to_string()
+                .contains("another Git operation is in progress"),
+            "{error}"
+        );
+        assert_eq!(read(&common.join("index.lock")), b"other-worker-lock");
+        assert!(!common.join("HEAD.lock").exists());
+    }
+
+    #[test]
+    fn phase24_staging_lock_is_acquired_before_snapshot_is_read() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        std::fs::write(common.join("HEAD.lock"), b"other-worker-lock").unwrap();
+        // A symlinked entry would make the snapshot fail if it ran first.
+        std::os::unix::fs::symlink(fixture.path().join("outside-index"), common.join("index"))
+            .unwrap();
+        let error = GitWorktreeStaging::prepare(&repository, std::slice::from_ref(&common))
+            .expect_err("preparation must fail while another HEAD lock exists");
+        assert!(
+            error
+                .to_string()
+                .contains("another Git operation is in progress"),
+            "the snapshot was read before the locks were acquired: {error}"
+        );
+        assert_eq!(read(&common.join("HEAD.lock")), b"other-worker-lock");
+        assert!(!common.join("index.lock").exists());
+    }
+
+    #[test]
+    fn phase24_staging_snapshot_failure_releases_owned_locks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        make_fifo(&common.join("index"));
+        let error = GitWorktreeStaging::prepare(&repository, std::slice::from_ref(&common))
+            .expect_err("a special-file snapshot entry must fail closed");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(
+            !common.join("index.lock").exists(),
+            "the owned index lock was not released"
+        );
+        assert!(
+            !common.join("HEAD.lock").exists(),
+            "the owned HEAD lock was not released"
+        );
+    }
+
+    #[test]
+    fn phase24_staging_drop_removes_private_staging_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        let directory = staged.directory_path().to_owned();
+        assert!(directory.is_dir());
+        drop(staged);
+        assert!(!directory.exists(), "staging directory remains after Drop");
+        assert!(!common.join("index.lock").exists());
+        assert!(!common.join("HEAD.lock").exists());
+    }
+
+    #[test]
+    fn phase24_staging_drop_does_not_remove_a_replaced_staging_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let staged = prepare_staging(&repository);
+        let directory = staged.directory_path().to_owned();
+        let moved = fixture.path().join("moved-staging");
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("sentinel"), b"unrelated").unwrap();
+        drop(staged);
+        assert_eq!(
+            read(&directory.join("sentinel")),
+            b"unrelated",
+            "Drop removed an unrelated directory"
+        );
+        assert!(moved.is_dir());
+        assert!(!moved.join("HEAD").exists());
+        assert!(!moved.join("logs").exists());
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+    }
+
+    #[test]
+    fn phase24_staging_rejects_symlinked_metadata_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let link = fixture.path().join("git-link");
+        std::os::unix::fs::symlink(repository.join(".git"), &link).unwrap();
+        let error = GitWorktreeStaging::prepare(&repository, std::slice::from_ref(&link))
+            .expect_err("a symlinked metadata root must fail closed");
+        assert!(error.to_string().contains("symbolic-link"), "{error}");
+    }
+
+    #[test]
+    fn phase24_staging_apply_rejects_retargeted_common_directory_and_preserves_unrelated_repository()
+     {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository_a = disposable_repository(fixture.path(), "repository-a");
+        let repository_b = disposable_repository(fixture.path(), "repository-b");
+        let common_a = repository_a.join(".git");
+        let common_b = repository_b.join(".git");
+        let unrelated_before = read(&common_b.join("HEAD"));
+        let staged = prepare_staging(&repository_a);
+        std::fs::write(
+            staged.directory_path().join("HEAD"),
+            b"ref: refs/heads/phase24-probe\n",
+        )
+        .unwrap();
+        std::fs::write(common_b.join("index.lock"), b"other-repository-lock").unwrap();
+        std::fs::rename(&common_a, repository_a.join("saved-git")).unwrap();
+        std::os::unix::fs::symlink(&common_b, &common_a).unwrap();
+        let error = staged
+            .apply()
+            .expect_err("apply must reject a retargeted common directory");
+        assert!(
+            error
+                .to_string()
+                .contains("replaced after staging was prepared"),
+            "{error}"
+        );
+        let directory = staged.directory_path().to_owned();
+        drop(staged);
+        assert_eq!(read(&common_b.join("HEAD")), unrelated_before);
+        assert_eq!(
+            read(&common_b.join("index.lock")),
+            b"other-repository-lock",
+            "Drop removed an unrelated repository lock"
+        );
+        assert_eq!(
+            read(&common_b.join("HEAD")),
+            unrelated_before,
+            "apply mutated an unrelated repository"
+        );
+        assert!(
+            !repository_a.join("saved-git").join("index.lock").exists(),
+            "the owned lock was not released in the verified metadata directory"
+        );
+        assert!(!repository_a.join("saved-git").join("HEAD.lock").exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn phase24_staging_apply_rejects_symlinked_reflog_parent() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let outside = fixture.path().join("outside-metadata");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("HEAD"), b"sentinel").unwrap();
+        let staged = prepare_staging(&repository);
+        std::fs::write(staged.directory_path().join("logs/HEAD"), b"staged-reflog").unwrap();
+        std::os::unix::fs::symlink(&outside, common.join("logs")).unwrap();
+        let error = staged
+            .apply()
+            .expect_err("a symlinked reflog parent must fail closed");
+        assert!(!format!("{error:#}").is_empty());
+        assert!(
+            std::fs::symlink_metadata(common.join("logs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read(&outside.join("HEAD")), b"sentinel");
+    }
+
+    #[test]
+    fn phase24_staging_apply_rejects_symlinked_staged_entry() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let before = read(&common.join("HEAD"));
+        let staged = prepare_staging(&repository);
+        let outside = fixture.path().join("outside-staged-head");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(staged.directory_path().join("HEAD")).unwrap();
+        std::os::unix::fs::symlink(&outside, staged.directory_path().join("HEAD")).unwrap();
+        let error = staged
+            .apply()
+            .expect_err("a symlinked staged entry must fail closed");
+        assert!(!format!("{error:#}").is_empty());
+        assert_eq!(read(&common.join("HEAD")), before);
+    }
+
+    #[test]
+    fn phase24_staging_apply_rejects_symlinked_target_entry() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        std::fs::write(
+            staged.directory_path().join("HEAD"),
+            b"ref: refs/heads/phase24-symlink\n",
+        )
+        .unwrap();
+        let outside = fixture.path().join("outside-target-head");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        std::fs::remove_file(common.join("HEAD")).unwrap();
+        std::os::unix::fs::symlink(&outside, common.join("HEAD")).unwrap();
+        let error = staged
+            .apply()
+            .expect_err("a symlinked target entry must fail closed");
+        assert!(error.to_string().contains("non-regular"), "{error}");
+        assert_eq!(read(&outside), b"sentinel");
+    }
+
+    #[test]
+    fn phase24_staging_apply_rejects_special_target_entry() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        std::fs::write(staged.directory_path().join("index"), b"staged-index").unwrap();
+        make_fifo(&common.join("index"));
+        let error = staged
+            .apply()
+            .expect_err("a special-file target must fail closed");
+        assert!(error.to_string().contains("non-regular"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(common.join("index"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(!common.join(".temote-git-sync-probe").exists());
+    }
+
+    #[test]
+    fn phase24_staging_apply_preserves_state_the_command_did_not_change() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        let drift = b"ref: refs/heads/host-drift\n";
+        std::fs::write(common.join("HEAD"), drift).unwrap();
+        std::fs::write(staged.directory_path().join("index"), b"staged-index").unwrap();
+        staged.apply().unwrap();
+        assert_eq!(
+            read(&common.join("HEAD")),
+            drift,
+            "apply restored state the command did not change"
+        );
+        assert_eq!(read(&common.join("index")), b"staged-index");
+    }
+
+    #[test]
+    fn phase24_staging_apply_writes_changed_state_and_preserves_permissions() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        let staged_head = staged.directory_path().join("HEAD");
+        std::fs::write(&staged_head, b"ref: refs/heads/phase24-applied\n").unwrap();
+        std::fs::set_permissions(&staged_head, std::fs::Permissions::from_mode(0o640)).unwrap();
+        staged.apply().unwrap();
+        assert_eq!(
+            read(&common.join("HEAD")),
+            b"ref: refs/heads/phase24-applied\n"
+        );
+        let mode = std::fs::symlink_metadata(common.join("HEAD"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "apply did not preserve the staged permissions");
+    }
+
+    #[test]
+    fn phase24_staging_apply_applies_changed_reflog_into_new_logs_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        assert!(!common.join("logs").exists());
+        let staged = prepare_staging(&repository);
+        std::fs::write(staged.directory_path().join("logs/HEAD"), b"phase24-reflog").unwrap();
+        staged.apply().unwrap();
+        assert!(common.join("logs").is_dir());
+        assert_eq!(read(&common.join("logs/HEAD")), b"phase24-reflog");
+    }
+
+    #[test]
+    fn phase24_staging_apply_rejects_symlinked_staged_reflog_parent() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        std::fs::write(staged.directory_path().join("logs/HEAD"), b"staged-reflog").unwrap();
+        let outside = fixture.path().join("outside-reflog");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(staged.directory_path().join("logs")).unwrap();
+        std::os::unix::fs::symlink(&outside, staged.directory_path().join("logs")).unwrap();
+        let error = staged
+            .apply()
+            .expect_err("a symlinked staging parent must fail closed");
+        assert!(!format!("{error:#}").is_empty());
+        assert!(!common.join("logs").exists());
+    }
+
+    #[test]
+    fn phase24_staging_no_apply_when_the_command_has_no_result() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let before = read(&common.join("HEAD"));
+        let staged = prepare_staging(&repository);
+        std::fs::write(
+            staged.directory_path().join("HEAD"),
+            b"ref: refs/heads/phase24-pending\n",
+        )
+        .unwrap();
+        let failure: Result<Output> = Err(anyhow::anyhow!("sandbox setup failed"));
+        finalize_staged_git_state(Some(&staged), &failure).unwrap();
+        assert_eq!(
+            read(&common.join("HEAD")),
+            before,
+            "a stale snapshot was applied after a command without a result"
+        );
+    }
+
+    #[test]
+    fn phase24_staging_apply_runs_for_completed_command_even_on_nonzero_exit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        std::fs::write(
+            staged.directory_path().join("HEAD"),
+            b"ref: refs/heads/phase24-partial\n",
+        )
+        .unwrap();
+        let completed = Ok(Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: "partial update".to_owned(),
+            truncated: false,
+        });
+        finalize_staged_git_state(Some(&staged), &completed).unwrap();
+        assert_eq!(
+            read(&common.join("HEAD")),
+            b"ref: refs/heads/phase24-partial\n",
+            "a legitimate partial update of a failed command was discarded"
+        );
+    }
+
+    #[test]
+    fn phase24_staging_owned_lock_replacement_is_not_removed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let staged = prepare_staging(&repository);
+        assert!(common.join("index.lock").is_file());
+        assert!(common.join("HEAD.lock").is_file());
+        for name in ["index.lock", "HEAD.lock"] {
+            std::fs::remove_file(common.join(name)).unwrap();
+            std::fs::write(common.join(name), b"other-worker-replacement").unwrap();
+        }
+        drop(staged);
+        assert_eq!(
+            read(&common.join("index.lock")),
+            b"other-worker-replacement",
+            "Drop removed a lock that was replaced after acquisition"
+        );
+        assert_eq!(read(&common.join("HEAD.lock")), b"other-worker-replacement");
+    }
+
+    #[test]
+    fn phase24_staging_apply_failure_cleans_temporary_files_and_reports_already_applied() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = disposable_repository(fixture.path(), "repository");
+        let common = repository.join(".git");
+        let mut staged = prepare_staging(&repository);
+        std::fs::write(
+            staged.directory_path().join("HEAD"),
+            b"ref: refs/heads/phase24-partial-apply\n",
+        )
+        .unwrap();
+        std::fs::write(staged.directory_path().join("index"), b"phase24-index").unwrap();
+        staged.fail_before_rename = Some("index");
+        let error = staged
+            .apply()
+            .expect_err("the injected apply failure must surface as an error");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("already applied: HEAD"),
+            "apply failure did not report the applied state: {message}"
+        );
+        assert_eq!(
+            read(&common.join("HEAD")),
+            b"ref: refs/heads/phase24-partial-apply\n"
+        );
+        assert!(!common.join("index").exists());
+        assert!(
+            temporary_sync_files(&common).is_empty(),
+            "apply failure left temporary files behind"
+        );
     }
 }

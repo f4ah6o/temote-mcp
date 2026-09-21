@@ -88,6 +88,7 @@ pub fn local_agent_command(
         scope.read_only_scaffold_directories,
         scope.read_only_files,
         scope.hidden_roots,
+        scope.expected_repository,
     )?;
     let executable = helper_executable()?;
     let args = helper::command_args(&policy, command)?;

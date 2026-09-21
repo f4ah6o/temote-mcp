@@ -36,6 +36,7 @@ sandboxed-test:
     cargo test --bin temote-mcp --all-features --locked session_control::tests::session_gc
     @echo "NOT RUN (host/CI gate): session_gc socket liveness acceptance (session_control::tests::host_liveness_tests)"
     @echo "NOT RUN (host/CI gate): Linux nested sandbox runtime tests (sandbox::linux_tests)"
+    @echo "NOT RUN (host/CI gate): pinned-workspace path-swap bubblewrap acceptance (sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap_host_acceptance)"
     @echo "NOT RUN (host/CI gate): local_agent real-wiring tests (nested Linux sandbox required)"
     @echo "NOT RUN (host/CI gate): agent-mode linked-worktree broker metadata acceptance (nested Linux sandbox required)"
     @echo "NOT RUN (host/CI gate): deployment-preflight CLI subprocess tests (nested process spawn required)"
@@ -63,6 +64,7 @@ gateway-sandbox-test:
 linux-sandbox-acceptance:
     cargo build --bin temote-linux-sandbox --locked
     cargo test --lib --all-features --locked linux_tests -- --nocapture
+    cargo test --lib --all-features --locked sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap_host_acceptance -- --exact --ignored --nocapture
     cargo test --bin temote-mcp --all-features --locked agent_git -- --ignored --nocapture
 
 fmt-check:

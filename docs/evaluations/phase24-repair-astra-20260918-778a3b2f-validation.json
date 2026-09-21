@@ -1,0 +1,340 @@
+{
+  "decision": "REQUEST_CHANGES",
+  "reviewer": "ChatGPT.com GPT-6 Astra Pro",
+  "head": "39fddd514af06964f89410ca70711382a7d53806",
+  "origin_main": "a32e75219fddd71114d7c1c7f29e4e71bef8c358",
+  "source_diff_sha256": "4f99d1ab6fba06f0e66f4a612e315a35c2d21f2b76d156b698eb6efb0d202ddf",
+  "index_entries_sha256": "737548a18b6f9fc3593f0d2959bb103635920aa93792dc8be3c67a7577bf28e7",
+  "gate": {
+    "command": [
+      "just",
+      "sandboxed-check"
+    ],
+    "exit_code": 101,
+    "result": "FAIL",
+    "library_passed": 118,
+    "library_failed": 1,
+    "failure": "sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap: Linux sandboxing requires a root-owned, non-writable /usr/bin/bwrap"
+  },
+  "independent_probes": {
+    "command": [
+      "cargo",
+      "test",
+      "--manifest-path",
+      "target/phase24-astra-20260918-778a3b2f/source-snapshot/Cargo.toml",
+      "--target-dir",
+      "target",
+      "--lib",
+      "--all-features",
+      "--locked",
+      "phase24_astra_",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 101,
+    "passed": 0,
+    "failed": 5,
+    "patch": "docs/evaluations/phase24-repair-astra-20260918-778a3b2f-independent-probes.patch"
+  },
+  "remaining_checks": [
+    {
+      "name": "managed-worktree",
+      "command": [
+        "cargo",
+        "test",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "managed_worktree::tests::",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/managed-worktree.log",
+      "summary": [
+        "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 933 filtered out; finished in 0.02s"
+      ]
+    },
+    {
+      "name": "approval-identity",
+      "command": [
+        "cargo",
+        "test",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "mcp::tests::local_agent_worktree_approval_identity_uses_the_configured_src_named_root",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/approval-identity.log",
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 949 filtered out; finished in 0.03s"
+      ]
+    },
+    {
+      "name": "approval-metadata",
+      "command": [
+        "cargo",
+        "test",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "local_agent::tests::approval_metadata_reports_the_bounded_managed_workspace_identity",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/approval-metadata.log",
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 949 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "name": "worktree-input",
+      "command": [
+        "cargo",
+        "test",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "mcp::tests::local_agent_worktree_input_is_bounded_and_path_free",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/worktree-input.log",
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 949 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "name": "agent-git",
+      "command": [
+        "cargo",
+        "test",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "agent_git"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/agent-git.log",
+      "summary": [
+        "test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 919 filtered out; finished in 0.63s"
+      ]
+    },
+    {
+      "name": "generic-sandbox",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "sandbox::generic_tests::"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/generic-sandbox.log",
+      "summary": [
+        "test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 108 filtered out; finished in 0.10s"
+      ]
+    },
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/fmt.log",
+      "summary": []
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/clippy.log",
+      "summary": []
+    },
+    {
+      "name": "no-default",
+      "command": [
+        "cargo",
+        "check",
+        "--no-default-features",
+        "--all-targets",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/no-default.log",
+      "summary": [
+        "warning: variant `RemoteUpgrade` is never constructed",
+        "warning: function `request` is never used",
+        "warning: function `request_supervisor_approval` is never used",
+        "warning: methods `name`, `ingress_name`, and `auth_name` are never used",
+        "warning: methods `roots_configured` and `validate_upgrade_session` are never used",
+        "warning: function `approval_proxy_sender` is never used",
+        "warning: methods `digest_hex` and `execution_fd` are never used",
+        "warning: field `planned_sessions` is never read",
+        "warning: function `remote_upgrade_preflight` is never used",
+        "warning: function `verify_planned_upgrade_sessions` is never used",
+        "warning: function `validate_planned_upgrade_session_identities` is never used",
+        "warning: function `request_upgrade_session_views` is never used",
+        "warning: function `request_supervisor_approval` is never used",
+        "warning: `temote-mcp` (bin \"temote-mcp\") generated 12 warnings",
+        "warning: `temote-mcp` (bin \"temote-mcp\" test) generated 9 warnings (8 duplicates)"
+      ]
+    },
+    {
+      "name": "gateway",
+      "command": [
+        "npm",
+        "run",
+        "test:sandbox",
+        "--prefix",
+        "gateway"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/gateway.log",
+      "summary": []
+    },
+    {
+      "name": "diff-check",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "target/phase24-astra-20260918-778a3b2f/diff-check.log",
+      "summary": []
+    }
+  ],
+  "isolated_original_checks": [
+    {
+      "name": "isolated-original-generic",
+      "command": [
+        "cargo",
+        "test",
+        "--target-dir",
+        "target/phase24-astra-20260918-778a3b2f/original-build",
+        "--lib",
+        "--all-features",
+        "--locked",
+        "sandbox::generic_tests::"
+      ],
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.12s"
+      ]
+    },
+    {
+      "name": "isolated-original-managed",
+      "command": [
+        "cargo",
+        "test",
+        "--target-dir",
+        "target/phase24-astra-20260918-778a3b2f/original-build",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "managed_worktree::tests::"
+      ],
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 933 filtered out; finished in 0.02s"
+      ]
+    },
+    {
+      "name": "isolated-original-contract",
+      "command": [
+        "cargo",
+        "test",
+        "--target-dir",
+        "target/phase24-astra-20260918-778a3b2f/original-build",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "mcp::tests::routed_gateway_contract_matches_checked_in_snapshot",
+        "--",
+        "--exact"
+      ],
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 949 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "name": "isolated-original-fingerprint",
+      "command": [
+        "cargo",
+        "test",
+        "--target-dir",
+        "target/phase24-astra-20260918-778a3b2f/original-build",
+        "--bin",
+        "temote-mcp",
+        "--all-features",
+        "--locked",
+        "mcp::tests::public_contract_fingerprint_matches_checked_in_snapshot",
+        "--",
+        "--exact"
+      ],
+      "exit_code": 0,
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 949 filtered out; finished in 0.00s"
+      ]
+    }
+  ],
+  "opencode_attempts": [
+    {
+      "attempt": 1,
+      "agent": "opencode",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "access": "workspace_write",
+      "json_rpc_error_code": -32000,
+      "exit_code": 1,
+      "job_id": null,
+      "stderr": "Error: Unexpected error\n\nEPERM : failed to spawn process\n"
+    },
+    {
+      "attempt": 2,
+      "agent": "opencode",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "access": "workspace_write",
+      "json_rpc_error_code": -32000,
+      "exit_code": 1,
+      "job_id": null,
+      "stderr": "Error: Unexpected error\n\nEPERM : failed to spawn process\n"
+    }
+  ],
+  "product_source_modified_by_this_review": false,
+  "commit_or_push_performed": false,
+  "issue_counts": {
+    "open": 6,
+    "doing": 8,
+    "polished": 22,
+    "done": 62
+  }
+}

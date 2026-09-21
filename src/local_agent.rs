@@ -545,6 +545,11 @@ pub(crate) struct PreparedRun {
     session_roots: Vec<PathBuf>,
     session: config::Session,
     workspace: Option<crate::managed_worktree::SessionWorkspace>,
+    /// Repository identity that a managed-worktree authority resolution
+    /// validated before this run. The Git broker and the sandbox launch fail
+    /// closed unless they re-observe exactly this identity. `None` for runs
+    /// without a managed-worktree binding.
+    expected_repository: Option<sandbox::WorkspaceRepositoryIdentity>,
     task: String,
     task_bytes: usize,
     task_sha256: String,
@@ -553,6 +558,24 @@ pub(crate) struct PreparedRun {
 }
 
 impl PreparedRun {
+    /// Pins the validated managed-worktree repository identity to this run.
+    ///
+    /// The identity must describe exactly the canonical run cwd, so the later
+    /// launch stages cannot use it to widen the selected workspace. It is a
+    /// typed internal value derived from the canonical filesystem; approval
+    /// display metadata and caller input never contribute to it.
+    pub(crate) fn bind_managed_worktree_identity(
+        &mut self,
+        identity: sandbox::WorkspaceRepositoryIdentity,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            identity.worktree_root == self.cwd,
+            "managed worktree identity does not match the local agent workspace"
+        );
+        self.expected_repository = Some(identity);
+        Ok(())
+    }
+
     pub(crate) fn approval_detail(&self) -> String {
         let mut detail = format!(
             "agent: {}\ncwd: {}\naccess: {}\ntask_bytes: {}\ntask_sha256: {}\ntask_preview:\n{}",
@@ -845,6 +868,7 @@ where
         session_roots: canonical_session_roots(session)?,
         session: session.clone(),
         workspace,
+        expected_repository: None,
         task: task.to_owned(),
         task_bytes: task.len(),
         task_sha256: task_sha256(task.as_bytes()),
@@ -856,12 +880,13 @@ where
 pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
     let state_root = prepared.state.root.clone();
     let broker_responses_root = prepared.state.broker_responses_directory().to_path_buf();
-    let _broker = crate::agent_git::GitBroker::start(
+    let _broker = crate::agent_git::GitBroker::start_with_expected(
         prepared.state.broker_directory().to_path_buf(),
         broker_responses_root.clone(),
         prepared.session.clone(),
         prepared.cwd.clone(),
         prepared.access,
+        prepared.expected_repository.as_ref(),
     )?;
     let mut writable_roots = Vec::new();
     if prepared.access == Access::WorkspaceWrite {
@@ -923,6 +948,7 @@ pub(crate) async fn run(prepared: PreparedRun) -> Result<sandbox::Output> {
             read_only_scaffold_directories: &prepared.dependency_directories,
             read_only_files: &read_only_files,
             hidden_roots: prepared.state.hidden_roots(),
+            expected_repository: prepared.expected_repository.as_ref(),
         },
         stdin,
         &prepared.environment,
@@ -2385,6 +2411,7 @@ mod tests {
                 environment
             },
             workspace: None,
+            expected_repository: None,
             session_roots: Vec::new(),
             session: session(&root.path().canonicalize().unwrap()),
             task: task.clone(),
@@ -2541,6 +2568,7 @@ mod tests {
             dependency_files: Vec::new(),
             environment: HashMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]),
             workspace: None,
+            expected_repository: None,
             session_roots: Vec::new(),
             session: literal_session(Path::new("/workspace")),
             task: String::new(),
@@ -2569,6 +2597,79 @@ mod tests {
             !serde_json::to_string(&metadata)
                 .unwrap()
                 .contains("visible task")
+        );
+    }
+
+    #[test]
+    fn approval_metadata_reports_the_bounded_managed_workspace_identity() {
+        let state = AgentState::create(Agent::Codex, &[]).unwrap();
+        let workspace = crate::managed_worktree::SessionWorkspace {
+            workspace_type: crate::managed_worktree::SessionWorkspaceType::ManagedWorktree,
+            repository: Some("repo".to_owned()),
+            repository_root: PathBuf::from("/src/repo"),
+            workspace_root: PathBuf::from("/src/worktrees/repo/feature-x"),
+            branch: Some("feature/x".to_owned()),
+            task: Some("feature-x".to_owned()),
+        };
+        let prepared = PreparedRun {
+            agent: Agent::Codex,
+            access: Access::ReadOnly,
+            cwd: workspace.workspace_root.clone(),
+            command: vec!["/usr/bin/codex".to_owned()],
+            executable_target: PathBuf::from("/usr/bin/codex"),
+            dependency_roots: Vec::new(),
+            dependency_symlinks: Vec::new(),
+            dependency_directories: Vec::new(),
+            dependency_files: Vec::new(),
+            environment: HashMap::new(),
+            workspace: Some(workspace),
+            expected_repository: None,
+            session_roots: Vec::new(),
+            session: literal_session(&PathBuf::from("/src/repo")),
+            task: String::new(),
+            task_bytes: 0,
+            task_sha256: task_sha256(b""),
+            task_preview: String::new(),
+            state,
+        };
+
+        let detail = prepared.approval_detail();
+        assert!(
+            detail.contains("workspace_type: managed_worktree"),
+            "{detail}"
+        );
+        assert!(detail.contains("repository_root: /src/repo"), "{detail}");
+        assert!(
+            detail.contains("workspace_root: /src/worktrees/repo/feature-x"),
+            "{detail}"
+        );
+        assert!(detail.contains("repository: repo"), "{detail}");
+        assert!(detail.contains("branch: feature/x"), "{detail}");
+        assert!(detail.contains("task: feature-x"), "{detail}");
+        assert!(detail.len() <= MAX_APPROVAL_DETAIL_BYTES);
+
+        let metadata = prepared.approval_metadata();
+        assert_eq!(
+            metadata.get("workspace_type").map(String::as_str),
+            Some("managed_worktree")
+        );
+        assert_eq!(
+            metadata.get("repository_root").map(String::as_str),
+            Some("/src/repo")
+        );
+        assert_eq!(
+            metadata.get("workspace_root").map(String::as_str),
+            Some("/src/worktrees/repo/feature-x")
+        );
+        assert_eq!(metadata.get("repository").map(String::as_str), Some("repo"));
+        assert_eq!(
+            metadata.get("branch").map(String::as_str),
+            Some("feature/x")
+        );
+        assert_eq!(metadata.get("task").map(String::as_str), Some("feature-x"));
+        assert_eq!(
+            metadata.get("scope").map(String::as_str),
+            Some("session_cwd")
         );
     }
 
@@ -2783,6 +2884,7 @@ mod tests {
             dependency_directories: Vec::new(),
             dependency_files: Vec::new(),
             workspace: None,
+            expected_repository: None,
             session_roots: Vec::new(),
             session: literal_session(&root.path().canonicalize().unwrap()),
             task: String::new(),
@@ -2877,6 +2979,7 @@ mod tests {
                 dependency_files: Vec::new(),
                 environment,
                 workspace: None,
+                expected_repository: None,
                 session_roots: vec![
                     root_a.path().canonicalize().unwrap(),
                     root_b.path().canonicalize().unwrap(),
@@ -2994,6 +3097,7 @@ exit 9
                 dependency_files: Vec::new(),
                 environment,
                 workspace: None,
+                expected_repository: None,
                 session_roots: vec![repository.clone()],
                 session: session(&repository),
                 command: vec![
@@ -3135,6 +3239,7 @@ exit 8
                 dependency_files: Vec::new(),
                 environment,
                 workspace: None,
+                expected_repository: None,
                 session_roots: vec![repository.clone()],
                 session: session(&repository),
                 command: vec![
@@ -3251,6 +3356,7 @@ exit 8
             dependency_files: Vec::new(),
             environment,
             workspace: None,
+            expected_repository: None,
             session_roots: Vec::new(),
             session: session(&workspace.canonicalize()?),
             task: "test".to_owned(),
@@ -3326,6 +3432,7 @@ exit 8
             dependency_files: closure.files,
             environment,
             workspace: None,
+            expected_repository: None,
             session_roots: Vec::new(),
             session: session(&workspace.canonicalize()?),
             task: "test".to_owned(),
