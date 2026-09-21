@@ -248,7 +248,7 @@ impl ManagedRepository {
         self.ensure_target_absent(target)
     }
 
-    fn ensure_authority(&self) -> Result<()> {
+    pub(crate) fn ensure_authority(&self) -> Result<()> {
         ensure_normal_directory(&self.src_root, "configured src root")?;
         ensure_normal_directory(&self.primary_checkout, "canonical repository checkout")
     }

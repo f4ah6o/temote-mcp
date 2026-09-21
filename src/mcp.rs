@@ -17,7 +17,8 @@ use crate::line_protocol::{
 use crate::{
     activity_runtime, apply_patch, approvals, checkpoints, child_env, codex_app_server, config,
     dev_tool, evidence, friction, local_agent, managed_worktree, onepassword_cli, onepassword_mcp,
-    onepassword_sdk, recall, sandbox, session_control::SessionBackend, work_handoff,
+    onepassword_sdk, recall, sandbox, session_control, session_control::SessionBackend,
+    work_handoff,
 };
 use temote_mcp::activity::contract::{
     ActivityCancellationReason, ActivityErrorKind, ActivityOperation, ActivityRemote,
@@ -196,6 +197,11 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         "git_worktree_list",
         ActivityOperation::GitWorktreeList,
         "Git worktree list",
+    ),
+    activity_tool(
+        "git_worktree_remove",
+        ActivityOperation::GitWorktreeRemove,
+        "Git worktree remove",
     ),
     activity_tool(
         "github_workflow_dispatch",
@@ -409,6 +415,7 @@ enum JobActivityOutcome {
 struct Job {
     session_id: String,
     command: String,
+    cwd: PathBuf,
     handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
     output_policy: OutputPolicy,
@@ -1060,6 +1067,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_worktree_add","title":"Create a repository-owned Git worktree","description":"Create a linked worktree only at <repository>/.wt/<name>. If base is provided, create the validated branch from that local/fetched repository ref; otherwise attach an existing validated local branch. Arbitrary paths and force options are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","name","branch"],"additionalProperties":false}},
         {"name":"git_worktree_create","title":"Create a Temote-managed Git worktree","description":"Create a linked worktree only below the selected repository's exact managed root (<configured src root>/worktrees/<repository>/<task>, normally ~/src/worktrees/<repo>/<task>). Only one validated existing local branch can be attached; create a new branch with git_branch_create first. The task directory is derived from the branch when task is omitted; branch '/' never becomes directory hierarchy. Callers cannot choose a filesystem path, cwd or base, and legacy worktrees such as <repository>/.wt/<name> are never moved, adopted or deleted.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255},"branch":{"type":"string","minLength":1,"maxLength":255},"task":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_worktree_list","title":"List repository worktrees by Temote classification","description":"List the selected repository's registered worktrees as primary, managed (canonically contained below the exact trusted managed root with matching repository identity) or legacy. Read-only; legacy worktrees are reported but never moved, adopted or deleted.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_worktree_remove","title":"Remove a clean Temote-managed Git worktree","description":"Remove one known Temote-managed linked worktree of the selected repository below the exact trusted managed root. The target is always derived by broker policy: task selects the direct child and an optional path is accepted only when it equals that derived path. Primary checkouts, legacy worktrees, unknown or wrong-repository targets, symlinked or swapped paths, the current session working directory, worktrees owned by another active session or running job, and dirty or untracked worktrees are refused. Branches and remote refs are never deleted, no stash/reset/clean/force is performed, and sibling worktrees are preserved.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255},"task":{"type":"string","minLength":1,"maxLength":64},"path":{"type":"string","minLength":1,"maxLength":4096}},"required":["session_id"],"additionalProperties":false}},
         {"name":"github_workflow_dispatch","title":"Dispatch a GitHub Actions workflow","description":"Dispatch an exact workflow file or numeric workflow ID at an exact branch/tag ref for the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping, never the ambient active gh account, and returns the created workflow run ID without exposing tokens.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"workflow":{"type":"string","minLength":1,"maxLength":255},"ref":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","workflow","ref"],"additionalProperties":false}},
         {"name":"github_workflow_run_get","title":"Read a GitHub Actions workflow run","description":"Read bounded status for one exact workflow run ID in the GitHub repository resolved from a configured remote. Requires the same repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"run_id":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","run_id"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
@@ -1364,7 +1372,8 @@ async fn call_tool_with_local_agent_executable(
             | "git_switch"
             | "git_worktree_add"
             | "git_worktree_create"
-            | "git_worktree_list") => {
+            | "git_worktree_list"
+            | "git_worktree_remove") => {
                 let operation =
                     git_activity_operation(name).expect("matched Git activity operation");
                 match operation {
@@ -1398,6 +1407,9 @@ async fn call_tool_with_local_agent_executable(
                     }
                     ActivityOperation::GitWorktreeList => {
                         git_worktree_list(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitWorktreeRemove => {
+                        git_worktree_remove(&args, &session, activity.as_ref()).await
                     }
                     _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
@@ -2553,6 +2565,7 @@ fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
         "git_worktree_add" => Some(ActivityOperation::GitWorktreeAdd),
         "git_worktree_create" => Some(ActivityOperation::GitWorktreeCreate),
         "git_worktree_list" => Some(ActivityOperation::GitWorktreeList),
+        "git_worktree_remove" => Some(ActivityOperation::GitWorktreeRemove),
         _ => None,
     }
 }
@@ -3299,6 +3312,643 @@ async fn git_worktree_list_with_src_root(
         })
         .to_string(),
     )
+}
+
+/// Resolves one removal/prune target from broker policy only.
+///
+/// `task` is a validated single path component; `path` is accepted only as a
+/// redundant selector that must equal the exact broker-derived direct child of
+/// the trusted managed root. Neither input grants filesystem authority: the
+/// returned path is always `managed_root/task`. At least one selector is
+/// required, and when both are present they must select the same worktree.
+fn resolve_managed_worktree_target(
+    repository: &managed_worktree::ManagedRepository,
+    task: Option<&str>,
+    path: Option<&str>,
+) -> Result<(String, PathBuf)> {
+    let from_task = match task {
+        Some(task) => Some((task.to_owned(), repository.target(task)?)),
+        None => None,
+    };
+    let from_path = match path {
+        Some(path) => {
+            let candidate = Path::new(path);
+            anyhow::ensure!(
+                candidate.is_absolute(),
+                "worktree path must be absolute; Temote derives managed worktree paths"
+            );
+            let name = candidate
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("worktree path has no usable final component")?;
+            managed_worktree::validate_task_name(name)?;
+            let derived = repository.target(name)?;
+            anyhow::ensure!(
+                candidate == derived,
+                "requested worktree path is not the Temote-derived managed path {}",
+                derived.display()
+            );
+            Some((name.to_owned(), derived))
+        }
+        None => None,
+    };
+    match (from_task, from_path) {
+        (Some((task, target)), Some((path_task, _))) => {
+            anyhow::ensure!(
+                task == path_task,
+                "task and path select different managed worktrees"
+            );
+            Ok((task, target))
+        }
+        (Some(pair), None) | (None, Some(pair)) => Ok(pair),
+        (None, None) => anyhow::bail!("a managed worktree task or path is required"),
+    }
+}
+
+/// Reads the private Git metadata directory of one linked worktree from its
+/// own `.git` pointer and requires it to live below the selected repository's
+/// common Git directory.
+fn linked_worktree_private_git_dir(
+    target: &Path,
+    common_dir: &Path,
+    expected_worktree_root: &Path,
+) -> Result<PathBuf> {
+    let pointer = target.join(".git");
+    let metadata = std::fs::symlink_metadata(&pointer).with_context(|| {
+        format!(
+            "cannot inspect linked worktree pointer {}",
+            pointer.display()
+        )
+    })?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "linked worktree pointer must be a regular file: {}",
+        pointer.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= 4096,
+        "linked worktree pointer is too large: {}",
+        pointer.display()
+    );
+    let contents = std::fs::read_to_string(&pointer)
+        .with_context(|| format!("cannot read linked worktree pointer {}", pointer.display()))?;
+    let raw = contents
+        .trim_end()
+        .strip_prefix("gitdir: ")
+        .context("linked worktree pointer is malformed")?;
+    anyhow::ensure!(
+        !raw.is_empty() && !raw.chars().any(char::is_control),
+        "linked worktree pointer is malformed"
+    );
+    let private = Path::new(raw);
+    anyhow::ensure!(
+        private.is_absolute(),
+        "linked worktree private metadata must be an absolute path"
+    );
+    let worktrees_root = common_dir.join("worktrees");
+    anyhow::ensure!(
+        private.parent() == Some(worktrees_root.as_path())
+            && private
+                .file_name()
+                .is_some_and(|name| name.to_str().is_some()),
+        "linked worktree private metadata must be a direct child of {}",
+        worktrees_root.display()
+    );
+    anyhow::ensure!(
+        private != expected_worktree_root,
+        "linked worktree private metadata must not be the worktree itself"
+    );
+    Ok(private.to_path_buf())
+}
+
+/// Bounded ownership snapshot for one destructive managed-worktree operation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ManagedWorktreeOwnership {
+    owning_sessions: Vec<String>,
+    owning_jobs: Vec<String>,
+}
+
+impl ManagedWorktreeOwnership {
+    fn is_empty(&self) -> bool {
+        self.owning_sessions.is_empty() && self.owning_jobs.is_empty()
+    }
+}
+
+fn path_holds_target(candidate: &Path, target: &Path) -> bool {
+    candidate == target || candidate.starts_with(target)
+}
+
+/// Pure ownership decision used by [`managed_worktree_ownership`].
+///
+/// The current session, every session whose status is not clearly terminal, and
+/// every in-process running job are owners. Terminal session states
+/// (`stopped`, `crashed`, `degraded`) never own a worktree.
+fn managed_worktree_owners_from(
+    session: &config::Session,
+    target: &Path,
+    views: &[session_control::SessionView],
+    jobs: &[(String, PathBuf)],
+) -> ManagedWorktreeOwnership {
+    let mut ownership = ManagedWorktreeOwnership::default();
+    if path_holds_target(&session.cwd, target) {
+        ownership.owning_sessions.push(session.id.clone());
+    }
+    for view in views {
+        if view.id == session.id {
+            continue;
+        }
+        if matches!(view.status.as_str(), "stopped" | "crashed" | "degraded") {
+            continue;
+        }
+        let workspace_owned = view
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| path_holds_target(&workspace.workspace_root, target));
+        if workspace_owned || path_holds_target(&view.cwd, target) {
+            ownership.owning_sessions.push(view.id.clone());
+        }
+    }
+    for (job_id, cwd) in jobs {
+        if path_holds_target(cwd, target) {
+            ownership.owning_jobs.push(job_id.clone());
+        }
+    }
+    ownership.owning_sessions.sort();
+    ownership.owning_sessions.dedup();
+    ownership.owning_jobs.sort();
+    ownership.owning_jobs.dedup();
+    ownership
+}
+
+/// Resolves the live owners of one managed worktree path.
+///
+/// The current session, every session whose status is not clearly terminal, and
+/// every in-process running job are checked. A supervisor/liveness lookup
+/// failure is an error so callers fail closed instead of assuming the worktree
+/// is unowned.
+async fn managed_worktree_ownership(
+    session: &config::Session,
+    target: &Path,
+) -> Result<ManagedWorktreeOwnership> {
+    let views = session_control::session_views_for_mcp()
+        .await
+        .context("cannot determine whether another session owns this managed worktree")?;
+    let jobs = {
+        let state = jobs().lock().unwrap();
+        state
+            .jobs
+            .iter()
+            .map(|(job_id, job)| (job_id.to_string(), job.cwd.clone()))
+            .collect::<Vec<_>>()
+    };
+    Ok(managed_worktree_owners_from(session, target, &views, &jobs))
+}
+
+/// Read-only precondition proof for removing one managed worktree.
+#[derive(Clone, Debug)]
+struct ManagedWorktreeRemovalPlan {
+    repository: managed_worktree::ManagedRepository,
+    task: String,
+    target: PathBuf,
+    branch: Option<String>,
+    private_git_dir: PathBuf,
+    registered_siblings: Vec<PathBuf>,
+}
+
+/// Adds one Temote-validated managed worktree root to a session's permitted
+/// roots for host-side Git inspection of that exact validated target.
+///
+/// The root is always the broker-derived direct child that the caller already
+/// proved; no request-supplied path participates.
+fn managed_target_session(session: &config::Session, target: &Path) -> config::Session {
+    let mut widened = session.clone();
+    if !widened
+        .permitted_directories
+        .iter()
+        .any(|root| target == *root || target.starts_with(root))
+    {
+        widened.permitted_directories.push(target.to_path_buf());
+        widened.permitted_directories.sort();
+        widened.permitted_directories.dedup();
+    }
+    widened
+}
+
+/// Proves that one managed worktree may be removed.
+///
+/// Every step is read-only and fail-closed: the target must be a registered,
+/// non-prunable managed worktree of the selected repository at the exact
+/// direct-child path below the trusted canonical managed root, must not be the
+/// current session working directory, must not be owned by another live
+/// session or running job, and must have no dirty or untracked files.
+async fn inspect_managed_worktree_for_removal(
+    session: &config::Session,
+    repository: managed_worktree::ManagedRepository,
+    task: String,
+    target: PathBuf,
+) -> Result<ManagedWorktreeRemovalPlan> {
+    repository.ensure_authority()?;
+    anyhow::ensure!(
+        managed_worktree::trusted_canonical_managed_root(&repository).as_deref()
+            == Some(repository.managed_root()),
+        "managed worktree root is not a trusted normal directory: {}",
+        repository.managed_root().display()
+    );
+    let metadata = std::fs::symlink_metadata(&target)
+        .with_context(|| format!("cannot inspect managed worktree {}", target.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "managed worktree target is not a normal directory: {}",
+        target.display()
+    );
+    let canonical_target = std::fs::canonicalize(&target)
+        .with_context(|| format!("cannot resolve managed worktree {}", target.display()))?;
+    anyhow::ensure!(
+        canonical_target == target,
+        "managed worktree target must be canonical and not a swapped path: {}",
+        target.display()
+    );
+    anyhow::ensure!(
+        target.parent() == Some(repository.managed_root()),
+        "managed worktree target must be a direct child of {}",
+        repository.managed_root().display()
+    );
+    anyhow::ensure!(
+        target != repository.primary_checkout(),
+        "the canonical primary checkout can never be removed as a managed worktree"
+    );
+
+    let selected_common_dir = sandbox::git_common_dir(repository.primary_checkout())?;
+    anyhow::ensure!(
+        sandbox::git_common_dir(&canonical_target)? == selected_common_dir,
+        "managed worktree does not belong to the selected repository (common Git directory mismatch): {}",
+        target.display()
+    );
+    anyhow::ensure!(
+        sandbox::git_primary_checkout(&canonical_target)? == repository.primary_checkout(),
+        "managed worktree primary checkout mismatch: {}",
+        target.display()
+    );
+    let private_git_dir = linked_worktree_private_git_dir(
+        &canonical_target,
+        &selected_common_dir,
+        &canonical_target,
+    )?;
+
+    let registered = registered_worktrees(session, repository.primary_checkout()).await?;
+    let mut registered_siblings = Vec::new();
+    let mut matched = false;
+    for entry in &registered {
+        let canonical_path = std::fs::canonicalize(&entry.path).ok();
+        let registered_common_dir = canonical_path
+            .as_deref()
+            .and_then(|path| sandbox::git_common_dir(path).ok());
+        let registered_primary_checkout = canonical_path
+            .as_deref()
+            .and_then(|path| sandbox::git_primary_checkout(path).ok());
+        let classification = managed_worktree::classify_registered_worktree(
+            managed_worktree::RegisteredWorktreeIdentity {
+                canonical_path: canonical_path.as_deref(),
+                common_dir: registered_common_dir.as_deref(),
+                primary_checkout: registered_primary_checkout.as_deref(),
+            },
+            repository.primary_checkout(),
+            managed_worktree::trusted_canonical_managed_root(&repository).as_deref(),
+            &selected_common_dir,
+        );
+        if canonical_path.as_deref() == Some(canonical_target.as_path()) {
+            anyhow::ensure!(
+                classification == managed_worktree::WorktreeClassification::Managed,
+                "target is not a registered Temote-managed worktree: {}",
+                target.display()
+            );
+            anyhow::ensure!(
+                !entry.prunable && !entry.bare,
+                "target is not a removable live worktree: {}",
+                target.display()
+            );
+            matched = true;
+            continue;
+        }
+        registered_siblings.push(entry.path.clone());
+    }
+    anyhow::ensure!(
+        matched,
+        "target is not a registered worktree of the selected repository: {}",
+        target.display()
+    );
+
+    let branch = sandbox::git_current_branch(&canonical_target)?;
+
+    let ownership = managed_worktree_ownership(session, &target).await?;
+    anyhow::ensure!(
+        ownership.is_empty(),
+        "managed worktree is in use by {} session(s) and {} running job(s); refusing removal",
+        ownership.owning_sessions.len(),
+        ownership.owning_jobs.len()
+    );
+
+    let status = run_host_git_inspection(
+        &managed_target_session(session, &target),
+        &target,
+        &[
+            "git".to_owned(),
+            "status".to_owned(),
+            "--porcelain".to_owned(),
+            "--untracked-files=all".to_owned(),
+            "-z".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        status.status == 0,
+        "cannot inspect the managed worktree for dirty or untracked work: {}",
+        status.stderr.trim()
+    );
+    anyhow::ensure!(
+        !status.truncated,
+        "managed worktree status exceeded the output limit; refusing removal"
+    );
+    anyhow::ensure!(
+        status.stdout.is_empty(),
+        "managed worktree contains modified or untracked files; refusing removal without force"
+    );
+
+    Ok(ManagedWorktreeRemovalPlan {
+        repository,
+        task,
+        target,
+        branch,
+        private_git_dir,
+        registered_siblings,
+    })
+}
+
+async fn registered_worktrees(
+    session: &config::Session,
+    cwd: &Path,
+) -> Result<Vec<managed_worktree::RegisteredWorktree>> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "-c".to_owned(),
+            "core.hooksPath=/dev/null".to_owned(),
+            "worktree".to_owned(),
+            "list".to_owned(),
+            "--porcelain".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "git worktree list failed: {}",
+        output.stderr.trim()
+    );
+    anyhow::ensure!(
+        !output.truncated,
+        "git worktree list output was truncated before classification"
+    );
+    managed_worktree::parse_worktree_list(&output.stdout)
+}
+
+fn build_git_worktree_remove_command(target: &Path) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "worktree".to_owned(),
+        "remove".to_owned(),
+        "--".to_owned(),
+        target.to_string_lossy().into_owned(),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn managed_worktree_remove_result(
+    status: &str,
+    plan: &ManagedWorktreeRemovalPlan,
+    output: &sandbox::Output,
+    directory_removed: bool,
+    metadata_removed: bool,
+    siblings_preserved: bool,
+    branch_preserved: bool,
+    verification_error: Option<&str>,
+) -> String {
+    let mut value = json!({
+        "status": status,
+        "repository": plan.repository.repository_name(),
+        "path": plan.target.to_string_lossy(),
+        "task": plan.task,
+        "branch": plan.branch,
+        "mutation_committed": output.status == 0,
+        "directory_removed": directory_removed,
+        "metadata_removed": metadata_removed,
+        "siblings_preserved": siblings_preserved,
+        "branch_preserved": branch_preserved,
+        "exit_code": output.status,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "truncated": output.truncated,
+    });
+    if let Some(error) = verification_error {
+        value["verification_error"] = json!(error);
+    }
+    value.to_string()
+}
+
+/// Post-remove verification. Git success alone is never enough: the directory,
+/// the selected worktree's own private metadata and its registration must all
+/// be gone while sibling registrations and the branch ref are unchanged.
+async fn verify_managed_worktree_removed(
+    session: &config::Session,
+    plan: &ManagedWorktreeRemovalPlan,
+) -> Result<(bool, bool, bool, bool)> {
+    let directory_removed = matches!(
+        std::fs::symlink_metadata(&plan.target),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    anyhow::ensure!(
+        directory_removed,
+        "managed worktree directory still exists after removal: {}",
+        plan.target.display()
+    );
+    let metadata_removed = matches!(
+        std::fs::symlink_metadata(&plan.private_git_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    anyhow::ensure!(
+        metadata_removed,
+        "managed worktree private metadata still exists after removal: {}",
+        plan.private_git_dir.display()
+    );
+
+    let remaining = registered_worktrees(session, plan.repository.primary_checkout()).await?;
+    let mut remaining_paths = Vec::new();
+    for entry in &remaining {
+        let canonical_path =
+            std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+        anyhow::ensure!(
+            canonical_path != plan.target,
+            "managed worktree is still registered after removal: {}",
+            plan.target.display()
+        );
+        remaining_paths.push(entry.path.clone());
+    }
+    let siblings_preserved = remaining_paths == plan.registered_siblings;
+    anyhow::ensure!(
+        siblings_preserved,
+        "sibling worktree registrations changed during managed worktree removal"
+    );
+
+    let branch_preserved = match &plan.branch {
+        Some(branch) => {
+            let probe = run_host_git_inspection(
+                session,
+                plan.repository.primary_checkout(),
+                &[
+                    "git".to_owned(),
+                    "show-ref".to_owned(),
+                    "--verify".to_owned(),
+                    "--quiet".to_owned(),
+                    format!("refs/heads/{branch}"),
+                ],
+            )
+            .await?;
+            probe.status == 0
+        }
+        None => true,
+    };
+    anyhow::ensure!(
+        branch_preserved,
+        "branch ref was deleted by managed worktree removal"
+    );
+    Ok((
+        directory_removed,
+        metadata_removed,
+        siblings_preserved,
+        branch_preserved,
+    ))
+}
+
+async fn git_worktree_remove(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let src_root = configured_src_root()?;
+    git_worktree_remove_in_src_root(args, session, &src_root, activity).await
+}
+
+async fn git_worktree_remove_in_src_root(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    reject_removed_managed_worktree_arguments(args, &["cwd", "base"])?;
+    let task = match args.get("task") {
+        Some(value) => Some(value.as_str().context("task must be a string")?),
+        None => None,
+    };
+    let path = match args.get("path") {
+        Some(value) => Some(value.as_str().context("path must be a string")?),
+        None => None,
+    };
+    let requested_repository = match args.get("repository") {
+        Some(value) => Some(value.as_str().context("repository must be a string")?),
+        None => None,
+    };
+    let cwd = config::resolve_cwd(session, None)?;
+    let repository =
+        managed_repository_for_requested(requested_repository, session, &cwd, src_root)?;
+    let (task, target) = resolve_managed_worktree_target(&repository, task, path)?;
+    let plan = inspect_managed_worktree_for_removal(session, repository, task, target).await?;
+    approve_local_git_mutation(
+        session,
+        plan.repository.primary_checkout(),
+        "git_worktree_remove",
+        format!(
+            "repository={} task={} branch={}",
+            plan.repository.repository_name(),
+            plan.task,
+            plan.branch.as_deref().unwrap_or("(detached)")
+        ),
+        activity,
+    )
+    .await?;
+    // The approval boundary is not a trust boundary: re-prove every
+    // precondition on freshly observed state before the mutation runs.
+    let plan = inspect_managed_worktree_for_removal(
+        session,
+        plan.repository.clone(),
+        plan.task.clone(),
+        plan.target.clone(),
+    )
+    .await?;
+
+    let command = build_git_worktree_remove_command(&plan.target);
+    let rendered_command = render_command(&command);
+    approvals::activity(
+        &session.id,
+        "Remove managed Git worktree",
+        Some(rendered_command.clone()),
+    )
+    .await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let output = sandbox::run_unrestricted_with_env(
+        &command,
+        plan.repository.primary_checkout(),
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await;
+    let result = match output {
+        Ok(output) => {
+            let verification = if output.status == 0 {
+                verify_managed_worktree_removed(session, &plan)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            } else {
+                Err("git worktree remove did not complete successfully".to_owned())
+            };
+            match verification {
+                Ok((directory_removed, metadata_removed, siblings_preserved, branch_preserved)) => {
+                    Ok(managed_worktree_remove_result(
+                        "removed",
+                        &plan,
+                        &output,
+                        directory_removed,
+                        metadata_removed,
+                        siblings_preserved,
+                        branch_preserved,
+                        None,
+                    ))
+                }
+                Err(error) => Err(anyhow::anyhow!(managed_worktree_remove_result(
+                    if output.status == 0 {
+                        "verification_failed"
+                    } else {
+                        "failed"
+                    },
+                    &plan,
+                    &output,
+                    false,
+                    false,
+                    false,
+                    false,
+                    Some(&error),
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
+    text_result(result?)
 }
 
 async fn approve_local_git_mutation(
@@ -4572,15 +5222,23 @@ async fn execute(
     activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, handle, completion) =
+    let (rendered_command, cwd, handle, completion) =
         spawn_sandboxed_command(args, session, activity).await?;
 
-    finish_foreground_or_store_job(session, rendered_command, handle, completion, output_policy)
-        .await
+    finish_foreground_or_store_job(
+        session,
+        cwd,
+        rendered_command,
+        handle,
+        completion,
+        output_policy,
+    )
+    .await
 }
 
 async fn finish_foreground_or_store_job(
     session: &config::Session,
+    cwd: PathBuf,
     rendered_command: String,
     mut handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
@@ -4600,6 +5258,7 @@ async fn finish_foreground_or_store_job(
         Err(_) => {
             store_job(
                 session,
+                cwd,
                 rendered_command,
                 handle,
                 completion,
@@ -4617,10 +5276,11 @@ async fn start_command(
     activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, handle, completion) =
+    let (rendered_command, cwd, handle, completion) =
         spawn_sandboxed_command(args, session, activity).await?;
     store_job(
         session,
+        cwd,
         rendered_command,
         handle,
         completion,
@@ -4848,6 +5508,7 @@ where
     // The broker and the sandbox launch compare against the identity above,
     // so the final validation and the actual spawn target cannot diverge into
     // a different repository that happens to live at the same path.
+    let boundary_cwd = prepared.cwd.clone();
     boundary();
     let (description, mut handle, completion) =
         spawn_local_agent(prepared, &current_session, activity).await?;
@@ -4865,6 +5526,7 @@ where
         Err(_) => {
             store_job(
                 session,
+                boundary_cwd,
                 description,
                 handle,
                 completion,
@@ -4993,6 +5655,7 @@ async fn dev_tool_run_with_executable(
         "session instance changed while developer-tool approval was pending"
     );
     prepared.revalidate(&current_session)?;
+    let boundary_cwd = prepared.cwd().to_path_buf();
     let (description, mut handle, completion) =
         spawn_dev_tool(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
@@ -5009,6 +5672,7 @@ async fn dev_tool_run_with_executable(
         Err(_) => {
             store_job(
                 session,
+                boundary_cwd,
                 description,
                 handle,
                 completion,
@@ -5096,7 +5760,7 @@ async fn spawn_sandboxed_command(
     args: &Value,
     session: &config::Session,
     activity: Option<ActivityScope>,
-) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
+) -> Result<(String, PathBuf, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
     spawn_sandboxed_command_with_controls(
         args,
         session,
@@ -5113,7 +5777,7 @@ async fn spawn_sandboxed_command_with_controls<F>(
     activity: Option<ActivityScope>,
     session_stop: F,
     max_lifetime: Duration,
-) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
+) -> Result<(String, PathBuf, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -5130,6 +5794,7 @@ where
     let session_id = session.id.clone();
     let evidence_scope = session.cwd.clone();
     let task_command = rendered_command.clone();
+    let task_cwd = cwd.clone();
     let completion = Arc::new(Mutex::new(JobCompletion {
         activity,
         ..JobCompletion::default()
@@ -5137,7 +5802,7 @@ where
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
         let (result, outcome) = tokio::select! {
-            result = run_session_command(&command, &cwd, &roots, permission_mode) => {
+            result = run_session_command(&command, &task_cwd, &roots, permission_mode) => {
                 match result {
                     Ok(output) => {
                         let result = render_output(output);
@@ -5173,7 +5838,7 @@ where
         reap_jobs();
         report_command_finished(session_id, "execute", &task_command, &result).await;
     });
-    Ok((rendered_command, handle, completion))
+    Ok((rendered_command, cwd, handle, completion))
 }
 
 fn finish_job_completion(
@@ -5254,6 +5919,7 @@ async fn run_session_command(
 
 async fn store_job(
     session: &config::Session,
+    cwd: PathBuf,
     rendered_command: String,
     handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
@@ -5268,6 +5934,7 @@ async fn store_job(
             Job {
                 session_id: session.id.clone(),
                 command: rendered_command.clone(),
+                cwd,
                 handle,
                 completion,
                 output_policy,
@@ -6483,7 +7150,7 @@ mod tests {
         let session = activity_job_session(cwd.path());
 
         let (success_scope, success_emitter) = activity_job_scope(ActivityOperation::Execute);
-        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "printf success"]}),
             &session,
             Some(success_scope),
@@ -6494,6 +7161,7 @@ mod tests {
         .unwrap();
         let success = finish_foreground_or_store_job(
             &session,
+            cwd,
             rendered,
             handle,
             completion,
@@ -6517,7 +7185,7 @@ mod tests {
         );
 
         let (failure_scope, failure_emitter) = activity_job_scope(ActivityOperation::Execute);
-        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "exit 7"]}),
             &session,
             Some(failure_scope),
@@ -6528,6 +7196,7 @@ mod tests {
         .unwrap();
         let failure = finish_foreground_or_store_job(
             &session,
+            cwd,
             rendered,
             handle,
             completion,
@@ -6561,7 +7230,7 @@ mod tests {
         session.permitted_directories =
             vec![canonical.clone(), canonical.join("missing-sandbox-root")];
         let (scope, emitter) = activity_job_scope(ActivityOperation::Execute);
-        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "printf unreachable"]}),
             &session,
             Some(scope),
@@ -6572,6 +7241,7 @@ mod tests {
         .unwrap();
         let failure = finish_foreground_or_store_job(
             &session,
+            cwd,
             rendered,
             handle,
             completion,
@@ -6604,7 +7274,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let session = activity_job_session(cwd.path());
         let (command_scope, command_emitter) = activity_job_scope(ActivityOperation::StartCommand);
-        let (rendered, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "sleep 30"]}),
             &session,
             Some(command_scope),
@@ -6615,6 +7285,7 @@ mod tests {
         .unwrap();
         let started = store_job(
             &session,
+            cwd,
             rendered,
             handle,
             completion,
@@ -6741,7 +7412,7 @@ mod tests {
         let session = activity_job_session(cwd.path());
         let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
         let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
-        let (_, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (_, _cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "sleep 30"]}),
             &session,
             Some(scope),
@@ -6776,7 +7447,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let session = activity_job_session(cwd.path());
         let (scope, emitter) = activity_job_scope(ActivityOperation::StartCommand);
-        let (_, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (_, _cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "sleep 30"]}),
             &session,
             Some(scope),
@@ -7124,6 +7795,7 @@ mod tests {
         .unwrap();
         let started = store_job(
             &session,
+            session.cwd.clone(),
             description,
             handle,
             completion,
@@ -7168,6 +7840,7 @@ mod tests {
         .unwrap();
         let started = store_job(
             &session,
+            session.cwd.clone(),
             description,
             handle,
             completion,
@@ -8210,7 +8883,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 54);
+        assert_eq!(tools.len(), 55);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -8707,6 +9380,7 @@ mod tests {
                 Job {
                     session_id: owner_id,
                     command: "test".to_owned(),
+                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -8762,6 +9436,7 @@ mod tests {
                 Job {
                     session_id: owner_id,
                     command: "test".to_owned(),
+                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -8803,6 +9478,7 @@ mod tests {
                 Job {
                     session_id: session.id.clone(),
                     command: "test".to_owned(),
+                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -8880,6 +9556,7 @@ mod tests {
                 Job {
                     session_id: session.id.clone(),
                     command: "test".to_owned(),
+                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -8977,6 +9654,7 @@ mod tests {
             Job {
                 session_id: owner.clone(),
                 command: marker_command.to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle: tokio::spawn(async {}),
                 completion: owner_completion,
                 output_policy: OutputPolicy::default(),
@@ -8987,6 +9665,7 @@ mod tests {
             Job {
                 session_id: other,
                 command: "other-secret-command".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 completion: other_completion,
                 output_policy: OutputPolicy::default(),
@@ -9040,6 +9719,7 @@ mod tests {
                 Job {
                     session_id: session_id.clone(),
                     command: command.to_owned(),
+                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle: tokio::spawn(async {}),
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -9078,6 +9758,7 @@ mod tests {
             Job {
                 session_id: session_id.clone(),
                 command: "hidden".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle: tokio::spawn(async {}),
                 completion,
                 output_policy: OutputPolicy::default(),
@@ -9126,6 +9807,7 @@ mod tests {
                 Job {
                     session_id: session_id.clone(),
                     command: "hidden".to_owned(),
+                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -9164,6 +9846,7 @@ mod tests {
             Job {
                 session_id: session_id.clone(),
                 command: "hidden".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -9210,6 +9893,7 @@ mod tests {
             Job {
                 session_id: session_id.clone(),
                 command: "hidden".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -9307,6 +9991,7 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion,
                 output_policy: OutputPolicy::default(),
@@ -9340,6 +10025,7 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -9374,6 +10060,7 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -9528,6 +10215,7 @@ mod tests {
                     Job {
                         session_id,
                         command: "test".to_owned(),
+                        cwd: PathBuf::from("/tmp/temote-test-job"),
                         handle,
                         completion,
                         output_policy: OutputPolicy::default(),
@@ -9581,6 +10269,7 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
+                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion,
                 output_policy: OutputPolicy::default(),
@@ -10386,7 +11075,11 @@ mod tests {
     #[test]
     fn managed_worktree_tools_do_not_expose_cwd_or_base() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        for name in ["git_worktree_create", "git_worktree_list"] {
+        for name in [
+            "git_worktree_create",
+            "git_worktree_list",
+            "git_worktree_remove",
+        ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == name)
@@ -10533,6 +11226,421 @@ mod tests {
         .await
         .unwrap();
         assert!(binding.is_none());
+    }
+
+    fn managed_worktree_removal_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, config::Session)
+    {
+        let (root, canonical_root, checkout, session) = managed_worktree_fixture();
+        for (branch, task) in [
+            ("feature/remove-me", "feature-remove-me"),
+            ("feature/sibling", "feature-sibling"),
+        ] {
+            run_git_fixture(&checkout, &["branch", branch]);
+            let target = canonical_root.join("worktrees/repo").join(task);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            run_git_fixture(
+                &checkout,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    target.to_str().unwrap(),
+                    branch,
+                ],
+            );
+        }
+        (root, canonical_root, checkout, session)
+    }
+
+    fn session_view_for_test(
+        id: &str,
+        cwd: PathBuf,
+        status: &str,
+        workspace_root: Option<PathBuf>,
+    ) -> session_control::SessionView {
+        session_control::SessionView {
+            host_id: "test-host".to_owned(),
+            id: id.to_owned(),
+            session_id: id.to_owned(),
+            status: status.to_owned(),
+            pid: None,
+            process_id: 0,
+            cwd,
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            stopped_at: None,
+            exit_reason: None,
+            last_error: None,
+            permission_mode: config::PermissionMode::Agent,
+            yolo: false,
+            logical_path: None,
+            workspace: workspace_root.map(|root| managed_worktree::SessionWorkspace {
+                workspace_type: managed_worktree::SessionWorkspaceType::ManagedWorktree,
+                repository: Some("repo".to_owned()),
+                repository_root: root.clone(),
+                workspace_root: root,
+                branch: None,
+                task: None,
+            }),
+            restart_policy: "never".to_owned(),
+            restart_count: 0,
+            last_restart_at: None,
+            next_restart_at: None,
+            restart_limit_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_remove_removes_only_the_selected_clean_worktree() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+        let target = managed_root.join("feature-remove-me");
+        let sibling = managed_root.join("feature-sibling");
+        let legacy = checkout.join(".wt/legacy");
+        let legacy_sibling = canonical_root.join("repo-legacy-linked");
+        let primary_before = worktree_snapshot(&checkout);
+        let legacy_before = worktree_snapshot(&legacy);
+        let legacy_sibling_before = worktree_snapshot(&legacy_sibling);
+
+        let result = git_worktree_remove_in_src_root(
+            &json!({"session_id": session.id, "task": "feature-remove-me"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap();
+        let value = result_text(&result);
+        assert_eq!(value["status"], "removed");
+        assert_eq!(value["repository"], "repo");
+        assert_eq!(value["task"], "feature-remove-me");
+        assert_eq!(value["branch"], "feature/remove-me");
+        assert_eq!(value["mutation_committed"], true);
+        assert_eq!(value["directory_removed"], true);
+        assert_eq!(value["metadata_removed"], true);
+        assert_eq!(value["siblings_preserved"], true);
+        assert_eq!(value["branch_preserved"], true);
+        assert!(value.get("verification_error").is_none());
+        assert!(!target.exists());
+        assert!(!checkout.join(".git/worktrees/feature-remove-me").exists());
+        assert!(
+            !git_fixture_stdout(&checkout, &["branch", "--list", "feature/remove-me"]).is_empty(),
+            "the branch ref must be preserved"
+        );
+
+        // The path selector is accepted only as the exact derived path.
+        let result = git_worktree_remove_in_src_root(
+            &json!({"session_id": session.id, "path": sibling.to_string_lossy()}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result_text(&result)["status"], "removed");
+        assert!(!sibling.exists());
+
+        // Primary, legacy and out-of-root sibling worktrees are unchanged.
+        assert_eq!(worktree_snapshot(&checkout), primary_before);
+        assert_eq!(worktree_snapshot(&legacy), legacy_before);
+        assert_eq!(worktree_snapshot(&legacy_sibling), legacy_sibling_before);
+        assert!(legacy.join("tracked.txt").exists());
+        assert!(legacy_sibling.join("tracked.txt").exists());
+        assert!(
+            !git_fixture_stdout(&checkout, &["branch", "--list", "feature/sibling"]).is_empty(),
+            "the sibling branch ref must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_remove_rejects_dirty_and_untracked_work() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+        let target = managed_root.join("feature-remove-me");
+
+        std::fs::write(target.join("tracked.txt"), "modified\n").unwrap();
+        let error = git_worktree_remove_in_src_root(
+            &json!({"session_id": session.id, "task": "feature-remove-me"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("modified or untracked"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("tracked.txt")).unwrap(),
+            "modified\n"
+        );
+
+        run_git_fixture(&target, &["checkout", "--", "tracked.txt"]);
+        std::fs::write(target.join("untracked.txt"), "keep me\n").unwrap();
+        let error = git_worktree_remove_in_src_root(
+            &json!({"session_id": session.id, "task": "feature-remove-me"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("modified or untracked"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(target.exists());
+        assert!(checkout.join(".git/worktrees/feature-remove-me").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_remove_rejects_unknown_wrong_repo_and_arbitrary_paths() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+
+        for args in [
+            json!({"session_id": session.id, "task": "missing-task"}),
+            json!({"session_id": session.id, "task": "../escape"}),
+            json!({"session_id": session.id, "task": "feature/remove-me"}),
+            json!({"session_id": session.id, "repository": "other", "task": "feature-remove-me"}),
+            json!({"session_id": session.id, "path": "/tmp/escape"}),
+            json!({"session_id": session.id, "path": managed_root.join("other-task").to_string_lossy()}),
+            json!({"session_id": session.id, "path": "relative/task"}),
+            json!({"session_id": session.id}),
+            json!({"session_id": session.id, "cwd": "/tmp", "task": "feature-remove-me"}),
+            json!({"session_id": session.id, "base": "HEAD", "task": "feature-remove-me"}),
+        ] {
+            let error = git_worktree_remove_in_src_root(&args, &session, &canonical_root, None)
+                .await
+                .unwrap_err();
+            assert!(
+                !error.to_string().contains("escape/"),
+                "unexpected error for {args}: {error:#}"
+            );
+        }
+        // A task and a path that select different managed worktrees fail closed.
+        let error = git_worktree_remove_in_src_root(
+            &json!({
+                "session_id": session.id,
+                "task": "feature-remove-me",
+                "path": managed_root.join("feature-sibling").to_string_lossy()
+            }),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("different managed worktrees"),
+            "{error:#}"
+        );
+
+        // Nothing was removed and the repository identity is unchanged.
+        assert!(managed_root.join("feature-remove-me").exists());
+        assert!(managed_root.join("feature-sibling").exists());
+        assert!(checkout.join(".git/worktrees/feature-remove-me").exists());
+        assert!(checkout.join(".git/worktrees/feature-sibling").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_remove_rejects_the_current_session_cwd() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let target = canonical_root.join("worktrees/repo/feature-remove-me");
+        let inside = config::Session {
+            cwd: target.clone(),
+            permitted_directories: vec![checkout.clone(), target.clone()],
+            ..session
+        };
+        let error = git_worktree_remove_in_src_root(
+            &json!({"session_id": inside.id, "task": "feature-remove-me"}),
+            &inside,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("in use by"), "{error:#}");
+        assert!(target.exists());
+        assert!(checkout.join(".git/worktrees/feature-remove-me").exists());
+    }
+
+    #[test]
+    fn managed_worktree_ownership_is_fail_closed_for_live_sessions_and_jobs() {
+        let target = PathBuf::from("/src/worktrees/repo/task");
+        let session = config::Session {
+            id: "current".to_owned(),
+            cwd: PathBuf::from("/src/repo"),
+            permitted_directories: vec![PathBuf::from("/src/repo")],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        // The current session cwd inside the target is an owner.
+        let mut nested = session.clone();
+        nested.cwd = target.join("sub");
+        let ownership = managed_worktree_owners_from(&nested, &target, &[], &[]);
+        assert_eq!(ownership.owning_sessions, vec!["current".to_owned()]);
+
+        // Live sibling sessions owning the worktree or a parent path are owners.
+        let views = [
+            session_view_for_test(
+                "live-workspace",
+                PathBuf::from("/elsewhere"),
+                "active",
+                Some(target.clone()),
+            ),
+            session_view_for_test("live-cwd", target.join("sub"), "starting", None),
+            session_view_for_test("unknown", target.clone(), "unknown", None),
+            session_view_for_test("stopped", target.clone(), "stopped", Some(target.clone())),
+            session_view_for_test("crashed", target.clone(), "crashed", Some(target.clone())),
+            session_view_for_test("degraded", target.clone(), "degraded", Some(target.clone())),
+            session_view_for_test(
+                "unrelated",
+                PathBuf::from("/src/other"),
+                "active",
+                Some(PathBuf::from("/src/other")),
+            ),
+        ];
+        let ownership = managed_worktree_owners_from(&session, &target, &views, &[]);
+        assert_eq!(
+            ownership.owning_sessions,
+            vec![
+                "live-cwd".to_owned(),
+                "live-workspace".to_owned(),
+                "unknown".to_owned()
+            ]
+        );
+        assert!(ownership.owning_jobs.is_empty());
+
+        // A running job whose resolved cwd is inside the target is an owner.
+        let jobs = [
+            ("job-inside".to_owned(), target.join("sub")),
+            ("job-outside".to_owned(), PathBuf::from("/src/other")),
+        ];
+        let ownership = managed_worktree_owners_from(&session, &target, &[], &jobs);
+        assert_eq!(ownership.owning_jobs, vec!["job-inside".to_owned()]);
+        assert!(!ownership.is_empty());
+        assert!(
+            managed_worktree_owners_from(&session, &target, &[], &[]).is_empty(),
+            "an unowned worktree must not report owners"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_worktree_remove_rejects_symlinked_targets_and_swapped_roots() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+        let target = managed_root.join("feature-remove-me");
+
+        // A symlinked managed-root child is never a managed worktree.
+        let linked = managed_root.join("linked-task");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        let error = git_worktree_remove_in_src_root(
+            &json!({"session_id": session.id, "task": "linked-task"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("normal directory"), "{error:#}");
+        assert!(target.exists());
+
+        // A swapped managed root disables the managed authority entirely.
+        let swapped = canonical_root.join("swapped");
+        std::fs::rename(&managed_root, &swapped).unwrap();
+        std::os::unix::fs::symlink(&swapped, &managed_root).unwrap();
+        let error = git_worktree_remove_in_src_root(
+            &json!({"session_id": session.id, "task": "feature-remove-me"}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("trusted normal directory"),
+            "{error:#}"
+        );
+        assert!(swapped.join("feature-remove-me").exists());
+        assert!(checkout.join(".git/worktrees/feature-remove-me").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_remove_after_remove_is_a_bounded_failure() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let args = json!({"session_id": session.id, "task": "feature-remove-me"});
+        git_worktree_remove_in_src_root(&args, &session, &canonical_root, None)
+            .await
+            .unwrap();
+
+        let error = git_worktree_remove_in_src_root(&args, &session, &canonical_root, None)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot inspect managed worktree"),
+            "{message}"
+        );
+        // The legacy sibling worktree and the primary checkout are untouched.
+        assert!(
+            canonical_root
+                .join("repo-legacy-linked")
+                .join("tracked.txt")
+                .exists()
+        );
+        assert!(checkout.join("tracked.txt").exists());
+    }
+
+    #[test]
+    fn managed_worktree_removal_targets_never_escape_the_managed_root() -> noprop::TestResult {
+        let fixture = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
+        let checkout = src_root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let repository =
+            managed_worktree::ManagedRepository::resolve(&checkout, &src_root).unwrap();
+
+        test_support::run(0x5257_4d54_4152_4745, 1024, |ctx| {
+            let length = noprop::sample_usize_in(ctx, 0..=80);
+            let candidate = (0..length)
+                .map(|_| match noprop::sample_usize_in(ctx, 0..=7) {
+                    0 => '/',
+                    1 => '.',
+                    2 => '\\',
+                    3 => '-',
+                    4 => '_',
+                    5 => 'a',
+                    6 => ':',
+                    _ => char::from_u32(0x20 + noprop::sample_u32(ctx) % 95).unwrap(),
+                })
+                .collect::<String>();
+            if let Ok((task, target)) =
+                resolve_managed_worktree_target(&repository, Some(&candidate), None)
+            {
+                assert_eq!(target.parent(), Some(repository.managed_root()));
+                assert!(target.starts_with(repository.managed_root()));
+                assert_eq!(target.file_name().unwrap().to_str(), Some(task.as_str()));
+                managed_worktree::validate_task_name(&task).unwrap();
+            }
+            // A caller path never grants authority: any accepted path is the
+            // exact derived direct child of the trusted managed root.
+            if let Ok((_, target)) =
+                resolve_managed_worktree_target(&repository, None, Some(&candidate))
+            {
+                assert_eq!(target.parent(), Some(repository.managed_root()));
+                assert!(target.starts_with(repository.managed_root()));
+            }
+            Ok(())
+        })
     }
 
     #[tokio::test]
@@ -11973,6 +13081,7 @@ mod tests {
             ("git_worktree_add", ActivityOperation::GitWorktreeAdd),
             ("git_worktree_create", ActivityOperation::GitWorktreeCreate),
             ("git_worktree_list", ActivityOperation::GitWorktreeList),
+            ("git_worktree_remove", ActivityOperation::GitWorktreeRemove),
         ] {
             assert_eq!(git_activity_operation(name), Some(expected));
         }

@@ -579,6 +579,21 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "git_worktree_remove",
+    "Remove a clean Temote-managed Git worktree",
+    "Remove one broker-derived clean managed worktree; branches, remote refs and sibling worktrees are preserved.",
+    mutation,
+    schema(
+      {
+        ...sessionProperty,
+        repository: { type: "string", minLength: 1, maxLength: 255 },
+        task: { type: "string", minLength: 1, maxLength: 64 },
+        path: { type: "string", minLength: 1, maxLength: 4096 },
+      },
+      ["session_id"],
+    ),
+  ),
+  tool(
     "github_workflow_dispatch",
     "Dispatch a GitHub Actions workflow",
     "Dispatch one workflow/ref pair using the configured repository's managed Git credential mapping.",
