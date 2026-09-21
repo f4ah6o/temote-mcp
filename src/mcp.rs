@@ -204,6 +204,11 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         "Git worktree remove",
     ),
     activity_tool(
+        "git_worktree_prune",
+        ActivityOperation::GitWorktreePrune,
+        "Git worktree prune",
+    ),
+    activity_tool(
         "github_workflow_dispatch",
         ActivityOperation::GithubWorkflowDispatch,
         "GitHub workflow dispatch",
@@ -1068,6 +1073,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_worktree_create","title":"Create a Temote-managed Git worktree","description":"Create a linked worktree only below the selected repository's exact managed root (<configured src root>/worktrees/<repository>/<task>, normally ~/src/worktrees/<repo>/<task>). Only one validated existing local branch can be attached; create a new branch with git_branch_create first. The task directory is derived from the branch when task is omitted; branch '/' never becomes directory hierarchy. Callers cannot choose a filesystem path, cwd or base, and legacy worktrees such as <repository>/.wt/<name> are never moved, adopted or deleted.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255},"branch":{"type":"string","minLength":1,"maxLength":255},"task":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_worktree_list","title":"List repository worktrees by Temote classification","description":"List the selected repository's registered worktrees as primary, managed (canonically contained below the exact trusted managed root with matching repository identity) or legacy. Read-only; legacy worktrees are reported but never moved, adopted or deleted.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_worktree_remove","title":"Remove a clean Temote-managed Git worktree","description":"Remove one known Temote-managed linked worktree of the selected repository below the exact trusted managed root. The target is always derived by broker policy: task selects the direct child and an optional path is accepted only when it equals that derived path. Primary checkouts, legacy worktrees, unknown or wrong-repository targets, symlinked or swapped paths, the current session working directory, worktrees owned by another active session or running job, and dirty or untracked worktrees are refused. Branches and remote refs are never deleted, no stash/reset/clean/force is performed, and sibling worktrees are preserved.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255},"task":{"type":"string","minLength":1,"maxLength":64},"path":{"type":"string","minLength":1,"maxLength":4096}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_worktree_prune","title":"Prune stale Git worktree metadata","description":"Run a bounded git worktree prune for the selected repository's canonical primary checkout. Only Git-classified stale worktree metadata is removed; filesystem directories are never deleted, and live managed, dirty, active-session and legacy worktrees are preserved. Caller input is path-free and the result reports bounded before/after identities and counts.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id"],"additionalProperties":false}},
         {"name":"github_workflow_dispatch","title":"Dispatch a GitHub Actions workflow","description":"Dispatch an exact workflow file or numeric workflow ID at an exact branch/tag ref for the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping, never the ambient active gh account, and returns the created workflow run ID without exposing tokens.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"workflow":{"type":"string","minLength":1,"maxLength":255},"ref":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","workflow","ref"],"additionalProperties":false}},
         {"name":"github_workflow_run_get","title":"Read a GitHub Actions workflow run","description":"Read bounded status for one exact workflow run ID in the GitHub repository resolved from a configured remote. Requires the same repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"run_id":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","run_id"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
@@ -1373,7 +1379,8 @@ async fn call_tool_with_local_agent_executable(
             | "git_worktree_add"
             | "git_worktree_create"
             | "git_worktree_list"
-            | "git_worktree_remove") => {
+            | "git_worktree_remove"
+            | "git_worktree_prune") => {
                 let operation =
                     git_activity_operation(name).expect("matched Git activity operation");
                 match operation {
@@ -1410,6 +1417,9 @@ async fn call_tool_with_local_agent_executable(
                     }
                     ActivityOperation::GitWorktreeRemove => {
                         git_worktree_remove(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitWorktreePrune => {
+                        git_worktree_prune(&args, &session, activity.as_ref()).await
                     }
                     _ => unreachable!("Git operation mapping returned a non-Git variant"),
                 }
@@ -2566,6 +2576,7 @@ fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
         "git_worktree_create" => Some(ActivityOperation::GitWorktreeCreate),
         "git_worktree_list" => Some(ActivityOperation::GitWorktreeList),
         "git_worktree_remove" => Some(ActivityOperation::GitWorktreeRemove),
+        "git_worktree_prune" => Some(ActivityOperation::GitWorktreePrune),
         _ => None,
     }
 }
@@ -3941,6 +3952,286 @@ async fn git_worktree_remove_in_src_root(
                     false,
                     false,
                     false,
+                    Some(&error),
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
+    text_result(result?)
+}
+
+/// Result of one bounded `git worktree prune` operation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ManagedWorktreePruneObservation {
+    registered: Vec<managed_worktree::RegisteredWorktree>,
+    prunable: Vec<PathBuf>,
+    existing_paths: Vec<PathBuf>,
+}
+
+/// Bounded, path-free observation of the repository's worktree registrations.
+async fn observe_managed_worktrees(
+    session: &config::Session,
+    repository: &managed_worktree::ManagedRepository,
+) -> Result<ManagedWorktreePruneObservation> {
+    let registered = registered_worktrees(session, repository.primary_checkout()).await?;
+    anyhow::ensure!(
+        registered.len() <= MAX_MANAGED_WORKTREE_LIST_ENTRIES,
+        "repository has more than {MAX_MANAGED_WORKTREE_LIST_ENTRIES} registered worktrees; refusing a bounded prune"
+    );
+    let mut prunable = Vec::new();
+    let mut existing_paths = Vec::new();
+    for entry in &registered {
+        if entry.prunable {
+            prunable.push(entry.path.clone());
+        }
+        if std::fs::symlink_metadata(&entry.path).is_ok() {
+            existing_paths.push(entry.path.clone());
+        }
+    }
+    Ok(ManagedWorktreePruneObservation {
+        registered,
+        prunable,
+        existing_paths,
+    })
+}
+
+/// Refuses a prune when any Git-stale entry is owned by the current session or
+/// by another non-terminal session or running job.
+///
+/// `git worktree prune` has no per-entry filter, so one owned stale entry
+/// rejects the whole bounded operation instead of pruning around it.
+fn ensure_prunable_entries_unowned_from(
+    session: &config::Session,
+    prunable: &[PathBuf],
+    views: &[session_control::SessionView],
+    jobs: &[(String, PathBuf)],
+) -> Result<()> {
+    for path in prunable {
+        let ownership = managed_worktree_owners_from(session, path, views, jobs);
+        anyhow::ensure!(
+            ownership.is_empty(),
+            "stale worktree metadata is owned by {} session(s) and {} running job(s); refusing prune: {}",
+            ownership.owning_sessions.len(),
+            ownership.owning_jobs.len(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_prunable_entries_unowned(
+    session: &config::Session,
+    prunable: &[PathBuf],
+) -> Result<()> {
+    let views = session_control::session_views_for_mcp()
+        .await
+        .context("cannot determine whether another session owns stale worktree metadata")?;
+    let jobs = {
+        let state = jobs().lock().unwrap();
+        state
+            .jobs
+            .iter()
+            .map(|(job_id, job)| (job_id.to_string(), job.cwd.clone()))
+            .collect::<Vec<_>>()
+    };
+    ensure_prunable_entries_unowned_from(session, prunable, &views, &jobs)
+}
+
+fn build_git_worktree_prune_command() -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "worktree".to_owned(),
+        "prune".to_owned(),
+        "--expire=now".to_owned(),
+    ]
+}
+
+fn bounded_path_list(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn managed_worktree_prune_result(
+    status: &str,
+    repository: &managed_worktree::ManagedRepository,
+    before: &ManagedWorktreePruneObservation,
+    after: &ManagedWorktreePruneObservation,
+    output: &sandbox::Output,
+    verification_error: Option<&str>,
+) -> String {
+    let removed = before
+        .prunable
+        .iter()
+        .filter(|path| !after.prunable.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut value = json!({
+        "status": status,
+        "repository": repository.repository_name(),
+        "primary_checkout": repository.primary_checkout().to_string_lossy(),
+        "before": {
+            "registered_count": before.registered.len(),
+            "prunable_count": before.prunable.len(),
+            "prunable": bounded_path_list(&before.prunable),
+        },
+        "after": {
+            "registered_count": after.registered.len(),
+            "prunable_count": after.prunable.len(),
+            "prunable": bounded_path_list(&after.prunable),
+        },
+        "removed_metadata_entries": bounded_path_list(&removed),
+        "removed_metadata_count": removed.len(),
+        "filesystem_directories_preserved": true,
+        "mutation_committed": output.status == 0,
+        "exit_code": output.status,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "truncated": output.truncated,
+    });
+    if let Some(error) = verification_error {
+        value["verification_error"] = json!(error);
+        value["filesystem_directories_preserved"] = json!(false);
+    }
+    value.to_string()
+}
+
+/// Post-prune verification: only previously stale registrations disappeared,
+/// every live registration survived and no filesystem directory was deleted.
+fn verify_managed_worktree_prune(
+    before: &ManagedWorktreePruneObservation,
+    after: &ManagedWorktreePruneObservation,
+) -> Result<()> {
+    for path in &after.prunable {
+        anyhow::ensure!(
+            before.prunable.contains(path),
+            "prune left unexpected stale metadata behind: {}",
+            path.display()
+        );
+    }
+    let live_before = before
+        .registered
+        .iter()
+        .filter(|entry| !entry.prunable)
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    let live_after = after
+        .registered
+        .iter()
+        .filter(|entry| !entry.prunable)
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        live_before == live_after,
+        "prune removed or changed a live worktree registration"
+    );
+    for path in &before.existing_paths {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(path).is_ok(),
+            "prune deleted a filesystem directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn git_worktree_prune(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let src_root = configured_src_root()?;
+    git_worktree_prune_in_src_root(args, session, &src_root, activity).await
+}
+
+async fn git_worktree_prune_in_src_root(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    reject_removed_managed_worktree_arguments(args, &["cwd", "base", "task", "path"])?;
+    let requested_repository = match args.get("repository") {
+        Some(value) => Some(value.as_str().context("repository must be a string")?),
+        None => None,
+    };
+    let cwd = config::resolve_cwd(session, None)?;
+    let repository =
+        managed_repository_for_requested(requested_repository, session, &cwd, src_root)?;
+    repository.ensure_authority()?;
+    let before = observe_managed_worktrees(session, &repository).await?;
+    ensure_prunable_entries_unowned(session, &before.prunable).await?;
+    approve_local_git_mutation(
+        session,
+        repository.primary_checkout(),
+        "git_worktree_prune",
+        format!(
+            "repository={} stale_metadata={}",
+            repository.repository_name(),
+            before.prunable.len()
+        ),
+        activity,
+    )
+    .await?;
+    // The approval boundary is not a trust boundary: re-observe everything.
+    let before = observe_managed_worktrees(session, &repository).await?;
+    ensure_prunable_entries_unowned(session, &before.prunable).await?;
+
+    let command = build_git_worktree_prune_command();
+    let rendered_command = render_command(&command);
+    approvals::activity(
+        &session.id,
+        "Prune stale Git worktree metadata",
+        Some(rendered_command.clone()),
+    )
+    .await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let output = sandbox::run_unrestricted_with_env(
+        &command,
+        repository.primary_checkout(),
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await;
+    let result = match output {
+        Ok(output) => {
+            let verification = if output.status == 0 {
+                match observe_managed_worktrees(session, &repository).await {
+                    Ok(after) => verify_managed_worktree_prune(&before, &after)
+                        .map(|()| after)
+                        .map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            } else {
+                Err("git worktree prune did not complete successfully".to_owned())
+            };
+            match verification {
+                Ok(after) => Ok(managed_worktree_prune_result(
+                    "pruned",
+                    &repository,
+                    &before,
+                    &after,
+                    &output,
+                    None,
+                )),
+                Err(error) => Err(anyhow::anyhow!(managed_worktree_prune_result(
+                    if output.status == 0 {
+                        "verification_failed"
+                    } else {
+                        "failed"
+                    },
+                    &repository,
+                    &before,
+                    &ManagedWorktreePruneObservation::default(),
+                    &output,
                     Some(&error),
                 ))),
             }
@@ -8883,7 +9174,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 55);
+        assert_eq!(tools.len(), 56);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -11079,6 +11370,7 @@ mod tests {
             "git_worktree_create",
             "git_worktree_list",
             "git_worktree_remove",
+            "git_worktree_prune",
         ] {
             let tool = tools
                 .iter()
@@ -11288,6 +11580,249 @@ mod tests {
             next_restart_at: None,
             restart_limit_reason: None,
         }
+    }
+
+    fn managed_worktree_prune_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, config::Session) {
+        let (root, canonical_root, checkout, session) = managed_worktree_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+        std::fs::create_dir_all(&managed_root).unwrap();
+        for (branch, task) in [
+            ("stale-branch", "stale-managed"),
+            ("gone-branch", "gone-managed"),
+            ("live-branch", "live-managed"),
+            ("dirty-branch", "dirty-managed"),
+        ] {
+            run_git_fixture(&checkout, &["branch", branch]);
+            run_git_fixture(
+                &checkout,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    managed_root.join(task).to_str().unwrap(),
+                    branch,
+                ],
+            );
+        }
+        // Git-classified stale metadata whose directory still exists with
+        // unrelated files.
+        let stale = managed_root.join("stale-managed");
+        std::fs::remove_file(stale.join(".git")).unwrap();
+        std::fs::write(stale.join("unrelated.txt"), "keep me\n").unwrap();
+        // Git-classified stale metadata whose directory is gone.
+        std::fs::remove_dir_all(managed_root.join("gone-managed")).unwrap();
+        // Dirty worktree.
+        std::fs::write(managed_root.join("dirty-managed/unrelated.txt"), "dirty\n").unwrap();
+        // A filesystem-only directory that was never registered.
+        std::fs::create_dir(managed_root.join("orphan-dir")).unwrap();
+        std::fs::write(managed_root.join("orphan-dir/keep.txt"), "orphan\n").unwrap();
+        (root, canonical_root, checkout, session)
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_prune_removes_only_stale_metadata_and_preserves_filesystems() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_prune_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+        let stale = managed_root.join("stale-managed");
+        let live = managed_root.join("live-managed");
+        let dirty = managed_root.join("dirty-managed");
+        let legacy = checkout.join(".wt/legacy");
+        let legacy_sibling = canonical_root.join("repo-legacy-linked");
+        let live_before = worktree_snapshot(&live);
+        let dirty_before = worktree_snapshot(&dirty);
+        let legacy_before = worktree_snapshot(&legacy);
+        let legacy_sibling_before = worktree_snapshot(&legacy_sibling);
+        let primary_before = worktree_snapshot(&checkout);
+
+        let result = git_worktree_prune_in_src_root(
+            &json!({"session_id": session.id}),
+            &session,
+            &canonical_root,
+            None,
+        )
+        .await
+        .unwrap();
+        let value = result_text(&result);
+        assert_eq!(value["status"], "pruned");
+        assert_eq!(value["repository"], "repo");
+        assert_eq!(value["before"]["prunable_count"], 2);
+        assert_eq!(value["after"]["prunable_count"], 0);
+        assert_eq!(value["removed_metadata_count"], 2);
+        assert_eq!(value["filesystem_directories_preserved"], true);
+        assert!(value.get("verification_error").is_none());
+
+        // Metadata-only: the stale directory and its unrelated files survive.
+        assert_eq!(
+            std::fs::read_to_string(stale.join("unrelated.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(managed_root.join("orphan-dir/keep.txt").exists());
+        assert!(!checkout.join(".git/worktrees/stale-managed").exists());
+        assert!(!checkout.join(".git/worktrees/gone-managed").exists());
+        assert!(checkout.join(".git/worktrees/live-managed").exists());
+        assert!(checkout.join(".git/worktrees/dirty-managed").exists());
+
+        // Live, dirty, legacy and out-of-root worktrees are unchanged.
+        assert_eq!(worktree_snapshot(&live), live_before);
+        assert_eq!(worktree_snapshot(&dirty), dirty_before);
+        assert_eq!(worktree_snapshot(&legacy), legacy_before);
+        assert_eq!(worktree_snapshot(&legacy_sibling), legacy_sibling_before);
+        assert_eq!(worktree_snapshot(&checkout), primary_before);
+        for branch in ["stale-branch", "gone-branch", "live-branch", "dirty-branch"] {
+            assert!(
+                !git_fixture_stdout(&checkout, &["branch", "--list", branch]).is_empty(),
+                "branch {branch} must be preserved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_prune_is_idempotent() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_prune_fixture();
+        let args = json!({"session_id": session.id});
+        let first = result_text(
+            &git_worktree_prune_in_src_root(&args, &session, &canonical_root, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(first["removed_metadata_count"], 2);
+        let registered_after_first =
+            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
+
+        let second = result_text(
+            &git_worktree_prune_in_src_root(&args, &session, &canonical_root, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(second["status"], "pruned");
+        assert_eq!(second["before"]["prunable_count"], 0);
+        assert_eq!(second["after"]["prunable_count"], 0);
+        assert_eq!(second["removed_metadata_count"], 0);
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
+            registered_after_first
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_prune_refuses_owned_stale_metadata_and_path_input() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_prune_fixture();
+        let stale = canonical_root.join("worktrees/repo/stale-managed");
+        let gone = canonical_root.join("worktrees/repo/gone-managed");
+        let prunable = vec![stale.clone(), gone.clone()];
+
+        // A live session that owns the stale path rejects the whole prune, so
+        // nothing is pruned around it.
+        let views = [session_view_for_test(
+            "owner",
+            PathBuf::from("/elsewhere"),
+            "active",
+            Some(stale.clone()),
+        )];
+        let error =
+            ensure_prunable_entries_unowned_from(&session, &prunable, &views, &[]).unwrap_err();
+        assert!(error.to_string().contains("refusing prune"), "{error:#}");
+
+        // A running job in the stale path rejects it too.
+        let jobs = [("job".to_owned(), gone.join("sub"))];
+        let error =
+            ensure_prunable_entries_unowned_from(&session, &prunable, &[], &jobs).unwrap_err();
+        assert!(error.to_string().contains("refusing prune"), "{error:#}");
+
+        // Terminal sessions never own stale metadata.
+        let views = [
+            session_view_for_test("stopped", stale.clone(), "stopped", Some(stale.clone())),
+            session_view_for_test("crashed", stale.clone(), "crashed", Some(stale.clone())),
+            session_view_for_test("degraded", stale.clone(), "degraded", Some(stale.clone())),
+        ];
+        ensure_prunable_entries_unowned_from(&session, &prunable, &views, &[]).unwrap();
+
+        // The structured tool is path-free.
+        for args in [
+            json!({"session_id": session.id, "task": "stale-managed"}),
+            json!({"session_id": session.id, "path": stale.to_string_lossy()}),
+            json!({"session_id": session.id, "cwd": "/tmp"}),
+            json!({"session_id": session.id, "base": "HEAD"}),
+            json!({"session_id": session.id, "repository": "other"}),
+        ] {
+            let error = git_worktree_prune_in_src_root(&args, &session, &canonical_root, None)
+                .await
+                .unwrap_err();
+            assert!(
+                !error.to_string().contains("prune did not complete"),
+                "{args}: {error:#}"
+            );
+        }
+        // A session outside the configured src root fails closed.
+        let outside = config::Session {
+            cwd: std::env::temp_dir(),
+            permitted_directories: vec![std::env::temp_dir()],
+            ..session
+        };
+        assert!(
+            git_worktree_prune_in_src_root(
+                &json!({"session_id": outside.id}),
+                &outside,
+                &canonical_root,
+                None
+            )
+            .await
+            .is_err()
+        );
+
+        // Nothing was pruned by any rejected request.
+        assert!(checkout.join(".git/worktrees/stale-managed").exists());
+        assert!(stale.join("unrelated.txt").exists());
+    }
+
+    #[test]
+    fn managed_worktree_prune_verification_rejects_live_or_filesystem_changes() {
+        let stale = PathBuf::from("/src/worktrees/repo/stale");
+        let live = PathBuf::from("/src/worktrees/repo/live");
+        let entry = |path: &Path, prunable: bool| managed_worktree::RegisteredWorktree {
+            path: path.to_path_buf(),
+            head: None,
+            branch: None,
+            bare: false,
+            detached: false,
+            prunable,
+        };
+        let fixture = tempfile::tempdir().unwrap();
+        let existing = std::fs::canonicalize(fixture.path()).unwrap();
+        let before = ManagedWorktreePruneObservation {
+            registered: vec![entry(&stale, true), entry(&existing, false)],
+            prunable: vec![stale.clone()],
+            existing_paths: vec![existing.clone()],
+        };
+
+        // A prune that drops a live registration is rejected.
+        let after = ManagedWorktreePruneObservation {
+            registered: vec![entry(&stale, true)],
+            prunable: vec![stale.clone()],
+            existing_paths: vec![existing.clone()],
+        };
+        assert!(verify_managed_worktree_prune(&before, &after).is_err());
+
+        // A prune that deletes a filesystem directory is rejected.
+        let after = ManagedWorktreePruneObservation {
+            registered: vec![entry(&existing, false)],
+            prunable: Vec::new(),
+            existing_paths: vec![existing.clone()],
+        };
+        std::fs::remove_dir_all(&existing).unwrap();
+        assert!(verify_managed_worktree_prune(&before, &after).is_err());
+
+        // A prune that leaves an unexpected stale entry is rejected.
+        let after = ManagedWorktreePruneObservation {
+            registered: vec![
+                entry(&stale, true),
+                entry(&live, true),
+                entry(&existing, false),
+            ],
+            prunable: vec![stale.clone(), live.clone()],
+            existing_paths: Vec::new(),
+        };
+        assert!(verify_managed_worktree_prune(&before, &after).is_err());
     }
 
     #[tokio::test]
@@ -13082,6 +13617,7 @@ mod tests {
             ("git_worktree_create", ActivityOperation::GitWorktreeCreate),
             ("git_worktree_list", ActivityOperation::GitWorktreeList),
             ("git_worktree_remove", ActivityOperation::GitWorktreeRemove),
+            ("git_worktree_prune", ActivityOperation::GitWorktreePrune),
         ] {
             assert_eq!(git_activity_operation(name), Some(expected));
         }

@@ -59,6 +59,7 @@ pub enum ActivityOperation {
     GitWorktreeCreate,
     GitWorktreeList,
     GitWorktreeRemove,
+    GitWorktreePrune,
     GithubWorkflowDispatch,
     GithubWorkflowRunGet,
     Execute,
@@ -136,6 +137,7 @@ impl<'de> Deserialize<'de> for ActivityOperation {
             "git_worktree_create" => Ok(Self::GitWorktreeCreate),
             "git_worktree_list" => Ok(Self::GitWorktreeList),
             "git_worktree_remove" => Ok(Self::GitWorktreeRemove),
+            "git_worktree_prune" => Ok(Self::GitWorktreePrune),
             "github_workflow_dispatch" => Ok(Self::GithubWorkflowDispatch),
             "github_workflow_run_get" => Ok(Self::GithubWorkflowRunGet),
             "execute" => Ok(Self::Execute),
@@ -1436,6 +1438,7 @@ mod tests {
             (ActivityOperation::GitWorktreeCreate, "git_worktree_create"),
             (ActivityOperation::GitWorktreeList, "git_worktree_list"),
             (ActivityOperation::GitWorktreeRemove, "git_worktree_remove"),
+            (ActivityOperation::GitWorktreePrune, "git_worktree_prune"),
             (
                 ActivityOperation::GithubWorkflowDispatch,
                 "github_workflow_dispatch",
