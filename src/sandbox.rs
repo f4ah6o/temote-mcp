@@ -5593,6 +5593,62 @@ done
         Ok(())
     }
 
+    /// The first sandboxed branch create in a fresh repository must read the
+    /// missing `packed-refs` as absent — the mask that once materialized a
+    /// denied placeholder regressed this exact invocation.
+    #[tokio::test]
+    async fn linux_first_branch_create_on_a_fresh_repository_reads_missing_packed_refs()
+    -> Result<()> {
+        let root = test_root();
+        let repository = root.path().join("repository");
+        init_metadata_repository(&repository)?;
+        let packed_refs = repository.join(".git").join("packed-refs");
+        assert!(matches!(host_entry(&packed_refs)?, HostEntry::Missing));
+        let base = host_git_stdout(&repository, &["rev-parse", "HEAD"])?;
+
+        let git_roots = git_metadata_roots(&repository)?;
+        let created = run_git(
+            &command(
+                "/usr/bin/git",
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "branch",
+                    "--no-track",
+                    "feature",
+                    base.as_str(),
+                ],
+            ),
+            &repository,
+            std::slice::from_ref(&repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(created.status, 0, "{}", created.stderr);
+        assert_eq!(
+            host_git_stdout(&repository, &["rev-parse", "feature"])?,
+            base
+        );
+
+        // The branch persisted through staging and the missing entry stays
+        // absent for every later invocation.
+        let listed = run_git(
+            &command("/usr/bin/git", &["branch", "--list", "feature"]),
+            &repository,
+            std::slice::from_ref(&repository),
+            &git_roots,
+            None,
+        )
+        .await?;
+        assert_eq!(listed.status, 0, "{}", listed.stderr);
+        assert_eq!(listed.stdout.trim(), "feature");
+        assert!(matches!(host_entry(&packed_refs)?, HostEntry::Missing));
+
+        std::fs::remove_dir_all(root.path())?;
+        Ok(())
+    }
+
     /// An existing shallow repository keeps its shallow state and shallow file
     /// inside the sandbox, and the protected file stays immutable.
     #[tokio::test]

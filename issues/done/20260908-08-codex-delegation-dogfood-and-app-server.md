@@ -288,3 +288,7 @@ Audit result: every repository-local app-server/runtime residual is `already-cov
 | `resolve_codex_home` `#[cfg(test)]` isolation (on `complete-open-work`) | Production-only path on `main` (`install_current`/`status_current`/`diagnose_current`); every test passes an explicit tempdir — the override is dead isolation, not a missing behavior | not needed |
 
 Missing coherent behaviors: none — no child issues created.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

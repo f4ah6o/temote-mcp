@@ -1,6 +1,6 @@
 # Linux sandbox: first `git branch <name> <sha>` in a fresh repository fails reading `.git/packed-refs`
 
-Status: polished
+Status: done
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/polished/20260916-structured-git-branch-worktree-operations.md` (regression evidence)
 Depends on: host Linux sandbox acceptance
@@ -62,3 +62,39 @@ environment and the CI/host gate that proves it.
 
 First-invocation branch creation succeeds on the supported Linux sandbox, or the behavior is
 explicitly documented as host-environment-limited with evidence.
+
+## Disposition — 2026-09-22 (Devin session)
+
+**Real defect on `4c7b35a`, already removed by refactor `ab78587`; regression test added here.**
+
+Diagnosis: on `4c7b35a` `append_missing_mask` emitted `--ro-bind /dev/null .git/packed-refs`
+for every missing protected file. bubblewrap materializes a regular empty mountpoint file
+(mode 0444 — the exact `stat` the probe recorded) before the bind lands, so the first reader in
+a fresh namespace could observe the unbound placeholder instead of the device — matching the
+hypothesis that the placeholder's intermediate state denied the reader.
+
+Current main no longer produces that placeholder for this path. `ab78587` ("complete managed
+worktree phase 2.4 repair") reworked the policy in `src/sandbox/linux/policy.rs`: a primary
+checkout's whole metadata root goes to `read_only_roots`, and only `refs/heads`, `objects`,
+`logs` (plus `worktrees` under pinned scope) are re-exposed writable. `helper.rs`
+`effective_mount_is_read_only` then *skips* masking missing paths below a read-only mount —
+`packed-refs` is absent inside the sandbox and Git takes its native ENOENT path. The surviving
+mask (writable-mount case, e.g. `objects/info`, `objects/pack`) is `--dev-bind /dev/null`, a
+world-readable character device, not a mode-restricted regular file. Helper unit test
+`missing_protected_paths_are_masked_only_when_the_effective_mount_is_writable` pins both halves.
+
+New focused test `sandbox::linux_tests::linux_first_branch_create_on_a_fresh_repository_reads_missing_packed_refs`
+runs the exact `run_git` invocation from the observation (`git -c core.hooksPath=/dev/null
+branch --no-track feature <sha>`) as the first sandboxed call on a fresh repo, asserts the
+branch lands, a second `git branch --list` sees it, and the host never gains a placeholder.
+
+## Verification — 2026-09-22 (Devin session)
+
+- Focused test compiles into the lib target and is discovered; on this VM it reports the
+  documented host gate (`temote-linux-sandbox` helper missing), identical to every other
+  `sandbox::linux_tests` entry — `just linux-sandbox-acceptance` and the CI `host` job
+  (`cargo test --lib --all-features --locked linux_tests`) are the live gate.
+- `linux_missing_protected_metadata_stays_missing_in_a_primary_checkout` already asserts
+  `packed-refs-absent` + `write-packed-refs-denied` inside the sandbox.
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo check --no-default-features --all-targets --locked`, `git diff --check` all clean.

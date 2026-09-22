@@ -528,3 +528,7 @@ package version は CalVer workflow が管理するため、この実装のた�
 ## 2026-09-16 branch-salvage packet
 
 Do not merge `codex/20260915-completion-activity` wholesale. Current-main reconciliation and any remaining S05-S16 porting is owned by `issues/polished/20260916-completion-activity-branch-salvage.md`.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

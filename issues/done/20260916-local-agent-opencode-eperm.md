@@ -112,3 +112,7 @@ The currently running Temote server predates this source change, so repeating `l
 - [x] spawn failure は fixed/bounded classification で runner / sandbox setup / agent child-process denial / generic non-zero exit を区別できる。
 - [ ] Codex local agent、OpenCode fake adapter、auth isolation、sandbox tests が回帰しない。
 - [ ] yolo、broad HOME exposure、raw argv/executable input を追加しない。
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".
