@@ -2871,6 +2871,42 @@ async fn resolve_git_remote_destinations(
     Ok(GitRemoteDestinations { urls })
 }
 
+async fn resolve_git_remote_destinations_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    remote: &str,
+    operation: GitRemoteOperation,
+) -> Result<GitRemoteDestinations> {
+    validate_git_remote(remote)?;
+    if operation == GitRemoteOperation::Pull && remote == "." {
+        return Ok(GitRemoteDestinations { urls: Vec::new() });
+    }
+
+    let command = match operation {
+        GitRemoteOperation::Fetch | GitRemoteOperation::Pull => vec![
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            remote.to_owned(),
+        ],
+        GitRemoteOperation::Push => vec![
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "--push".to_owned(),
+            "--all".to_owned(),
+            remote.to_owned(),
+        ],
+    };
+    let output =
+        map_git_remote_inspection_error(run_pinned_git_inspection(pinned, &command).await)?;
+    anyhow::ensure!(
+        output.status == 0,
+        "Git remote {remote:?} is not configured"
+    );
+    let urls = parse_git_remote_destinations(&output, operation)?;
+    Ok(GitRemoteDestinations { urls })
+}
+
 fn parse_git_remote_destinations(
     output: &sandbox::Output,
     operation: GitRemoteOperation,
@@ -3238,6 +3274,45 @@ async fn ensure_github_https_destinations_credential_mapping(
     Ok(())
 }
 
+async fn ensure_github_https_destinations_credential_mapping_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    destinations: &GitRemoteDestinations,
+) -> Result<()> {
+    if !destinations.requires_github_credential_mapping() {
+        return Ok(());
+    }
+    let local_helpers = map_github_credential_inspection_error(
+        run_pinned_git_inspection(
+            pinned,
+            &[
+                "git".to_owned(),
+                "config".to_owned(),
+                "--local".to_owned(),
+                "--includes".to_owned(),
+                "--get-all".to_owned(),
+                "credential.helper".to_owned(),
+            ],
+        )
+        .await,
+    )?;
+    let local_use_http_path = map_github_credential_inspection_error(
+        run_pinned_git_inspection(
+            pinned,
+            &[
+                "git".to_owned(),
+                "config".to_owned(),
+                "--local".to_owned(),
+                "--includes".to_owned(),
+                "--get".to_owned(),
+                "credential.useHttpPath".to_owned(),
+            ],
+        )
+        .await,
+    )?;
+    validate_github_credential_mapping_inspection(&local_helpers, &local_use_http_path)?;
+    Ok(())
+}
+
 fn map_github_credential_inspection_error<T>(result: Result<T>) -> Result<T> {
     result.map_err(|_| anyhow::anyhow!(GITHUB_CREDENTIAL_MAPPING_ERROR))
 }
@@ -3379,12 +3454,19 @@ async fn git_remote_branch_delete(
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     let cwd = cwd(args, session)?;
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    // Capture the worktree and both Git metadata roots before any approval
+    // wait. Every inspection and the final network mutation below uses this
+    // descriptor-backed context rather than resolving `cwd` again.
+    let pinned = sandbox::pin_git_repository(&repository_root)?;
     let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
     let branch = args
         .get("branch")
         .and_then(Value::as_str)
         .context("missing or non-string branch")?;
-    validate_git_branch_name(session, &cwd, branch).await?;
+    validate_git_branch_name_pinned(&pinned, branch).await?;
     let expected_remote_sha = args
         .get("expected_remote_sha")
         .and_then(Value::as_str)
@@ -3393,21 +3475,18 @@ async fn git_remote_branch_delete(
     let expected_remote_sha = expected_remote_sha.to_ascii_lowercase();
 
     let destinations =
-        resolve_git_remote_destinations(session, &cwd, &remote, GitRemoteOperation::Push).await?;
+        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Push).await?;
     anyhow::ensure!(
         destinations.urls.len() == 1,
         "remote branch deletion requires exactly one configured push destination"
     );
-    ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
+    ensure_github_https_destinations_credential_mapping_pinned(&pinned, &destinations).await?;
     let fetch_destinations =
-        resolve_git_remote_destinations(session, &cwd, &remote, GitRemoteOperation::Fetch).await?;
+        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Fetch).await?;
     anyhow::ensure!(
         fetch_destinations.urls == destinations.urls,
         "remote branch deletion requires matching fetch and push destinations"
     );
-    let repository_root = sandbox::git_worktree_root(&cwd)?;
-    config::ensure_permitted(session, &repository_root)
-        .context("Git repository root must be inside a permitted session root")?;
     request_activity_approval(
         session,
         ActivityApprovalRequest {
@@ -3423,28 +3502,49 @@ async fn git_remote_branch_delete(
         activity,
     )
     .await?;
+
+    // Approval is not the trust boundary. Re-read the configured destinations
+    // and repository-local credential mapping from the pinned repository, then
+    // use only those live values for the remaining authority checks and push.
+    let destinations_after =
+        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Push).await?;
+    anyhow::ensure!(
+        destinations_after.urls.len() == 1,
+        "remote branch deletion requires exactly one configured push destination"
+    );
+    anyhow::ensure!(
+        destinations_after == destinations,
+        "configured remote destination changed during approval"
+    );
+    let fetch_destinations_after =
+        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Fetch).await?;
+    anyhow::ensure!(
+        fetch_destinations_after.urls == destinations_after.urls,
+        "remote branch deletion requires matching fetch and push destinations"
+    );
+    ensure_github_https_destinations_credential_mapping_pinned(&pinned, &destinations_after)
+        .await?;
+
     // The remote's live symbolic HEAD is authoritative; a cached
     // refs/remotes/origin/HEAD or a conventional branch name is not sufficient.
-    let default_branch =
-        resolve_remote_default_branch_after_approval(session, &cwd, &remote).await?;
+    let default_branch = resolve_remote_default_branch_after_approval(&pinned, &remote).await?;
     anyhow::ensure!(
         branch != default_branch,
         "remote default branch cannot be deleted"
     );
 
     if let Some(repository) = github_repository_from_destination(
-        destinations
+        destinations_after
             .urls
             .first()
             .context("remote branch deletion destination is unavailable")?,
     )? {
         let protected =
-            github_remote_branch_is_protected_after_approval(session, &cwd, &repository, branch)
-                .await?;
+            github_remote_branch_is_protected_after_approval(&pinned, &repository, branch).await?;
         anyhow::ensure!(!protected, "remote protected branch cannot be deleted");
     } else {
         let protected_branches =
-            non_github_remote_protected_branches_after_approval(session, &cwd, &remote).await?;
+            non_github_remote_protected_branches_after_approval(&pinned, &remote).await?;
         anyhow::ensure!(
             !protected_branches
                 .iter()
@@ -3454,12 +3554,12 @@ async fn git_remote_branch_delete(
     }
 
     let command = build_git_remote_branch_delete_command(&remote, branch, &expected_remote_sha);
-    let output = run_git_output_after_approval(
+    let output = run_pinned_git_output_after_approval(
         session,
-        cwd,
+        &pinned,
         command,
         activity,
-        destinations.requires_github_credential_mapping(),
+        destinations_after.requires_github_credential_mapping(),
     )
     .await?;
     text_result(render_output(output)?)
@@ -3469,13 +3569,11 @@ async fn git_remote_branch_delete(
 /// `origin/HEAD` ref is intentionally not consulted: it is a local cache and
 /// can be stale or absent.
 async fn resolve_remote_default_branch_after_approval(
-    session: &config::Session,
-    cwd: &Path,
+    pinned: &sandbox::PinnedGitRepository,
     remote: &str,
 ) -> Result<String> {
-    let output = run_host_git_inspection(
-        session,
-        cwd,
+    let output = run_pinned_git_inspection(
+        pinned,
         &[
             "git".to_owned(),
             "ls-remote".to_owned(),
@@ -3488,7 +3586,7 @@ async fn resolve_remote_default_branch_after_approval(
     .map_err(|_| anyhow::anyhow!(GIT_REMOTE_DEFAULT_BRANCH_ERROR))?;
     let branch = parse_remote_default_branch(&output)
         .map_err(|_| anyhow::anyhow!(GIT_REMOTE_DEFAULT_BRANCH_ERROR))?;
-    validate_git_branch_name(session, cwd, &branch)
+    validate_git_branch_name_pinned(pinned, &branch)
         .await
         .map_err(|_| anyhow::anyhow!(GIT_REMOTE_DEFAULT_BRANCH_ERROR))?;
     Ok(branch)
@@ -3533,15 +3631,13 @@ fn github_repository_from_destination(url: &str) -> Result<Option<GithubReposito
 }
 
 async fn github_remote_branch_is_protected_after_approval(
-    session: &config::Session,
-    cwd: &Path,
+    pinned: &sandbox::PinnedGitRepository,
     repository: &GithubRepository,
     branch: &str,
 ) -> Result<bool> {
     let path = github_branch_metadata_path(repository, branch)?;
-    let response = run_github_api_after_approval(
-        session,
-        cwd,
+    let response = run_pinned_github_api_after_approval(
+        pinned,
         repository,
         GithubApiCall {
             method: GithubApiMethod::Get,
@@ -3557,17 +3653,16 @@ async fn github_remote_branch_is_protected_after_approval(
 }
 
 async fn non_github_remote_protected_branches_after_approval(
-    session: &config::Session,
-    cwd: &Path,
+    pinned: &sandbox::PinnedGitRepository,
     remote: &str,
 ) -> Result<Vec<String>> {
     let key = format!("temote.remote.{remote}.protectedBranch");
-    let values = git_local_config_values(session, cwd, &key)
+    let values = git_local_config_values_pinned(pinned, &key)
         .await
         .map_err(|_| anyhow::anyhow!(GIT_REMOTE_PROTECTION_POLICY_ERROR))?;
     anyhow::ensure!(!values.is_empty(), GIT_REMOTE_PROTECTION_POLICY_ERROR);
     for value in &values {
-        validate_git_branch_name(session, cwd, value)
+        validate_git_branch_name_pinned(pinned, value)
             .await
             .map_err(|_| anyhow::anyhow!(GIT_REMOTE_PROTECTION_POLICY_ERROR))?;
     }
@@ -5193,11 +5288,7 @@ async fn approve_local_git_mutation(
     .await
 }
 
-pub(crate) async fn validate_git_branch_name(
-    session: &config::Session,
-    cwd: &Path,
-    branch: &str,
-) -> Result<()> {
+fn validate_git_branch_name_syntax(branch: &str) -> Result<()> {
     anyhow::ensure!(!branch.is_empty(), "branch must not be empty");
     anyhow::ensure!(
         branch.len() <= MAX_GIT_BRANCH_NAME_BYTES,
@@ -5211,9 +5302,37 @@ pub(crate) async fn validate_git_branch_name(
         !branch.chars().any(char::is_control),
         "branch must not contain control characters"
     );
+    Ok(())
+}
+
+pub(crate) async fn validate_git_branch_name(
+    session: &config::Session,
+    cwd: &Path,
+    branch: &str,
+) -> Result<()> {
+    validate_git_branch_name_syntax(branch)?;
     let output = run_host_git_inspection(
         session,
         cwd,
+        &[
+            "git".to_owned(),
+            "check-ref-format".to_owned(),
+            "--branch".to_owned(),
+            branch.to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "invalid Git branch name");
+    Ok(())
+}
+
+async fn validate_git_branch_name_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    branch: &str,
+) -> Result<()> {
+    validate_git_branch_name_syntax(branch)?;
+    let output = run_pinned_git_inspection(
+        pinned,
         &[
             "git".to_owned(),
             "check-ref-format".to_owned(),
@@ -5943,6 +6062,26 @@ async fn run_github_api_after_approval(
     }
 }
 
+/// Executes the remote-branch-delete protection query with the repository
+/// context pinned before approval.  In particular, credential/config lookup
+/// must not resolve a replacement `cwd` pathname after approval.
+async fn run_pinned_github_api_after_approval(
+    pinned: &sandbox::PinnedGitRepository,
+    repository: &GithubRepository,
+    call: GithubApiCall<'_>,
+) -> Result<String> {
+    #[cfg(feature = "network")]
+    {
+        let token = repo_scoped_github_token_pinned(pinned, repository).await?;
+        github_api_request(&token, call.method, call.path, call.body).await
+    }
+    #[cfg(not(feature = "network"))]
+    {
+        let _ = (pinned, repository, call);
+        anyhow::bail!("GitHub API operations require the network feature")
+    }
+}
+
 async fn run_approved_github_api(
     session: &config::Session,
     cwd: PathBuf,
@@ -6116,6 +6255,69 @@ async fn repo_scoped_github_token(
     let output = sandbox::run_unrestricted_with_env(
         &github_managed_credential_command(),
         repository_root,
+        Some(input.as_bytes()),
+        &environment,
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0,
+        "GitHub repository credential is unavailable"
+    );
+    let credential_stdout = zeroize::Zeroizing::new(output.stdout);
+    let token = parse_repo_scoped_github_credential(&credential_stdout)?;
+    Ok(zeroize::Zeroizing::new(token))
+}
+
+#[cfg(feature = "network")]
+async fn repo_scoped_github_token_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    repository: &GithubRepository,
+) -> Result<zeroize::Zeroizing<String>> {
+    let local_helpers = run_pinned_git_inspection(
+        pinned,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--local".to_owned(),
+            "--includes".to_owned(),
+            "--get-all".to_owned(),
+            "credential.helper".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(local_helpers.status == 0, GITHUB_CREDENTIAL_MAPPING_ERROR);
+    let local_use_http_path = run_pinned_git_inspection(
+        pinned,
+        &[
+            "git".to_owned(),
+            "config".to_owned(),
+            "--local".to_owned(),
+            "--includes".to_owned(),
+            "--get".to_owned(),
+            "credential.useHttpPath".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        local_use_http_path.status == 0
+            && repo_scoped_github_credential_mapping_valid(
+                &local_helpers.stdout,
+                &local_use_http_path.stdout,
+            ),
+        GITHUB_CREDENTIAL_MAPPING_ERROR
+    );
+
+    let path = format!("{}/{}.git", repository.owner, repository.repo);
+    let input = format!("protocol=https\nhost=github.com\npath={path}\n\n");
+    let environment = HashMap::from([
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ("GCM_INTERACTIVE".to_owned(), "Never".to_owned()),
+        ("GIT_ASKPASS".to_owned(), "/bin/false".to_owned()),
+    ]);
+    let output = sandbox::run_pinned_git_command(
+        pinned,
+        &github_managed_credential_command(),
         Some(input.as_bytes()),
         &environment,
         child_env::SENSITIVE_ENV_NAMES,
@@ -6319,14 +6521,6 @@ async fn git_config_values(
     git_config_values_with_scope(session, cwd, key, false).await
 }
 
-async fn git_local_config_values(
-    session: &config::Session,
-    cwd: &Path,
-    key: &str,
-) -> Result<Vec<String>> {
-    git_config_values_with_scope(session, cwd, key, true).await
-}
-
 async fn git_config_values_with_scope(
     session: &config::Session,
     cwd: &Path,
@@ -6371,6 +6565,48 @@ async fn git_config_values_with_scope(
     Ok(parsed)
 }
 
+async fn git_local_config_values_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    key: &str,
+) -> Result<Vec<String>> {
+    let command = vec![
+        "git".to_owned(),
+        "config".to_owned(),
+        "--local".to_owned(),
+        "--get-all".to_owned(),
+        key.to_owned(),
+    ];
+    let output = run_pinned_git_inspection(pinned, &command).await?;
+    anyhow::ensure!(
+        !output.truncated && output.stdout.len() <= MAX_GIT_CONFIG_OUTPUT_BYTES,
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    if output.status != 0 {
+        anyhow::ensure!(output.status == 1, GIT_PULL_UPSTREAM_CONFIGURATION_ERROR);
+        return Ok(Vec::new());
+    }
+    let mut values = output.stdout.split('\n').collect::<Vec<_>>();
+    if values.last() == Some(&"") {
+        values.pop();
+    }
+    anyhow::ensure!(
+        !values.is_empty() && values.len() <= MAX_GIT_CONFIG_VALUES,
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        anyhow::ensure!(
+            !value.is_empty()
+                && value.len() <= MAX_GIT_BASE_REF_BYTES
+                && value == value.trim()
+                && !value.chars().any(char::is_control),
+            GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+        );
+        parsed.push(value.to_owned());
+    }
+    Ok(parsed)
+}
+
 async fn run_host_git_inspection(
     session: &config::Session,
     cwd: &Path,
@@ -6382,6 +6618,20 @@ async fn run_host_git_inspection(
     sandbox::run_unrestricted_with_env(
         command,
         &repository_root,
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await
+}
+
+async fn run_pinned_git_inspection(
+    pinned: &sandbox::PinnedGitRepository,
+    command: &[String],
+) -> Result<sandbox::Output> {
+    sandbox::run_pinned_git_command(
+        pinned,
+        command,
         None,
         &HashMap::new(),
         child_env::SENSITIVE_ENV_NAMES,
@@ -6498,6 +6748,41 @@ async fn run_git_output_after_approval(
     let output = sandbox::run_unrestricted_with_env(
         &command,
         &repository_root,
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await
+    .map(|output| {
+        if github_https_destination {
+            sanitize_github_https_network_git_output(output)
+        } else {
+            output
+        }
+    });
+    let reported = match &output {
+        Ok(output) => render_output(output.clone()),
+        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+    };
+    report_command_finished(session.id.clone(), "git", &rendered_command, &reported).await;
+    output
+}
+
+async fn run_pinned_git_output_after_approval(
+    session: &config::Session,
+    pinned: &sandbox::PinnedGitRepository,
+    command: Vec<String>,
+    activity: Option<&ActivityScope>,
+    github_https_destination: bool,
+) -> Result<sandbox::Output> {
+    let rendered_command = render_command(&command);
+    approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let output = sandbox::run_pinned_git_command(
+        pinned,
+        &command,
         None,
         &HashMap::new(),
         child_env::SENSITIVE_ENV_NAMES,
@@ -6746,7 +7031,7 @@ async fn run_git_branch_delete_and_report(
         let _ = activity.running();
     }
     let output = sandbox::run_pinned_git_command(
-        pinned,
+        &pinned,
         &command,
         None,
         &HashMap::new(),
@@ -12433,6 +12718,141 @@ mod tests {
         assert!(!git_ref_exists(&original, "refs/heads/merged"));
         assert!(git_ref_exists(&repository, "refs/heads/merged"));
         runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_git_remote_branch_delete_stays_bound_after_cwd_path_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let replacement = root.path().join("replacement");
+        let original = root.path().join("original");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+
+        let remote_a = tempfile::tempdir().unwrap();
+        let remote_b = tempfile::tempdir().unwrap();
+        run_git_fixture(remote_a.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(remote_b.path(), &["init", "--bare", "--quiet"]);
+        init_git_repository(&repository);
+        init_git_repository(&replacement);
+
+        run_git_fixture(
+            &repository,
+            &["remote", "add", "origin", remote_a.path().to_str().unwrap()],
+        );
+        run_git_fixture(
+            &replacement,
+            &["fetch", "--quiet", repository.to_str().unwrap(), "main"],
+        );
+        let shared_tip = git_fixture_stdout(&repository, &["rev-parse", "refs/heads/main"]);
+        run_git_fixture(
+            &replacement,
+            &["reset", "--quiet", "--hard", shared_tip.as_str()],
+        );
+        run_git_fixture(
+            &replacement,
+            &["remote", "add", "origin", remote_b.path().to_str().unwrap()],
+        );
+        run_git_fixture(
+            remote_a.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        run_git_fixture(
+            remote_b.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        run_git_fixture(&repository, &["push", "--quiet", "origin", "main"]);
+        run_git_fixture(&replacement, &["push", "--quiet", "origin", "main"]);
+
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "temote.remote.origin.protectedBranch",
+                "main",
+            ],
+        );
+        run_git_fixture(
+            &replacement,
+            &[
+                "config",
+                "--local",
+                "temote.remote.origin.protectedBranch",
+                "replacement-only",
+            ],
+        );
+        run_git_fixture(&repository, &["branch", "review"]);
+        run_git_fixture(&replacement, &["branch", "review"]);
+        run_git_fixture(&repository, &["push", "--quiet", "origin", "review"]);
+        run_git_fixture(&replacement, &["push", "--quiet", "origin", "review"]);
+
+        let id = format!("remote-branch-delete-swap-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+        let expected_remote_sha =
+            git_fixture_stdout(remote_a.path(), &["rev-parse", "refs/heads/review"]);
+        let request = json!({
+            "session_id": id,
+            "cwd": repository.to_string_lossy(),
+            "remote": "origin",
+            "branch": "review",
+            "expected_remote_sha": expected_remote_sha,
+        });
+        let task =
+            tokio::spawn(async move { git_remote_branch_delete(&request, &session, None).await });
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("remote branch delete did not request approval")
+            .expect("approval channel closed before remote branch delete request");
+        assert_eq!(prompt.request.operation, "git_remote_branch_delete");
+        std::fs::rename(&repository, &original).unwrap();
+        std::fs::rename(&replacement, &repository).unwrap();
+        prompt.respond(true);
+
+        let result = task.await.unwrap();
+        runtime.shutdown().await.unwrap();
+        result.unwrap();
+
+        assert!(!git_ref_exists(remote_a.path(), "refs/heads/review"));
+        assert!(git_ref_exists(remote_b.path(), "refs/heads/review"));
+        assert_eq!(
+            git_fixture_stdout(&original, &["remote", "get-url", "origin"]),
+            remote_a.path().to_string_lossy()
+        );
+        assert_eq!(
+            git_fixture_stdout(&repository, &["remote", "get-url", "origin"]),
+            remote_b.path().to_string_lossy()
+        );
+        assert_eq!(
+            git_fixture_stdout(
+                &original,
+                &[
+                    "config",
+                    "--local",
+                    "--get-all",
+                    "temote.remote.origin.protectedBranch",
+                ],
+            ),
+            "main"
+        );
+        assert_eq!(
+            git_fixture_stdout(
+                &repository,
+                &[
+                    "config",
+                    "--local",
+                    "--get-all",
+                    "temote.remote.origin.protectedBranch",
+                ],
+            ),
+            "replacement-only"
+        );
     }
 
     #[tokio::test]

@@ -2508,10 +2508,11 @@ pub async fn run_unrestricted_with_env(
 /// mutation is approved.
 ///
 /// This is intentionally narrower than [`run_unrestricted_with_env`].  It is
-/// only used by the exact structured local-branch-delete operation.  On Unix,
-/// the child receives descriptor-backed `cwd`, `GIT_DIR`, `GIT_COMMON_DIR`, and
-/// `GIT_WORK_TREE` paths, so replacing the validated pathname after approval
-/// cannot redirect the Git process to another repository.
+/// only used by exact structured branch-delete operations and their bounded
+/// inspections.  On Unix, the child receives descriptor-backed `cwd`,
+/// `GIT_DIR`, `GIT_COMMON_DIR`, and `GIT_WORK_TREE` paths, so replacing the
+/// validated pathname after approval cannot redirect the Git process to
+/// another repository.
 pub struct PinnedGitRepository {
     #[cfg(not(unix))]
     identity: WorkspaceRepositoryIdentity,
@@ -2590,10 +2591,12 @@ pub fn pin_git_repository(root: &Path) -> Result<PinnedGitRepository> {
 }
 
 /// Executes one already-classified structured Git command through the pinned
-/// repository.  The function is crate-private and does not provide a public
-/// arbitrary unsandboxed command surface.
+/// repository.  The pinned context is borrowed so one structured operation can
+/// inspect and mutate the same descriptor-backed repository across approval.
+/// The function is crate-private and does not provide a public arbitrary
+/// unsandboxed command surface.
 pub async fn run_pinned_git_command(
-    pinned: PinnedGitRepository,
+    pinned: &PinnedGitRepository,
     command: &[String],
     stdin: Option<&[u8]>,
     environment: &HashMap<String, String>,
@@ -2611,7 +2614,7 @@ pub async fn run_pinned_git_command(
 }
 
 async fn run_pinned_git_command_inner<F>(
-    pinned: PinnedGitRepository,
+    pinned: &PinnedGitRepository,
     command: &[String],
     stdin: Option<&[u8]>,
     environment: &HashMap<String, String>,
