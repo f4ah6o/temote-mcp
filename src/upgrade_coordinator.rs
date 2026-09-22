@@ -621,6 +621,8 @@ mod tests {
             reconnect_expected: supervisor_handoff_required,
             plugin_reconciliation_required: true,
             client_restart_required_if_plugin_replaced: true,
+            #[cfg(all(feature = "network", unix))]
+            direct_ingress: None,
             planned_sessions: vec![upgrade_transaction::UpgradePlannedSession {
                 session_id: "session-a".to_owned(),
                 source_process_id: 100,
