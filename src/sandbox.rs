@@ -2673,11 +2673,9 @@ where
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
 
     #[cfg(unix)]
-    let (worktree_fd, git_dir_fd, common_dir_fd) = (
-        pinned.worktree.as_raw_fd(),
-        pinned.git_dir.as_raw_fd(),
-        pinned.common_dir.as_raw_fd(),
-    );
+    let worktree_fd = pinned.worktree.as_raw_fd();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (git_dir_fd, common_dir_fd) = (pinned.git_dir.as_raw_fd(), pinned.common_dir.as_raw_fd());
 
     #[cfg(unix)]
     let mut process = {
@@ -2725,7 +2723,7 @@ where
     }
     process.envs(environment);
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         process.env("GIT_DIR", fd_path(git_dir_fd)?);
         process.env("GIT_COMMON_DIR", fd_path(common_dir_fd)?);
@@ -2733,6 +2731,27 @@ where
         process.env("GIT_CONFIG_NOSYSTEM", "1");
         process.env("GIT_TERMINAL_PROMPT", "0");
     }
+
+    // macOS Git cannot traverse the `/dev/fd` indirection for `GIT_*` path
+    // environment, so the pinned metadata directories are projected to their
+    // descriptor-derived paths and re-proven by device/inode when the command
+    // exits.  The descriptor remains the authority: a path rebound around the
+    // run fails closed instead of redirecting the command.  `GIT_WORK_TREE`
+    // needs no pathname because the child cwd is already bound to
+    // `worktree_fd` by the fchdir above.
+    #[cfg(target_os = "macos")]
+    let macos_exec_paths = {
+        let paths = PinnedGitExecPaths {
+            git_dir: validated_fd_path(&pinned.git_dir, "Git private metadata")?,
+            common_dir: validated_fd_path(&pinned.common_dir, "Git common metadata")?,
+        };
+        process.env("GIT_DIR", &paths.git_dir);
+        process.env("GIT_COMMON_DIR", &paths.common_dir);
+        process.env("GIT_WORK_TREE", ".");
+        process.env("GIT_CONFIG_NOSYSTEM", "1");
+        process.env("GIT_TERMINAL_PROMPT", "0");
+        paths
+    };
 
     process
         .kill_on_drop(true)
@@ -2755,7 +2774,101 @@ where
         let _ = child.wait().await;
         return Err(error);
     }
-    wait_with_limited_output(child, stdin).await
+    let output = wait_with_limited_output(child, stdin).await;
+
+    #[cfg(target_os = "macos")]
+    {
+        revalidate_fd_path(
+            &pinned.git_dir,
+            &macos_exec_paths.git_dir,
+            "Git private metadata",
+        )?;
+        revalidate_fd_path(
+            &pinned.common_dir,
+            &macos_exec_paths.common_dir,
+            "Git common metadata",
+        )?;
+    }
+
+    output
+}
+
+/// Resolved `GIT_*` path projection for one pinned repository on macOS.
+///
+/// macOS Git cannot traverse the `/dev/fd` indirection, so these paths carry
+/// the descriptor-derived real paths that were proven to name the pinned
+/// inodes when the command environment was built.
+#[cfg(target_os = "macos")]
+struct PinnedGitExecPaths {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+}
+
+/// Derives the real path of one open descriptor via `F_GETPATH`.
+#[cfg(target_os = "macos")]
+fn fd_real_path(fd: RawFd) -> Result<PathBuf> {
+    use anyhow::anyhow;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: `buffer` is writable for PATH_MAX bytes and remains alive for the call.
+    let result = unsafe { libc::fcntl(fd, libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to obtain pinned directory path");
+    }
+
+    let bytes: Vec<u8> = buffer.into_iter().map(|byte| byte as u8).collect();
+    let nul = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| anyhow!("pinned directory path was not NUL-terminated"))?;
+    if nul == 0 {
+        return Err(anyhow!("pinned directory path was empty"));
+    }
+    let candidate = PathBuf::from(std::ffi::OsString::from_vec(bytes[..nul].to_vec()));
+    if !candidate.is_absolute() {
+        return Err(anyhow!("pinned directory path was not absolute"));
+    }
+    Ok(candidate)
+}
+
+/// Resolves the descriptor-derived path of one pinned directory and proves the
+/// pathname still names that descriptor's inode.  The descriptor remains the
+/// execution authority; the path is only its re-verified projection.
+#[cfg(target_os = "macos")]
+fn validated_fd_path(file: &std::fs::File, label: &str) -> Result<PathBuf> {
+    let pinned_identity = file
+        .metadata()
+        .with_context(|| format!("cannot inspect pinned {label}"))?;
+    let candidate = fd_real_path(file.as_raw_fd())
+        .with_context(|| format!("cannot derive the pinned {label} path"))?;
+    let candidate_identity = candidate
+        .metadata()
+        .with_context(|| format!("cannot inspect the pinned {label} path"))?;
+    anyhow::ensure!(
+        same_file_identity(&pinned_identity, &candidate_identity),
+        "pinned {label} path changed while it was being resolved"
+    );
+    Ok(candidate)
+}
+
+/// Re-proves that a descriptor-derived path still names its pinned inode after
+/// the Git command finished, so a path rebound mid-run cannot silently
+/// redirect the completed operation.
+#[cfg(target_os = "macos")]
+fn revalidate_fd_path(file: &std::fs::File, candidate: &Path, label: &str) -> Result<()> {
+    let pinned_identity = file
+        .metadata()
+        .with_context(|| format!("cannot inspect pinned {label}"))?;
+    let candidate_identity = candidate
+        .metadata()
+        .with_context(|| format!("cannot re-inspect the pinned {label} path"))?;
+    anyhow::ensure!(
+        same_file_identity(&pinned_identity, &candidate_identity),
+        "pinned {label} path was replaced while the Git command was running"
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2768,29 +2881,10 @@ fn pinned_git_workspace_identity(file: &std::fs::File) -> Result<WorkspaceReposi
     #[cfg(target_os = "macos")]
     {
         use anyhow::anyhow;
-        use std::os::unix::ffi::OsStringExt;
 
         let before = file.metadata()?;
-        let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
-        // SAFETY: `buffer` is writable for PATH_MAX bytes and remains alive for the call.
-        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to obtain pinned Git workspace path");
-        }
-
-        let bytes: Vec<u8> = buffer.into_iter().map(|byte| byte as u8).collect();
-        let nul = bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| anyhow!("pinned Git workspace path was not NUL-terminated"))?;
-        if nul == 0 {
-            return Err(anyhow!("pinned Git workspace path was empty"));
-        }
-        let candidate = PathBuf::from(std::ffi::OsString::from_vec(bytes[..nul].to_vec()));
-        if !candidate.is_absolute() {
-            return Err(anyhow!("pinned Git workspace path was not absolute"));
-        }
+        let candidate =
+            fd_real_path(file.as_raw_fd()).context("failed to obtain pinned Git workspace path")?;
 
         let candidate_before = candidate.metadata()?;
         if !same_file_identity(&before, &candidate_before) {
@@ -2844,13 +2938,11 @@ fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bo
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn fd_path(fd: RawFd) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     let path = PathBuf::from(format!("/proc/self/fd/{fd}"));
-    #[cfg(target_os = "macos")]
-    let path = PathBuf::from(format!("/dev/fd/{fd}"));
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(target_os = "linux"))]
     let path = {
         let _ = fd;
         anyhow::bail!("descriptor-backed Git execution is unsupported on this Unix host")

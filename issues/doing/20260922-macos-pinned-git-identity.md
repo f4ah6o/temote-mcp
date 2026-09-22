@@ -23,6 +23,19 @@ The failure has progressed beyond the initial `/dev/fd/repo` identity inspection
 
 Required remaining gates are the six failing cleanup/branch-delete tests and `github_pr_tools_stay_on_the_configured_repository_and_never_echo_credentials`. This is not solved by weakening tests, dropping macOS coverage, or replacing pinned post-approval authority with a mutable pathname. Keep this issue in `doing` until a safe platform-specific implementation passes those gates.
 
+## Descriptor-proven path projection — 2026-09-22 (Devin session)
+
+`run_pinned_git_command` no longer passes `/dev/fd/N` to Git on macOS:
+
+- `GIT_DIR` / `GIT_COMMON_DIR` are set to each pinned metadata descriptor's `F_GETPATH`-derived real path, proven identical to the descriptor by device/inode immediately before spawn (`validated_fd_path`).
+- `GIT_WORK_TREE` is `"."`, bound to the `fchdir(worktree_fd)` child cwd, so the worktree needs no pathname at all.
+- After the command exits, both metadata paths are re-proven against their descriptors (`revalidate_fd_path`); a path rebound around the run fails closed instead of silently redirecting the completed operation.
+- Linux `/proc/self/fd/N` handling, the pre-approval identity inspection, approval-time pinning, and all `git_push`/lease semantics are unchanged. No test was weakened and no mutable pathname is adopted as authority: the descriptor remains the authority, the path only its re-verified projection.
+
+Verification on a Linux development VM (`38dc76e` + this change): `cargo check --all-targets --all-features` PASS; `cargo check --target aarch64-apple-darwin --no-default-features` and `cargo clippy --target aarch64-apple-darwin --no-default-features` PASS with no new warnings (full-features macOS check cannot run here: `aws-lc-sys` needs an Apple toolchain); focused Linux tests `branch_delete` 5/6 and `agent_git` 42/42 PASS — the one Linux failure and `github_pr_tools_*` failure are the preexisting Devin-VM github.com proxy-rewrite limitation, identical on clean `main`.
+
+Remaining gate: macOS CI on the implementing PR must pass the six cleanup/branch-delete tests and `github_pr_tools_stay_on_the_configured_repository_and_never_echo_credentials`.
+
 Exact final CI evidence: `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`.
 
 No deployment.
