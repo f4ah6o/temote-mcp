@@ -529,4 +529,29 @@ If remote package acquisition is designed later, it requires a separate issue an
 
 ## 2026-09-16 branch-salvage packet
 
-Do not merge `codex/20260915-completion-upgrade` wholesale. Current-main reconciliation and bounded missing-slice porting is owned by `issues/polished/20260916-completion-upgrade-branch-salvage.md`.
+Do not merge `codex/20260915-completion-upgrade` wholesale. Current-main reconciliation and bounded missing-slice porting is owned by `issues/done/20260916-completion-upgrade-branch-salvage.md`.
+
+## 2026-09-22 current-main coverage (salvage audit)
+
+Audit result: every repository-local item in the acceptance list is `already-covered` on current `main`; the only residual is the macOS process-boundary reconnect E2E, which is a live acceptance item and must not be marked PASS from deterministic fixtures (Phase 4). `codex/20260915-completion-upgrade` is deleted as a ref; its history was audited via `codex/20260915-complete-open-work`.
+
+| Acceptance item | Current-main evidence | Verdict |
+| --- | --- | --- |
+| remote apply of the canonical installed target, no executable path | `upgrade_apply` schema accepts only `session_id` + optional `expected_version` (`src/http.rs`) | already-covered |
+| destructive work owned outside the direct-ingress lifetime | internal `temote-mcp upgrade-coordinator` process (`src/cli.rs`, `src/upgrade_coordinator.rs`); restarted ingress owned as a detached session leader | already-covered |
+| initiating response flushed before destructive commit | `src/http.rs` `(response_result, upgrade_commit)` split; tests `http1_driver_commits_only_after_complete_close_delimited_response`, `http1_driver_aborts_when_client_resets_before_accepted_response_flush` | already-covered |
+| no fixed-delay sleep for ordering | ordering is the protocol-level flush/commit barrier above | already-covered |
+| transaction survives connection loss | durable `src/upgrade_transaction.rs` store + exclusive lock (`transaction_round_trips_every_state`, `transaction_lock_is_exclusive_and_released_on_drop`, `transaction_lock_probe_detects_live_owner_without_creating_files`) | already-covered |
+| reconnect verifies stable host identity, target version, boot generation | `boot_generation` in health/initialize metadata; `replacement_identity_rejects_stale_healthy_boot_generation`, `health_identity_prefers_single_active_transaction_with_same_timestamp` | already-covered |
+| `upgrade_status(transaction_id)` deterministic terminal after reconnect | `upgrade_status` tool (`src/http.rs`) over the durable store | already-covered |
+| successful status requires session-restore + replacement endpoint health/identity checks | coordinator restore + endpoint checks, `DirectIngressUpgradePlan`/`RemoteUpgradePreflight.direct_ingress` bounded diagnostics | already-covered |
+| duplicates cannot create concurrent destructive upgrades | `admit_apply_is_idempotent_for_the_same_active_target`, `admit_apply_fails_closed_when_multiple_transactions_are_active`, `classify_apply_is_idempotent_and_conflict_safe` | already-covered |
+| owner-only, bounded, no-symlink, non-secret persistence | 0700 transaction dir; `transaction_lock_rejects_symlinks`, `load_transactions_fails_closed_on_an_unsafe_existing_record`, `transaction_serialization_contains_only_safe_schema_fields`, `transaction_failure_summary_is_bounded_and_nul_free` | already-covered |
+| no credential/command/client-controlled path persisted or executed | apply schema has no executable-path input; safe-schema serialization tests | already-covered |
+| sandbox/yolo/approval/public-HTTP boundaries unchanged | `upgrade_tools_are_absent_from_stdio_dispatch`; apply requires a managed normal session + explicit local approval (`docs/public-http.md`) | already-covered |
+| direct-ingress fail-closed credential reacquisition | durable non-secret restart recipe + `/healthz` recovery requirement (`docs/public-http.md`, `skills/temote-mcp/SKILL.md`) | already-covered |
+| local CLI upgrade supported + shared primitives | `temote-mcp upgrade`/`--dry-run` (`src/cli.rs`) shares coordinator primitives | already-covered |
+| process-boundary reconnect E2E | `tests/upgrade_reconnect_e2e.rs` (`direct_http_upgrade_reconnects_after_real_ingress_replacement`) — Linux-only, `#[ignore]` explicit host gate | Linux landed; **macOS leg remains a live Phase-4 residual** |
+| EN/JA docs + Agent Skill reconnect contract | `docs/public-http.md` / `docs/public-http.ja.md` (Remote upgrade and reconnect), `skills/temote-mcp/SKILL.md` (Direct-HTTP remote upgrade; "Temote cannot force the MCP client to reconnect") | already-covered |
+
+Missing coherent behaviors: none — no child issues created. Exact live-only residual: run the macOS process-boundary reconnect E2E on a suitable host before the parent's acceptance can close.
