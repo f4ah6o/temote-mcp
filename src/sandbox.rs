@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::os::unix::io::RawFd;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -2051,19 +2053,7 @@ fn resolve_git_metadata_paths(cwd: &Path) -> Result<GitMetadataPaths> {
         resolve_git_pointer(&dot_git_path)?
     };
     let common_dir = match read_git_control_file(&git_dir.join("commondir"), "Git commondir")? {
-        Some(value) => {
-            let mut lines = value.lines().filter(|line| !line.trim().is_empty());
-            let relative = lines.next().map(str::trim).unwrap_or_default();
-            anyhow::ensure!(!relative.is_empty(), "Git commondir is empty");
-            anyhow::ensure!(
-                lines.next().is_none(),
-                "Git commondir contains unexpected extra content"
-            );
-            let path = git_dir.join(relative);
-            std::fs::canonicalize(&path).with_context(|| {
-                format!("cannot resolve Git common directory {}", path.display())
-            })?
-        }
+        Some(value) => parse_commondir_pointer(&value, &git_dir)?,
         None => git_dir.clone(),
     };
     if dot_git_is_directory {
@@ -2173,6 +2163,13 @@ fn read_git_control_file(path: &Path, label: &str) -> Result<Option<String>> {
 fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
     let contents = read_git_control_file(dot_git, "Git pointer")?
         .with_context(|| format!("Git pointer does not exist: {}", dot_git.display()))?;
+    parse_gitdir_pointer(
+        &contents,
+        dot_git.parent().context("Git pointer has no parent")?,
+    )
+}
+
+fn parse_gitdir_pointer(contents: &str, base: &Path) -> Result<PathBuf> {
     let mut lines = contents.lines();
     let value = lines
         .next()
@@ -2188,13 +2185,23 @@ fn resolve_git_pointer(dot_git: &Path) -> Result<PathBuf> {
     let path = if path.is_absolute() {
         path
     } else {
-        dot_git
-            .parent()
-            .context("Git pointer has no parent")?
-            .join(path)
+        base.join(path)
     };
     std::fs::canonicalize(&path)
         .with_context(|| format!("cannot resolve Git directory {}", path.display()))
+}
+
+fn parse_commondir_pointer(contents: &str, git_dir: &Path) -> Result<PathBuf> {
+    let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
+    let relative = lines.next().map(str::trim).unwrap_or_default();
+    anyhow::ensure!(!relative.is_empty(), "Git commondir is empty");
+    anyhow::ensure!(
+        lines.next().is_none(),
+        "Git commondir contains unexpected extra content"
+    );
+    let path = git_dir.join(relative);
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("cannot resolve Git common directory {}", path.display()))
 }
 
 fn resolve_plain_git_pointer(pointer: &Path) -> Result<PathBuf> {
@@ -2627,11 +2634,9 @@ where
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
 
     #[cfg(unix)]
-    let (worktree_fd, git_dir_fd, common_dir_fd) = (
-        pinned.worktree.as_raw_fd(),
-        pinned.git_dir.as_raw_fd(),
-        pinned.common_dir.as_raw_fd(),
-    );
+    let worktree_fd = pinned.worktree.as_raw_fd();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (git_dir_fd, common_dir_fd) = (pinned.git_dir.as_raw_fd(), pinned.common_dir.as_raw_fd());
 
     #[cfg(unix)]
     let mut process = {
@@ -2681,11 +2686,28 @@ where
 
     #[cfg(unix)]
     {
-        process.env("GIT_DIR", fd_path(git_dir_fd)?);
-        process.env("GIT_COMMON_DIR", fd_path(common_dir_fd)?);
-        process.env("GIT_WORK_TREE", fd_path(worktree_fd)?);
+        // macOS has no descriptor-relative filesystem path: its /dev/fd
+        // entries only duplicate the descriptor itself and cannot prefix
+        // lookups such as `<fd>/HEAD`, so Git rejects them as repository
+        // paths. The pre-exec fchdir anchors the child's cwd to the pinned
+        // worktree descriptor and Git discovers the repository from that
+        // anchored cwd instead.
+        #[cfg(not(target_os = "macos"))]
+        {
+            process.env("GIT_DIR", fd_path(git_dir_fd)?);
+            process.env("GIT_COMMON_DIR", fd_path(common_dir_fd)?);
+            process.env("GIT_WORK_TREE", fd_path(worktree_fd)?);
+        }
         process.env("GIT_CONFIG_NOSYSTEM", "1");
         process.env("GIT_TERMINAL_PROMPT", "0");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Re-prove that `.git` inside the pinned worktree still resolves to
+        // the pinned metadata descriptors before Git discovers the
+        // repository from the anchored cwd.
+        ensure_pinned_git_discovery(pinned)?;
     }
 
     process
@@ -2722,30 +2744,9 @@ fn pinned_git_workspace_identity(file: &std::fs::File) -> Result<WorkspaceReposi
     #[cfg(target_os = "macos")]
     {
         use anyhow::anyhow;
-        use std::os::unix::ffi::OsStringExt;
 
         let before = file.metadata()?;
-        let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
-        // SAFETY: `buffer` is writable for PATH_MAX bytes and remains alive for the call.
-        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to obtain pinned Git workspace path");
-        }
-
-        let bytes: Vec<u8> = buffer.into_iter().map(|byte| byte as u8).collect();
-        let nul = bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(|| anyhow!("pinned Git workspace path was not NUL-terminated"))?;
-        if nul == 0 {
-            return Err(anyhow!("pinned Git workspace path was empty"));
-        }
-        let candidate = PathBuf::from(std::ffi::OsString::from_vec(bytes[..nul].to_vec()));
-        if !candidate.is_absolute() {
-            return Err(anyhow!("pinned Git workspace path was not absolute"));
-        }
-
+        let candidate = descriptor_fs_path(file)?;
         let candidate_before = candidate.metadata()?;
         if !same_file_identity(&before, &candidate_before) {
             return Err(anyhow!("pinned Git workspace identity changed"));
@@ -2763,6 +2764,203 @@ fn pinned_git_workspace_identity(file: &std::fs::File) -> Result<WorkspaceReposi
 
         Ok(identity)
     }
+}
+
+/// Resolves the live kernel path of an open descriptor on macOS.
+///
+/// `/dev/fd` entries cannot be used for this: they only duplicate the
+/// descriptor and cannot prefix path lookups, so they cannot report a
+/// canonical workspace path. `F_GETPATH` reports the descriptor's own path.
+#[cfg(target_os = "macos")]
+fn descriptor_fs_path(file: &std::fs::File) -> Result<PathBuf> {
+    use anyhow::anyhow;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: `buffer` is writable for PATH_MAX bytes and remains alive for the call.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to obtain pinned Git workspace path");
+    }
+
+    let bytes: Vec<u8> = buffer.into_iter().map(|byte| byte as u8).collect();
+    let nul = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| anyhow!("pinned Git workspace path was not NUL-terminated"))?;
+    if nul == 0 {
+        return Err(anyhow!("pinned Git workspace path was empty"));
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_vec(bytes[..nul].to_vec()));
+    if !path.is_absolute() {
+        return Err(anyhow!("pinned Git workspace path was not absolute"));
+    }
+    Ok(path)
+}
+
+/// Re-proves that `.git` inside the pinned worktree still resolves to the
+/// pinned Git metadata descriptors.
+///
+/// macOS `/dev/fd` entries only duplicate the descriptor itself and cannot
+/// prefix path lookups such as `<fd>/HEAD`, so the child cannot receive
+/// descriptor-backed `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE` strings.
+/// The pre-exec `fchdir` anchors the child's cwd to the pinned worktree
+/// descriptor and Git discovers the repository from that anchored cwd; a
+/// swapped `.git` must therefore fail closed here instead of redirecting
+/// discovery to another repository.
+#[cfg(target_os = "macos")]
+fn ensure_pinned_git_discovery(pinned: &PinnedGitRepository) -> Result<()> {
+    let stat = pinned_entry_stat(&pinned.worktree, c".git")?;
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => ensure_same_descriptor(&stat, &pinned.git_dir, "Git metadata directory"),
+        libc::S_IFREG => ensure_pinned_gitfile_bound(pinned),
+        _ => Err(anyhow::anyhow!(
+            "Git metadata pointer inside the pinned worktree changed type"
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pinned_entry_stat(dir: &std::fs::File, name: &std::ffi::CStr) -> Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` is fully initialized by a successful fstatat and `name`
+    // is a live NUL-terminated string.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "cannot inspect {} inside the pinned Git worktree",
+                name.to_string_lossy()
+            )
+        });
+    }
+    // SAFETY: fstatat succeeded and initialized `stat`.
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_same_descriptor(stat: &libc::stat, file: &std::fs::File, label: &str) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect pinned {label}"))?;
+    anyhow::ensure!(
+        stat.st_dev as u64 == metadata.dev() && stat.st_ino == metadata.ino(),
+        "{label} changed while it was pinned"
+    );
+    Ok(())
+}
+
+/// Verifies that a `.git` file (linked-worktree pointer) inside the pinned
+/// worktree still resolves to the pinned private and common metadata
+/// descriptors.
+#[cfg(target_os = "macos")]
+fn ensure_pinned_gitfile_bound(pinned: &PinnedGitRepository) -> Result<()> {
+    let contents = read_pinned_control_file(&pinned.worktree, c".git", "Git metadata pointer")?;
+    let worktree_path = descriptor_fs_path(&pinned.worktree)?;
+    let git_dir = parse_gitdir_pointer(&contents, &worktree_path)?;
+    let stat = std::fs::metadata(&git_dir).with_context(|| {
+        format!(
+            "cannot inspect Git metadata directory {}",
+            git_dir.display()
+        )
+    })?;
+    let pinned_git_dir = pinned
+        .git_dir
+        .metadata()
+        .context("cannot inspect pinned Git metadata directory")?;
+    anyhow::ensure!(
+        stat.dev() == pinned_git_dir.dev() && stat.ino() == pinned_git_dir.ino(),
+        "Git metadata pointer no longer resolves to the pinned metadata"
+    );
+
+    match read_git_control_file(&git_dir.join("commondir"), "Git commondir")? {
+        Some(contents) => {
+            let common_dir = parse_commondir_pointer(&contents, &git_dir)?;
+            let stat = std::fs::metadata(&common_dir).with_context(|| {
+                format!(
+                    "cannot inspect Git common directory {}",
+                    common_dir.display()
+                )
+            })?;
+            let pinned_common_dir = pinned
+                .common_dir
+                .metadata()
+                .context("cannot inspect pinned Git common directory")?;
+            anyhow::ensure!(
+                stat.dev() == pinned_common_dir.dev() && stat.ino() == pinned_common_dir.ino(),
+                "Git common directory no longer resolves to the pinned metadata"
+            );
+        }
+        None => {
+            let pinned_common_dir = pinned
+                .common_dir
+                .metadata()
+                .context("cannot inspect pinned Git common directory")?;
+            anyhow::ensure!(
+                same_file_identity(&pinned_git_dir, &pinned_common_dir),
+                "Git common directory no longer resolves to the pinned metadata"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reads a bounded control file inside a descriptor-pinned directory on
+/// macOS, mirroring [`read_git_control_file`] without re-resolving the
+/// directory by path.
+#[cfg(target_os = "macos")]
+fn read_pinned_control_file(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+    label: &str,
+) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::io::FromRawFd;
+
+    // SAFETY: `name` is a live NUL-terminated string.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("cannot open pinned {label} safely"));
+    }
+    // SAFETY: `fd` is a live owned descriptor returned by openat.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect pinned {label}"))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "pinned {label} is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_GIT_POINTER_BYTES,
+        "pinned {label} exceeds {MAX_GIT_POINTER_BYTES} bytes"
+    );
+    let mut bytes =
+        Vec::with_capacity((metadata.len() as usize).min(MAX_GIT_POINTER_BYTES as usize));
+    file.by_ref()
+        .take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read pinned {label}"))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_GIT_POINTER_BYTES,
+        "pinned {label} exceeds {MAX_GIT_POINTER_BYTES} bytes"
+    );
+    String::from_utf8(bytes).with_context(|| format!("pinned {label} is not valid UTF-8"))
 }
 
 #[cfg(unix)]
@@ -2798,13 +2996,11 @@ fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bo
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn fd_path(fd: RawFd) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     let path = PathBuf::from(format!("/proc/self/fd/{fd}"));
-    #[cfg(target_os = "macos")]
-    let path = PathBuf::from(format!("/dev/fd/{fd}"));
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(target_os = "linux"))]
     let path = {
         let _ = fd;
         anyhow::bail!("descriptor-backed Git execution is unsupported on this Unix host")

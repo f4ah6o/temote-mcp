@@ -25,4 +25,10 @@ Required remaining gates are the six failing cleanup/branch-delete tests and `gi
 
 Exact final CI evidence: `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`.
 
+## Follow-up implementation — 2026-09-22 (second pass)
+
+macOS has no descriptor-relative filesystem path: per `fd(4)`, `open("/dev/fd/N")` only duplicates the descriptor (like `fcntl(N, F_DUPFD, 0)`), so `/dev/fd/N/HEAD` never resolves and Git's `is_git_directory()` rejects `GIT_DIR=/dev/fd/N`. On macOS the pinned run therefore no longer sets `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`; the pre-exec `fchdir(worktree_fd)` remains the sole descriptor pin and Git discovers the repository from the anchored cwd. Before spawn, `ensure_pinned_git_discovery` re-proves that `.git` inside the pinned worktree still resolves to the pinned metadata descriptors — directory case compares `.git`'s dev/ino against the pinned `git_dir` descriptor via `fstatat(AT_SYMLINK_NOFOLLOW)`; gitfile case re-reads the pointer through `openat(O_NOFOLLOW)` and re-verifies both the resolved gitdir and commondir against the pinned descriptors. A swap fails closed instead of redirecting discovery to another repository; no mutable pathname is handed to Git.
+
+Linux keeps the descriptor-backed env path unchanged. Verification on macOS CI pending; issue stays in `doing` until the seven gated tests pass there.
+
 No deployment.
