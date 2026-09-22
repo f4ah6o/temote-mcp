@@ -110,6 +110,17 @@ fn apparmor_profile_hint() -> String {
     hint
 }
 
+fn sandbox_permission_hint() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        apparmor_profile_hint()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "Check the host sandbox policy, then restart temote-mcp.".to_owned()
+    }
+}
+
 struct Report {
     checks: Vec<Check>,
 }
@@ -1821,7 +1832,7 @@ async fn check_sandbox_execution(report: &mut Report) {
                 output.stderr.trim().to_owned()
             };
             let hint = if contains_loopback_permission_error_text(&detail) {
-                apparmor_profile_hint()
+                sandbox_permission_hint()
             } else {
                 "Fix the lower-level sandbox check above, then restart temote-mcp.".to_owned()
             };
@@ -1830,7 +1841,7 @@ async fn check_sandbox_execution(report: &mut Report) {
         Err(error) => {
             let detail = format!("{error:#}");
             let hint = if contains_loopback_permission_error_text(&detail) {
-                apparmor_profile_hint()
+                sandbox_permission_hint()
             } else {
                 "Fix the lower-level sandbox check above, then restart temote-mcp.".to_owned()
             };
