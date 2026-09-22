@@ -20,6 +20,11 @@ fn socket_namespace(state_home: &Path) -> String {
 }
 
 fn isolate_process<'a>(command: &'a mut Command, state_home: &Path) -> &'a mut Command {
+    // Resolve platform path aliases (for example macOS /var -> /private/var)
+    // so the spawned process observes the canonical state root that Temote's
+    // swapped-path checks require.
+    let state_home =
+        fs::canonicalize(state_home).expect("failed to canonicalize isolated process state home");
     let private_directories = [
         state_home.join("cache"),
         state_home.join("codex"),
@@ -41,12 +46,12 @@ fn isolate_process<'a>(command: &'a mut Command, state_home: &Path) -> &'a mut C
     command
         .env_clear()
         .env("PATH", path)
-        .env("HOME", state_home)
+        .env("HOME", &state_home)
         .env("CODEX_HOME", state_home.join("codex"))
         .env("XDG_CACHE_HOME", state_home.join("cache"))
         .env("XDG_CONFIG_HOME", state_home.join("config"))
         .env("XDG_RUNTIME_DIR", state_home.join("xdg-runtime"))
-        .env("XDG_STATE_HOME", state_home)
+        .env("XDG_STATE_HOME", &state_home)
         .env("TMPDIR", state_home.join("tmp"))
         .env("TEMOTE_MCP_RUNTIME_DIR", state_home.join("runtime"))
 }
