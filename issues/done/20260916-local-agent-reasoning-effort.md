@@ -123,3 +123,7 @@ Global `cargo fmt --all -- --check` はこの変更とは別の concurrent `sess
 ## 2026-09-16 polishing update
 
 `a8df54b` is on current `main`. Do not reimplement the schema/argv contract. Remaining work is only docs, full repository gate on a clean tree, and the rebuilt-runtime live canary; live evidence also updates the matrix.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

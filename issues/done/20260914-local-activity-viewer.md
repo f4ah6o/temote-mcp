@@ -531,7 +531,7 @@ Do not merge `codex/20260915-completion-activity` wholesale. Current-main reconc
 
 ## 2026-09-22 current-main coverage (salvage audit)
 
-Audit result: every S05-S16 requirement is `already-covered` on current `main`; nothing remains to port. Current `main` is a strict superset of `codex/20260915-completion-activity` for the activity surface — the only branch-only deltas are completion evidence documents (owned by `issues/polished/20260916-completion-evidence-branch-salvage.md`) and stale issue/app-server state outside this packet. The branch is safe for Phase 5 deletion after independent diff review.
+Audit result: every S05-S16 requirement is `already-covered` on current `main`; nothing remains to port. Current `main` is a strict superset of `codex/20260915-completion-activity` for the activity surface — the only branch-only deltas are completion evidence documents (owned by `issues/done/20260916-completion-evidence-branch-salvage.md`) and stale issue/app-server state outside this packet. The branch is safe for Phase 5 deletion after independent diff review.
 
 | Unit | Current-main evidence | Verdict |
 | --- | --- | --- |
@@ -549,3 +549,7 @@ Audit result: every S05-S16 requirement is `already-covered` on current `main`; 
 | S16 docs + CHANGES | `docs/usage.md`, `docs/usage.ja.md`, `docs/managed-sessions.md` (Local activity viewer), `docs/managed-sessions.ja.md`, `CHANGES.md` | already-covered; S16 stays unchecked until the parent's live gates (public/gateway non-exposure, multi-viewer, privacy, supported-OS manual runs) close |
 
 Missing coherent behaviors: none — no child issues created.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

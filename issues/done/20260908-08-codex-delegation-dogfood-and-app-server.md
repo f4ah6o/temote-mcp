@@ -272,3 +272,7 @@ API費用は測定日の公式単価、課金条件、認証方式を記録し�
 ## 2026-09-16 branch-salvage packet
 
 Do not merge the old app-server/runtime-isolation branches wholesale. Repository-local reconciliation is owned by `issues/polished/20260916-completion-appserver-branch-salvage.md`; live dogfood/comparison remains a separate Phase 4 acceptance step.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

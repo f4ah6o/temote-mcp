@@ -344,3 +344,7 @@ This file is now an umbrella/tracking issue. After the Git shim packets, execute
 2. `issues/polished/20260916-agent-repository-triage-e2e.md`
 
 Cross-repo writes remain parent-orchestrator scope; do not broaden a local-agent session root.
+
+## 2026-09-22 consolidation: done
+
+All bounded child packets are complete on `main` or in the merging PR set; remaining live acceptance is tracked in `issues/open/20260908-live-acceptance-matrix.md`.
