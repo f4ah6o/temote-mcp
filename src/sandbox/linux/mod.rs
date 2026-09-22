@@ -101,17 +101,12 @@ pub fn run_main() -> ! {
     helper::run_main()
 }
 
-fn helper_executable() -> Result<PathBuf> {
-    let executable = match std::env::var_os("TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR") {
-        Some(locator) => std::fs::canonicalize(locator)?,
-        None => std::env::current_exe()?,
-    };
+fn helper_candidates(executable: &Path) -> Result<Vec<PathBuf>> {
     let directory = executable
         .parent()
         .context("temote-mcp executable has no parent directory")?;
-
-    let candidates = if directory.file_name().is_some_and(|name| name == "deps") {
-        directory
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        Ok(directory
             .parent()
             .map(|profile| {
                 vec![
@@ -119,11 +114,18 @@ fn helper_executable() -> Result<PathBuf> {
                     profile.join(HELPER_BINARY_NAME),
                 ]
             })
-            .unwrap_or_else(|| vec![directory.join(HELPER_BINARY_NAME)])
+            .unwrap_or_else(|| vec![directory.join(HELPER_BINARY_NAME)]))
     } else {
-        vec![directory.join(HELPER_BINARY_NAME)]
+        Ok(vec![directory.join(HELPER_BINARY_NAME)])
+    }
+}
+
+fn helper_executable() -> Result<PathBuf> {
+    let executable = match std::env::var_os("TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR") {
+        Some(locator) => std::fs::canonicalize(locator)?,
+        None => std::env::current_exe()?,
     };
-    candidates
+    helper_candidates(&executable)?
         .into_iter()
         .find(|candidate| candidate.is_file())
         .with_context(|| {
@@ -132,6 +134,15 @@ fn helper_executable() -> Result<PathBuf> {
                 executable.display()
             )
         })
+}
+
+/// The sandbox helper bundled next to a temote-mcp executable path, used by
+/// upgrade preflight to classify the replacement bundle's helper generation.
+pub fn helper_sibling_of(executable: &Path) -> Option<PathBuf> {
+    helper_candidates(executable)
+        .ok()?
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]

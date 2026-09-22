@@ -112,6 +112,10 @@ pub(crate) async fn prepare_apply(
         !preflight.direct_ingress_blocked,
         "direct ingress upgrade is blocked"
     );
+    anyhow::ensure!(
+        preflight.helper_generation == session_control::HelperGeneration::Compatible,
+        "sandbox helper generation is not compatible with the running supervisor"
+    );
     session_control::revalidate_installed_upgrade_executable(&executable)?;
     let _admission = upgrade_transaction::acquire_admission_lock()?;
     session_control::verify_planned_upgrade_sessions(&preflight.planned_sessions, true).await?;
@@ -621,6 +625,7 @@ mod tests {
             reconnect_expected: supervisor_handoff_required,
             plugin_reconciliation_required: true,
             client_restart_required_if_plugin_replaced: true,
+            helper_generation: session_control::HelperGeneration::Compatible,
             planned_sessions: vec![upgrade_transaction::UpgradePlannedSession {
                 session_id: "session-a".to_owned(),
                 source_process_id: 100,

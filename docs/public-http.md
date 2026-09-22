@@ -201,6 +201,8 @@ Authenticated direct HTTP exposes `upgrade_preflight`, `upgrade_apply`, and `upg
 
 The remote request can select only the locally installed Temote executable. It cannot supply a path, URL, command, argument vector, or environment. `expected_version` is an optional optimistic-concurrency check against that installed candidate.
 
+Preflight also reports `helper_generation`: a bounded `compatible` / `incompatible` / `unavailable` classification of the Linux sandbox helper bundled next to the installed executable. Apply refuses the handoff before any destructive step when the classification is not `compatible`. On platforms without a sandbox helper the classification is `compatible`.
+
 For a new accepted transaction, Temote writes the complete response through its HTTP/1 connection, shuts down that socket, and then authorizes an independent local coordinator to mutate the supervisor or ingress. This establishes successful server-side writing and shutdown; it does not prove that the peer application processed the response. If writing or shutdown fails, the coordinator aborts before destructive work.
 
 The accepted response includes a transaction ID. Reconnect to the same endpoint, authenticate again, verify the host/version/boot identity in `initialize` or `ping`, and poll `upgrade_status` until it reaches a terminal state. Local OAuth registrations and tokens are process-local, so an ingress restart requires a new OAuth authorization flow. A completed transaction records the verified host, target version, boot generation, and restored-session count without exposing executable paths, session paths, credentials, headers, or command output.
