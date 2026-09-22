@@ -160,6 +160,14 @@ enum ControlRequest {
         session_id: String,
         path: PathBuf,
     },
+    PermissionGrant {
+        session_id: String,
+        request: config::SessionGrantRequest,
+    },
+    PermissionUngrant {
+        session_id: String,
+        request: config::SessionGrantRequest,
+    },
     ValidatePublicUpgradeSession {
         session_id: String,
     },
@@ -206,6 +214,10 @@ pub struct SessionView {
     pub last_error: Option<String>,
     pub permission_mode: config::PermissionMode,
     pub yolo: bool,
+    /// Persisted additive capability grants (listen ports, dev-tool env
+    /// prefixes, ambient Git credentials). Empty by default.
+    #[serde(default)]
+    pub grants: config::SessionGrants,
     pub logical_path: Option<String>,
     /// Bounded non-secret workspace identity derived from the canonical session
     /// working directory. `None` when the workspace is not a supported standard
@@ -987,6 +999,18 @@ pub async fn permission(
         crate::cli::SessionPermissionCommand::Revoke { path } => {
             ControlRequest::PermissionRevoke { session_id, path }
         }
+        crate::cli::SessionPermissionCommand::Grant { request } => {
+            ControlRequest::PermissionGrant {
+                session_id,
+                request,
+            }
+        }
+        crate::cli::SessionPermissionCommand::Ungrant { request } => {
+            ControlRequest::PermissionUngrant {
+                session_id,
+                request,
+            }
+        }
     };
     let result = request(control_request).await?;
     print_json(&result)
@@ -1242,6 +1266,26 @@ async fn dispatch_request(
         ControlRequest::PermissionRevoke { session_id, path } => {
             supervisor.revoke_directory(&session_id, path).await?;
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
+        }
+        ControlRequest::PermissionGrant {
+            session_id,
+            request,
+        } => {
+            let applied = supervisor.apply_grants(&session_id, request).await?;
+            Ok(json!({
+                "grants": applied,
+                "session": inspect_session(&session_id).await?,
+            }))
+        }
+        ControlRequest::PermissionUngrant {
+            session_id,
+            request,
+        } => {
+            let removed = supervisor.revoke_grants(&session_id, request).await?;
+            Ok(json!({
+                "grants": removed,
+                "session": inspect_session(&session_id).await?,
+            }))
         }
         ControlRequest::ValidatePublicUpgradeSession { session_id } => {
             let session = supervisor
@@ -3588,6 +3632,7 @@ async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<Sessi
     };
     let permission_mode = session.permission_mode;
     let yolo = session.yolo();
+    let grants = session.grants.clone();
     // Workspace identity is derived from the canonical cwd and the configured
     // `src` named root; an unresolvable workspace reports none.
     let workspace = if workspace_resolved {
@@ -3614,6 +3659,7 @@ async fn build_session_view(id: &str, reconcile_lifecycle: bool) -> Result<Sessi
         last_error,
         permission_mode,
         yolo,
+        grants,
         logical_path: inferred.logical_path,
         workspace,
         restart_policy: inferred.restart_policy,
@@ -5481,6 +5527,7 @@ mod tests {
             started_at: 2,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         })
         .await
         .unwrap();
@@ -5498,6 +5545,7 @@ mod tests {
                 started_at: 1,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Agent,
+                grants: config::SessionGrants::default(),
             })
             .await
             .unwrap();
@@ -5548,6 +5596,7 @@ mod tests {
             started_at: 1_700_000_000,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         config::save_session(&session).await.unwrap();
         let mut lifecycle =
@@ -5607,6 +5656,7 @@ mod tests {
             started_at: 1,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         })
         .await
         .unwrap();
@@ -6546,6 +6596,7 @@ mod tests {
             started_at: 10,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         config::save_session(&session).await.unwrap();
         config::session_path(id).unwrap()
@@ -6660,6 +6711,7 @@ mod tests {
             started_at: 10,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         std::fs::write(&mismatched_metadata, serde_json::to_vec(&foreign).unwrap()).unwrap();
         backdate_file(&mismatched_metadata, old);

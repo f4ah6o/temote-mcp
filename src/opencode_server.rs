@@ -544,10 +544,12 @@ impl TaskStore {
             .join(format!("{task_id}.lock"))
     }
 
+    fn runtime_state_root(&self) -> PathBuf {
+        self.directory.join("runtime-state")
+    }
+
     fn runtime_state_directory(&self, task_id: Uuid) -> PathBuf {
-        self.directory
-            .join("runtime-state")
-            .join(task_id.to_string())
+        self.runtime_state_root().join(task_id.to_string())
     }
 
     fn try_acquire_runtime_lease(&self, task_id: Uuid) -> Result<Option<TaskRuntimeLease>> {
@@ -1653,15 +1655,16 @@ async fn spawn_serve(
     _lease: Arc<TaskRuntimeLease>,
     binary: &Path,
 ) -> Result<ServeClient> {
-    #[cfg(test)]
-    if let Some(hook) = spawn_hook() {
-        return hook(session, task_id);
-    }
     let scope = config::canonical_directory(&session.cwd)?;
+    ensure_private_directory(&store.runtime_state_root())?;
     let state_dir = store.runtime_state_directory(task_id);
     ensure_private_directory(&state_dir)?;
     let data_dir = state_dir.join("data");
     ensure_private_directory(&data_dir)?;
+    #[cfg(test)]
+    if let Some(hook) = spawn_hook() {
+        return hook(session, task_id);
+    }
 
     // Seed provider auth into the isolated data dir (fresh copy on every spawn
     // so upstream credential refreshes in the real home propagate).

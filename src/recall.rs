@@ -466,6 +466,7 @@ mod tests {
             started_at: 1,
             process_id: 2,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         }
     }
 

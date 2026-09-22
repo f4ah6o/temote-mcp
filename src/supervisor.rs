@@ -796,6 +796,55 @@ impl SessionSupervisor {
         result
     }
 
+    /// Apply additive capability grants to a running session. This is the
+    /// host-side control path (`session permission grant`); the CLI request
+    /// itself is the host approval.
+    pub async fn apply_grants(
+        &self,
+        session_id: &str,
+        request: config::SessionGrantRequest,
+    ) -> Result<serde_json::Value> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let sessions = self.sessions.lock().await;
+        let handle = sessions.get(session_id).with_context(|| {
+            format!("session {session_id} is not managed by this supervisor process")
+        })?;
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionGrant,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.apply_grants(request).await;
+        finish_supervisor_activity(&activity, &result);
+        result
+    }
+
+    pub async fn revoke_grants(
+        &self,
+        session_id: &str,
+        request: config::SessionGrantRequest,
+    ) -> Result<serde_json::Value> {
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+        config::validate_session_id(session_id)?;
+        let sessions = self.sessions.lock().await;
+        let handle = sessions.get(session_id).with_context(|| {
+            format!("session {session_id} is not managed by this supervisor process")
+        })?;
+        let activity = self.activity_scope_with_instance(
+            ActivityOperation::SessionPermissionUngrant,
+            session_id.to_owned(),
+            handle.activity_session_instance(),
+        );
+        let result = handle.revoke_grants(request).await;
+        finish_supervisor_activity(&activity, &result);
+        result
+    }
+
     pub async fn set_restart_policy(&self, session_id: &str, policy: &str) -> Result<()> {
         let _transition = self.transitions.lock().await;
         self.ensure_mutations_allowed()?;

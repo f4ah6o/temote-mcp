@@ -137,8 +137,18 @@ pub enum SessionPermissionCommand {
     Ask,
     Agent,
     Yolo,
-    Allow { path: PathBuf },
-    Revoke { path: PathBuf },
+    Allow {
+        path: PathBuf,
+    },
+    Revoke {
+        path: PathBuf,
+    },
+    Grant {
+        request: config::SessionGrantRequest,
+    },
+    Ungrant {
+        request: config::SessionGrantRequest,
+    },
 }
 
 pub enum ParseOutcome {
@@ -444,6 +454,62 @@ fn parse_activity(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
     })
 }
 
+fn parse_grant_request(
+    args: &mut noargs::RawArgs,
+    allow_directories: bool,
+) -> noargs::Result<config::SessionGrantRequest> {
+    let mut request = config::SessionGrantRequest::default();
+    let listen_port = noargs::opt("listen-port")
+        .ty("PORT")
+        .doc("TCP port a sandboxed command may bind and listen on; repeatable. On macOS the Seatbelt sandbox cannot scope a bind to loopback, so the port becomes bindable on all interfaces");
+    while let Some(value) = listen_port
+        .take(args)
+        .present()
+        .map(|opt| opt.value().to_owned())
+    {
+        let port = value.parse::<u16>().map_err(|_| {
+            noargs::Error::other(args, "--listen-port must be a TCP port (0-65535)")
+        })?;
+        request.listen_ports.push(port);
+    }
+    let env_prefix = noargs::opt("dev-tool-env-prefix")
+        .ty("PREFIX")
+        .doc("Environment-variable name prefix dev_tool_run may accept from the caller (for example MADOBE_ or CARGO_); repeatable");
+    while let Some(prefix) = env_prefix
+        .take(args)
+        .present()
+        .map(|opt| opt.value().to_owned())
+    {
+        request.dev_tool_env_prefixes.push(prefix);
+    }
+    request.ambient_git_credentials = noargs::flag("ambient-git-credentials")
+        .doc("Let network Git operations and the GitHub tools fall back to the ambient host credentials when no managed repository credential mapping is configured")
+        .take(args)
+        .is_present();
+    if allow_directories {
+        let directory = noargs::opt("directory")
+            .ty("PATH")
+            .doc("Additional permitted directory for the session; repeatable");
+        while let Some(path) = directory
+            .take(args)
+            .present()
+            .map(|opt| PathBuf::from(opt.value()))
+        {
+            request.directories.push(path);
+        }
+    }
+    request
+        .validate()
+        .map_err(|error| noargs::Error::other(args, format!("{error:#}")))?;
+    if request.is_effectively_empty() {
+        return Err(noargs::Error::other(
+            args,
+            "grant request is empty (pass --listen-port, --dev-tool-env-prefix, --ambient-git-credentials, or --directory)",
+        ));
+    }
+    Ok(request)
+}
+
 fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
     if noargs::cmd("start")
         .doc("Start a supervisor-owned session under a configured named root")
@@ -609,12 +675,28 @@ fn parse_session(args: &mut noargs::RawArgs) -> noargs::Result<SessionCommand> {
                 .take(args)
                 .then(|arg| Ok::<_, std::convert::Infallible>(PathBuf::from(arg.value())))?;
             SessionPermissionCommand::Revoke { path }
+        } else if noargs::cmd("grant")
+            .doc("Persist additive capability grants approved by the host")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Grant {
+                request: parse_grant_request(args, true)?,
+            }
+        } else if noargs::cmd("ungrant")
+            .doc("Remove capability grants previously approved on the session")
+            .take(args)
+            .is_present()
+        {
+            SessionPermissionCommand::Ungrant {
+                request: parse_grant_request(args, false)?,
+            }
         } else if args.metadata().help_mode {
             SessionPermissionCommand::Status
         } else {
             return Err(noargs::Error::other(
                 args,
-                "permission command is not specified (expected status, ask, agent, yolo, allow, or revoke)",
+                "permission command is not specified (expected status, ask, agent, yolo, allow, revoke, grant, or ungrant)",
             ));
         };
         return Ok(SessionCommand::Permission {

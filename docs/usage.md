@@ -74,6 +74,8 @@ Migration validates the legacy state file and verifies live process names before
 
 A normal session starts with its canonical startup directory as its permitted root. Local named-root selection determines which project directory is used; remote `session_start` can only resolve paths below administrator-configured named roots. Normal sessions reject paths, symlink targets, and command working directories that escape their permitted roots.
 
+Named roots come from `TEMOTE_MCP_ROOTS` on the host before Temote MCP starts. Set a single mapping such as `TEMOTE_MCP_ROOTS='src=~/src'` or a JSON object such as `TEMOTE_MCP_ROOTS='{"src":"~/src","opt":"~/opt"}'`, then restart Temote MCP. When it is unset, `session_start` stays disabled and named-root resolution errors explain how to configure it. A running session's roots can also grow through host-approved `directories` grants (below) without a restart.
+
 The legacy inline `/permission ...` terminal command UI is not the owner of detached runtimes and is not exposed through the first supervisor control surface. This does not widen permissions: the runtime remains fail-closed with its persisted permitted roots.
 
 ## Permission modes
@@ -87,6 +89,17 @@ An explicit session permission mode controls the Temote-local approval layer:
 `agent` is not a weaker spelling of `yolo`: ordinary `execute`/`start_command` remain sandboxed and path-contained (`ask` restricted, `agent` development-network-enabled), public `without_sandbox` remains unavailable, force-push and arbitrary Git URLs/refspecs remain rejected, and integrations keep their own authentication and capability boundaries.
 
 Use `temote-mcp session permission <id> status|ask|agent|yolo` to inspect or intentionally change a running managed session. Existing persisted sessions keep their stored mode across restart, automatic restart, restore, and upgrade handoff; an explicit `ask` session is not silently migrated to `agent`.
+
+## Session capability grants
+
+A running sandboxed session can request additional, individually scoped capabilities through `session_permission_request({session_id, listen_ports?, dev_tool_env_prefixes?, ambient_git_credentials?, directories?})`. Every field is additive and every non-empty field crosses the local approval console — the host sees the exact ports, prefixes, and paths before approving. Bundling fields collects them under one approval prompt, so an automation can gather several capabilities in a single host interaction. Approved grants persist in session metadata, survive session restart, and are listed by `session_info` under `grants`. The local CLI equivalent is `temote-mcp session permission <id> grant|ungrant` with the corresponding options; removing a permitted directory still uses `session permission revoke <path>`.
+
+- `listen_ports: [5173, ...]` (up to 64) lets a command bind TCP listeners on exactly those ports, but only when the call also sets `allow_loopback_listen: true` on `execute` or `start_command`. On macOS the sandbox cannot scope a bind to loopback, so a granted port can bind on every interface — grant only the ports the workload needs. On Linux the development profile already permits listening, so the option is a no-op. `port_check({session_id, port})` probes `127.0.0.1:<port>` from the host and reports whether it accepts connections; only granted ports may be probed, keeping it a workspace observation tool rather than a general port scanner.
+- `dev_tool_env_prefixes: ["MADOBE_", "CARGO_"]` (up to 32 prefixes of `1..=64` bytes using only `[A-Za-z0-9_]`) lets `dev_tool_run` accept an `env` object whose names start with a granted prefix. Names and values are bounded and cannot contain NUL, and broker-set variables such as `npm_config_ignore_scripts` still cannot be overridden.
+- `ambient_git_credentials: true` lets validated `git_fetch`, `git_pull`, `git_push`, and `git_push_tag` fall back to ambient host Git credentials (credential helpers and the forwarded `ssh-agent`) when the repository has no managed GitHub credential mapping. A configured mapping still takes precedence, and global `gh` auth state is never touched.
+- `directories: ["/abs/path", ...]` (up to 16, absolute paths) extends the session's permitted roots mid-flight.
+
+Keep the original startup-directory rule: add directories through host approval rather than starting sessions with broad roots.
 
 ## Commands
 
@@ -201,6 +214,16 @@ Ordinary sandboxed commands keep Git metadata read-only. Use the dedicated tools
 - `github_workflow_run_get` reads bounded status for one exact workflow run ID in that same configured GitHub repository using the same repository-scoped credential mapping. Poll this tool until `status` is `completed`, then use `conclusion` as the terminal result. It does not download raw logs or artifacts.
 
 Remote Git operations are host operations. In `ask` mode they require local approval; in `agent` mode the validated structured operation runs without the local approval console, and in `yolo` mode the existing local behavior is unchanged. The safe-remote, fast-forward-only, current-branch, and no-force rules are identical in every mode. `git_worktree_create` is the corresponding host-side workspace operation, and its managed-root policy and validation are identical in every mode.
+
+GitHub HTTPS remotes require the repository-local managed credential mapping before `git_fetch`, `git_pull`, `git_push`, `git_push_tag`, and the `github_workflow_*`/`github_pr_*` tools may run. Configure it once per clone on the host:
+
+```sh
+git config --local credential.helper ''
+git config --local --add credential.helper '!gh git credential --managed'
+git config --local credential.useHttpPath true
+```
+
+The `credential mapping is unavailable` error repeats these steps. As an opt-in alternative, the host-approved `ambient_git_credentials` session grant lets the same tools fall back to ambient Git credentials when no mapping exists; non-GitHub and SSH remotes keep their normal credential path in every case.
 
 ## Yolo mode
 

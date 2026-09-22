@@ -682,6 +682,7 @@ mod tests {
             started_at: 1,
             process_id: 2,
             permission_mode: config::PermissionMode::from_legacy_yolo(yolo),
+            grants: config::SessionGrants::default(),
         }
     }
 

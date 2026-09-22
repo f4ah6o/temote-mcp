@@ -544,6 +544,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         };
         assert!(
             enforce_path_boundary(
@@ -623,6 +624,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         };
 
         test_support::run(0x4f50_4d4f_554e_5401, 512, |ctx| {

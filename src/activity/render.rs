@@ -69,6 +69,8 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::SessionPermissionMode => "session_permission_mode",
         ActivityOperation::SessionPermissionAllow => "session_permission_allow",
         ActivityOperation::SessionPermissionRevoke => "session_permission_revoke",
+        ActivityOperation::SessionPermissionGrant => "session_permission_grant",
+        ActivityOperation::SessionPermissionUngrant => "session_permission_ungrant",
         ActivityOperation::SessionRestartPolicy => "session_restart_policy",
         ActivityOperation::SessionForget => "session_forget",
         ActivityOperation::SessionCrash => "session_crash",

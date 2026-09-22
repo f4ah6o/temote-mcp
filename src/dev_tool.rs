@@ -287,7 +287,7 @@ pub(crate) fn prepare_with_executable(
     session: &config::Session,
     executable: Option<&Path>,
 ) -> Result<PreparedDevToolRun> {
-    const KEYS: &[&str] = &["session_id", "tool", "operation", "args", "cwd"];
+    const KEYS: &[&str] = &["session_id", "tool", "operation", "args", "cwd", "env"];
     let object = args
         .as_object()
         .context("dev_tool_run arguments must be an object")?;
@@ -349,6 +349,7 @@ pub(crate) fn prepare_with_executable(
     };
     let command = build_command(&request, program, broker_state_root.as_deref());
     let mut environment = crate::local_agent::filtered_environment()?;
+    environment.extend(requested_environment(object, session)?);
     if matches!(
         (tool, request.operation()),
         (DevTool::Npm, "install" | "ci" | "update") | (DevTool::Pnpm, "install" | "update")
@@ -368,6 +369,56 @@ pub(crate) fn prepare_with_executable(
         writable_roots,
         broker_state_root,
     })
+}
+
+const MAX_DEV_TOOL_ENV_ENTRIES: usize = 64;
+const MAX_DEV_TOOL_ENV_NAME_BYTES: usize = 256;
+const MAX_DEV_TOOL_ENV_VALUE_BYTES: usize = 4096;
+
+/// Caller-supplied environment for one `dev_tool_run`, admitted only for
+/// names covered by the session's host-approved `dev_tool_env_prefixes`
+/// grants. Broker-set invariants (lifecycle-script disables, package-manager
+/// state roots) are applied after this map, so they cannot be overridden.
+fn requested_environment(
+    object: &serde_json::Map<String, Value>,
+    session: &config::Session,
+) -> Result<HashMap<String, String>> {
+    let Some(value) = object.get("env") else {
+        return Ok(HashMap::new());
+    };
+    let entries = value
+        .as_object()
+        .context("dev_tool_run env must be an object of name/value string pairs")?;
+    anyhow::ensure!(
+        entries.len() <= MAX_DEV_TOOL_ENV_ENTRIES,
+        "dev_tool_run env accepts at most {MAX_DEV_TOOL_ENV_ENTRIES} entries"
+    );
+    let mut environment = HashMap::with_capacity(entries.len());
+    for (name, value) in entries {
+        anyhow::ensure!(
+            !name.is_empty()
+                && name.len() <= MAX_DEV_TOOL_ENV_NAME_BYTES
+                && !name.contains(['=', '\0']),
+            "dev_tool_run env name must be a non-empty variable name: {name:?}"
+        );
+        anyhow::ensure!(
+            session
+                .grants
+                .dev_tool_env_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str())),
+            "dev_tool_run env name {name:?} is not covered by a granted dev_tool_env_prefixes grant; request it via session_permission_request"
+        );
+        let value = value
+            .as_str()
+            .context("dev_tool_run env values must be strings")?;
+        anyhow::ensure!(
+            value.len() <= MAX_DEV_TOOL_ENV_VALUE_BYTES && !value.contains('\0'),
+            "dev_tool_run env value for {name:?} exceeds {MAX_DEV_TOOL_ENV_VALUE_BYTES} bytes or contains NUL"
+        );
+        environment.insert(name.clone(), value.to_owned());
+    }
+    Ok(environment)
 }
 
 fn build_command(
@@ -877,6 +928,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         }
     }
 
@@ -1240,5 +1292,83 @@ mod tests {
             output.stdout,
             output.stderr
         );
+    }
+
+    #[test]
+    fn requested_environment_admits_only_granted_prefix_names() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut session = test_session(cwd.path());
+        session.grants.dev_tool_env_prefixes = vec!["MADOBE_".to_owned()];
+
+        let allowed = json!({
+            "env": {"MADOBE_UI_DIST_DIR": "dist", "MADOBE_MODE": "dev"}
+        });
+        let environment = requested_environment(allowed.as_object().unwrap(), &session).unwrap();
+        assert_eq!(environment.get("MADOBE_UI_DIST_DIR").unwrap(), "dist");
+        assert_eq!(environment.get("MADOBE_MODE").unwrap(), "dev");
+
+        for args in [
+            json!({"env": {"HOME": "/tmp"}}),
+            json!({"env": {"MAD": "x"}}),
+            json!({"env": {"MADOBE_": "x", "OTHER_": "y"}}),
+            json!({"env": {"MADOBE_X": 1}}),
+            json!({"env": ["MADOBE_X=1"]}),
+            json!({"env": {"MADOBE_NUL": "a\0b"}}),
+        ] {
+            assert!(
+                requested_environment(args.as_object().unwrap(), &session).is_err(),
+                "accepted env outside grants: {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_environment_without_grants_rejects_every_name() {
+        let cwd = tempfile::tempdir().unwrap();
+        let session = test_session(cwd.path());
+        let args = json!({"env": {"MADOBE_X": "y"}});
+        assert!(requested_environment(args.as_object().unwrap(), &session).is_err());
+    }
+
+    #[test]
+    fn prepare_merges_requested_env_but_broker_invariants_win() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let fake = root.path().join("fake-npm");
+        let mut session = test_session(&cwd);
+        session.grants.dev_tool_env_prefixes = vec!["MADOBE_".to_owned(), "npm_config_".to_owned()];
+        let args = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "npm",
+            "operation": "install",
+            "env": {"MADOBE_UI_DIST_DIR": "dist", "npm_config_ignore_scripts": "false"}
+        });
+        let prepared = prepare_with_executable(&args, &session, Some(&fake)).unwrap();
+        assert_eq!(
+            prepared.environment.get("MADOBE_UI_DIST_DIR").unwrap(),
+            "dist"
+        );
+        assert_eq!(
+            prepared
+                .environment
+                .get("npm_config_ignore_scripts")
+                .unwrap(),
+            "true",
+            "broker-set lifecycle-script disables must not be overridable"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_env_name_outside_granted_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(root.path()).unwrap();
+        let session = test_session(&cwd);
+        let args = json!({
+            "session_id": "dev-tool-test-session",
+            "tool": "cargo",
+            "operation": "check",
+            "env": {"HOME": "/tmp"}
+        });
+        assert!(prepare(&args, &session).is_err());
     }
 }

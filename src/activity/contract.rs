@@ -41,6 +41,8 @@ pub enum ActivityOperation {
     SessionPermissionMode,
     SessionPermissionAllow,
     SessionPermissionRevoke,
+    SessionPermissionGrant,
+    SessionPermissionUngrant,
     SessionRestartPolicy,
     SessionForget,
     SessionCrash,
@@ -128,6 +130,8 @@ impl<'de> Deserialize<'de> for ActivityOperation {
             "session_permission_mode" => Ok(Self::SessionPermissionMode),
             "session_permission_allow" => Ok(Self::SessionPermissionAllow),
             "session_permission_revoke" => Ok(Self::SessionPermissionRevoke),
+            "session_permission_grant" => Ok(Self::SessionPermissionGrant),
+            "session_permission_ungrant" => Ok(Self::SessionPermissionUngrant),
             "session_restart_policy" => Ok(Self::SessionRestartPolicy),
             "session_forget" => Ok(Self::SessionForget),
             "session_crash" => Ok(Self::SessionCrash),
@@ -1431,6 +1435,14 @@ mod tests {
             (
                 ActivityOperation::SessionPermissionRevoke,
                 "session_permission_revoke",
+            ),
+            (
+                ActivityOperation::SessionPermissionGrant,
+                "session_permission_grant",
+            ),
+            (
+                ActivityOperation::SessionPermissionUngrant,
+                "session_permission_ungrant",
             ),
             (
                 ActivityOperation::SessionRestartPolicy,

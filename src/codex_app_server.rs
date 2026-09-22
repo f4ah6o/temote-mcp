@@ -3696,6 +3696,7 @@ mod tests {
             started_at: 1234,
             process_id: 5678,
             permission_mode: config::PermissionMode::from_legacy_yolo(yolo),
+            grants: config::SessionGrants::default(),
         }
     }
 

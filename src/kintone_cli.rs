@@ -775,6 +775,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         }
     }
 
