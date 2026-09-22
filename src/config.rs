@@ -1483,10 +1483,11 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let fixture = tempfile::tempdir().unwrap();
-        let real = fixture.path().join("real");
+        let fixture_root = canonical_directory(fixture.path()).unwrap();
+        let real = fixture_root.join("real");
         std::fs::create_dir(&real).unwrap();
         let real = canonical_directory(&real).unwrap();
-        let link = fixture.path().join("link");
+        let link = fixture_root.join("link");
         symlink(&real, &link).unwrap();
 
         let resolved_id = format!("view-symlink-file-{}", Uuid::new_v4());
@@ -1513,8 +1514,8 @@ mod tests {
         );
         let _ = tokio::fs::remove_file(session_path(&ancestor_id).unwrap()).await;
 
-        let broken = fixture.path().join("broken");
-        symlink(fixture.path().join("missing-target"), &broken).unwrap();
+        let broken = fixture_root.join("broken");
+        symlink(fixture_root.join("missing-target"), &broken).unwrap();
         let broken_ids = [
             format!("view-broken-leaf-{}", Uuid::new_v4()),
             format!("view-broken-ancestor-{}", Uuid::new_v4()),

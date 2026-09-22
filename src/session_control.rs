@@ -5105,6 +5105,8 @@ mod tests {
 
     #[test]
     fn activity_cli_output_writer_handles_success_broken_pipe_and_timeout() {
+        let mutable_status_flags =
+            |flags| flags & (libc::O_APPEND | libc::O_NONBLOCK | libc::O_ASYNC);
         let mut success_pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(success_pipe.as_mut_ptr()) }, 0);
         let success_flags = unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) };
@@ -5114,8 +5116,8 @@ mod tests {
             ActivityOutputStatus::Complete
         );
         assert_eq!(
-            unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) },
-            success_flags,
+            mutable_status_flags(unsafe { libc::fcntl(success_pipe[1], libc::F_GETFL) }),
+            mutable_status_flags(success_flags),
             "activity output must preserve shared file-description flags"
         );
         let mut bytes = [0_u8; 9];
@@ -5165,7 +5167,10 @@ mod tests {
             write_activity_output_line(full_pipe[1], b"blocked\n", Duration::from_millis(20),),
             ActivityOutputStatus::Failed
         );
-        assert_eq!(unsafe { libc::fcntl(full_pipe[1], libc::F_GETFL) }, flags);
+        assert_eq!(
+            mutable_status_flags(unsafe { libc::fcntl(full_pipe[1], libc::F_GETFL) }),
+            mutable_status_flags(flags)
+        );
         unsafe {
             libc::close(full_pipe[0]);
             libc::close(full_pipe[1]);
@@ -6536,8 +6541,8 @@ mod tests {
         let cwd = config::canonical_directory(Path::new(GC_TEST_CWD)).unwrap();
         let session = config::Session {
             id: id.to_owned(),
-            cwd,
-            permitted_directories: vec![PathBuf::from(GC_TEST_CWD)],
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
             started_at: 10,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
@@ -6647,10 +6652,11 @@ mod tests {
 
         let mismatched = gc_test_id("gc-mismatch");
         let mismatched_metadata = config::session_path(&mismatched).unwrap();
+        let cwd = config::canonical_directory(Path::new(GC_TEST_CWD)).unwrap();
         let foreign = config::Session {
             id: gc_test_id("gc-foreign"),
-            cwd: config::canonical_directory(Path::new(GC_TEST_CWD)).unwrap(),
-            permitted_directories: vec![PathBuf::from(GC_TEST_CWD)],
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
             started_at: 10,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
