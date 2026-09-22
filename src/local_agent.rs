@@ -3029,7 +3029,7 @@ printf '{"schema":1,"cwd":"%s","argv":%s}' "$PWD" "$argv" > "$dir/requests/$id.t
 i=0
 while [ "$i" -lt 1000 ]; do
   if [ -f "$resp/$id.json" ]; then
-    if /bin/grep -q '"error"' "$resp/$id.json"; then
+    if /usr/bin/grep -q '"error"' "$resp/$id.json"; then
       test "$1" = read_only && exit 0
       exit 8
     fi
@@ -3170,7 +3170,7 @@ fi
 if /bin/rm "$resp/$id.json" 2>/dev/null; then record unlink_response=allowed; else record unlink_response=denied; fi
 if /bin/mv "$resp/$id.json" "$resp/$id.renamed" 2>/dev/null; then record rename_response=allowed; else record rename_response=denied; fi
 if /bin/mv "$resp" "$resp.moved" 2>/dev/null; then record rename_response_dir=allowed; else record rename_response_dir=denied; fi
-if /bin/grep -q '"error"' "$resp/$id.json"; then
+if /usr/bin/grep -q '"error"' "$resp/$id.json"; then
   record outcome=rejected
   /bin/cat "$report"
   test "$1" = read_only && exit 0
@@ -3580,8 +3580,9 @@ exit 8
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        let workspace = root.path().join("workspace");
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        let home = root_path.join("home");
+        let workspace = root_path.join("workspace");
         let bin = home.join("bin");
         let version_bin = home.join("0.2.9/bin");
         let package_store = home.join("packages/@openai/codex/install");
@@ -3655,8 +3656,9 @@ exit 8
         use std::os::unix::fs::symlink;
 
         let fixture = tempfile::tempdir().unwrap();
-        let real = fixture.path().join("real/bin");
-        let alias = fixture.path().join("alias");
+        let fixture_root = fs::canonicalize(fixture.path()).unwrap();
+        let real = fixture_root.join("real/bin");
+        let alias = fixture_root.join("alias");
         fs::create_dir_all(&real).unwrap();
         make_executable(&real.join("codex"));
         symlink("real", &alias).unwrap();
@@ -3668,7 +3670,7 @@ exit 8
             closure.symlinks,
             vec![sandbox::LocalAgentSymlink {
                 link: alias,
-                target: fixture.path().join("real"),
+                target: fixture_root.join("real"),
             }]
         );
     }
@@ -3741,8 +3743,9 @@ exit 8
         use std::os::unix::fs::symlink;
 
         let fixture = tempfile::tempdir().unwrap();
-        let real = fixture.path().join("real");
-        let alias = fixture.path().join("alias");
+        let fixture_root = fs::canonicalize(fixture.path()).unwrap();
+        let real = fixture_root.join("real");
+        let alias = fixture_root.join("alias");
         fs::create_dir_all(real.join("bin")).unwrap();
         make_executable(&real.join("bin/vp"));
         symlink("real", &alias).unwrap();
