@@ -527,7 +527,28 @@ package version は CalVer workflow が管理するため、この実装のた�
 
 ## 2026-09-16 branch-salvage packet
 
-Do not merge `codex/20260915-completion-activity` wholesale. Current-main reconciliation and any remaining S05-S16 porting is owned by `issues/polished/20260916-completion-activity-branch-salvage.md`.
+Do not merge `codex/20260915-completion-activity` wholesale. Current-main reconciliation and any remaining S05-S16 porting is owned by `issues/done/20260916-completion-activity-branch-salvage.md`.
+
+## 2026-09-22 current-main coverage (salvage audit)
+
+Audit result: every S05-S16 requirement is `already-covered` on current `main`; nothing remains to port. Current `main` is a strict superset of `codex/20260915-completion-activity` for the activity surface — the only branch-only deltas are completion evidence documents (owned by `issues/done/20260916-completion-evidence-branch-salvage.md`) and stale issue/app-server state outside this packet. The branch is safe for Phase 5 deletion after independent diff review.
+
+| Unit | Current-main evidence | Verdict |
+| --- | --- | --- |
+| S05 instance-bound sink + typed ingress | `src/supervisor.rs` `activity_scope_with_instance` / `crash_activity_scope`; `src/approvals.rs` tests `activity_ingress_accepts_matching_instance_and_stamps_identity`, `activity_ingress_discards_stale_expected_instance`, `activity_ingress_discards_retired_sink_without_stopping_runtime`, `activity_ingress_rejects_unknown_and_duplicate_fields`, `activity_ingress_oversized_frame_does_not_stop_runtime` | already-covered |
+| S06 bounded producer adapter | `src/activity_runtime.rs`; tests `activity_producer_is_ordered_and_captures_expected_instance_once`, `activity_producer_queue_is_bounded_and_try_emit_never_waits`, `activity_producer_timeout_is_fixed_and_never_retries`, `activity_producer_fixed_errors_never_include_raw_paths`, `activity_producer_bad_ack_drops_one_item_and_continues`, `activity_producer_upgrade_target_never_rebinds_to_recreated_instance`, `activity_producer_upgrade_terminal_never_reaches_recreated_instance` | already-covered |
+| S07 AttachActivity control surface | `src/session_control.rs` `ControlRequest::AttachActivity`, `handle_activity_attachment`, `run_activity_command`; attachment handler tests | already-covered |
+| S08 renderer + replay client | `src/activity/render.rs`, `run_activity` in `src/session_control.rs` | already-covered |
+| S09 CLI | `src/cli.rs` `parse_activity`, `src/main.rs` dispatch; tests `activity_cli_defaults_and_explicit_options_are_exact`, `activity_cli_rejects_invalid_tail_session_and_extra_arguments` | already-covered |
+| S10 first end-to-end scopes | `ActivityOperation::{ReadFile,WriteFile,SessionStart,SessionStop}` instrumented in `src/mcp.rs` / `src/supervisor.rs` (`finish_supervisor_activity`) | already-covered |
+| S11 approval wrapper + git_* | approval-ordering test `activity_coverage_explicit_approval_result_is_ordered_and_terminal_once` in `src/mcp.rs`; all Git operations in the operation enum | already-covered |
+| S12 job scope + terminal once | `src/mcp.rs` tests `activity_job_foreground_completion_and_child_failure_are_terminalized`, `activity_job_sandbox_setup_failure_is_not_child_failed`, `activity_job_return_does_not_complete_and_stop_cancels_original_scope`, `activity_job_natural_first_and_stop_first_are_linearized_under_completion_lock`, `activity_job_session_stop_uses_fixed_cancellation_reason`, `activity_job_lifetime_uses_fixed_cancellation_reason` | already-covered |
+| S13 local_agent / dev_tool | `ActivityOperation::{LocalAgentRun,DevToolRun}` emitted via `activity_job_tool` | already-covered |
+| S14 coverage table | `activity_tool_coverage` in `src/mcp.rs`; tests `activity_coverage_classifies_every_advertised_session_tool_once`, `activity_coverage_finalizes_call_worker_accepted_and_failure_paths` | already-covered |
+| S15 lifecycle instrumentation | `ActivityOperation::{SessionCrash,SessionAutoRestart,SessionForget,SessionRestart,SessionRestartPolicy,SessionPermissionMode,SessionPermissionAllow,SessionPermissionRevoke,SessionPermissionGrant,SessionPermissionUngrant,SupervisorUpgrade}` in `src/supervisor.rs` / `src/approvals.rs` / `src/upgrade_coordinator.rs` | already-covered |
+| S16 docs + CHANGES | `docs/usage.md`, `docs/usage.ja.md`, `docs/managed-sessions.md` (Local activity viewer), `docs/managed-sessions.ja.md`, `CHANGES.md` | already-covered; S16 stays unchecked until the parent's live gates (public/gateway non-exposure, multi-viewer, privacy, supported-OS manual runs) close |
+
+Missing coherent behaviors: none — no child issues created.
 
 ## 2026-09-22 consolidation: done
 
