@@ -555,3 +555,7 @@ Audit result: every repository-local item in the acceptance list is `already-cov
 | EN/JA docs + Agent Skill reconnect contract | `docs/public-http.md` / `docs/public-http.ja.md` (Remote upgrade and reconnect), `skills/temote-mcp/SKILL.md` (Direct-HTTP remote upgrade; "Temote cannot force the MCP client to reconnect") | already-covered |
 
 Missing coherent behaviors: none — no child issues created. Exact live-only residual: run the macOS process-boundary reconnect E2E on a suitable host before the parent's acceptance can close.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

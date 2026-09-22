@@ -76,6 +76,21 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 - [ ] On a rebuilt runtime, an installed Codex/OpenCode `local_agent_run` invokes ordinary `git switch` / `git switch -c` through the private shim and completes the branch change while direct `.git` writes remain denied (from `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`).
 
+### Repository-completion live residuals (agent-mode consolidation)
+
+Live evidence left open by issues closed at the 2026-09-22 consolidation; each row names its source issue. Record evidence per the requirements below before checking.
+
+- [ ] macOS process-boundary upgrade reconnect E2E (`tests/upgrade_reconnect_e2e.rs`, currently `#![cfg(all(feature = "network", target_os = "linux"))] + #[ignore]`): run on a macOS host (from `issues/done/20260908-07-client-safe-upgrade-reconnect.md`).
+- [ ] Codex delegation Phase-4 dogfood and Phase-D three-arm adoption evaluation on the current rebuilt runtime: T07-C, T08-C, T08-A, T09, T10 arms still unattempted; resume from the frozen manifest `docs/evaluations/completion-evaluation-manifest-20260915.md` (from `issues/done/20260908-08-codex-delegation-dogfood-and-app-server.md`).
+- [ ] Local activity viewer S16 live gates: real supervisor activity stream with retention/disconnect evidence on a live host (from `issues/done/20260914-local-activity-viewer.md`).
+- [ ] GitHub PR broker installed-runtime read-only canary plus live fixture close on a disposable repo (from `issues/done/20260916-github-pr-broker.md`).
+- [ ] OpenCode `local_agent_run` read-only and bounded `workspace_write` canary against a rebuilt runtime (EPERM classification verified live) (from `issues/done/20260916-local-agent-opencode-eperm.md`).
+- [ ] Codex `local_agent_run(model=..., effort="max")` live canary on a rebuilt runtime (from `issues/done/20260916-local-agent-reasoning-effort.md`).
+- [ ] Package-manager broker live acceptance: `uv`, `npm`, `pnpm`, `go` supported dependency operations from a normal `agent` session (from `issues/done/20260916-package-manager-broker-coverage-and-state.md`).
+- [ ] Repo-scoped GitHub account selection live acceptance: multiple GitHub accounts on one host, repo-mapped credential wins without touching global `gh auth` active account (from `issues/done/20260916-repo-scoped-github-account-selection.md`).
+- [ ] OpenCode `run`/`resume` CLI rebuilt-runtime canary including `delegate --backend opencode --session` resume preflight on real session state (from `issues/done/20260922-opencode-run-cli-compatibility.md`).
+- [ ] Server-backend live parity: `codex exec` vs `codex app-server` and `opencode run` vs `opencode serve` task APIs — structured report, usage, observed model/effort, permission denial, interrupt, orphan-free (from `issues/open/20260922-agent-server-backends-cli-deprecation.md`, Phase 2).
+
 ## Evidence requirements
 
 For each checked item record enough evidence to identify:

@@ -106,3 +106,7 @@ Do not assign this whole issue to an implementation agent. Execute after the com
 ## 2026-09-22 salvaged evidence note
 
 The 2026-09-15 evaluation lane recorded a related incident on the same host: an upgrade-process test stopped the original ingress and recovery blocked on a wedged supervisor control socket (listen backlog 58, `Ping`/list timeouts) while 23 live session sockets disagreed with persisted `crashed` lifecycle records. Labeled copy: `docs/evaluations/completion-20260915-salvaged-evidence.md`. Session-liveness observability divergence is only partially covered by the bounded runtime-observation diagnostics; treat it as context for the runtime-observation child and for live acceptance rather than a new defect claim.
+
+## 2026-09-22 consolidation: done
+
+All bounded child packets are complete on `main` or in the merging PR set; remaining live acceptance is tracked in `issues/open/20260908-live-acceptance-matrix.md`.
