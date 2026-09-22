@@ -88,7 +88,7 @@ impl OpenCodeExecutableStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OpenCodeExecutableSource {
+pub(crate) enum OpenCodeExecutableSource {
     EnvOverride,
     PathLookup,
     InvalidOverride,
@@ -105,7 +105,7 @@ impl OpenCodeExecutableSource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum OpenCodeExecutableError {
+pub(crate) enum OpenCodeExecutableError {
     Empty,
     InvalidValue,
     TooLong,
@@ -128,7 +128,7 @@ impl OpenCodeExecutableError {
         }
     }
 
-    fn message(self) -> String {
+    pub(crate) fn message(self) -> String {
         match self {
             Self::Empty => {
                 "TEMOTE_OPENCODE_BIN is set but empty; unset it to use PATH lookup".to_owned()
@@ -146,13 +146,13 @@ impl OpenCodeExecutableError {
         }
     }
 
-    pub(super) fn delegation_message(self) -> String {
+    pub(crate) fn delegation_message(self) -> String {
         format!("OpenCode backend unavailable: {}", self.message())
     }
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ResolvedOpenCodeExecutable {
+pub(crate) struct ResolvedOpenCodeExecutable {
     source: OpenCodeExecutableSource,
     binary: PathBuf,
 }
@@ -162,7 +162,7 @@ impl ResolvedOpenCodeExecutable {
         self.source
     }
 
-    fn binary(&self) -> &Path {
+    pub(crate) fn binary(&self) -> &Path {
         &self.binary
     }
 
@@ -179,7 +179,7 @@ pub(super) fn bin_override_value() -> Result<Option<String>, OpenCodeExecutableE
     }
 }
 
-pub(super) fn resolve_opencode_executable(
+pub(crate) fn resolve_opencode_executable(
     override_value: Option<&str>,
     fallback: &Path,
 ) -> Result<ResolvedOpenCodeExecutable, OpenCodeExecutableError> {
@@ -230,7 +230,7 @@ fn is_executable_path_metadata(_metadata: &fs::Metadata) -> bool {
     true
 }
 
-fn resolve_default_opencode_executable()
+pub(crate) fn resolve_default_opencode_executable()
 -> Result<ResolvedOpenCodeExecutable, OpenCodeExecutableError> {
     let override_value = bin_override_value()?;
     resolve_opencode_executable(override_value.as_deref(), &default_binary())

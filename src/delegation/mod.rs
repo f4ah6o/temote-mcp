@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 mod codex;
-mod opencode;
+pub(crate) mod opencode;
 
 pub(crate) const DEFAULT_MAX_REPORT_BYTES: usize = 4096;
 
@@ -770,7 +770,10 @@ fn capture_artifact<R: Read>(mut reader: R, mut file: File) -> std::io::Result<b
     Ok(truncated)
 }
 
-fn filtered_child_environment<I>(environment: I, allowlist: &[&str]) -> Vec<(OsString, OsString)>
+pub(crate) fn filtered_child_environment<I>(
+    environment: I,
+    allowlist: &[&str],
+) -> Vec<(OsString, OsString)>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {

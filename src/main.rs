@@ -9,7 +9,7 @@ mod approvals;
 mod boot_identity;
 mod checkpoints;
 mod child_env;
-mod cli;
+pub(crate) mod cli;
 mod codex_app_server;
 mod config;
 mod dev_tool;
@@ -40,6 +40,8 @@ mod onepassword_mcp;
 mod onepassword_sdk;
 #[cfg(feature = "network")]
 mod openai_tunnel;
+#[cfg(feature = "network")]
+mod opencode_server;
 mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]

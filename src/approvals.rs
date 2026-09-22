@@ -638,6 +638,8 @@ pub(crate) enum ApprovalClass {
     LocalStructured,
     /// Experimental Codex app-server task operations.
     CodexAppServer,
+    /// Experimental OpenCode serve task operations.
+    OpenCodeServer,
     /// Local-only escape hatches that leave the Temote sandbox
     /// (`without_sandbox`).
     HostUnrestricted,
@@ -676,7 +678,7 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
             _ => Skip,
         },
         RemoteUpgrade => RequestUser,
-        CodexAppServer | HostUnrestricted => match mode {
+        CodexAppServer | OpenCodeServer | HostUnrestricted => match mode {
             config::PermissionMode::Yolo => Skip,
             _ => Request,
         },
@@ -1307,6 +1309,8 @@ async fn spawn_runtime_inner(
     let id = config::session_id(session_id)?;
     let _lifecycle_lock = config::acquire_session_lifecycle_lock().await?;
     crate::codex_app_server::ensure_session_replacement_allowed(&id)?;
+    #[cfg(feature = "network")]
+    crate::opencode_server::ensure_session_replacement_allowed(&id)?;
     let previous_session = config::read_session_metadata(&id).await.ok();
     let previous_lifecycle = config::read_session_lifecycle(&id).await.ok().flatten();
     config::remove_inactive_socket_unlocked(&id).await?;
@@ -4578,7 +4582,7 @@ esac
         assert_eq!(local_approval(Ask, LocalAgent), RequestUser);
         assert_eq!(local_approval(Agent, LocalAgent), Skip);
         assert_eq!(local_approval(Yolo, LocalAgent), RequestUser);
-        for class in [CodexAppServer, HostUnrestricted] {
+        for class in [CodexAppServer, OpenCodeServer, HostUnrestricted] {
             assert_eq!(local_approval(Ask, class), Request, "{class:?}");
             assert_eq!(local_approval(Agent, class), Request, "{class:?}");
             assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");

@@ -10,6 +10,7 @@
 - Added `temote-mcp activity` for bounded local replay and live observation of session operations, lifecycle changes, approvals, jobs, integrations, and supervisor upgrades. Activity stays on the owner-only local control socket and is not a durable audit log. ([local activity viewer](issues/polished/20260914-local-activity-viewer.md))
 - Added authenticated direct HTTP session lifecycle and supervisor upgrade tools with explicit local approval, durable transaction status, and reconnect-after-commit behavior. ([client-safe upgrade reconnect](issues/open/20260908-07-client-safe-upgrade-reconnect.md))
 - Added opt-in structured Codex task tools backed by a version-checked local app server, typed control actions, bounded evidence, and persistent reconciliation receipts. ([Codex delegation and app server](issues/open/20260908-08-codex-delegation-dogfood-and-app-server.md))
+- Added opt-in `opencode_status`, `opencode_task_start`, `opencode_task_get`, and `opencode_task_control` tools that drive a per-task `opencode serve` child over the `unofficial-opencode-sdk` client with the same ownership, lease, receipt, retention, and scoped-evidence contract as the Codex task tools. Each serve child runs on loopback with a dynamic port, an instance-scoped Basic-auth password, an isolated data directory, and a bounded permission configuration. ([server-primary agent backends](issues/open/20260922-agent-server-backends-cli-deprecation.md))
 
 ### Changed
 
