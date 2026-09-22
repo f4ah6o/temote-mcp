@@ -109,6 +109,14 @@ Temote の yolo は Temote 自身の local sandbox と approval behavior だけ�
 
 生成される turn には Codex の `workspaceWrite`、session の canonical directory を writable root、network disabled を指定します。これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な app-server adapter です。app-server process 自体は inference service と直接通信するため、Codex build と sandbox behavior を検証できない場合はこの surface を無効または opt-in のままにしてください。generic JSON-RPC、remote shell、automatic approval は公開しません。
 
+### Experimental OpenCode task
+
+opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`opencode_task_control` は、task ごとの `opencode serve` child を loopback 上に起動し、`unofficial-opencode-sdk` HTTP client 経由で操作します。各 serve child は 127.0.0.1 の動的 port、child 環境変数経由のみで渡す instance ごとの random Basic-auth password、task ごとの隔離 data directory (host の OpenCode auth の private copy を seed)、`OPENCODE_CONFIG_CONTENT` で注入される上限付き serve permission 設定で動きます。task record、ownership、lease、receipt、retention、scoped evidence は上記 Codex app-server task と同じ契約です。task は完全な session instance と canonical working directory に所有され、別 session、別 process generation、別 scope から resume できません。
+
+`opencode_task_start` と `opencode_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み session に追加の prompt を送り、resume は保持済み session を reconcile した上で同じ task 用 state directory を使う新しい serve child に spawn し直します (新しい task の開始や終了済み child の再起動ではありません)。prompt には operation 由来の deterministic `messageID` が付くため、`opencode_task_get` は start prompt が server に受理されたかを判定してから `reconciliation_required` を決めます。terminal state の report は `local_agent_run` と同じ bounded report contract の下、最後の assistant message から抽出します。usage と observed model は self-reported 値ではなく session message から読みます。通常 session では Codex task と同じ provenance/scope/mutation metadata を伴う local approval が必要です。`opencode_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
+
+これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な serve adapter です。serve process 自体は provider API と直接通信します。保留中の OpenCode permission/question request は auto-approval ではなく `waiting_approval` task state として表面化します。host の OpenCode build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
+
 ### 構造化ローカルエージェント broker
 
 `local_agent_run({session_id, agent, task, cwd?, access, model?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。

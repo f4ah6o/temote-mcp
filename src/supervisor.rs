@@ -150,6 +150,25 @@ pub struct SupervisorUpgradePreview {
     pub active_sessions: Vec<SupervisorUpgradeSessionIdentity>,
 }
 
+/// Begin shutdown for every agent-task backend bound to this session
+/// instance. Agent task backends fence their records on session instance
+/// identity, so a session that stops must stop accepting and drain its owned
+/// task operations.
+fn begin_agent_session_shutdown(session: &config::Session) {
+    crate::codex_app_server::begin_session_shutdown(session);
+    #[cfg(feature = "network")]
+    crate::opencode_server::begin_session_shutdown(session);
+}
+
+/// Remove this session's tasks and owned runtimes across every agent-task
+/// backend, returning the first failure while still attempting each backend.
+async fn remove_agent_sessions(session: &config::Session) -> Result<()> {
+    crate::codex_app_server::remove_session(session).await?;
+    #[cfg(feature = "network")]
+    crate::opencode_server::remove_session(session).await?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SupervisorUpgradeSessionIdentity {
     pub session_id: String,
@@ -591,11 +610,11 @@ impl SessionSupervisor {
                     "public managed session has no named-root path"
                 );
             }
-            crate::codex_app_server::begin_session_shutdown(&session);
+            begin_agent_session_shutdown(&session);
             if config::session_is_active(session_id).await? {
                 self.stop_owned_validated(session_id, public).await?;
             } else {
-                crate::codex_app_server::remove_session(&session).await?;
+                remove_agent_sessions(&session).await?;
             }
             if let Some(path) = logical_path {
                 let cwd = self.roots.resolve(&path)?;
@@ -943,7 +962,7 @@ impl SessionSupervisor {
                     continue;
                 }
             };
-            if let Err(error) = crate::codex_app_server::remove_session(&old_session).await {
+            if let Err(error) = remove_agent_sessions(&old_session).await {
                 let result: Result<()> = Err(anyhow::anyhow!("old instance cleanup failed"));
                 finish_supervisor_activity(&activity, &result);
                 eprintln!("automatic restart cleanup for session {id} failed: {error:#}");
@@ -1003,7 +1022,7 @@ impl SessionSupervisor {
             let mut sessions = self.sessions.lock().await;
             if let Some(handle) = sessions.get(session_id) {
                 handle.retire_activity();
-                crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                begin_agent_session_shutdown(&handle.session_metadata());
             }
             sessions.remove(session_id)
         };
@@ -1016,7 +1035,7 @@ impl SessionSupervisor {
             if self.restart_specs.lock().await.remove(session_id).is_some() {
                 self.public_sessions.lock().await.remove(session_id);
                 let session = config::read_session_metadata(session_id).await?;
-                let cleanup_result = crate::codex_app_server::remove_session(&session).await;
+                let cleanup_result = remove_agent_sessions(&session).await;
                 if let Some(mut lifecycle) = config::read_session_lifecycle(session_id).await? {
                     lifecycle.status = config::LifecycleStatus::Stopped;
                     lifecycle.stopped_at = Some(config::unix_time());
@@ -1034,7 +1053,7 @@ impl SessionSupervisor {
         self.public_sessions.lock().await.remove(session_id);
         let session = handle.session_metadata();
         let shutdown_result = handle.shutdown().await;
-        let cleanup_result = crate::codex_app_server::remove_session(&session).await;
+        let cleanup_result = remove_agent_sessions(&session).await;
         shutdown_result.with_context(|| format!("failed to stop session {session_id}"))?;
         cleanup_result
     }
@@ -1308,14 +1327,14 @@ impl SessionSupervisor {
                         planned.session_id
                     )
                 })?;
-                crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                begin_agent_session_shutdown(&handle.session_metadata());
                 sessions
                     .remove(&planned.session_id)
                     .expect("session handle disappeared after it was inspected")
             };
             let session = handle.session_metadata();
             let shutdown_result = handle.shutdown().await;
-            let cleanup_result = crate::codex_app_server::remove_session(&session).await;
+            let cleanup_result = remove_agent_sessions(&session).await;
             shutdown_result
                 .with_context(|| format!("failed to drain session {}", planned.session_id))?;
             cleanup_result
@@ -1390,7 +1409,7 @@ impl SessionSupervisor {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(handle) = sessions.get(&id) {
                     handle.retire_activity();
-                    crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                    begin_agent_session_shutdown(&handle.session_metadata());
                 }
                 sessions.remove(&id)
             };
@@ -1406,9 +1425,9 @@ impl SessionSupervisor {
                     Some(error.context(format!("failed to stop partially restored session {id}")));
             }
             let cleanup_result = match session {
-                Some(session) => crate::codex_app_server::remove_session(&session).await,
+                Some(session) => remove_agent_sessions(&session).await,
                 None => match config::read_session_metadata(&id).await {
-                    Ok(session) => crate::codex_app_server::remove_session(&session).await,
+                    Ok(session) => remove_agent_sessions(&session).await,
                     Err(error) => Err(error)
                         .context("cannot read session metadata for restored-session cleanup"),
                 },
@@ -1574,7 +1593,7 @@ impl SessionSupervisor {
             let handle = {
                 let mut sessions = self.sessions.lock().await;
                 if let Some(handle) = sessions.get(&id) {
-                    crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+                    begin_agent_session_shutdown(&handle.session_metadata());
                 }
                 sessions.remove(&id)
             };
@@ -1588,7 +1607,7 @@ impl SessionSupervisor {
                         ActivityErrorKind::RuntimeUnavailable,
                     ));
                 }
-                let cleanup_result = crate::codex_app_server::remove_session(&session).await;
+                let cleanup_result = remove_agent_sessions(&session).await;
                 let cleanup_failed = if let Err(error) = cleanup_result {
                     eprintln!("Codex task cleanup for ended session {id} failed: {error:#}");
                     true
@@ -1645,7 +1664,7 @@ impl SessionSupervisor {
             sessions.drain().collect::<Vec<_>>()
         };
         for (_, handle) in &handles {
-            crate::codex_app_server::begin_session_shutdown(&handle.session_metadata());
+            begin_agent_session_shutdown(&handle.session_metadata());
         }
         self.restart_specs.lock().await.clear();
         self.public_sessions.lock().await.clear();
@@ -1657,7 +1676,7 @@ impl SessionSupervisor {
             {
                 first_error = Some(error);
             }
-            let cleanup_result = crate::codex_app_server::remove_session(&session).await;
+            let cleanup_result = remove_agent_sessions(&session).await;
             if let Err(error) = cleanup_result
                 && first_error.is_none()
             {

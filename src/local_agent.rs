@@ -2054,7 +2054,7 @@ fn build_opencode_command(
     command
 }
 
-fn opencode_config(access: Access, auth_paths: &[PathBuf]) -> Result<Value> {
+pub(crate) fn opencode_config(access: Access, auth_paths: &[PathBuf]) -> Result<Value> {
     let edit = if access == Access::WorkspaceWrite {
         let mut rules = serde_json::Map::from_iter([
             ("*".to_owned(), json!("allow")),

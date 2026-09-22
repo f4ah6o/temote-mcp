@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[path = "delegation/mod.rs"]
-mod delegation;
+pub(crate) mod delegation;
 
 const PLUGIN_NAME: &str = "temote-mcp";
 const MARKETPLACE: &str = "debug";

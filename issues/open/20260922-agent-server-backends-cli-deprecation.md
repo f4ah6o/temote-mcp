@@ -50,6 +50,10 @@ Codex および OpenCode の delegation / local-agent 経路を、長期的に s
 - parity matrix の各項目が PASS、または棄却理由が記録されている。
 - CLI 経路の legacy 化・削除が docs と code で一致している。
 
+## Progress
+
+- 2026-09-22: Phase 1 実装 — `opencode_status` / `opencode_task_start` / `opencode_task_get` / `opencode_task_control` を追加 (`src/opencode_server.rs`)。task ごとの `opencode serve` を 127.0.0.1 動的 port + instance random Basic-auth password + 隔離 data directory + `OPENCODE_CONFIG_CONTENT` の bounded permission で起動し、`unofficial-opencode-sdk` v1 API (`session create`/`prompt_async`/`abort`/`status`/`messages`、`permission`/`question` list) で駆動する。ownership/lease/receipt/retention/scoped-evidence 契約は codex_app_server と同一。deterministic な prompt `messageID` により start prompt の admission を判別し、crash window を `reconciliation_required` で表現する。module は `network` feature のみで compile し、`--no-default-features` build を維持。live parity (Phase 2) は `opencode` binary が利用可能な環境での実測待ち。
+
 ## Related
 
 - `issues/doing/20260908-08-codex-delegation-dogfood-and-app-server.md` (Codex Phase D live gate)

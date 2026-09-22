@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::{net::SocketAddr, str::FromStr};
 
 #[path = "codex.rs"]
-mod codex;
+pub(crate) mod codex;
 
 use crate::config;
 #[cfg(feature = "network")]
