@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -58,6 +59,25 @@ struct DirectIngressRuntimeState {
     restart_recipe_available: bool,
 }
 
+/// Which derivation produced the direct-ingress runtime directory.
+///
+/// Reported on upgrade observations so callers can explain a divergence
+/// between, for example, a Temote-invoked and a local-shell `upgrade
+/// --dry-run` without exposing raw environment values or directory paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeRootSource {
+    TemoteRuntimeDir,
+    XdgRuntimeDir,
+    HomeCache,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeRoot {
+    path: PathBuf,
+    source: RuntimeRootSource,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DirectIngressUpgradePlan {
     pub active: bool,
@@ -68,6 +88,14 @@ pub struct DirectIngressUpgradePlan {
     pub action: String,
     pub health: String,
     pub reason: Option<String>,
+    pub runtime_root: Option<RuntimeRootSource>,
+    /// Bounded fingerprint of the resolved runtime directory: a truncated
+    /// SHA-256 that only distinguishes same/different roots and reveals no
+    /// path content.
+    pub runtime_root_id: Option<String>,
+    pub pid: Option<i32>,
+    pub host_id: Option<String>,
+    pub state_schema: Option<u64>,
 }
 
 pub struct PreparedDirectIngressUpgrade {
@@ -828,6 +856,8 @@ fn direct_ingress_restart_reason(
 pub async fn prepare_direct_ingress_upgrade(
     target_version: &str,
 ) -> Result<PreparedDirectIngressUpgrade> {
+    let root = runtime_root()?;
+    let root_id = runtime_root_fingerprint(&root.path);
     let inactive = |health: &str, reason: Option<String>| PreparedDirectIngressUpgrade {
         plan: DirectIngressUpgradePlan {
             active: false,
@@ -838,6 +868,11 @@ pub async fn prepare_direct_ingress_upgrade(
             action: "inactive".to_owned(),
             health: health.to_owned(),
             reason,
+            runtime_root: Some(root.source),
+            runtime_root_id: Some(root_id.clone()),
+            pid: None,
+            host_id: None,
+            state_schema: None,
         },
         state: None,
     };
@@ -876,6 +911,11 @@ pub async fn prepare_direct_ingress_upgrade(
                     "running direct ingress predates durable restart metadata; run `temote-mcp down` and start `temote-mcp up` once before automatic upgrade"
                         .to_owned(),
                 ),
+                runtime_root: Some(root.source),
+                runtime_root_id: Some(root_id.clone()),
+                pid: Some(pid),
+                host_id: None,
+                state_schema: None,
             },
             state: None,
         });
@@ -908,6 +948,11 @@ pub async fn prepare_direct_ingress_upgrade(
             action,
             health,
             reason,
+            runtime_root: Some(root.source),
+            runtime_root_id: Some(root_id),
+            pid: Some(state.pid),
+            host_id: Some(state.host_id.clone()),
+            state_schema: Some(state.schema),
         },
         state: Some(state),
     })
@@ -1072,15 +1117,36 @@ fn pid_file(create_parent: bool) -> Result<PathBuf> {
 }
 
 fn runtime_directory() -> Result<PathBuf> {
+    Ok(runtime_root()?.path)
+}
+
+/// The single derivation both dry-run and apply observers use to locate the
+/// direct-ingress runtime directory, together with a bounded label for the
+/// derivation source. Keeping the locator and its source together is what
+/// lets two callers detect that they observed different roots.
+fn runtime_root() -> Result<RuntimeRoot> {
     if let Some(path) = env_path("TEMOTE_MCP_RUNTIME_DIR") {
-        return Ok(path.join("temote-mcp"));
+        return Ok(RuntimeRoot {
+            path: path.join("temote-mcp"),
+            source: RuntimeRootSource::TemoteRuntimeDir,
+        });
     }
     if let Some(path) = env_path("XDG_RUNTIME_DIR") {
-        return Ok(path.join("temote-mcp"));
+        return Ok(RuntimeRoot {
+            path: path.join("temote-mcp"),
+            source: RuntimeRootSource::XdgRuntimeDir,
+        });
     }
     crate::platform_paths::home_dir()
-        .map(|home| home.join(".cache").join("temote-mcp"))
+        .map(|home| RuntimeRoot {
+            path: home.join(".cache").join("temote-mcp"),
+            source: RuntimeRootSource::HomeCache,
+        })
         .context("could not determine a runtime directory")
+}
+
+fn runtime_root_fingerprint(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()))[..16].to_owned()
 }
 
 fn default_tunnel_token_file() -> Result<PathBuf> {
@@ -1882,5 +1948,58 @@ mod tests {
         unsafe { std::env::remove_var("TEMOTE_MCP_RUNTIME_DIR") };
         foreign.kill().unwrap();
         foreign.wait().unwrap();
+    }
+
+    /// Env-deriving runtime roots are process-global, so equivalent and
+    /// divergent observation checks share one test instead of racing the same
+    /// variable across parallel test threads.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ingress_runtime_observations_report_equivalent_and_distinct_roots() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+
+        unsafe { std::env::set_var("TEMOTE_MCP_RUNTIME_DIR", root_a.path()) };
+        let first = prepare_direct_ingress_upgrade("2026.9.0")
+            .await
+            .unwrap()
+            .plan;
+        let second = prepare_direct_ingress_upgrade("2026.9.0")
+            .await
+            .unwrap()
+            .plan;
+        unsafe { std::env::set_var("TEMOTE_MCP_RUNTIME_DIR", root_b.path()) };
+        let divergent = prepare_direct_ingress_upgrade("2026.9.0")
+            .await
+            .unwrap()
+            .plan;
+        unsafe { std::env::remove_var("TEMOTE_MCP_RUNTIME_DIR") };
+
+        // Equivalent observers classify identically and report the same root.
+        assert_eq!(first.action, "inactive");
+        assert_eq!(first.source_version, second.source_version);
+        assert_eq!(first.target_version, second.target_version);
+        assert_eq!(first.action, second.action);
+        assert_eq!(
+            first.runtime_root,
+            Some(RuntimeRootSource::TemoteRuntimeDir)
+        );
+        assert_eq!(first.runtime_root, second.runtime_root);
+        assert_eq!(first.runtime_root_id, second.runtime_root_id);
+        assert!(
+            first
+                .runtime_root_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        );
+
+        // A different runtime root never silently agrees: the observation
+        // carries an explicitly different fingerprint.
+        assert_eq!(divergent.action, "inactive");
+        assert_eq!(divergent.runtime_root, first.runtime_root);
+        assert_ne!(
+            divergent.runtime_root_id, first.runtime_root_id,
+            "observers of different runtime roots must carry distinct identity diagnostics"
+        );
     }
 }

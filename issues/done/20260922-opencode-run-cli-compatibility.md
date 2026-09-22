@@ -52,3 +52,7 @@ The implementation and tests were authored by a delegated coding agent. The coor
 No deployment or restart was performed.
 
 CI and reviewer evidence: `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

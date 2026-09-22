@@ -98,3 +98,7 @@ deterministic tests は exact helper argv、extra local helper rejection、host/
 ## 2026-09-16 polishing update
 
 Current `main` includes repo-scoped GitHub workflow/tag credential routing and the completed bounded Git shim network packet at `issues/done/20260916-git-shim-network-gh-git.md`; this tracker still owns existing-implementation review and live multi-account acceptance.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

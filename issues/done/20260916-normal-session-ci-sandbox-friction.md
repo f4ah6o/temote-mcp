@@ -76,3 +76,7 @@ Temote MCP 自身を Temote の normal sandboxed developer session から開発�
 - `docs/development.md` と `AGENTS.md` に normal sandbox と host/CI の責務分離を記載した。host-only test が outer sandbox で assertion 前に失敗した場合は environment-blocked / NOT RUN と扱う。
 
 `just sandboxed-check` は normal Temote session で exit 0。library deterministic subset 100/100、activity job 5/5、activity coverage 3/3、upgrade transaction 40/40、upgrade coordinator 6/6、gateway 2/2 が PASS。fmt / clippy / no-default-features / diff check も PASS。nested Linux sandbox runtime、full binary/local Unix-socket integration、ignored supervisor/process-boundary E2E は recipe 出力で明示的に `NOT RUN (host/CI gate)` と表示された。push 後 CI の確認が残る。
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".
