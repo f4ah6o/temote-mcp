@@ -58,6 +58,7 @@ const GIT_PULL_UPSTREAM_CONFIGURATION_ERROR: &str =
 const GIT_PUSH_REMOTE_CONFIGURATION_ERROR: &str = "Git push remote configuration is unavailable";
 const GIT_REMOTE_DESTINATION_ERROR: &str = "Git remote destination is unavailable";
 const GIT_REMOTE_DEFAULT_BRANCH_ERROR: &str = "Git remote default branch is unavailable";
+const GIT_REMOTE_TRACKING_REF_ERROR: &str = "Git remote-tracking ref is unavailable or invalid; fetch and inspect the configured remote branch before retrying";
 const GIT_REMOTE_PROTECTION_POLICY_ERROR: &str =
     "Git remote branch protection policy is unavailable";
 const GITHUB_CREDENTIAL_MAPPING_ERROR: &str = "GitHub repository credential mapping is unavailable";
@@ -3448,6 +3449,17 @@ async fn git_branch_delete(
     run_git_branch_delete_and_report(session, pinned, branch, activity).await
 }
 
+/// Runs the structured merged-only branch deletion for the local-agent shim.
+/// The shim supplies no alternate command shape or mutation path; this remains
+/// the same approval, worktree-ownership, recheck, and pinned mutation path as
+/// the structured MCP operation.
+pub(crate) async fn git_branch_delete_for_shim(
+    session: &config::Session,
+    branch: &str,
+) -> Result<Value> {
+    git_branch_delete(&json!({"branch": branch}), session, None).await
+}
+
 async fn git_remote_branch_delete(
     args: &Value,
     session: &config::Session,
@@ -3466,23 +3478,138 @@ async fn git_remote_branch_delete(
         .get("branch")
         .and_then(Value::as_str)
         .context("missing or non-string branch")?;
-    validate_git_branch_name_pinned(&pinned, branch).await?;
     let expected_remote_sha = args
         .get("expected_remote_sha")
         .and_then(Value::as_str)
         .context("missing or non-string expected_remote_sha")?;
+
+    git_remote_branch_delete_with_pinned_repository(
+        session,
+        &pinned,
+        &repository_root,
+        &remote,
+        branch,
+        expected_remote_sha,
+        activity,
+    )
+    .await
+}
+
+/// Runs the ordinary local-agent remote-delete form. The request cwd has
+/// already been validated by the broker; derive the repository root from that
+/// cwd here so nested directories remain valid without allowing the caller to
+/// pair an unrelated root path with a pinned repository.
+pub(crate) async fn git_remote_branch_delete_for_shim(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let repository_root = sandbox::git_worktree_root(cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    let pinned = sandbox::pin_git_repository(&repository_root)?;
+    let expected_remote_sha =
+        resolve_git_remote_tracking_sha_pinned(&pinned, remote, branch).await?;
+    git_remote_branch_delete_with_pinned_repository(
+        session,
+        &pinned,
+        &repository_root,
+        remote,
+        branch,
+        &expected_remote_sha,
+        activity,
+    )
+    .await
+}
+
+/// Resolves the exact fetch-established remote-tracking ref used as the
+/// ordinary shim push-delete lease. This intentionally never contacts the
+/// remote: the tracking ref is the local review snapshot, and every failure is
+/// reduced to one bounded instruction to fetch and inspect before retrying.
+pub(crate) async fn resolve_git_remote_tracking_sha_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    remote: &str,
+    branch: &str,
+) -> Result<String> {
+    validate_git_remote(remote).map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
+    validate_git_branch_name_pinned(pinned, branch)
+        .await
+        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
+    let tracking_ref = format!("refs/remotes/{remote}/{branch}");
+    let output = run_pinned_git_inspection(
+        pinned,
+        &[
+            "git".to_owned(),
+            "show-ref".to_owned(),
+            "--verify".to_owned(),
+            "--hash".to_owned(),
+            tracking_ref,
+        ],
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
+    let sha = parse_git_remote_tracking_sha(&output)
+        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
+    let object = run_pinned_git_inspection(
+        pinned,
+        &[
+            "git".to_owned(),
+            "cat-file".to_owned(),
+            "-e".to_owned(),
+            format!("{sha}^{{object}}"),
+        ],
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
+    anyhow::ensure!(
+        object.status == 0 && !object.truncated,
+        GIT_REMOTE_TRACKING_REF_ERROR
+    );
+    Ok(sha)
+}
+
+fn parse_git_remote_tracking_sha(output: &sandbox::Output) -> Result<String> {
+    anyhow::ensure!(output.status == 0 && !output.truncated);
+    let value = output
+        .stdout
+        .strip_suffix('\n')
+        .context("missing SHA line")?;
+    anyhow::ensure!(!value.is_empty() && !value.contains(['\n', '\r']));
+    validate_git_object_id(value, "remote-tracking SHA")?;
+    Ok(value.to_ascii_lowercase())
+}
+
+/// Deletes one exact remote branch using a repository descriptor pinned by the
+/// caller before tracking-ref resolution. All destination, credential,
+/// default/protection, approval, and lease-mutation operations below use this
+/// same pinned repository.
+pub(crate) async fn git_remote_branch_delete_with_pinned_repository(
+    session: &config::Session,
+    pinned: &sandbox::PinnedGitRepository,
+    repository_root: &Path,
+    remote: &str,
+    branch: &str,
+    expected_remote_sha: &str,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    config::ensure_permitted(session, repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    validate_git_remote(remote)?;
+    validate_git_branch_name_pinned(pinned, branch).await?;
     validate_git_object_id(expected_remote_sha, "expected_remote_sha")?;
     let expected_remote_sha = expected_remote_sha.to_ascii_lowercase();
 
     let destinations =
-        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Push).await?;
+        resolve_git_remote_destinations_pinned(pinned, remote, GitRemoteOperation::Push).await?;
     anyhow::ensure!(
         destinations.urls.len() == 1,
         "remote branch deletion requires exactly one configured push destination"
     );
-    ensure_github_https_destinations_credential_mapping_pinned(&pinned, &destinations).await?;
+    ensure_github_https_destinations_credential_mapping_pinned(pinned, &destinations).await?;
     let fetch_destinations =
-        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Fetch).await?;
+        resolve_git_remote_destinations_pinned(pinned, remote, GitRemoteOperation::Fetch).await?;
     anyhow::ensure!(
         fetch_destinations.urls == destinations.urls,
         "remote branch deletion requires matching fetch and push destinations"
@@ -3495,7 +3622,7 @@ async fn git_remote_branch_delete(
             detail: format!(
                 "remote={remote} branch={branch} expected_remote_sha={expected_remote_sha}"
             ),
-            cwd: repository_root.clone(),
+            cwd: repository_root.to_path_buf(),
             metadata: BTreeMap::new(),
             denial: "user denied Git remote branch deletion",
         },
@@ -3507,7 +3634,7 @@ async fn git_remote_branch_delete(
     // and repository-local credential mapping from the pinned repository, then
     // use only those live values for the remaining authority checks and push.
     let destinations_after =
-        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Push).await?;
+        resolve_git_remote_destinations_pinned(pinned, remote, GitRemoteOperation::Push).await?;
     anyhow::ensure!(
         destinations_after.urls.len() == 1,
         "remote branch deletion requires exactly one configured push destination"
@@ -3517,17 +3644,16 @@ async fn git_remote_branch_delete(
         "configured remote destination changed during approval"
     );
     let fetch_destinations_after =
-        resolve_git_remote_destinations_pinned(&pinned, &remote, GitRemoteOperation::Fetch).await?;
+        resolve_git_remote_destinations_pinned(pinned, remote, GitRemoteOperation::Fetch).await?;
     anyhow::ensure!(
         fetch_destinations_after.urls == destinations_after.urls,
         "remote branch deletion requires matching fetch and push destinations"
     );
-    ensure_github_https_destinations_credential_mapping_pinned(&pinned, &destinations_after)
-        .await?;
+    ensure_github_https_destinations_credential_mapping_pinned(pinned, &destinations_after).await?;
 
     // The remote's live symbolic HEAD is authoritative; a cached
     // refs/remotes/origin/HEAD or a conventional branch name is not sufficient.
-    let default_branch = resolve_remote_default_branch_after_approval(&pinned, &remote).await?;
+    let default_branch = resolve_remote_default_branch_after_approval(pinned, remote).await?;
     anyhow::ensure!(
         branch != default_branch,
         "remote default branch cannot be deleted"
@@ -3540,11 +3666,11 @@ async fn git_remote_branch_delete(
             .context("remote branch deletion destination is unavailable")?,
     )? {
         let protected =
-            github_remote_branch_is_protected_after_approval(&pinned, &repository, branch).await?;
+            github_remote_branch_is_protected_after_approval(pinned, &repository, branch).await?;
         anyhow::ensure!(!protected, "remote protected branch cannot be deleted");
     } else {
         let protected_branches =
-            non_github_remote_protected_branches_after_approval(&pinned, &remote).await?;
+            non_github_remote_protected_branches_after_approval(pinned, remote).await?;
         anyhow::ensure!(
             !protected_branches
                 .iter()
@@ -3553,10 +3679,10 @@ async fn git_remote_branch_delete(
         );
     }
 
-    let command = build_git_remote_branch_delete_command(&remote, branch, &expected_remote_sha);
+    let command = build_git_remote_branch_delete_command(remote, branch, &expected_remote_sha);
     let output = run_pinned_git_output_after_approval(
         session,
-        &pinned,
+        pinned,
         command,
         activity,
         destinations_after.requires_github_credential_mapping(),
@@ -5288,7 +5414,7 @@ async fn approve_local_git_mutation(
     .await
 }
 
-fn validate_git_branch_name_syntax(branch: &str) -> Result<()> {
+pub(crate) fn validate_git_branch_name_syntax(branch: &str) -> Result<()> {
     anyhow::ensure!(!branch.is_empty(), "branch must not be empty");
     anyhow::ensure!(
         branch.len() <= MAX_GIT_BRANCH_NAME_BYTES,

@@ -45,7 +45,7 @@ pub(crate) const BROKER_RESPONSES_ENVIRONMENT_VARIABLE: &str =
 pub(crate) const GIT_EXECUTABLE_ENVIRONMENT_VARIABLE: &str = "TEMOTE_MCP_GIT_EXECUTABLE";
 pub(crate) const SHIM_EXIT_REJECTED: i32 = 128;
 pub(crate) const SHIM_EXIT_INDETERMINATE: i32 = 70;
-pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, worktree list [--porcelain], worktree add [-b <new-branch>] <broker-derived-managed-path> [<existing-branch>], worktree remove <broker-derived-managed-path>, fetch [--prune] [<configured-remote>], pull [--ff-only], push [-u] [<configured-remote>], and the read-only commands status, diff, log, show, rev-parse, ls-files";
+pub(crate) const SHIM_REJECTION_MESSAGE: &str = "git shim supports only: switch <existing-branch>, switch -c <new-branch>, add <path>..., commit -m <message>, branch -d <merged-local-branch>, worktree list [--porcelain], worktree add [-b <new-branch>] <broker-derived-managed-path> [<existing-branch>], worktree remove <broker-derived-managed-path>, fetch [--prune] [<configured-remote>], pull [--ff-only], push [-u] [<configured-remote>], push <configured-remote> --delete <branch>, and the read-only commands status, diff, log, show, rev-parse, ls-files";
 pub(crate) const SHIM_INDETERMINATE_MESSAGE: &str = "git shim could not confirm the operation result; the operation may still be running; inspect the repository before retrying";
 const BROKER_SCHEMA: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -75,6 +75,10 @@ enum ShimCommand {
     SwitchCreate,
     Add,
     Commit,
+    /// `branch -d` — delegated to the structured merged-only branch delete.
+    BranchDelete {
+        branch: String,
+    },
     /// `worktree list [--porcelain]` — served from the managed inventory.
     WorktreeList,
     /// `worktree add` — the destination must be the broker-derived managed
@@ -98,6 +102,12 @@ enum ShimCommand {
     Push {
         remote: Option<String>,
         set_upstream: bool,
+    },
+    /// `push <configured-remote> --delete <branch>` — the expected lease is
+    /// bound by the broker from the exact local remote-tracking ref.
+    RemoteBranchDelete {
+        remote: String,
+        branch: String,
     },
 }
 
@@ -145,14 +155,51 @@ fn classify_argv(argv: &[String]) -> Result<ShimCommand> {
             mcp::validate_git_commit_message(message)?;
             Ok(ShimCommand::Commit)
         }
+        [command, option, branch] if command.as_str() == "branch" && option == "-d" => {
+            validate_shim_cleanup_branch(branch)?;
+            Ok(ShimCommand::BranchDelete {
+                branch: branch.clone(),
+            })
+        }
         [command, subcommand, rest @ ..] if command.as_str() == "worktree" => {
             classify_worktree_argv(subcommand, rest)
         }
         [command, rest @ ..] if command.as_str() == "fetch" => classify_fetch(rest),
         [command, rest @ ..] if command.as_str() == "pull" => classify_pull(rest),
+        [command, remote, option, branch] if command.as_str() == "push" && option == "--delete" => {
+            validate_shim_remote(remote)?;
+            validate_shim_cleanup_branch(branch)?;
+            Ok(ShimCommand::RemoteBranchDelete {
+                remote: remote.clone(),
+                branch: branch.clone(),
+            })
+        }
         [command, rest @ ..] if command.as_str() == "push" => classify_push(rest),
         _ => anyhow::bail!("unsupported Git shim command"),
     }
+}
+
+/// Classifies a cleanup branch before any repository inspection. The
+/// structured operation performs the authoritative Git `check-ref-format`
+/// validation; this layer rejects refspec/revision/glob forms early so the
+/// ordinary shim syntax cannot carry an arbitrary ref.
+fn validate_shim_cleanup_branch(branch: &str) -> Result<()> {
+    mcp::validate_git_branch_name_syntax(branch)?;
+    anyhow::ensure!(
+        !branch.chars().any(|character| {
+            matches!(character, '*' | '?' | '[' | ']' | '~' | '^' | ':' | '\\')
+        }),
+        "cleanup branch must be an exact branch name, not a glob or revision"
+    );
+    anyhow::ensure!(
+        !branch.contains("..") && !branch.contains("@{") && !branch.contains("//"),
+        "cleanup branch must be an exact branch name, not a ref expression"
+    );
+    anyhow::ensure!(
+        !branch.ends_with('/') && !branch.ends_with(".lock"),
+        "cleanup branch must be an exact branch name"
+    );
+    Ok(())
 }
 
 /// Classifies the bounded network allowlist.
@@ -952,6 +999,11 @@ async fn handle_request_inner(
             let command = mcp::build_git_commit_command(&request.argv[2]);
             run_git_command(state, &workspace, command).await
         }
+        ShimCommand::BranchDelete { branch } => {
+            let operation = state.operation_session(&cwd);
+            let result = mcp::git_branch_delete_for_shim(&operation, &branch).await;
+            Ok(structured_shim_output(result))
+        }
         ShimCommand::WorktreeList => {
             let src_root = match managed_src_root_or_output(state) {
                 Ok(src_root) => src_root,
@@ -1063,6 +1115,13 @@ async fn handle_request_inner(
             Ok(shim_output_or_error(
                 mcp::git_push_output(&operation, cwd, remote, set_upstream, None).await,
             ))
+        }
+        ShimCommand::RemoteBranchDelete { remote, branch } => {
+            let operation = state.operation_session(&cwd);
+            let result =
+                mcp::git_remote_branch_delete_for_shim(&operation, &cwd, &remote, &branch, None)
+                    .await;
+            Ok(structured_shim_output(result))
         }
     }
 }
@@ -2477,6 +2536,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cleanup_classifier_accepts_only_exact_local_and_remote_delete_forms() {
+        assert_eq!(
+            classify_argv(&argv(&["branch", "-d", "merged"])).unwrap(),
+            ShimCommand::BranchDelete {
+                branch: "merged".to_owned()
+            }
+        );
+        assert_eq!(
+            classify_argv(&argv(&["push", "origin", "--delete", "review"])).unwrap(),
+            ShimCommand::RemoteBranchDelete {
+                remote: "origin".to_owned(),
+                branch: "review".to_owned(),
+            }
+        );
+
+        for values in [
+            vec!["branch"],
+            vec!["branch", "-d"],
+            vec!["branch", "-d", "merged", "extra"],
+            vec!["branch", "-D", "merged"],
+            vec!["branch", "--delete", "merged"],
+            vec!["branch", "-d", "merged*"],
+            vec!["branch", "-d", "refs/heads/merged"],
+            vec!["branch", "-d", "HEAD~1"],
+            vec!["branch", "-d", "merged:other"],
+            vec!["branch", "-d", "-merged"],
+            vec!["branch", "-d", ""],
+            vec!["push", "--delete", "origin", "review"],
+            vec!["push", "origin", "-d", "review"],
+            vec!["push", "origin", "--delete"],
+            vec!["push", "origin", "--delete", "review", "extra"],
+            vec!["push", "origin", "review", "--delete"],
+            vec!["push", "origin", "--delete", "refs/heads/review"],
+            vec!["push", "origin", "--delete", "review:other"],
+            vec!["push", "origin", "--delete", "review*"],
+            vec!["push", "origin", "--delete", "-D"],
+            vec!["push", "--force", "origin", "--delete", "review"],
+            vec![
+                "push",
+                "-c",
+                "core.hooksPath=/tmp",
+                "origin",
+                "--delete",
+                "review",
+            ],
+            vec![
+                "push",
+                "https://github.com/example/repo.git",
+                "--delete",
+                "review",
+            ],
+            vec![
+                "push",
+                "origin",
+                "--delete",
+                "refs/heads/review:refs/heads/other",
+            ],
+        ] {
+            assert!(classify_argv(&argv(&values)).is_err(), "{values:?}");
+        }
+    }
+
     fn network_shim_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let fixture = tempfile::tempdir().unwrap();
         let src_root = std::fs::canonicalize(fixture.path()).unwrap();
@@ -2598,6 +2720,246 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repository.join("tracked.txt")).unwrap(),
             "local-dirty\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn shim_cleanup_deletes_only_reviewed_local_and_remote_refs_from_nested_cwd() {
+        let (_fixture, src_root, repository, remote) = network_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let state = BrokerState {
+            src_root: None,
+            ..broker_state
+        };
+        run_host_git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "temote.remote.origin.protectedBranch",
+                "main",
+            ],
+        );
+
+        // The local target is already merged; the remote target is reviewed by
+        // the fetch-established tracking ref. Both unrelated refs stay alive.
+        run_host_git(&repository, &["branch", "merged-cleanup"]);
+        run_host_git(&repository, &["branch", "remote-cleanup"]);
+        run_host_git(&repository, &["branch", "unrelated-local"]);
+        run_host_git(
+            &repository,
+            &["push", "--quiet", "origin", "remote-cleanup"],
+        );
+        run_host_git(
+            &repository,
+            &["push", "--quiet", "origin", "unrelated-local"],
+        );
+        run_host_git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        run_host_git(&repository, &["fetch", "--quiet", "origin"]);
+        assert!(git_ref_exists(
+            &repository,
+            "refs/remotes/origin/remote-cleanup"
+        ));
+        let unrelated_remote_sha = run_host_git(
+            &repository,
+            &["rev-parse", "refs/remotes/origin/unrelated-local"],
+        );
+        std::fs::write(repository.join("tracked.txt"), "keep-dirty\n").unwrap();
+        std::fs::write(repository.join("unrelated-untracked.txt"), "keep\n").unwrap();
+        let dirty_status = run_host_git(&repository, &["status", "--porcelain"]);
+        let nested_cwd = repository.join("nested");
+        std::fs::create_dir(&nested_cwd).unwrap();
+
+        let local = handle_request(
+            &state,
+            request(&repository, &["branch", "-d", "merged-cleanup"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(local.status, 0, "{}", local.stderr);
+        assert!(!git_ref_exists(&repository, "refs/heads/merged-cleanup"));
+        assert!(git_ref_exists(&repository, "refs/heads/unrelated-local"));
+
+        let remote_delete = handle_request(
+            &state,
+            request(
+                &nested_cwd,
+                &["push", "origin", "--delete", "remote-cleanup"],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(remote_delete.status, 0, "{}", remote_delete.stderr);
+        assert!(!git_ref_exists(&remote, "refs/heads/remote-cleanup"));
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/unrelated-local"]),
+            unrelated_remote_sha
+        );
+        assert_eq!(
+            run_host_git(
+                &repository,
+                &["rev-parse", "refs/remotes/origin/unrelated-local"]
+            ),
+            unrelated_remote_sha,
+            "remote deletion must not rewrite an unrelated tracking ref"
+        );
+        assert_eq!(
+            run_host_git(&repository, &["status", "--porcelain"]),
+            dirty_status,
+            "cleanup must preserve unrelated dirty and untracked work"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("unrelated-untracked.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn shim_remote_delete_requires_a_fetch_established_tracking_ref() {
+        let (_fixture, src_root, repository, remote) = network_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let state = BrokerState {
+            src_root: None,
+            ..broker_state
+        };
+        run_host_git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "temote.remote.origin.protectedBranch",
+                "main",
+            ],
+        );
+        run_host_git(&repository, &["branch", "missing-tracking"]);
+        run_host_git(
+            &repository,
+            &["push", "--quiet", "origin", "missing-tracking"],
+        );
+        run_host_git(
+            &repository,
+            &["update-ref", "-d", "refs/remotes/origin/missing-tracking"],
+        );
+        assert!(git_ref_exists(&remote, "refs/heads/missing-tracking"));
+
+        let rejected = handle_request(
+            &state,
+            request(
+                &repository,
+                &["push", "origin", "--delete", "missing-tracking"],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert!(
+            rejected.stderr.contains("fetch and inspect"),
+            "{}",
+            rejected.stderr
+        );
+        assert!(
+            git_ref_exists(&remote, "refs/heads/missing-tracking"),
+            "missing review context must fail before remote mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn shim_remote_delete_uses_the_tracking_ref_as_a_stale_lease() {
+        let (_fixture, src_root, repository, remote) = network_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let state = BrokerState {
+            src_root: None,
+            ..broker_state
+        };
+        run_host_git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "temote.remote.origin.protectedBranch",
+                "main",
+            ],
+        );
+        run_host_git(&repository, &["branch", "stale-cleanup"]);
+        run_host_git(&repository, &["push", "--quiet", "origin", "stale-cleanup"]);
+        run_host_git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        run_host_git(&repository, &["fetch", "--quiet", "origin"]);
+        let stale_tip = run_host_git(
+            &repository,
+            &["rev-parse", "refs/remotes/origin/stale-cleanup"],
+        );
+
+        run_host_git(
+            &repository,
+            &["switch", "--quiet", "-c", "remote-drift-source"],
+        );
+        std::fs::write(repository.join("remote-drift.txt"), "drift\n").unwrap();
+        run_host_git(&repository, &["add", "remote-drift.txt"]);
+        run_host_git(&repository, &["commit", "--quiet", "-m", "remote drift"]);
+        run_host_git(
+            &repository,
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                "remote-drift-source:remote-drift-source",
+            ],
+        );
+        let drifted_source = run_host_git(&repository, &["rev-parse", "remote-drift-source"]);
+        run_host_git(
+            &remote,
+            &[
+                "update-ref",
+                "refs/heads/stale-cleanup",
+                drifted_source.as_str(),
+            ],
+        );
+        run_host_git(&repository, &["switch", "--quiet", "main"]);
+        let live_tip = run_host_git(&remote, &["rev-parse", "refs/heads/stale-cleanup"]);
+        assert_ne!(stale_tip, live_tip);
+        assert_eq!(
+            run_host_git(
+                &repository,
+                &["rev-parse", "refs/remotes/origin/stale-cleanup"]
+            ),
+            stale_tip
+        );
+
+        let rejected = handle_request(
+            &state,
+            request(
+                &repository,
+                &["push", "origin", "--delete", "stale-cleanup"],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rejected.status, 0);
+        assert!(
+            rejected.stderr.contains("stale info"),
+            "{}",
+            rejected.stderr
+        );
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/stale-cleanup"]),
+            live_tip,
+            "a stale tracking ref must not delete the concurrently updated branch"
         );
     }
 
@@ -3315,6 +3677,17 @@ mod tests {
         )
     }
 
+    fn git_ref_exists(path: &Path, reference: &str) -> bool {
+        Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", reference])
+            .current_dir(path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("host git must be installed for this test")
+            .success()
+    }
+
     #[tokio::test]
     async fn linked_worktree_scope_pins_metadata_below_the_primary_checkout() {
         let fixture = tempfile::tempdir().unwrap();
@@ -3920,10 +4293,12 @@ mod tests {
             vec!["switch", "-c", "feature/x"],
             vec!["add", "tracked.txt"],
             vec!["commit", "-m", "x"],
+            vec!["branch", "-d", "merged"],
             vec!["fetch", "--prune"],
             vec!["pull", "--ff-only"],
             vec!["push"],
             vec!["push", "-u", "origin"],
+            vec!["push", "origin", "--delete", "review"],
             vec!["worktree", "list"],
             vec!["worktree", "remove", "/src/worktrees/repo/task"],
         ] {
