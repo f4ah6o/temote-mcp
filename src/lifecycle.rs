@@ -917,7 +917,7 @@ fn spawn_direct_ingress(
     executable: &Path,
     installed_locator: &Path,
     state: &DirectIngressRuntimeState,
-) -> Result<()> {
+) -> Result<std::process::Child> {
     let profile = parse_runtime_profile(state)?;
     let mut command = Command::new(executable);
     command.env(
@@ -946,13 +946,45 @@ fn spawn_direct_ingress(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // The restarted ingress is owned by the OS session, not the upgrade
+    // caller: it becomes a session leader so a teardown of the caller's
+    // process group or controlling terminal cannot take it down.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command.spawn().with_context(|| {
         format!(
             "failed to restart direct ingress with {}",
             executable.display()
         )
-    })?;
-    Ok(())
+    })
+}
+
+/// Removes the PID file and runtime state left behind by a failed ingress
+/// restart, but only while the recorded slot still belongs to the failed
+/// spawn. `down()` refuses to signal a non-Temote process, so a stale slot
+/// that was re-claimed by something else is left untouched.
+async fn cleanup_failed_ingress_spawn(spawned_pid: u32) -> Result<()> {
+    let pid_path = pid_file(false)?;
+    let mut handle = match open_readonly_nofollow(&pid_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", pid_path.display()));
+        }
+    };
+    let recorded = read_pid_from_open_file(&mut handle, &pid_path)?;
+    if recorded != spawned_pid as i32 {
+        return Ok(());
+    }
+    down().await
 }
 
 pub async fn apply_direct_ingress_upgrade(
@@ -986,26 +1018,48 @@ pub async fn apply_direct_ingress_upgrade(
     );
     validate_restart_recipe(expected)?;
     down().await?;
-    spawn_direct_ingress(executable, installed_locator, expected)?;
+    let mut child = spawn_direct_ingress(executable, installed_locator, expected)?;
+    let spawned_pid = child.id();
 
     let deadline = tokio::time::Instant::now() + INGRESS_RESTART_TIMEOUT;
-    loop {
-        let status = prepare_direct_ingress_upgrade(&prepared.plan.target_version).await?;
-        if status.plan.action == "untouched"
-            && status.plan.source_version.as_deref() == Some(prepared.plan.target_version.as_str())
-            && status.plan.health == "healthy"
+    let restart_error = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll the restarted direct ingress")?
         {
-            let mut result = status.plan;
-            result.action = "restarted".to_owned();
-            result.reason = Some("restart completed and /healthz returned HTTP 200".to_owned());
-            return Ok(result);
+            break anyhow::anyhow!(
+                "restarted direct ingress exited with {status} before becoming healthy"
+            );
         }
+        let status = prepare_direct_ingress_upgrade(&prepared.plan.target_version).await;
+        match status {
+            Ok(status)
+                if status.plan.action == "untouched"
+                    && status.plan.source_version.as_deref()
+                        == Some(prepared.plan.target_version.as_str())
+                    && status.plan.health == "healthy" =>
+            {
+                let mut result = status.plan;
+                result.action = "restarted".to_owned();
+                result.reason = Some("restart completed and /healthz returned HTTP 200".to_owned());
+                return Ok(result);
+            }
+            Ok(_) => {}
+            Err(error) => break error,
+        };
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
+            break anyhow::anyhow!(
                 "direct ingress restart did not become healthy within the bounded verification window"
             );
         }
         sleep(Duration::from_millis(100)).await;
+    };
+    let cleanup = cleanup_failed_ingress_spawn(spawned_pid).await;
+    match cleanup {
+        Ok(()) => Err(restart_error),
+        Err(cleanup_error) => Err(restart_error.context(format!(
+            "stale ingress state cleanup also failed: {cleanup_error:#}"
+        ))),
     }
 }
 
@@ -1728,5 +1782,105 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("stale source boot generation"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restarted_ingress_becomes_a_session_leader_detached_from_the_caller() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("stub-ingress");
+        std::fs::write(&stub, b"#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = DirectIngressRuntimeState {
+            schema: RUNTIME_STATE_SCHEMA_VERSION,
+            ownership: RUNTIME_STATE_OWNERSHIP.to_owned(),
+            pid: -1,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            profile: "openai".to_owned(),
+            host_id: "host-test".to_owned(),
+            addr: "127.0.0.1:9".parse().unwrap(),
+            public_url: None,
+            tunnel_token_file: None,
+            openai_tunnel_id: None,
+            tunnel_client_bin: None,
+            restart_context_keys: Vec::new(),
+            restart_recipe_available: false,
+        };
+
+        let mut child = spawn_direct_ingress(&stub, &stub, &state)
+            .expect("failed to spawn detached ingress stub");
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields = stat
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        // After comm: state, ppid, pgrp, session.
+        let pgrp = fields[2].parse::<u32>().unwrap();
+        let session = fields[3].parse::<u32>().unwrap();
+        assert_eq!(
+            pgrp, pid,
+            "restarted ingress must lead its own process group"
+        );
+        assert_eq!(session, pid, "restarted ingress must lead its own session");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_ingress_cleanup_preserves_foreign_slots_and_clears_owned_stale_ones() {
+        use std::os::fd::AsRawFd;
+
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("TEMOTE_MCP_RUNTIME_DIR", temp.path()) };
+        let runtime = temp.path().join("temote-mcp");
+        std::fs::create_dir(&runtime).unwrap();
+        let pid_path = runtime.join(PID_FILE_NAME);
+
+        // A slot recording a different pid is never touched.
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pid_path, format!("{}\n", foreign.id())).unwrap();
+        cleanup_failed_ingress_spawn(u32::MAX).await.unwrap();
+        assert!(
+            pid_path.exists(),
+            "a foreign-owned slot must be left intact"
+        );
+
+        // The stale slot still owned by the failed spawn is removed without
+        // signaling the recorded (non-Temote) process: nothing holds its lock.
+        cleanup_failed_ingress_spawn(foreign.id()).await.unwrap();
+        assert!(!pid_path.exists(), "the owned stale slot must be removed");
+        assert!(
+            process_exists(foreign.id() as i32),
+            "the foreign process must not be signaled"
+        );
+
+        // A foreign process holding the slot lock fails closed: the state is
+        // preserved and the process is never signaled.
+        std::fs::write(&pid_path, format!("{}\n", foreign.id())).unwrap();
+        let lock = std::fs::File::open(&pid_path).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let error = cleanup_failed_ingress_spawn(foreign.id())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unexpected process"),
+            "{error:#}"
+        );
+        assert!(pid_path.exists(), "a locked foreign slot must be preserved");
+        assert!(process_exists(foreign.id() as i32));
+
+        drop(lock);
+        unsafe { std::env::remove_var("TEMOTE_MCP_RUNTIME_DIR") };
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
     }
 }
