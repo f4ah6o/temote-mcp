@@ -1,6 +1,6 @@
 # Local-agent Git shim slice 3: map worktree syntax onto Temote-managed lifecycle
 
-Status: polished
+Status: done — existing implementation verified at `a3591d7`.
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`
 Depends on: `20260916-managed-worktree-create-list.md` + `20260916-managed-worktree-session-integration.md` + `20260916-structured-worktree-remove.md`
@@ -28,3 +28,7 @@ The broker owns worktree location and lifecycle; the shim is only a compatibilit
 - dirty/active/legacy/sibling worktrees are preserved according to broker rules;
 - local-agent protected Git metadata boundaries remain intact;
 - focused tests and `just sandboxed-check` pass.
+
+## Completion review — 2026-09-22
+
+`shim_worktree_forms_delegate_to_the_managed_broker` and `shim_worktree_remove_rejects_dirty_worktrees_and_missing_src_authority` pass with the managed lifecycle containment tests in Linux and macOS CI. The broker continues to own placement and protected metadata; no arbitrary path or legacy adoption was added. Constituent gate evidence is in `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`. Later branch-delete/cleanup macOS failures remain separate, unresolved work.

@@ -1,6 +1,6 @@
 # Local-agent Git shim slice 4: fetch/pull/push with repo-scoped gh-git identity
 
-Status: polished
+Status: done — bounded source packet verified at `a3591d7`; live matrix remains Phase 4.
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`
 Depends on: `20260916-git-shim-worktree.md`
@@ -23,3 +23,7 @@ Reject force, arbitrary URL/refspec, config/helper injection, and unknown networ
 ## Acceptance
 
 Deterministic tests cover command validation and concurrent repo identity separation. Live GitHub account behavior is recorded in Phase 4; repository-local gates must pass first.
+
+## Completion review — 2026-09-22
+
+Configured-remote network forms, single-branch push despite configured multi-branch refspecs, follow-tags suppression, and concurrent repository-local GitHub credential selection tests pass in Linux and macOS CI. The real repository binding resolved to `f4ah6o` and scoped pushes succeeded without a global account switch; this is not the full live account matrix. Evidence: `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`.

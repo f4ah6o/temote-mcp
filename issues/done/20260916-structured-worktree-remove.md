@@ -1,6 +1,6 @@
 # Managed worktree broker slice 3: safe structured worktree remove
 
-Status: polished
+Status: done — existing implementation verified at `a3591d7`.
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-temote-managed-worktree-broker.md`
 Depends on: `20260916-managed-worktree-create-list.md` + session/job ownership evidence
@@ -26,3 +26,7 @@ Do not delete branches, remote refs, or real directories unrelated to the select
 - existing canonical checkout and unrelated worktrees are unchanged;
 - public/gateway contract snapshots are synchronized if this operation is public;
 - focused tests and `just sandboxed-check` pass.
+
+## Completion review — 2026-09-22
+
+The existing managed remove implementation passes clean-selection, dirty/untracked, owner/current-cwd, wrong-repository, arbitrary-path, symlink/root-swap, and repeated-removal tests in Linux and macOS CI. Gateway contract checks pass. Constituent repository gates and the distinction between CI execution and the locally blocked `just` wrapper are recorded in `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`. No real user worktree was removed during this review.

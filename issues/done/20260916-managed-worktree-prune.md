@@ -1,6 +1,6 @@
 # Managed worktree broker slice 4: metadata-only prune
 
-Status: polished
+Status: done — existing implementation verified at `a3591d7`.
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-temote-managed-worktree-broker.md`
 Depends on: `20260916-managed-worktree-create-list.md` + `20260916-structured-worktree-remove.md`
@@ -27,3 +27,7 @@ Do not delete branches or remote refs in this packet.
 - active session/job ownership prevents conflicting cleanup;
 - repeated prune is idempotent;
 - focused tests and `just sandboxed-check` pass.
+
+## Completion review — 2026-09-22
+
+The existing metadata-only prune implementation passes stale-metadata/filesystem preservation, idempotence, owner refusal, path-input rejection, and bounded-output tests in Linux and macOS CI. The repository-gate evidence and local wrapper limitation are recorded in `docs/evaluations/20260922-interrupted-opencode-recovery-review.md`. Branch/ref deletion and live repository cleanup are not part of this closure.
