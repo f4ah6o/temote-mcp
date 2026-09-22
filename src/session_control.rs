@@ -1639,7 +1639,11 @@ async fn handle_upgrade_request(
         }
     };
 
-    let helper_generation = classify_helper_generation(&executable);
+    // The execution path is a private snapshot that does not carry the bundled
+    // sandbox helper; the upgraded supervisor resolves its helper next to the
+    // installed locator, so that is the bundle whose generation is classified.
+    let helper_generation =
+        classify_helper_generation(installed_locator.as_deref().unwrap_or(&executable));
 
     if dry_run {
         let preview = supervisor
