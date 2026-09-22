@@ -1699,7 +1699,21 @@ fn upgrade_plan_directory() -> Result<PathBuf> {
     Ok(config::state_dir()?.join("upgrade"))
 }
 
+// Parallel tests in this binary share one process-wide state root, so a
+// restore-plan writer (or a fixture parked by a test) must not overlap a
+// session-GC scan of the same directory. Hold this for the full duration a
+// restore-*.json file exists in an inconsistent state; do not hold it across
+// calls that take it internally (write_upgrade_plan, remove_upgrade_plan,
+// protected_upgrade_session_ids).
+#[cfg(test)]
+fn upgrade_plan_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 fn write_upgrade_plan(plan: &SupervisorUpgradePlan) -> Result<PathBuf> {
+    #[cfg(test)]
+    let _guard = upgrade_plan_test_lock();
     let directory = upgrade_plan_directory()?;
     std::fs::create_dir_all(&directory).with_context(|| {
         format!(
@@ -1995,6 +2009,8 @@ fn format_upgrade_failure_report(report: &UpgradeFailureReport) -> String {
 }
 
 fn remove_upgrade_plan(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    let _guard = upgrade_plan_test_lock();
     validate_upgrade_plan_path(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -4007,6 +4023,12 @@ async fn build_retention_plan(owned: &HashSet<String>) -> Result<RetentionPlan> 
 }
 
 fn protected_upgrade_session_ids() -> Result<HashSet<String>> {
+    #[cfg(test)]
+    let _guard = upgrade_plan_test_lock();
+    scan_upgrade_restore_plans()
+}
+
+fn scan_upgrade_restore_plans() -> Result<HashSet<String>> {
     let directory = upgrade_plan_directory()?;
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -5867,9 +5889,34 @@ mod tests {
     }
 
     #[test]
+    fn restore_plan_scan_still_fails_closed_on_a_malformed_plan() {
+        // Hold the serialization guard while a malformed restore-*.json
+        // fixture exists in the shared state root so no concurrent session-GC
+        // scan can observe it; the scan itself must still fail closed.
+        let _guard = upgrade_plan_test_lock();
+        let directory = upgrade_plan_directory().unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plan_path = directory.join(format!("restore-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&plan_path, b"{}").unwrap();
+        std::fs::set_permissions(&plan_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = scan_upgrade_restore_plans().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("a supervisor restore plan could not be read safely"),
+            "{error:#}"
+        );
+        std::fs::remove_file(&plan_path).unwrap();
+    }
+
+    #[test]
     fn upgrade_failure_report_rejects_outside_paths_symlinks_and_oversize() {
         use std::os::unix::fs::symlink;
 
+        // The restore-*.json fixture below parks an unreadable plan in the
+        // shared state root for the whole test; keep session-GC scans out
+        // while it exists.
+        let _guard = upgrade_plan_test_lock();
         let (_plan, report) = failure_report_fixture("not-written");
         let outside = tempfile::tempdir().unwrap();
         let outside_report = outside.path().join("restore-outside.failure.json");
