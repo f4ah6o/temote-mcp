@@ -2031,19 +2031,18 @@ fn build_codex_command(
 
 fn build_opencode_command(
     executable: &str,
-    cwd: &str,
+    _cwd: &str,
     task: &str,
     model: Option<&str>,
     profile: Option<&str>,
 ) -> Vec<String> {
+    // The outer canonical cwd is owned and applied by LocalAgentScope.
     let mut command = vec![
         executable.to_owned(),
         "run".to_owned(),
-        "--pure".to_owned(),
+        "--standalone".to_owned(),
         "--format".to_owned(),
         "json".to_owned(),
-        "--dir".to_owned(),
-        cwd.to_owned(),
     ];
     if let Some(model) = model {
         command.extend(["--model".to_owned(), model.to_owned()]);
@@ -2521,6 +2520,89 @@ mod tests {
                 .iter()
                 .any(|value| value.contains("\"/workspace\"=\"write\""))
         );
+    }
+
+    #[test]
+    fn opencode_command_uses_supported_full_argv() {
+        let command = build_opencode_command(
+            "opencode",
+            "/workspace",
+            "implement the task",
+            Some("provider/model#variant"),
+            Some("default"),
+        );
+
+        assert_eq!(
+            command,
+            vec![
+                "opencode",
+                "run",
+                "--standalone",
+                "--format",
+                "json",
+                "--model",
+                "provider/model#variant",
+                "--agent",
+                "default",
+                "--",
+                "implement the task",
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_command_uses_supported_minimal_argv() {
+        let command =
+            build_opencode_command("opencode", "/workspace", "implement the task", None, None);
+
+        assert_eq!(
+            command,
+            vec![
+                "opencode",
+                "run",
+                "--standalone",
+                "--format",
+                "json",
+                "--",
+                "implement the task",
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_command_keeps_cwd_out_and_task_delimited() {
+        let cwd = "/workspace/--server value";
+        let task = "--server value --auto --continue";
+        let command = build_opencode_command("opencode", cwd, task, None, None);
+
+        assert_eq!(
+            command,
+            vec![
+                "opencode",
+                "run",
+                "--standalone",
+                "--format",
+                "json",
+                "--",
+                "--server value --auto --continue",
+            ]
+        );
+        assert!(!command.iter().any(|argument| argument == cwd));
+        for prohibited in [
+            "--server",
+            "--continue",
+            "--session",
+            "--auto",
+            "--pure",
+            "--dir",
+        ] {
+            assert!(!command.iter().any(|argument| argument == prohibited));
+        }
+        assert_eq!(
+            command.iter().filter(|argument| *argument == "--").count(),
+            1
+        );
+        assert_eq!(command.last().map(String::as_str), Some(task));
     }
 
     #[test]
