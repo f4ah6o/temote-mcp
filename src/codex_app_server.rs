@@ -4433,8 +4433,16 @@ for raw in sys.stdin:
             let id = id.clone();
             tokio::spawn(async move { supervisor.stop(&id).await })
         };
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(!config::session_is_active(&id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !config::session_is_active(&id).await.unwrap() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("session did not enter the inactive stopping state");
 
         let mut starting = {
             let supervisor = Arc::clone(&supervisor);
@@ -5343,6 +5351,7 @@ for raw in sys.stdin:
         const READY: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_READY";
         const RELEASE: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_RELEASE";
         const STOPPED: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_STOPPED";
+        const OWNER: &str = "TEMOTE_TEST_CODEX_CROSS_PROCESS_OWNER";
 
         if let Some(role) = std::env::var_os(ROLE) {
             let store = TaskStore::new(PathBuf::from(std::env::var_os(STORE).unwrap()));
@@ -5351,6 +5360,7 @@ for raw in sys.stdin:
             let ready = PathBuf::from(std::env::var_os(READY).unwrap());
             let release = PathBuf::from(std::env::var_os(RELEASE).unwrap());
             let stopped = PathBuf::from(std::env::var_os(STOPPED).unwrap());
+            let owner_path = PathBuf::from(std::env::var_os(OWNER).unwrap());
             match role.to_str().unwrap() {
                 "holder" => {
                     let _lease = store
@@ -5375,6 +5385,12 @@ for raw in sys.stdin:
                 "runtime-holder" => {
                     let (session_handle, owner) =
                         active_test_session(&workspace, "cross-process-live-owner", true).await;
+                    let socket_path = config::socket_path(&owner.id).unwrap();
+                    std::fs::write(
+                        &owner_path,
+                        serde_json::to_vec(&(owner.clone(), socket_path)).unwrap(),
+                    )
+                    .unwrap();
                     store
                         .save(&task_record(
                             &owner,
@@ -5466,6 +5482,7 @@ for raw in sys.stdin:
         let current_exe = std::env::current_exe().unwrap();
         let spawn_child = |role: &str, child_task_id: Uuid, ready: &Path, release: &Path| {
             let stopped = ready.with_extension("stopped");
+            let owner = ready.with_extension("owner.json");
             ChildGuard::new(
                 std::process::Command::new(&current_exe)
                     .args(["--exact", TEST_NAME, "--nocapture"])
@@ -5476,6 +5493,7 @@ for raw in sys.stdin:
                     .env(READY, ready)
                     .env(RELEASE, release)
                     .env(STOPPED, stopped)
+                    .env(OWNER, owner)
                     .spawn()
                     .unwrap(),
             )
@@ -5643,10 +5661,15 @@ for raw in sys.stdin:
                 .unwrap()
                 .is_none()
         );
-        let watched_owner = config::read_session_metadata("cross-process-live-owner")
-            .await
-            .unwrap();
-        std::fs::remove_file(config::socket_path(&watched_owner.id).unwrap()).unwrap();
+        let watched_owner_path = watched_ready.with_extension("owner.json");
+        let (watched_owner, watched_socket): (config::Session, PathBuf) =
+            serde_json::from_slice(&std::fs::read(watched_owner_path).unwrap()).unwrap();
+        assert_eq!(watched_owner.id, "cross-process-live-owner");
+        assert_eq!(
+            watched_owner.cwd,
+            std::fs::canonicalize(&workspace).unwrap()
+        );
+        std::fs::remove_file(watched_socket).unwrap();
         wait_for_marker(&watched_stopped).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -6749,20 +6772,29 @@ for raw in sys.stdin:
     }
 
     #[tokio::test]
-    async fn app_server_rejects_incompatible_and_oversized_protocol() {
+    async fn app_server_accepts_arbitrary_peer_version_and_rejects_oversized_protocol() {
         let root = tempfile::tempdir().unwrap();
         let session = session(root.path(), "protocol", true);
-        let incompatible = root.path().join("fake-app-server-incompatible");
-        let incompatible_script = "#!/usr/bin/env python3\nimport json,sys\nfor line in sys.stdin:\n r=json.loads(line)\n if r.get('method')=='initialize': print(json.dumps({'id':r['id'],'result':{'userAgent':'temote-mcp/0.153.3 (Ubuntu 24.4.0; x86_64) unknown (temote-mcp; __CLIENT_VERSION__)','codexHome':'/tmp','platformFamily':'unix','platformOs':'linux'}}),flush=True)\n"
+        let arbitrary_version = root.path().join("fake-app-server-arbitrary-version");
+        let arbitrary_version_script = "#!/usr/bin/env python3\nimport json,sys\nfor line in sys.stdin:\n r=json.loads(line)\n if r.get('method')=='initialize': print(json.dumps({'id':r['id'],'result':{'userAgent':'temote-mcp/99.123.456 (FutureOS 1; x86_64) future (temote-mcp; __CLIENT_VERSION__)','codexHome':'/tmp','platformFamily':'unix','platformOs':'linux'}}),flush=True)\n"
             .replace("__CLIENT_VERSION__", APP_SERVER_CLIENT_VERSION);
-        std::fs::write(&incompatible, incompatible_script).unwrap();
-        std::fs::set_permissions(&incompatible, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error =
-            spawn_initialized_client_with_binary_mode(&session, None, &incompatible, false, None)
-                .await
-                .err()
-                .unwrap();
-        assert!(error.to_string().contains("CODEX_APP_SERVER_INCOMPATIBLE"));
+        std::fs::write(&arbitrary_version, arbitrary_version_script).unwrap();
+        std::fs::set_permissions(&arbitrary_version, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let (client, initialized) = spawn_initialized_client_with_binary_mode(
+            &session,
+            None,
+            &arbitrary_version,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app_server_version_from_initialize_response(&initialized),
+            Some("99.123.456")
+        );
+        client.shutdown().await;
 
         let oversized = root.path().join("fake-app-server-oversized");
         std::fs::write(

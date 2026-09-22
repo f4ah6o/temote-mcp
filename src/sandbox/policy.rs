@@ -96,6 +96,7 @@ impl SandboxSpec {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn local_agent(
         cwd: &Path,
         writable_roots: &[PathBuf],

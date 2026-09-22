@@ -56,6 +56,10 @@ impl FakeActivityServer {
                     Err(error) => panic!("failed to accept activity CLI: {error}"),
                 }
             };
+            // Accepted sockets may inherit the listener's nonblocking mode on
+            // macOS. The scripted server must remain open until the client
+            // disconnects when `hold_open` is set.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(EXIT_TIMEOUT)).unwrap();
             let mut request = String::new();
             BufReader::new(stream.try_clone().unwrap())
@@ -249,8 +253,8 @@ fn open_pty() -> (File, File) {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
