@@ -292,6 +292,7 @@ mod tests {
             started_at: 123,
             process_id: 456,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         }
     }
 

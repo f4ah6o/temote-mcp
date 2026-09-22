@@ -13,11 +13,18 @@ pub(super) fn command(spec: &SandboxSpec, argv: &[String]) -> Result<Command> {
     let (read_policy, mut definitions) = build_read_policy(spec)?;
     let (write_policy, write_definitions) = build_write_policy(spec)?;
     definitions.extend(write_definitions);
-    let network_policy = if spec.network_access() {
-        "(allow network-outbound)"
-    } else {
-        ""
-    };
+    let mut network_clauses = Vec::new();
+    if spec.network_access() {
+        network_clauses.push("(allow network-outbound)".to_owned());
+    }
+    for port in spec.listen_ports() {
+        // Seatbelt has no filter matching a bind to loopback only
+        // ("localhost:*" also permits 0.0.0.0 binds), so each granted port is
+        // bindable on all interfaces. The grant is host-approved.
+        network_clauses.push(format!("(allow network-bind (local tcp \"*:{port}\"))"));
+        network_clauses.push(format!("(allow network-inbound (local tcp \"*:{port}\"))"));
+    }
+    let network_policy = network_clauses.join("\n");
     let policy = format!(
         "{BASE_POLICY}\n; allow read-only file operations\n{read_policy}\n{network_policy}\n{write_policy}\n"
     );

@@ -162,6 +162,55 @@
     },
     {
       "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ambient_git_credentials": {
+            "type": "boolean"
+          },
+          "dev_tool_env_prefixes": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "directories": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "listen_ports": {
+            "items": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "session_permission_request"
+    },
+    {
+      "annotations": {
         "destructiveHint": false,
         "idempotentHint": true,
         "openWorldHint": false,
@@ -521,6 +570,14 @@
           },
           "cwd": {
             "type": "string"
+          },
+          "env": {
+            "additionalProperties": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxProperties": 64,
+            "type": "object"
           },
           "host_id": {
             "type": "string"
@@ -1404,6 +1461,10 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "allow_loopback_listen": {
+            "default": false,
+            "type": "boolean"
+          },
           "command": {
             "items": {
               "type": "string"
@@ -1448,6 +1509,10 @@
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "allow_loopback_listen": {
+            "default": false,
+            "type": "boolean"
+          },
           "command": {
             "items": {
               "type": "string"
@@ -1547,6 +1612,36 @@
         "type": "object"
       },
       "name": "job_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "port": {
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "port"
+        ],
+        "type": "object"
+      },
+      "name": "port_check"
     },
     {
       "annotations": {

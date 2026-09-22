@@ -109,6 +109,7 @@ pub struct Session {
     pub started_at: u64,
     pub process_id: u32,
     pub permission_mode: PermissionMode,
+    pub grants: SessionGrants,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +126,8 @@ struct SessionWire {
     permission_mode: Option<PermissionMode>,
     #[serde(default)]
     yolo: bool,
+    #[serde(default)]
+    grants: SessionGrants,
 }
 
 impl From<SessionWire> for Session {
@@ -138,6 +141,7 @@ impl From<SessionWire> for Session {
             permission_mode: wire
                 .permission_mode
                 .unwrap_or_else(|| PermissionMode::from_legacy_yolo(wire.yolo)),
+            grants: wire.grants,
         }
     }
 }
@@ -152,6 +156,7 @@ impl From<Session> for SessionWire {
             process_id: session.process_id,
             permission_mode: Some(session.permission_mode),
             yolo: session.permission_mode.is_yolo(),
+            grants: session.grants,
         }
     }
 }
@@ -160,6 +165,263 @@ impl Session {
     pub fn yolo(&self) -> bool {
         self.permission_mode.is_yolo()
     }
+}
+
+/// Maximum listen ports a session may hold grants for.
+pub const MAX_GRANT_LISTEN_PORTS: usize = 64;
+/// Maximum dev-tool environment-variable prefixes a session may hold.
+pub const MAX_GRANT_ENV_PREFIXES: usize = 32;
+/// Maximum byte length of one dev-tool environment-variable prefix.
+pub const MAX_GRANT_ENV_PREFIX_BYTES: usize = 64;
+/// Maximum directories one grant request may add at once.
+pub const MAX_GRANT_DIRECTORIES: usize = 16;
+
+/// Persisted per-session capability grants.
+///
+/// Grants are additive capabilities the host explicitly approved for this
+/// session (through the local approval console or the `session permission`
+/// CLI). They are stored next to `permitted_directories` in session metadata
+/// and carried across session restart. Every field defaults to off.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SessionGrants {
+    /// TCP ports a sandboxed command may bind and listen on when the command
+    /// opts in (`allow_loopback_listen`). Scoped per port; macOS Seatbelt
+    /// cannot scope a bind to loopback only, so a granted port is bindable on
+    /// all interfaces — the approval prompt and docs state this explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen_ports: Vec<u16>,
+    /// Environment-variable name prefixes `dev_tool_run` may accept from the
+    /// caller (for example `MADOBE_` or `CARGO_`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dev_tool_env_prefixes: Vec<String>,
+    /// Allow network Git operations and the GitHub tools to fall back to the
+    /// ambient host credentials when the repository-local managed credential
+    /// mapping is absent.
+    #[serde(default)]
+    pub ambient_git_credentials: bool,
+}
+
+/// A bounded, validated grant request applied to a session.
+///
+/// This is the wire payload of the `ApplyGrants` session message and the
+/// `session_permission_request` tool: each non-empty field is unioned into the
+/// session's persisted grants (directories are unioned into
+/// `permitted_directories`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionGrantRequest {
+    #[serde(default)]
+    pub listen_ports: Vec<u16>,
+    #[serde(default)]
+    pub dev_tool_env_prefixes: Vec<String>,
+    #[serde(default)]
+    pub ambient_git_credentials: bool,
+    #[serde(default)]
+    pub directories: Vec<PathBuf>,
+}
+
+impl SessionGrantRequest {
+    /// True when the request carries at least one grant.
+    pub fn is_effectively_empty(&self) -> bool {
+        self.listen_ports.is_empty()
+            && self.dev_tool_env_prefixes.is_empty()
+            && !self.ambient_git_credentials
+            && self.directories.is_empty()
+    }
+
+    /// Validate name/scope invariants without touching the filesystem.
+    /// Directory paths are canonicalized separately by [`grants_missing_from`]
+    /// and [`apply_session_grants`].
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.listen_ports.len() <= MAX_GRANT_LISTEN_PORTS,
+            "listen port grant exceeds {MAX_GRANT_LISTEN_PORTS} ports"
+        );
+        anyhow::ensure!(
+            self.dev_tool_env_prefixes.len() <= MAX_GRANT_ENV_PREFIXES,
+            "dev-tool env prefix grant exceeds {MAX_GRANT_ENV_PREFIXES} prefixes"
+        );
+        anyhow::ensure!(
+            self.directories.len() <= MAX_GRANT_DIRECTORIES,
+            "directory grant exceeds {MAX_GRANT_DIRECTORIES} directories"
+        );
+        for prefix in &self.dev_tool_env_prefixes {
+            validate_dev_tool_env_prefix(prefix)?;
+        }
+        for directory in &self.directories {
+            anyhow::ensure!(
+                directory.is_absolute(),
+                "directory grant must be an absolute path: {}",
+                directory.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Grant fields of `self` that are not already covered by `session`
+    /// (directory paths are canonicalized for the comparison).
+    pub fn grants_missing_from(&self, session: &Session) -> Result<SessionGrantRequest> {
+        self.validate()?;
+        let mut missing = SessionGrantRequest::default();
+        for port in &self.listen_ports {
+            if !session.grants.listen_ports.contains(port) {
+                missing.listen_ports.push(*port);
+            }
+        }
+        for prefix in &self.dev_tool_env_prefixes {
+            if !session.grants.dev_tool_env_prefixes.contains(prefix) {
+                missing.dev_tool_env_prefixes.push(prefix.clone());
+            }
+        }
+        missing.ambient_git_credentials =
+            self.ambient_git_credentials && !session.grants.ambient_git_credentials;
+        for directory in &self.directories {
+            let directory = canonical_directory(directory)?;
+            if !session.permitted_directories.contains(&directory) {
+                missing.directories.push(directory);
+            }
+        }
+        missing.listen_ports.sort_unstable();
+        missing.listen_ports.dedup();
+        missing.dev_tool_env_prefixes.sort();
+        missing.dev_tool_env_prefixes.dedup();
+        missing.directories.sort();
+        missing.directories.dedup();
+        Ok(missing)
+    }
+
+    /// Human-readable single-line summary for approval prompts and responses.
+    /// Never contains secret material (ports, prefixes, paths only).
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.listen_ports.is_empty() {
+            parts.push(format!(
+                "listen on TCP ports {} (any interface)",
+                self.listen_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.dev_tool_env_prefixes.is_empty() {
+            parts.push(format!(
+                "dev-tool env prefixes {}",
+                self.dev_tool_env_prefixes.join(", ")
+            ));
+        }
+        if self.ambient_git_credentials {
+            parts.push("ambient Git credentials".to_owned());
+        }
+        if !self.directories.is_empty() {
+            parts.push(format!(
+                "permitted directories {}",
+                self.directories
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+fn validate_dev_tool_env_prefix(prefix: &str) -> Result<()> {
+    anyhow::ensure!(
+        !prefix.is_empty() && prefix.len() <= MAX_GRANT_ENV_PREFIX_BYTES,
+        "dev-tool env prefix must be 1..={MAX_GRANT_ENV_PREFIX_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        prefix
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "dev-tool env prefix may contain only ASCII letters, numbers, and '_': {prefix:?}"
+    );
+    Ok(())
+}
+
+/// Union a validated grant request into the session and return the applied
+/// delta. Shared by the session runtime (socket `ApplyGrants` messages) and the
+/// supervisor (`session permission grant`).
+pub fn apply_session_grants(
+    session: &mut Session,
+    request: &SessionGrantRequest,
+) -> Result<SessionGrantRequest> {
+    let applied = request.grants_missing_from(session)?;
+    if applied.is_effectively_empty() {
+        return Ok(applied);
+    }
+    session
+        .grants
+        .listen_ports
+        .extend(applied.listen_ports.iter().copied());
+    session.grants.listen_ports.sort_unstable();
+    session.grants.listen_ports.dedup();
+    anyhow::ensure!(
+        session.grants.listen_ports.len() <= MAX_GRANT_LISTEN_PORTS,
+        "listen port grant exceeds {MAX_GRANT_LISTEN_PORTS} ports"
+    );
+    session
+        .grants
+        .dev_tool_env_prefixes
+        .extend(applied.dev_tool_env_prefixes.iter().cloned());
+    session.grants.dev_tool_env_prefixes.sort();
+    session.grants.dev_tool_env_prefixes.dedup();
+    anyhow::ensure!(
+        session.grants.dev_tool_env_prefixes.len() <= MAX_GRANT_ENV_PREFIXES,
+        "dev-tool env prefix grant exceeds {MAX_GRANT_ENV_PREFIXES} prefixes"
+    );
+    session.grants.ambient_git_credentials |= applied.ambient_git_credentials;
+    session
+        .permitted_directories
+        .extend(applied.directories.iter().cloned());
+    session.permitted_directories.sort();
+    session.permitted_directories.dedup();
+    Ok(applied)
+}
+
+/// Remove grants previously applied to the session and return the removed
+/// delta. Directories are not revoked here; the dedicated `permission revoke`
+/// path owns directory removal.
+pub fn revoke_session_grants(
+    session: &mut Session,
+    request: &SessionGrantRequest,
+) -> Result<SessionGrantRequest> {
+    anyhow::ensure!(
+        request.directories.is_empty(),
+        "directories are revoked with `session permission revoke <path>`"
+    );
+    request.validate()?;
+    let mut removed = SessionGrantRequest {
+        listen_ports: request
+            .listen_ports
+            .iter()
+            .copied()
+            .filter(|port| session.grants.listen_ports.contains(port))
+            .collect(),
+        dev_tool_env_prefixes: request
+            .dev_tool_env_prefixes
+            .iter()
+            .filter(|prefix| session.grants.dev_tool_env_prefixes.contains(prefix))
+            .cloned()
+            .collect(),
+        ..SessionGrantRequest::default()
+    };
+    session
+        .grants
+        .listen_ports
+        .retain(|port| !request.listen_ports.contains(port));
+    session
+        .grants
+        .dev_tool_env_prefixes
+        .retain(|prefix| !request.dev_tool_env_prefixes.contains(prefix));
+    if request.ambient_git_credentials && session.grants.ambient_git_credentials {
+        session.grants.ambient_git_credentials = false;
+        removed.ambient_git_credentials = true;
+    }
+    Ok(removed)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -375,6 +637,7 @@ pub fn new_session_with_mode(
         started_at: unix_time(),
         process_id: 0,
         permission_mode,
+        grants: SessionGrants::default(),
     };
     Ok(session)
 }
@@ -1179,6 +1442,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: PermissionMode::Ask,
+            grants: SessionGrants::default(),
         };
         std::fs::write(root.join("inside.txt"), "ok").unwrap();
 
@@ -1201,6 +1465,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: PermissionMode::Yolo,
+            grants: SessionGrants::default(),
         };
         std::fs::write(outside.join("outside.txt"), "ok").unwrap();
 
@@ -1226,6 +1491,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: PermissionMode::Ask,
+            grants: SessionGrants::default(),
         };
 
         assert!(resolve_existing_path(&session, Path::new("outside/secret.txt")).is_err());
@@ -1258,6 +1524,7 @@ mod tests {
                     1 => PermissionMode::Agent,
                     _ => PermissionMode::Yolo,
                 },
+                grants: SessionGrants::default(),
             };
             let mutation = noprop::sample_usize_in(ctx, 0..=5);
             let expected = mutation == 0;
@@ -1330,6 +1597,7 @@ mod tests {
             started_at: 1_700_000_000,
             process_id: 4242,
             permission_mode: PermissionMode::Agent,
+            grants: SessionGrants::default(),
         }
     }
 
@@ -1555,6 +1823,7 @@ mod tests {
                 } else {
                     PermissionMode::Ask
                 },
+                grants: SessionGrants::default(),
             };
             tasks.push(tokio::spawn(async move { save_session(&session).await }));
         }
@@ -1629,6 +1898,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: PermissionMode::Ask,
+            grants: SessionGrants::default(),
         };
 
         test_support::run(0x5041_5448_4553_4301, 512, |ctx| {
@@ -1695,6 +1965,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode,
+            grants: SessionGrants::default(),
         }
     }
 
@@ -1752,6 +2023,125 @@ mod tests {
         .unwrap();
         assert_eq!(session.permission_mode, PermissionMode::Agent);
         assert!(!session.yolo());
+    }
+
+    #[test]
+    fn apply_session_grants_unions_sorts_dedups_and_reports_delta() {
+        let mut session = session_with_mode("grant-target", PermissionMode::Agent);
+        let request = SessionGrantRequest {
+            listen_ports: vec![8080, 5173, 5173],
+            dev_tool_env_prefixes: vec!["MADOBE_".to_owned()],
+            ambient_git_credentials: true,
+            directories: vec![],
+        };
+
+        let delta = apply_session_grants(&mut session, &request).unwrap();
+        assert_eq!(delta.listen_ports, vec![5173, 8080]);
+        assert_eq!(session.grants.listen_ports, vec![5173, 8080]);
+        assert_eq!(delta.dev_tool_env_prefixes, vec!["MADOBE_"]);
+        assert!(delta.ambient_git_credentials);
+        assert!(session.grants.ambient_git_credentials);
+
+        let second = apply_session_grants(&mut session, &request).unwrap();
+        assert!(second.is_effectively_empty());
+        assert_eq!(session.grants.listen_ports, vec![5173, 8080]);
+    }
+
+    #[test]
+    fn apply_session_grants_merges_directories_into_permitted_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let mut session = session_with_mode("grant-dir-target", PermissionMode::Agent);
+        session.permitted_directories = vec![workspace.path().to_path_buf()];
+        let request = SessionGrantRequest {
+            directories: vec![extra.path().to_path_buf()],
+            ..SessionGrantRequest::default()
+        };
+
+        let delta = apply_session_grants(&mut session, &request).unwrap();
+        let canonical_extra = std::fs::canonicalize(extra.path()).unwrap();
+        assert_eq!(delta.directories, vec![canonical_extra.clone()]);
+        assert!(session.permitted_directories.contains(&canonical_extra));
+        assert!(!session.grants.ambient_git_credentials);
+    }
+
+    #[test]
+    fn revoke_session_grants_removes_only_present_grants_and_refuses_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut session = session_with_mode("revoke-target", PermissionMode::Agent);
+        session.grants = SessionGrants {
+            listen_ports: vec![5173, 8080],
+            dev_tool_env_prefixes: vec!["MADOBE_".to_owned(), "CARGO_".to_owned()],
+            ambient_git_credentials: true,
+        };
+        let request = SessionGrantRequest {
+            listen_ports: vec![5173, 9999],
+            dev_tool_env_prefixes: vec!["CARGO_".to_owned()],
+            ambient_git_credentials: true,
+            directories: vec![],
+        };
+
+        let removed = revoke_session_grants(&mut session, &request).unwrap();
+        assert_eq!(removed.listen_ports, vec![5173]);
+        assert_eq!(removed.dev_tool_env_prefixes, vec!["CARGO_"]);
+        assert!(removed.ambient_git_credentials);
+        assert_eq!(session.grants.listen_ports, vec![8080]);
+        assert_eq!(session.grants.dev_tool_env_prefixes, vec!["MADOBE_"]);
+        assert!(!session.grants.ambient_git_credentials);
+
+        let with_directory = SessionGrantRequest {
+            directories: vec![workspace.path().to_path_buf()],
+            ..SessionGrantRequest::default()
+        };
+        assert!(revoke_session_grants(&mut session, &with_directory).is_err());
+    }
+
+    #[test]
+    fn grant_request_validation_rejects_unbounded_or_malformed_requests() {
+        assert!(
+            SessionGrantRequest {
+                listen_ports: vec![0; MAX_GRANT_LISTEN_PORTS + 1],
+                ..SessionGrantRequest::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SessionGrantRequest {
+                dev_tool_env_prefixes: vec!["X".repeat(MAX_GRANT_ENV_PREFIX_BYTES + 1)],
+                ..SessionGrantRequest::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SessionGrantRequest {
+                dev_tool_env_prefixes: vec!["HAS SPACE_".to_owned()],
+                ..SessionGrantRequest::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SessionGrantRequest {
+                directories: vec![PathBuf::from("relative/no-slash")],
+                ..SessionGrantRequest::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(SessionGrantRequest::default().is_effectively_empty());
+    }
+
+    #[test]
+    fn session_grants_wire_tolerates_missing_grants_field() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": "no-grants-field",
+            "cwd": "/tmp",
+            "permission_mode": "agent",
+        }))
+        .unwrap();
+        assert_eq!(session.grants, SessionGrants::default());
     }
 
     #[test]
