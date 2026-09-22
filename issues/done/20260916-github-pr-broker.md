@@ -56,3 +56,7 @@ CI run `35712942259` passed the full Linux Rust job (`106697619409`) and gateway
 macOS compilation, no-default compilation, clippy, and PR pure validation tests pass. However, `github_pr_tools_stay_on_the_configured_repository_and_never_echo_credentials` fails with `configured Git remote is unavailable` on the shared descriptor-backed Git execution path. This remains blocked by `issues/doing/20260922-macos-pinned-git-identity.md`; the macOS job has seven total failures and is not green.
 
 Installed-runtime read-only canary and live fixture close remain NOT RUN. The source changes have been committed and pushed, but no running service was upgraded. This packet stays in `doing` until its unresolved integration and runtime gates are satisfied.
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".
