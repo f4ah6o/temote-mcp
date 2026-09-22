@@ -2536,7 +2536,7 @@ pub fn pin_git_repository(root: &Path) -> Result<PinnedGitRepository> {
     #[cfg(unix)]
     {
         let worktree = open_pinned_directory(root, "Git worktree")?;
-        let identity = WorkspaceRepositoryIdentity::for_workspace(&fd_path(worktree.as_raw_fd())?)?;
+        let identity = pinned_git_workspace_identity(&worktree)?;
         anyhow::ensure!(
             identity.worktree_root == std::fs::canonicalize(root)?,
             "Git worktree path changed while it was being pinned"
@@ -2568,7 +2568,7 @@ pub fn pin_git_repository(root: &Path) -> Result<PinnedGitRepository> {
 
         // Re-check the identity after every metadata descriptor is open.  The
         // child will use these descriptors, not the paths, after this point.
-        let observed = WorkspaceRepositoryIdentity::for_workspace(&fd_path(worktree.as_raw_fd())?)?;
+        let observed = pinned_git_workspace_identity(&worktree)?;
         anyhow::ensure!(
             observed == identity,
             "Git repository identity changed while metadata was being pinned"
@@ -2710,6 +2710,59 @@ where
         return Err(error);
     }
     wait_with_limited_output(child, stdin).await
+}
+
+#[cfg(unix)]
+fn pinned_git_workspace_identity(file: &std::fs::File) -> Result<WorkspaceRepositoryIdentity> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        WorkspaceRepositoryIdentity::for_workspace(&fd_path(file.as_raw_fd())?)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use anyhow::anyhow;
+        use std::os::unix::ffi::OsStringExt;
+
+        let before = file.metadata()?;
+        let mut buffer = vec![0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: `buffer` is writable for PATH_MAX bytes and remains alive for the call.
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to obtain pinned Git workspace path");
+        }
+
+        let bytes: Vec<u8> = buffer.into_iter().map(|byte| byte as u8).collect();
+        let nul = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| anyhow!("pinned Git workspace path was not NUL-terminated"))?;
+        if nul == 0 {
+            return Err(anyhow!("pinned Git workspace path was empty"));
+        }
+        let candidate = PathBuf::from(std::ffi::OsString::from_vec(bytes[..nul].to_vec()));
+        if !candidate.is_absolute() {
+            return Err(anyhow!("pinned Git workspace path was not absolute"));
+        }
+
+        let candidate_before = candidate.metadata()?;
+        if !same_file_identity(&before, &candidate_before) {
+            return Err(anyhow!("pinned Git workspace identity changed"));
+        }
+
+        // This candidate is only for pre-approval identity inspection and is never
+        // execution authority after approval.
+        let identity = WorkspaceRepositoryIdentity::for_workspace(&candidate)?;
+
+        let after = file.metadata()?;
+        let candidate_after = candidate.metadata()?;
+        if !same_file_identity(&after, &candidate_after) {
+            return Err(anyhow!("pinned Git workspace identity changed"));
+        }
+
+        Ok(identity)
+    }
 }
 
 #[cfg(unix)]
