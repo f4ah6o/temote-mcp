@@ -102,3 +102,7 @@ client restart を自動化すると利用中の会話や MCP connection を切�
 ## 2026-09-16 polishing update
 
 Do not assign this whole issue to an implementation agent. Execute after the completion-upgrade audit in this order: `20260916-upgrade-helper-generation-preflight.md`, `20260916-upgrade-ingress-process-ownership.md`, `20260916-upgrade-runtime-observation-consistency.md`. Plugin/fresh-client behavior is live acceptance.
+
+## 2026-09-22 salvaged evidence note
+
+The 2026-09-15 evaluation lane recorded a related incident on the same host: an upgrade-process test stopped the original ingress and recovery blocked on a wedged supervisor control socket (listen backlog 58, `Ping`/list timeouts) while 23 live session sockets disagreed with persisted `crashed` lifecycle records. Labeled copy: `docs/evaluations/completion-20260915-salvaged-evidence.md`. Session-liveness observability divergence is only partially covered by the bounded runtime-observation diagnostics; treat it as context for the runtime-observation child and for live acceptance rather than a new defect claim.

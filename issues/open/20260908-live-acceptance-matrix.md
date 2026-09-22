@@ -37,7 +37,7 @@ The source issues are archived under `issues/done/` after this consolidation.
 - [ ] Durable Object exports/configuration and required secrets are applied to a real Cloudflare account.
 - [ ] At least two concurrent gateway sessions are exercised through one external MCP endpoint.
 - [ ] Reconnect/generation fencing is observed live; stale generations are rejected and non-idempotent calls are not auto-replayed.
-- [ ] On a real account, the chosen gateway deployment target (custom domain binding or existing-DNS Worker route) is applied with `workers_dev = false`, deploy output is checked so `No targets deployed` is not treated as success, and the route/domain binding is verified read-only (from `issues/done/20260911-gateway-deployment-target.md`).
+- [ ] On a real account, the chosen gateway deployment target (custom domain binding or existing-DNS Worker route) is applied with `workers_dev = false`, deploy output is checked so `No targets deployed` is not treated as success, and the route/domain binding is verified read-only (from `issues/done/20260911-gateway-deployment-target.md`). 2026-09-15 salvaged read-only evidence: `wrangler whoami` authenticated, `deployments status` reported one current `temote-mcp-gateway` version without proving a route/custom-domain target, `secret list` was empty (`HOST_TOKENS_JSON` absent under that account/script), and an unauthenticated `/healthz` returned an OAuth error document — reachability and auth enforcement, not an authenticated MCP session. See `docs/evaluations/completion-20260915-salvaged-evidence.md`.
 
 ### Connection profile matrix
 
@@ -66,6 +66,7 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 - [ ] On a host with Vite+ `vp` installed, a rebuilt Temote normal (`yolo=false`) session completes representative `dev_tool_run` `vp check`, `vp test`, and `vp build` operations without whole-session yolo or broad HOME exposure; record the installed version, operation class, and non-secret result.
 - [ ] On a macOS host with a Vite+-managed Codex installation, a rebuilt Temote `local_agent_run(agent=codex)` completes after authorization with the verified bounded launcher dependency closure; record only non-secret launcher/runtime evidence and the result.
+- [ ] On a Linux host or outer-sandbox backend that supports nested user namespaces while retaining the Codex named-profile auth deny, a rebuilt Temote `local_agent_run(agent=codex)` completes a representative read-only canary and one bounded workspace write. 2026-09-15 salvaged evidence: on `ms-01-alpha` (`kernel.apparmor_restrict_unprivileged_userns=1` + `bwrap-userns-restrict`) the nested unified-exec returned `Operation not permitted` even for `pwd`, while the same installed Codex and named profile worked outside the outer sandbox — see `docs/evaluations/completion-20260915-salvaged-evidence.md`.
 
 ### Agent-mode development network
 
@@ -101,3 +102,12 @@ Repository-local implementation regressions belong in their owning implementatio
 ## 2026-09-16 consolidation update
 
 This is the single tracker for live-only evidence. It now also owns the remaining live checks formerly duplicated by the Vite+-Codex runtime issue, host-side release-trigger implementation issue, connected-surface drift issue, package-manager broker, repo-scoped GitHub credential routing, and rebuilt-runtime OpenCode canary. Repository-local implementation stays in the owning `doing`/`polished` packet; this matrix records only actual live/host/CI evidence.
+
+## 2026-09-22 salvaged completion evidence
+
+Imported from `docs/evaluations/completion-20260915-salvaged-evidence.md` (the distilled, labeled copy of the deleted completion branches' live evidence):
+
+- The OpenCode provider-entitlement row's 2026-09-15 attempt detail is now recorded: `opencode-go/deepseek-v4-flash` requires explicit regional opt-in, `opencode/gpt-5.6-luna`, `opencode/gpt-5.6-sol`, `opencode-go/mimo-v2.5`, `opencode-go/mimo-v2.5-pro` reported no payment method, and `opencode/mimo-v2.5-free` reported disabled; deterministic adapter suite 73/73 and bounded diagnostics passed. Unchanged open limitation.
+- The nested-user-namespace Linux limitation and macOS Vite+ Codex acceptance are recorded under Developer broker / installed runtime above.
+- The Cloudflare account read-only probe results are recorded under Cloudflare Worker / Durable Object gateway above.
+- Open operational follow-ups with no matrix row: a credential visible in another process's command line during the 2026-09-15 ingress recovery was never rotated (explicitly noted, value never recorded), and the wedged-supervisor control-socket incident is preserved under `issues/open/20260916-upgrade-process-group-friction.md`.
