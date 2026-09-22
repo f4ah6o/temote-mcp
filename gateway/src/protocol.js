@@ -521,6 +521,36 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "git_branch_delete",
+    "Delete a merged local Git branch",
+    "Delete one exact validated local branch with Git's merged-only semantics. The current branch, a branch checked out in any worktree, an unmerged branch, and an absent branch are refused. No force-delete input, reset, stash or cleanup is exposed.",
+    mutation,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        branch: { type: "string", minLength: 1, maxLength: 255 },
+      },
+      ["session_id", "branch"],
+    ),
+  ),
+  tool(
+    "git_remote_branch_delete",
+    "Delete an exact remote Git branch with a lease",
+    "Delete one exact validated branch from one configured safe remote only when the remote ref still equals expected_remote_sha. The live remote HEAD is authoritative for rejecting its default branch. GitHub destinations require live branch metadata to report protected=false; other destinations require a valid repository-local temote.remote.<remote>.protectedBranch policy. Missing or ambiguous state fails closed. Temote constructs the refs/heads delete ref and exact force-with-lease internally. Multiple push destinations, arbitrary URLs/refspecs, wildcards, tag deletion and unconditional force are refused.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+        branch: { type: "string", minLength: 1, maxLength: 255 },
+        expected_remote_sha: { type: "string", minLength: 40, maxLength: 64 },
+      },
+      ["session_id", "branch", "expected_remote_sha"],
+    ),
+  ),
+  tool(
     "git_switch",
     "Switch to an existing local Git branch",
     "Switch the current worktree without force/reset/stash.",

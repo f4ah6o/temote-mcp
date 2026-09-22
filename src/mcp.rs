@@ -55,7 +55,11 @@ const MAX_GIT_CONFIG_VALUES: usize = 32;
 const MAX_GIT_CONFIG_OUTPUT_BYTES: usize = 16 * 1024;
 const GIT_PULL_UPSTREAM_CONFIGURATION_ERROR: &str =
     "Git pull upstream configuration is unavailable";
+const GIT_PUSH_REMOTE_CONFIGURATION_ERROR: &str = "Git push remote configuration is unavailable";
 const GIT_REMOTE_DESTINATION_ERROR: &str = "Git remote destination is unavailable";
+const GIT_REMOTE_DEFAULT_BRANCH_ERROR: &str = "Git remote default branch is unavailable";
+const GIT_REMOTE_PROTECTION_POLICY_ERROR: &str =
+    "Git remote branch protection policy is unavailable";
 const GITHUB_CREDENTIAL_MAPPING_ERROR: &str = "GitHub repository credential mapping is unavailable";
 const GITHUB_CREDENTIAL_UNAVAILABLE_ERROR: &str = "GitHub repository credential is unavailable";
 const GITHUB_CREDENTIAL_PERMISSION_ERROR: &str =
@@ -193,6 +197,16 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         "git_branch_create",
         ActivityOperation::GitBranchCreate,
         "Git branch",
+    ),
+    activity_tool(
+        "git_branch_delete",
+        ActivityOperation::GitBranchDelete,
+        "Git branch delete",
+    ),
+    activity_tool(
+        "git_remote_branch_delete",
+        ActivityOperation::GitRemoteBranchDelete,
+        "Git remote branch delete",
     ),
     activity_tool("git_switch", ActivityOperation::GitSwitch, "Git branch"),
     activity_tool(
@@ -1089,6 +1103,8 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push_tag","title":"Push an exact Git tag ref","description":"Push one exact commit SHA to refs/tags/<tag> on a configured remote using force-with-lease safety. Omitting expected_remote_sha is create-only; supplying it permits an update only when the remote tag still equals that exact SHA. Arbitrary refspecs, URLs, and unconditional force are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"tag":{"type":"string","minLength":1,"maxLength":255},"source_sha":{"type":"string","minLength":40,"maxLength":64},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","tag","source_sha"],"additionalProperties":false}},
         {"name":"git_branch_create","title":"Create a local Git branch","description":"Create one validated local branch from HEAD or a validated local/fetched repository ref. The operation exposes no force/reset/refspec/URL input and does not switch the current worktree.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","branch"],"additionalProperties":false}},
+        {"name":"git_branch_delete","title":"Delete a merged local Git branch","description":"Delete one exact validated local branch with Git's merged-only semantics. The current branch, a branch checked out in any worktree, an unmerged branch, and an absent branch are refused. No force-delete input, reset, stash or cleanup is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","branch"],"additionalProperties":false}},
+        {"name":"git_remote_branch_delete","title":"Delete an exact remote Git branch with a lease","description":"Delete one exact validated branch from one configured safe remote only when the remote ref still equals expected_remote_sha. The live remote HEAD is authoritative for rejecting its default branch. GitHub destinations require live branch metadata to report protected=false; other destinations require a valid repository-local temote.remote.<remote>.protectedBranch policy. Missing or ambiguous state fails closed. Temote constructs the refs/heads delete ref and exact force-with-lease internally. Multiple push destinations, arbitrary URLs/refspecs, wildcards, tag deletion and unconditional force are refused.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"branch":{"type":"string","minLength":1,"maxLength":255},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","branch","expected_remote_sha"],"additionalProperties":false}},
         {"name":"git_switch","title":"Switch to an existing local Git branch","description":"Switch the current worktree to one validated existing local branch without force/reset/stash. Git refuses an unsafe switch when dirty files would be overwritten.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_worktree_add","title":"Create a repository-owned Git worktree","description":"Create a linked worktree only at <repository>/.wt/<name>. If base is provided, create the validated branch from that local/fetched repository ref; otherwise attach an existing validated local branch. Arbitrary paths and force options are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","name","branch"],"additionalProperties":false}},
         {"name":"git_worktree_create","title":"Create a Temote-managed Git worktree","description":"Create a linked worktree only below the selected repository's exact managed root (<configured src root>/worktrees/<repository>/<task>, normally ~/src/worktrees/<repo>/<task>). Only one validated existing local branch can be attached; create a new branch with git_branch_create first. The task directory is derived from the branch when task is omitted; branch '/' never becomes directory hierarchy. Callers cannot choose a filesystem path, cwd or base, and legacy worktrees such as <repository>/.wt/<name> are never moved, adopted or deleted.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255},"branch":{"type":"string","minLength":1,"maxLength":255},"task":{"type":"string","minLength":1,"maxLength":64}},"required":["session_id","branch"],"additionalProperties":false}},
@@ -1396,6 +1412,8 @@ async fn call_tool_with_local_agent_executable(
             | "git_push"
             | "git_push_tag"
             | "git_branch_create"
+            | "git_branch_delete"
+            | "git_remote_branch_delete"
             | "git_switch"
             | "git_worktree_add"
             | "git_worktree_create"
@@ -1423,6 +1441,12 @@ async fn call_tool_with_local_agent_executable(
                     }
                     ActivityOperation::GitBranchCreate => {
                         git_branch_create(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitBranchDelete => {
+                        git_branch_delete(&args, &session, activity.as_ref()).await
+                    }
+                    ActivityOperation::GitRemoteBranchDelete => {
+                        git_remote_branch_delete(&args, &session, activity.as_ref()).await
                     }
                     ActivityOperation::GitSwitch => {
                         git_switch(&args, &session, activity.as_ref()).await
@@ -2118,7 +2142,10 @@ fn activity_tool_summary(args: &Value, operation: ActivityOperation) -> Activity
 
 fn git_activity_summary(args: &Value, operation: ActivityOperation) -> ActivitySummary {
     match operation {
-        ActivityOperation::GitFetch | ActivityOperation::GitPull | ActivityOperation::GitPush => {
+        ActivityOperation::GitFetch
+        | ActivityOperation::GitPull
+        | ActivityOperation::GitPush
+        | ActivityOperation::GitRemoteBranchDelete => {
             let remote = match args.get("remote").and_then(Value::as_str) {
                 None | Some("origin") => ActivityRemote::Origin,
                 Some(_) => ActivityRemote::Other,
@@ -2592,6 +2619,8 @@ fn git_activity_operation(name: &str) -> Option<ActivityOperation> {
         "git_push" => Some(ActivityOperation::GitPush),
         "git_push_tag" => Some(ActivityOperation::GitPush),
         "git_branch_create" => Some(ActivityOperation::GitBranchCreate),
+        "git_branch_delete" => Some(ActivityOperation::GitBranchDelete),
+        "git_remote_branch_delete" => Some(ActivityOperation::GitRemoteBranchDelete),
         "git_switch" => Some(ActivityOperation::GitSwitch),
         "git_worktree_add" => Some(ActivityOperation::GitWorktreeAdd),
         "git_worktree_create" => Some(ActivityOperation::GitWorktreeCreate),
@@ -2924,8 +2953,8 @@ fn validate_git_merge_ref(merge: &str) -> Result<()> {
 /// `remote.pushDefault`, `branch.<name>.remote`, then `origin`) so the
 /// repository-local credential gate is applied to the same remote Git would
 /// contact. A local destination (`"."`) needs no credential. When nothing
-/// resolves, the existing structured `git push` behavior is unchanged and Git
-/// itself decides.
+/// resolves, the structured push fails closed instead of delegating destination
+/// or refspec selection back to repository configuration.
 async fn git_current_push_remote(session: &config::Session, cwd: &Path) -> Result<Option<String>> {
     if let Some(remote) = git_remote_for_symbolic_rev(session, cwd, "@{push}").await? {
         return Ok(Some(remote));
@@ -2940,8 +2969,9 @@ async fn git_current_push_remote(session: &config::Session, cwd: &Path) -> Resul
                 continue;
             };
             if remote == "." {
-                // A local destination never contacts a remote.
-                return Ok(None);
+                // Preserve Git's local-remote semantics while still returning
+                // the exact destination that the mutation command must use.
+                return Ok(Some(remote));
             }
             validate_git_remote(&remote)?;
             return Ok(Some(remote));
@@ -3030,9 +3060,11 @@ async fn git_remote_for_symbolic_rev(
         Some(parts) => parts,
         None => return Ok(None),
     };
-    if remote.is_empty() || remote == "." {
-        // A local destination never contacts a network remote.
+    if remote.is_empty() {
         return Ok(None);
+    }
+    if remote == "." {
+        return Ok(Some(remote.to_owned()));
     }
     validate_git_remote(remote)?;
     Ok(Some(remote.to_owned()))
@@ -3063,36 +3095,35 @@ pub(crate) async fn git_push_output(
     set_upstream: bool,
     activity: Option<&ActivityScope>,
 ) -> Result<sandbox::Output> {
+    let explicit_remote = remote.is_some();
     let selected_remote = if set_upstream {
-        Some(remote.clone().unwrap_or_else(|| "origin".to_owned()))
+        remote.unwrap_or_else(|| "origin".to_owned())
     } else if remote.is_some() {
-        remote.clone()
+        remote.context(GIT_PUSH_REMOTE_CONFIGURATION_ERROR)?
     } else {
-        // No explicit remote: resolve the effective push remote only to decide
-        // whether the repository-local managed credential mapping is required.
-        // The command itself stays `git push` and never receives this value.
-        git_current_push_remote(session, &cwd).await?
+        git_current_push_remote(session, &cwd)
+            .await?
+            .context(GIT_PUSH_REMOTE_CONFIGURATION_ERROR)?
     };
-    let destinations = if let Some(remote) = &selected_remote {
-        validate_git_remote(remote)?;
-        let destinations =
-            resolve_git_remote_destinations(session, &cwd, remote, GitRemoteOperation::Push)
-                .await?;
-        ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
-        Some(destinations)
+    validate_git_remote(&selected_remote)?;
+    let destinations = if !explicit_remote && !set_upstream && selected_remote == "." {
+        GitRemoteDestinations { urls: Vec::new() }
     } else {
-        None
+        resolve_git_remote_destinations(session, &cwd, &selected_remote, GitRemoteOperation::Push)
+            .await?
     };
-    let command = build_git_push_command(remote, set_upstream);
+    ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
+    // The inspected destination and the mutation destination are deliberately
+    // the same value.  Supplying both the remote and HEAD prevents repository
+    // push.default or remote.<name>.push configuration from widening scope.
+    let command = build_git_push_command(&selected_remote, set_upstream);
     run_approved_git_network_output(
         session,
         cwd,
         command,
         "git_push",
         activity,
-        destinations
-            .as_ref()
-            .is_some_and(GitRemoteDestinations::requires_github_credential_mapping),
+        destinations.requires_github_credential_mapping(),
     )
     .await
 }
@@ -3128,23 +3159,22 @@ pub(crate) fn build_git_pull_command() -> Vec<String> {
 
 /// The exact current-branch push shape. `HEAD` is the only refspec and no force
 /// option exists.
-pub(crate) fn build_git_push_command(remote: Option<String>, set_upstream: bool) -> Vec<String> {
+pub(crate) fn build_git_push_command(remote: &str, set_upstream: bool) -> Vec<String> {
     let mut command = vec![
         "git".to_owned(),
         "-c".to_owned(),
         "core.hooksPath=/dev/null".to_owned(),
         "-c".to_owned(),
         "push.recurseSubmodules=off".to_owned(),
+        "-c".to_owned(),
+        "push.followTags=false".to_owned(),
         "push".to_owned(),
     ];
     if set_upstream {
         command.push("--set-upstream".to_owned());
-        command.push(remote.unwrap_or_else(|| "origin".to_owned()));
-        command.push("HEAD".to_owned());
-    } else if let Some(remote) = remote {
-        command.push(remote);
-        command.push("HEAD".to_owned());
     }
+    command.push(remote.to_owned());
+    command.push("HEAD".to_owned());
     command
 }
 
@@ -3301,6 +3331,247 @@ async fn git_branch_create(
     .await?;
     let command = build_git_branch_create_command(branch, &base);
     run_git_and_report(session, cwd, command, "Create Git branch", activity).await
+}
+
+async fn git_branch_delete(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    // Capture the worktree and both Git metadata roots before any approval
+    // wait. The final bounded command uses these descriptors rather than
+    // resolving the request pathname again, so a replaced cwd cannot redirect
+    // the host-side mutation to another repository.
+    let pinned = sandbox::pin_git_repository(&repository_root)?;
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("missing or non-string branch")?;
+    validate_git_branch_name(session, &cwd, branch).await?;
+    ensure_local_branch_exists(session, &cwd, branch).await?;
+    ensure_local_branch_not_checked_out(session, &cwd, branch).await?;
+    approve_local_git_mutation(
+        session,
+        &cwd,
+        "git_branch_delete",
+        format!("branch={branch} mode=merged-only"),
+        activity,
+    )
+    .await?;
+    // Approval is not the trust boundary. Re-prove existence and worktree
+    // ownership immediately before the exact host-side mutation. The normal
+    // Git sandbox intentionally keeps packed-refs immutable, while native
+    // merged-only branch deletion always acquires packed-refs.lock even for a
+    // loose ref, so this dedicated structured path must own that metadata
+    // mutation itself.
+    ensure_local_branch_exists(session, &cwd, branch).await?;
+    ensure_local_branch_not_checked_out(session, &cwd, branch).await?;
+    run_git_branch_delete_and_report(session, pinned, branch, activity).await
+}
+
+async fn git_remote_branch_delete(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let cwd = cwd(args, session)?;
+    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .context("missing or non-string branch")?;
+    validate_git_branch_name(session, &cwd, branch).await?;
+    let expected_remote_sha = args
+        .get("expected_remote_sha")
+        .and_then(Value::as_str)
+        .context("missing or non-string expected_remote_sha")?;
+    validate_git_object_id(expected_remote_sha, "expected_remote_sha")?;
+    let expected_remote_sha = expected_remote_sha.to_ascii_lowercase();
+
+    let destinations =
+        resolve_git_remote_destinations(session, &cwd, &remote, GitRemoteOperation::Push).await?;
+    anyhow::ensure!(
+        destinations.urls.len() == 1,
+        "remote branch deletion requires exactly one configured push destination"
+    );
+    ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
+    let fetch_destinations =
+        resolve_git_remote_destinations(session, &cwd, &remote, GitRemoteOperation::Fetch).await?;
+    anyhow::ensure!(
+        fetch_destinations.urls == destinations.urls,
+        "remote branch deletion requires matching fetch and push destinations"
+    );
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    request_activity_approval(
+        session,
+        ActivityApprovalRequest {
+            class: approvals::ApprovalClass::GitNetwork,
+            operation: "git_remote_branch_delete",
+            detail: format!(
+                "remote={remote} branch={branch} expected_remote_sha={expected_remote_sha}"
+            ),
+            cwd: repository_root.clone(),
+            metadata: BTreeMap::new(),
+            denial: "user denied Git remote branch deletion",
+        },
+        activity,
+    )
+    .await?;
+    // The remote's live symbolic HEAD is authoritative; a cached
+    // refs/remotes/origin/HEAD or a conventional branch name is not sufficient.
+    let default_branch =
+        resolve_remote_default_branch_after_approval(session, &cwd, &remote).await?;
+    anyhow::ensure!(
+        branch != default_branch,
+        "remote default branch cannot be deleted"
+    );
+
+    if let Some(repository) = github_repository_from_destination(
+        destinations
+            .urls
+            .first()
+            .context("remote branch deletion destination is unavailable")?,
+    )? {
+        let protected =
+            github_remote_branch_is_protected_after_approval(session, &cwd, &repository, branch)
+                .await?;
+        anyhow::ensure!(!protected, "remote protected branch cannot be deleted");
+    } else {
+        let protected_branches =
+            non_github_remote_protected_branches_after_approval(session, &cwd, &remote).await?;
+        anyhow::ensure!(
+            !protected_branches
+                .iter()
+                .any(|protected| protected == branch),
+            "remote protected branch cannot be deleted"
+        );
+    }
+
+    let command = build_git_remote_branch_delete_command(&remote, branch, &expected_remote_sha);
+    let output = run_git_output_after_approval(
+        session,
+        cwd,
+        command,
+        activity,
+        destinations.requires_github_credential_mapping(),
+    )
+    .await?;
+    text_result(render_output(output)?)
+}
+
+/// Reads the live symbolic HEAD of the configured remote.  The remote-tracking
+/// `origin/HEAD` ref is intentionally not consulted: it is a local cache and
+/// can be stale or absent.
+async fn resolve_remote_default_branch_after_approval(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+) -> Result<String> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "ls-remote".to_owned(),
+            "--symref".to_owned(),
+            remote.to_owned(),
+            "HEAD".to_owned(),
+        ],
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(GIT_REMOTE_DEFAULT_BRANCH_ERROR))?;
+    let branch = parse_remote_default_branch(&output)
+        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_DEFAULT_BRANCH_ERROR))?;
+    validate_git_branch_name(session, cwd, &branch)
+        .await
+        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_DEFAULT_BRANCH_ERROR))?;
+    Ok(branch)
+}
+
+fn parse_remote_default_branch(output: &sandbox::Output) -> Result<String> {
+    anyhow::ensure!(output.status == 0 && !output.truncated);
+    let mut lines = output.stdout.split('\n').collect::<Vec<_>>();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    anyhow::ensure!(lines.len() == 2);
+    let (symref, symref_name) = lines[0].split_once('\t').context("missing remote symref")?;
+    anyhow::ensure!(symref_name == "HEAD");
+    let branch = symref
+        .strip_prefix("ref: refs/heads/")
+        .context("remote HEAD is not a branch symref")?;
+    anyhow::ensure!(!branch.is_empty());
+    let (sha, head_name) = lines[1].split_once('\t').context("missing remote HEAD")?;
+    anyhow::ensure!(head_name == "HEAD");
+    validate_git_object_id(sha, "remote HEAD")?;
+    Ok(branch.to_owned())
+}
+
+/// A GitHub branch protection check is only authoritative when the deletion
+/// destination itself identifies a GitHub repository.  A fetch URL is not used
+/// for this decision when a different push URL is configured.
+fn github_repository_from_destination(url: &str) -> Result<Option<GithubRepository>> {
+    let github = is_github_https_destination(url)
+        || url
+            .strip_prefix("git@")
+            .and_then(|value| value.split_once(':'))
+            .is_some_and(|(host, _)| host.eq_ignore_ascii_case("github.com"))
+        || url
+            .strip_prefix("ssh://git@")
+            .and_then(|value| value.split_once('/'))
+            .is_some_and(|(host, _)| host.eq_ignore_ascii_case("github.com"));
+    if !github {
+        return Ok(None);
+    }
+    Ok(Some(github_repository_from_remote_url(url)?))
+}
+
+async fn github_remote_branch_is_protected_after_approval(
+    session: &config::Session,
+    cwd: &Path,
+    repository: &GithubRepository,
+    branch: &str,
+) -> Result<bool> {
+    let path = github_branch_metadata_path(repository, branch)?;
+    let response = run_github_api_after_approval(
+        session,
+        cwd,
+        repository,
+        GithubApiCall {
+            method: GithubApiMethod::Get,
+            path: &path,
+            body: None,
+            operation: "git_remote_branch_delete",
+        },
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(GIT_REMOTE_PROTECTION_POLICY_ERROR))?;
+    parse_github_branch_protected_response(&response, branch)
+        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_PROTECTION_POLICY_ERROR))
+}
+
+async fn non_github_remote_protected_branches_after_approval(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+) -> Result<Vec<String>> {
+    let key = format!("temote.remote.{remote}.protectedBranch");
+    let values = git_local_config_values(session, cwd, &key)
+        .await
+        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_PROTECTION_POLICY_ERROR))?;
+    anyhow::ensure!(!values.is_empty(), GIT_REMOTE_PROTECTION_POLICY_ERROR);
+    for value in &values {
+        validate_git_branch_name(session, cwd, value)
+            .await
+            .map_err(|_| anyhow::anyhow!(GIT_REMOTE_PROTECTION_POLICY_ERROR))?;
+    }
+    Ok(values)
 }
 
 async fn git_switch(
@@ -5027,6 +5298,39 @@ pub(crate) async fn ensure_local_branch_exists(
     Ok(())
 }
 
+async fn ensure_local_branch_not_checked_out(
+    session: &config::Session,
+    cwd: &Path,
+    branch: &str,
+) -> Result<()> {
+    let output = run_host_git_inspection(
+        session,
+        cwd,
+        &[
+            "git".to_owned(),
+            "-c".to_owned(),
+            "core.hooksPath=/dev/null".to_owned(),
+            "worktree".to_owned(),
+            "list".to_owned(),
+            "--porcelain".to_owned(),
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status == 0 && !output.truncated,
+        "Git worktree ownership is unavailable"
+    );
+    let worktrees = managed_worktree::parse_worktree_list(&output.stdout)
+        .context("Git worktree ownership is unavailable")?;
+    anyhow::ensure!(
+        !worktrees
+            .iter()
+            .any(|worktree| worktree.branch.as_deref() == Some(branch)),
+        "local Git branch is checked out in a worktree"
+    );
+    Ok(())
+}
+
 async fn git_local_branch_probe(
     session: &config::Session,
     cwd: &Path,
@@ -5130,6 +5434,39 @@ pub(crate) fn build_git_branch_create_command(branch: &str, base_sha: &str) -> V
         "--no-track".to_owned(),
         branch.to_owned(),
         base_sha.to_owned(),
+    ]
+}
+
+fn build_git_branch_delete_command(branch: &str) -> Vec<String> {
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "branch".to_owned(),
+        "--delete".to_owned(),
+        "--".to_owned(),
+        branch.to_owned(),
+    ]
+}
+
+fn build_git_remote_branch_delete_command(
+    remote: &str,
+    branch: &str,
+    expected_remote_sha: &str,
+) -> Vec<String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    vec![
+        "git".to_owned(),
+        "-c".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "-c".to_owned(),
+        "push.recurseSubmodules=off".to_owned(),
+        "-c".to_owned(),
+        "push.followTags=false".to_owned(),
+        "push".to_owned(),
+        format!("--force-with-lease={branch_ref}:{expected_remote_sha}"),
+        remote.to_owned(),
+        format!(":{branch_ref}"),
     ]
 }
 
@@ -5386,11 +5723,11 @@ async fn configured_github_repository(
 }
 
 fn github_repository_from_remote_url(remote_url: &str) -> Result<GithubRepository> {
-    let path = if let Some(path) = remote_url.strip_prefix("https://github.com/") {
+    let path = if let Some(path) = strip_ascii_prefix(remote_url, "https://github.com/") {
         path
-    } else if let Some(path) = remote_url.strip_prefix("git@github.com:") {
+    } else if let Some(path) = strip_ascii_prefix(remote_url, "git@github.com:") {
         path
-    } else if let Some(path) = remote_url.strip_prefix("ssh://git@github.com/") {
+    } else if let Some(path) = strip_ascii_prefix(remote_url, "ssh://git@github.com/") {
         path
     } else {
         anyhow::bail!("configured remote must resolve to github.com")
@@ -5413,6 +5750,13 @@ fn github_repository_from_remote_url(remote_url: &str) -> Result<GithubRepositor
         owner: owner.to_owned(),
         repo: repo.to_owned(),
     })
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
 }
 
 fn validate_github_repository_component(value: &str, allow_dot_underscore: bool) -> Result<()> {
@@ -5517,6 +5861,40 @@ fn github_workflow_run_get_path(repository: &GithubRepository, run_id: u64) -> S
     )
 }
 
+fn github_branch_metadata_path(repository: &GithubRepository, branch: &str) -> Result<String> {
+    let mut encoded = String::with_capacity(branch.len());
+    for byte in branch.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    anyhow::ensure!(!encoded.is_empty(), "GitHub branch metadata path is empty");
+    Ok(format!(
+        "repos/{}/{}/branches/{encoded}",
+        repository.owner, repository.repo
+    ))
+}
+
+fn parse_github_branch_protected_response(response: &str, branch: &str) -> Result<bool> {
+    let value: Value = serde_json::from_str(response)
+        .context("GitHub branch metadata response is not valid JSON")?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .context("GitHub branch metadata response is missing name")?;
+    anyhow::ensure!(
+        name == branch,
+        "GitHub branch metadata name does not match request"
+    );
+    value
+        .get("protected")
+        .and_then(Value::as_bool)
+        .context("GitHub branch metadata response is missing protected state")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GithubApiMethod {
     Get,
@@ -5538,6 +5916,31 @@ struct GithubApiCall<'a> {
     #[cfg_attr(not(feature = "network"), allow(dead_code))]
     body: Option<&'a Value>,
     operation: &'a str,
+}
+
+/// Executes a GitHub API call after the caller has already authorized the
+/// encompassing structured operation.  Keeping this separate from
+/// `run_approved_github_api` lets one remote-branch-delete approval cover both
+/// the live protection preflight and the final leased Git mutation.
+async fn run_github_api_after_approval(
+    session: &config::Session,
+    cwd: &Path,
+    repository: &GithubRepository,
+    call: GithubApiCall<'_>,
+) -> Result<String> {
+    let repository_root = sandbox::git_worktree_root(cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    #[cfg(feature = "network")]
+    {
+        let token = repo_scoped_github_token(session, &repository_root, repository).await?;
+        github_api_request(&token, call.method, call.path, call.body).await
+    }
+    #[cfg(not(feature = "network"))]
+    {
+        let _ = (session, cwd, repository, call);
+        anyhow::bail!("GitHub API operations require the network feature")
+    }
 }
 
 async fn run_approved_github_api(
@@ -5570,16 +5973,7 @@ async fn run_approved_github_api(
     if let Some(activity) = activity {
         let _ = activity.running();
     }
-    #[cfg(feature = "network")]
-    {
-        let token = repo_scoped_github_token(session, &repository_root, repository).await?;
-        github_api_request(&token, call.method, call.path, call.body).await
-    }
-    #[cfg(not(feature = "network"))]
-    {
-        let _ = (repository, call);
-        anyhow::bail!("GitHub API operations require the network feature")
-    }
+    run_github_api_after_approval(session, &repository_root, repository, call).await
 }
 
 #[cfg(feature = "network")]
@@ -5595,10 +5989,7 @@ async fn github_api_request(
             && path.len() <= 1024
             && !path.starts_with('/')
             && !path.contains("..")
-            && path
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric()
-                    || matches!(character, '/' | '.' | '_' | '-')),
+            && github_api_path_is_bounded(path),
         "GitHub API path is invalid"
     );
     let client = reqwest::Client::builder()
@@ -5640,6 +6031,26 @@ async fn github_api_request(
         "GitHub API response is too large"
     );
     String::from_utf8(bytes.to_vec()).context("GitHub API response is not UTF-8")
+}
+
+fn github_api_path_is_bounded(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-') {
+            index += 1;
+            continue;
+        }
+        if byte != b'%' || index + 2 >= bytes.len() {
+            return false;
+        }
+        if !bytes[index + 1].is_ascii_hexdigit() || !bytes[index + 2].is_ascii_hexdigit() {
+            return false;
+        }
+        index += 3;
+    }
+    true
 }
 
 #[cfg_attr(not(feature = "network"), allow(dead_code))]
@@ -5905,17 +6316,29 @@ async fn git_config_values(
     cwd: &Path,
     key: &str,
 ) -> Result<Vec<String>> {
-    let output = run_host_git_inspection(
-        session,
-        cwd,
-        &[
-            "git".to_owned(),
-            "config".to_owned(),
-            "--get-all".to_owned(),
-            key.to_owned(),
-        ],
-    )
-    .await?;
+    git_config_values_with_scope(session, cwd, key, false).await
+}
+
+async fn git_local_config_values(
+    session: &config::Session,
+    cwd: &Path,
+    key: &str,
+) -> Result<Vec<String>> {
+    git_config_values_with_scope(session, cwd, key, true).await
+}
+
+async fn git_config_values_with_scope(
+    session: &config::Session,
+    cwd: &Path,
+    key: &str,
+    local_only: bool,
+) -> Result<Vec<String>> {
+    let mut command = vec!["git".to_owned(), "config".to_owned()];
+    if local_only {
+        command.push("--local".to_owned());
+    }
+    command.extend(["--get-all".to_owned(), key.to_owned()]);
+    let output = run_host_git_inspection(session, cwd, &command).await?;
     anyhow::ensure!(
         !output.truncated && output.stdout.len() <= MAX_GIT_CONFIG_OUTPUT_BYTES,
         GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
@@ -6054,6 +6477,19 @@ async fn run_approved_git_output_inner(
         }
         anyhow::bail!("user denied {operation}")
     }
+    run_git_output_after_approval(session, cwd, command, activity, github_https_destination).await
+}
+
+async fn run_git_output_after_approval(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    activity: Option<&ActivityScope>,
+    github_https_destination: bool,
+) -> Result<sandbox::Output> {
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     if let Some(activity) = activity {
@@ -6281,6 +6717,42 @@ async fn run_git_and_report(
         )
         .await
     };
+    let result = output.and_then(render_output);
+    report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
+    text_result(result?)
+}
+
+/// Runs the exact merged-only local branch deletion on the host.
+///
+/// Native branch deletion always acquires `packed-refs.lock`, which the general
+/// Git sandbox deliberately keeps read-only. The caller validates the branch,
+/// obtains approval and re-proves the preconditions immediately before this
+/// exact bounded host-side mutation.
+async fn run_git_branch_delete_and_report(
+    session: &config::Session,
+    pinned: sandbox::PinnedGitRepository,
+    branch: &str,
+    activity: Option<&ActivityScope>,
+) -> Result<Value> {
+    let command = build_git_branch_delete_command(branch);
+    let rendered_command = render_command(&command);
+    approvals::activity(
+        &session.id,
+        "Delete merged Git branch",
+        Some(rendered_command.clone()),
+    )
+    .await;
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    let output = sandbox::run_pinned_git_command(
+        pinned,
+        &command,
+        None,
+        &HashMap::new(),
+        child_env::SENSITIVE_ENV_NAMES,
+    )
+    .await;
     let result = output.and_then(render_output);
     report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
     text_result(result?)
@@ -10026,7 +10498,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 56);
+        assert_eq!(tools.len(), 58);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -10049,6 +10521,12 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "git_push"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_push_tag"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_branch_create"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git_branch_delete"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "git_remote_branch_delete")
+        );
         assert!(tools.iter().any(|tool| tool["name"] == "git_switch"));
         assert!(tools.iter().any(|tool| tool["name"] == "git_worktree_add"));
         assert!(
@@ -11579,6 +12057,15 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
+    fn git_ref_exists(cwd: &Path, reference: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", reference])
+            .current_dir(cwd)
+            .status()
+            .unwrap()
+            .success()
+    }
+
     #[test]
     fn git_push_tag_validation_and_command_are_exact_and_lease_bound() {
         let sha1 = "0123456789abcdef0123456789abcdef01234567";
@@ -11675,10 +12162,12 @@ mod tests {
         assert_eq!(destination, repository.path().join(".wt/feature"));
 
         let branch = build_git_branch_create_command("feature", base_sha);
+        let delete = build_git_branch_delete_command("feature");
+        let remote_delete = build_git_remote_branch_delete_command("origin", "feature", base_sha);
         let switch = build_git_switch_command("feature");
         let create = build_git_worktree_add_create_command(&destination, "feature", base_sha);
         let existing = build_git_worktree_add_existing_command(&destination, "feature");
-        for command in [&branch, &switch, &create, &existing] {
+        for command in [&branch, &delete, &switch, &create, &existing] {
             assert_eq!(command.first().map(String::as_str), Some("git"));
             for forbidden in ["--force", "-f", "-B", "reset", "stash"] {
                 assert!(
@@ -11689,6 +12178,20 @@ mod tests {
         }
         assert_eq!(branch[3], "branch");
         assert_eq!(branch[4], "--no-track");
+        assert_eq!(delete[3..], ["branch", "--delete", "--", "feature"]);
+        assert_eq!(remote_delete[7], "push");
+        assert_eq!(
+            remote_delete[8],
+            format!("--force-with-lease=refs/heads/feature:{base_sha}")
+        );
+        assert_eq!(remote_delete[9], "origin");
+        assert_eq!(remote_delete[10], ":refs/heads/feature");
+        assert!(!remote_delete.iter().any(|argument| argument == "--force"));
+        assert!(
+            remote_delete
+                .iter()
+                .any(|argument| argument == "push.followTags=false")
+        );
         assert_eq!(switch[3], "switch");
         assert_eq!(switch[4], "--no-guess");
         assert_eq!(create[3], "worktree");
@@ -11714,6 +12217,501 @@ mod tests {
             assert!(!command.iter().any(|argument| argument == "--force"));
             Ok(())
         })
+    }
+
+    #[test]
+    fn generated_branch_delete_commands_stay_in_heads_namespace() -> noprop::TestResult {
+        test_support::run(0x4252_414e_4348_444c, 1024, |ctx| {
+            let branch = format!("review/{:016x}", noprop::sample_u64(ctx));
+            let expected = format!("{:040x}", noprop::sample_u64(ctx));
+            let local = build_git_branch_delete_command(&branch);
+            let remote = build_git_remote_branch_delete_command("origin", &branch, &expected);
+            assert_eq!(local.last(), Some(&branch));
+            assert_eq!(local[local.len() - 2], "--");
+            assert_eq!(
+                remote[8],
+                format!("--force-with-lease=refs/heads/{branch}:{expected}")
+            );
+            assert_eq!(remote[9], "origin");
+            assert_eq!(remote[10], format!(":refs/heads/{branch}"));
+            assert!(!remote.iter().any(|argument| argument == "--force"));
+            assert!(
+                !remote
+                    .iter()
+                    .any(|argument| argument.contains("refs/tags/"))
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn branch_delete_authority_parsers_fail_closed_on_ambiguous_state() {
+        let default = sandbox::Output {
+            status: 0,
+            stdout: "ref: refs/heads/main\tHEAD\n0123456789abcdef0123456789abcdef01234567\tHEAD\n"
+                .to_owned(),
+            stderr: String::new(),
+            truncated: false,
+        };
+        assert_eq!(parse_remote_default_branch(&default).unwrap(), "main");
+        for output in [
+            sandbox::Output {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+            },
+            sandbox::Output {
+                status: 0,
+                stdout: "ref: refs/heads/main\tHEAD\n".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            },
+            sandbox::Output {
+                status: 0,
+                stdout: "ref: refs/heads/main\tHEAD\nnot-a-sha\tHEAD\n".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            },
+        ] {
+            assert!(parse_remote_default_branch(&output).is_err());
+        }
+
+        assert!(
+            parse_github_branch_protected_response(r#"{"name":"main","protected":true}"#, "main")
+                .unwrap()
+        );
+        assert!(
+            !parse_github_branch_protected_response(
+                r#"{"name":"review","protected":false}"#,
+                "review"
+            )
+            .unwrap()
+        );
+        assert!(
+            parse_github_branch_protected_response(r#"{"name":"main","protected":true}"#, "other")
+                .is_err()
+        );
+
+        let repository = GithubRepository {
+            owner: "example".to_owned(),
+            repo: "repository".to_owned(),
+        };
+        let path = github_branch_metadata_path(&repository, "feature/review@1").unwrap();
+        assert!(path.ends_with("/branches/feature/review%401"));
+        assert!(github_api_path_is_bounded(&path));
+        assert!(!github_api_path_is_bounded(
+            "repos/example/repository/branches/%"
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_git_branch_delete_is_merged_only_and_worktree_safe() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        init_git_repository(&repository);
+        let repository = std::fs::canonicalize(repository).unwrap();
+        let session = config::Session {
+            id: format!("branch-delete-{}", Uuid::new_v4()),
+            cwd: repository.clone(),
+            permitted_directories: vec![repository.clone()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        run_git_fixture(&repository, &["branch", "merged"]);
+        std::fs::write(repository.join("preserve-untracked.txt"), "preserve\n").unwrap();
+        git_branch_delete(
+            &json!({"session_id": session.id, "branch": "merged"}),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!git_ref_exists(&repository, "refs/heads/merged"));
+        assert_eq!(
+            std::fs::read_to_string(repository.join("preserve-untracked.txt")).unwrap(),
+            "preserve\n"
+        );
+
+        run_git_fixture(&repository, &["switch", "--quiet", "-c", "unmerged"]);
+        std::fs::write(repository.join("unmerged.txt"), "unmerged\n").unwrap();
+        run_git_fixture(&repository, &["add", "unmerged.txt"]);
+        run_git_fixture(&repository, &["commit", "--quiet", "-m", "unmerged"]);
+        run_git_fixture(&repository, &["switch", "--quiet", "main"]);
+        let unmerged_error = git_branch_delete(
+            &json!({"session_id": session.id, "branch": "unmerged"}),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(unmerged_error.to_string().contains("not fully merged"));
+        assert!(git_ref_exists(&repository, "refs/heads/unmerged"));
+
+        let current_error = git_branch_delete(
+            &json!({"session_id": session.id, "branch": "main"}),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(current_error.to_string().contains("checked out"));
+        assert!(git_ref_exists(&repository, "refs/heads/main"));
+
+        run_git_fixture(&repository, &["branch", "linked"]);
+        let linked = root.path().join("linked");
+        run_git_fixture(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                linked.to_str().unwrap(),
+                "linked",
+            ],
+        );
+        let linked_error = git_branch_delete(
+            &json!({"session_id": session.id, "branch": "linked"}),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(linked_error.to_string().contains("checked out"));
+        assert!(git_ref_exists(&repository, "refs/heads/linked"));
+
+        let absent_error = git_branch_delete(
+            &json!({"session_id": session.id, "branch": "absent"}),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(absent_error.to_string().contains("does not exist"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn structured_git_branch_delete_stays_bound_after_cwd_path_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let replacement = root.path().join("replacement");
+        let original = root.path().join("original");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        init_git_repository(&repository);
+        init_git_repository(&replacement);
+        run_git_fixture(&repository, &["branch", "merged"]);
+        run_git_fixture(&replacement, &["branch", "merged"]);
+
+        let id = format!("branch-delete-swap-{}", Uuid::new_v4());
+        let (sender, mut receiver) = approvals::approval_channel();
+        let runtime = approvals::spawn_runtime(root.path(), Some(&id), false, sender)
+            .await
+            .unwrap();
+        let session = config::load_session(&id).await.unwrap();
+        let request = json!({
+            "session_id": id,
+            "cwd": repository.to_string_lossy(),
+            "branch": "merged",
+        });
+        let task = tokio::spawn(async move { git_branch_delete(&request, &session, None).await });
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("branch delete did not request approval")
+            .expect("approval channel closed before branch delete request");
+        assert_eq!(prompt.request.operation, "git_branch_delete");
+        std::fs::rename(&repository, &original).unwrap();
+        std::fs::rename(&replacement, &repository).unwrap();
+        prompt.respond(true);
+
+        task.await.unwrap().unwrap();
+        assert!(!git_ref_exists(&original, "refs/heads/merged"));
+        assert!(git_ref_exists(&repository, "refs/heads/merged"));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_git_remote_branch_delete_requires_exact_tip_and_one_destination() {
+        let remote = tempfile::tempdir().unwrap();
+        let second_remote = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        run_git_fixture(remote.path(), &["init", "--bare", "--quiet"]);
+        run_git_fixture(second_remote.path(), &["init", "--bare", "--quiet"]);
+        init_git_repository(repository.path());
+        run_git_fixture(
+            repository.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git_fixture(remote.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        run_git_fixture(repository.path(), &["push", "--quiet", "origin", "main"]);
+        run_git_fixture(
+            repository.path(),
+            &[
+                "config",
+                "--local",
+                "temote.remote.origin.protectedBranch",
+                "main",
+            ],
+        );
+        run_git_fixture(repository.path(), &["branch", "review"]);
+        run_git_fixture(repository.path(), &["branch", "protected"]);
+        run_git_fixture(repository.path(), &["push", "--quiet", "origin", "review"]);
+        run_git_fixture(
+            repository.path(),
+            &["push", "--quiet", "origin", "protected"],
+        );
+        run_git_fixture(
+            repository.path(),
+            &[
+                "config",
+                "--local",
+                "--add",
+                "temote.remote.origin.protectedBranch",
+                "protected",
+            ],
+        );
+
+        let cwd = config::canonical_directory(repository.path()).unwrap();
+        let session = config::Session {
+            id: format!("remote-branch-delete-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd.clone()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        let default_tip = git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/main"]);
+        let default_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "main",
+                "expected_remote_sha": default_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(default_error.to_string().contains("default branch"));
+
+        let protected_tip =
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/protected"]);
+        let protected_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "protected",
+                "expected_remote_sha": protected_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(protected_error.to_string().contains("protected branch"));
+
+        let original_tip = git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/review"]);
+        git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "review",
+                "expected_remote_sha": original_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!git_ref_exists(remote.path(), "refs/heads/review"));
+        assert!(git_ref_exists(&cwd, "refs/heads/review"));
+
+        run_git_fixture(&cwd, &["push", "--quiet", "origin", "review"]);
+        let stale_tip = git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/review"]);
+        run_git_fixture(&cwd, &["switch", "--quiet", "-c", "drift"]);
+        std::fs::write(cwd.join("drift.txt"), "drift\n").unwrap();
+        run_git_fixture(&cwd, &["add", "drift.txt"]);
+        run_git_fixture(&cwd, &["commit", "--quiet", "-m", "drift"]);
+        run_git_fixture(&cwd, &["push", "--quiet", "origin", "drift:review"]);
+        run_git_fixture(&cwd, &["switch", "--quiet", "main"]);
+        let drifted_tip = git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/review"]);
+        assert_ne!(stale_tip, drifted_tip);
+
+        let drift_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "review",
+                "expected_remote_sha": stale_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(drift_error.to_string().contains("stale info"));
+        assert_eq!(
+            git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/review"]),
+            drifted_tip
+        );
+
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "--unset-all",
+                "temote.remote.origin.protectedBranch",
+            ],
+        );
+        let missing_policy_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "review",
+                "expected_remote_sha": drifted_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            missing_policy_error
+                .to_string()
+                .contains(GIT_REMOTE_PROTECTION_POLICY_ERROR)
+        );
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "temote.remote.origin.protectedBranch",
+                "refs/heads/main",
+            ],
+        );
+        let invalid_policy_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "review",
+                "expected_remote_sha": drifted_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            invalid_policy_error
+                .to_string()
+                .contains(GIT_REMOTE_PROTECTION_POLICY_ERROR)
+        );
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "--unset-all",
+                "temote.remote.origin.protectedBranch",
+            ],
+        );
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "--add",
+                "temote.remote.origin.protectedBranch",
+                "main",
+            ],
+        );
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "--add",
+                "temote.remote.origin.protectedBranch",
+                "protected",
+            ],
+        );
+
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                remote.path().to_str().unwrap(),
+            ],
+        );
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                second_remote.path().to_str().unwrap(),
+            ],
+        );
+        let multiple_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "review",
+                "expected_remote_sha": drifted_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(multiple_error.to_string().contains("exactly one"));
+        assert!(git_ref_exists(remote.path(), "refs/heads/review"));
+        assert!(!git_ref_exists(second_remote.path(), "refs/heads/review"));
+
+        for invalid in [
+            json!({"session_id": session.id, "remote": remote.path(), "branch": "review", "expected_remote_sha": drifted_tip}),
+            json!({"session_id": session.id, "remote": "origin", "branch": "refs/heads/review", "expected_remote_sha": drifted_tip}),
+            json!({"session_id": session.id, "remote": "origin", "branch": "review", "expected_remote_sha": "not-a-sha"}),
+        ] {
+            assert!(
+                git_remote_branch_delete(&invalid, &session, None)
+                    .await
+                    .is_err()
+            );
+        }
+
+        run_git_fixture(&cwd, &["config", "--unset-all", "remote.origin.pushurl"]);
+        run_git_fixture(
+            &cwd,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "https://github.com/example/repository.git",
+            ],
+        );
+        let mapping_error = git_remote_branch_delete(
+            &json!({
+                "session_id": session.id,
+                "remote": "origin",
+                "branch": "review",
+                "expected_remote_sha": drifted_tip,
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            mapping_error
+                .to_string()
+                .contains(GITHUB_CREDENTIAL_MAPPING_ERROR),
+            "{mapping_error:#}"
+        );
+        assert!(git_ref_exists(remote.path(), "refs/heads/review"));
     }
 
     #[test]
@@ -13255,14 +14253,18 @@ mod tests {
             Some("origin")
         );
         assert_eq!(
-            build_git_push_command(None, false),
+            build_git_push_command("origin", false),
             vec![
                 "git".to_owned(),
                 "-c".to_owned(),
                 "core.hooksPath=/dev/null".to_owned(),
                 "-c".to_owned(),
                 "push.recurseSubmodules=off".to_owned(),
+                "-c".to_owned(),
+                "push.followTags=false".to_owned(),
                 "push".to_owned(),
+                "origin".to_owned(),
+                "HEAD".to_owned(),
             ]
         );
     }
@@ -13308,7 +14310,8 @@ mod tests {
             Some("origin".to_owned())
         );
 
-        // A local destination never contacts a remote.
+        // A local destination never contacts a network remote, but remains
+        // the exact destination passed to the bounded mutation command.
         run_git_fixture(
             &repository,
             &["config", "--local", "branch.main.remote", "."],
@@ -13317,7 +14320,29 @@ mod tests {
             git_current_push_remote(&session, &repository)
                 .await
                 .unwrap(),
-            None
+            Some(".".to_owned())
+        );
+        assert_eq!(
+            build_git_push_command(".", false)
+                .iter()
+                .rev()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["HEAD".to_owned(), ".".to_owned()]
+        );
+        let explicit_local = git_push_output(
+            &session,
+            repository.clone(),
+            Some(".".to_owned()),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            explicit_local.to_string().contains("not configured"),
+            "{explicit_local:#}"
         );
 
         // A configured branch remote wins over the origin default.
@@ -15470,6 +16495,11 @@ mod tests {
             ("git_push", ActivityOperation::GitPush),
             ("git_push_tag", ActivityOperation::GitPush),
             ("git_branch_create", ActivityOperation::GitBranchCreate),
+            ("git_branch_delete", ActivityOperation::GitBranchDelete),
+            (
+                "git_remote_branch_delete",
+                ActivityOperation::GitRemoteBranchDelete,
+            ),
             ("git_switch", ActivityOperation::GitSwitch),
             ("git_worktree_add", ActivityOperation::GitWorktreeAdd),
             ("git_worktree_create", ActivityOperation::GitWorktreeCreate),

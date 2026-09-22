@@ -2601,6 +2601,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shim_push_ignores_configured_multi_branch_refspecs() {
+        let (_fixture, src_root, repository, remote) = network_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let state = BrokerState {
+            src_root: None,
+            ..broker_state
+        };
+
+        run_host_git(&repository, &["switch", "--quiet", "-c", "extra"]);
+        run_host_git(&repository, &["push", "--quiet", "origin", "extra"]);
+        let remote_extra_before = run_host_git(&remote, &["rev-parse", "refs/heads/extra"]);
+        std::fs::write(repository.join("extra.txt"), "local extra\n").unwrap();
+        run_host_git(&repository, &["add", "extra.txt"]);
+        run_host_git(&repository, &["commit", "--quiet", "-m", "advance extra"]);
+        let local_extra_after = run_host_git(&repository, &["rev-parse", "extra"]);
+        assert_ne!(local_extra_after, remote_extra_before);
+        run_host_git(&repository, &["switch", "--quiet", "main"]);
+
+        // A plain Git push would publish every matching branch here.  The
+        // broker must instead execute the resolved remote plus HEAD.
+        run_host_git(
+            &repository,
+            &["config", "--local", "push.default", "matching"],
+        );
+        let pushed = handle_request(&state, request(&repository, &["push"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/extra"]),
+            remote_extra_before,
+            "push.default=matching must not publish a non-current branch"
+        );
+
+        // A configured remote refspec is also ignored because the explicit
+        // command-line HEAD refspec is the only allowed mutation scope.
+        run_host_git(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "remote.origin.push",
+                "refs/heads/extra:refs/heads/extra",
+            ],
+        );
+        let pushed = handle_request(&state, request(&repository, &["push"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/extra"]),
+            remote_extra_before,
+            "remote.origin.push must not publish a non-current branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn shim_push_disables_follow_tags_for_every_supported_form() {
+        let (_fixture, src_root, repository, remote) = network_shim_fixture();
+        let broker_state = state_with_src_root(&repository, &src_root);
+        let state = BrokerState {
+            src_root: None,
+            ..broker_state
+        };
+        run_host_git(
+            &repository,
+            &["config", "--local", "push.followTags", "true"],
+        );
+
+        // Ordinary push: publish the current branch commit, but never the
+        // reachable annotated tag enabled by repository-local configuration.
+        run_host_git(
+            &repository,
+            &["commit", "--quiet", "--allow-empty", "-m", "ordinary"],
+        );
+        run_host_git(
+            &repository,
+            &["tag", "-a", "v-ordinary", "-m", "ordinary tag"],
+        );
+        let pushed = handle_request(&state, request(&repository, &["push"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/main"]),
+            run_host_git(&repository, &["rev-parse", "HEAD"])
+        );
+        assert!(run_host_git(&remote, &["tag", "--list", "v-ordinary"]).is_empty());
+
+        // Explicit remote uses the same hardened builder.
+        run_host_git(
+            &repository,
+            &["commit", "--quiet", "--allow-empty", "-m", "explicit"],
+        );
+        run_host_git(
+            &repository,
+            &["tag", "-a", "v-explicit", "-m", "explicit tag"],
+        );
+        let pushed = handle_request(&state, request(&repository, &["push", "origin"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/main"]),
+            run_host_git(&repository, &["rev-parse", "HEAD"])
+        );
+        assert!(run_host_git(&remote, &["tag", "--list", "v-explicit"]).is_empty());
+
+        // Set-upstream publishes only the new current branch and establishes
+        // its upstream without also publishing its annotated tag.
+        run_host_git(
+            &repository,
+            &["switch", "--quiet", "-c", "feature/follow-tags"],
+        );
+        run_host_git(
+            &repository,
+            &["commit", "--quiet", "--allow-empty", "-m", "upstream"],
+        );
+        run_host_git(
+            &repository,
+            &["tag", "-a", "v-upstream", "-m", "upstream tag"],
+        );
+        let pushed = handle_request(&state, request(&repository, &["push", "-u", "origin"]))
+            .await
+            .unwrap();
+        assert_eq!(pushed.status, 0, "{}", pushed.stderr);
+        assert_eq!(
+            run_host_git(&remote, &["rev-parse", "refs/heads/feature/follow-tags"]),
+            run_host_git(&repository, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            run_host_git(
+                &repository,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "feature/follow-tags@{upstream}"
+                ]
+            ),
+            "origin/feature/follow-tags"
+        );
+        assert!(run_host_git(&remote, &["tag", "--list", "v-upstream"]).is_empty());
+        assert!(run_host_git(&remote, &["tag", "--list"]).is_empty());
+    }
+
     #[test]
     fn network_command_shapes_never_carry_force_refspecs_or_urls() {
         let fetch = mcp::build_git_fetch_command("origin");
@@ -2608,12 +2754,13 @@ mod tests {
         assert!(fetch.iter().any(|token| token == "--prune"));
         let pull = mcp::build_git_pull_command();
         assert!(pull.iter().any(|token| token == "--ff-only"));
-        let push = mcp::build_git_push_command(Some("origin".to_owned()), false);
+        let push = mcp::build_git_push_command("origin", false);
+        assert!(push.iter().any(|token| token == "push.followTags=false"));
         assert_eq!(
             push.iter().rev().take(2).cloned().collect::<Vec<_>>(),
             vec!["HEAD".to_owned(), "origin".to_owned()]
         );
-        let push_upstream = mcp::build_git_push_command(Some("origin".to_owned()), true);
+        let push_upstream = mcp::build_git_push_command("origin", true);
         assert!(push_upstream.iter().any(|token| token == "--set-upstream"));
         for command in [&fetch, &pull, &push, &push_upstream] {
             let rendered = command.join(" ");

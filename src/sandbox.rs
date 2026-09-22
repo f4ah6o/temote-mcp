@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -2500,6 +2502,258 @@ pub async fn run_unrestricted_with_env(
 ) -> Result<Output> {
     run_unrestricted_with_env_mode(command, cwd, stdin, environment, remove_environment, false)
         .await
+}
+
+/// A Git worktree and its metadata directories pinned before a structured
+/// mutation is approved.
+///
+/// This is intentionally narrower than [`run_unrestricted_with_env`].  It is
+/// only used by the exact structured local-branch-delete operation.  On Unix,
+/// the child receives descriptor-backed `cwd`, `GIT_DIR`, `GIT_COMMON_DIR`, and
+/// `GIT_WORK_TREE` paths, so replacing the validated pathname after approval
+/// cannot redirect the Git process to another repository.
+pub struct PinnedGitRepository {
+    #[cfg(not(unix))]
+    identity: WorkspaceRepositoryIdentity,
+    #[cfg(unix)]
+    worktree: std::fs::File,
+    #[cfg(unix)]
+    git_dir: std::fs::File,
+    #[cfg(unix)]
+    common_dir: std::fs::File,
+    #[cfg(not(unix))]
+    root: PathBuf,
+}
+
+/// Pins one canonical Git worktree root and its private/common metadata.
+///
+/// The descriptor is opened before approval and remains owned by the caller
+/// until the mutation finishes.  `WorkspaceRepositoryIdentity` is resolved
+/// through the opened worktree descriptor on Linux/macOS rather than adopting
+/// a later pathname resolution.
+pub fn pin_git_repository(root: &Path) -> Result<PinnedGitRepository> {
+    #[cfg(unix)]
+    {
+        let worktree = open_pinned_directory(root, "Git worktree")?;
+        let identity = WorkspaceRepositoryIdentity::for_workspace(&fd_path(worktree.as_raw_fd())?)?;
+        anyhow::ensure!(
+            identity.worktree_root == std::fs::canonicalize(root)?,
+            "Git worktree path changed while it was being pinned"
+        );
+
+        let current = std::fs::metadata(root)
+            .with_context(|| format!("cannot inspect Git worktree {}", root.display()))?;
+        anyhow::ensure!(
+            same_file_identity(&worktree.metadata()?, &current),
+            "Git worktree path changed while it was being pinned"
+        );
+
+        let git_dir_path = identity
+            .metadata_roots
+            .iter()
+            .find(|path| *path != &identity.common_dir)
+            .cloned()
+            .unwrap_or_else(|| identity.common_dir.clone());
+        let git_dir = open_pinned_directory(&git_dir_path, "Git private metadata")?;
+        let common_dir = if git_dir_path == identity.common_dir {
+            let common_dir = git_dir
+                .try_clone()
+                .context("cannot duplicate pinned Git common metadata descriptor")?;
+            make_fd_inheritable(&common_dir)?;
+            common_dir
+        } else {
+            open_pinned_directory(&identity.common_dir, "Git common metadata")?
+        };
+
+        // Re-check the identity after every metadata descriptor is open.  The
+        // child will use these descriptors, not the paths, after this point.
+        let observed = WorkspaceRepositoryIdentity::for_workspace(&fd_path(worktree.as_raw_fd())?)?;
+        anyhow::ensure!(
+            observed == identity,
+            "Git repository identity changed while metadata was being pinned"
+        );
+
+        Ok(PinnedGitRepository {
+            worktree,
+            git_dir,
+            common_dir,
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let root = std::fs::canonicalize(root)
+            .with_context(|| format!("cannot resolve Git worktree {}", root.display()))?;
+        let identity = WorkspaceRepositoryIdentity::for_workspace(&root)?;
+        Ok(PinnedGitRepository { identity, root })
+    }
+}
+
+/// Executes one already-classified structured Git command through the pinned
+/// repository.  The function is crate-private and does not provide a public
+/// arbitrary unsandboxed command surface.
+pub async fn run_pinned_git_command(
+    pinned: PinnedGitRepository,
+    command: &[String],
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+) -> Result<Output> {
+    run_pinned_git_command_inner(
+        pinned,
+        command,
+        stdin,
+        environment,
+        remove_environment,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn run_pinned_git_command_inner<F>(
+    pinned: PinnedGitRepository,
+    command: &[String],
+    stdin: Option<&[u8]>,
+    environment: &HashMap<String, String>,
+    remove_environment: &[&str],
+    on_spawn: F,
+) -> Result<Output>
+where
+    F: FnOnce(u32) -> Result<()>,
+{
+    anyhow::ensure!(!command.is_empty(), "command must not be empty");
+
+    #[cfg(unix)]
+    let (worktree_fd, git_dir_fd, common_dir_fd) = (
+        pinned.worktree.as_raw_fd(),
+        pinned.git_dir.as_raw_fd(),
+        pinned.common_dir.as_raw_fd(),
+    );
+
+    #[cfg(unix)]
+    let mut process = {
+        let mut process = tokio::process::Command::new(&command[0]);
+        process.args(&command[1..]);
+        // The descriptor-backed fchdir below is the authority.  Do not set a
+        // pathname cwd that could be swapped between command construction and
+        // the child pre-exec hook.
+        unsafe {
+            process.pre_exec(move || {
+                // SAFETY: the descriptor is held by `pinned` until the child
+                // has completed, and fchdir does not allocate or touch Rust
+                // synchronization primitives in the forked child.
+                if libc::fchdir(worktree_fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        process
+    };
+
+    #[cfg(not(unix))]
+    let mut process = {
+        anyhow::ensure!(
+            WorkspaceRepositoryIdentity::for_workspace(&pinned.root)? == pinned.identity,
+            "Git repository identity changed before structured mutation"
+        );
+        tokio::process::Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(&pinned.root)
+    };
+
+    // Do not let inherited GIT_* variables redirect this exact operation to a
+    // different index, object database, config, or repository.  The caller's
+    // environment is applied only after the inherited variables are removed;
+    // the pinned values are written last and cannot be overridden by it.
+    for (name, _) in
+        std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("GIT_"))
+    {
+        process.env_remove(name);
+    }
+    for name in remove_environment {
+        process.env_remove(name);
+    }
+    process.envs(environment);
+
+    #[cfg(unix)]
+    {
+        process.env("GIT_DIR", fd_path(git_dir_fd)?);
+        process.env("GIT_COMMON_DIR", fd_path(common_dir_fd)?);
+        process.env("GIT_WORK_TREE", fd_path(worktree_fd)?);
+        process.env("GIT_CONFIG_NOSYSTEM", "1");
+        process.env("GIT_TERMINAL_PROMPT", "0");
+    }
+
+    process
+        .kill_on_drop(true)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process
+        .spawn()
+        .context("failed to start pinned structured Git command")?;
+    let pid = child
+        .id()
+        .context("pinned structured Git child PID is unavailable after spawn")?;
+    if let Err(error) = on_spawn(pid) {
+        let mut child = child;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
+    wait_with_limited_output(child, stdin).await
+}
+
+#[cfg(unix)]
+fn open_pinned_directory(path: &Path, label: &str) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot open pinned {label} {}", path.display()))?;
+    make_fd_inheritable(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn make_fd_inheritable(file: &std::fs::File) -> Result<()> {
+    let fd = file.as_raw_fd();
+    // SAFETY: fd belongs to the live file descriptor held by `file`.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    anyhow::ensure!(flags >= 0, "cannot inspect pinned Git descriptor flags");
+    // SAFETY: fd belongs to the live file descriptor held by `file`; clearing
+    // close-on-exec is required for the child to resolve /proc/self/fd paths.
+    anyhow::ensure!(
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == 0,
+        "cannot make pinned Git descriptor inheritable"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(unix)]
+fn fd_path(fd: RawFd) -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+    #[cfg(target_os = "macos")]
+    let path = PathBuf::from(format!("/dev/fd/{fd}"));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let path = {
+        let _ = fd;
+        anyhow::bail!("descriptor-backed Git execution is unsupported on this Unix host")
+    };
+    Ok(path)
 }
 
 pub async fn run_unrestricted_with_env_and_spawn_hook<F>(

@@ -950,6 +950,82 @@
         ],
         "type": "object"
       },
+      "name": "git_branch_delete"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "expected_remote_sha": {
+            "maxLength": 64,
+            "minLength": 40,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch",
+          "expected_remote_sha"
+        ],
+        "type": "object"
+      },
+      "name": "git_remote_branch_delete"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch"
+        ],
+        "type": "object"
+      },
       "name": "git_switch"
     },
     {
