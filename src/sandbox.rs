@@ -357,7 +357,47 @@ pub async fn run_with_network_policy(
     network: CommandNetworkPolicy,
     stdin: Option<&[u8]>,
 ) -> Result<Output> {
-    run_with_metadata_roots(command, cwd, writable_roots, &[], None, network, stdin, &[]).await
+    run_with_metadata_roots(
+        command,
+        cwd,
+        writable_roots,
+        &[],
+        None,
+        network,
+        stdin,
+        &[],
+        &[],
+    )
+    .await
+}
+
+/// Runs an ordinary sandboxed command with an explicit network policy plus
+/// granted TCP listen ports.
+///
+/// `listen_ports` comes from the session's host-approved grants, never from
+/// request input. On macOS each granted port is bindable on all interfaces
+/// (Seatbelt cannot scope a bind to loopback); on Linux the ordinary-command
+/// profile shares the host network namespace and the list is ignored.
+pub async fn run_with_network_policy_and_listen(
+    command: &[String],
+    cwd: &Path,
+    writable_roots: &[PathBuf],
+    network: CommandNetworkPolicy,
+    stdin: Option<&[u8]>,
+    listen_ports: &[u16],
+) -> Result<Output> {
+    run_with_metadata_roots(
+        command,
+        cwd,
+        writable_roots,
+        &[],
+        None,
+        network,
+        stdin,
+        &[],
+        listen_ports,
+    )
+    .await
 }
 
 /// Runs the structured local-agent broker profile.
@@ -1596,6 +1636,7 @@ async fn run_git_with_metadata_roots_platform(
         CommandNetworkPolicy::Restricted,
         stdin,
         &environment,
+        &[],
     )
     .await;
     finalize_staged_git_state(staging.as_ref(), &output)?;
@@ -1644,6 +1685,7 @@ async fn run_git_with_metadata_roots_platform(
         None,
         CommandNetworkPolicy::Restricted,
         stdin,
+        &[],
         &[],
     )
     .await
@@ -1763,6 +1805,7 @@ pub async fn run_git_worktree_add(
         CommandNetworkPolicy::Restricted,
         stdin,
         &environment,
+        &[],
     )
     .await
 }
@@ -1777,6 +1820,7 @@ async fn run_with_metadata_roots(
     network: CommandNetworkPolicy,
     stdin: Option<&[u8]>,
     extra_environment: &[(String, String)],
+    listen_ports: &[u16],
 ) -> Result<Output> {
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
@@ -1794,7 +1838,9 @@ async fn run_with_metadata_roots(
         )?
     } else {
         policy::SandboxSpec::git(&cwd, writable_roots, git_metadata_roots)?
-    };
+    }
+    .with_listen_ports(listen_ports);
+    let _ = listen_ports;
 
     #[cfg(target_os = "linux")]
     let mut process = if let Some(protected_worktree_roots) = protected_worktree_roots {

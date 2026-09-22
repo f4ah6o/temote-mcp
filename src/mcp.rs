@@ -61,7 +61,7 @@ const GIT_REMOTE_DEFAULT_BRANCH_ERROR: &str = "Git remote default branch is unav
 const GIT_REMOTE_TRACKING_REF_ERROR: &str = "Git remote-tracking ref is unavailable or invalid; fetch and inspect the configured remote branch before retrying";
 const GIT_REMOTE_PROTECTION_POLICY_ERROR: &str =
     "Git remote branch protection policy is unavailable";
-const GITHUB_CREDENTIAL_MAPPING_ERROR: &str = "GitHub repository credential mapping is unavailable";
+const GITHUB_CREDENTIAL_MAPPING_ERROR: &str = "GitHub repository credential mapping is unavailable; configure the repository-local mapping (`git config --local credential.helper '' && git config --local --add credential.helper '!gh git credential --managed' && git config --local credential.useHttpPath true`; see docs/usage.md) or request the ambient_git_credentials session grant via session_permission_request";
 const GITHUB_CREDENTIAL_UNAVAILABLE_ERROR: &str = "GitHub repository credential is unavailable";
 const GITHUB_CREDENTIAL_PERMISSION_ERROR: &str =
     "GitHub repository credential lacks required permission";
@@ -141,6 +141,11 @@ const ACTIVITY_NON_DISPATCH_COVERAGE: &[ActivityNonDispatchCoverage] = &[
         owner: ActivityNonDispatchOwner::Excluded,
         fixture: "viewer query excluded",
     },
+    ActivityNonDispatchCoverage {
+        name: "port_check",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
 ];
 
 const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
@@ -188,6 +193,11 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
     ),
     activity_tool("write_file", ActivityOperation::WriteFile, "file write"),
     activity_tool("apply_patch", ActivityOperation::ApplyPatch, "patch apply"),
+    activity_tool(
+        "session_permission_request",
+        ActivityOperation::SessionPermissionGrant,
+        "session grant",
+    ),
     activity_tool("git_add", ActivityOperation::GitAdd, "Git local"),
     activity_tool("git_commit", ActivityOperation::GitCommit, "Git local"),
     activity_tool("git_fetch", ActivityOperation::GitFetch, "Git network"),
@@ -1086,7 +1096,8 @@ fn dev_tool_input_schema() -> Value {
             "tool":{"type":"string","enum":["cargo","vp","uv","npm","pnpm","go"]},
             "operation":{"type":"string","minLength":1,"maxLength":dev_tool::MAX_DEV_TOOL_OPERATION_BYTES},
             "args":{"type":"array","items":{"type":"string","maxLength":dev_tool::MAX_DEV_TOOL_ARGUMENT_BYTES},"maxItems":dev_tool::MAX_DEV_TOOL_ARGUMENTS},
-            "cwd":{"type":"string"}
+            "cwd":{"type":"string"},
+            "env":{"type":"object","additionalProperties":{"type":"string","maxLength":4096},"maxProperties":64}
         },
         "required":["session_id","tool","operation"],
         "additionalProperties":false
@@ -1100,6 +1111,7 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"session_permission_request","title":"Request host capability grants","description":"Ask the host approval console to persist additive capability grants on a running sandboxed session: listen_ports a sandboxed command may bind when the call opts in (macOS cannot scope binds to loopback, so granted ports bind on all interfaces), dev_tool_env_prefixes dev_tool_run may accept from the caller, ambient_git_credentials to fall back to host Git credentials when no managed credential mapping exists, or extra permitted directories. Every non-empty field needs explicit host approval; bundling grants into one request collects them under a single approval prompt.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"listen_ports":{"type":"array","items":{"type":"integer","minimum":0,"maximum":65535}},"dev_tool_env_prefixes":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64}},"ambient_git_credentials":{"type":"boolean"},"directories":{"type":"array","items":{"type":"string"}}},"required":["session_id"],"additionalProperties":false}},
         {"name":"read_file","title":"Read a local file","description":"Read a UTF-8 regular file up to 8 MiB. With optional start_line/end_line or offset_bytes plus max_bytes, return bounded range metadata with an unambiguous UTF-8 next offset. Omitting range arguments preserves whole-file behavior.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"offset_bytes":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":4,"maximum":8388608}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"evidence_read","title":"Read scoped Temote evidence","description":"Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"evidence_id":{"type":"string","format":"uuid"},"offset_bytes":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384}},"required":["session_id","evidence_id"],"additionalProperties":false}},
         {"name":"codex_status","title":"Check Codex app-server compatibility","description":"Check the locally installed Codex app-server through stdio, validate the concrete protocol response shapes Temote consumes, and return bounded model/effort plus best-effort version diagnostics without a release-number allowlist.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
@@ -1107,16 +1119,16 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"codex_task_get","title":"Read a scoped Codex task","description":"Read and reconcile a retained Codex task owned by the full Temote session instance and canonical scope. Detailed thread data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"codex_task_control","title":"Control a scoped Codex task","description":"Idempotently steer, resume, or interrupt a retained scoped Codex task. Acceptance is persisted before the app-server side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy. With worktree.branch, Temote binds the run to the selected repository's managed worktree (<configured src root>/worktrees/<repo>/<task>) and derives the path itself: it reuses only a verified managed worktree of that repository and branch, otherwise creates one through the approved path, and rejects cwd combined with worktree.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
-        {"name":"dev_tool_run","title":"Run a structured developer tool operation","description":"Run a validated Cargo, Vite+, uv, npm, pnpm, or Go operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. Package-manager operations use a narrow fixed subcommand contract and do not expose arbitrary executables or raw host commands.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":dev_tool_input_schema()},
+        {"name":"dev_tool_run","title":"Run a structured developer tool operation","description":"Run a validated Cargo, Vite+, uv, npm, pnpm, or Go operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. Package-manager operations use a narrow fixed subcommand contract and do not expose arbitrary executables or raw host commands. Optional env entries are admitted only when every name is covered by a granted dev_tool_env_prefixes session grant; broker-set variables cannot be overridden.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":dev_tool_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"write_file","title":"Write a local file","description":"Write a UTF-8 regular file using the selected session permission mode. Existing special-file targets are rejected. Normal sessions are restricted to permitted roots and use the temote-mcp sandbox; yolo sessions may write anywhere the local user can.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["session_id","path","content"],"additionalProperties":false}},
         {"name":"apply_patch","title":"Apply a bounded multi-file patch","description":"Parse a Codex-style *** Begin Patch patch, preflight every source and destination inside the session roots, request approval once for normal sessions, then apply add/update/move/delete operations without invoking a shell parser. Partial I/O failure reports the exact committed operations.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"patch":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","patch"],"additionalProperties":false}},
         {"name":"git_add","title":"Stage files with Git","description":"Stage existing files or directories in the session repository with git add. Only the specified paths are staged; Git hooks and network access are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"cwd":{"type":"string"}},"required":["session_id","paths"],"additionalProperties":false}},
         {"name":"git_commit","title":"Create a local Git commit","description":"Create a local commit from the current Git index. This does not push, hooks and signing are disabled, and network access is unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"message":{"type":"string","minLength":1,"maxLength":16384},"cwd":{"type":"string"}},"required":["session_id","message"],"additionalProperties":false}},
-        {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. A GitHub HTTPS upstream additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping and never uses the ambient active gh account. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_fetch","title":"Fetch Git remote updates","description":"Run git fetch --prune for a configured remote on the host. The remote must be a safe configured name and arbitrary URLs and refspecs are not accepted. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping or, when no mapping exists, the host-approved ambient_git_credentials session grant for ambient helpers/agent credentials. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_pull","title":"Fast-forward Git branch","description":"Run git pull --ff-only for the current branch and its configured upstream on the host. Hooks are disabled. A GitHub HTTPS upstream additionally requires the repository-local managed Git credential mapping or, when no mapping exists, the host-approved ambient_git_credentials session grant for ambient helpers/agent credentials. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"git_push","title":"Push current Git branch","description":"Push the current branch on the host without force options. Optionally set origin (or another safe configured remote) as the upstream. Hooks are disabled. A GitHub HTTPS remote additionally requires the repository-local managed Git credential mapping or, when no mapping exists, the host-approved ambient_git_credentials session grant for ambient helpers/agent credentials. temote-mcp requests local approval unless the session is in yolo mode.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string"},"set_upstream":{"type":"boolean","default":false}},"required":["session_id"],"additionalProperties":false}},
         {"name":"git_push_tag","title":"Push an exact Git tag ref","description":"Push one exact commit SHA to refs/tags/<tag> on a configured remote using force-with-lease safety. Omitting expected_remote_sha is create-only; supplying it permits an update only when the remote tag still equals that exact SHA. Arbitrary refspecs, URLs, and unconditional force are unavailable.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"tag":{"type":"string","minLength":1,"maxLength":255},"source_sha":{"type":"string","minLength":40,"maxLength":64},"expected_remote_sha":{"type":"string","minLength":40,"maxLength":64}},"required":["session_id","tag","source_sha"],"additionalProperties":false}},
         {"name":"git_branch_create","title":"Create a local Git branch","description":"Create one validated local branch from HEAD or a validated local/fetched repository ref. The operation exposes no force/reset/refspec/URL input and does not switch the current worktree.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255},"base":{"type":"string","minLength":1,"maxLength":512}},"required":["session_id","branch"],"additionalProperties":false}},
         {"name":"git_branch_delete","title":"Delete a merged local Git branch","description":"Delete one exact validated local branch with Git's merged-only semantics. The current branch, a branch checked out in any worktree, an unmerged branch, and an absent branch are refused. No force-delete input, reset, stash or cleanup is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"branch":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","branch"],"additionalProperties":false}},
@@ -1132,10 +1144,11 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"github_pr_list","title":"List open GitHub pull requests","description":"List bounded summaries of open pull requests for the GitHub repository resolved from a configured remote. Only number, title, state, draft, head branch, update time and html URL are returned; arbitrary REST/GraphQL, other repositories and raw tokens are unavailable. Requires the repository-local managed Git credential mapping and never the ambient active gh account.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"github_pr_get","title":"Read one GitHub pull request","description":"Read the same bounded summary for one exact pull request number in the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"number":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","number"],"additionalProperties":false}},
         {"name":"github_pr_close","title":"Close one GitHub pull request","description":"Close one exact pull request number in the GitHub repository resolved from a configured remote. Merge, review, comment, release, issue mutation, arbitrary REST/GraphQL and cross-repository access are unavailable. Requires the repository-local managed Git credential mapping and never changes the global gh account.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"number":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","number"],"additionalProperties":false}},
-        {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
-        {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Optional output_limit_bytes or status_only becomes the default completed-result view for later polls.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id. Set allow_loopback_listen to let the command bind TCP listeners on ports previously granted via session_permission_request (host-approved; on macOS binds are interface-wide, not loopback-scoped).","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false},"allow_loopback_listen":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
+        {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Optional output_limit_bytes or status_only becomes the default completed-result view for later polls. Set allow_loopback_listen to let the command bind TCP listeners on ports previously granted via session_permission_request (host-approved; on macOS binds are interface-wide, not loopback-scoped).","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false},"allow_loopback_listen":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"port_check","title":"Probe a granted listen port","description":"Probe 127.0.0.1:<port> from the host and report whether something accepts connections there. Only ports in this session's granted listen_ports may be checked; use it to verify a dev server started through allow_loopback_listen actually bound.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535}},"required":["session_id","port"],"additionalProperties":false}},
         {"name":"checkpoint_save","title":"Save a scoped work checkpoint","description":"Persist a bounded client-reported work checkpoint scoped to the current canonical working directory. A mandatory operation_id makes exact retries idempotent. Normal sessions require local approval.","annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_save_input_schema()},
         {"name":"checkpoint_load","title":"Load a scoped work checkpoint","description":"Read one client-reported checkpoint only when it belongs to the current canonical working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":checkpoint_load_input_schema()},
         {"name":"work_handoff","title":"Read a work handoff snapshot","description":"Project scoped client-reported checkpoint state together with a redacted live snapshot of current-session jobs and best-effort local learning recall for a selected checkpoint. This tool does not execute or revalidate reported work.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":work_handoff_input_schema()},
@@ -1423,6 +1436,21 @@ async fn call_tool_with_local_agent_executable(
                     ));
                 }
                 text_result(serde_json::to_string_pretty(&outcome)?)
+            }
+            "session_permission_request" => {
+                let request = parse_session_grant_request(&args)?;
+                let result = approvals::request_session_grants(&session, request).await;
+                report_result(
+                    &session.id,
+                    "Requested session capability grants".to_owned(),
+                    &result,
+                )
+                .await;
+                text_result(serde_json::to_string_pretty(&result?)?)
+            }
+            "port_check" => {
+                assert_non_dispatch_activity_owner(name, ActivityNonDispatchOwner::Excluded);
+                port_check(&args, &session).await
             }
             name @ ("git_add"
             | "git_commit"
@@ -2547,6 +2575,102 @@ fn required_session_id(args: &Value) -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn parse_session_grant_request(args: &Value) -> Result<config::SessionGrantRequest> {
+    let object = args
+        .as_object()
+        .context("session_permission_request arguments must be an object")?;
+    anyhow::ensure!(
+        object.keys().all(|key| matches!(
+            key.as_str(),
+            "session_id"
+                | "listen_ports"
+                | "dev_tool_env_prefixes"
+                | "ambient_git_credentials"
+                | "directories"
+        )),
+        "session_permission_request accepts only session_id, listen_ports, dev_tool_env_prefixes, ambient_git_credentials, and directories"
+    );
+    let mut request = config::SessionGrantRequest::default();
+    if let Some(ports) = object.get("listen_ports") {
+        let ports = ports
+            .as_array()
+            .context("listen_ports must be an array of TCP port numbers")?;
+        for port in ports {
+            let port = port
+                .as_u64()
+                .context("listen_ports entries must be integers")?;
+            request.listen_ports.push(
+                u16::try_from(port).context("listen_ports entries must be TCP ports (0-65535)")?,
+            );
+        }
+    }
+    if let Some(prefixes) = object.get("dev_tool_env_prefixes") {
+        let prefixes = prefixes
+            .as_array()
+            .context("dev_tool_env_prefixes must be an array of strings")?;
+        for prefix in prefixes {
+            request.dev_tool_env_prefixes.push(
+                prefix
+                    .as_str()
+                    .context("dev_tool_env_prefixes entries must be strings")?
+                    .to_owned(),
+            );
+        }
+    }
+    if let Some(value) = object.get("ambient_git_credentials") {
+        request.ambient_git_credentials = value
+            .as_bool()
+            .context("ambient_git_credentials must be a boolean")?;
+    }
+    if let Some(directories) = object.get("directories") {
+        let directories = directories
+            .as_array()
+            .context("directories must be an array of paths")?;
+        for directory in directories {
+            request.directories.push(PathBuf::from(
+                directory
+                    .as_str()
+                    .context("directories entries must be strings")?,
+            ));
+        }
+    }
+    request.validate()?;
+    anyhow::ensure!(
+        !request.is_effectively_empty(),
+        "grant request is empty (pass listen_ports, dev_tool_env_prefixes, ambient_git_credentials, or directories)"
+    );
+    Ok(request)
+}
+
+/// Probes a host-granted listen port for acceptance on the loopback
+/// interface. Only ports the session was granted via `session_permission_request`
+/// may be probed, so this cannot become a general host port scanner.
+async fn port_check(args: &Value, session: &config::Session) -> Result<Value> {
+    let port = args
+        .get("port")
+        .and_then(Value::as_u64)
+        .context("missing port")?;
+    let port = u16::try_from(port).context("port must be a TCP port (0-65535)")?;
+    anyhow::ensure!(
+        session.grants.listen_ports.contains(&port),
+        "port {port} is not in this session's granted listen_ports; request it via session_permission_request"
+    );
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listening = matches!(
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await,
+        Ok(Ok(_))
+    );
+    text_result(serde_json::to_string_pretty(&json!({
+        "port": port,
+        "listening": listening,
+        "checked_on": "127.0.0.1",
+    }))?)
+}
+
 fn cwd(args: &Value, session: &config::Session) -> Result<PathBuf> {
     let path = args
         .get("cwd")
@@ -3289,6 +3413,12 @@ async fn ensure_github_https_destinations_credential_mapping(
     if !destinations.requires_github_credential_mapping() {
         return Ok(());
     }
+    if session.grants.ambient_git_credentials {
+        // Host-approved fallback: the command runs unrestricted anyway, so
+        // ambient helpers/agent credentials may authenticate instead of the
+        // repository-local managed mapping.
+        return Ok(());
+    }
     let local_helpers = map_github_credential_inspection_error(
         run_host_git_inspection(
             session,
@@ -3326,8 +3456,12 @@ async fn ensure_github_https_destinations_credential_mapping(
 async fn ensure_github_https_destinations_credential_mapping_pinned(
     pinned: &sandbox::PinnedGitRepository,
     destinations: &GitRemoteDestinations,
+    ambient_git_credentials: bool,
 ) -> Result<()> {
     if !destinations.requires_github_credential_mapping() {
+        return Ok(());
+    }
+    if ambient_git_credentials {
         return Ok(());
     }
     let local_helpers = map_github_credential_inspection_error(
@@ -3655,7 +3789,12 @@ pub(crate) async fn git_remote_branch_delete_with_pinned_repository(
         destinations.urls.len() == 1,
         "remote branch deletion requires exactly one configured push destination"
     );
-    ensure_github_https_destinations_credential_mapping_pinned(pinned, &destinations).await?;
+    ensure_github_https_destinations_credential_mapping_pinned(
+        pinned,
+        &destinations,
+        session.grants.ambient_git_credentials,
+    )
+    .await?;
     let fetch_destinations =
         resolve_git_remote_destinations_pinned(pinned, remote, GitRemoteOperation::Fetch).await?;
     anyhow::ensure!(
@@ -3697,7 +3836,12 @@ pub(crate) async fn git_remote_branch_delete_with_pinned_repository(
         fetch_destinations_after.urls == destinations_after.urls,
         "remote branch deletion requires matching fetch and push destinations"
     );
-    ensure_github_https_destinations_credential_mapping_pinned(pinned, &destinations_after).await?;
+    ensure_github_https_destinations_credential_mapping_pinned(
+        pinned,
+        &destinations_after,
+        session.grants.ambient_git_credentials,
+    )
+    .await?;
 
     // The remote's live symbolic HEAD is authoritative; a cached
     // refs/remotes/origin/HEAD or a conventional branch name is not sufficient.
@@ -8438,6 +8582,21 @@ where
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
     let permission_mode = session.permission_mode;
+    let allow_loopback_listen = match args.get("allow_loopback_listen") {
+        Some(value) => value
+            .as_bool()
+            .context("allow_loopback_listen must be a boolean")?,
+        None => false,
+    };
+    let listen_ports: Vec<u16> = if allow_loopback_listen {
+        anyhow::ensure!(
+            !session.grants.listen_ports.is_empty(),
+            "allow_loopback_listen requires host-granted listen ports; request them via session_permission_request"
+        );
+        session.grants.listen_ports.clone()
+    } else {
+        Vec::new()
+    };
     let slot = reserve_job_slot_for_cwd(&session.id, &cwd).await?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
@@ -8455,7 +8614,7 @@ where
     let task_completion = Arc::clone(&completion);
     let handle = tokio::spawn(async move {
         let (result, outcome) = tokio::select! {
-            result = run_session_command(&command, &task_cwd, &roots, permission_mode) => {
+            result = run_session_command(&command, &task_cwd, &roots, permission_mode, &listen_ports) => {
                 match result {
                     Ok(output) => {
                         let result = render_output(output);
@@ -8563,9 +8722,20 @@ async fn run_session_command(
     cwd: &Path,
     roots: &[PathBuf],
     permission_mode: config::PermissionMode,
+    listen_ports: &[u16],
 ) -> Result<sandbox::Output> {
     match permission_mode.command_network_policy() {
-        Some(network) => sandbox::run_with_network_policy(command, cwd, roots, network, None).await,
+        Some(network) => {
+            sandbox::run_with_network_policy_and_listen(
+                command,
+                cwd,
+                roots,
+                network,
+                None,
+                listen_ports,
+            )
+            .await
+        }
         None => sandbox::run_unrestricted(command, cwd, None).await,
     }
 }
@@ -9599,6 +9769,7 @@ mod tests {
             started_at: 1,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         }
     }
 
@@ -9673,7 +9844,9 @@ mod tests {
                 .filter(|coverage| coverage.owner == ActivityNonDispatchOwner::Excluded)
                 .map(|coverage| coverage.name)
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["session_info", "session_list"].into_iter().collect()
+            ["port_check", "session_info", "session_list"]
+                .into_iter()
+                .collect()
         );
         assert_eq!(
             ACTIVITY_TOOL_COVERAGE
@@ -11593,7 +11766,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 61);
+        assert_eq!(tools.len(), 63);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -11749,6 +11922,7 @@ mod tests {
             started_at: 1,
             process_id: 1,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         };
         config::save_session(&session).await.unwrap();
 
@@ -11791,6 +11965,7 @@ mod tests {
             started_at: 1,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         config::save_session(&session).await.unwrap();
         let mut lifecycle = config::SessionLifecycle::starting(session.started_at, None);
@@ -11899,6 +12074,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         };
 
         test_support::run(0x4749_5450_4154_4801, 512, |ctx| {
@@ -12075,6 +12251,7 @@ mod tests {
                 started_at: 0,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Yolo,
+                grants: config::SessionGrants::default(),
             };
             let other = config::Session {
                 id: other_id,
@@ -12083,6 +12260,7 @@ mod tests {
                 started_at: 0,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Yolo,
+                grants: config::SessionGrants::default(),
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion {
@@ -12132,6 +12310,7 @@ mod tests {
                 started_at: 0,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Yolo,
+                grants: config::SessionGrants::default(),
             };
             let other = config::Session {
                 id: other_id,
@@ -12140,6 +12319,7 @@ mod tests {
                 started_at: 0,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Yolo,
+                grants: config::SessionGrants::default(),
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -12183,6 +12363,7 @@ mod tests {
                 started_at: 0,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Yolo,
+                grants: config::SessionGrants::default(),
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -12260,6 +12441,7 @@ mod tests {
                 started_at: 0,
                 process_id: 0,
                 permission_mode: config::PermissionMode::Yolo,
+                grants: config::SessionGrants::default(),
             };
             let job_id = Uuid::new_v4();
             let completion = Arc::new(Mutex::new(JobCompletion::default()));
@@ -12318,6 +12500,7 @@ mod tests {
             started_at: 1,
             process_id: 2,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         };
         let marker = "denied-secret-sentinel";
         let request = checkpoints::parse_save_request(&json!({
@@ -12575,6 +12758,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         };
         assert!(job_list(&json!({"session_id":session.id,"limit":1}), &session).is_ok());
         assert!(job_list(&json!({"session_id":session.id,"limit":128}), &session).is_ok());
@@ -12638,6 +12822,7 @@ mod tests {
             workspace.path(),
             &[workspace.path().to_path_buf()],
             config::PermissionMode::Yolo,
+            &[],
         )
         .await
         .unwrap();
@@ -12683,6 +12868,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         };
         let job_id = Uuid::new_v4();
         let completion = Arc::new(Mutex::new(JobCompletion {
@@ -12721,6 +12907,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         };
         let job_id = Uuid::new_v4();
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
@@ -12755,6 +12942,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         };
         let job_id = Uuid::new_v4();
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
@@ -12883,6 +13071,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         };
         let reservation = managed_worktree::acquire_worktree_reservation(&target).unwrap();
         let slot = reserve_job_slot_with_admission(
@@ -13414,6 +13603,7 @@ mod tests {
             started_at: 1,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         run_git_fixture(&repository, &["branch", "merged"]);
@@ -13714,6 +13904,7 @@ mod tests {
             started_at: 1,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let default_tip = git_fixture_stdout(remote.path(), &["rev-parse", "refs/heads/main"]);
         let default_error = git_remote_branch_delete(
@@ -14137,6 +14328,7 @@ mod tests {
             started_at: 1,
             process_id: 1,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         (root, canonical_root, checkout, session)
     }
@@ -14759,6 +14951,7 @@ mod tests {
             status: status.to_owned(),
             pid: None,
             process_id: 0,
+            grants: config::SessionGrants::default(),
             cwd,
             permitted_directories: Vec::new(),
             started_at: 0,
@@ -15262,6 +15455,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         ensure_github_https_remote_credential_mapping(&session, &managed, "origin")
@@ -15363,6 +15557,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let bound_session = session_for("bound", &bound);
         let unmanaged_session = session_for("unmanaged", &unmanaged);
@@ -15430,6 +15625,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         // Without the managed mapping the validated network commands fail
@@ -15513,6 +15709,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         // No remote at all: nothing to gate.
@@ -15635,6 +15832,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         assert_eq!(
@@ -15673,6 +15871,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         // A non-GitHub fetch URL with a GitHub pushurl still requires mapping.
@@ -16128,6 +16327,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
 
         // The current session cwd inside the target is an owner.
@@ -16814,6 +17014,7 @@ mod tests {
             started_at: 1,
             process_id: 1,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -17482,6 +17683,7 @@ mod tests {
             started_at: 1,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         (root, checkout, session)
     }
@@ -18270,6 +18472,7 @@ mod tests {
             started_at: 1,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let base_args = json!({
             "session_id": session.id,
@@ -18342,6 +18545,7 @@ mod tests {
             started_at: 1,
             process_id: std::process::id(),
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         git_push(
             &json!({
@@ -18573,6 +18777,7 @@ mod tests {
             started_at: 1,
             process_id: 1,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let (agent_scope, agent_emitter) = recorded_git_pull_scope();
         let agent_result = git_pull(
@@ -18641,6 +18846,7 @@ mod tests {
             started_at: 1,
             process_id: 1,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         std::fs::write(checkout.join("local.txt"), "local\n").unwrap();
 
@@ -18720,6 +18926,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let result = git_fetch(
             &json!({"session_id": "agent-git-fetch", "cwd": cwd}),
@@ -18750,6 +18957,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         };
         let error = git_fetch(
             &json!({"session_id": session.id, "cwd": cwd}),
@@ -18815,11 +19023,93 @@ mod tests {
             workspace.path(),
             &[workspace.path().to_path_buf()],
             config::PermissionMode::Agent,
+            &[],
         )
         .await
         .unwrap();
         assert_ne!(output.status, 0, "sandbox must deny writes outside roots");
         assert!(!marker.exists());
         let _ = std::fs::remove_file(&marker);
+    }
+
+    fn grant_test_session(cwd: &Path) -> config::Session {
+        config::Session {
+            id: format!("grant-test-{}", Uuid::new_v4()),
+            cwd: cwd.to_path_buf(),
+            permitted_directories: vec![cwd.to_path_buf()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        }
+    }
+
+    #[test]
+    fn session_grant_request_parsing_accepts_bounded_fields() {
+        let args = json!({
+            "session_id": "s",
+            "listen_ports": [5173, 8080],
+            "dev_tool_env_prefixes": ["MADOBE_", "CARGO_"],
+            "ambient_git_credentials": true,
+            "directories": ["/tmp"],
+        });
+        let request = parse_session_grant_request(&args).unwrap();
+        assert_eq!(request.listen_ports, vec![5173, 8080]);
+        assert_eq!(
+            request.dev_tool_env_prefixes,
+            vec!["MADOBE_".to_owned(), "CARGO_".to_owned()]
+        );
+        assert!(request.ambient_git_credentials);
+        assert_eq!(request.directories, vec![PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn session_grant_request_parsing_rejects_empty_unknown_and_malformed() {
+        for args in [
+            json!({"session_id": "s"}),
+            json!({"session_id": "s", "ambient_git_credentials": false}),
+            json!({"session_id": "s", "unknown_field": 1}),
+            json!({"session_id": "s", "listen_ports": ["5173"]}),
+            json!({"session_id": "s", "listen_ports": [70000]}),
+            json!({"session_id": "s", "dev_tool_env_prefixes": [""]}),
+            json!({"session_id": "s", "ambient_git_credentials": "yes"}),
+        ] {
+            assert!(
+                parse_session_grant_request(&args).is_err(),
+                "accepted malformed request: {args}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn port_check_rejects_ungranted_ports_and_probes_granted_ones() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut session = grant_test_session(workspace.path());
+        session.grants.listen_ports = vec![5173];
+
+        let denied = port_check(&json!({"port": 9999}), &session).await;
+        assert!(denied.is_err(), "ungranted port probe must fail");
+
+        // A granted port may be probed; nothing is listening here, so the
+        // result reports listening=false rather than erroring.
+        let result = port_check(&json!({"port": 5173}), &session).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let rendered: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(rendered["port"], 5173);
+        assert_eq!(rendered["listening"], false);
+    }
+
+    #[tokio::test]
+    async fn port_check_reports_a_real_listener_on_a_granted_port() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut session = grant_test_session(workspace.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        session.grants.listen_ports = vec![port];
+
+        let result = port_check(&json!({"port": port}), &session).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let rendered: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(rendered["listening"], true);
     }
 }

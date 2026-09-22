@@ -287,6 +287,28 @@ export const PUBLIC_TOOLS = [
     schema(sessionProperty, ["session_id"]),
   ),
   tool(
+    "session_permission_request",
+    "Request host capability grants",
+    "Ask the host approval console to persist additive capability grants on a running sandboxed session: listen_ports, dev_tool_env_prefixes, ambient_git_credentials, or extra permitted directories.",
+    mutation,
+    schema(
+      {
+        ...sessionProperty,
+        listen_ports: {
+          type: "array",
+          items: { type: "integer", minimum: 0, maximum: 65535 },
+        },
+        dev_tool_env_prefixes: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: 64 },
+        },
+        ambient_git_credentials: { type: "boolean" },
+        directories: { type: "array", items: { type: "string" } },
+      },
+      ["session_id"],
+    ),
+  ),
+  tool(
     "read_file",
     "Read a local file",
     "Read a UTF-8 file from the selected host session, optionally as a bounded line/byte range.",
@@ -394,6 +416,11 @@ export const PUBLIC_TOOLS = [
           maxItems: 64,
         },
         cwd: { type: "string" },
+        env: {
+          type: "object",
+          additionalProperties: { type: "string", maxLength: 4096 },
+          maxProperties: 64,
+        },
       },
       ["session_id", "tool", "operation"],
     ),
@@ -723,6 +750,7 @@ export const PUBLIC_TOOLS = [
         cwd: { type: "string" },
         output_limit_bytes: { type: "integer", minimum: 256, maximum: 1048576 },
         status_only: { type: "boolean", default: false },
+        allow_loopback_listen: { type: "boolean", default: false },
       },
       ["session_id", "command"],
     ),
@@ -739,6 +767,7 @@ export const PUBLIC_TOOLS = [
         cwd: { type: "string" },
         output_limit_bytes: { type: "integer", minimum: 256, maximum: 1048576 },
         status_only: { type: "boolean", default: false },
+        allow_loopback_listen: { type: "boolean", default: false },
       },
       ["session_id", "command"],
     ),
@@ -766,6 +795,19 @@ export const PUBLIC_TOOLS = [
     schema(
       { ...sessionProperty, limit: { type: "integer", minimum: 1, maximum: 128, default: 50 } },
       ["session_id"],
+    ),
+  ),
+  tool(
+    "port_check",
+    "Probe a granted listen port",
+    "Probe 127.0.0.1:<port> from the host and report whether a granted listen port accepts connections.",
+    readOnly,
+    schema(
+      {
+        ...sessionProperty,
+        port: { type: "integer", minimum: 0, maximum: 65535 },
+      },
+      ["session_id", "port"],
     ),
   ),
   tool(

@@ -74,7 +74,20 @@ migration は legacy state file を安全に検証し、signal 前に live PID �
 
 通常 session では canonical な起動 directory が最初の permitted root です。local named-root selection で対象 project directory を決め、remote `session_start` は administrator が設定した named root 配下しか解決できません。通常 session は permitted root の外へ出る path、symlink target、command `cwd` を拒否します。
 
+named root は Temote MCP 起動前に host 側の `TEMOTE_MCP_ROOTS` で設定します。`TEMOTE_MCP_ROOTS='src=~/src'` のような単一 mapping、または `TEMOTE_MCP_ROOTS='{"src":"~/src","opt":"~/opt"}'` のような JSON object を設定してから Temote MCP を再起動してください。未設定の場合 `session_start` は無効のままで、named-root resolution の error に設定方法が表示されます。実行中 session の root は後述の host-approved `directories` grant で restart なしに追加することもできます。
+
 従来の inline `/permission ...` terminal command UI は detached runtime の owner ではなくなったため、第一段階の supervisor control surface には載せていません。権限を広げる変更ではなく、runtime は persisted permitted root のまま fail closed します。
+
+## session capability grant
+
+実行中の sandboxed session は `session_permission_request({session_id, listen_ports?, dev_tool_env_prefixes?, ambient_git_credentials?, directories?})` で個別スコープの追加 capability を request できます。各 field は additive で、empty でない field はすべて local approval console を通ります。host は承認前に正確な port、prefix、path を確認します。field を束ねると1つの approval prompt にまとまるため、automation が必要な capability を一度の host 操作で集められます。承認された grant は session metadata に永続化され、session restart 後も維持され、`session_info` の `grants` に表示されます。local CLI では `temote-mcp session permission <id> grant|ungrant` と対応する option が同等の操作です。permitted directory の削除は従来どおり `session permission revoke <path>` を使います。
+
+- `listen_ports: [5173, ...]`（最大64）を grant すると、`execute` / `start_command` の `allow_loopback_listen: true` を併用した call に限り、その port の TCP listener bind を許可します。macOS の sandbox は bind を loopback に限定できないため、granted port はすべての interface で bind 可能です。workload が必要とする port だけを grant してください。Linux の development profile はもともと listen を許可するため、この option は no-op です。`port_check({session_id, port})` は host から `127.0.0.1:<port>` に接続して accept されるかを報告します。probe できるのは granted port のみで、workspace の観測 tool として機能し、汎用 port scanner にはなりません。
+- `dev_tool_env_prefixes: ["MADOBE_", "CARGO_"]`（最大32、各 prefix は `[A-Za-z0-9_]` のみの 1〜64 byte）を grant すると、`dev_tool_run` が granted prefix で始まる名前の `env` object を受け付けます。name/value は bounded で NUL を含めず、`npm_config_ignore_scripts` など broker が設定する変数は上書きできません。
+- `ambient_git_credentials: true` を grant すると、validated `git_fetch` / `git_pull` / `git_push` / `git_push_tag` は repository に managed GitHub credential mapping がない場合に限り ambient な host Git credential（credential helper、forward された `ssh-agent`）に fallback します。managed mapping が設定されている場合はそちらが優先され、global な `gh` auth state は一切変更しません。
+- `directories: ["/abs/path", ...]`（最大16、absolute path のみ）は session の permitted root を実行中に拡張します。
+
+起動 directory の原則は変わりません。最初から広い root で起動するのではなく、host approval で必要な directory を追加してください。
 
 ## command
 
@@ -204,6 +217,16 @@ authoritative learningはrepo-managed Markdownです。`recall({session_id, quer
 - `github_workflow_run_get`: 同じ repository-scoped credential mapping を使い、configured GitHub repository の exact workflow run ID を bounded status として読む。`status=completed` になるまでこの tool を poll し、terminal result は `conclusion` で判定する。raw log/artifact は取得しない
 
 remote Git 操作は host operation なので、通常 session ではローカル承認が必要です。`git_worktree_create` も対応する host-side workspace operation であり、managed root policy と validation はどの permission mode でも同じです。
+
+GitHub HTTPS remote では、`git_fetch` / `git_pull` / `git_push` / `git_push_tag` と `github_workflow_*` / `github_pr_*` の各 tool の前に repository-local の managed credential mapping が必要です。host 上で clone ごとに一度だけ設定します。
+
+```sh
+git config --local credential.helper ''
+git config --local --add credential.helper '!gh git credential --managed'
+git config --local credential.useHttpPath true
+```
+
+`credential mapping is unavailable` の error にも同じ手順が表示されます。opt-in の代替として、host-approved `ambient_git_credentials` session grant を使うと、mapping がない場合に限り ambient な Git credential に fallback できます。GitHub 以外や SSH remote の credential path はどの場合も変わりません。
 
 ## Yolo mode
 

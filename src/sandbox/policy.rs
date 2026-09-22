@@ -44,6 +44,7 @@ pub(super) struct SandboxSpec {
     hidden_roots: Vec<PathBuf>,
     discovered_protected_metadata_paths: Vec<PathBuf>,
     network_access: bool,
+    listen_ports: Vec<u16>,
 }
 
 impl SandboxSpec {
@@ -93,6 +94,7 @@ impl SandboxSpec {
             hidden_roots: Vec::new(),
             discovered_protected_metadata_paths: Vec::new(),
             network_access,
+            listen_ports: Vec::new(),
         })
     }
 
@@ -233,6 +235,7 @@ impl SandboxSpec {
             hidden_roots: hidden,
             discovered_protected_metadata_paths,
             network_access: true,
+            listen_ports: Vec::new(),
         })
     }
 
@@ -335,6 +338,21 @@ impl SandboxSpec {
 
     pub(super) fn network_access(&self) -> bool {
         self.network_access
+    }
+
+    /// TCP ports the command may bind listeners on. Seatbelt cannot scope a
+    /// bind to loopback, so each granted port is bindable on all interfaces;
+    /// host approval is the gate that limits which ports land here.
+    pub(super) fn with_listen_ports(mut self, listen_ports: &[u16]) -> Self {
+        let mut ports = listen_ports.to_vec();
+        ports.sort_unstable();
+        ports.dedup();
+        self.listen_ports = ports;
+        self
+    }
+
+    pub(super) fn listen_ports(&self) -> &[u16] {
+        &self.listen_ports
     }
 
     pub(super) fn protected_metadata_paths(&self, root: &Path) -> Vec<PathBuf> {

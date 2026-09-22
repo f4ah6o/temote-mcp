@@ -82,7 +82,20 @@ impl NamedRoots {
         let physical_root = self
             .roots
             .get(&root_name)
-            .with_context(|| format!("unknown named root: {root_name}"))?;
+            .with_context(|| {
+                if self.roots.is_empty() {
+                    "no named roots are configured; set TEMOTE_MCP_ROOTS on the host before starting temote-mcp (a single mapping like TEMOTE_MCP_ROOTS='src=~/src' or a JSON object like {\"src\":\"~/src\"}) and restart temote-mcp, then retry session_start".to_owned()
+                } else {
+                    format!(
+                        "unknown named root: {root_name} (configured: {}; to add a root, include it in TEMOTE_MCP_ROOTS on the host and restart temote-mcp)",
+                        self.roots
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            })?;
 
         let mut candidate = physical_root.clone();
         for component in components {

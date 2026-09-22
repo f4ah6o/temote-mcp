@@ -893,6 +893,7 @@ mod tests {
             started_at: 123,
             process_id: 456,
             permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
         }
     }
 

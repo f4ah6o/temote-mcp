@@ -522,6 +522,11 @@ enum Message {
     KintoneCli {
         request: KintoneCliRequest,
     },
+    ApplyGrants {
+        request: config::SessionGrantRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_session: Option<ExpectedSessionInstance>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -644,6 +649,11 @@ pub(crate) enum ApprovalClass {
     /// Applying the locally installed Temote binary from authenticated HTTP.
     /// This always crosses the explicit local-user approval boundary.
     RemoteUpgrade,
+    /// Persisting additive capability grants (listen ports, dev-tool env
+    /// prefixes, ambient Git credentials, extra directories) on a sandboxed
+    /// session. Always crosses the host approval boundary unless the session
+    /// already runs without a sandbox.
+    SessionGrant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -677,6 +687,10 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
         },
         RemoteUpgrade => RequestUser,
         CodexAppServer | HostUnrestricted => match mode {
+            config::PermissionMode::Yolo => Skip,
+            _ => Request,
+        },
+        SessionGrant => match mode {
             config::PermissionMode::Yolo => Skip,
             _ => Request,
         },
@@ -791,6 +805,45 @@ async fn request_with_metadata_mode(
         "deny" => Ok(false),
         value => anyhow::bail!("invalid response from session: {value:?}"),
     }
+}
+
+/// Ask a running session runtime to persist additive capability grants.
+///
+/// The runtime applies `request` after a host approval prompt under ask/agent
+/// modes and auto-applies under yolo (where grants have no sandbox effect
+/// anyway). Returns the applied grant delta plus the session's resulting
+/// grants and permitted directories.
+pub(crate) async fn request_session_grants(
+    session: &Session,
+    request: config::SessionGrantRequest,
+) -> Result<Value> {
+    request.validate()?;
+    let message = encode_session_json_line(&Message::ApplyGrants {
+        request,
+        expected_session: Some(ExpectedSessionInstance::from_session(session)),
+    })?;
+    let path = config::socket_path(&session.id)?;
+    let mut stream = UnixStream::connect(&path).await.with_context(|| {
+        format!(
+            "session {} is not running; run `temote-mcp start`",
+            session.id
+        )
+    })?;
+    stream.write_all(&message).await?;
+    stream.shutdown().await?;
+
+    let response =
+        read_session_response(stream, MAX_SESSION_MESSAGE_BYTES, "grant response").await?;
+    let response: Value =
+        serde_json::from_str(response.trim()).context("invalid grant response from session")?;
+    if let Some(error) = response
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|error| !error.is_empty())
+    {
+        anyhow::bail!("{error}");
+    }
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 pub async fn request_user_approval_for_instance(
@@ -1057,6 +1110,14 @@ enum RuntimeCommand {
         path: PathBuf,
         response: oneshot::Sender<Result<()>>,
     },
+    ApplyGrants {
+        request: config::SessionGrantRequest,
+        response: oneshot::Sender<Result<Value>>,
+    },
+    RevokeGrants {
+        request: config::SessionGrantRequest,
+        response: oneshot::Sender<Result<Value>>,
+    },
     RevokeDirectory {
         path: PathBuf,
         response: oneshot::Sender<Result<()>>,
@@ -1144,6 +1205,36 @@ impl RuntimeHandle {
             .await
             .context("session runtime stopped before revoking sandbox root")??;
         Ok(())
+    }
+
+    /// Apply additive capability grants without a prompt. Callers are the
+    /// supervisor control plane (`session permission grant`), which is itself
+    /// the host-side approval.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn apply_grants(&self, request: config::SessionGrantRequest) -> Result<Value> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::ApplyGrants { request, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before applying capability grants")?
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn revoke_grants(
+        &self,
+        request: config::SessionGrantRequest,
+    ) -> Result<Value> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::RevokeGrants { request, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("session {} runtime stopped", self.id))?;
+        receiver
+            .await
+            .context("session runtime stopped before revoking capability grants")?
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1336,6 +1427,7 @@ async fn spawn_runtime_inner(
             session.permitted_directories.push(session.cwd.clone());
             session.permitted_directories.sort();
         }
+        session.grants = previous.grants;
     }
     let path = config::socket_path(&session.id)?;
     let state_dir = path.parent().context("session socket has no parent")?;
@@ -1396,11 +1488,13 @@ async fn spawn_runtime_inner(
     let runtime_activity_sink = activity_sink.clone();
     let completion_activity_sink = activity_sink.clone();
     let (commands, command_receiver) = mpsc::channel(MAX_PENDING_RUNTIME_COMMANDS);
+    let runtime_commands = commands.clone();
     let runtime_join = tokio::spawn(async move {
         let result = run_runtime(
             listener,
             &mut session,
             command_receiver,
+            runtime_commands,
             approval_sender,
             RuntimeServices {
                 service_account_token,
@@ -1545,6 +1639,38 @@ async fn receive_session_message(
     let _ = queue_incoming_session_message(&sender, stream, message, permit);
 }
 
+fn grant_response_value(
+    session: &Session,
+    delta_key: &str,
+    delta: &config::SessionGrantRequest,
+) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        delta_key.to_owned(),
+        serde_json::to_value(delta).expect("grant request serializes"),
+    );
+    map.insert(
+        "grants".to_owned(),
+        serde_json::to_value(&session.grants).expect("session grants serialize"),
+    );
+    map.insert(
+        "permitted_directories".to_owned(),
+        serde_json::to_value(&session.permitted_directories)
+            .expect("permitted directories serialize"),
+    );
+    Value::Object(map)
+}
+
+/// Spawn a best-effort session-result write for grant messages so the runtime
+/// loop never blocks on a slow grant requester.
+fn respond_grant(mut stream: UnixStream, result: Result<Value>) {
+    let bytes = encode_session_result(result, "grant response");
+    tokio::spawn(async move {
+        let _ = stream.write_all(&bytes).await;
+        let _ = stream.shutdown().await;
+    });
+}
+
 struct ActiveOperationGuard {
     count: Arc<AtomicUsize>,
 }
@@ -1573,6 +1699,7 @@ async fn run_runtime(
     listener: UnixListener,
     session: &mut Session,
     mut commands: mpsc::Receiver<RuntimeCommand>,
+    command_sender: mpsc::Sender<RuntimeCommand>,
     approval_sender: ApprovalSender,
     services: RuntimeServices,
 ) -> Result<()> {
@@ -1676,6 +1803,13 @@ async fn run_runtime(
                             );
                             let _ = stream.write_all(&bytes).await;
                         }
+                        Message::ApplyGrants { .. } => {
+                            let bytes = encode_session_result(
+                                Err(anyhow::anyhow!("session is quiesced for supervisor upgrade")),
+                                "grant response",
+                            );
+                            let _ = stream.write_all(&bytes).await;
+                        }
                         Message::Probe
                         | Message::Activity { .. }
                         | Message::ActivityBind { .. }
@@ -1695,6 +1829,134 @@ async fn run_runtime(
                     }
                     Message::ActivityBind { .. } => unreachable!("handled before quiesce dispatch"),
                     Message::ActivityUpdate(_) => unreachable!("handled before quiesce dispatch"),
+                    Message::ApplyGrants {
+                        request,
+                        expected_session,
+                    } => {
+                        if expected_session
+                            .as_ref()
+                            .is_some_and(|expected| !expected.matches(session))
+                        {
+                            respond_grant(
+                                stream,
+                                Err(anyhow::anyhow!(
+                                    "grant request targets a stale session instance"
+                                )),
+                            );
+                            continue;
+                        }
+                        match local_approval(session.permission_mode, ApprovalClass::SessionGrant) {
+                            LocalApproval::Skip => {
+                                eprintln!(
+                                    "[session {}] [yolo] applying grants: {}",
+                                    session.id,
+                                    bounded_console_text(
+                                        &request.describe(),
+                                        MAX_APPROVAL_DETAIL_BYTES
+                                    ),
+                                );
+                                let result = async {
+                                    let applied = config::apply_session_grants(session, &request)?;
+                                    config::save_session(session).await?;
+                                    Ok::<_, anyhow::Error>(grant_response_value(session, "applied", &applied))
+                                }
+                                .await;
+                                respond_grant(stream, result);
+                            }
+                            _ => {
+                                let permit = match Arc::clone(&approval_slots).try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        respond_grant(
+                                            stream,
+                                            Err(anyhow::anyhow!(
+                                                "too many pending approvals; try again"
+                                            )),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let friction_operation = "session_permission_grant".to_owned();
+                                let friction_session = session.clone();
+                                let (response, receiver) = oneshot::channel();
+                                let prompt = ApprovalPrompt {
+                                    session_id: session.id.clone(),
+                                    request: Request {
+                                        id: Uuid::new_v4(),
+                                        operation: "session_permission_grant".to_owned(),
+                                        detail: request.describe(),
+                                        cwd: session.cwd.clone(),
+                                        metadata: BTreeMap::from([(
+                                            "class".to_owned(),
+                                            "session_grant".to_owned(),
+                                        )]),
+                                    },
+                                    response,
+                                };
+                                if let Err(error) = approval_sender.try_send(prompt) {
+                                    error.into_inner().respond(false);
+                                    drop(permit);
+                                    respond_grant(
+                                        stream,
+                                        Err(anyhow::anyhow!(
+                                            "approval console is unavailable"
+                                        )),
+                                    );
+                                    continue;
+                                }
+                                let mut runtime_alive = approval_lifetime.subscribe();
+                                let command_sender = command_sender.clone();
+                                let operation = ActiveOperationGuard::new(Arc::clone(&active_operations));
+                                tokio::spawn(async move {
+                                    let _operation = operation;
+                                    let _permit = permit;
+                                    let allowed = tokio::select! {
+                                        response = receiver => response.unwrap_or(false),
+                                        _ = runtime_alive.changed() => false,
+                                    };
+                                    if !allowed {
+                                        friction::record_observed(
+                                            &friction_session,
+                                            friction::FrictionKind::ApprovalDenied,
+                                            Some("approval"),
+                                            Some(&friction_operation),
+                                            friction::EventOutcome::Denied,
+                                            None,
+                                            None,
+                                        );
+                                        let bytes = encode_session_result(
+                                            Err(anyhow::anyhow!("grant denied by host")),
+                                            "grant response",
+                                        );
+                                        let _ = stream.write_all(&bytes).await;
+                                        let _ = stream.shutdown().await;
+                                        return;
+                                    }
+                                    let (applied_tx, applied_rx) = oneshot::channel();
+                                    let enqueue = command_sender
+                                        .send(RuntimeCommand::ApplyGrants {
+                                            request,
+                                            response: applied_tx,
+                                        })
+                                        .await;
+                                    let result = match enqueue {
+                                        Ok(()) => match applied_rx.await {
+                                            Ok(result) => result,
+                                            Err(_) => Err(anyhow::anyhow!(
+                                                "session runtime stopped before applying grants"
+                                            )),
+                                        },
+                                        Err(_) => Err(anyhow::anyhow!(
+                                            "session runtime stopped before applying grants"
+                                        )),
+                                    };
+                                    let bytes = encode_session_result(result, "grant response");
+                                    let _ = stream.write_all(&bytes).await;
+                                    let _ = stream.shutdown().await;
+                                });
+                            }
+                        }
+                    }
                     Message::OnePasswordServiceAccount { request } => {
                         let session = session.clone();
                         let token = services.service_account_token.clone();
@@ -1859,6 +2121,24 @@ async fn run_runtime(
                             Ok(()) => config::save_session(session).await,
                             Err(error) => Err(error),
                         };
+                        let _ = response.send(result);
+                    }
+                    RuntimeCommand::ApplyGrants { request, response } => {
+                        let result = async {
+                            let applied = config::apply_session_grants(session, &request)?;
+                            config::save_session(session).await?;
+                            Ok::<_, anyhow::Error>(grant_response_value(session, "applied", &applied))
+                        }
+                        .await;
+                        let _ = response.send(result);
+                    }
+                    RuntimeCommand::RevokeGrants { request, response } => {
+                        let result = async {
+                            let removed = config::revoke_session_grants(session, &request)?;
+                            config::save_session(session).await?;
+                            Ok::<_, anyhow::Error>(grant_response_value(session, "removed", &removed))
+                        }
+                        .await;
                         let _ = response.send(result);
                     }
                     RuntimeCommand::Snapshot { response } => {
@@ -2787,6 +3067,7 @@ mod tests {
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Ask,
+            grants: config::SessionGrants::default(),
         }
     }
 
@@ -4598,6 +4879,7 @@ esac
             started_at: 0,
             process_id: 0,
             permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
         };
         let approved = ensure_local_approval(
             &agent_session,
