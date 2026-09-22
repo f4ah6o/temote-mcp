@@ -640,3 +640,7 @@ Rules:
 - local_agent_run receives that project root and performs implementation work there.
 - Repository-local AGENTS.md policy is not required for enforcing this behavior.
 ```
+
+## 2026-09-22 consolidation: done
+
+All bounded child packets are complete on `main` or in the merging PR set; remaining live acceptance is tracked in `issues/open/20260908-live-acceptance-matrix.md`.

@@ -134,3 +134,7 @@ live network acceptance は current ChatGPT-connected Temote runtime が source�
 - [x] tool-specific state roots は最小化され、HOME 全体 writable にはならない。
 - [x] package manager ごとの table-driven tests と generated/PBT coverage を追加する。
 - [x] Cargo/Vite+ の既存 classifier / network / sandbox tests を回帰させない。
+
+## 2026-09-22 consolidation: done
+
+Repository-local implementation verified on `main`; remaining live/canary evidence is tracked in `issues/open/20260908-live-acceptance-matrix.md` under "Repository-completion live residuals".

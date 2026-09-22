@@ -2353,6 +2353,12 @@ pub struct RemoteUpgradePreflight {
     pub plugin_reconciliation_required: bool,
     pub client_restart_required_if_plugin_replaced: bool,
     pub helper_generation: HelperGeneration,
+    /// The observed direct-ingress runtime state, including bounded non-secret
+    /// diagnostics (runtime-root source and fingerprint, recorded pid, host
+    /// identity, state schema) that let a caller explain why another observer
+    /// classified the same ingress differently.
+    #[cfg(all(feature = "network", unix))]
+    pub direct_ingress: Option<crate::lifecycle::DirectIngressUpgradePlan>,
     #[serde(skip)]
     pub(crate) planned_sessions: Vec<crate::upgrade_transaction::UpgradePlannedSession>,
 }
@@ -2449,6 +2455,8 @@ async fn upgrade_preflight_with_force(
         plugin_reconciliation_required: true,
         client_restart_required_if_plugin_replaced: true,
         helper_generation,
+        #[cfg(all(feature = "network", unix))]
+        direct_ingress: Some(ingress.plan().clone()),
         planned_sessions,
     })
 }

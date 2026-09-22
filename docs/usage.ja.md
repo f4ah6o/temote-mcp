@@ -119,7 +119,7 @@ opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`op
 
 ### 構造化ローカルエージェント broker
 
-`local_agent_run({session_id, agent, task, cwd?, access, model?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。
+`local_agent_run({session_id, agent, task, cwd?, access, model?, effort?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。`model` は adapter の model identifier、`effort` は Codex 専用の reasoning effort 名（他 agent では拒否）、`profile` は child に適用する名前付き provider/auth profile を選びます。
 `worktree: {branch, task?}` を指定した場合、caller は path を一切渡しません。Temote が selected session workspace から canonical repository を解決し、`<configured src root>/worktrees/<repo>/<task>` を自ら導出して、その repository と branch の検証済み managed worktree だけを再利用し、存在しなければ承認済みの managed-worktree 経路で作成します。`cwd` と `worktree` の同時指定は拒否し、検証済み workspace は agent 起動直前に再検証します。`<repository>/.wt/<name>` や `<src>/<repo>-*` などの legacy worktree はこの選択で adopt・移動・削除しません。
 `agent` は `codex` と `opencode` に限定し、呼び出し側が渡せるのは bounded な task と access mode だけです。
 実行ファイル、raw argv、environment、network policy は Temote が構築し、caller から指定できません。

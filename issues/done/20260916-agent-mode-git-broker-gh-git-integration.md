@@ -278,3 +278,7 @@ This file is now an umbrella/tracking issue. Implement in order and do not assig
 4. `issues/done/20260916-git-shim-network-gh-git.md`
 
 After those packets pass, close this umbrella from their combined evidence.
+
+## 2026-09-22 consolidation: done
+
+All bounded child packets are complete on `main` or in the merging PR set; remaining live acceptance is tracked in `issues/open/20260908-live-acceptance-matrix.md`.

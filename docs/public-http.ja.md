@@ -218,3 +218,6 @@ accepted response には transaction ID が含まれます。
 local OAuth の registration と token は process-local state なので、ingress を再起動した場合は OAuth authorization flow もやり直します。
 completed transaction は、検証した host、target version、boot generation、復元 session 数を返します。
 実行ファイルの path、session path、credential、header、command output は返しません。
+
+preflight には観測された direct-ingress plan が `direct_ingress` として埋め込まれ、秘密値を含まない境界付きの診断 field が付きます: `runtime_root`(runtime directory の導出元 — `temote-runtime-dir`、`xdg-runtime-dir`、`home-cache` のいずれか)、`runtime_root_id`(解決済み directory の切り詰め SHA-256 で、path を明かさずに root の同一性だけを比較できます)、`pid`、`host_id`、`state_schema` です。
+例えば Temote 経由とローカル shell の `upgrade --dry-run` が異なる runtime directory を観測して同じ ingress を異なる分類とした場合、これらの field を比較すれば、静かに不一致となる代わりに観測差の原因を特定できます。

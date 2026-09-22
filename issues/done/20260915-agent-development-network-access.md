@@ -239,3 +239,7 @@ The bounded child `issues/polished/20260916-agent-network-mode-policy.md` is imp
 - Docs updated: `docs/usage.md` / `.ja`, `docs/public-http.md` / `.ja`, `skills/temote-mcp/SKILL.md`, `AGENTS.md` safety invariant, and `CHANGES.md`.
 
 Live outbound HTTPS / LAN / RTSP evidence cannot be established in this environment and is now a row in the `Agent-mode development network` section of `issues/open/20260908-live-acceptance-matrix.md`. This umbrella therefore stays open until Phase 4 resolves that live row.
+
+## 2026-09-22 consolidation: done
+
+All bounded child packets are complete on `main` or in the merging PR set; remaining live acceptance is tracked in `issues/open/20260908-live-acceptance-matrix.md`.

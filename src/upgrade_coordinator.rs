@@ -626,6 +626,8 @@ mod tests {
             plugin_reconciliation_required: true,
             client_restart_required_if_plugin_replaced: true,
             helper_generation: session_control::HelperGeneration::Compatible,
+            #[cfg(all(feature = "network", unix))]
+            direct_ingress: None,
             planned_sessions: vec![upgrade_transaction::UpgradePlannedSession {
                 session_id: "session-a".to_owned(),
                 source_process_id: 100,

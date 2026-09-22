@@ -18478,6 +18478,258 @@ mod tests {
         );
     }
 
+    /// Agent-mode repository triage end-to-end: one ordinary agent session
+    /// rescues active work and removes only obsolete repository state, with
+    /// no Temote-specific Git instructions beyond the bounded structured
+    /// operations.
+    ///
+    /// The fixture is deterministic: a local repository with dirty and merged
+    /// state plus the bounded GitHub adapter, so worktree/branch/PR
+    /// classification and cleanup run without live GitHub state or a
+    /// supervisor socket.
+    #[tokio::test]
+    async fn agent_mode_repository_triage_rescues_active_work_and_cleans_only_obsolete_state() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let src_root = canonical.join("src");
+        let checkout = src_root.join("fixture-repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        init_git_repository(&checkout);
+        run_git_fixture(
+            &checkout,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/f4ah6o/temote-mcp.git",
+            ],
+        );
+
+        // Pre-existing repository state the agent must classify: dirty main,
+        // an unrelated untracked file, a merged obsolete branch with its own
+        // managed worktree, and an active rescue branch with another.
+        std::fs::write(checkout.join("tracked.txt"), "base\ndirty\n").unwrap();
+        std::fs::write(checkout.join("scratch.txt"), "unrelated scratch\n").unwrap();
+        run_git_fixture(&checkout, &["checkout", "--quiet", "-b", "obsolete/merged"]);
+        std::fs::write(checkout.join("obsolete.txt"), "obsolete\n").unwrap();
+        run_git_fixture(&checkout, &["add", "obsolete.txt"]);
+        run_git_fixture(&checkout, &["commit", "--quiet", "-m", "obsolete work"]);
+        run_git_fixture(&checkout, &["checkout", "--quiet", "main"]);
+        run_git_fixture(
+            &checkout,
+            &[
+                "merge",
+                "--quiet",
+                "--no-ff",
+                "-m",
+                "merge obsolete",
+                "obsolete/merged",
+            ],
+        );
+        run_git_fixture(&checkout, &["branch", "rescue/active-work"]);
+        let managed_root = src_root.join("worktrees").join("fixture-repo");
+        let merged_worktree = managed_root.join("merged");
+        let rescue_worktree = managed_root.join("rescue");
+        run_git_fixture(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                merged_worktree.to_str().unwrap(),
+                "obsolete/merged",
+            ],
+        );
+        run_git_fixture(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                rescue_worktree.to_str().unwrap(),
+                "rescue/active-work",
+            ],
+        );
+
+        let session = config::Session {
+            id: format!("triage-e2e-{}", Uuid::new_v4()),
+            cwd: checkout.clone(),
+            permitted_directories: vec![src_root.clone()],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+
+        // Inspection first: classify worktrees before any mutation.
+        let listed = git_worktree_list_with_src_root(
+            &json!({"session_id": session.id}),
+            &session,
+            Some(&src_root),
+            None,
+        )
+        .await
+        .unwrap();
+        let classification = listed["content"][0]["text"].as_str().unwrap().to_owned();
+        assert!(
+            classification.contains("merged") && classification.contains("rescue"),
+            "managed worktrees missing from classification: {classification}"
+        );
+
+        // Rescue: edit, stage and commit through the structured operations in
+        // the rescue worktree.
+        std::fs::write(rescue_worktree.join("rescued.txt"), "rescued work\n").unwrap();
+        git_add(
+            &json!({
+                "session_id": session.id,
+                "cwd": rescue_worktree,
+                "paths": [rescue_worktree.join("rescued.txt").to_string_lossy()],
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        git_commit(
+            &json!({
+                "session_id": session.id,
+                "cwd": rescue_worktree,
+                "message": "rescue active work",
+            }),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        // An uncommitted file keeps the rescue worktree provably active.
+        std::fs::write(rescue_worktree.join("in-progress.txt"), "still working\n").unwrap();
+
+        // Triage the one open pull request through the bounded adapter.
+        let credentials = FakeGithubPrCredentials {
+            token: "ghp_secret_broker_token",
+        };
+        let list_transport = FakeGithubPrTransport::responding_with(&format!(
+            "[{}]",
+            github_pr_summary_body(7, "open")
+        ));
+        let listed_prs = github_pr_list(
+            &json!({"session_id": session.id}),
+            &session,
+            None,
+            &credentials,
+            &list_transport,
+        )
+        .await
+        .unwrap();
+        let listed_prs: Value =
+            serde_json::from_str(listed_prs["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(listed_prs["pull_requests"][0]["number"], "7");
+        let close_transport =
+            FakeGithubPrTransport::responding_with(&github_pr_summary_body(7, "closed"));
+        let closed = github_pr_close(
+            &json!({"session_id": session.id, "number": "7"}),
+            &session,
+            None,
+            &credentials,
+            &close_transport,
+        )
+        .await
+        .unwrap();
+        let close_text = closed["content"][0]["text"].as_str().unwrap();
+        assert!(close_text.contains("\"closed\":true"));
+        assert!(!close_text.contains("ghp_secret_broker_token"));
+        assert_eq!(close_transport.recorded()[0].method, "PATCH");
+        assert_eq!(
+            close_transport.recorded()[0].path,
+            "repos/f4ah6o/temote-mcp/pulls/7"
+        );
+        assert_eq!(
+            close_transport.recorded()[0].body,
+            Some(json!({"state": "closed"}))
+        );
+
+        // Cleanup removes only obsolete state: the clean managed worktree and
+        // the merged branch go; the dirty rescue worktree and its checked-out
+        // unmerged branch are both refused.
+        git_worktree_remove_in_src_root_with_snapshots(
+            &json!({"session_id": session.id, "task": "merged"}),
+            &session,
+            &src_root,
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(!merged_worktree.exists());
+        git_branch_delete(
+            &json!({"session_id": session.id, "branch": "obsolete/merged"}),
+            &session,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            git_worktree_remove_in_src_root_with_snapshots(
+                &json!({"session_id": session.id, "task": "rescue"}),
+                &session,
+                &src_root,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .is_err(),
+            "a dirty active rescue worktree must never be removed"
+        );
+        assert!(
+            git_branch_delete(
+                &json!({"session_id": session.id, "branch": "rescue/active-work"}),
+                &session,
+                None,
+            )
+            .await
+            .is_err(),
+            "a checked-out unmerged rescue branch must never be deleted"
+        );
+
+        // The original dirty/untracked bytes, the rescue worktree and its
+        // branch survive.
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "base\ndirty\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("scratch.txt")).unwrap(),
+            "unrelated scratch\n"
+        );
+        assert!(rescue_worktree.join("rescued.txt").exists());
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["status", "--porcelain"]),
+            "M tracked.txt\n?? scratch.txt"
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["diff", "--name-only"]),
+            "tracked.txt"
+        );
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["diff", "--cached", "--name-only"]),
+            ""
+        );
+        let branches = git_fixture_stdout(&checkout, &["branch", "--format=%(refname:short)"]);
+        assert!(
+            branches
+                .lines()
+                .any(|branch| branch == "rescue/active-work")
+        );
+        assert!(!branches.lines().any(|branch| branch == "obsolete/merged"));
+        assert_eq!(
+            git_fixture_stdout(&checkout, &["rev-parse", "rescue/active-work"]).trim(),
+            git_fixture_stdout(&rescue_worktree, &["rev-parse", "HEAD"]).trim(),
+            "the rescue commit did not land on the rescue branch"
+        );
+    }
+
     #[test]
     fn github_repository_credential_mapping_requires_managed_repo_local_helper() {
         assert!(repo_scoped_github_credential_mapping_valid(
