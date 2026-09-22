@@ -879,6 +879,31 @@ fn resolve_shim_worktree_path(cwd: &Path, path: &str) -> PathBuf {
 }
 
 async fn handle_request(state: &BrokerState, request: GitShimRequest) -> Result<sandbox::Output> {
+    handle_request_inner(state, request, None).await
+}
+
+type OwnershipSnapshots<'a> = (
+    &'a [crate::session_control::SessionView],
+    &'a [(String, PathBuf)],
+);
+
+#[cfg(test)]
+async fn handle_request_with_ownership_snapshots(
+    state: &BrokerState,
+    request: GitShimRequest,
+    views: &[crate::session_control::SessionView],
+    jobs: &[(String, PathBuf)],
+) -> Result<sandbox::Output> {
+    handle_request_inner(state, request, Some((views, jobs))).await
+}
+
+async fn handle_request_inner(
+    state: &BrokerState,
+    request: GitShimRequest,
+    ownership_snapshots: Option<OwnershipSnapshots<'_>>,
+) -> Result<sandbox::Output> {
+    #[cfg(not(test))]
+    let _ = ownership_snapshots;
     anyhow::ensure!(
         request.schema == BROKER_SCHEMA,
         "unsupported Git broker schema"
@@ -1000,13 +1025,22 @@ async fn handle_request(state: &BrokerState, request: GitShimRequest) -> Result<
             };
             let operation = state.operation_session(&cwd);
             let requested = resolve_shim_worktree_path(&cwd, &path);
-            let result = mcp::git_worktree_remove_in_src_root(
-                &json!({"path": requested.to_string_lossy()}),
-                &operation,
-                &src_root,
-                None,
-            )
-            .await;
+            let args = json!({"path": requested.to_string_lossy()});
+            #[cfg(test)]
+            let result = match ownership_snapshots {
+                Some((views, jobs)) => {
+                    mcp::git_worktree_remove_in_src_root_with_snapshots(
+                        &args, &operation, &src_root, None, views, jobs,
+                    )
+                    .await
+                }
+                None => {
+                    mcp::git_worktree_remove_in_src_root(&args, &operation, &src_root, None).await
+                }
+            };
+            #[cfg(not(test))]
+            let result =
+                mcp::git_worktree_remove_in_src_root(&args, &operation, &src_root, None).await;
             Ok(structured_shim_output(result))
         }
         ShimCommand::Fetch { remote } => {
@@ -2252,12 +2286,14 @@ mod tests {
         assert!(!mismatched.exists());
 
         // remove: delegated to the structured managed remove.
-        let removed = handle_request(
+        let removed = handle_request_with_ownership_snapshots(
             &state,
             request(
                 &repository,
                 &["worktree", "remove", target.to_str().unwrap()],
             ),
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -2269,12 +2305,14 @@ mod tests {
         );
 
         // Legacy and out-of-root worktrees are never adopted or removed.
-        let rejected = handle_request(
+        let rejected = handle_request_with_ownership_snapshots(
             &state,
             request(
                 &repository,
                 &["worktree", "remove", legacy.to_str().unwrap()],
             ),
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -2306,12 +2344,14 @@ mod tests {
         assert_eq!(created.status, 0, "{}", created.stderr);
         std::fs::write(target.join("unrelated.txt"), "keep\n").unwrap();
 
-        let rejected = handle_request(
+        let rejected = handle_request_with_ownership_snapshots(
             &broker_state,
             request(
                 &repository,
                 &["worktree", "remove", target.to_str().unwrap()],
             ),
+            &[],
+            &[],
         )
         .await
         .unwrap();

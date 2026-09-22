@@ -49,6 +49,18 @@ const MAX_MANAGED_WORKTREE_LIST_ENTRIES: usize = 128;
 const MAX_GITHUB_WORKFLOW_BYTES: usize = 255;
 const MAX_GITHUB_REF_BYTES: usize = 255;
 const MAX_GITHUB_REMOTE_URL_BYTES: usize = 2048;
+const MAX_GIT_REMOTE_DESTINATIONS: usize = 32;
+const MAX_GIT_REMOTE_DESTINATIONS_BYTES: usize = 32 * MAX_GITHUB_REMOTE_URL_BYTES;
+const MAX_GIT_CONFIG_VALUES: usize = 32;
+const MAX_GIT_CONFIG_OUTPUT_BYTES: usize = 16 * 1024;
+const GIT_PULL_UPSTREAM_CONFIGURATION_ERROR: &str =
+    "Git pull upstream configuration is unavailable";
+const GIT_REMOTE_DESTINATION_ERROR: &str = "Git remote destination is unavailable";
+const GITHUB_CREDENTIAL_MAPPING_ERROR: &str = "GitHub repository credential mapping is unavailable";
+const GITHUB_CREDENTIAL_UNAVAILABLE_ERROR: &str = "GitHub repository credential is unavailable";
+const GITHUB_CREDENTIAL_PERMISSION_ERROR: &str =
+    "GitHub repository credential lacks required permission";
+const GITHUB_NETWORK_GIT_ERROR: &str = "GitHub repository network Git operation failed";
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MCP_RESPONSE_BYTES: usize = 52 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -420,25 +432,33 @@ enum JobActivityOutcome {
 struct Job {
     session_id: String,
     command: String,
-    cwd: PathBuf,
     handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
     output_policy: OutputPolicy,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveJobAdmission {
+    cwd: PathBuf,
+    worktree_root: Option<PathBuf>,
+}
+
 struct JobSlot {
     session_id: String,
+    admission_id: Uuid,
+    _reservation: Option<managed_worktree::WorktreeReservation>,
 }
 
 impl Drop for JobSlot {
     fn drop(&mut self) {
-        release_job_slot(&self.session_id);
+        release_job_slot(&self.session_id, self.admission_id);
     }
 }
 
 struct JobState {
     jobs: HashMap<Uuid, Job>,
     active_by_session: HashMap<String, usize>,
+    active_admissions: HashMap<Uuid, ActiveJobAdmission>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
@@ -459,6 +479,7 @@ fn jobs() -> &'static Mutex<JobState> {
         Mutex::new(JobState {
             jobs: HashMap::new(),
             active_by_session: HashMap::new(),
+            active_admissions: HashMap::new(),
         })
     })
 }
@@ -2618,6 +2639,60 @@ async fn git_commit(
     run_git_and_report(session, cwd, command, "Create Git commit", activity).await
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitRemoteOperation {
+    Fetch,
+    Pull,
+    Push,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitRemoteDestinations {
+    urls: Vec<String>,
+}
+
+impl GitRemoteDestinations {
+    fn requires_github_credential_mapping(&self) -> bool {
+        self.urls.iter().any(|url| is_github_https_destination(url))
+    }
+}
+
+fn is_github_https_destination(url: &str) -> bool {
+    if url.is_empty()
+        || url.len() > MAX_GITHUB_REMOTE_URL_BYTES
+        || url.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let Some((scheme, authority_and_path)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() || authority.chars().any(char::is_control) {
+        return false;
+    }
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_and_port)| host_and_port);
+    let host = if let Some(bracketed_host) = host_and_port.strip_prefix('[') {
+        bracketed_host
+            .split_once(']')
+            .map_or(bracketed_host, |(host, _)| host)
+    } else {
+        host_and_port
+            .split_once(':')
+            .map_or(host_and_port, |(host, _)| host)
+    };
+    host.trim_end_matches('.')
+        .eq_ignore_ascii_case("github.com")
+}
+
 async fn git_fetch(
     args: &Value,
     session: &config::Session,
@@ -2639,10 +2714,20 @@ pub(crate) async fn git_fetch_output(
     activity: Option<&ActivityScope>,
 ) -> Result<sandbox::Output> {
     let remote = remote.unwrap_or_else(|| "origin".to_owned());
-    ensure_configured_git_remote(session, &cwd, &remote).await?;
-    ensure_github_https_remote_credential_mapping(session, &cwd, &remote).await?;
+    validate_git_remote(&remote)?;
+    let destinations =
+        resolve_git_remote_destinations(session, &cwd, &remote, GitRemoteOperation::Fetch).await?;
+    ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
     let command = build_git_fetch_command(&remote);
-    run_approved_git_output(session, cwd, command, "git_fetch", activity).await
+    run_approved_git_network_output(
+        session,
+        cwd,
+        command,
+        "git_fetch",
+        activity,
+        destinations.requires_github_credential_mapping(),
+    )
+    .await
 }
 
 async fn git_pull(
@@ -2664,22 +2749,173 @@ pub(crate) async fn git_pull_output(
     activity: Option<&ActivityScope>,
 ) -> Result<sandbox::Output> {
     let remote = git_current_upstream_remote(session, &cwd).await?;
-    if let Some(remote) = &remote {
-        ensure_github_https_remote_credential_mapping(session, &cwd, remote).await?;
-    }
+    let remote = remote.context(GIT_PULL_UPSTREAM_CONFIGURATION_ERROR)?;
+    let destinations =
+        resolve_git_remote_destinations(session, &cwd, &remote, GitRemoteOperation::Pull).await?;
+    ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
     let command = build_git_pull_command();
-    run_approved_git_output(session, cwd, command, "git_pull", activity).await
+    run_approved_git_network_output(
+        session,
+        cwd,
+        command,
+        "git_pull",
+        activity,
+        destinations.requires_github_credential_mapping(),
+    )
+    .await
 }
 
-/// Resolves the configured upstream remote of the current branch, if any.
+/// Resolves the configured upstream remote of the current branch.
 ///
-/// Used only to decide whether a repo-local GitHub credential mapping is
-/// required; the pull command itself never receives a caller-supplied remote.
+/// This reads the current branch's fixed remote/merge config directly instead
+/// of requiring an already-created remote-tracking ref. The pull command never
+/// receives a caller-supplied remote.
 async fn git_current_upstream_remote(
     session: &config::Session,
     cwd: &Path,
 ) -> Result<Option<String>> {
-    git_remote_for_symbolic_rev(session, cwd, "@{upstream}").await
+    let branch = git_current_branch_name(session, cwd)
+        .await?
+        .context(GIT_PULL_UPSTREAM_CONFIGURATION_ERROR)?;
+    let remote_key = format!("branch.{branch}.remote");
+    let remote_values = git_config_values(session, cwd, &remote_key).await?;
+    anyhow::ensure!(
+        remote_values.len() == 1,
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    let remote = remote_values
+        .into_iter()
+        .next()
+        .context(GIT_PULL_UPSTREAM_CONFIGURATION_ERROR)?;
+    if remote != "." {
+        validate_git_remote(&remote)
+            .map_err(|_| anyhow::anyhow!(GIT_PULL_UPSTREAM_CONFIGURATION_ERROR))?;
+    }
+    let merge_key = format!("branch.{branch}.merge");
+    let merge_values = git_config_values(session, cwd, &merge_key).await?;
+    anyhow::ensure!(
+        merge_values.len() == 1,
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    let merge = merge_values
+        .into_iter()
+        .next()
+        .context(GIT_PULL_UPSTREAM_CONFIGURATION_ERROR)?;
+    validate_git_merge_ref(&merge)?;
+    Ok(Some(remote))
+}
+
+async fn resolve_git_remote_destinations(
+    session: &config::Session,
+    cwd: &Path,
+    remote: &str,
+    operation: GitRemoteOperation,
+) -> Result<GitRemoteDestinations> {
+    validate_git_remote(remote)?;
+    if operation == GitRemoteOperation::Pull && remote == "." {
+        return Ok(GitRemoteDestinations { urls: Vec::new() });
+    }
+
+    let command = match operation {
+        GitRemoteOperation::Fetch | GitRemoteOperation::Pull => vec![
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            remote.to_owned(),
+        ],
+        GitRemoteOperation::Push => vec![
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            "--push".to_owned(),
+            "--all".to_owned(),
+            remote.to_owned(),
+        ],
+    };
+    let output =
+        map_git_remote_inspection_error(run_host_git_inspection(session, cwd, &command).await)?;
+    anyhow::ensure!(
+        output.status == 0,
+        "Git remote {remote:?} is not configured"
+    );
+    let urls = parse_git_remote_destinations(&output, operation)?;
+    Ok(GitRemoteDestinations { urls })
+}
+
+fn parse_git_remote_destinations(
+    output: &sandbox::Output,
+    operation: GitRemoteOperation,
+) -> Result<Vec<String>> {
+    anyhow::ensure!(output.status == 0, GIT_REMOTE_DESTINATION_ERROR);
+    anyhow::ensure!(!output.truncated, GIT_REMOTE_DESTINATION_ERROR);
+    anyhow::ensure!(
+        !output.stdout.is_empty() && output.stdout.len() <= MAX_GIT_REMOTE_DESTINATIONS_BYTES,
+        GIT_REMOTE_DESTINATION_ERROR
+    );
+
+    let mut lines = output.stdout.split('\n').collect::<Vec<_>>();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    anyhow::ensure!(
+        !lines.is_empty() && lines.len() <= MAX_GIT_REMOTE_DESTINATIONS,
+        GIT_REMOTE_DESTINATION_ERROR
+    );
+    if matches!(
+        operation,
+        GitRemoteOperation::Fetch | GitRemoteOperation::Pull
+    ) {
+        anyhow::ensure!(lines.len() == 1, GIT_REMOTE_DESTINATION_ERROR);
+    }
+
+    let mut total_bytes = 0usize;
+    let mut urls = Vec::with_capacity(lines.len());
+    for line in lines {
+        anyhow::ensure!(
+            !line.is_empty()
+                && line.len() <= MAX_GITHUB_REMOTE_URL_BYTES
+                && line == line.trim()
+                && !line.chars().any(char::is_control),
+            GIT_REMOTE_DESTINATION_ERROR
+        );
+        total_bytes = total_bytes
+            .checked_add(line.len())
+            .context(GIT_REMOTE_DESTINATION_ERROR)?;
+        anyhow::ensure!(
+            total_bytes <= MAX_GIT_REMOTE_DESTINATIONS_BYTES,
+            GIT_REMOTE_DESTINATION_ERROR
+        );
+        urls.push(line.to_owned());
+    }
+    Ok(urls)
+}
+
+fn map_git_remote_inspection_error<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|_| anyhow::anyhow!(GIT_REMOTE_DESTINATION_ERROR))
+}
+
+fn validate_git_merge_ref(merge: &str) -> Result<()> {
+    anyhow::ensure!(
+        merge.len() > "refs/heads/".len()
+            && merge.len() <= MAX_GIT_BASE_REF_BYTES
+            && merge.starts_with("refs/heads/")
+            && merge == merge.trim()
+            && !merge.chars().any(char::is_control),
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    let branch = &merge["refs/heads/".len()..];
+    anyhow::ensure!(
+        branch.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+        }) && !branch.starts_with('/')
+            && !branch.ends_with('/')
+            && !branch.contains("..")
+            && !branch.contains("//")
+            && !branch.contains("@{")
+            && !branch.ends_with(".lock"),
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    Ok(())
 }
 
 /// Resolves the effective push remote of the current branch, if any.
@@ -2760,25 +2996,12 @@ async fn git_config_value(
     cwd: &Path,
     key: &str,
 ) -> Result<Option<String>> {
-    let output = run_host_git_inspection(
-        session,
-        cwd,
-        &[
-            "git".to_owned(),
-            "config".to_owned(),
-            "--get".to_owned(),
-            key.to_owned(),
-        ],
-    )
-    .await?;
-    if output.status != 0 {
-        return Ok(None);
+    let values = git_config_values(session, cwd, key).await?;
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.to_owned())),
+        _ => anyhow::bail!(GIT_PULL_UPSTREAM_CONFIGURATION_ERROR),
     }
-    let value = output.stdout.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(value.to_owned()))
 }
 
 /// Resolves `<remote>/<ref>` for one symbolic revision to a validated remote
@@ -2850,12 +3073,28 @@ pub(crate) async fn git_push_output(
         // The command itself stays `git push` and never receives this value.
         git_current_push_remote(session, &cwd).await?
     };
-    if let Some(remote) = &selected_remote {
-        ensure_configured_git_remote(session, &cwd, remote).await?;
-        ensure_github_https_remote_credential_mapping(session, &cwd, remote).await?;
-    }
+    let destinations = if let Some(remote) = &selected_remote {
+        validate_git_remote(remote)?;
+        let destinations =
+            resolve_git_remote_destinations(session, &cwd, remote, GitRemoteOperation::Push)
+                .await?;
+        ensure_github_https_destinations_credential_mapping(session, &cwd, &destinations).await?;
+        Some(destinations)
+    } else {
+        None
+    };
     let command = build_git_push_command(remote, set_upstream);
-    run_approved_git_output(session, cwd, command, "git_push", activity).await
+    run_approved_git_network_output(
+        session,
+        cwd,
+        command,
+        "git_push",
+        activity,
+        destinations
+            .as_ref()
+            .is_some_and(GitRemoteDestinations::requires_github_credential_mapping),
+    )
+    .await
 }
 
 /// The exact non-force fetch shape: fixed hooks/submodule hardening plus the
@@ -2916,65 +3155,77 @@ pub(crate) fn build_git_push_command(remote: Option<String>, set_upstream: bool)
 /// the existing configured-remote validation. The mapping is always read from
 /// the selected repository's own local config, so concurrent repositories can
 /// never borrow each other's identity.
+#[allow(dead_code)]
 pub(crate) async fn ensure_github_https_remote_credential_mapping(
     session: &config::Session,
     cwd: &Path,
     remote: &str,
 ) -> Result<()> {
-    let output = run_host_git_inspection(
-        session,
-        cwd,
-        &[
-            "git".to_owned(),
-            "remote".to_owned(),
-            "get-url".to_owned(),
-            remote.to_owned(),
-        ],
-    )
-    .await?;
-    anyhow::ensure!(output.status == 0, "configured Git remote is unavailable");
-    let remote_url = output.stdout.trim();
-    anyhow::ensure!(
-        !remote_url.is_empty() && remote_url.len() <= MAX_GITHUB_REMOTE_URL_BYTES,
-        "configured Git remote URL is invalid"
-    );
-    if !remote_url.starts_with("https://github.com/") {
+    let destinations =
+        resolve_git_remote_destinations(session, cwd, remote, GitRemoteOperation::Fetch).await?;
+    ensure_github_https_destinations_credential_mapping(session, cwd, &destinations).await
+}
+
+async fn ensure_github_https_destinations_credential_mapping(
+    session: &config::Session,
+    cwd: &Path,
+    destinations: &GitRemoteDestinations,
+) -> Result<()> {
+    if !destinations.requires_github_credential_mapping() {
         return Ok(());
     }
-    let local_helpers = run_host_git_inspection(
-        session,
-        cwd,
-        &[
-            "git".to_owned(),
-            "config".to_owned(),
-            "--local".to_owned(),
-            "--includes".to_owned(),
-            "--get-all".to_owned(),
-            "credential.helper".to_owned(),
-        ],
-    )
-    .await?;
-    let local_use_http_path = run_host_git_inspection(
-        session,
-        cwd,
-        &[
-            "git".to_owned(),
-            "config".to_owned(),
-            "--local".to_owned(),
-            "--includes".to_owned(),
-            "--get".to_owned(),
-            "credential.useHttpPath".to_owned(),
-        ],
-    )
-    .await?;
+    let local_helpers = map_github_credential_inspection_error(
+        run_host_git_inspection(
+            session,
+            cwd,
+            &[
+                "git".to_owned(),
+                "config".to_owned(),
+                "--local".to_owned(),
+                "--includes".to_owned(),
+                "--get-all".to_owned(),
+                "credential.helper".to_owned(),
+            ],
+        )
+        .await,
+    )?;
+    let local_use_http_path = map_github_credential_inspection_error(
+        run_host_git_inspection(
+            session,
+            cwd,
+            &[
+                "git".to_owned(),
+                "config".to_owned(),
+                "--local".to_owned(),
+                "--includes".to_owned(),
+                "--get".to_owned(),
+                "credential.useHttpPath".to_owned(),
+            ],
+        )
+        .await,
+    )?;
+    validate_github_credential_mapping_inspection(&local_helpers, &local_use_http_path)?;
+    Ok(())
+}
+
+fn map_github_credential_inspection_error<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|_| anyhow::anyhow!(GITHUB_CREDENTIAL_MAPPING_ERROR))
+}
+
+fn validate_github_credential_mapping_inspection(
+    local_helpers: &sandbox::Output,
+    local_use_http_path: &sandbox::Output,
+) -> Result<()> {
     anyhow::ensure!(
         local_helpers.status == 0
+            && !local_helpers.truncated
             && local_use_http_path.status == 0
+            && !local_use_http_path.truncated
             && repo_scoped_github_credential_mapping_valid(
                 &local_helpers.stdout,
                 &local_use_http_path.stdout,
             ),
-        "GitHub repository credential mapping is unavailable"
+        GITHUB_CREDENTIAL_MAPPING_ERROR
     );
     Ok(())
 }
@@ -3722,6 +3973,9 @@ struct ManagedWorktreeOwnership {
     owning_jobs: Vec<String>,
 }
 
+type ManagedWorktreeOwnershipSnapshots<'a> =
+    (&'a [session_control::SessionView], &'a [(String, PathBuf)]);
+
 impl ManagedWorktreeOwnership {
     fn is_empty(&self) -> bool {
         self.owning_sessions.is_empty() && self.owning_jobs.is_empty()
@@ -3774,30 +4028,6 @@ fn managed_worktree_owners_from(
     ownership
 }
 
-/// Resolves the live owners of one managed worktree path.
-///
-/// The current session, every session whose status is not clearly terminal, and
-/// every in-process running job are checked. A supervisor/liveness lookup
-/// failure is an error so callers fail closed instead of assuming the worktree
-/// is unowned.
-async fn managed_worktree_ownership(
-    session: &config::Session,
-    target: &Path,
-) -> Result<ManagedWorktreeOwnership> {
-    let views = session_control::session_views_for_mcp()
-        .await
-        .context("cannot determine whether another session owns this managed worktree")?;
-    let jobs = {
-        let state = jobs().lock().unwrap();
-        state
-            .jobs
-            .iter()
-            .map(|(job_id, job)| (job_id.to_string(), job.cwd.clone()))
-            .collect::<Vec<_>>()
-    };
-    Ok(managed_worktree_owners_from(session, target, &views, &jobs))
-}
-
 /// Read-only precondition proof for removing one managed worktree.
 #[derive(Clone, Debug)]
 struct ManagedWorktreeRemovalPlan {
@@ -3840,6 +4070,22 @@ async fn inspect_managed_worktree_for_removal(
     repository: managed_worktree::ManagedRepository,
     task: String,
     target: PathBuf,
+) -> Result<ManagedWorktreeRemovalPlan> {
+    let views = session_control::session_views_for_mcp()
+        .await
+        .context("cannot determine whether another session owns this managed worktree")?;
+    let jobs = snapshot_active_job_ownerships();
+    inspect_managed_worktree_for_removal_inner(session, repository, task, target, &views, &jobs)
+        .await
+}
+
+async fn inspect_managed_worktree_for_removal_inner(
+    session: &config::Session,
+    repository: managed_worktree::ManagedRepository,
+    task: String,
+    target: PathBuf,
+    views: &[session_control::SessionView],
+    jobs: &[(String, PathBuf)],
 ) -> Result<ManagedWorktreeRemovalPlan> {
     repository.ensure_authority()?;
     anyhow::ensure!(
@@ -3934,7 +4180,7 @@ async fn inspect_managed_worktree_for_removal(
 
     let branch = sandbox::git_current_branch(&canonical_target)?;
 
-    let ownership = managed_worktree_ownership(session, &target).await?;
+    let ownership = managed_worktree_owners_from(session, &target, views, jobs);
     anyhow::ensure!(
         ownership.is_empty(),
         "managed worktree is in use by {} session(s) and {} running job(s); refusing removal",
@@ -4141,6 +4387,33 @@ pub(crate) async fn git_worktree_remove_in_src_root(
     src_root: &Path,
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
+    git_worktree_remove_in_src_root_impl(args, session, src_root, activity, None).await
+}
+
+/// Deterministic managed-worktree remove entry point.  The same precondition
+/// and mutation path as production is used, but ownership snapshots are
+/// supplied by the caller so focused tests and the Git shim do not need a live
+/// supervisor socket.
+#[cfg(test)]
+pub(crate) async fn git_worktree_remove_in_src_root_with_snapshots(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+    views: &[session_control::SessionView],
+    jobs: &[(String, PathBuf)],
+) -> Result<Value> {
+    git_worktree_remove_in_src_root_impl(args, session, src_root, activity, Some((views, jobs)))
+        .await
+}
+
+async fn git_worktree_remove_in_src_root_impl(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+    snapshots: Option<ManagedWorktreeOwnershipSnapshots<'_>>,
+) -> Result<Value> {
     reject_removed_managed_worktree_arguments(args, &["cwd", "base"])?;
     let task = match args.get("task") {
         Some(value) => Some(value.as_str().context("task must be a string")?),
@@ -4158,7 +4431,15 @@ pub(crate) async fn git_worktree_remove_in_src_root(
     let repository =
         managed_repository_for_requested(requested_repository, session, &cwd, src_root)?;
     let (task, target) = resolve_managed_worktree_target(&repository, task, path)?;
-    let plan = inspect_managed_worktree_for_removal(session, repository, task, target).await?;
+    let plan = match snapshots {
+        Some((views, jobs)) => {
+            inspect_managed_worktree_for_removal_inner(
+                session, repository, task, target, views, jobs,
+            )
+            .await?
+        }
+        None => inspect_managed_worktree_for_removal(session, repository, task, target).await?,
+    };
     approve_local_git_mutation(
         session,
         plan.repository.primary_checkout(),
@@ -4172,15 +4453,37 @@ pub(crate) async fn git_worktree_remove_in_src_root(
         activity,
     )
     .await?;
-    // The approval boundary is not a trust boundary: re-prove every
-    // precondition on freshly observed state before the mutation runs.
-    let plan = inspect_managed_worktree_for_removal(
-        session,
-        plan.repository.clone(),
-        plan.task.clone(),
-        plan.target.clone(),
+    // The approval boundary is not a trust boundary.  First serialize this
+    // target against session/job admission; while the guard is held, re-prove
+    // every precondition on freshly observed state before the mutation runs.
+    let _repository_reservation = managed_worktree::acquire_shared_repository_reservation_async(
+        plan.repository.primary_checkout(),
     )
     .await?;
+    let _reservation =
+        managed_worktree::try_acquire_worktree_reservation_async(&plan.target).await?;
+    let plan = match snapshots {
+        Some((views, jobs)) => {
+            inspect_managed_worktree_for_removal_inner(
+                session,
+                plan.repository.clone(),
+                plan.task.clone(),
+                plan.target.clone(),
+                views,
+                jobs,
+            )
+            .await?
+        }
+        None => {
+            inspect_managed_worktree_for_removal(
+                session,
+                plan.repository.clone(),
+                plan.task.clone(),
+                plan.target.clone(),
+            )
+            .await?
+        }
+    };
 
     let command = build_git_worktree_remove_command(&plan.target);
     let rendered_command = render_command(&command);
@@ -4311,15 +4614,24 @@ async fn ensure_prunable_entries_unowned(
     let views = session_control::session_views_for_mcp()
         .await
         .context("cannot determine whether another session owns stale worktree metadata")?;
-    let jobs = {
-        let state = jobs().lock().unwrap();
-        state
-            .jobs
-            .iter()
-            .map(|(job_id, job)| (job_id.to_string(), job.cwd.clone()))
-            .collect::<Vec<_>>()
-    };
+    let jobs = snapshot_active_job_ownerships();
     ensure_prunable_entries_unowned_from(session, prunable, &views, &jobs)
+}
+
+fn ensure_prunable_entries_covered(
+    reservations: &managed_worktree::WorktreeReservations,
+    observed: &[PathBuf],
+) -> Result<()> {
+    let locked = reservations.identities();
+    for path in observed {
+        let identity = managed_worktree::worktree_reservation_identity(path)?;
+        anyhow::ensure!(
+            locked.iter().any(|candidate| *candidate == identity),
+            "prunable worktree set changed after reservations were acquired; refusing to prune: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn build_git_worktree_prune_command() -> Vec<String> {
@@ -4338,6 +4650,26 @@ fn bounded_path_list(paths: &[PathBuf]) -> Vec<String> {
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect()
+}
+
+const MANAGED_WORKTREE_PRUNE_MUTATION_ERROR: &str =
+    "git worktree prune did not complete successfully";
+const MANAGED_WORKTREE_PRUNE_OBSERVATION_ERROR: &str = "post-prune observation failed";
+const MANAGED_WORKTREE_PRUNE_VERIFICATION_ERROR: &str = "post-prune verification failed";
+
+fn bounded_managed_worktree_prune_error(
+    output: &sandbox::Output,
+    verification_error: &str,
+) -> &'static str {
+    if output.status != 0 {
+        MANAGED_WORKTREE_PRUNE_MUTATION_ERROR
+    } else if verification_error == MANAGED_WORKTREE_PRUNE_OBSERVATION_ERROR {
+        MANAGED_WORKTREE_PRUNE_OBSERVATION_ERROR
+    } else {
+        // Never copy an observation or verification error into the public
+        // result: both can contain arbitrary paths or child-process output.
+        MANAGED_WORKTREE_PRUNE_VERIFICATION_ERROR
+    }
 }
 
 fn managed_worktree_prune_result(
@@ -4373,12 +4705,9 @@ fn managed_worktree_prune_result(
         "filesystem_directories_preserved": true,
         "mutation_committed": output.status == 0,
         "exit_code": output.status,
-        "stdout": output.stdout,
-        "stderr": output.stderr,
-        "truncated": output.truncated,
     });
     if let Some(error) = verification_error {
-        value["verification_error"] = json!(error);
+        value["verification_error"] = json!(bounded_managed_worktree_prune_error(output, error));
         value["filesystem_directories_preserved"] = json!(false);
     }
     value.to_string()
@@ -4438,6 +4767,32 @@ async fn git_worktree_prune_in_src_root(
     src_root: &Path,
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
+    git_worktree_prune_in_src_root_impl(args, session, src_root, activity, None).await
+}
+
+/// Deterministic managed-worktree prune entry point.  The injected snapshots
+/// feed the same ownership decision as production while the Git observation,
+/// reservation ordering and post-verification stay unchanged.
+#[cfg(test)]
+pub(crate) async fn git_worktree_prune_in_src_root_with_snapshots(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+    views: &[session_control::SessionView],
+    jobs: &[(String, PathBuf)],
+) -> Result<Value> {
+    git_worktree_prune_in_src_root_impl(args, session, src_root, activity, Some((views, jobs)))
+        .await
+}
+
+async fn git_worktree_prune_in_src_root_impl(
+    args: &Value,
+    session: &config::Session,
+    src_root: &Path,
+    activity: Option<&ActivityScope>,
+    snapshots: Option<ManagedWorktreeOwnershipSnapshots<'_>>,
+) -> Result<Value> {
     reject_removed_managed_worktree_arguments(args, &["cwd", "base", "task", "path"])?;
     let requested_repository = match args.get("repository") {
         Some(value) => Some(value.as_str().context("repository must be a string")?),
@@ -4448,7 +4803,12 @@ async fn git_worktree_prune_in_src_root(
         managed_repository_for_requested(requested_repository, session, &cwd, src_root)?;
     repository.ensure_authority()?;
     let before = observe_managed_worktrees(session, &repository).await?;
-    ensure_prunable_entries_unowned(session, &before.prunable).await?;
+    match snapshots {
+        Some((views, jobs)) => {
+            ensure_prunable_entries_unowned_from(session, &before.prunable, views, jobs)?
+        }
+        None => ensure_prunable_entries_unowned(session, &before.prunable).await?,
+    }
     approve_local_git_mutation(
         session,
         repository.primary_checkout(),
@@ -4461,9 +4821,24 @@ async fn git_worktree_prune_in_src_root(
         activity,
     )
     .await?;
-    // The approval boundary is not a trust boundary: re-observe everything.
+    // The approval boundary is not a trust boundary.  Lock every currently
+    // prunable entry in stable order, then re-observe the set while those
+    // locks are held.  A newly observed entry that was not covered by a lock
+    // rejects the entire prune instead of being silently removed.
+    let _repository_reservation =
+        managed_worktree::try_acquire_repository_reservation_async(repository.primary_checkout())
+            .await?;
     let before = observe_managed_worktrees(session, &repository).await?;
-    ensure_prunable_entries_unowned(session, &before.prunable).await?;
+    let _reservations =
+        managed_worktree::try_acquire_worktree_reservations_async(&before.prunable).await?;
+    let before = observe_managed_worktrees(session, &repository).await?;
+    ensure_prunable_entries_covered(&_reservations, &before.prunable)?;
+    match snapshots {
+        Some((views, jobs)) => {
+            ensure_prunable_entries_unowned_from(session, &before.prunable, views, jobs)?
+        }
+        None => ensure_prunable_entries_unowned(session, &before.prunable).await?,
+    }
 
     let command = build_git_worktree_prune_command();
     let rendered_command = render_command(&command);
@@ -4490,11 +4865,11 @@ async fn git_worktree_prune_in_src_root(
                 match observe_managed_worktrees(session, &repository).await {
                     Ok(after) => verify_managed_worktree_prune(&before, &after)
                         .map(|()| after)
-                        .map_err(|error| format!("{error:#}")),
-                    Err(error) => Err(format!("{error:#}")),
+                        .map_err(|_| MANAGED_WORKTREE_PRUNE_VERIFICATION_ERROR),
+                    Err(_) => Err(MANAGED_WORKTREE_PRUNE_OBSERVATION_ERROR),
                 }
             } else {
-                Err("git worktree prune did not complete successfully".to_owned())
+                Err(MANAGED_WORKTREE_PRUNE_MUTATION_ERROR)
             };
             match verification {
                 Ok(after) => Ok(managed_worktree_prune_result(
@@ -4515,7 +4890,7 @@ async fn git_worktree_prune_in_src_root(
                     &before,
                     &ManagedWorktreePruneObservation::default(),
                     &output,
-                    Some(&error),
+                    Some(error),
                 ))),
             }
         }
@@ -5297,10 +5672,7 @@ async fn repo_scoped_github_token(
         ],
     )
     .await?;
-    anyhow::ensure!(
-        local_helpers.status == 0,
-        "GitHub repository credential mapping is unavailable"
-    );
+    anyhow::ensure!(local_helpers.status == 0, GITHUB_CREDENTIAL_MAPPING_ERROR);
     let local_use_http_path = run_host_git_inspection(
         session,
         repository_root,
@@ -5320,7 +5692,7 @@ async fn repo_scoped_github_token(
                 &local_helpers.stdout,
                 &local_use_http_path.stdout,
             ),
-        "GitHub repository credential mapping is unavailable"
+        GITHUB_CREDENTIAL_MAPPING_ERROR
     );
 
     let path = format!("{}/{}.git", repository.owner, repository.repo);
@@ -5521,23 +5893,59 @@ async fn ensure_configured_git_remote(
     cwd: &Path,
     remote: &str,
 ) -> Result<()> {
+    validate_git_remote(remote)?;
+    let _ = resolve_git_remote_destinations(session, cwd, remote, GitRemoteOperation::Fetch)
+        .await
+        .with_context(|| format!("Git remote {remote:?} is not configured"))?;
+    Ok(())
+}
+
+async fn git_config_values(
+    session: &config::Session,
+    cwd: &Path,
+    key: &str,
+) -> Result<Vec<String>> {
     let output = run_host_git_inspection(
         session,
         cwd,
         &[
             "git".to_owned(),
-            "remote".to_owned(),
-            "get-url".to_owned(),
-            remote.to_owned(),
+            "config".to_owned(),
+            "--get-all".to_owned(),
+            key.to_owned(),
         ],
     )
     .await?;
     anyhow::ensure!(
-        output.status == 0,
-        "Git remote {remote:?} is not configured: {}",
-        output.stderr.trim()
+        !output.truncated && output.stdout.len() <= MAX_GIT_CONFIG_OUTPUT_BYTES,
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
     );
-    Ok(())
+    if output.status != 0 {
+        // Git uses status 1 for a missing key. Any other failure is treated as
+        // unavailable rather than returning config/parser diagnostics.
+        anyhow::ensure!(output.status == 1, GIT_PULL_UPSTREAM_CONFIGURATION_ERROR);
+        return Ok(Vec::new());
+    }
+    let mut values = output.stdout.split('\n').collect::<Vec<_>>();
+    if values.last() == Some(&"") {
+        values.pop();
+    }
+    anyhow::ensure!(
+        !values.is_empty() && values.len() <= MAX_GIT_CONFIG_VALUES,
+        GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+    );
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        anyhow::ensure!(
+            !value.is_empty()
+                && value.len() <= MAX_GIT_BASE_REF_BYTES
+                && value == value.trim()
+                && !value.chars().any(char::is_control),
+            GIT_PULL_UPSTREAM_CONFIGURATION_ERROR
+        );
+        parsed.push(value.to_owned());
+    }
+    Ok(parsed)
 }
 
 async fn run_host_git_inspection(
@@ -5596,6 +6004,36 @@ async fn run_approved_git_output(
     operation: &str,
     activity: Option<&ActivityScope>,
 ) -> Result<sandbox::Output> {
+    run_approved_git_output_inner(session, cwd, command, operation, activity, false).await
+}
+
+async fn run_approved_git_network_output(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    operation: &str,
+    activity: Option<&ActivityScope>,
+    github_https_destination: bool,
+) -> Result<sandbox::Output> {
+    run_approved_git_output_inner(
+        session,
+        cwd,
+        command,
+        operation,
+        activity,
+        github_https_destination,
+    )
+    .await
+}
+
+async fn run_approved_git_output_inner(
+    session: &config::Session,
+    cwd: PathBuf,
+    command: Vec<String>,
+    operation: &str,
+    activity: Option<&ActivityScope>,
+    github_https_destination: bool,
+) -> Result<sandbox::Output> {
     let repository_root = sandbox::git_worktree_root(&cwd)?;
     config::ensure_permitted(session, &repository_root)
         .context("Git repository root must be inside a permitted session root")?;
@@ -5628,13 +6066,87 @@ async fn run_approved_git_output(
         &HashMap::new(),
         child_env::SENSITIVE_ENV_NAMES,
     )
-    .await;
+    .await
+    .map(|output| {
+        if github_https_destination {
+            sanitize_github_https_network_git_output(output)
+        } else {
+            output
+        }
+    });
     let reported = match &output {
         Ok(output) => render_output(output.clone()),
         Err(error) => Err(anyhow::anyhow!("{error:#}")),
     };
     report_command_finished(session.id.clone(), "git", &rendered_command, &reported).await;
     output
+}
+
+fn sanitize_github_https_network_git_output(mut output: sandbox::Output) -> sandbox::Output {
+    if let Some(message) = classify_github_https_network_git_error(&output) {
+        output.stdout.clear();
+        output.stderr = message.to_owned();
+        output.truncated = false;
+    }
+    output
+}
+
+/// Maps a failed GitHub HTTPS network Git process to a bounded, secret-free
+/// policy message. A successful process is never classified, even if it emits
+/// warning text on stderr.
+pub(crate) fn classify_github_https_network_git_error(
+    output: &sandbox::Output,
+) -> Option<&'static str> {
+    if output.status == 0 {
+        return None;
+    }
+    let mut text = String::with_capacity(output.stdout.len() + output.stderr.len() + 1);
+    text.push_str(&output.stdout);
+    text.push('\n');
+    text.push_str(&output.stderr);
+    let text = text.to_ascii_lowercase();
+
+    let permission_patterns = [
+        "403",
+        "forbidden",
+        "permission denied",
+        "write access denied",
+        "write-access-denied",
+        "write access to repository not granted",
+        "does not have permission",
+        "not allowed to push",
+        "protected branch hook declined",
+        "permission to ",
+    ];
+    if permission_patterns
+        .iter()
+        .any(|pattern| text.contains(pattern))
+    {
+        return Some(GITHUB_CREDENTIAL_PERMISSION_ERROR);
+    }
+
+    let unavailable_patterns = [
+        "401",
+        "authentication failed",
+        "authentication required",
+        "could not read username",
+        "could not read password",
+        "no such device or address",
+        "terminal prompts disabled",
+        "no credentials available",
+        "credential unavailable",
+        "invalid username or password",
+        "bad credentials",
+        "repository not found",
+    ];
+    if unavailable_patterns
+        .iter()
+        .any(|pattern| text.contains(pattern))
+    {
+        return Some(GITHUB_CREDENTIAL_UNAVAILABLE_ERROR);
+    }
+
+    Some(GITHUB_NETWORK_GIT_ERROR)
 }
 
 fn required_string_array(args: &Value, name: &str) -> Result<Vec<String>> {
@@ -5810,23 +6322,15 @@ async fn execute(
     activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, cwd, handle, completion) =
+    let (rendered_command, _cwd, handle, completion) =
         spawn_sandboxed_command(args, session, activity).await?;
 
-    finish_foreground_or_store_job(
-        session,
-        cwd,
-        rendered_command,
-        handle,
-        completion,
-        output_policy,
-    )
-    .await
+    finish_foreground_or_store_job(session, rendered_command, handle, completion, output_policy)
+        .await
 }
 
 async fn finish_foreground_or_store_job(
     session: &config::Session,
-    cwd: PathBuf,
     rendered_command: String,
     mut handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
@@ -5846,7 +6350,6 @@ async fn finish_foreground_or_store_job(
         Err(_) => {
             store_job(
                 session,
-                cwd,
                 rendered_command,
                 handle,
                 completion,
@@ -5864,11 +6367,10 @@ async fn start_command(
     activity: Option<ActivityScope>,
 ) -> Result<Value> {
     let output_policy = parse_output_policy(args)?;
-    let (rendered_command, cwd, handle, completion) =
+    let (rendered_command, _cwd, handle, completion) =
         spawn_sandboxed_command(args, session, activity).await?;
     store_job(
         session,
-        cwd,
         rendered_command,
         handle,
         completion,
@@ -6096,7 +6598,6 @@ where
     // The broker and the sandbox launch compare against the identity above,
     // so the final validation and the actual spawn target cannot diverge into
     // a different repository that happens to live at the same path.
-    let boundary_cwd = prepared.cwd.clone();
     boundary();
     let (description, mut handle, completion) =
         spawn_local_agent(prepared, &current_session, activity).await?;
@@ -6114,7 +6615,6 @@ where
         Err(_) => {
             store_job(
                 session,
-                boundary_cwd,
                 description,
                 handle,
                 completion,
@@ -6151,7 +6651,7 @@ async fn spawn_local_agent_with_controls<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let slot = reserve_job_slot(&session.id)?;
+    let slot = reserve_job_slot_for_cwd(&session.id, &prepared.cwd).await?;
     let description = prepared.activity_label();
     approvals::activity(&session.id, format!("Running {description}"), None).await;
     if let Some(activity) = &activity {
@@ -6243,7 +6743,6 @@ async fn dev_tool_run_with_executable(
         "session instance changed while developer-tool approval was pending"
     );
     prepared.revalidate(&current_session)?;
-    let boundary_cwd = prepared.cwd().to_path_buf();
     let (description, mut handle, completion) =
         spawn_dev_tool(prepared, &current_session, activity).await?;
     match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
@@ -6260,7 +6759,6 @@ async fn dev_tool_run_with_executable(
         Err(_) => {
             store_job(
                 session,
-                boundary_cwd,
                 description,
                 handle,
                 completion,
@@ -6297,7 +6795,7 @@ async fn spawn_dev_tool_with_controls<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let slot = reserve_job_slot(&session.id)?;
+    let slot = reserve_job_slot_for_cwd(&session.id, prepared.cwd()).await?;
     let description = prepared.activity_label();
     approvals::activity(&session.id, format!("Running {description}"), None).await;
     if let Some(activity) = &activity {
@@ -6373,7 +6871,7 @@ where
     let cwd = cwd(args, session)?;
     let roots = session.permitted_directories.clone();
     let permission_mode = session.permission_mode;
-    let slot = reserve_job_slot(&session.id)?;
+    let slot = reserve_job_slot_for_cwd(&session.id, &cwd).await?;
     let rendered_command = render_command(&command);
     approvals::activity(&session.id, format!("Running {rendered_command}"), None).await;
     if let Some(activity) = &activity {
@@ -6507,7 +7005,6 @@ async fn run_session_command(
 
 async fn store_job(
     session: &config::Session,
-    cwd: PathBuf,
     rendered_command: String,
     handle: JoinHandle<()>,
     completion: Arc<Mutex<JobCompletion>>,
@@ -6522,7 +7019,6 @@ async fn store_job(
             Job {
                 session_id: session.id.clone(),
                 command: rendered_command.clone(),
-                cwd,
                 handle,
                 completion,
                 output_policy,
@@ -6690,7 +7186,35 @@ fn parse_output_policy_override(args: &Value) -> Result<Option<OutputPolicy>> {
     }))
 }
 
+#[cfg(test)]
 fn reserve_job_slot(session_id: &str) -> Result<JobSlot> {
+    reserve_job_slot_with_admission(session_id, Path::new("."), None, None, None)
+}
+
+async fn reserve_job_slot_for_cwd(session_id: &str, cwd: &Path) -> Result<JobSlot> {
+    let configured_src_root = managed_worktree::configured_src_root_from_env();
+    let managed_worktree::WorktreeAdmission {
+        cwd,
+        worktree_root,
+        repository_reservation,
+        reservation,
+    } = managed_worktree::acquire_worktree_admission(cwd, configured_src_root.as_deref()).await?;
+    reserve_job_slot_with_admission(
+        session_id,
+        &cwd,
+        worktree_root,
+        repository_reservation,
+        reservation,
+    )
+}
+
+fn reserve_job_slot_with_admission(
+    session_id: &str,
+    cwd: &Path,
+    worktree_root: Option<PathBuf>,
+    repository_reservation: Option<managed_worktree::RepositoryReservation>,
+    reservation: Option<managed_worktree::WorktreeReservation>,
+) -> Result<JobSlot> {
     let mut state = jobs().lock().unwrap();
     let active = state
         .active_by_session
@@ -6700,20 +7224,57 @@ fn reserve_job_slot(session_id: &str) -> Result<JobSlot> {
         *active < MAX_ACTIVE_JOBS_PER_SESSION,
         "session {session_id} already has {MAX_ACTIVE_JOBS_PER_SESSION} active sandbox jobs"
     );
+    let admission_id = Uuid::new_v4();
     *active += 1;
+    state.active_admissions.insert(
+        admission_id,
+        ActiveJobAdmission {
+            cwd: cwd.to_path_buf(),
+            worktree_root,
+        },
+    );
+    // The active registry is now visible while the lifecycle reservation is
+    // still held.  Keep the shared reservation for the entire job lifetime:
+    // cleanup in another Temote process cannot observe this process-local
+    // registry, but it will still fail closed on the cross-process lock.
+    drop(repository_reservation);
     Ok(JobSlot {
         session_id: session_id.to_owned(),
+        admission_id,
+        _reservation: reservation,
     })
 }
 
-fn release_job_slot(session_id: &str) {
+fn release_job_slot(session_id: &str, admission_id: Uuid) {
     let mut state = jobs().lock().unwrap();
+    state.active_admissions.remove(&admission_id);
     if let Some(active) = state.active_by_session.get_mut(session_id) {
         *active = active.saturating_sub(1);
         if *active == 0 {
             state.active_by_session.remove(session_id);
         }
     }
+}
+
+/// Snapshot all active operation admissions, including foreground tasks that
+/// have not yet been inserted into the completed/background `jobs` cache.
+/// The caller supplies this snapshot to the same pure ownership predicate used
+/// by deterministic remove/prune tests.
+fn snapshot_active_job_ownerships() -> Vec<(String, PathBuf)> {
+    let state = jobs().lock().unwrap();
+    let mut owners = state
+        .active_admissions
+        .iter()
+        .map(|(admission_id, admission)| {
+            let owner_path = admission
+                .worktree_root
+                .clone()
+                .unwrap_or_else(|| admission.cwd.clone());
+            (admission_id.to_string(), owner_path)
+        })
+        .collect::<Vec<_>>();
+    owners.sort_by(|left, right| left.0.cmp(&right.0));
+    owners
 }
 
 #[cfg(test)]
@@ -7738,7 +8299,7 @@ mod tests {
         let session = activity_job_session(cwd.path());
 
         let (success_scope, success_emitter) = activity_job_scope(ActivityOperation::Execute);
-        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, _cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "printf success"]}),
             &session,
             Some(success_scope),
@@ -7749,7 +8310,6 @@ mod tests {
         .unwrap();
         let success = finish_foreground_or_store_job(
             &session,
-            cwd,
             rendered,
             handle,
             completion,
@@ -7773,7 +8333,7 @@ mod tests {
         );
 
         let (failure_scope, failure_emitter) = activity_job_scope(ActivityOperation::Execute);
-        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, _cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "exit 7"]}),
             &session,
             Some(failure_scope),
@@ -7784,7 +8344,6 @@ mod tests {
         .unwrap();
         let failure = finish_foreground_or_store_job(
             &session,
-            cwd,
             rendered,
             handle,
             completion,
@@ -7818,7 +8377,7 @@ mod tests {
         session.permitted_directories =
             vec![canonical.clone(), canonical.join("missing-sandbox-root")];
         let (scope, emitter) = activity_job_scope(ActivityOperation::Execute);
-        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, _cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "printf unreachable"]}),
             &session,
             Some(scope),
@@ -7829,7 +8388,6 @@ mod tests {
         .unwrap();
         let failure = finish_foreground_or_store_job(
             &session,
-            cwd,
             rendered,
             handle,
             completion,
@@ -7862,7 +8420,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let session = activity_job_session(cwd.path());
         let (command_scope, command_emitter) = activity_job_scope(ActivityOperation::StartCommand);
-        let (rendered, cwd, handle, completion) = spawn_sandboxed_command_with_controls(
+        let (rendered, _cwd, handle, completion) = spawn_sandboxed_command_with_controls(
             &json!({"command": ["sh", "-c", "sleep 30"]}),
             &session,
             Some(command_scope),
@@ -7873,7 +8431,6 @@ mod tests {
         .unwrap();
         let started = store_job(
             &session,
-            cwd,
             rendered,
             handle,
             completion,
@@ -8383,7 +8940,6 @@ mod tests {
         .unwrap();
         let started = store_job(
             &session,
-            session.cwd.clone(),
             description,
             handle,
             completion,
@@ -8428,7 +8984,6 @@ mod tests {
         .unwrap();
         let started = store_job(
             &session,
-            session.cwd.clone(),
             description,
             handle,
             completion,
@@ -9968,7 +10523,6 @@ mod tests {
                 Job {
                     session_id: owner_id,
                     command: "test".to_owned(),
-                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -10024,7 +10578,6 @@ mod tests {
                 Job {
                     session_id: owner_id,
                     command: "test".to_owned(),
-                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -10066,7 +10619,6 @@ mod tests {
                 Job {
                     session_id: session.id.clone(),
                     command: "test".to_owned(),
-                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -10144,7 +10696,6 @@ mod tests {
                 Job {
                     session_id: session.id.clone(),
                     command: "test".to_owned(),
-                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -10242,7 +10793,6 @@ mod tests {
             Job {
                 session_id: owner.clone(),
                 command: marker_command.to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle: tokio::spawn(async {}),
                 completion: owner_completion,
                 output_policy: OutputPolicy::default(),
@@ -10253,7 +10803,6 @@ mod tests {
             Job {
                 session_id: other,
                 command: "other-secret-command".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle: tokio::spawn(async { std::future::pending::<()>().await }),
                 completion: other_completion,
                 output_policy: OutputPolicy::default(),
@@ -10307,7 +10856,6 @@ mod tests {
                 Job {
                     session_id: session_id.clone(),
                     command: command.to_owned(),
-                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle: tokio::spawn(async {}),
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -10346,7 +10894,6 @@ mod tests {
             Job {
                 session_id: session_id.clone(),
                 command: "hidden".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle: tokio::spawn(async {}),
                 completion,
                 output_policy: OutputPolicy::default(),
@@ -10395,7 +10942,6 @@ mod tests {
                 Job {
                     session_id: session_id.clone(),
                     command: "hidden".to_owned(),
-                    cwd: PathBuf::from("/tmp/temote-test-job"),
                     handle,
                     completion,
                     output_policy: OutputPolicy::default(),
@@ -10434,7 +10980,6 @@ mod tests {
             Job {
                 session_id: session_id.clone(),
                 command: "hidden".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -10481,7 +11026,6 @@ mod tests {
             Job {
                 session_id: session_id.clone(),
                 command: "hidden".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -10579,7 +11123,6 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion,
                 output_policy: OutputPolicy::default(),
@@ -10613,7 +11156,6 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -10648,7 +11190,6 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion: Arc::new(Mutex::new(JobCompletion::default())),
                 output_policy: OutputPolicy::default(),
@@ -10757,6 +11298,143 @@ mod tests {
     }
 
     #[test]
+    fn foreground_job_admission_is_visible_to_worktree_ownership_snapshot() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("managed-task");
+        std::fs::create_dir(&target).unwrap();
+        let target = std::fs::canonicalize(target).unwrap();
+        let session = config::Session {
+            id: format!("foreground-owner-{}", Uuid::new_v4()),
+            cwd: fixture.path().to_path_buf(),
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Yolo,
+        };
+        let reservation = managed_worktree::acquire_worktree_reservation(&target).unwrap();
+        let slot = reserve_job_slot_with_admission(
+            &session.id,
+            &target,
+            Some(target.clone()),
+            None,
+            Some(reservation),
+        )
+        .unwrap();
+        let jobs = snapshot_active_job_ownerships();
+        let ownership = managed_worktree_owners_from(&session, &target, &[], &jobs);
+        assert_eq!(ownership.owning_jobs.len(), 1);
+        assert!(!ownership.owning_jobs[0].is_empty());
+        drop(slot);
+        assert!(snapshot_active_job_ownerships().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_admission_waits_for_cleanup_reservation_but_not_unrelated_worktree() {
+        let (_root, canonical_root, _checkout, _session) = managed_worktree_removal_fixture();
+        let target = canonical_root.join("worktrees/repo/feature-remove-me");
+        let unrelated = canonical_root.join("worktrees/repo/feature-sibling");
+        let target_root = sandbox::git_worktree_root(&target).unwrap();
+        let unrelated_root = sandbox::git_worktree_root(&unrelated).unwrap();
+        assert_ne!(target_root, unrelated_root);
+
+        let cleanup_reservation =
+            managed_worktree::acquire_worktree_reservation(&target_root).unwrap();
+        let session_id = format!("admission-target-{}", Uuid::new_v4());
+        let mut blocked = Box::pin(reserve_job_slot_for_cwd(&session_id, &target));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut blocked)
+                .await
+                .is_err(),
+            "same-worktree job admission must wait for cleanup"
+        );
+
+        let unrelated_id = format!("admission-unrelated-{}", Uuid::new_v4());
+        let unrelated_slot = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reserve_job_slot_for_cwd(&unrelated_id, &unrelated),
+        )
+        .await
+        .expect("unrelated worktree admission must not wait for cleanup")
+        .unwrap();
+        drop(unrelated_slot);
+
+        drop(cleanup_reservation);
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(2), &mut blocked)
+            .await
+            .expect("same-worktree admission must complete after cleanup releases")
+            .unwrap();
+        let owners = snapshot_active_job_ownerships();
+        assert!(owners.iter().any(|(_, owner)| owner == &target_root));
+        drop(slot);
+        assert!(
+            !snapshot_active_job_ownerships()
+                .iter()
+                .any(|(_, owner)| owner == &target_root)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_job_admissions_exclude_cross_process_cleanup_until_all_drop() {
+        let (_root, canonical_root, _checkout, _session) = managed_worktree_removal_fixture();
+        let target = canonical_root.join("worktrees/repo/feature-remove-me");
+        let unrelated = canonical_root.join("worktrees/repo/feature-sibling");
+        let target_root = sandbox::git_worktree_root(&target).unwrap();
+        let unrelated_root = sandbox::git_worktree_root(&unrelated).unwrap();
+        assert_ne!(target_root, unrelated_root);
+
+        let first_id = format!("shared-job-first-{}", Uuid::new_v4());
+        let first = reserve_job_slot_for_cwd(&first_id, &target).await.unwrap();
+        let second_id = format!("shared-job-second-{}", Uuid::new_v4());
+        let second = reserve_job_slot_for_cwd(&second_id, &target).await.unwrap();
+        assert!(
+            managed_worktree::try_acquire_worktree_reservation_async(&target_root)
+                .await
+                .is_err(),
+            "exclusive cleanup must fail while a shared job reservation is held"
+        );
+
+        drop(first);
+        assert!(
+            managed_worktree::try_acquire_worktree_reservation_async(&target_root)
+                .await
+                .is_err(),
+            "the remaining shared job reservation must exclude cleanup"
+        );
+        drop(second);
+
+        let cleanup = managed_worktree::try_acquire_worktree_reservation_async(&target_root)
+            .await
+            .unwrap();
+        let blocked_id = format!("shared-job-blocked-{}", Uuid::new_v4());
+        let mut blocked = Box::pin(reserve_job_slot_for_cwd(&blocked_id, &target));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut blocked)
+                .await
+                .is_err(),
+            "new same-worktree admission must wait while cleanup owns the target"
+        );
+
+        let unrelated_id = format!("shared-job-unrelated-{}", Uuid::new_v4());
+        let unrelated_slot = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reserve_job_slot_for_cwd(&unrelated_id, &unrelated),
+        )
+        .await
+        .expect("unrelated admission must not wait for target cleanup")
+        .unwrap();
+        drop(unrelated_slot);
+
+        drop(cleanup);
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(2), &mut blocked)
+            .await
+            .expect("same-worktree admission must complete after cleanup release")
+            .unwrap();
+        drop(admitted);
+    }
+
+    #[test]
     fn generated_completed_job_cache_stays_bounded_and_preserves_active_jobs() -> noprop::TestResult
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -10773,6 +11451,7 @@ mod tests {
             let mut state = JobState {
                 jobs: HashMap::new(),
                 active_by_session: HashMap::new(),
+                active_admissions: HashMap::new(),
             };
             let mut active_ids = std::collections::HashSet::new();
 
@@ -10803,7 +11482,6 @@ mod tests {
                     Job {
                         session_id,
                         command: "test".to_owned(),
-                        cwd: PathBuf::from("/tmp/temote-test-job"),
                         handle,
                         completion,
                         output_policy: OutputPolicy::default(),
@@ -10857,7 +11535,6 @@ mod tests {
             Job {
                 session_id,
                 command: "test".to_owned(),
-                cwd: PathBuf::from("/tmp/temote-test-job"),
                 handle,
                 completion,
                 output_policy: OutputPolicy::default(),
@@ -11931,11 +12608,13 @@ mod tests {
         let legacy_sibling_before = worktree_snapshot(&legacy_sibling);
         let primary_before = worktree_snapshot(&checkout);
 
-        let result = git_worktree_prune_in_src_root(
+        let result = git_worktree_prune_in_src_root_with_snapshots(
             &json!({"session_id": session.id}),
             &session,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -11945,8 +12624,25 @@ mod tests {
         assert_eq!(value["before"]["prunable_count"], 2);
         assert_eq!(value["after"]["prunable_count"], 0);
         assert_eq!(value["removed_metadata_count"], 2);
+        assert_eq!(
+            value["primary_checkout"],
+            checkout.to_string_lossy().as_ref()
+        );
+        assert!(
+            value["before"]["prunable"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == stale.to_string_lossy().as_ref())
+        );
         assert_eq!(value["filesystem_directories_preserved"], true);
         assert!(value.get("verification_error").is_none());
+        for field in ["stdout", "stderr", "truncated"] {
+            assert!(
+                value.get(field).is_none(),
+                "unexpected public field: {field}"
+            );
+        }
 
         // Metadata-only: the stale directory and its unrelated files survive.
         assert_eq!(
@@ -11978,23 +12674,43 @@ mod tests {
         let (_root, canonical_root, checkout, session) = managed_worktree_prune_fixture();
         let args = json!({"session_id": session.id});
         let first = result_text(
-            &git_worktree_prune_in_src_root(&args, &session, &canonical_root, None)
-                .await
-                .unwrap(),
+            &git_worktree_prune_in_src_root_with_snapshots(
+                &args,
+                &session,
+                &canonical_root,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(first["removed_metadata_count"], 2);
         let registered_after_first =
             git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
 
         let second = result_text(
-            &git_worktree_prune_in_src_root(&args, &session, &canonical_root, None)
-                .await
-                .unwrap(),
+            &git_worktree_prune_in_src_root_with_snapshots(
+                &args,
+                &session,
+                &canonical_root,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
         );
         assert_eq!(second["status"], "pruned");
         assert_eq!(second["before"]["prunable_count"], 0);
         assert_eq!(second["after"]["prunable_count"], 0);
         assert_eq!(second["removed_metadata_count"], 0);
+        for field in ["stdout", "stderr", "truncated"] {
+            assert!(
+                second.get(field).is_none(),
+                "unexpected public field: {field}"
+            );
+        }
         assert_eq!(
             git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
             registered_after_first
@@ -12042,9 +12758,16 @@ mod tests {
             json!({"session_id": session.id, "base": "HEAD"}),
             json!({"session_id": session.id, "repository": "other"}),
         ] {
-            let error = git_worktree_prune_in_src_root(&args, &session, &canonical_root, None)
-                .await
-                .unwrap_err();
+            let error = git_worktree_prune_in_src_root_with_snapshots(
+                &args,
+                &session,
+                &canonical_root,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap_err();
             assert!(
                 !error.to_string().contains("prune did not complete"),
                 "{args}: {error:#}"
@@ -12057,11 +12780,13 @@ mod tests {
             ..session
         };
         assert!(
-            git_worktree_prune_in_src_root(
+            git_worktree_prune_in_src_root_with_snapshots(
                 &json!({"session_id": outside.id}),
                 &outside,
                 &canonical_root,
-                None
+                None,
+                &[],
+                &[],
             )
             .await
             .is_err()
@@ -12070,6 +12795,37 @@ mod tests {
         // Nothing was pruned by any rejected request.
         assert!(checkout.join(".git/worktrees/stale-managed").exists());
         assert!(stale.join("unrelated.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn managed_worktree_prune_rejects_existing_owner_before_mutation() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_prune_fixture();
+        let managed_root = canonical_root.join("worktrees/repo");
+        let stale = managed_root.join("stale-managed");
+        let stale_metadata = checkout.join(".git/worktrees/stale-managed");
+        let gone_metadata = checkout.join(".git/worktrees/gone-managed");
+        let views = [session_view_for_test(
+            "owner",
+            PathBuf::from("/elsewhere"),
+            "active",
+            Some(stale.clone()),
+        )];
+
+        let error = git_worktree_prune_in_src_root_with_snapshots(
+            &json!({"session_id": session.id}),
+            &session,
+            &canonical_root,
+            None,
+            &views,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing prune"), "{error:#}");
+        assert!(stale.exists());
+        assert!(stale.join("unrelated.txt").exists());
+        assert!(stale_metadata.exists());
+        assert!(gone_metadata.exists());
     }
 
     #[test]
@@ -12120,6 +12876,85 @@ mod tests {
             existing_paths: Vec::new(),
         };
         assert!(verify_managed_worktree_prune(&before, &after).is_err());
+    }
+
+    #[test]
+    fn managed_worktree_prune_result_bounds_failure_output() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = std::fs::canonicalize(root.path()).unwrap();
+        let checkout = src_root.join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        let repository =
+            managed_worktree::ManagedRepository::resolve(&checkout, &src_root).unwrap();
+        let stale = src_root.join("worktrees/repo/stale");
+        let before = ManagedWorktreePruneObservation {
+            registered: Vec::new(),
+            prunable: vec![stale.clone()],
+            existing_paths: vec![stale.clone()],
+        };
+        let after = ManagedWorktreePruneObservation::default();
+        let raw_stdout = "raw stdout must not be returned";
+        let raw_stderr = "raw stderr /tmp/secret must not be returned";
+        let output = sandbox::Output {
+            status: 17,
+            stdout: raw_stdout.to_owned(),
+            stderr: raw_stderr.to_owned(),
+            truncated: true,
+        };
+        let rendered = managed_worktree_prune_result(
+            "failed",
+            &repository,
+            &before,
+            &after,
+            &output,
+            Some("raw verification error /tmp/secret"),
+        );
+        let value: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["repository"], "repo");
+        assert_eq!(value["before"]["prunable_count"], 1);
+        assert_eq!(
+            value["before"]["prunable"][0],
+            stale.to_string_lossy().as_ref()
+        );
+        assert_eq!(value["removed_metadata_count"], 1);
+        assert_eq!(value["filesystem_directories_preserved"], false);
+        assert_eq!(value["mutation_committed"], false);
+        assert_eq!(value["exit_code"], 17);
+        assert_eq!(
+            value["verification_error"],
+            MANAGED_WORKTREE_PRUNE_MUTATION_ERROR
+        );
+        for field in ["stdout", "stderr", "truncated"] {
+            assert!(
+                value.get(field).is_none(),
+                "unexpected public field: {field}"
+            );
+        }
+        assert!(!rendered.contains(raw_stdout));
+        assert!(!rendered.contains(raw_stderr));
+        assert!(!rendered.contains("raw verification error"));
+
+        let verification_output = sandbox::Output {
+            status: 0,
+            stdout: raw_stdout.to_owned(),
+            stderr: raw_stderr.to_owned(),
+            truncated: true,
+        };
+        let verification = managed_worktree_prune_result(
+            "verification_failed",
+            &repository,
+            &before,
+            &after,
+            &verification_output,
+            Some("raw verification error /tmp/secret"),
+        );
+        let verification: Value = serde_json::from_str(&verification).unwrap();
+        assert_eq!(
+            verification["verification_error"],
+            MANAGED_WORKTREE_PRUNE_VERIFICATION_ERROR
+        );
+        assert!(!verification.to_string().contains("raw verification error"));
     }
 
     #[tokio::test]
@@ -12515,6 +13350,299 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_https_pull_gate_uses_configured_branch_before_tracking_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        init_git_repository(&repository);
+        run_git_fixture(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/first-pull.git",
+            ],
+        );
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "branch.main.remote", "origin"],
+        );
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "branch.main.merge", "refs/heads/main"],
+        );
+        let repository = std::fs::canonicalize(repository).unwrap();
+        let session = config::Session {
+            id: format!("pull-first-{}", Uuid::new_v4()),
+            cwd: repository.clone(),
+            permitted_directories: vec![repository.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        assert_eq!(
+            git_current_upstream_remote(&session, &repository)
+                .await
+                .unwrap(),
+            Some("origin".to_owned())
+        );
+        let error = git_pull_output(&session, repository, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), GITHUB_CREDENTIAL_MAPPING_ERROR);
+    }
+
+    #[tokio::test]
+    async fn github_https_push_gate_uses_all_actual_push_urls() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        let local_remote = root.path().join("local.git");
+        std::fs::create_dir(&repository).unwrap();
+        init_git_repository(&repository);
+        run_git_fixture(
+            root.path(),
+            &["init", "--quiet", "--bare", local_remote.to_str().unwrap()],
+        );
+        run_git_fixture(
+            &repository,
+            &["remote", "add", "origin", local_remote.to_str().unwrap()],
+        );
+        let local_remote = std::fs::canonicalize(local_remote).unwrap();
+        let repository = std::fs::canonicalize(repository).unwrap();
+        let session = config::Session {
+            id: format!("push-destinations-{}", Uuid::new_v4()),
+            cwd: repository.clone(),
+            permitted_directories: vec![repository.clone(), local_remote.clone()],
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Agent,
+        };
+
+        // A non-GitHub fetch URL with a GitHub pushurl still requires mapping.
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "remote.origin.pushurl",
+                "https://github.com/example/push.git",
+            ],
+        );
+        let error = git_push_output(
+            &session,
+            repository.clone(),
+            Some("origin".to_owned()),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), GITHUB_CREDENTIAL_MAPPING_ERROR);
+
+        // A local pushurl is the only actual push destination; a GitHub fetch
+        // URL must not force a mapping gate for this push.
+        run_git_fixture(
+            &repository,
+            &["config", "--local", "--unset-all", "remote.origin.pushurl"],
+        );
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://github.com/example/fetch-only.git",
+            ],
+        );
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "remote.origin.pushurl",
+                local_remote.to_str().unwrap(),
+            ],
+        );
+        let output = git_push_output(
+            &session,
+            repository.clone(),
+            Some("origin".to_owned()),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status, 0, "{}", output.stderr);
+
+        // Every pushurl is inspected; a later GitHub destination cannot be
+        // hidden behind an earlier local destination.
+        run_git_fixture(
+            &repository,
+            &[
+                "config",
+                "--local",
+                "--add",
+                "remote.origin.pushurl",
+                "https://github.com/example/second-push.git",
+            ],
+        );
+        let destinations = resolve_git_remote_destinations(
+            &session,
+            &repository,
+            "origin",
+            GitRemoteOperation::Push,
+        )
+        .await
+        .unwrap();
+        assert_eq!(destinations.urls.len(), 2);
+        assert!(destinations.requires_github_credential_mapping());
+        let error = git_push_output(&session, repository, Some("origin".to_owned()), false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), GITHUB_CREDENTIAL_MAPPING_ERROR);
+    }
+
+    #[test]
+    fn github_https_network_git_error_classification_is_fixed_and_secret_free() {
+        let unavailable = sandbox::Output {
+            status: 128,
+            stdout: String::new(),
+            stderr: "fatal: could not read Username for https://github.com: terminal prompts disabled; secret-marker".to_owned(),
+            truncated: false,
+        };
+        assert_eq!(
+            classify_github_https_network_git_error(&unavailable),
+            Some(GITHUB_CREDENTIAL_UNAVAILABLE_ERROR)
+        );
+
+        let permission = sandbox::Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: "remote: Write access denied (403) secret-marker".to_owned(),
+            truncated: false,
+        };
+        assert_eq!(
+            classify_github_https_network_git_error(&permission),
+            Some(GITHUB_CREDENTIAL_PERMISSION_ERROR)
+        );
+
+        let unknown = sandbox::Output {
+            status: 1,
+            stdout: String::new(),
+            stderr: "fatal: protocol failure secret-marker".to_owned(),
+            truncated: true,
+        };
+        let generic = classify_github_https_network_git_error(&unknown).unwrap();
+        assert_eq!(generic, GITHUB_NETWORK_GIT_ERROR);
+        assert!(!generic.contains("secret-marker"));
+
+        let success = sandbox::Output {
+            status: 0,
+            stdout: "ok".to_owned(),
+            stderr: "403 warning secret-marker".to_owned(),
+            truncated: false,
+        };
+        assert_eq!(classify_github_https_network_git_error(&success), None);
+        let sanitized = sanitize_github_https_network_git_output(unknown);
+        assert_eq!(sanitized.stderr, GITHUB_NETWORK_GIT_ERROR);
+        assert!(!sanitized.stderr.contains("secret-marker"));
+        assert!(sanitized.stdout.is_empty());
+    }
+
+    #[test]
+    fn github_https_destination_detection_is_case_insensitive_and_authority_bound() {
+        for url in [
+            "HTTPS://GITHUB.COM/example/repo.git",
+            "https://github.com:443/example/repo.git",
+            "https://user:password@GitHub.Com/example/repo.git",
+        ] {
+            assert!(
+                is_github_https_destination(url),
+                "expected GitHub URL: {url}"
+            );
+        }
+        for url in [
+            "http://github.com/example/repo.git",
+            "https://github.com.evil.example/example/repo.git",
+            "https://github.com@evil.example/example/repo.git",
+            "file:///tmp/repo.git",
+        ] {
+            assert!(
+                !is_github_https_destination(url),
+                "unexpected GitHub URL: {url}"
+            );
+        }
+        assert!(
+            GitRemoteDestinations {
+                urls: vec!["HTTPS://GITHUB.COM/example/repo.git".to_owned()],
+            }
+            .requires_github_credential_mapping()
+        );
+    }
+
+    #[test]
+    fn github_credential_and_destination_inspection_errors_are_fixed_and_secret_free() {
+        let marker = "inspection-marker";
+        let mapping_invocation = map_github_credential_inspection_error::<()>(Err(
+            anyhow::anyhow!("helper diagnostic: {marker}"),
+        ))
+        .unwrap_err();
+        assert_eq!(
+            mapping_invocation.to_string(),
+            GITHUB_CREDENTIAL_MAPPING_ERROR
+        );
+        assert!(!mapping_invocation.to_string().contains(marker));
+
+        let destination_invocation =
+            map_git_remote_inspection_error::<()>(Err(anyhow::anyhow!("git diagnostic: {marker}")))
+                .unwrap_err();
+        assert_eq!(
+            destination_invocation.to_string(),
+            GIT_REMOTE_DESTINATION_ERROR
+        );
+        assert!(!destination_invocation.to_string().contains(marker));
+
+        let mapping_truncated = validate_github_credential_mapping_inspection(
+            &sandbox::Output {
+                status: 0,
+                stdout: "\n!gh git credential --managed\n".to_owned(),
+                stderr: marker.to_owned(),
+                truncated: true,
+            },
+            &sandbox::Output {
+                status: 0,
+                stdout: "true\n".to_owned(),
+                stderr: String::new(),
+                truncated: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            mapping_truncated.to_string(),
+            GITHUB_CREDENTIAL_MAPPING_ERROR
+        );
+        assert!(!mapping_truncated.to_string().contains(marker));
+
+        let destination_truncated = parse_git_remote_destinations(
+            &sandbox::Output {
+                status: 0,
+                stdout: "https://github.com/example/repo.git\n".to_owned(),
+                stderr: marker.to_owned(),
+                truncated: true,
+            },
+            GitRemoteOperation::Push,
+        )
+        .unwrap_err();
+        assert_eq!(
+            destination_truncated.to_string(),
+            GIT_REMOTE_DESTINATION_ERROR
+        );
+        assert!(!destination_truncated.to_string().contains(marker));
+    }
+
+    #[tokio::test]
     async fn managed_worktree_remove_removes_only_the_selected_clean_worktree() {
         let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
         let managed_root = canonical_root.join("worktrees/repo");
@@ -12526,11 +13654,13 @@ mod tests {
         let legacy_before = worktree_snapshot(&legacy);
         let legacy_sibling_before = worktree_snapshot(&legacy_sibling);
 
-        let result = git_worktree_remove_in_src_root(
+        let result = git_worktree_remove_in_src_root_with_snapshots(
             &json!({"session_id": session.id, "task": "feature-remove-me"}),
             &session,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -12553,11 +13683,13 @@ mod tests {
         );
 
         // The path selector is accepted only as the exact derived path.
-        let result = git_worktree_remove_in_src_root(
+        let result = git_worktree_remove_in_src_root_with_snapshots(
             &json!({"session_id": session.id, "path": sibling.to_string_lossy()}),
             &session,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -12577,17 +13709,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_worktree_remove_rejects_existing_owner_before_mutation() {
+        let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
+        let target = canonical_root.join("worktrees/repo/feature-remove-me");
+        let metadata = checkout.join(".git/worktrees/feature-remove-me");
+        let jobs = [("owner-job".to_owned(), target.join("nested"))];
+
+        let error = git_worktree_remove_in_src_root_with_snapshots(
+            &json!({"session_id": session.id, "task": "feature-remove-me"}),
+            &session,
+            &canonical_root,
+            None,
+            &[],
+            &jobs,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing removal"), "{error:#}");
+        assert!(target.exists());
+        assert!(metadata.exists());
+    }
+
+    #[tokio::test]
     async fn managed_worktree_remove_rejects_dirty_and_untracked_work() {
         let (_root, canonical_root, checkout, session) = managed_worktree_removal_fixture();
         let managed_root = canonical_root.join("worktrees/repo");
         let target = managed_root.join("feature-remove-me");
 
         std::fs::write(target.join("tracked.txt"), "modified\n").unwrap();
-        let error = git_worktree_remove_in_src_root(
+        let error = git_worktree_remove_in_src_root_with_snapshots(
             &json!({"session_id": session.id, "task": "feature-remove-me"}),
             &session,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap_err();
@@ -12602,11 +13758,13 @@ mod tests {
 
         run_git_fixture(&target, &["checkout", "--", "tracked.txt"]);
         std::fs::write(target.join("untracked.txt"), "keep me\n").unwrap();
-        let error = git_worktree_remove_in_src_root(
+        let error = git_worktree_remove_in_src_root_with_snapshots(
             &json!({"session_id": session.id, "task": "feature-remove-me"}),
             &session,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap_err();
@@ -12639,16 +13797,23 @@ mod tests {
             json!({"session_id": session.id, "cwd": "/tmp", "task": "feature-remove-me"}),
             json!({"session_id": session.id, "base": "HEAD", "task": "feature-remove-me"}),
         ] {
-            let error = git_worktree_remove_in_src_root(&args, &session, &canonical_root, None)
-                .await
-                .unwrap_err();
+            let error = git_worktree_remove_in_src_root_with_snapshots(
+                &args,
+                &session,
+                &canonical_root,
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap_err();
             assert!(
                 !error.to_string().contains("escape/"),
                 "unexpected error for {args}: {error:#}"
             );
         }
         // A task and a path that select different managed worktrees fail closed.
-        let error = git_worktree_remove_in_src_root(
+        let error = git_worktree_remove_in_src_root_with_snapshots(
             &json!({
                 "session_id": session.id,
                 "task": "feature-remove-me",
@@ -12657,6 +13822,8 @@ mod tests {
             &session,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap_err();
@@ -12681,11 +13848,13 @@ mod tests {
             permitted_directories: vec![checkout.clone(), target.clone()],
             ..session
         };
-        let error = git_worktree_remove_in_src_root(
+        let error = git_worktree_remove_in_src_root_with_snapshots(
             &json!({"session_id": inside.id, "task": "feature-remove-me"}),
             &inside,
             &canonical_root,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap_err();

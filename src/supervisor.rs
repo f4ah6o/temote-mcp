@@ -506,6 +506,19 @@ impl SessionSupervisor {
             "session {id} is already running"
         );
 
+        // Serialize session admission with managed-worktree cleanup.  The
+        // shared guard is held across cwd/worktree revalidation, runtime
+        // metadata visibility and supervisor insertion; a cleanup that wins
+        // the race therefore makes this start fail closed after waiting.
+        let admission = crate::managed_worktree::acquire_worktree_admission(
+            &cwd,
+            self.roots
+                .canonical_root(crate::managed_worktree::MANAGED_SRC_ROOT_NAME),
+        )
+        .await
+        .with_context(|| format!("cannot admit session {id}"))?;
+        let cwd = admission.cwd.clone();
+
         let spec = RestartSpec {
             cwd: cwd.clone(),
             permission_mode,
@@ -536,6 +549,9 @@ impl SessionSupervisor {
         if public {
             self.public_sessions.lock().await.insert(id);
         }
+        // Drop only after runtime/session state and supervisor ownership are
+        // visible to the regular ownership snapshot path.
+        drop(admission);
         Ok(info)
     }
 
