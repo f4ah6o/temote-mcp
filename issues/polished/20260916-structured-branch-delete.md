@@ -3,7 +3,7 @@
 Status: polished / blocker remediation implemented; independent review pending
 Model: opencode-go/deepseek-v4.1-flash
 Parent: `issues/open/20260916-agent-mode-repository-triage-end-to-end.md`
-Depends on: `issues/polished/20260916-structured-worktree-remove.md`
+Depends on: `issues/done/20260916-structured-worktree-remove.md`
 
 ## Goal
 

@@ -340,7 +340,7 @@ Temote agent session
 
 This file is now an umbrella/tracking issue. After the Git shim packets, execute:
 
-1. `issues/polished/20260916-github-pr-broker.md`
+1. `issues/doing/20260916-github-pr-broker.md`
 2. `issues/polished/20260916-agent-repository-triage-e2e.md`
 
 Cross-repo writes remain parent-orchestrator scope; do not broaden a local-agent session root.

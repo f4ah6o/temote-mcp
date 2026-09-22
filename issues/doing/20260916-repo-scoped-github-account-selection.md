@@ -97,4 +97,4 @@ deterministic tests は exact helper argv、extra local helper rejection、host/
 
 ## 2026-09-16 polishing update
 
-Current `main` includes repo-scoped GitHub workflow/tag credential routing. Further implementation belongs to `issues/polished/20260916-git-shim-network-gh-git.md`; this tracker owns only existing-implementation review and live multi-account acceptance.
+Current `main` includes repo-scoped GitHub workflow/tag credential routing and the completed bounded Git shim network packet at `issues/done/20260916-git-shim-network-gh-git.md`; this tracker still owns existing-implementation review and live multi-account acceptance.

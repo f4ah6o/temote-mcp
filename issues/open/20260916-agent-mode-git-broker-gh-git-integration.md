@@ -272,9 +272,9 @@ This file is now an umbrella/tracking issue. Implement in order and do not assig
 2. `issues/polished/20260916-git-shim-add-commit.md`
 3. `issues/polished/20260916-managed-worktree-create-list.md`
 4. `issues/polished/20260916-managed-worktree-session-integration.md`
-5. `issues/polished/20260916-structured-worktree-remove.md`
-6. `issues/polished/20260916-managed-worktree-prune.md`
-7. `issues/polished/20260916-git-shim-worktree.md`
-4. `issues/polished/20260916-git-shim-network-gh-git.md`
+5. `issues/done/20260916-structured-worktree-remove.md`
+6. `issues/done/20260916-managed-worktree-prune.md`
+7. `issues/done/20260916-git-shim-worktree.md`
+4. `issues/done/20260916-git-shim-network-gh-git.md`
 
 After those packets pass, close this umbrella from their combined evidence.

@@ -612,9 +612,9 @@ Do not hand this umbrella directly to OpenCode. Execute these bounded packets in
 
 1. `issues/polished/20260916-managed-worktree-create-list.md`
 2. `issues/polished/20260916-managed-worktree-session-integration.md`
-3. `issues/polished/20260916-structured-worktree-remove.md`
-4. `issues/polished/20260916-managed-worktree-prune.md`
-5. `issues/polished/20260916-git-shim-worktree.md`
+3. `issues/done/20260916-structured-worktree-remove.md`
+4. `issues/done/20260916-managed-worktree-prune.md`
+5. `issues/done/20260916-git-shim-worktree.md`
 
 Close this tracker only after all packets are done and legacy-worktree preservation has regression coverage.
 

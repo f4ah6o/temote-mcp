@@ -1,6 +1,6 @@
 # Add bounded host-side GitHub PR list/get/close operations
 
-Status: doing — implementation recovered; full Rust CI verification pending
+Status: doing — Linux source gates pass; macOS integration and installed-runtime acceptance remain open
 Implementation: interrupted OpenCode work, completed by delegated Codex implementation workers under coordinator review
 Parent: `issues/open/20260916-agent-mode-repository-triage-end-to-end.md`
 Depends on: `20260916-git-shim-network-gh-git.md`
@@ -48,3 +48,11 @@ The two failures were reviewed against implementation semantics rather than chan
 - The pure path validator must itself reject relative traversal and absolute paths. Transport-level guards already rejected literal `..`; the helper is strengthened to cover bounded segments and encoded dot/slash/control forms while retaining valid workflow and encoded branch names.
 
 Delegated follow-up implementation adds regression tests for both repairs. The next commit's CI is required; earlier results do not certify that commit. No live PR mutation was used for validation.
+
+## Follow-up result at `be2efb6`
+
+CI run `35712942259` passed the full Linux Rust job (`106697619409`) and gateway job (`106697619315`). Both follow-up regression tests and the Rust/gateway snapshot and fingerprint checks pass.
+
+macOS compilation, no-default compilation, clippy, and PR pure validation tests pass. However, `github_pr_tools_stay_on_the_configured_repository_and_never_echo_credentials` fails with `configured Git remote is unavailable` on the shared descriptor-backed Git execution path. This remains blocked by `issues/doing/20260922-macos-pinned-git-identity.md`; the macOS job has seven total failures and is not green.
+
+Installed-runtime read-only canary and live fixture close remain NOT RUN. The source changes have been committed and pushed, but no running service was upgraded. This packet stays in `doing` until its unresolved integration and runtime gates are satisfied.

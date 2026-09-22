@@ -62,4 +62,4 @@ GitHub capability の診断で、少なくとも次を明確に区別する。
 
 ## 2026-09-16 polishing disposition
 
-No separate capability is required. Sandbox-child `gh auth status` guidance and host-side readiness classification are folded into `issues/polished/20260916-git-shim-network-gh-git.md` and the existing repo-scoped credential tracker.
+No separate capability is required. Sandbox-child `gh auth status` guidance and host-side readiness classification are folded into `issues/done/20260916-git-shim-network-gh-git.md` and the existing repo-scoped credential tracker.

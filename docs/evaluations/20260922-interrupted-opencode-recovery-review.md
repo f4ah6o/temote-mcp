@@ -49,6 +49,21 @@ Follow-up source repairs:
 
 These follow-up commits require their own CI results; results from earlier commits are not substituted for them.
 
+## Final source verification — `be2efb6`
+
+CI run [35712942259](https://github.com/f4ah6o/temote-mcp/actions/runs/35712942259) checked exact source commit `be2efb6ceb4c420be072beb961bcf18ab036c52a`, which includes both follow-up repairs.
+
+- Linux job `106697619409`: SUCCESS for the complete job, including formatting, all-target and no-default builds, clippy, dependency boundary, real Linux sandbox acceptance, all-target/all-feature tests, supervisor upgrade E2E, CLI lifecycle E2E, and packaged-crate installation.
+- Gateway job `106697619315`: SUCCESS.
+- macOS job `106697619369`: formatting, both build checks, and clippy PASS. Library tests: 125 passed. Binary tests: 1010 passed, 7 failed, 2 ignored. The macOS job is FAILED, not a platform-wide pass.
+- The two PR follow-up regressions now PASS: confirmed-close activity classification and bounded path validation. The public contract fingerprint/snapshot checks also PASS.
+- macOS PR pure validation tests PASS, but `github_pr_tools_stay_on_the_configured_repository_and_never_echo_credentials` FAILS with `configured Git remote is unavailable`. Therefore the macOS PR handler integration is not verified.
+- The remaining six macOS failures concern cleanup/stale-lease behavior and local/remote branch deletion, including approval-time cwd swaps. Several now report `fatal: not a git repository: '/dev/fd/18'` (descriptor number varies). The pre-approval inspection repair did not establish working descriptor-backed Git execution on macOS.
+
+No failing assertion was ignored or relaxed. The seven failing macOS tests are retained as required acceptance gates. The remaining implementation must preserve repository/worktree/private/common metadata authority after approval; falling back to a re-resolved mutable pathname is not an accepted repair.
+
+The final follow-up changes only reviewer evidence and issue-navigation documents. Source validation is attributed to `be2efb6`, not to a claim that a later documentation-only commit has already completed CI.
+
 ## Still not verified
 
 - Rebuilt installed-runtime OpenCode canary and nested agent shell execution.

@@ -70,8 +70,8 @@ Complete in this order; do not start the next packet until the previous contract
 2. `20260916-git-shim-add-commit.md`
 3. `issues/polished/20260916-managed-worktree-create-list.md`
 4. `issues/polished/20260916-managed-worktree-session-integration.md`
-5. `issues/polished/20260916-structured-worktree-remove.md`
-6. `issues/polished/20260916-managed-worktree-prune.md`
+5. `issues/done/20260916-structured-worktree-remove.md`
+6. `issues/done/20260916-managed-worktree-prune.md`
 7. `20260916-git-shim-worktree.md`
 8. `20260916-git-shim-network-gh-git.md`
 9. `issues/polished/20260916-structured-branch-delete.md`
