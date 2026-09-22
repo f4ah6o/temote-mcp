@@ -541,10 +541,9 @@ fn session_list_skips_invalid_legacy_metadata_without_failing_active_discovery()
 #[test]
 fn session_list_remains_bounded_and_deterministic() {
     let fixture = Fixture::new();
-    let mut supervisor = fixture.spawn_supervisor();
-    fixture.wait_for_supervisor();
-    fixture.start_active("active-a");
-    fixture.start_active("active-b");
+    // Write the terminal fixture before the supervisor starts: it materializes
+    // a lifecycle half for metadata it discovers, so seeding the pair early
+    // keeps the consecutive reads below on a settled directory.
     let directory = fixture.metadata_dir();
     let cwd = fixture.canonical_project();
     for index in 0..600_u64 {
@@ -556,6 +555,10 @@ fn session_list_remains_bounded_and_deterministic() {
             10_000 + index,
         );
     }
+    let mut supervisor = fixture.spawn_supervisor();
+    fixture.wait_for_supervisor();
+    fixture.start_active("active-a");
+    fixture.start_active("active-b");
 
     let mut client = fixture.mcp_client();
     let first = client.session_list();
