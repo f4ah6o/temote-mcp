@@ -37,3 +37,14 @@ Pure/PBT tests prove repository/PR-number containment, response bounding, secret
 - Full Rust CI is pending for this packet. The normal local session cannot launch compiler child processes; this restriction is not a compiler result.
 - Installed-runtime canary and live fixture PR close: NOT RUN. No real PR, branch, or worktree was deleted.
 - Shared macOS descriptor-pinned Git identity failures are tracked separately and must not be hidden by weakening approval or repository identity checks.
+
+## CI review and repair
+
+CI run `35711560164` at `23bcd28` passed formatting, all-target and no-default builds, clippy, the gateway job, and real Linux sandbox acceptance. The Linux binary suite reported 1026 passed, 2 failed, and 1 ignored.
+
+The two failures were reviewed against implementation semantics rather than changing assertions to match the implementation:
+
+- `github_pr_close` waits for a validated closed response, so its activity result must be `Completed`, not `Accepted`. The existing accepted-operation expectation is retained.
+- The pure path validator must itself reject relative traversal and absolute paths. Transport-level guards already rejected literal `..`; the helper is strengthened to cover bounded segments and encoded dot/slash/control forms while retaining valid workflow and encoded branch names.
+
+Delegated follow-up implementation adds regression tests for both repairs. The next commit's CI is required; earlier results do not certify that commit. No live PR mutation was used for validation.

@@ -255,10 +255,10 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         ActivityOperation::GithubPrGet,
         "GitHub pull request status",
     ),
-    activity_tool_accepted(
+    activity_tool(
         "github_pr_close",
         ActivityOperation::GithubPrClose,
-        "GitHub pull request close acceptance",
+        "GitHub pull request close",
     ),
     activity_job_tool(
         "execute",
@@ -6398,21 +6398,54 @@ fn github_api_query_is_bounded(query: &str) -> bool {
 
 fn github_api_path_is_bounded(path: &str) -> bool {
     let bytes = path.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-') {
-            index += 1;
-            continue;
-        }
-        if byte != b'%' || index + 2 >= bytes.len() {
-            return false;
-        }
-        if !bytes[index + 1].is_ascii_hexdigit() || !bytes[index + 2].is_ascii_hexdigit() {
-            return false;
-        }
-        index += 3;
+    if bytes.is_empty() || bytes.len() > 1024 || bytes.starts_with(b"/") {
+        return false;
     }
+
+    // This is lexical containment validation, not an API routing allowlist.
+    // Callers remain responsible for constructing their fixed GitHub routes.
+    for segment in bytes.split(|byte| *byte == b'/') {
+        if segment.is_empty() {
+            return false;
+        }
+
+        let mut decoded = Vec::with_capacity(segment.len());
+        let mut index = 0;
+        while index < segment.len() {
+            let byte = segment[index];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+                decoded.push(byte);
+                index += 1;
+                continue;
+            }
+
+            if byte != b'%' || index + 2 >= segment.len() {
+                return false;
+            }
+            let Some(high) = (segment[index + 1] as char).to_digit(16) else {
+                return false;
+            };
+            let Some(low) = (segment[index + 2] as char).to_digit(16) else {
+                return false;
+            };
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        }
+
+        if decoded == b"." || decoded == b".." {
+            return false;
+        }
+        if decoded
+            .iter()
+            .any(|byte| matches!(byte, b'/' | b'\\' | b'\0') || byte.is_ascii_control())
+        {
+            return false;
+        }
+        if std::str::from_utf8(&decoded).is_err() {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -17809,6 +17842,69 @@ mod tests {
 
         append_github_api_response_chunk(&mut empty, &[], 0).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn github_pr_close_activity_is_completed_after_confirmed_response() {
+        assert!(ACTIVITY_TOOL_COVERAGE.iter().any(|entry| {
+            entry.operation == ActivityOperation::GithubPrClose
+                && entry.success == ActivitySuccess::Completed
+        }));
+        assert!(ACTIVITY_TOOL_COVERAGE.iter().any(|entry| {
+            entry.operation == ActivityOperation::GithubPrList
+                && entry.success == ActivitySuccess::Completed
+        }));
+        assert!(ACTIVITY_TOOL_COVERAGE.iter().any(|entry| {
+            entry.operation == ActivityOperation::GithubPrGet
+                && entry.success == ActivitySuccess::Completed
+        }));
+        assert!(ACTIVITY_TOOL_COVERAGE.iter().any(|entry| {
+            entry.operation == ActivityOperation::CodexTaskControl
+                && entry.success == ActivitySuccess::Accepted
+        }));
+        assert!(ACTIVITY_TOOL_COVERAGE.iter().any(|entry| {
+            entry.operation == ActivityOperation::CodexTaskStart
+                && entry.success == ActivitySuccess::Accepted
+        }));
+    }
+
+    #[test]
+    fn github_api_path_validation_rejects_traversal_and_preserves_internal_routes() {
+        for path in [
+            "repos/f4ah6o/temote-mcp/pulls/7",
+            "repos/f4ah6o/temote-mcp/actions/workflows/release.yml/dispatches",
+            "repos/example/repository/branches/feature/review%401",
+            "repos/example/repository/branches/%E6%96%B0",
+            "repos/example/repository/branches/literal%25data",
+        ] {
+            assert!(github_api_path_is_bounded(path), "{path}");
+        }
+
+        for path in [
+            "",
+            "../pulls",
+            "/pulls",
+            "repos/x/y/../pulls",
+            "repos/x/y/./pulls",
+            "repos//y/pulls",
+            "repos/x/y/pulls/",
+            "repos/x/y/%2e/pulls",
+            "repos/x/y/.%2E/pulls",
+            "repos/x/y/%2e%2E/pulls",
+            "repos/x/y/%2Fpulls",
+            "repos/x/y/%5cpulls",
+            "repos/x/y/%00",
+            "repos/x/y/%0a",
+            "repos/x/y?state=open",
+            "repos/x/y#f",
+            "repos/x/y/malformed%",
+            "repos/x/y/%G0",
+        ] {
+            assert!(!github_api_path_is_bounded(path), "{path}");
+        }
+
+        assert!(github_api_path_is_bounded(&"a".repeat(1024)));
+        assert!(!github_api_path_is_bounded(&"a".repeat(1025)));
     }
 
     #[test]
