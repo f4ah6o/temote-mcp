@@ -48,7 +48,11 @@ fn create_private_process_root() -> Result<PathBuf, String> {
                         ));
                     }
                 }
-                return Ok(path);
+                // macOS spells /tmp as /private/tmp; keep this test fixture
+                // canonical so production path authority remains unchanged.
+                return std::fs::canonicalize(&path).map_err(|error| {
+                    format!("failed to canonicalize private process root {path:?}: {error}")
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -66,7 +70,9 @@ fn create_private_process_root() -> Result<PathBuf, String> {
 fn test_isolation_process_root_is_stable_private_and_short() {
     let root = private_process_root().unwrap();
     assert_eq!(private_process_root().unwrap(), root);
-    assert_eq!(root.parent(), Some(std::path::Path::new("/tmp")));
+    let canonical_tmp = std::fs::canonicalize("/tmp").unwrap();
+    assert_eq!(root.parent(), Some(canonical_tmp.as_path()));
+    assert_eq!(root, std::fs::canonicalize(&root).unwrap());
     assert!(
         root.as_os_str().len() <= 32,
         "test root is too long: {root:?}"
@@ -79,6 +85,33 @@ fn test_isolation_process_root_is_stable_private_and_short() {
             0o700
         );
     }
+}
+
+#[test]
+fn test_isolation_process_root_nested_state_paths_are_canonical_and_private() {
+    let root = private_process_root().unwrap();
+    let unique = uuid::Uuid::new_v4().to_string();
+    let subtree = root.join("state").join(unique);
+    let state_path = subtree.join("temote-mcp");
+
+    std::fs::create_dir_all(&state_path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&subtree, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&subtree).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(subtree, std::fs::canonicalize(&subtree).unwrap());
+    assert_eq!(state_path, std::fs::canonicalize(&state_path).unwrap());
+    std::fs::remove_dir_all(subtree).unwrap();
 }
 
 pub fn seed(salt: u64) -> u64 {

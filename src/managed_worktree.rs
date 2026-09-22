@@ -1643,6 +1643,38 @@ mod tests {
         let second = fixture
             .path()
             .join(std::ffi::OsString::from_vec(b"work-\x81".to_vec()));
+
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_ne!(first.as_os_str(), second.as_os_str());
+
+        let first_key = reservation_path(fixture.path(), ReservationNamespace::Worktree, &first);
+        let second_key = reservation_path(fixture.path(), ReservationNamespace::Worktree, &second);
+        assert_ne!(first_key, second_key);
+        assert_eq!(
+            first_key,
+            reservation_path(fixture.path(), ReservationNamespace::Worktree, &first)
+        );
+        assert_eq!(
+            second_key,
+            reservation_path(fixture.path(), ReservationNamespace::Worktree, &second)
+        );
+        assert_ne!(
+            first_key,
+            reservation_path(fixture.path(), ReservationNamespace::Repository, &first)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_reservation_filesystem_locks_are_independent() {
+        // Linux filesystem acceptance; APFS rejects invalid-byte path names.
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"work-\x80".to_vec()));
+        let second = fixture
+            .path()
+            .join(std::ffi::OsString::from_vec(b"work-\x81".to_vec()));
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
 
