@@ -271,4 +271,20 @@ API費用は測定日の公式単価、課金条件、認証方式を記録し�
 
 ## 2026-09-16 branch-salvage packet
 
-Do not merge the old app-server/runtime-isolation branches wholesale. Repository-local reconciliation is owned by `issues/polished/20260916-completion-appserver-branch-salvage.md`; live dogfood/comparison remains a separate Phase 4 acceptance step.
+Do not merge the old app-server/runtime-isolation branches wholesale. Repository-local reconciliation is owned by `issues/done/20260916-completion-appserver-branch-salvage.md`; live dogfood/comparison remains a separate Phase 4 acceptance step.
+
+## 2026-09-22 current-main coverage (salvage audit)
+
+Audit result: every repository-local app-server/runtime residual is `already-covered` on current `main`; nothing remains to port, and no child issues were created. Repository-local completion is closed; Phase 4 live dogfood/comparison/adoption stays as the only open acceptance (unchanged). Sources `codex/20260915-completion-appserver` and `codex/20260915-test-runtime-isolation` have been deleted as refs; their history was audited via `codex/20260915-complete-open-work`, which also carries the audit's `codex/eval-t05-c-r2-incomplete` evidence.
+
+| Scope item | Current-main evidence | Verdict |
+| --- | --- | --- |
+| runtime ownership / fencing | `TaskRuntimeLease` (`try_acquire_runtime_lease`); tests `runtime_lease_is_exclusive_per_task_and_released_on_drop`, `terminal_task_runtime_lease_defers_owner_cleanup_without_rewriting_terminal_state`, `session_runtime_cleanup_is_instance_fenced_and_waits_for_shutdown`, `old_instance_cannot_insert_runtime_after_cleanup`, `cross_process_store_and_runtime_ownership_are_fenced` | already-covered |
+| cleanup / drain correctness | `restart_does_not_start_replacement_until_old_turn_drained`, `stop_during_turn_start_waits_for_inflight_child_shutdown`, `drain_timeout_fails_closed`, `registered_runtime_and_inflight_drain_do_not_deadlock`, `managed_session_restart_removes_old_codex_runtime_before_replacement`, `child_approval_permit_drains_before_session_cleanup` | already-covered |
+| protocol / user-agent compatibility | `validate_initialize_response`, `app_server_version_from_user_agent` (best-effort diagnostic); tests `initialize_validation_is_version_agnostic`, `generated_initialize_versions_are_not_allowlisted`, `app_server_version_is_best_effort_diagnostic_only`, `initialize_validation_bounds_user_agent_without_pinning_grammar`, `initialize_validation_requires_the_response_shape`, `app_server_accepts_arbitrary_peer_version_and_rejects_oversized_protocol` | already-covered; the supported contract is deliberately version-agnostic — `CODEX_APP_SERVER_INCOMPATIBLE` and the `0.153.4` pin were removed by design |
+| crash / reconcile / retention boundaries | `reconciled_task_status`; tests `reconciliation_never_regresses_a_terminal_task`, `accepted_operation_replay_requires_reconciliation_and_conflicts_on_change`, `task_get_reconciles_remote_completion_before_not_modified`, `task_get_defers_to_live_runtime_owner_and_resumes_after_release`, `finalized_task_expires_and_is_pruned_after_retention`, `task_store_retains_fresh_terminal_and_prunes_expired_records`, `concurrent_start_acceptance_has_one_durable_winner`, `concurrent_control_acceptance_is_idempotent_for_duplicate_operation`, `concurrent_completion_and_control_acceptance_never_resurrects_task` | already-covered |
+| 0.153.4 `reasoningEffort` model schema | `advertised_effort_name` accepts `reasoningEffort`/`effort` aliases; test `model_list_effort_parser_accepts_reasoning_effort_schema_aliases` | already-covered |
+| 2026-09-16 observed test drift | `app_server_rejects_incompatible_and_oversized_protocol` was superseded by `app_server_accepts_arbitrary_peer_version_and_rejects_oversized_protocol` (version-agnostic contract); `cross_process_store_and_runtime_ownership_are_fenced` passes on current `main` (rerun: 1 passed) | resolved on main |
+| `resolve_codex_home` `#[cfg(test)]` isolation (on `complete-open-work`) | Production-only path on `main` (`install_current`/`status_current`/`diagnose_current`); every test passes an explicit tempdir — the override is dead isolation, not a missing behavior | not needed |
+
+Missing coherent behaviors: none — no child issues created.
