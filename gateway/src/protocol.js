@@ -668,6 +668,50 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "github_pr_list",
+    "List GitHub pull requests",
+    "Lists up to 50 updated open pull requests for the currently configured repository using repository-local gh and Git configuration, not a global account selector. Token and raw API response bodies are secret data and are not exposed.",
+    networkReadOnly,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+      },
+      ["session_id"],
+    ),
+  ),
+  tool(
+    "github_pr_get",
+    "Get a GitHub pull request",
+    "Gets one pull request from the currently configured repository using repository-local gh and Git configuration, not a global account selector. Token and raw API response bodies are secret data and are not exposed.",
+    networkReadOnly,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+        number: { type: "string", minLength: 1, maxLength: 20 },
+      },
+      ["session_id", "number"],
+    ),
+  ),
+  tool(
+    "github_pr_close",
+    "Close a GitHub pull request",
+    "After approval, updates one pull request to the closed state in the currently configured repository using repository-local gh and Git configuration, without merging or deleting a branch. Token and raw API response bodies are secret data and are not exposed.",
+    networkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        cwd: { type: "string" },
+        remote: { type: "string", default: "origin" },
+        number: { type: "string", minLength: 1, maxLength: 20 },
+      },
+      ["session_id", "number"],
+    ),
+  ),
+  tool(
     "execute",
     "Run a sandboxed command",
     "Execute argv in the selected host's network-disabled sandbox.",

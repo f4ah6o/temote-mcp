@@ -245,6 +245,21 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         ActivityOperation::GithubWorkflowRunGet,
         "GitHub workflow status",
     ),
+    activity_tool(
+        "github_pr_list",
+        ActivityOperation::GithubPrList,
+        "GitHub pull request list",
+    ),
+    activity_tool(
+        "github_pr_get",
+        ActivityOperation::GithubPrGet,
+        "GitHub pull request status",
+    ),
+    activity_tool_accepted(
+        "github_pr_close",
+        ActivityOperation::GithubPrClose,
+        "GitHub pull request close acceptance",
+    ),
     activity_job_tool(
         "execute",
         ActivityOperation::Execute,
@@ -1114,6 +1129,9 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"git_worktree_prune","title":"Prune stale Git worktree metadata","description":"Run a bounded git worktree prune for the selected repository's canonical primary checkout. Only Git-classified stale worktree metadata is removed; filesystem directories are never deleted, and live managed, dirty, active-session and legacy worktrees are preserved. Caller input is path-free and the result reports bounded before/after identities and counts.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"repository":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id"],"additionalProperties":false}},
         {"name":"github_workflow_dispatch","title":"Dispatch a GitHub Actions workflow","description":"Dispatch an exact workflow file or numeric workflow ID at an exact branch/tag ref for the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping, never the ambient active gh account, and returns the created workflow run ID without exposing tokens.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"workflow":{"type":"string","minLength":1,"maxLength":255},"ref":{"type":"string","minLength":1,"maxLength":255}},"required":["session_id","workflow","ref"],"additionalProperties":false}},
         {"name":"github_workflow_run_get","title":"Read a GitHub Actions workflow run","description":"Read bounded status for one exact workflow run ID in the GitHub repository resolved from a configured remote. Requires the same repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"run_id":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","run_id"],"additionalProperties":false}},
+        {"name":"github_pr_list","title":"List open GitHub pull requests","description":"List bounded summaries of open pull requests for the GitHub repository resolved from a configured remote. Only number, title, state, draft, head branch, update time and html URL are returned; arbitrary REST/GraphQL, other repositories and raw tokens are unavailable. Requires the repository-local managed Git credential mapping and never the ambient active gh account.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"github_pr_get","title":"Read one GitHub pull request","description":"Read the same bounded summary for one exact pull request number in the GitHub repository resolved from a configured remote. Requires the repository-local managed Git credential mapping and never exposes tokens.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"number":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","number"],"additionalProperties":false}},
+        {"name":"github_pr_close","title":"Close one GitHub pull request","description":"Close one exact pull request number in the GitHub repository resolved from a configured remote. Merge, review, comment, release, issue mutation, arbitrary REST/GraphQL and cross-repository access are unavailable. Requires the repository-local managed Git credential mapping and never changes the global gh account.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"cwd":{"type":"string"},"remote":{"type":"string","default":"origin"},"number":{"type":"string","minLength":1,"maxLength":20}},"required":["session_id","number"],"additionalProperties":false}},
         {"name":"execute","title":"Run a command","description":"Execute argv without a shell using the selected session permission mode. Optional output_limit_bytes or status_only bounds the parent-facing result while preserving scoped evidence for omitted captured output. Returns the normal result when it finishes within 30 seconds; otherwise returns a job_id.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"start_command","title":"Start a command","description":"Start argv immediately as a background job using the selected session permission mode. Optional output_limit_bytes or status_only becomes the default completed-result view for later polls.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean","default":false}},"required":["session_id","command"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -1475,6 +1493,36 @@ async fn call_tool_with_local_agent_executable(
             }
             "github_workflow_run_get" => {
                 github_workflow_run_get(&args, &session, activity.as_ref()).await
+            }
+            "github_pr_list" => {
+                github_pr_list(
+                    &args,
+                    &session,
+                    activity.as_ref(),
+                    &GithubPrManagedCredential,
+                    &GithubPrHttpTransport,
+                )
+                .await
+            }
+            "github_pr_get" => {
+                github_pr_get(
+                    &args,
+                    &session,
+                    activity.as_ref(),
+                    &GithubPrManagedCredential,
+                    &GithubPrHttpTransport,
+                )
+                .await
+            }
+            "github_pr_close" => {
+                github_pr_close(
+                    &args,
+                    &session,
+                    activity.as_ref(),
+                    &GithubPrManagedCredential,
+                    &GithubPrHttpTransport,
+                )
+                .await
             }
             "execute" => execute(&args, &session, activity.clone()).await,
             "start_command" => start_command(&args, &session, activity.clone()).await,
@@ -5863,7 +5911,7 @@ fn build_git_push_tag_command(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct GithubRepository {
+pub(crate) struct GithubRepository {
     owner: String,
     repo: String,
 }
@@ -6141,9 +6189,11 @@ fn parse_github_branch_protected_response(response: &str, branch: &str) -> Resul
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GithubApiMethod {
+pub(crate) enum GithubApiMethod {
     Get,
     Post,
+    #[cfg_attr(not(feature = "network"), allow(dead_code))]
+    Patch,
 }
 
 impl GithubApiMethod {
@@ -6151,6 +6201,7 @@ impl GithubApiMethod {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Patch => "PATCH",
         }
     }
 }
@@ -6248,6 +6299,23 @@ async fn github_api_request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<String> {
+    github_api_request_with_query(token, method, path, None, body, GithubApiContext::Workflow).await
+}
+
+/// One bounded authenticated GitHub API request.
+///
+/// The path and query are always constructed by Temote; callers never pass
+/// arbitrary request text. `query` is validated against a fixed allowlist and
+/// is only ever the internal pull-request list shape.
+#[cfg(feature = "network")]
+async fn github_api_request_with_query(
+    token: &str,
+    method: GithubApiMethod,
+    path: &str,
+    query: Option<&str>,
+    body: Option<&Value>,
+    context: GithubApiContext,
+) -> Result<String> {
     const MAX_GITHUB_API_RESPONSE_BYTES: u64 = 256 * 1024;
     anyhow::ensure!(
         !path.is_empty()
@@ -6257,29 +6325,40 @@ async fn github_api_request(
             && github_api_path_is_bounded(path),
         "GitHub API path is invalid"
     );
+    if let Some(query) = query {
+        anyhow::ensure!(
+            github_api_query_is_bounded(query),
+            "GitHub API query is invalid"
+        );
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .user_agent(format!("temote-mcp/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("failed to initialize GitHub API client")?;
-    let url = format!("https://api.github.com/{path}");
+    let mut url = format!("https://api.github.com/{path}");
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
     let mut request = match method {
         GithubApiMethod::Get => client.get(url),
         GithubApiMethod::Post => client.post(url),
+        GithubApiMethod::Patch => client.patch(url),
     }
     .header("Accept", "application/vnd.github+json")
     .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(body);
     }
-    let response = request
+    let mut response = request
         .send()
         .await
         .map_err(|_| anyhow::anyhow!("GitHub API is unavailable"))?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!(github_api_error_message(status.as_u16()));
+        anyhow::bail!(context.error_message(status.as_u16()));
     }
     if let Some(length) = response.content_length() {
         anyhow::ensure!(
@@ -6287,15 +6366,34 @@ async fn github_api_request(
             "GitHub API response is too large"
         );
     }
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| anyhow::anyhow!("GitHub API response could not be read"))?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_GITHUB_API_RESPONSE_BYTES as usize,
-        "GitHub API response is too large"
-    );
-    String::from_utf8(bytes.to_vec()).context("GitHub API response is not UTF-8")
+        .map_err(|_| anyhow::anyhow!("GitHub API response could not be read"))?
+    {
+        append_github_api_response_chunk(
+            &mut bytes,
+            &chunk,
+            MAX_GITHUB_API_RESPONSE_BYTES as usize,
+        )?;
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("GitHub API response is not UTF-8"))
+}
+
+/// Bounded query allowlist for internally constructed request queries. A query
+/// never carries caller text, credentials or arbitrary endpoints.
+fn github_api_query_is_bounded(query: &str) -> bool {
+    !query.is_empty()
+        && query.len() <= 256
+        && !query.starts_with('?')
+        && !query.starts_with('&')
+        && !query.ends_with('&')
+        && !query.contains("&&")
+        && !query.contains("..")
+        && query.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '=' | '&' | '_' | '-' | '.')
+        })
 }
 
 fn github_api_path_is_bounded(path: &str) -> bool {
@@ -6318,14 +6416,26 @@ fn github_api_path_is_bounded(path: &str) -> bool {
     true
 }
 
-#[cfg_attr(not(feature = "network"), allow(dead_code))]
-fn github_api_error_message(status: u16) -> &'static str {
-    match status {
-        401 => "GitHub repository credential was rejected",
-        403 => "GitHub repository credential lacks required permission",
-        404 => "GitHub repository workflow/run is unavailable",
-        422 => "GitHub workflow request was rejected",
-        _ => "GitHub API operation failed",
+/// Selects the bounded, secret-free error wording for one GitHub API surface.
+///
+/// The status code is the only signal; response bodies are never echoed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GithubApiContext {
+    Workflow,
+    PullRequest,
+}
+
+impl GithubApiContext {
+    const fn error_message(self, status: u16) -> &'static str {
+        match (self, status) {
+            (_, 401) => "GitHub repository credential was rejected",
+            (_, 403) => "GitHub repository credential lacks required permission",
+            (Self::Workflow, 404) => "GitHub repository workflow/run is unavailable",
+            (Self::Workflow, 422) => "GitHub workflow request was rejected",
+            (Self::PullRequest, 404) => "GitHub pull request is unavailable",
+            (Self::PullRequest, 422) => "GitHub pull request request was rejected",
+            _ => "GitHub API operation failed",
+        }
     }
 }
 
@@ -6616,6 +6726,547 @@ fn bounded_github_html_url(value: Option<&Value>) -> Result<&str> {
         "GitHub response contains invalid html_url"
     );
     Ok(value)
+}
+
+// --- Bounded GitHub pull-request broker -------------------------------------
+//
+// The local agent may only list open pull requests, read one exact pull
+// request, and close one exact pull request for the repository resolved from a
+// configured GitHub remote. There is no caller-supplied repository, path,
+// query, method or header: every request is built here from a fixed shape, and
+// every response is reduced to bounded, secret-free fields.
+
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
+fn append_github_api_response_chunk(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    maximum: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        buffer.len() <= maximum && chunk.len() <= maximum.saturating_sub(buffer.len()),
+        "GitHub API response is too large"
+    );
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+pub(crate) const MAX_GITHUB_PR_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_GITHUB_PR_NUMBER_DIGITS: usize = 20;
+const MAX_GITHUB_PR_LIST_ITEMS: usize = 50;
+const MAX_GITHUB_PR_TITLE_BYTES: usize = 512;
+const MAX_GITHUB_PR_REF_BYTES: usize = 255;
+const MAX_GITHUB_PR_TIMESTAMP_BYTES: usize = 64;
+
+/// One bounded, fixed GitHub pull-request request shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GithubPrRequest {
+    List,
+    Get { number: u64 },
+    Close { number: u64 },
+}
+
+impl GithubPrRequest {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::List => "github_pr_list",
+            Self::Get { .. } => "github_pr_get",
+            Self::Close { .. } => "github_pr_close",
+        }
+    }
+
+    const fn method(self) -> GithubApiMethod {
+        match self {
+            Self::List | Self::Get { .. } => GithubApiMethod::Get,
+            Self::Close { .. } => GithubApiMethod::Patch,
+        }
+    }
+
+    fn path(self, repository: &GithubRepository) -> String {
+        match self {
+            Self::List => format!("repos/{}/{}/pulls", repository.owner, repository.repo),
+            Self::Get { number } | Self::Close { number } => format!(
+                "repos/{}/{}/pulls/{number}",
+                repository.owner, repository.repo
+            ),
+        }
+    }
+
+    const fn query(self) -> Option<&'static str> {
+        match self {
+            Self::List => Some("state=open&per_page=50&sort=updated&direction=desc"),
+            Self::Get { .. } | Self::Close { .. } => None,
+        }
+    }
+
+    fn body(self) -> Option<Value> {
+        match self {
+            Self::Close { .. } => Some(json!({"state": "closed"})),
+            Self::List | Self::Get { .. } => None,
+        }
+    }
+}
+
+/// Transport seam for the bounded pull-request broker.
+///
+/// The production implementation performs the authenticated repository-scoped
+/// HTTPS request; tests substitute a deterministic adapter so repository
+/// containment, response bounding and secret non-echo stay provable without
+/// live GitHub state. The transport receives the fixed request shape and the
+/// configured repository, never caller-supplied request text.
+pub(crate) trait GithubPrTransport: Send + Sync {
+    fn request<'a>(
+        &'a self,
+        token: &'a str,
+        request: GithubPrRequest,
+        repository: &'a GithubRepository,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>;
+}
+
+pub(crate) struct GithubPrHttpTransport;
+
+impl GithubPrTransport for GithubPrHttpTransport {
+    fn request<'a>(
+        &'a self,
+        token: &'a str,
+        request: GithubPrRequest,
+        repository: &'a GithubRepository,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        let path = request.path(repository);
+        let body = request.body();
+        #[cfg(feature = "network")]
+        {
+            Box::pin(async move {
+                github_api_request_with_query(
+                    token,
+                    request.method(),
+                    &path,
+                    request.query(),
+                    body.as_ref(),
+                    GithubApiContext::PullRequest,
+                )
+                .await
+            })
+        }
+        #[cfg(not(feature = "network"))]
+        {
+            let _ = (self, token, request, repository, path, body);
+            Box::pin(async { anyhow::bail!("GitHub API operations require the network feature") })
+        }
+    }
+}
+
+/// Repository-scoped managed credential selection for the pull-request broker.
+///
+/// The production implementation reproduces the existing repo-local `gh-git`
+/// mapping contract used by structured GitHub workflow operations; it never
+/// reads or changes the ambient active `gh` account. The credential never
+/// crosses this trait boundary: the implementation hands it directly to the
+/// transport so it cannot be copied into ordinary output.
+pub(crate) trait GithubPrCredentialSource: Send + Sync {
+    fn request_with_credential<'a>(
+        &'a self,
+        pinned: &'a sandbox::PinnedGitRepository,
+        repository: &'a GithubRepository,
+        request: GithubPrRequest,
+        transport: &'a dyn GithubPrTransport,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>;
+}
+
+pub(crate) struct GithubPrManagedCredential;
+
+impl GithubPrCredentialSource for GithubPrManagedCredential {
+    fn request_with_credential<'a>(
+        &'a self,
+        pinned: &'a sandbox::PinnedGitRepository,
+        repository: &'a GithubRepository,
+        request: GithubPrRequest,
+        transport: &'a dyn GithubPrTransport,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        #[cfg(feature = "network")]
+        {
+            Box::pin(async move {
+                let token = repo_scoped_github_token_pinned(pinned, repository).await?;
+                transport.request(&token, request, repository).await
+            })
+        }
+        #[cfg(not(feature = "network"))]
+        {
+            let _ = (self, pinned, repository, request, transport);
+            Box::pin(async { anyhow::bail!("GitHub API operations require the network feature") })
+        }
+    }
+}
+
+fn validate_github_pr_number(value: &str) -> Result<u64> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= MAX_GITHUB_PR_NUMBER_DIGITS
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && (value.len() == 1 || !value.starts_with('0')),
+        "pull request number must be a positive decimal integer"
+    );
+    let parsed = value
+        .parse::<u64>()
+        .context("pull request number is out of range")?;
+    anyhow::ensure!(parsed > 0, "pull request number must be greater than zero");
+    Ok(parsed)
+}
+
+fn validate_github_pr_handler_args(args: &Value, accepts_number: bool) -> Result<()> {
+    let object = args
+        .as_object()
+        .context("GitHub pull request arguments must be an object")?;
+    for key in object.keys() {
+        let allowed = matches!(key.as_str(), "session_id" | "cwd" | "remote")
+            || (accepts_number && key == "number");
+        anyhow::ensure!(allowed, "unsupported GitHub pull request argument");
+    }
+    Ok(())
+}
+
+fn required_github_pr_number(args: &Value) -> Result<u64> {
+    let value = args
+        .get("number")
+        .and_then(Value::as_str)
+        .context("missing or non-string number")?;
+    validate_github_pr_number(value)
+}
+
+fn github_repository_identity(repository: &GithubRepository) -> Value {
+    json!({"owner": repository.owner, "repo": repository.repo})
+}
+
+fn bounded_github_pr_text<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+    maximum: usize,
+) -> Result<&'a str> {
+    let value = value
+        .and_then(Value::as_str)
+        .with_context(|| format!("GitHub pull request response is missing {field}"))?;
+    anyhow::ensure!(
+        !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control),
+        "GitHub pull request response contains invalid {field}"
+    );
+    Ok(value)
+}
+
+fn parse_github_pr_summary(value: &Value) -> Result<Value> {
+    let number = value
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("GitHub pull request response is missing number")?;
+    anyhow::ensure!(
+        number > 0 && number.to_string().len() <= MAX_GITHUB_PR_NUMBER_DIGITS,
+        "GitHub pull request response contains invalid number"
+    );
+    let title = bounded_github_pr_text(value.get("title"), "title", MAX_GITHUB_PR_TITLE_BYTES)?;
+    let state = bounded_github_enum(value.get("state"), "state")?;
+    anyhow::ensure!(
+        matches!(state, "open" | "closed"),
+        "GitHub pull request response contains invalid state"
+    );
+    let draft = value
+        .get("draft")
+        .and_then(Value::as_bool)
+        .context("GitHub pull request draft is not a boolean")?;
+    let html_url = bounded_github_html_url(value.get("html_url"))?;
+    let head_ref = bounded_github_pr_text(
+        value.pointer("/head/ref"),
+        "head.ref",
+        MAX_GITHUB_PR_REF_BYTES,
+    )?;
+    let updated_at = bounded_github_pr_text(
+        value.get("updated_at"),
+        "updated_at",
+        MAX_GITHUB_PR_TIMESTAMP_BYTES,
+    )?;
+    Ok(json!({
+        "number": number.to_string(),
+        "title": title,
+        "state": state,
+        "draft": draft,
+        "head_ref": head_ref,
+        "updated_at": updated_at,
+        "html_url": html_url,
+    }))
+}
+
+fn validate_github_pr_summary_repository(
+    summary: &Value,
+    repository: &GithubRepository,
+) -> Result<()> {
+    let number = summary
+        .get("number")
+        .and_then(Value::as_str)
+        .context("GitHub pull request response number is invalid")?;
+    let parsed = validate_github_pr_number(number)
+        .map_err(|_| anyhow::anyhow!("GitHub pull request response number is invalid"))?;
+    anyhow::ensure!(
+        parsed.to_string() == number,
+        "GitHub pull request response number is invalid"
+    );
+    let html_url = summary
+        .get("html_url")
+        .and_then(Value::as_str)
+        .context("GitHub pull request response URL is invalid")?;
+    let expected = format!(
+        "https://github.com/{}/{}/pull/{}",
+        repository.owner, repository.repo, number
+    );
+    anyhow::ensure!(
+        html_url.eq_ignore_ascii_case(&expected),
+        "GitHub pull request response repository mismatch"
+    );
+    Ok(())
+}
+
+fn parse_github_pr_list_response(stdout: &str) -> Result<Vec<Value>> {
+    anyhow::ensure!(
+        stdout.len() <= MAX_GITHUB_PR_RESPONSE_BYTES,
+        "GitHub pull request response is too large"
+    );
+    let value: Value = serde_json::from_str(stdout)
+        .map_err(|_| anyhow::anyhow!("invalid GitHub pull request response"))?;
+    let items = value
+        .as_array()
+        .context("GitHub pull request list response is not an array")?;
+    anyhow::ensure!(
+        items.len() <= MAX_GITHUB_PR_LIST_ITEMS,
+        "GitHub pull request list response exceeds the supported size"
+    );
+    items
+        .iter()
+        .map(|item| {
+            let summary = parse_github_pr_summary(item)?;
+            anyhow::ensure!(
+                summary.get("state").and_then(Value::as_str) == Some("open"),
+                "GitHub pull request list response contains a non-open pull request"
+            );
+            Ok(summary)
+        })
+        .collect()
+}
+
+fn parse_github_pr_get_response(stdout: &str, expected_number: u64) -> Result<Value> {
+    anyhow::ensure!(
+        stdout.len() <= MAX_GITHUB_PR_RESPONSE_BYTES,
+        "GitHub pull request response is too large"
+    );
+    let value: Value = serde_json::from_str(stdout)
+        .map_err(|_| anyhow::anyhow!("invalid GitHub pull request response"))?;
+    let summary = parse_github_pr_summary(&value)?;
+    anyhow::ensure!(
+        summary.get("number").and_then(Value::as_str) == Some(expected_number.to_string().as_str()),
+        "GitHub pull request response number mismatch"
+    );
+    Ok(summary)
+}
+
+fn parse_github_pr_close_response(stdout: &str, expected_number: u64) -> Result<Value> {
+    let summary = parse_github_pr_get_response(stdout, expected_number)?;
+    anyhow::ensure!(
+        summary.get("state").and_then(Value::as_str) == Some("closed"),
+        "GitHub pull request close was not confirmed"
+    );
+    Ok(json!({"closed": true, "pull_request": summary}))
+}
+
+fn sanitize_github_pr_operation_error(error: anyhow::Error) -> anyhow::Error {
+    let message = error.root_cause().to_string();
+    let safe = matches!(
+        message.as_str(),
+        "GitHub pull request is unavailable"
+            | "GitHub repository credential was rejected"
+            | "GitHub repository credential lacks required permission"
+            | "GitHub repository credential is unavailable"
+            | "GitHub API operations require the network feature"
+            | "GitHub API is unavailable"
+            | "GitHub API response is too large"
+            | "GitHub API response could not be read"
+            | "GitHub API response is not UTF-8"
+    );
+    if safe {
+        anyhow::anyhow!(message)
+    } else {
+        anyhow::anyhow!("GitHub pull request operation failed")
+    }
+}
+
+/// Resolves the configured GitHub repository through the pinned repository
+/// context. The repository identity always comes from the configured remote;
+/// no caller input can select a different repository.
+async fn github_pr_repository(
+    args: &Value,
+    session: &config::Session,
+) -> Result<(PathBuf, sandbox::PinnedGitRepository, GithubRepository)> {
+    let cwd = cwd(args, session)?;
+    let repository_root = sandbox::git_worktree_root(&cwd)?;
+    config::ensure_permitted(session, &repository_root)
+        .context("Git repository root must be inside a permitted session root")?;
+    let pinned = sandbox::pin_git_repository(&repository_root)?;
+    let repository = configured_github_repository_pinned(&pinned, args).await?;
+    Ok((repository_root, pinned, repository))
+}
+
+async fn configured_github_repository_pinned(
+    pinned: &sandbox::PinnedGitRepository,
+    args: &Value,
+) -> Result<GithubRepository> {
+    let remote = optional_git_remote(args)?.unwrap_or_else(|| "origin".to_owned());
+    validate_git_remote(&remote)?;
+    let output = run_pinned_git_inspection(
+        pinned,
+        &[
+            "git".to_owned(),
+            "remote".to_owned(),
+            "get-url".to_owned(),
+            remote,
+        ],
+    )
+    .await?;
+    anyhow::ensure!(output.status == 0, "configured Git remote is unavailable");
+    let remote_url = output.stdout.trim();
+    anyhow::ensure!(
+        !remote_url.is_empty() && remote_url.len() <= MAX_GITHUB_REMOTE_URL_BYTES,
+        "configured Git remote URL is invalid"
+    );
+    github_repository_from_remote_url(remote_url)
+}
+
+// Each parameter represents an explicit trust boundary in GitHub PR request execution.
+#[allow(clippy::too_many_arguments)]
+async fn execute_github_pr_request(
+    session: &config::Session,
+    repository_root: &Path,
+    pinned: &sandbox::PinnedGitRepository,
+    repository: &GithubRepository,
+    request: GithubPrRequest,
+    credentials: &dyn GithubPrCredentialSource,
+    transport: &dyn GithubPrTransport,
+    activity: Option<&ActivityScope>,
+) -> Result<String> {
+    if !approvals::ensure_local_approval_with_activity(
+        session,
+        approvals::ApprovalClass::GitNetwork,
+        request.operation(),
+        format!(
+            "method={} path={}",
+            request.method().as_str(),
+            request.path(repository)
+        ),
+        repository_root.to_path_buf(),
+        BTreeMap::new(),
+        activity,
+    )
+    .await?
+    {
+        if let Some(activity) = activity {
+            let _ = activity
+                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
+        }
+        anyhow::bail!("user denied {}", request.operation())
+    }
+    if let Some(activity) = activity {
+        let _ = activity.running();
+    }
+    credentials
+        .request_with_credential(pinned, repository, request, transport)
+        .await
+        .map_err(sanitize_github_pr_operation_error)
+}
+
+async fn github_pr_list(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+    credentials: &dyn GithubPrCredentialSource,
+    transport: &dyn GithubPrTransport,
+) -> Result<Value> {
+    validate_github_pr_handler_args(args, false)?;
+    let (repository_root, pinned, repository) = github_pr_repository(args, session).await?;
+    let response = execute_github_pr_request(
+        session,
+        &repository_root,
+        &pinned,
+        &repository,
+        GithubPrRequest::List,
+        credentials,
+        transport,
+        activity,
+    )
+    .await?;
+    let pull_requests = parse_github_pr_list_response(&response)?;
+    for pull_request in &pull_requests {
+        validate_github_pr_summary_repository(pull_request, &repository)?;
+    }
+    text_result(serde_json::to_string(&json!({
+        "repository": github_repository_identity(&repository),
+        "limit": MAX_GITHUB_PR_LIST_ITEMS,
+        "possibly_truncated": pull_requests.len() == MAX_GITHUB_PR_LIST_ITEMS,
+        "pull_requests": pull_requests,
+    }))?)
+}
+
+async fn github_pr_get(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+    credentials: &dyn GithubPrCredentialSource,
+    transport: &dyn GithubPrTransport,
+) -> Result<Value> {
+    validate_github_pr_handler_args(args, true)?;
+    let number = required_github_pr_number(args)?;
+    let (repository_root, pinned, repository) = github_pr_repository(args, session).await?;
+    let response = execute_github_pr_request(
+        session,
+        &repository_root,
+        &pinned,
+        &repository,
+        GithubPrRequest::Get { number },
+        credentials,
+        transport,
+        activity,
+    )
+    .await?;
+    let pull_request = parse_github_pr_get_response(&response, number)?;
+    validate_github_pr_summary_repository(&pull_request, &repository)?;
+    text_result(serde_json::to_string(&json!({
+        "repository": github_repository_identity(&repository),
+        "pull_request": pull_request,
+    }))?)
+}
+
+async fn github_pr_close(
+    args: &Value,
+    session: &config::Session,
+    activity: Option<&ActivityScope>,
+    credentials: &dyn GithubPrCredentialSource,
+    transport: &dyn GithubPrTransport,
+) -> Result<Value> {
+    validate_github_pr_handler_args(args, true)?;
+    let number = required_github_pr_number(args)?;
+    let (repository_root, pinned, repository) = github_pr_repository(args, session).await?;
+    let response = execute_github_pr_request(
+        session,
+        &repository_root,
+        &pinned,
+        &repository,
+        GithubPrRequest::Close { number },
+        credentials,
+        transport,
+        activity,
+    )
+    .await?;
+    let closed = parse_github_pr_close_response(&response, number)?;
+    let pull_request = closed
+        .get("pull_request")
+        .context("GitHub pull request close response is invalid")?;
+    validate_github_pr_summary_repository(pull_request, &repository)?;
+    text_result(serde_json::to_string(&json!({
+        "repository": github_repository_identity(&repository),
+        "pull_request": closed,
+    }))?)
 }
 
 fn optional_git_remote(args: &Value) -> Result<Option<String>> {
@@ -10909,7 +11560,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 58);
+        assert_eq!(tools.len(), 61);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -16683,22 +17334,677 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            github_api_error_message(401),
+            GithubApiContext::Workflow.error_message(401),
             "GitHub repository credential was rejected"
         );
         assert_eq!(
-            github_api_error_message(403),
+            GithubApiContext::Workflow.error_message(403),
             "GitHub repository credential lacks required permission"
         );
         assert_eq!(
-            github_api_error_message(404),
+            GithubApiContext::Workflow.error_message(404),
             "GitHub repository workflow/run is unavailable"
         );
         assert_eq!(
-            github_api_error_message(422),
+            GithubApiContext::Workflow.error_message(422),
             "GitHub workflow request was rejected"
         );
-        assert_eq!(github_api_error_message(500), "GitHub API operation failed");
+        assert_eq!(
+            GithubApiContext::Workflow.error_message(500),
+            "GitHub API operation failed"
+        );
+    }
+
+    /// Deterministic pull-request adapter used by the broker tests. The broker
+    /// hands it the fixed request shape and the repository-scoped credential,
+    /// so tests can prove containment and secret non-echo without live GitHub
+    /// state.
+    struct FakeGithubPrTransport {
+        response: Result<String, String>,
+        requests: std::sync::Mutex<Vec<RecordedGithubPrRequest>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecordedGithubPrRequest {
+        token: String,
+        operation: &'static str,
+        method: &'static str,
+        path: String,
+        query: Option<&'static str>,
+        body: Option<Value>,
+    }
+
+    impl FakeGithubPrTransport {
+        fn responding_with(body: &str) -> Self {
+            Self {
+                response: Ok(body.to_owned()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing_with(message: &str) -> Self {
+            Self {
+                response: Err(message.to_owned()),
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedGithubPrRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl GithubPrTransport for FakeGithubPrTransport {
+        fn request<'a>(
+            &'a self,
+            token: &'a str,
+            request: GithubPrRequest,
+            repository: &'a GithubRepository,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>
+        {
+            self.requests.lock().unwrap().push(RecordedGithubPrRequest {
+                token: token.to_owned(),
+                operation: request.operation(),
+                method: request.method().as_str(),
+                path: request.path(repository),
+                query: request.query(),
+                body: request.body(),
+            });
+            let response = match &self.response {
+                Ok(body) => Ok(body.clone()),
+                Err(message) => Err(anyhow::anyhow!(message.clone())),
+            };
+            Box::pin(async move { response })
+        }
+    }
+
+    struct FakeGithubPrCredentials {
+        token: &'static str,
+    }
+
+    impl GithubPrCredentialSource for FakeGithubPrCredentials {
+        fn request_with_credential<'a>(
+            &'a self,
+            _pinned: &'a sandbox::PinnedGitRepository,
+            repository: &'a GithubRepository,
+            request: GithubPrRequest,
+            transport: &'a dyn GithubPrTransport,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>
+        {
+            Box::pin(async move { transport.request(self.token, request, repository).await })
+        }
+    }
+
+    fn github_pr_fixture(remote: &str) -> (tempfile::TempDir, PathBuf, config::Session) {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = std::fs::canonicalize(root.path()).unwrap().join("repo");
+        std::fs::create_dir(&checkout).unwrap();
+        init_git_repository(&checkout);
+        run_git_fixture(&checkout, &["remote", "add", "origin", remote]);
+        let cwd = config::canonical_directory(&checkout).unwrap();
+        let session = config::Session {
+            id: format!("github-pr-{}", Uuid::new_v4()),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
+            started_at: 1,
+            process_id: std::process::id(),
+            permission_mode: config::PermissionMode::Agent,
+        };
+        (root, checkout, session)
+    }
+
+    fn github_pr_summary_body(number: u64, state: &str) -> String {
+        json!({
+            "number": number,
+            "title": "obsolete work",
+            "state": state,
+            "draft": false,
+            "html_url": format!("https://github.com/f4ah6o/temote-mcp/pull/{number}"),
+            "head": {
+                "ref": format!("obsolete/{number}"),
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+            },
+            "updated_at": "2026-09-22T00:00:00Z",
+            "body": "SHOULD-NOT-APPEAR",
+            "token": "ghp_should_not_appear",
+            "labels": [{"name": "SHOULD-NOT-APPEAR"}],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn github_pr_requests_are_fixed_repo_scoped_shapes() {
+        let repository = GithubRepository {
+            owner: "f4ah6o".to_owned(),
+            repo: "temote-mcp".to_owned(),
+        };
+        assert_eq!(GithubApiMethod::Patch.as_str(), "PATCH");
+        assert_eq!(
+            GithubPrRequest::List.path(&repository),
+            "repos/f4ah6o/temote-mcp/pulls"
+        );
+        assert_eq!(GithubPrRequest::List.method(), GithubApiMethod::Get);
+        assert_eq!(
+            GithubPrRequest::List.query(),
+            Some("state=open&per_page=50&sort=updated&direction=desc")
+        );
+        assert_eq!(GithubPrRequest::List.body(), None);
+        assert_eq!(
+            GithubPrRequest::Get { number: 7 }.path(&repository),
+            "repos/f4ah6o/temote-mcp/pulls/7"
+        );
+        assert_eq!(
+            GithubPrRequest::Close { number: 7 }.path(&repository),
+            "repos/f4ah6o/temote-mcp/pulls/7"
+        );
+        assert_eq!(
+            GithubPrRequest::Close { number: 7 }.method(),
+            GithubApiMethod::Patch
+        );
+        assert_eq!(
+            GithubPrRequest::Close { number: 7 }.body(),
+            Some(json!({"state": "closed"}))
+        );
+        assert_eq!(GithubPrRequest::List.operation(), "github_pr_list");
+        assert_eq!(
+            GithubPrRequest::Get { number: 1 }.operation(),
+            "github_pr_get"
+        );
+        assert_eq!(
+            GithubPrRequest::Close { number: 1 }.operation(),
+            "github_pr_close"
+        );
+
+        // The bounded query allowlist admits only the internal list shape.
+        assert!(github_api_query_is_bounded(
+            "state=open&per_page=50&sort=updated&direction=desc"
+        ));
+        assert!(github_api_path_is_bounded(
+            "repos/f4ah6o/temote-mcp/pulls/7"
+        ));
+        for invalid in [
+            "",
+            "?",
+            "?state=open",
+            "state=open&",
+            "state=open path",
+            "state=open&path=..",
+            "state=open&q=a%20b",
+            &"a".repeat(257),
+        ] {
+            assert!(
+                !github_api_query_is_bounded(invalid),
+                "{invalid:?} must be rejected"
+            );
+        }
+        for invalid in ["../pulls", "/pulls", "repos/x/y?state=open", "repos/x/y#f"] {
+            assert!(
+                !github_api_path_is_bounded(invalid),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_pr_number_validation_rejects_injection_shapes() {
+        for valid in ["1", "7", "42", "18446744073709551615"] {
+            assert!(validate_github_pr_number(valid).is_ok(), "{valid:?}");
+        }
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1e3",
+            "0x10",
+            "012345678901234567890",
+            "99999999999999999999",
+            "1;rm -rf /",
+            "1/pulls",
+            "１",
+            "1\n",
+        ] {
+            assert!(
+                validate_github_pr_number(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn github_pr_response_parsing_is_bounded_and_secret_free() {
+        let list = format!(
+            "[{},{}]",
+            github_pr_summary_body(7, "open"),
+            github_pr_summary_body(8, "open")
+        );
+        let parsed = parse_github_pr_list_response(&list).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0],
+            json!({
+                "number": "7",
+                "title": "obsolete work",
+                "state": "open",
+                "draft": false,
+                "head_ref": "obsolete/7",
+                "updated_at": "2026-09-22T00:00:00Z",
+                "html_url": "https://github.com/f4ah6o/temote-mcp/pull/7",
+            })
+        );
+        let rendered = serde_json::to_string(&parsed).unwrap();
+        assert!(!rendered.contains("SHOULD-NOT-APPEAR"));
+        assert!(!rendered.contains("ghp_should_not_appear"));
+        assert!(!rendered.contains("sha"));
+        assert!(!rendered.contains("body"));
+
+        let single = github_pr_summary_body(7, "open");
+        assert_eq!(
+            parse_github_pr_get_response(&single, 7)
+                .unwrap()
+                .get("number")
+                .and_then(Value::as_str),
+            Some("7")
+        );
+        assert!(parse_github_pr_get_response(&single, 8).is_err());
+
+        let closed = github_pr_summary_body(7, "closed");
+        let outcome = parse_github_pr_close_response(&closed, 7).unwrap();
+        assert_eq!(outcome["closed"], true);
+        assert_eq!(outcome["pull_request"]["state"], "closed");
+        assert!(
+            parse_github_pr_close_response(&single, 7).is_err(),
+            "an open pull request must never be reported as closed"
+        );
+
+        // Oversized lists, oversized responses and unknown states fail closed.
+        let items = (1..=MAX_GITHUB_PR_LIST_ITEMS + 1)
+            .map(|number| github_pr_summary_body(number as u64, "open"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_github_pr_list_response(&format!("[{items}]")).is_err());
+        assert!(
+            parse_github_pr_list_response(&"a".repeat(MAX_GITHUB_PR_RESPONSE_BYTES + 1)).is_err()
+        );
+        assert!(parse_github_pr_list_response("{}").is_err());
+        assert!(parse_github_pr_summary(&json!({"number": 0})).is_err());
+        assert!(
+            parse_github_pr_summary(&json!({
+                "number": 7,
+                "title": "x",
+                "state": "merged",
+                "html_url": "https://github.com/f4ah6o/temote-mcp/pull/7",
+                "head": {"ref": "obsolete/7"},
+                "updated_at": "2026-09-22T00:00:00Z",
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_github_pr_summary(&json!({
+                "number": 7,
+                "title": "x".repeat(MAX_GITHUB_PR_TITLE_BYTES + 1),
+                "state": "open",
+                "html_url": "https://github.com/f4ah6o/temote-mcp/pull/7",
+                "head": {"ref": "obsolete/7"},
+                "updated_at": "2026-09-22T00:00:00Z",
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_github_pr_summary(&json!({
+                "number": 7,
+                "title": "x",
+                "state": "open",
+                "html_url": "https://example.com/pull/7",
+                "head": {"ref": "obsolete/7"},
+                "updated_at": "2026-09-22T00:00:00Z",
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_github_pr_summary(&json!({
+                "number": 7,
+                "title": "x",
+                "state": "open",
+                "html_url": "https://github.com/f4ah6o/temote-mcp/pull/7",
+                "updated_at": "2026-09-22T00:00:00Z",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn github_pr_number_rejects_noncanonical_decimal() {
+        assert!(validate_github_pr_number("01").is_err());
+        assert!(validate_github_pr_number("00").is_err());
+        assert_eq!(validate_github_pr_number("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn github_pr_summary_requires_boolean_draft() {
+        for draft in [Value::Null, json!("false"), json!(0)] {
+            let mut value: Value =
+                serde_json::from_str(&github_pr_summary_body(7, "open")).unwrap();
+            value["draft"] = draft;
+            assert_eq!(
+                parse_github_pr_summary(&value).unwrap_err().to_string(),
+                "GitHub pull request draft is not a boolean"
+            );
+        }
+
+        let mut value: Value = serde_json::from_str(&github_pr_summary_body(7, "open")).unwrap();
+        value.as_object_mut().unwrap().remove("draft");
+        assert_eq!(
+            parse_github_pr_summary(&value).unwrap_err().to_string(),
+            "GitHub pull request draft is not a boolean"
+        );
+    }
+
+    #[test]
+    fn github_pr_list_rejects_closed_entries_and_malformed_json_safely() {
+        let closed = format!("[{}]", github_pr_summary_body(7, "closed"));
+        assert_eq!(
+            parse_github_pr_list_response(&closed)
+                .unwrap_err()
+                .to_string(),
+            "GitHub pull request list response contains a non-open pull request"
+        );
+        let malicious = "{\"token\":\"sentinel\"";
+        let error = parse_github_pr_list_response(malicious).unwrap_err();
+        assert_eq!(error.to_string(), "invalid GitHub pull request response");
+        assert!(!format!("{error:#}").contains("sentinel"));
+    }
+
+    #[test]
+    fn github_pr_summary_repository_is_exact_and_case_insensitive() {
+        let repository = GithubRepository {
+            owner: "f4ah6o".to_owned(),
+            repo: "temote-mcp".to_owned(),
+        };
+        let summary = parse_github_pr_get_response(&github_pr_summary_body(7, "open"), 7).unwrap();
+        validate_github_pr_summary_repository(&summary, &repository).unwrap();
+
+        let mut case_variant = summary.clone();
+        case_variant["html_url"] = json!("https://GITHUB.COM/F4AH6O/TEMOTE-MCP/pull/7");
+        validate_github_pr_summary_repository(&case_variant, &repository).unwrap();
+
+        for url in [
+            "https://github.com/f4ah6o/other/pull/7",
+            "https://github.com/f4ah6o/temote-mcp/pull/8",
+            "https://github.com/f4ah6o/temote-mcp/pull/7?x=1",
+            "https://github.com/f4ah6o/temote-mcp/pull/7/files",
+        ] {
+            let mut mismatched = summary.clone();
+            mismatched["html_url"] = json!(url);
+            assert!(validate_github_pr_summary_repository(&mismatched, &repository).is_err());
+        }
+    }
+
+    #[test]
+    fn github_pr_handler_arguments_are_allowlisted() {
+        validate_github_pr_handler_args(
+            &json!({"session_id": "s", "cwd": ".", "remote": "origin"}),
+            false,
+        )
+        .unwrap();
+        validate_github_pr_handler_args(&json!({"session_id": "s", "number": "7"}), true).unwrap();
+        assert!(validate_github_pr_handler_args(&json!({"number": "7"}), false).is_err());
+        assert!(
+            validate_github_pr_handler_args(&json!({"number": "7", "token": "sentinel"}), true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn github_pr_operation_errors_are_sanitized_without_chains() {
+        let safe = sanitize_github_pr_operation_error(anyhow::anyhow!(
+            "GitHub pull request is unavailable"
+        ));
+        assert_eq!(safe.to_string(), "GitHub pull request is unavailable");
+
+        let malicious = sanitize_github_pr_operation_error(
+            anyhow::anyhow!("token=sentinel").context("GitHub pull request is unavailable"),
+        );
+        assert_eq!(
+            malicious.to_string(),
+            "GitHub pull request operation failed"
+        );
+        assert!(!format!("{malicious:#}").contains("sentinel"));
+    }
+
+    #[test]
+    fn github_api_response_chunk_accumulator_is_bounded() {
+        let mut empty = Vec::new();
+        append_github_api_response_chunk(&mut empty, &[], 3).unwrap();
+        assert!(empty.is_empty());
+
+        append_github_api_response_chunk(&mut empty, b"abc", 3).unwrap();
+        assert_eq!(empty, b"abc");
+
+        let before = empty.clone();
+        assert_eq!(
+            append_github_api_response_chunk(&mut empty, b"d", 3)
+                .unwrap_err()
+                .to_string(),
+            "GitHub API response is too large"
+        );
+        assert_eq!(empty, before);
+    }
+
+    #[test]
+    fn github_api_response_chunk_rejects_preexisting_overflow() {
+        let mut overflow = vec![1, 2, 3];
+        assert!(append_github_api_response_chunk(&mut overflow, &[], 2).is_err());
+        assert_eq!(overflow, vec![1, 2, 3]);
+
+        let mut nonempty_at_zero = vec![1];
+        assert!(append_github_api_response_chunk(&mut nonempty_at_zero, &[], 0).is_err());
+        assert_eq!(nonempty_at_zero, vec![1]);
+
+        let mut empty = Vec::new();
+        assert!(append_github_api_response_chunk(&mut empty, &[1], 0).is_err());
+        assert!(empty.is_empty());
+
+        append_github_api_response_chunk(&mut empty, &[], 0).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn github_pr_repository_identity_resolution_fails_closed() {
+        for valid in [
+            "https://github.com/f4ah6o/temote-mcp",
+            "https://github.com/f4ah6o/temote-mcp.git",
+            "git@github.com:f4ah6o/temote-mcp.git",
+            "ssh://git@github.com/f4ah6o/temote-mcp",
+        ] {
+            let repository = github_repository_from_remote_url(valid).unwrap();
+            assert_eq!(repository.owner, "f4ah6o", "{valid}");
+            assert_eq!(repository.repo, "temote-mcp", "{valid}");
+        }
+        for invalid in [
+            "",
+            "https://gitlab.com/f4ah6o/temote-mcp",
+            "https://github.com/f4ah6o",
+            "https://github.com/f4ah6o/temote-mcp/extra",
+            "https://github.com/f4ah6o/temote-mcp?ref=main",
+            "https://github.com/f4ah6o/temote-mcp#frag",
+            "https://github.com/../temote-mcp",
+            "file:///tmp/repo",
+        ] {
+            assert!(
+                github_repository_from_remote_url(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            github_repository_from_destination("https://example.com/f4ah6o/temote-mcp").unwrap(),
+            None
+        );
+        assert_eq!(
+            github_repository_from_destination("https://github.com/f4ah6o/temote-mcp.git").unwrap(),
+            Some(GithubRepository {
+                owner: "f4ah6o".to_owned(),
+                repo: "temote-mcp".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn github_pr_broker_never_mutates_the_global_gh_account() {
+        assert_eq!(
+            github_managed_credential_command(),
+            vec!["gh", "git", "credential", "--managed", "get"]
+        );
+        assert!(
+            !github_managed_credential_command()
+                .iter()
+                .any(|argument| matches!(
+                    argument.as_str(),
+                    "auth" | "switch" | "login" | "logout" | "token"
+                )),
+            "the pull-request broker must never touch global gh account state"
+        );
+        // The credential mapping contract is the same repo-local one the
+        // structured workflow operations already require.
+        assert!(repo_scoped_github_credential_mapping_valid(
+            "\n!gh git credential --managed\n",
+            "true\n"
+        ));
+        assert!(!repo_scoped_github_credential_mapping_valid(
+            "\n!gh auth token\n",
+            "true\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn github_pr_tools_stay_on_the_configured_repository_and_never_echo_credentials() {
+        let (_root, _checkout, session) =
+            github_pr_fixture("https://github.com/f4ah6o/temote-mcp.git");
+        let body = format!("[{}]", github_pr_summary_body(7, "open"));
+        let transport = FakeGithubPrTransport::responding_with(&body);
+        let credentials = FakeGithubPrCredentials {
+            token: "ghp_secret_broker_token",
+        };
+
+        let result = github_pr_list(
+            &json!({"session_id": session.id}),
+            &session,
+            None,
+            &credentials,
+            &transport,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
+        assert!(!text.contains("ghp_secret_broker_token"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["repository"],
+            json!({"owner": "f4ah6o", "repo": "temote-mcp"})
+        );
+        assert_eq!(value["pull_requests"][0]["number"], "7");
+        assert_eq!(
+            transport.recorded(),
+            vec![RecordedGithubPrRequest {
+                token: "ghp_secret_broker_token".to_owned(),
+                operation: "github_pr_list",
+                method: "GET",
+                path: "repos/f4ah6o/temote-mcp/pulls".to_owned(),
+                query: Some("state=open&per_page=50&sort=updated&direction=desc"),
+                body: None,
+            }]
+        );
+
+        let transport = FakeGithubPrTransport::responding_with(&github_pr_summary_body(7, "open"));
+        github_pr_get(
+            &json!({"session_id": session.id, "number": "7"}),
+            &session,
+            None,
+            &credentials,
+            &transport,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transport.recorded()[0],
+            RecordedGithubPrRequest {
+                token: "ghp_secret_broker_token".to_owned(),
+                operation: "github_pr_get",
+                method: "GET",
+                path: "repos/f4ah6o/temote-mcp/pulls/7".to_owned(),
+                query: None,
+                body: None,
+            }
+        );
+
+        let transport =
+            FakeGithubPrTransport::responding_with(&github_pr_summary_body(7, "closed"));
+        let result = github_pr_close(
+            &json!({"session_id": session.id, "number": "7"}),
+            &session,
+            None,
+            &credentials,
+            &transport,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
+        assert!(text.contains("\"closed\":true"));
+        assert!(!text.contains("ghp_secret_broker_token"));
+        assert_eq!(
+            transport.recorded()[0].body,
+            Some(json!({"state": "closed"}))
+        );
+        assert_eq!(transport.recorded()[0].method, "PATCH");
+
+        // A different configured repository never borrows the first
+        // repository's identity or credential binding.
+        let (_other_root, _other_checkout, other_session) =
+            github_pr_fixture("git@github.com:example/other.git");
+        let other_transport = FakeGithubPrTransport::responding_with("[]");
+        github_pr_list(
+            &json!({"session_id": other_session.id}),
+            &other_session,
+            None,
+            &credentials,
+            &other_transport,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            other_transport.recorded()[0].path,
+            "repos/example/other/pulls"
+        );
+
+        // Unsupported numbers and transport failures stay bounded.
+        assert!(
+            github_pr_get(
+                &json!({"session_id": session.id, "number": "0"}),
+                &session,
+                None,
+                &credentials,
+                &FakeGithubPrTransport::responding_with("[]"),
+            )
+            .await
+            .is_err()
+        );
+        let failing = FakeGithubPrTransport::failing_with("GitHub pull request is unavailable");
+        let error = github_pr_list(
+            &json!({"session_id": session.id}),
+            &session,
+            None,
+            &credentials,
+            &failing,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("GitHub pull request is unavailable")
+        );
     }
 
     #[test]

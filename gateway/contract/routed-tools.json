@@ -1291,6 +1291,111 @@
     },
     {
       "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "github_pr_list"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "number": {
+            "maxLength": 20,
+            "minLength": 1,
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "number"
+        ],
+        "type": "object"
+      },
+      "name": "github_pr_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "number": {
+            "maxLength": 20,
+            "minLength": 1,
+            "type": "string"
+          },
+          "remote": {
+            "default": "origin",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "number"
+        ],
+        "type": "object"
+      },
+      "name": "github_pr_close"
+    },
+    {
+      "annotations": {
         "destructiveHint": true,
         "idempotentHint": false,
         "openWorldHint": true,
