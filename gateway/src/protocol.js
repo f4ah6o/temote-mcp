@@ -448,6 +448,59 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "devin_status",
+    "Check Devin ACP compatibility",
+    "Check the locally installed devin acp backend and return bounded capability metadata.",
+    networkReadOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "devin_task_start",
+    "Start a scoped Devin task",
+    "Start an idempotent scoped devin acp task with durable pre-side-effect acceptance.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        operation_id: { type: "string", format: "uuid" },
+        task: { type: "string", minLength: 1, maxLength: 1048576 },
+        model: { type: "string", minLength: 1, maxLength: 256 },
+        agent: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      ["session_id", "operation_id", "task"],
+    ),
+  ),
+  tool(
+    "devin_task_get",
+    "Read a scoped Devin task",
+    "Read and reconcile a retained Devin task owned by the selected full session instance and scope.",
+    networkReadOnly,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", format: "uuid" },
+        after_revision: { type: "integer", minimum: 0 },
+      },
+      ["session_id", "task_id"],
+    ),
+  ),
+  tool(
+    "devin_task_control",
+    "Control a scoped Devin task",
+    "Idempotently steer, resume, or interrupt the retained devin acp session of a scoped task.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", format: "uuid" },
+        operation_id: { type: "string", format: "uuid" },
+        action: { type: "string", enum: ["steer", "resume", "interrupt"] },
+        input: { type: "string", minLength: 1, maxLength: 1048576 },
+      },
+      ["session_id", "task_id", "operation_id", "action"],
+    ),
+  ),
+  tool(
     "local_agent_run",
     "Run a local coding agent",
     "Run a verified Codex or OpenCode non-interactive agent in the selected host session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. With worktree.branch, Temote derives and validates the repository's managed worktree itself and rejects cwd combined with worktree.",

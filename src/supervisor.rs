@@ -158,6 +158,7 @@ fn begin_agent_session_shutdown(session: &config::Session) {
     crate::codex_app_server::begin_session_shutdown(session);
     #[cfg(feature = "network")]
     crate::opencode_server::begin_session_shutdown(session);
+    crate::devin_acp::begin_session_shutdown(session);
 }
 
 /// Remove this session's tasks and owned runtimes across every agent-task
@@ -166,6 +167,7 @@ async fn remove_agent_sessions(session: &config::Session) -> Result<()> {
     crate::codex_app_server::remove_session(session).await?;
     #[cfg(feature = "network")]
     crate::opencode_server::remove_session(session).await?;
+    crate::devin_acp::remove_session(session).await?;
     Ok(())
 }
 

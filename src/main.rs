@@ -13,6 +13,7 @@ pub(crate) mod cli;
 mod codex_app_server;
 mod config;
 mod dev_tool;
+mod devin_acp;
 mod doctor;
 mod evidence;
 mod friction;
