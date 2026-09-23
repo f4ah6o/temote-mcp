@@ -117,6 +117,8 @@ opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`op
 
 これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な serve adapter です。serve process 自体は provider API と直接通信します。保留中の OpenCode permission/question request は auto-approval ではなく `waiting_approval` task state として表面化します。host の OpenCode build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
 
+OpenCode 1.x と 2.x では HTTP contract が異なります (`global/*` と `api/*`)。起動時にまず `global/health` を probe し、応答があれば既存の 1.x 経路を使います。1.x contract を満たさない serve child のみ `api/*` (2.x) adapter に切り替わるため、両方の contract を提供する build でも決定的に 1.x が選択されます。`TEMOTE_OPENCODE_SERVE_CONTRACT` に `v1` または `v2` を設定すると auto-detection を skip して contract を固定できます。それ以外の値または未設定では auto-detection のままです。
+
 ### 構造化ローカルエージェント broker
 
 `local_agent_run({session_id, agent, task, cwd?, access, model?, effort?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。`model` は adapter の model identifier、`effort` は Codex 専用の reasoning effort 名（他 agent では拒否）、`profile` は child に適用する名前付き provider/auth profile を選びます。
