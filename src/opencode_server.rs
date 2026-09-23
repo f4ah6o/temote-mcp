@@ -46,6 +46,26 @@ const SERVE_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVE_TAIL_BYTES: usize = 8 * 1024;
 const SERVE_SPAWN_ATTEMPTS: usize = 2;
+const SERVE_CONTRACT_ENV: &str = "TEMOTE_OPENCODE_SERVE_CONTRACT";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServeContract {
+    Auto,
+    V1,
+    V2,
+}
+
+fn serve_contract_override() -> ServeContract {
+    match std::env::var(SERVE_CONTRACT_ENV)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "v1" | "1" | "global" => ServeContract::V1,
+        "v2" | "2" | "api" => ServeContract::V2,
+        _ => ServeContract::Auto,
+    }
+}
 const CHILD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const SESSION_STOP_POLL: Duration = Duration::from_secs(1);
 const SESSION_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1346,9 +1366,10 @@ fn task_id_for_operation(session: &config::Session, operation_id: Uuid) -> Resul
 }
 
 fn prompt_message_id(operation_id: Uuid) -> String {
-    // opencode serve rejects message IDs that do not start with "msg".
+    // Both serve contracts require the "msg_" prefix: the V2 API validates
+    // `msg_` strictly and the V1 surface accepts it as a "msg"-prefixed id.
     format!(
-        "msg{}",
+        "msg_{}",
         Uuid::new_v5(&MESSAGE_ID_NAMESPACE, operation_id.as_bytes()).simple()
     )
 }
@@ -1436,6 +1457,7 @@ fn store_evidence_for_instance(
 /// child; tests use an in-memory fake so no network or process is required.
 enum ServeClient {
     Sdk(Arc<SdkServe>),
+    SdkV2(Arc<SdkV2Serve>),
     #[cfg(test)]
     Fake(Arc<std::sync::Mutex<FakeServe>>),
 }
@@ -1444,6 +1466,7 @@ impl Clone for ServeClient {
     fn clone(&self) -> Self {
         match self {
             Self::Sdk(inner) => Self::Sdk(Arc::clone(inner)),
+            Self::SdkV2(inner) => Self::SdkV2(Arc::clone(inner)),
             #[cfg(test)]
             Self::Fake(inner) => Self::Fake(Arc::clone(inner)),
         }
@@ -1462,6 +1485,41 @@ impl SdkServe {
         let _ = child.start_kill();
         let _ = child.wait().await;
     }
+}
+
+struct SdkV2Serve {
+    client: unofficial_opencode_sdk::v2::Client,
+    child: tokio::sync::Mutex<tokio::process::Child>,
+    tail: Arc<Mutex<String>>,
+}
+
+impl SdkV2Serve {
+    async fn kill(&self) {
+        let mut child = self.child.lock().await;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+fn v2_model_ref(body: &Value) -> Option<unofficial_opencode_sdk::v2::ModelRef> {
+    let model = body.get("model")?;
+    let provider = model
+        .get("providerID")
+        .or_else(|| model.get("provider_id"))
+        .and_then(Value::as_str)?;
+    let model_id = model
+        .get("modelID")
+        .or_else(|| model.get("model_id"))
+        .or_else(|| model.get("id"))
+        .and_then(Value::as_str)?;
+    Some(unofficial_opencode_sdk::v2::ModelRef {
+        id: model_id.to_owned(),
+        provider_id: provider.to_owned(),
+        variant: body
+            .get("variant")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 /// Bound every SDK request: a request sent while the child is starting or
@@ -1491,6 +1549,15 @@ impl ServeClient {
                     "version": health.version,
                 }))
             }
+            Self::SdkV2(inner) => {
+                let health = sdk_call(inner.client.health().get())
+                    .await
+                    .context("opencode serve health check failed")?;
+                Ok(json!({
+                    "healthy": health.healthy,
+                    "contract": "v2",
+                }))
+            }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().health(),
         }
@@ -1501,6 +1568,23 @@ impl ServeClient {
             Self::Sdk(inner) => sdk_call(inner.client.provider().list())
                 .await
                 .context("opencode provider list failed"),
+            Self::SdkV2(inner) => {
+                let providers = sdk_call(inner.client.provider().list(None))
+                    .await
+                    .context("opencode provider list failed")?;
+                let all: Vec<Value> = providers
+                    .data
+                    .iter()
+                    .map(|provider| {
+                        json!({
+                            "id": provider.id,
+                            "name": provider.name,
+                            "disabled": provider.disabled,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"all": all}))
+            }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().provider_list(),
         }
@@ -1512,6 +1596,17 @@ impl ServeClient {
                 let request: unofficial_opencode_sdk::CreateSessionRequest =
                     serde_json::from_value(body.clone())
                         .context("invalid session create request")?;
+                let session = sdk_call(inner.client.session().create(&request))
+                    .await
+                    .context("opencode session create failed")?;
+                Ok(serde_json::to_value(&session)?)
+            }
+            Self::SdkV2(inner) => {
+                let request = unofficial_opencode_sdk::v2::CreateSessionRequest {
+                    agent: body.get("agent").and_then(Value::as_str).map(str::to_owned),
+                    model: v2_model_ref(body),
+                    ..Default::default()
+                };
                 let session = sdk_call(inner.client.session().create(&request))
                     .await
                     .context("opencode session create failed")?;
@@ -1531,6 +1626,44 @@ impl ServeClient {
                     .await
                     .context("opencode prompt_async failed")
             }
+            Self::SdkV2(inner) => {
+                if let Some(model) = v2_model_ref(body) {
+                    sdk_call(inner.client.session().switch_model(session_id, &model))
+                        .await
+                        .context("opencode switch_model failed")?;
+                }
+                if let Some(agent) = body.get("agent").and_then(Value::as_str) {
+                    sdk_call(inner.client.session().switch_agent(session_id, agent))
+                        .await
+                        .context("opencode switch_agent failed")?;
+                }
+                let text = body
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .and_then(|parts| {
+                        parts.iter().find_map(|part| {
+                            (part.get("type").and_then(Value::as_str) == Some("text"))
+                                .then(|| part.get("text").and_then(Value::as_str))
+                                .flatten()
+                        })
+                    })
+                    .context("opencode prompt request has no text part")?;
+                let request = unofficial_opencode_sdk::v2::PromptRequest {
+                    id: body
+                        .get("messageID")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    prompt: Some(unofficial_opencode_sdk::v2::PromptInput::text(
+                        text.to_owned(),
+                    )),
+                    delivery: Some(unofficial_opencode_sdk::v2::Delivery::Queue),
+                    ..Default::default()
+                };
+                sdk_call(inner.client.session().prompt(session_id, &request))
+                    .await
+                    .context("opencode prompt failed")?;
+                Ok(())
+            }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().prompt_async(session_id, body),
         }
@@ -1542,6 +1675,12 @@ impl ServeClient {
                 sdk_call(inner.client.session().abort(session_id))
                     .await
                     .context("opencode abort failed")?;
+                Ok(())
+            }
+            Self::SdkV2(inner) => {
+                sdk_call(inner.client.session().interrupt(session_id))
+                    .await
+                    .context("opencode interrupt failed")?;
                 Ok(())
             }
             #[cfg(test)]
@@ -1556,6 +1695,15 @@ impl ServeClient {
                     .await
                     .context("opencode session status failed")?;
                 Ok(serde_json::to_value(status)?)
+            }
+            Self::SdkV2(inner) => {
+                let active = sdk_call(inner.client.session().active())
+                    .await
+                    .context("opencode session status failed")?;
+                Ok(active
+                    .into_keys()
+                    .map(|session_id| (session_id, json!({"type": "busy"})))
+                    .collect())
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().session_status(),
@@ -1573,6 +1721,20 @@ impl ServeClient {
             ))
             .await
             .context("opencode messages failed"),
+            Self::SdkV2(inner) => {
+                let mut page = sdk_call(inner.client.session().messages(
+                    session_id,
+                    &unofficial_opencode_sdk::v2::SessionMessagesOptions {
+                        limit: Some(limit),
+                        order: Some(unofficial_opencode_sdk::v2::Order::Desc),
+                        cursor: None,
+                    },
+                ))
+                .await
+                .context("opencode messages failed")?;
+                page.data.reverse();
+                Ok(page.data)
+            }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().messages(session_id, limit),
         }
@@ -1583,6 +1745,16 @@ impl ServeClient {
             Self::Sdk(inner) => sdk_call(inner.client.permission().list())
                 .await
                 .context("opencode permission list failed"),
+            Self::SdkV2(inner) => {
+                let pending = sdk_call(inner.client.permission().request().list(None))
+                    .await
+                    .context("opencode permission list failed")?;
+                pending
+                    .data
+                    .iter()
+                    .map(|request| serde_json::to_value(request).map_err(Into::into))
+                    .collect()
+            }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().permission_list(),
         }
@@ -1593,6 +1765,16 @@ impl ServeClient {
             Self::Sdk(inner) => sdk_call(inner.client.question().list())
                 .await
                 .context("opencode question list failed"),
+            Self::SdkV2(inner) => {
+                let pending = sdk_call(inner.client.question().request().list(None))
+                    .await
+                    .context("opencode question list failed")?;
+                pending
+                    .data
+                    .iter()
+                    .map(|request| serde_json::to_value(request).map_err(Into::into))
+                    .collect()
+            }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().question_list(),
         }
@@ -1601,6 +1783,7 @@ impl ServeClient {
     async fn shutdown(&self) {
         match self {
             Self::Sdk(inner) => inner.kill().await,
+            Self::SdkV2(inner) => inner.kill().await,
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().dead = true,
         }
@@ -1612,27 +1795,12 @@ impl ServeClient {
                 let tail = inner.tail.lock().unwrap().clone();
                 (!tail.is_empty()).then_some(tail)
             }
-            #[cfg(test)]
-            Self::Fake(_) => None,
-        }
-    }
-
-    async fn child_exited(&self) -> Option<String> {
-        match self {
-            Self::Sdk(inner) => {
-                let mut child = inner.child.lock().await;
-                child
-                    .try_wait()
-                    .ok()
-                    .flatten()
-                    .map(|status| status.to_string())
+            Self::SdkV2(inner) => {
+                let tail = inner.tail.lock().unwrap().clone();
+                (!tail.is_empty()).then_some(tail)
             }
             #[cfg(test)]
-            Self::Fake(inner) => inner
-                .lock()
-                .unwrap()
-                .dead
-                .then(|| "fake serve stopped".to_owned()),
+            Self::Fake(_) => None,
         }
     }
 }
@@ -1673,11 +1841,22 @@ async fn spawn_serve(
     )?;
     let config_content = serde_json::to_string(&config)?;
 
+    let contract = serve_contract_override();
     let mut last_error = None;
     for _attempt in 0..SERVE_SPAWN_ATTEMPTS {
         let port = reserve_loopback_port()?;
         let password = Uuid::new_v4().simple().to_string();
-        match spawn_serve_once(binary, &scope, &data_dir, port, &password, &config_content).await {
+        match spawn_serve_once(
+            binary,
+            &scope,
+            &data_dir,
+            port,
+            &password,
+            &config_content,
+            contract,
+        )
+        .await
+        {
             Ok(client) => return Ok(client),
             Err(error) => last_error = Some(error),
         }
@@ -1755,6 +1934,7 @@ async fn spawn_serve_once(
     port: u16,
     password: &str,
     config_content: &str,
+    contract_override: ServeContract,
 ) -> Result<ServeClient> {
     let mut command = tokio::process::Command::new(binary);
     command
@@ -1782,50 +1962,92 @@ async fn spawn_serve_once(
         drain_tail(stderr, Arc::clone(&tail));
     }
 
-    let client = unofficial_opencode_sdk::Client::builder()
-        .base_url(format!("http://127.0.0.1:{port}/"))
+    let base_url = format!("http://127.0.0.1:{port}/");
+    let directory = scope.to_string_lossy().into_owned();
+    let client_v1 = unofficial_opencode_sdk::Client::builder()
+        .base_url(base_url.clone())
         .password(password)
-        .directory(scope.to_string_lossy().into_owned())
+        .directory(directory.clone())
         .build()
         .context("cannot build OpenCode SDK client")?;
+    let client_v2 = unofficial_opencode_sdk::v2::Client::builder()
+        .base_url(base_url)
+        .password(password)
+        .directory(directory)
+        .build()
+        .context("cannot build OpenCode SDK v2 client")?;
 
-    let inner = Arc::new(SdkServe {
-        client,
-        child: tokio::sync::Mutex::new(child),
-        tail: Arc::clone(&tail),
-    });
-    let client = ServeClient::Sdk(inner);
-
+    let child = tokio::sync::Mutex::new(child);
     let deadline = Instant::now() + SERVE_HEALTH_TIMEOUT;
+    let mut v1_failed_once = false;
+    let mut last_error = None;
     loop {
         // A request sent while the child is still starting can hang without
         // ever completing, so each probe also carries its own timeout to keep
-        // the overall deadline effective.
-        let health = match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client.health()).await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("opencode serve health probe timed out")),
-        };
-        match health {
-            Ok(_) => return Ok(client),
-            Err(error) => {
-                if let Some(status) = client.child_exited().await {
-                    let tail = tail.lock().unwrap().clone();
-                    anyhow::bail!(
-                        "opencode serve exited early ({status}): {}",
-                        truncate_tail(&tail)
-                    );
+        // the overall deadline effective. Probe the V1 surface first: servers
+        // that answer `global/health` keep the established V1 code path, and
+        // only servers that fail it (OpenCode 2.x, which serves `api/*`) fall
+        // through to the V2 probe. The V2 probe only runs after the V1 probe
+        // has failed at least once, and each probe runs sequentially, so a
+        // working V1 surface always wins its poll; when both contracts are up
+        // either adapter is correct and V1 is preferred on ties.
+        if contract_override != ServeContract::V2 {
+            match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client_v1.global().health())
+                .await
+            {
+                Ok(Ok(_)) => {
+                    return Ok(ServeClient::Sdk(Arc::new(SdkServe {
+                        client: client_v1,
+                        child,
+                        tail: Arc::clone(&tail),
+                    })));
                 }
-                if Instant::now() >= deadline {
-                    let tail = tail.lock().unwrap().clone();
-                    return Err(error.context(format!(
-                        "opencode serve did not become healthy: {}",
-                        truncate_tail(&tail)
-                    )));
+                Ok(Err(error)) => {
+                    v1_failed_once = true;
+                    last_error = Some(error.to_string());
                 }
-                tokio::time::sleep(SERVE_HEALTH_POLL).await;
+                Err(_) => {
+                    v1_failed_once = true;
+                    last_error = Some("opencode serve health probe timed out".to_owned());
+                }
             }
         }
+        if contract_override != ServeContract::V1
+            && (contract_override == ServeContract::V2 || v1_failed_once)
+        {
+            match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client_v2.health().get()).await
+            {
+                Ok(Ok(_)) => {
+                    return Ok(ServeClient::SdkV2(Arc::new(SdkV2Serve {
+                        client: client_v2,
+                        child,
+                        tail: Arc::clone(&tail),
+                    })));
+                }
+                Ok(Err(error)) => last_error = Some(error.to_string()),
+                Err(_) => last_error = Some("opencode serve v2 health probe timed out".to_owned()),
+            }
+        }
+
+        {
+            let mut child_guard = child.lock().await;
+            if let Some(status) = child_guard.try_wait().ok().flatten() {
+                let tail = tail.lock().unwrap().clone();
+                anyhow::bail!(
+                    "opencode serve exited early ({status}): {}",
+                    truncate_tail(&tail)
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            let tail = tail.lock().unwrap().clone();
+            let detail = last_error.unwrap_or_else(|| "no health endpoint answered".to_owned());
+            return Err(anyhow::anyhow!(detail).context(format!(
+                "opencode serve did not become healthy: {}",
+                truncate_tail(&tail)
+            )));
+        }
+        tokio::time::sleep(SERVE_HEALTH_POLL).await;
     }
 }
 
@@ -2104,9 +2326,17 @@ fn extract_usage(info: &Value) -> Option<BTreeMap<String, u64>> {
 }
 
 fn message_is_assistant(message: &Value) -> bool {
+    // V1 wraps fields in `info`; V2 keeps them top-level with `type`.
     let info = message.get("info").unwrap_or(message);
-    info.get("role").and_then(Value::as_str) == Some("assistant")
-        || message.get("role").and_then(Value::as_str) == Some("assistant")
+    info.get("role")
+        .or_else(|| info.get("type"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+        || message
+            .get("role")
+            .or_else(|| message.get("type"))
+            .and_then(Value::as_str)
+            == Some("assistant")
 }
 
 fn message_completed(message: &Value) -> bool {
@@ -2133,8 +2363,10 @@ fn message_error(message: &Value) -> Option<String> {
 }
 
 fn message_text(message: &Value) -> String {
+    // V1 emits `parts`; V2 emits the same typed part list under `content`.
     let parts = message
         .get("parts")
+        .or_else(|| message.get("content"))
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -2157,14 +2389,19 @@ fn message_text(message: &Value) -> String {
 
 fn observed_model_from(message: &Value) -> Option<String> {
     let info = message.get("info").unwrap_or(message);
+    // V2 keeps a structured `model: {id, providerID}` object instead of the
+    // flat providerID/modelID strings.
+    let model_ref = info.get("model");
     let provider = info
         .get("providerID")
         .or_else(|| info.get("provider_id"))
+        .or_else(|| model_ref.and_then(|model| model.get("providerID")))
         .and_then(Value::as_str);
     let model = info
         .get("modelID")
         .or_else(|| info.get("model_id"))
-        .or_else(|| info.get("model"))
+        .or_else(|| model_ref.and_then(|model| model.get("id")))
+        .or(model_ref)
         .and_then(Value::as_str);
     match (provider, model) {
         (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
@@ -3844,6 +4081,161 @@ mod tests {
         assert!(!store.path(task_id).exists());
         assert!(!store.runtime_state_directory(task_id).exists());
         assert!(!store.runtime_lock_path(task_id).exists());
+    }
+
+    fn find_opencode_binary() -> Option<PathBuf> {
+        std::env::var_os("TEMOTE_OPENCODE_BIN")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|paths| {
+                    std::env::split_paths(&paths).find_map(|dir| {
+                        let candidate = dir.join("opencode");
+                        candidate.is_file().then_some(candidate)
+                    })
+                })
+            })
+    }
+
+    /// Live contract check against a real `opencode serve`: when the env
+    /// override forces V2 the probe must land on the `api/*` client and every
+    /// transport call the task machinery uses must answer. Skips when no
+    /// opencode binary is installed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_v2_contract_end_to_end() {
+        let _serial = serial().await;
+        let Some(binary) = find_opencode_binary() else {
+            eprintln!("opencode binary not found; skipping live V2 serve test");
+            return;
+        };
+        let root = tempdir();
+        let scope = root.join("scope");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&scope).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config =
+            crate::local_agent::opencode_config(crate::local_agent::Access::WorkspaceWrite, &[])
+                .unwrap();
+        let config_content = serde_json::to_string(&config).unwrap();
+
+        let serve_password = Uuid::new_v4().simple().to_string();
+        let client = spawn_serve_once(
+            &binary,
+            &scope,
+            &data_dir,
+            reserve_loopback_port().unwrap(),
+            &serve_password,
+            &config_content,
+            ServeContract::V2,
+        )
+        .await;
+        let client = match client {
+            Ok(client) => client,
+            Err(error) => panic!("v2-forced opencode serve did not start: {error:#}"),
+        };
+        let ServeClient::SdkV2(_) = &client else {
+            panic!("TEMOTE_OPENCODE_SERVE_CONTRACT=v2 must select the V2 client");
+        };
+
+        let health = client.health().await.unwrap();
+        assert_eq!(health["healthy"], true);
+        assert_eq!(health["contract"], "v2");
+
+        let providers = client.provider_list().await.unwrap();
+        assert!(
+            providers["all"].is_array(),
+            "provider list shape: {providers}"
+        );
+
+        let created = client
+            .session_create(&json!({"title": "v2-wire", "agent": "build"}))
+            .await
+            .unwrap();
+        let session_id = created["id"].as_str().unwrap().to_owned();
+
+        let message_id = prompt_message_id(Uuid::new_v4());
+        client
+            .prompt_async(
+                &session_id,
+                &json!({
+                    "messageID": message_id,
+                    "parts": [{"type": "text", "text": "say hi"}],
+                }),
+            )
+            .await
+            .expect("v2 prompt admission failed");
+
+        // The deterministic prompt id must be echoed as a message so the
+        // reconcile admission check can see it.
+        let mut admitted = false;
+        let mut assistant_done = false;
+        for _ in 0..40 {
+            let messages = client.messages(&session_id, 16).await.unwrap();
+            admitted |= messages.iter().any(|message| {
+                message
+                    .get("info")
+                    .unwrap_or(message)
+                    .get("id")
+                    .and_then(Value::as_str)
+                    == Some(message_id.as_str())
+            });
+            assistant_done |= messages
+                .iter()
+                .any(|message| message_is_assistant(message) && message_completed(message));
+            if admitted && assistant_done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let messages = client.messages(&session_id, 16).await.unwrap();
+        assert!(
+            admitted,
+            "prompt id must appear in the message list: {messages:?}"
+        );
+        let assistant = messages
+            .iter()
+            .find(|message| message_is_assistant(message))
+            .expect("assistant message missing");
+        assert!(
+            !message_text(assistant).is_empty(),
+            "assistant text must be extracted from v2 content parts: {assistant}"
+        );
+        assert!(
+            observed_model_from(assistant).is_some(),
+            "observed model must parse from v2 model object: {assistant}"
+        );
+
+        let status = client.session_status().await.unwrap();
+        assert!(status.is_object(), "session status shape: {status}");
+
+        let permissions = client.permission_list().await.unwrap();
+        assert!(permissions.iter().all(Value::is_object));
+        let questions = client.question_list().await.unwrap();
+        assert!(questions.iter().all(Value::is_object));
+
+        let _ = client.abort(&session_id).await;
+        client.shutdown().await;
+
+        // Auto detection on a server that answers both contracts must pick a
+        // live SDK-backed client (either adapter is correct there).
+        let serve_password = Uuid::new_v4().simple().to_string();
+        let client = spawn_serve_once(
+            &binary,
+            &scope,
+            &data_dir,
+            reserve_loopback_port().unwrap(),
+            &serve_password,
+            &config_content,
+            ServeContract::Auto,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !matches!(client, ServeClient::Fake(_)),
+            "auto probe must select an SDK-backed client"
+        );
+        assert_eq!(client.health().await.unwrap()["healthy"], true);
+        client.shutdown().await;
     }
 
     fn record_for(
