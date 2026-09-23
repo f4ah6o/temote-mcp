@@ -53,6 +53,14 @@ Codex および OpenCode の delegation / local-agent 経路を、長期的に s
 ## Progress
 
 - 2026-09-22: Phase 1 実装 — `opencode_status` / `opencode_task_start` / `opencode_task_get` / `opencode_task_control` を追加 (`src/opencode_server.rs`)。task ごとの `opencode serve` を 127.0.0.1 動的 port + instance random Basic-auth password + 隔離 data directory + `OPENCODE_CONFIG_CONTENT` の bounded permission で起動し、`unofficial-opencode-sdk` v1 API (`session create`/`prompt_async`/`abort`/`status`/`messages`、`permission`/`question` list) で駆動する。ownership/lease/receipt/retention/scoped-evidence 契約は codex_app_server と同一。deterministic な prompt `messageID` により start prompt の admission を判別し、crash window を `reconciliation_required` で表現する。module は `network` feature のみで compile し、`--no-default-features` build を維持。live parity (Phase 2) は `opencode` binary が利用可能な環境での実測待ち。
+- 2026-09-23: Phase 2 live 検証 (host: Ubuntu VM, opencode 1.18.32, codex-cli 0.156.1)。実 MCP stdio 経路 (`temote-mcp supervisor` + agent session + approval console) で両 server backend を端まで通した。
+  - `codex_status` → `codex app-server --stdio` spawn + initialize + `model/list` 実応答 (compatible:true, 実 model 一覧) → clean shutdown。
+  - `codex_task_start` → `thread/start` + `turn/start` 受理、status `running`、`codex_task_get` が turn 完了を reconcile → status `failed` + bounded evidence。turn 自体は `401 Unauthorized` (api.openai.com、認証情報なし) で失敗 — wire contract は正常、model 実行のみ credential-blocked。
+  - `opencode_status` → `opencode serve` spawn + health gate + `/provider` 実応答 (compatible:true, serve_version 1.18.32) → clean shutdown。
+  - `opencode_task_start` → `session create` + `prompt_async` 受理、status `running`、`opencode_task_get` が reconcile → status `retryable_failed` (`APIError`, provider 未認証の model 実行失敗) — wiring 正常、model 実行のみ credential-blocked。
+  - 修正した実害 bug 2件: (a) `opencode serve` 起動中の `health()` リクエストが server 側未応答のまま永久 pending になり health-gate deadline が効かず `opencode_*` 全系統が永久ハング → health probe に per-call timeout + 全 SDK 呼出に bounded timeout (`sdk_call`) を追加。(b) serve が `messageID` に `"msg"` 接頭辞を要求し `prompt_async` が HTTP 400 → deterministic `msg<uuid>` に修正。
+  - credential 前提の parity 残項目 (structured report/usage/model 実行成功、permission denial、interrupt) は provider credential が無いため credential-blocked のまま — `issues/open/20260908-live-acceptance-matrix.md` の parity 行に部分 evidence を記録。
+- 2026-09-23: CLI 経路の legacy/back-up 宣言 (coordinator 指示により parity 完全実測前倒し)。`temote-mcp delegate` / `temote-mcp codex delegate` の help 本文と `docs/development.md` に「server-backed `codex_task_*`/`opencode_task_*` が primary、one-shot argv は legacy fallback で削除予定」を明記。`local_agent_run` (per-command sandbox tier) は本指定の対象外 (Non-goal 維持)。argv 経路の削除自体は本変更に含まない。
 
 ## Related
 

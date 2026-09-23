@@ -53,7 +53,9 @@ Usage:\n\
   temote-mcp codex delegate --model <MODEL> --reasoning-effort <EFFORT> --prompt <PROMPT>\n\n\
 The installed plugin is a thin local router. It pins the exact temote-mcp binary\n\
 that performed the install and does not own session lifecycle, sandbox, approval,\n\
-OAuth, or ingress policy.\n"
+OAuth, or ingress policy.\n\
+`codex delegate` is the legacy one-shot CLI fallback; the server-backed\n\
+`codex_task_*` MCP tools (codex app-server --stdio) are the primary path.\n"
         .to_owned()
 }
 

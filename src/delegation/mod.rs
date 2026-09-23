@@ -290,7 +290,7 @@ impl DelegationResult {
 }
 
 pub(crate) fn usage() -> String {
-    r#"Experimental Codex delegation bootstrap
+    r#"Experimental Codex delegation bootstrap (legacy fallback)
 
 Usage:
   temote-mcp codex delegate --model <MODEL> --reasoning-effort <EFFORT> --prompt <PROMPT>
@@ -298,6 +298,9 @@ Usage:
 
 This developer-only command runs the installed codex exec CLI, captures JSONL
 and stderr as private temporary artifacts, and prints one bounded JSON result.
+The server-backed `codex_task_*` MCP tools (codex app-server --stdio) are the
+primary Codex delegation path; this one-shot argv interface is the legacy
+fallback and may be removed.
 "#
     .to_owned()
 }
@@ -320,6 +323,10 @@ session after a fail-closed directory preflight; `--fork` additionally requires
 `--session` and starts a new session with the parent's context. Diagnostics are
 read-only and never log in, change credentials, download models, or run a
 delegation task.
+
+The server-backed `codex_task_*` (codex app-server --stdio) and
+`opencode_task_*` (opencode serve + SDK) MCP tools are the primary delegation
+paths; this one-shot argv interface is the legacy fallback and may be removed.
 "#
     .to_owned()
 }
