@@ -296,7 +296,105 @@ pub async fn run(options: Options) -> Result<()> {
         )),
     }
 
+    check_delegation_backends(&mut report);
+
     report.finish()
+}
+
+fn delegation_binary_on_path(name: &str) -> Option<PathBuf> {
+    let search = std::env::var_os("PATH")?;
+    std::env::split_paths(&search)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn home_relative_file(env_key: &str, home_suffix: &str, file_suffix: &str) -> Option<PathBuf> {
+    std::env::var_os(env_key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::platform_paths::home_dir().map(|home| home.join(home_suffix)))
+        .map(|directory| directory.join(file_suffix))
+}
+
+fn codex_credential_source(auth_file_present: bool, api_key_present: bool) -> Option<&'static str> {
+    if api_key_present {
+        Some("OPENAI_API_KEY")
+    } else if auth_file_present {
+        Some("codex auth.json")
+    } else {
+        None
+    }
+}
+
+fn check_delegation_backends(report: &mut Report) {
+    match delegation_binary_on_path("codex") {
+        Some(binary) => {
+            let auth_file = home_relative_file("CODEX_HOME", ".codex", "auth.json");
+            let auth_file_present = auth_file.is_some_and(|path| path.is_file());
+            let api_key_present =
+                std::env::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty());
+            match codex_credential_source(auth_file_present, api_key_present) {
+                Some(source) => report.add(Check::pass(
+                    "delegation codex",
+                    format!("binary={}, credentials={source}", binary.display()),
+                )),
+                None => report.add(Check::warn(
+                    "delegation codex",
+                    format!(
+                        "binary={} but no Codex credentials are visible",
+                        binary.display()
+                    ),
+                    "Run `codex login` or set OPENAI_API_KEY; without credentials codex_task_* turns fail with 401.",
+                )),
+            }
+        }
+        None => report.add(Check::warn(
+            "delegation codex",
+            "codex is not on PATH",
+            "Install the Codex CLI (for example: npm install -g @openai/codex) to enable codex_task_*.",
+        )),
+    }
+
+    match crate::cli::codex::delegation::opencode::resolve_default_opencode_executable() {
+        Ok(resolved) => {
+            let configured = resolved.binary().to_owned();
+            let located = if configured.is_absolute() {
+                configured.is_file().then_some(configured.clone())
+            } else {
+                delegation_binary_on_path(configured.to_str().unwrap_or("opencode"))
+            };
+            let Some(binary) = located else {
+                report.add(Check::warn(
+                    "delegation opencode",
+                    format!("resolved binary {} is not usable", configured.display()),
+                    "Install the OpenCode CLI (for example: npm install -g opencode-ai) or set TEMOTE_OPENCODE_BIN to an absolute executable path to enable opencode_task_*.",
+                ));
+                return;
+            };
+            let auth_file =
+                home_relative_file("XDG_DATA_HOME", ".local/share", "opencode/auth.json");
+            if auth_file.is_some_and(|path| path.is_file()) {
+                report.add(Check::pass(
+                    "delegation opencode",
+                    format!("binary={}, credentials=auth.json", binary.display()),
+                ));
+            } else {
+                report.add(Check::warn(
+                    "delegation opencode",
+                    format!(
+                        "binary={} but no OpenCode credentials are visible",
+                        binary.display()
+                    ),
+                    "Run `opencode auth login`; without provider credentials opencode_task_* prompts fail at model execution.",
+                ));
+            }
+        }
+        Err(error) => report.add(Check::warn(
+            "delegation opencode",
+            format!("cannot resolve the OpenCode binary: {}", error.message()),
+            "Fix TEMOTE_OPENCODE_BIN or unset it to use PATH lookup.",
+        )),
+    }
 }
 
 #[allow(dead_code)]
@@ -2651,5 +2749,16 @@ mod tests {
             registration.map(GatewayStageStatus::level),
             Some(Level::Warn)
         );
+    }
+
+    #[test]
+    fn codex_credential_source_prefers_api_key_then_auth_file() {
+        assert_eq!(codex_credential_source(true, true), Some("OPENAI_API_KEY"));
+        assert_eq!(
+            codex_credential_source(true, false),
+            Some("codex auth.json")
+        );
+        assert_eq!(codex_credential_source(false, true), Some("OPENAI_API_KEY"));
+        assert_eq!(codex_credential_source(false, false), None);
     }
 }

@@ -27,6 +27,8 @@ temote-mcp doctor
 
 On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user namespaces, the isolated network namespace, a real Temote MCP sandbox command, and the shell runtime environment. Required failures produce a non-zero exit status. Bare `doctor` preserves the legacy Cloudflare auto-detection behavior. Provider-specific deployment checks are explicit:
 
+`doctor` also reports delegation backend readiness as warnings: whether the `codex` and `opencode` binaries are resolvable (including `TEMOTE_OPENCODE_BIN`) and whether each backend has visible credentials (`$CODEX_HOME/auth.json` or `OPENAI_API_KEY` for Codex; `$XDG_DATA_HOME/opencode/auth.json` for OpenCode). These are warnings rather than failures because delegation is optional, and no turn is executed.
+
 ```sh
 temote-mcp doctor --profile cloudflare
 temote-mcp doctor --profile tailscale
