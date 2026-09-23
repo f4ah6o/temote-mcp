@@ -42,6 +42,8 @@ const MAX_SUMMARY_CHARS: usize = 1200;
 const MAX_MESSAGES_SCAN: u32 = 16;
 const SERVE_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVE_HEALTH_POLL: Duration = Duration::from_millis(150);
+const SERVE_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVE_TAIL_BYTES: usize = 8 * 1024;
 const SERVE_SPAWN_ATTEMPTS: usize = 2;
 const CHILD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
@@ -1344,8 +1346,9 @@ fn task_id_for_operation(session: &config::Session, operation_id: Uuid) -> Resul
 }
 
 fn prompt_message_id(operation_id: Uuid) -> String {
+    // opencode serve rejects message IDs that do not start with "msg".
     format!(
-        "temote-{}",
+        "msg{}",
         Uuid::new_v5(&MESSAGE_ID_NAMESPACE, operation_id.as_bytes()).simple()
     )
 }
@@ -1461,14 +1464,26 @@ impl SdkServe {
     }
 }
 
+/// Bound every SDK request: a request sent while the child is starting or
+/// racing a connection teardown can otherwise wait forever.
+async fn sdk_call<F, T>(future: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, unofficial_opencode_sdk::Error>>,
+{
+    match tokio::time::timeout(SERVE_REQUEST_TIMEOUT, future).await {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!(
+            "opencode serve request exceeded {}s",
+            SERVE_REQUEST_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 impl ServeClient {
     async fn health(&self) -> Result<Value> {
         match self {
             Self::Sdk(inner) => {
-                let health = inner
-                    .client
-                    .global()
-                    .health()
+                let health = sdk_call(inner.client.global().health())
                     .await
                     .context("opencode serve health check failed")?;
                 Ok(json!({
@@ -1483,10 +1498,7 @@ impl ServeClient {
 
     async fn provider_list(&self) -> Result<Value> {
         match self {
-            Self::Sdk(inner) => inner
-                .client
-                .provider()
-                .list()
+            Self::Sdk(inner) => sdk_call(inner.client.provider().list())
                 .await
                 .context("opencode provider list failed"),
             #[cfg(test)]
@@ -1500,10 +1512,7 @@ impl ServeClient {
                 let request: unofficial_opencode_sdk::CreateSessionRequest =
                     serde_json::from_value(body.clone())
                         .context("invalid session create request")?;
-                let session = inner
-                    .client
-                    .session()
-                    .create(&request)
+                let session = sdk_call(inner.client.session().create(&request))
                     .await
                     .context("opencode session create failed")?;
                 Ok(serde_json::to_value(&session)?)
@@ -1518,10 +1527,7 @@ impl ServeClient {
             Self::Sdk(inner) => {
                 let request: unofficial_opencode_sdk::PromptRequest =
                     serde_json::from_value(body.clone()).context("invalid prompt request")?;
-                inner
-                    .client
-                    .session()
-                    .prompt_async(session_id, &request)
+                sdk_call(inner.client.session().prompt_async(session_id, &request))
                     .await
                     .context("opencode prompt_async failed")
             }
@@ -1533,10 +1539,7 @@ impl ServeClient {
     async fn abort(&self, session_id: &str) -> Result<()> {
         match self {
             Self::Sdk(inner) => {
-                inner
-                    .client
-                    .session()
-                    .abort(session_id)
+                sdk_call(inner.client.session().abort(session_id))
                     .await
                     .context("opencode abort failed")?;
                 Ok(())
@@ -1549,10 +1552,7 @@ impl ServeClient {
     async fn session_status(&self) -> Result<Value> {
         match self {
             Self::Sdk(inner) => {
-                let status = inner
-                    .client
-                    .session()
-                    .status()
+                let status = sdk_call(inner.client.session().status())
                     .await
                     .context("opencode session status failed")?;
                 Ok(serde_json::to_value(status)?)
@@ -1564,18 +1564,15 @@ impl ServeClient {
 
     async fn messages(&self, session_id: &str, limit: u32) -> Result<Vec<Value>> {
         match self {
-            Self::Sdk(inner) => inner
-                .client
-                .session()
-                .messages(
-                    session_id,
-                    &unofficial_opencode_sdk::current::SessionMessagesOptions {
-                        limit: Some(limit),
-                        before: None,
-                    },
-                )
-                .await
-                .context("opencode messages failed"),
+            Self::Sdk(inner) => sdk_call(inner.client.session().messages(
+                session_id,
+                &unofficial_opencode_sdk::current::SessionMessagesOptions {
+                    limit: Some(limit),
+                    before: None,
+                },
+            ))
+            .await
+            .context("opencode messages failed"),
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().messages(session_id, limit),
         }
@@ -1583,10 +1580,7 @@ impl ServeClient {
 
     async fn permission_list(&self) -> Result<Vec<Value>> {
         match self {
-            Self::Sdk(inner) => inner
-                .client
-                .permission()
-                .list()
+            Self::Sdk(inner) => sdk_call(inner.client.permission().list())
                 .await
                 .context("opencode permission list failed"),
             #[cfg(test)]
@@ -1596,10 +1590,7 @@ impl ServeClient {
 
     async fn question_list(&self) -> Result<Vec<Value>> {
         match self {
-            Self::Sdk(inner) => inner
-                .client
-                .question()
-                .list()
+            Self::Sdk(inner) => sdk_call(inner.client.question().list())
                 .await
                 .context("opencode question list failed"),
             #[cfg(test)]
@@ -1807,7 +1798,15 @@ async fn spawn_serve_once(
 
     let deadline = Instant::now() + SERVE_HEALTH_TIMEOUT;
     loop {
-        match client.health().await {
+        // A request sent while the child is still starting can hang without
+        // ever completing, so each probe also carries its own timeout to keep
+        // the overall deadline effective.
+        let health = match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client.health()).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("opencode serve health probe timed out")),
+        };
+        match health {
             Ok(_) => return Ok(client),
             Err(error) => {
                 if let Some(status) = client.child_exited().await {

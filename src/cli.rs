@@ -334,7 +334,7 @@ where
         return Ok(ParseOutcome::Print(codex::usage()));
     }
     if noargs::cmd("delegate")
-        .doc("Run one bounded non-interactive delegation request")
+        .doc("Run one bounded non-interactive delegation request (legacy fallback; the server-backed task tools are primary)")
         .take(&mut args)
         .is_present()
     {
