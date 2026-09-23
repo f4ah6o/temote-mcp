@@ -683,12 +683,13 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
             config::PermissionMode::Agent => Skip,
             _ => RequestUser,
         },
-        GitNetwork | DeveloperTool | Integration | LocalStructured => match mode {
+        GitNetwork | DeveloperTool | Integration | LocalStructured | CodexAppServer
+        | OpenCodeServer => match mode {
             config::PermissionMode::Ask => Request,
             _ => Skip,
         },
         RemoteUpgrade => RequestUser,
-        CodexAppServer | OpenCodeServer | HostUnrestricted => match mode {
+        HostUnrestricted => match mode {
             config::PermissionMode::Yolo => Skip,
             _ => Request,
         },
@@ -4855,7 +4856,14 @@ esac
         use LocalApproval::*;
         use config::PermissionMode::{Agent, Ask, Yolo};
 
-        for class in [GitNetwork, DeveloperTool, Integration, LocalStructured] {
+        for class in [
+            GitNetwork,
+            DeveloperTool,
+            Integration,
+            LocalStructured,
+            CodexAppServer,
+            OpenCodeServer,
+        ] {
             assert_eq!(local_approval(Ask, class), Request, "{class:?}");
             assert_eq!(local_approval(Agent, class), Skip, "{class:?}");
             assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");
@@ -4863,11 +4871,9 @@ esac
         assert_eq!(local_approval(Ask, LocalAgent), RequestUser);
         assert_eq!(local_approval(Agent, LocalAgent), Skip);
         assert_eq!(local_approval(Yolo, LocalAgent), RequestUser);
-        for class in [CodexAppServer, OpenCodeServer, HostUnrestricted] {
-            assert_eq!(local_approval(Ask, class), Request, "{class:?}");
-            assert_eq!(local_approval(Agent, class), Request, "{class:?}");
-            assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");
-        }
+        assert_eq!(local_approval(Ask, HostUnrestricted), Request);
+        assert_eq!(local_approval(Agent, HostUnrestricted), Request);
+        assert_eq!(local_approval(Yolo, HostUnrestricted), Skip);
         for mode in [Ask, Agent, Yolo] {
             assert_eq!(local_approval(mode, RemoteUpgrade), RequestUser);
         }
