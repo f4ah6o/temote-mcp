@@ -1487,8 +1487,17 @@ impl SdkServe {
     }
 }
 
+/// Raw HTTP V2 client for the OpenCode `api/*` contract. The typed SDK pins
+/// request and response shapes to one server revision, but the 1.x and 2.x
+/// serve surfaces disagree on paths (`api/health` vs `api/info`,
+/// `api/question/*` vs `api/form`) and on response envelopes, so V2 calls go
+/// through this JSON-tolerant client instead and the message parsers below
+/// normalize what comes back.
 struct SdkV2Serve {
-    client: unofficial_opencode_sdk::v2::Client,
+    client: reqwest::Client,
+    base_url: String,
+    password: String,
+    directory: String,
     child: tokio::sync::Mutex<tokio::process::Child>,
     tail: Arc<Mutex<String>>,
 }
@@ -1501,7 +1510,87 @@ impl SdkV2Serve {
     }
 }
 
-fn v2_model_ref(body: &Value) -> Option<unofficial_opencode_sdk::v2::ModelRef> {
+fn v2_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    password: &str,
+    method: reqwest::Method,
+    path: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, format!("{base_url}{path}"))
+        .basic_auth("opencode", Some(password))
+}
+
+/// Send one bounded V2 request and decode the body as JSON. A bare 200 is not
+/// proof an `api/*` route exists: OpenCode 1.x answers unmatched paths with an
+/// HTML shell page, so the body must parse as JSON to count.
+async fn v2_send(request: reqwest::RequestBuilder, path: &str) -> Result<Value> {
+    let response = match tokio::time::timeout(SERVE_REQUEST_TIMEOUT, request.send()).await {
+        Ok(result) => result.context("opencode serve request failed")?,
+        Err(_) => anyhow::bail!(
+            "opencode serve request exceeded {}s",
+            SERVE_REQUEST_TIMEOUT.as_secs()
+        ),
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "OpenCode API returned HTTP {status}: {}",
+            truncate_tail(&body)
+        );
+    }
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&body)
+        .with_context(|| format!("opencode serve {path} returned a non-JSON response"))
+}
+
+async fn v2_get_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    password: &str,
+    path: &str,
+) -> Result<Value> {
+    v2_send(
+        v2_request(client, base_url, password, reqwest::Method::GET, path),
+        path,
+    )
+    .await
+}
+
+async fn v2_post_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    password: &str,
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
+    v2_send(
+        v2_request(client, base_url, password, reqwest::Method::POST, path).json(body),
+        path,
+    )
+    .await
+}
+
+/// V2 health: `api/info` is the 2.x liveness route and answers even before the
+/// server finishes warming up; `api/health` is the 1.x `api/*` surface's
+/// equivalent. Accept whichever returns a JSON body.
+async fn v2_health_probe(client: &reqwest::Client, base_url: &str, password: &str) -> Result<()> {
+    if v2_get_json(client, base_url, password, "api/info")
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    v2_get_json(client, base_url, password, "api/health")
+        .await
+        .map(|_| ())
+}
+
+fn v2_model_ref(body: &Value) -> Option<Value> {
     let model = body.get("model")?;
     let provider = model
         .get("providerID")
@@ -1512,14 +1601,11 @@ fn v2_model_ref(body: &Value) -> Option<unofficial_opencode_sdk::v2::ModelRef> {
         .or_else(|| model.get("model_id"))
         .or_else(|| model.get("id"))
         .and_then(Value::as_str)?;
-    Some(unofficial_opencode_sdk::v2::ModelRef {
-        id: model_id.to_owned(),
-        provider_id: provider.to_owned(),
-        variant: body
-            .get("variant")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-    })
+    let mut reference = json!({"id": model_id, "providerID": provider});
+    if let Some(variant) = body.get("variant").and_then(Value::as_str) {
+        reference["variant"] = json!(variant);
+    }
+    Some(reference)
 }
 
 /// Bound every SDK request: a request sent while the child is starting or
@@ -1550,11 +1636,11 @@ impl ServeClient {
                 }))
             }
             Self::SdkV2(inner) => {
-                let health = sdk_call(inner.client.health().get())
+                v2_health_probe(&inner.client, &inner.base_url, &inner.password)
                     .await
                     .context("opencode serve health check failed")?;
                 Ok(json!({
-                    "healthy": health.healthy,
+                    "healthy": true,
                     "contract": "v2",
                 }))
             }
@@ -1569,20 +1655,31 @@ impl ServeClient {
                 .await
                 .context("opencode provider list failed"),
             Self::SdkV2(inner) => {
-                let providers = sdk_call(inner.client.provider().list(None))
-                    .await
-                    .context("opencode provider list failed")?;
+                let body = v2_get_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    "api/provider",
+                )
+                .await
+                .context("opencode provider list failed")?;
+                let providers = body.get("data").unwrap_or(&body).clone();
                 let all: Vec<Value> = providers
-                    .data
-                    .iter()
-                    .map(|provider| {
-                        json!({
-                            "id": provider.id,
-                            "name": provider.name,
-                            "disabled": provider.disabled,
-                        })
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .map(|provider| {
+                                json!({
+                                    "id": provider.get("id"),
+                                    "name": provider.get("name"),
+                                    "disabled": provider
+                                        .get("disabled")
+                                        .or_else(|| provider.get("activation")),
+                                })
+                            })
+                            .collect()
                     })
-                    .collect();
+                    .unwrap_or_default();
                 Ok(json!({"all": all}))
             }
             #[cfg(test)]
@@ -1602,15 +1699,25 @@ impl ServeClient {
                 Ok(serde_json::to_value(&session)?)
             }
             Self::SdkV2(inner) => {
-                let request = unofficial_opencode_sdk::v2::CreateSessionRequest {
-                    agent: body.get("agent").and_then(Value::as_str).map(str::to_owned),
-                    model: v2_model_ref(body),
-                    ..Default::default()
-                };
-                let session = sdk_call(inner.client.session().create(&request))
-                    .await
-                    .context("opencode session create failed")?;
-                Ok(serde_json::to_value(&session)?)
+                let mut request = json!({
+                    "location": {"directory": inner.directory},
+                });
+                if let Some(agent) = body.get("agent").and_then(Value::as_str) {
+                    request["agent"] = json!(agent);
+                }
+                if let Some(model) = v2_model_ref(body) {
+                    request["model"] = model;
+                }
+                let created = v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    "api/session",
+                    &request,
+                )
+                .await
+                .context("opencode session create failed")?;
+                Ok(created.get("data").unwrap_or(&created).clone())
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().session_create(body),
@@ -1628,14 +1735,26 @@ impl ServeClient {
             }
             Self::SdkV2(inner) => {
                 if let Some(model) = v2_model_ref(body) {
-                    sdk_call(inner.client.session().switch_model(session_id, &model))
-                        .await
-                        .context("opencode switch_model failed")?;
+                    v2_post_json(
+                        &inner.client,
+                        &inner.base_url,
+                        &inner.password,
+                        &format!("api/session/{session_id}/model"),
+                        &json!({"model": model}),
+                    )
+                    .await
+                    .context("opencode switch_model failed")?;
                 }
                 if let Some(agent) = body.get("agent").and_then(Value::as_str) {
-                    sdk_call(inner.client.session().switch_agent(session_id, agent))
-                        .await
-                        .context("opencode switch_agent failed")?;
+                    v2_post_json(
+                        &inner.client,
+                        &inner.base_url,
+                        &inner.password,
+                        &format!("api/session/{session_id}/agent"),
+                        &json!({"agent": agent}),
+                    )
+                    .await
+                    .context("opencode switch_agent failed")?;
                 }
                 let text = body
                     .get("parts")
@@ -1647,21 +1766,30 @@ impl ServeClient {
                                 .flatten()
                         })
                     })
+                    .or_else(|| body.get("prompt").and_then(Value::as_str))
+                    .or_else(|| body.get("text").and_then(Value::as_str))
                     .context("opencode prompt request has no text part")?;
-                let request = unofficial_opencode_sdk::v2::PromptRequest {
-                    id: body
-                        .get("messageID")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    prompt: Some(unofficial_opencode_sdk::v2::PromptInput::text(
-                        text.to_owned(),
-                    )),
-                    delivery: Some(unofficial_opencode_sdk::v2::Delivery::Queue),
-                    ..Default::default()
-                };
-                sdk_call(inner.client.session().prompt(session_id, &request))
-                    .await
-                    .context("opencode prompt failed")?;
+                let mut request = json!({
+                    // The 2.x schema spreads the prompt fields at top level
+                    // (`text`), while the 1.x `api/*` surface wraps them
+                    // (`prompt.text`). Send both; each revision ignores the
+                    // field it does not know.
+                    "text": text,
+                    "prompt": {"text": text},
+                    "delivery": "queue",
+                });
+                if let Some(message_id) = body.get("messageID").and_then(Value::as_str) {
+                    request["id"] = json!(message_id);
+                }
+                v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &format!("api/session/{session_id}/prompt"),
+                    &request,
+                )
+                .await
+                .context("opencode prompt failed")?;
                 Ok(())
             }
             #[cfg(test)]
@@ -1678,9 +1806,15 @@ impl ServeClient {
                 Ok(())
             }
             Self::SdkV2(inner) => {
-                sdk_call(inner.client.session().interrupt(session_id))
-                    .await
-                    .context("opencode interrupt failed")?;
+                v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &format!("api/session/{session_id}/interrupt"),
+                    &json!({}),
+                )
+                .await
+                .context("opencode interrupt failed")?;
                 Ok(())
             }
             #[cfg(test)]
@@ -1697,13 +1831,24 @@ impl ServeClient {
                 Ok(serde_json::to_value(status)?)
             }
             Self::SdkV2(inner) => {
-                let active = sdk_call(inner.client.session().active())
-                    .await
-                    .context("opencode session status failed")?;
+                let body = v2_get_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    "api/session/active",
+                )
+                .await
+                .context("opencode session status failed")?;
+                let active = body.get("data").unwrap_or(&body);
                 Ok(active
-                    .into_keys()
-                    .map(|session_id| (session_id, json!({"type": "busy"})))
-                    .collect())
+                    .as_object()
+                    .map(|entries| {
+                        entries
+                            .keys()
+                            .map(|session_id| (session_id.clone(), json!({"type": "busy"})))
+                            .collect()
+                    })
+                    .unwrap_or_default())
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().session_status(),
@@ -1722,18 +1867,20 @@ impl ServeClient {
             .await
             .context("opencode messages failed"),
             Self::SdkV2(inner) => {
-                let mut page = sdk_call(inner.client.session().messages(
-                    session_id,
-                    &unofficial_opencode_sdk::v2::SessionMessagesOptions {
-                        limit: Some(limit),
-                        order: Some(unofficial_opencode_sdk::v2::Order::Desc),
-                        cursor: None,
-                    },
-                ))
+                // 2.x caps `limit` at 200; older surfaces clamp or error the
+                // same way, so cap here instead of leaking a server-side 400.
+                let limit = limit.min(200);
+                let body = v2_get_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &format!("api/session/{session_id}/message?order=desc&limit={limit}"),
+                )
                 .await
                 .context("opencode messages failed")?;
-                page.data.reverse();
-                Ok(page.data)
+                let mut data = body.get("data").unwrap_or(&body).clone();
+                let messages = data.as_array_mut().map(std::mem::take).unwrap_or_default();
+                Ok(messages.into_iter().rev().collect())
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().messages(session_id, limit),
@@ -1746,14 +1893,16 @@ impl ServeClient {
                 .await
                 .context("opencode permission list failed"),
             Self::SdkV2(inner) => {
-                let pending = sdk_call(inner.client.permission().request().list(None))
-                    .await
-                    .context("opencode permission list failed")?;
-                pending
-                    .data
-                    .iter()
-                    .map(|request| serde_json::to_value(request).map_err(Into::into))
-                    .collect()
+                let body = v2_get_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    "api/permission/request",
+                )
+                .await
+                .context("opencode permission list failed")?;
+                let pending = body.get("data").unwrap_or(&body).clone();
+                Ok(pending.as_array().cloned().unwrap_or_default())
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().permission_list(),
@@ -1766,14 +1915,27 @@ impl ServeClient {
                 .await
                 .context("opencode question list failed"),
             Self::SdkV2(inner) => {
-                let pending = sdk_call(inner.client.question().request().list(None))
-                    .await
-                    .context("opencode question list failed")?;
-                pending
-                    .data
-                    .iter()
-                    .map(|request| serde_json::to_value(request).map_err(Into::into))
-                    .collect()
+                // 1.x exposes pending prompts as `api/question/request`; 2.x
+                // renamed that surface to `api/form`. The route that answers
+                // JSON wins; the 1.x fallback route returns the HTML shell,
+                // which `v2_send` rejects as non-JSON.
+                let body = match v2_get_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    "api/question/request",
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(_) => {
+                        v2_get_json(&inner.client, &inner.base_url, &inner.password, "api/form")
+                            .await
+                            .context("opencode question list failed")?
+                    }
+                };
+                let pending = body.get("data").unwrap_or(&body).clone();
+                Ok(pending.as_array().cloned().unwrap_or_default())
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().question_list(),
@@ -1970,12 +2132,10 @@ async fn spawn_serve_once(
         .directory(directory.clone())
         .build()
         .context("cannot build OpenCode SDK client")?;
-    let client_v2 = unofficial_opencode_sdk::v2::Client::builder()
-        .base_url(base_url)
-        .password(password)
-        .directory(directory)
+    let client_v2 = reqwest::Client::builder()
         .build()
-        .context("cannot build OpenCode SDK v2 client")?;
+        .context("cannot build OpenCode v2 HTTP client")?;
+    let password_v2 = password.to_owned();
 
     let child = tokio::sync::Mutex::new(child);
     let deadline = Instant::now() + SERVE_HEALTH_TIMEOUT;
@@ -2015,11 +2175,18 @@ async fn spawn_serve_once(
         if contract_override != ServeContract::V1
             && (contract_override == ServeContract::V2 || v1_failed_once)
         {
-            match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client_v2.health().get()).await
+            match tokio::time::timeout(
+                SERVE_HEALTH_REQUEST_TIMEOUT,
+                v2_health_probe(&client_v2, &base_url, &password_v2),
+            )
+            .await
             {
-                Ok(Ok(_)) => {
+                Ok(Ok(())) => {
                     return Ok(ServeClient::SdkV2(Arc::new(SdkV2Serve {
                         client: client_v2,
+                        base_url,
+                        password: password_v2,
+                        directory,
                         child,
                         tail: Arc::clone(&tail),
                     })));
