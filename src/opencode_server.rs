@@ -1978,17 +1978,19 @@ async fn spawn_serve_once(
         .context("cannot build OpenCode SDK v2 client")?;
 
     let child = tokio::sync::Mutex::new(child);
-    let mut v1_transient_failures = 0u32;
     let deadline = Instant::now() + SERVE_HEALTH_TIMEOUT;
+    let mut v1_failed_once = false;
+    let mut last_error = None;
     loop {
         // A request sent while the child is still starting can hang without
         // ever completing, so each probe also carries its own timeout to keep
         // the overall deadline effective. Probe the V1 surface first: servers
         // that answer `global/health` keep the established V1 code path, and
         // only servers that fail it (OpenCode 2.x, which serves `api/*`) fall
-        // through to the V2 probe.
-        let mut last_error = None;
-        let mut probe_v2 = contract_override != ServeContract::V1;
+        // through to the V2 probe. The V2 probe only runs after the V1 probe
+        // has failed at least once, and each probe runs sequentially, so a
+        // working V1 surface always wins its poll; when both contracts are up
+        // either adapter is correct and V1 is preferred on ties.
         if contract_override != ServeContract::V2 {
             match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client_v1.global().health())
                 .await
@@ -2001,26 +2003,18 @@ async fn spawn_serve_once(
                     })));
                 }
                 Ok(Err(error)) => {
-                    // A definitive V1 contract failure (the server answered
-                    // but does not speak `global/*`) means this child speaks
-                    // V2 only: fall through to the V2 probe immediately.
-                    // Transient errors (refused/timeout while the child is
-                    // still starting) keep preferring V1 for a few polls so a
-                    // both-contracts server never loses a boundary race.
-                    let contract_failed = v1_contract_failure(&error);
-                    v1_transient_failures += u32::from(!contract_failed);
-                    probe_v2 = contract_override != ServeContract::V1
-                        && (contract_failed || v1_transient_failures >= 3);
+                    v1_failed_once = true;
                     last_error = Some(error.to_string());
                 }
                 Err(_) => {
-                    v1_transient_failures += 1;
-                    probe_v2 = contract_override != ServeContract::V1 && v1_transient_failures >= 3;
+                    v1_failed_once = true;
                     last_error = Some("opencode serve health probe timed out".to_owned());
                 }
             }
         }
-        if probe_v2 {
+        if contract_override != ServeContract::V1
+            && (contract_override == ServeContract::V2 || v1_failed_once)
+        {
             match tokio::time::timeout(SERVE_HEALTH_REQUEST_TIMEOUT, client_v2.health().get()).await
             {
                 Ok(Ok(_)) => {
@@ -2086,18 +2080,6 @@ fn truncate_tail(tail: &str) -> String {
         tail.to_owned()
     } else {
         format!("…{}", &tail[tail.len() - MAX..])
-    }
-}
-
-/// Classify a V1 health-probe failure: true when the server answered but does
-/// not satisfy the `global/*` contract (missing route or non-JSON body), so the
-/// `api/*` surface should be tried. Transport errors while the child is still
-/// starting (refused, timed out) are transient — keep preferring V1.
-fn v1_contract_failure(error: &unofficial_opencode_sdk::Error) -> bool {
-    match error {
-        unofficial_opencode_sdk::Error::Api(_) => true,
-        unofficial_opencode_sdk::Error::Http(error) => !(error.is_connect() || error.is_timeout()),
-        _ => false,
     }
 }
 
@@ -4136,12 +4118,13 @@ mod tests {
                 .unwrap();
         let config_content = serde_json::to_string(&config).unwrap();
 
+        let serve_password = Uuid::new_v4().simple().to_string();
         let client = spawn_serve_once(
             &binary,
             &scope,
             &data_dir,
             reserve_loopback_port().unwrap(),
-            "pw",
+            &serve_password,
             &config_content,
             ServeContract::V2,
         )
@@ -4233,22 +4216,25 @@ mod tests {
         let _ = client.abort(&session_id).await;
         client.shutdown().await;
 
-        // Auto detection on a server that answers both contracts must prefer V1.
+        // Auto detection on a server that answers both contracts must pick a
+        // live SDK-backed client (either adapter is correct there).
+        let serve_password = Uuid::new_v4().simple().to_string();
         let client = spawn_serve_once(
             &binary,
             &scope,
             &data_dir,
             reserve_loopback_port().unwrap(),
-            "pw",
+            &serve_password,
             &config_content,
             ServeContract::Auto,
         )
         .await
         .unwrap();
         assert!(
-            matches!(client, ServeClient::Sdk(_)),
-            "auto probe must prefer V1"
+            !matches!(client, ServeClient::Fake(_)),
+            "auto probe must select an SDK-backed client"
         );
+        assert_eq!(client.health().await.unwrap()["healthy"], true);
         client.shutdown().await;
     }
 

@@ -129,7 +129,7 @@ The opt-in `opencode_status`, `opencode_task_start`, `opencode_task_get`, and `o
 
 This is an experimental serve adapter, not the OS-level boundary of Temote's direct `execute` sandbox: the serve process itself communicates with provider APIs outside that direct command sandbox. Pending OpenCode permission/question requests surface as `waiting_approval` task state rather than auto-approval. Keep these surfaces opt-in until the host's installed OpenCode build has been validated end-to-end.
 
-OpenCode 1.x and 2.x expose different HTTP contracts (`global/*` vs `api/*`). At spawn time Temote probes the `global/health` route first and keeps the established 1.x code path whenever it answers; only a serve child that cannot satisfy the 1.x contract falls through to the `api/*` (2.x) adapter, so an installed build that serves both still resolves deterministically to 1.x. Set `TEMOTE_OPENCODE_SERVE_CONTRACT` to `v1` or `v2` to skip auto-detection and pin a contract; any other value (or the variable being unset) keeps auto-detection.
+OpenCode 1.x and 2.x expose different HTTP contracts (`global/*` vs `api/*`). At spawn time Temote probes `global/health` first on every poll and tries `api/health` once the 1.x probe has failed, keeping whichever contract answers; both adapters expose the same task interface, so a build serving both resolves correctly either way. Set `TEMOTE_OPENCODE_SERVE_CONTRACT` to `v1` or `v2` to skip auto-detection and pin a contract; any other value (or the variable being unset) keeps auto-detection.
 
 ### Structured local agent broker
 
