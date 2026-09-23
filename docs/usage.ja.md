@@ -119,6 +119,15 @@ opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`op
 
 OpenCode 1.x と 2.x では HTTP contract が異なります (`global/*` と `api/*`)。起動時に各 poll で `global/health` を先に probe し、v1 probe が失敗した poll から `api/health` も試行して、先に応答した contract を採用します。両 adapter は同じ task interface を提供するため、両 contract を提供する build ではどちらが選ばれても正しく動作します。`TEMOTE_OPENCODE_SERVE_CONTRACT` に `v1` または `v2` を設定すると auto-detection を skip して contract を固定できます。それ以外の値または未設定では auto-detection のままです。
 
+### Experimental Devin task
+
+opt-in の `devin_status`、`devin_task_start`、`devin_task_get`、`devin_task_control` は、task ごとの `devin acp` child を起動し、stdio 上の JSON-RPC で Agent Client Protocol (ACP) を話します。child は task の canonical scope directory で、filter 済み環境変数 (PATH/HOME/proxy と Devin/Windsurf の credential 変数のみ) 付きで動きます。task record、ownership、lease、receipt、retention、scoped evidence は上記 Codex / OpenCode task と同じ契約です。task は完全な session instance と canonical working directory に所有され、別 session、別 process generation、別 scope から resume できません。
+
+`devin_task_start` と `devin_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み ACP session に追加の `session/prompt` を送り、resume は agent が `loadSession` capability を advertise する場合に限り `session/load` で reattach します (advertise が無ければ replay せず fail closed)、interrupt は `session/cancel` を送ります。各 `session/prompt` は blocking の ACP request で、その `stopReason` result が task status に対応します (`end_turn` は completed、`cancelled` は interrupted、それ以外は `retryable_failed`)。送信済みの可能性がある turn の応答を失った場合は replay せず保持済み session state から reconcile します。agent 側の `session/request_permission` は auto-approval ではなく Temote-local approval console 経由の `waiting_approval` task state として表面化します。terminal report は他の delegation backend と同じ bounded report contract の下、蓄積した assistant message から抽出します。`ask` mode では同じ Devin provenance/scope/mutation metadata を伴う local approval が必要で、`agent` と `yolo` session では Temote-local prompt を skip します。`devin_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
+
+これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な stdio adapter です。ACP child は Devin service と直接通信し、認証は install 済み CLI 自身の credential state (`devin auth login`、`DEVIN_API_KEY`、または `WINDSURF_API_KEY`) を使います。host の Devin CLI build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
+
+>>>>>>> 4a139de (delegation: add devin acp task backend)
 ### 構造化ローカルエージェント broker
 
 `local_agent_run({session_id, agent, task, cwd?, access, model?, effort?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。`model` は adapter の model identifier、`effort` は Codex 専用の reasoning effort 名（他 agent では拒否）、`profile` は child に適用する名前付き provider/auth profile を選びます。

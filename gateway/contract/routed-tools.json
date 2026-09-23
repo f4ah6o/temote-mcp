@@ -603,6 +603,156 @@
     },
     {
       "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "devin_status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "operation_id",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "devin_task_start"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after_revision": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "devin_task_get"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "steer",
+              "resume",
+              "interrupt"
+            ],
+            "type": "string"
+          },
+          "host_id": {
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "task_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "task_id",
+          "operation_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "devin_task_control"
+    },
+    {
+      "annotations": {
         "destructiveHint": true,
         "idempotentHint": false,
         "openWorldHint": true,

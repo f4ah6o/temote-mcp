@@ -645,6 +645,8 @@ pub(crate) enum ApprovalClass {
     CodexAppServer,
     /// Experimental OpenCode serve task operations.
     OpenCodeServer,
+    /// Experimental Devin acp task operations.
+    DevinAcp,
     /// Local-only escape hatches that leave the Temote sandbox
     /// (`without_sandbox`).
     HostUnrestricted,
@@ -684,7 +686,7 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
             _ => RequestUser,
         },
         GitNetwork | DeveloperTool | Integration | LocalStructured | CodexAppServer
-        | OpenCodeServer => match mode {
+        | OpenCodeServer | DevinAcp => match mode {
             config::PermissionMode::Ask => Request,
             _ => Skip,
         },
@@ -1403,6 +1405,7 @@ async fn spawn_runtime_inner(
     crate::codex_app_server::ensure_session_replacement_allowed(&id)?;
     #[cfg(feature = "network")]
     crate::opencode_server::ensure_session_replacement_allowed(&id)?;
+    crate::devin_acp::ensure_session_replacement_allowed(&id)?;
     let previous_session = config::read_session_metadata(&id).await.ok();
     let previous_lifecycle = config::read_session_lifecycle(&id).await.ok().flatten();
     config::remove_inactive_socket_unlocked(&id).await?;

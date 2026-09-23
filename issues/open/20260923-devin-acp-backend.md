@@ -64,6 +64,7 @@ vendor 独自 `thread/*`/`turn/*` より wire 面が小さい。`devin acp` は�
 ## Progress
 
 - 2026-09-23: issue 作成。Devin CLI の programmatic 経路調査完了 — `devin acp` (stdio JSON-RPC, ACP) を採用経路として決定。
+- 2026-09-23: 実装完了 (PR 参照)。`src/devin_acp.rs` に Codex/OpenCode と同じ task 契約 (durable record / idempotent receipt / typed control / scoped evidence / runtime lease) で `devin acp` adapter を追加。`devin_status` / `devin_task_start` / `devin_task_get` / `devin_task_control` を公開 tool 化 (ungated module、`--no-default-features` 維持)。`session/prompt` の blocking response (`stopReason`) を turn 完了通知として扱い、`session/request_permission` を Temote-local approval 経由の `waiting_approval` に写像、`session/load` は `loadSession` capability advertise 時のみ受理 (未 advertise は fail closed)。`ApprovalClass::DevinAcp` を Codex/OpenCode と同 tier に追加、doctor の delegation readiness に `devin` binary + credential チェック追加、gateway contract / usage docs (en/ja) を同期。`devin` binary 未導入のため live parity 検証は未実施 — open question のまま。
 
 ## Related
 

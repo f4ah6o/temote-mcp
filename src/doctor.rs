@@ -355,6 +355,8 @@ fn check_delegation_backends(report: &mut Report) {
         )),
     }
 
+    check_devin_delegation(report);
+
     match crate::cli::codex::delegation::opencode::resolve_default_opencode_executable() {
         Ok(resolved) => {
             let configured = resolved.binary().to_owned();
@@ -393,6 +395,60 @@ fn check_delegation_backends(report: &mut Report) {
             "delegation opencode",
             format!("cannot resolve the OpenCode binary: {}", error.message()),
             "Fix TEMOTE_OPENCODE_BIN or unset it to use PATH lookup.",
+        )),
+    }
+}
+
+fn check_devin_delegation(report: &mut Report) {
+    match crate::devin_acp::resolve_devin_executable() {
+        Ok(resolved) => {
+            let located = if resolved.is_absolute() {
+                resolved.is_file().then_some(resolved.clone())
+            } else {
+                delegation_binary_on_path(resolved.to_str().unwrap_or("devin"))
+            };
+            let Some(binary) = located else {
+                report.add(Check::warn(
+                    "delegation devin",
+                    format!("resolved binary {} is not usable", resolved.display()),
+                    "Install the Devin CLI or set TEMOTE_DEVIN_BIN to an absolute executable path to enable devin_task_*.",
+                ));
+                return;
+            };
+            let api_key_present = std::env::var_os("WINDSURF_API_KEY")
+                .is_some_and(|value| !value.is_empty())
+                || std::env::var_os("DEVIN_API_KEY").is_some_and(|value| !value.is_empty());
+            let auth_config_present = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| crate::platform_paths::home_dir().map(|home| home.join(".config")))
+                .map(|directory| directory.join("devin"))
+                .is_some_and(|path| path.is_dir());
+            if api_key_present || auth_config_present {
+                let source = if api_key_present {
+                    "environment key"
+                } else {
+                    "devin auth config"
+                };
+                report.add(Check::pass(
+                    "delegation devin",
+                    format!("binary={}, credentials={source}", binary.display()),
+                ));
+            } else {
+                report.add(Check::warn(
+                    "delegation devin",
+                    format!(
+                        "binary={} but no Devin credentials are visible",
+                        binary.display()
+                    ),
+                    "Run `devin auth login` or set WINDSURF_API_KEY; without credentials devin_task_* turns fail at authentication.",
+                ));
+            }
+        }
+        Err(error) => report.add(Check::warn(
+            "delegation devin",
+            format!("cannot resolve the Devin binary: {error}"),
+            "Fix TEMOTE_DEVIN_BIN or unset it to use PATH lookup.",
         )),
     }
 }
