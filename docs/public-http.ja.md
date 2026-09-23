@@ -205,6 +205,10 @@ apply には実行中の HTTP 管理下にある通常 session が必要で、`a
 path、URL、command、argument vector、environment は指定できません。
 省略可能な `expected_version` は、インストール済み候補が変わっていないことを確認するために使います。
 
+preflight は `helper_generation` も返します。これは、インストール済み実行ファイルの隣に配置された Linux sandbox helper の bounded な `compatible` / `incompatible` / `unavailable` 分類です。
+分類が `compatible` でない場合、apply は破壊的な処理の前に handoff を拒否します。
+sandbox helper を持たないプラットフォームでは `compatible` になります。
+
 新しい transaction を受け付けると、Temote は HTTP/1 response を書き込み、socket を shutdown してから、独立したローカル coordinator に supervisor または ingress の変更を許可します。
 この順序が証明するのは server 側の書き込みと shutdown の成功であり、client application が response を処理したことではありません。
 書き込みまたは shutdown に失敗した場合、coordinator は破壊的な処理を始める前に中止します。

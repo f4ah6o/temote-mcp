@@ -1521,6 +1521,77 @@ fn inspect_upgrade_executable(path: &Path) -> Result<(PathBuf, SupervisorCapabil
     Ok((path, capabilities))
 }
 
+/// Bounded classification of the sandbox helper bundled next to the upgrade
+/// executable. The running supervisor keeps serving sessions until the
+/// handoff exec, so a replacement helper that rejects the running policy
+/// schema would degrade ordinary sandbox commands during that window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HelperGeneration {
+    Compatible,
+    Incompatible,
+    Unavailable,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_helper_generation(executable: &Path) -> HelperGeneration {
+    use temote_mcp::sandbox::linux::helper_sibling_of;
+    use temote_mcp::sandbox::linux::policy::LINUX_SANDBOX_POLICY_VERSION;
+
+    #[derive(Deserialize)]
+    struct HelperCapabilities {
+        policy_schema: u64,
+    }
+
+    let reported = (|| -> Result<u64> {
+        let helper = helper_sibling_of(executable)
+            .context("sandbox helper is missing next to the upgrade executable")?;
+        let helper = std::fs::canonicalize(&helper)?;
+        let metadata = std::fs::metadata(&helper)?;
+        anyhow::ensure!(metadata.is_file(), "sandbox helper is not a regular file");
+        let mode = metadata.permissions().mode() & 0o777;
+        anyhow::ensure!(mode & 0o111 != 0, "sandbox helper is not executable");
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "sandbox helper is not owned by the current user"
+        );
+        anyhow::ensure!(mode & 0o022 == 0, "sandbox helper is group/world writable");
+        anyhow::ensure!(
+            metadata.len() <= MAX_UPGRADE_EXECUTABLE_BYTES,
+            "sandbox helper exceeds bounded identity size"
+        );
+        let output = std::process::Command::new(&helper)
+            .arg("--capabilities")
+            .output()
+            .context("failed to inspect sandbox helper capabilities")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "sandbox helper did not report capabilities successfully"
+        );
+        anyhow::ensure!(
+            output.stdout.len() <= 64 * 1024,
+            "sandbox helper capability response is too large"
+        );
+        let capabilities: HelperCapabilities = serde_json::from_slice(&output.stdout)
+            .context("invalid capability response from sandbox helper")?;
+        Ok(capabilities.policy_schema)
+    })();
+
+    match reported {
+        Ok(schema) if schema == u64::from(LINUX_SANDBOX_POLICY_VERSION) => {
+            HelperGeneration::Compatible
+        }
+        Ok(_) => HelperGeneration::Incompatible,
+        Err(_) => HelperGeneration::Unavailable,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn classify_helper_generation(_executable: &Path) -> HelperGeneration {
+    HelperGeneration::Compatible
+}
+
 async fn write_control_error(stream: &mut UnixStream, error: &anyhow::Error) -> Result<()> {
     let response = json!({
         "ok": false,
@@ -1568,6 +1639,12 @@ async fn handle_upgrade_request(
         }
     };
 
+    // The execution path is a private snapshot that does not carry the bundled
+    // sandbox helper; the upgraded supervisor resolves its helper next to the
+    // installed locator, so that is the bundle whose generation is classified.
+    let helper_generation =
+        classify_helper_generation(installed_locator.as_deref().unwrap_or(&executable));
+
     if dry_run {
         let preview = supervisor
             .preview_upgrade_plan(
@@ -1585,10 +1662,44 @@ async fn handle_upgrade_request(
                 return Ok(());
             }
         };
-        let response = json!({"ok": true, "result": preview, "error": Value::Null});
+        let mut result = match serde_json::to_value(&preview) {
+            Ok(result) => result,
+            Err(error) => {
+                write_control_error(&mut stream, &anyhow::Error::from(error)).await?;
+                return Ok(());
+            }
+        };
+        if let Value::Object(ref mut fields) = result {
+            fields.insert("helper_generation".to_owned(), json!(helper_generation));
+        }
+        let response = json!({"ok": true, "result": result, "error": Value::Null});
         stream.write_all(&encode_line(&response)?).await?;
         let _ = stream.shutdown().await;
         return Ok(());
+    }
+
+    match helper_generation {
+        HelperGeneration::Compatible => {}
+        HelperGeneration::Incompatible => {
+            write_control_error(
+                &mut stream,
+                &anyhow::anyhow!(
+                    "bundled Linux sandbox helper reports a policy schema incompatible with the running supervisor; refusing upgrade handoff"
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        HelperGeneration::Unavailable => {
+            write_control_error(
+                &mut stream,
+                &anyhow::anyhow!(
+                    "bundled Linux sandbox helper is missing or could not be inspected; refusing upgrade handoff"
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     let preflight: Result<SupervisorUpgradePlan> = async {
@@ -2257,6 +2368,7 @@ pub struct RemoteUpgradePreflight {
     pub reconnect_expected: bool,
     pub plugin_reconciliation_required: bool,
     pub client_restart_required_if_plugin_replaced: bool,
+    pub helper_generation: HelperGeneration,
     /// The observed direct-ingress runtime state, including bounded non-secret
     /// diagnostics (runtime-root source and fingerprint, recorded pid, host
     /// identity, state schema) that let a caller explain why another observer
@@ -2311,6 +2423,11 @@ async fn upgrade_preflight_with_force(
         expected_sessions: None,
     })
     .await?;
+    let helper_generation = preview_value
+        .get("helper_generation")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<HelperGeneration>(value).ok())
+        .unwrap_or(HelperGeneration::Unavailable);
     let preview: crate::supervisor::SupervisorUpgradePreview =
         serde_json::from_value(preview_value).context("invalid supervisor upgrade preview")?;
     #[cfg(all(feature = "network", unix))]
@@ -2353,6 +2470,7 @@ async fn upgrade_preflight_with_force(
         reconnect_expected,
         plugin_reconciliation_required: true,
         client_restart_required_if_plugin_replaced: true,
+        helper_generation,
         #[cfg(all(feature = "network", unix))]
         direct_ingress: Some(ingress.plan().clone()),
         planned_sessions,
@@ -2556,6 +2674,10 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     anyhow::ensure!(
         !preflight.direct_ingress_blocked,
         "direct ingress upgrade is blocked"
+    );
+    anyhow::ensure!(
+        preflight.helper_generation == HelperGeneration::Compatible,
+        "sandbox helper generation is not compatible with the running supervisor"
     );
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
     let restored = apply_supervisor_upgrade(
@@ -5724,6 +5846,57 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = validate_upgrade_executable(&executable, "test-version").unwrap_err();
         assert!(error.to_string().contains("control protocol"), "{error:#}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_generation_classifies_bundle_against_running_policy_schema() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let write_bundle = |helper_stdout: Option<String>| {
+            let temp = tempfile::tempdir().unwrap();
+            let executable = temp.path().join("temote-mcp");
+            std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if let Some(stdout) = helper_stdout {
+                let helper = temp.path().join("temote-linux-sandbox");
+                std::fs::write(
+                    &helper,
+                    format!("#!/bin/sh\nif [ \"$1\" = \"--capabilities\" ]; then echo '{stdout}'; else exit 2; fi\n"),
+                )
+                .unwrap();
+                std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            temp
+        };
+
+        let matching = write_bundle(Some(
+            "{\"version\":\"test-version\",\"policy_schema\":1}".to_owned(),
+        ));
+        assert_eq!(
+            classify_helper_generation(&matching.path().join("temote-mcp")),
+            HelperGeneration::Compatible
+        );
+
+        let newer = write_bundle(Some(
+            "{\"version\":\"test-version\",\"policy_schema\":999}".to_owned(),
+        ));
+        assert_eq!(
+            classify_helper_generation(&newer.path().join("temote-mcp")),
+            HelperGeneration::Incompatible
+        );
+
+        let missing = write_bundle(None);
+        assert_eq!(
+            classify_helper_generation(&missing.path().join("temote-mcp")),
+            HelperGeneration::Unavailable
+        );
+
+        let unparseable = write_bundle(Some("not-json".to_owned()));
+        assert_eq!(
+            classify_helper_generation(&unparseable.path().join("temote-mcp")),
+            HelperGeneration::Unavailable
+        );
     }
 
     #[cfg(unix)]

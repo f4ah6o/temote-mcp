@@ -66,6 +66,11 @@ fn private_upgrade_binary() -> (TempDir, PathBuf) {
         .expect("failed to copy upgrade test executable");
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
         .expect("failed to protect upgrade test executable");
+    let helper = directory.path().join("temote-linux-sandbox");
+    fs::copy(env!("CARGO_BIN_EXE_temote-linux-sandbox"), &helper)
+        .expect("failed to copy upgrade test sandbox helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))
+        .expect("failed to protect upgrade test sandbox helper");
     (directory, binary)
 }
 

@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
 
+/// Policy schema generation the helper accepts. Bump when the serialized
+/// `LinuxSandboxPolicy` shape changes; upgrade preflight compares the helper
+/// bundle's reported schema against this value.
+pub const LINUX_SANDBOX_POLICY_VERSION: u8 = 1;
+
 const MAX_ROOTS: usize = 128;
 const MAX_READ_ONLY_PATHS: usize = 1024;
 /// Network modes supported by the Temote Linux helper.
@@ -228,7 +233,7 @@ impl LinuxSandboxPolicy {
         normalize_paths(&mut read_only_paths);
         normalize_paths(&mut read_only_roots);
         let policy = Self {
-            version: 1,
+            version: LINUX_SANDBOX_POLICY_VERSION,
             cwd,
             writable_roots: writable,
             temporary_roots,
@@ -325,7 +330,7 @@ impl LinuxSandboxPolicy {
             None => None,
         };
         let policy = Self {
-            version: 1,
+            version: LINUX_SANDBOX_POLICY_VERSION,
             cwd,
             writable_roots: writable,
             temporary_roots: temporary,
@@ -344,7 +349,7 @@ impl LinuxSandboxPolicy {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            self.version == 1,
+            self.version == LINUX_SANDBOX_POLICY_VERSION,
             "unsupported Linux sandbox policy version"
         );
         if let Some(pinned) = &self.pinned_workspace {

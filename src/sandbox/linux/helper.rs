@@ -16,7 +16,9 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
-use super::policy::{LinuxNetworkPolicy, LinuxPinnedWorkspace, LinuxSandboxPolicy};
+use super::policy::{
+    LINUX_SANDBOX_POLICY_VERSION, LinuxNetworkPolicy, LinuxPinnedWorkspace, LinuxSandboxPolicy,
+};
 
 #[derive(Debug)]
 struct HelperArgs {
@@ -60,7 +62,20 @@ pub(super) fn command_args(policy: &LinuxSandboxPolicy, command: &[String]) -> R
     Ok(args)
 }
 
+fn capabilities_payload() -> String {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "policy_schema": LINUX_SANDBOX_POLICY_VERSION,
+    })
+    .to_string()
+}
+
 pub(super) fn run_main() -> ! {
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.len() == 2 && raw[1] == "--capabilities" {
+        println!("{}", capabilities_payload());
+        std::process::exit(0);
+    }
     let args = match parse_helper_args(std::env::args()) {
         Ok(args) => args,
         Err(error) => fail(error.context("invalid Linux sandbox helper arguments")),
@@ -1007,6 +1022,16 @@ fn fail(error: impl Display) -> ! {
 mod tests {
     use super::*;
 
+    #[test]
+    fn capabilities_payload_reports_running_policy_schema() {
+        let payload: serde_json::Value = serde_json::from_str(&capabilities_payload()).unwrap();
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            payload["policy_schema"],
+            serde_json::json!(LINUX_SANDBOX_POLICY_VERSION)
+        );
+    }
+
     fn run_git_fixture(cwd: &Path, args: &[&str]) {
         let status = std::process::Command::new("/usr/bin/git")
             .args(args)
@@ -1026,7 +1051,7 @@ mod tests {
         identity: &crate::sandbox::WorkspaceRepositoryIdentity,
     ) -> LinuxSandboxPolicy {
         LinuxSandboxPolicy {
-            version: 1,
+            version: LINUX_SANDBOX_POLICY_VERSION,
             cwd: target.to_path_buf(),
             writable_roots: vec![target.to_path_buf(), temporary.to_path_buf()],
             temporary_roots: vec![temporary.to_path_buf()],
