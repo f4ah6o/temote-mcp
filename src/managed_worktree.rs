@@ -52,11 +52,7 @@ impl std::fmt::Debug for WorktreeReservation {
     }
 }
 
-impl WorktreeReservation {
-    pub(crate) fn identity(&self) -> &Path {
-        &self.identity
-    }
-}
+impl WorktreeReservation {}
 
 impl Drop for WorktreeReservation {
     fn drop(&mut self) {
@@ -82,31 +78,6 @@ impl std::fmt::Debug for RepositoryReservation {
             .debug_struct("RepositoryReservation")
             .field("identity", &self.reservation.identity)
             .finish_non_exhaustive()
-    }
-}
-
-/// A sorted set of per-worktree reservations.  Keeping all guards in one RAII
-/// value makes it difficult for a caller to accidentally release one lock
-/// before its mutation and post-verification have completed.
-pub(crate) struct WorktreeReservations {
-    reservations: Vec<WorktreeReservation>,
-}
-
-impl std::fmt::Debug for WorktreeReservations {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("WorktreeReservations")
-            .field("identities", &self.identities())
-            .finish()
-    }
-}
-
-impl WorktreeReservations {
-    pub(crate) fn identities(&self) -> Vec<&Path> {
-        self.reservations
-            .iter()
-            .map(WorktreeReservation::identity)
-            .collect()
     }
 }
 
@@ -272,10 +243,6 @@ fn reservation_identity(path: &Path) -> Result<PathBuf> {
             )
         }),
     }
-}
-
-pub(crate) fn worktree_reservation_identity(path: &Path) -> Result<PathBuf> {
-    reservation_identity(path)
 }
 
 fn reservation_path(directory: &Path, namespace: ReservationNamespace, identity: &Path) -> PathBuf {
@@ -454,17 +421,6 @@ pub(crate) async fn acquire_shared_repository_reservation_async(
     .context("shared repository gate worker failed")?
 }
 
-pub(crate) async fn try_acquire_repository_reservation_async(
-    path: &Path,
-) -> Result<RepositoryReservation> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        acquire_repository_reservation_inner(&path, WorktreeReservationMode::Exclusive, true)
-    })
-    .await
-    .context("exclusive repository gate worker failed")?
-}
-
 /// Attempts an exclusive cleanup reservation without waiting for an active
 /// session/job in another process.  Cleanup must fail closed at this point
 /// instead of waiting indefinitely for an unknown owner.
@@ -482,91 +438,6 @@ pub(crate) async fn try_acquire_worktree_reservation_async(
     })
     .await
     .context("exclusive worktree reservation worker failed")?
-}
-
-fn reservation_identities(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut identities = paths
-        .iter()
-        .map(|path| reservation_identity(path))
-        .collect::<Result<Vec<_>>>()?;
-    identities.sort();
-    identities.dedup();
-    Ok(identities)
-}
-
-fn acquire_worktree_reservations_inner(
-    paths: &[PathBuf],
-    mode: WorktreeReservationMode,
-    nonblocking: bool,
-) -> Result<WorktreeReservations> {
-    let identities = reservation_identities(paths)?;
-    let directory = reservation_directory()?;
-    let mut reservations = Vec::with_capacity(identities.len());
-    for identity in identities {
-        let lock_path = reservation_path(&directory, ReservationNamespace::Worktree, &identity);
-        match open_reservation_file(&lock_path).and_then(|file| {
-            #[cfg(unix)]
-            {
-                let lock_type = match mode {
-                    WorktreeReservationMode::Shared => libc::LOCK_SH,
-                    WorktreeReservationMode::Exclusive => libc::LOCK_EX,
-                };
-                let operation = lock_type | if nonblocking { libc::LOCK_NB } else { 0 };
-                let locked = unsafe { libc::flock(file.as_raw_fd(), operation) } == 0;
-                if nonblocking {
-                    anyhow::ensure!(
-                        locked,
-                        "another Temote operation owns this Git worktree reservation: {}",
-                        identity.display()
-                    );
-                } else {
-                    anyhow::ensure!(
-                        locked,
-                        "failed to acquire Git worktree reservation: {}",
-                        identity.display()
-                    );
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = mode;
-                let _ = nonblocking;
-                anyhow::bail!(
-                    "Git worktree lifecycle reservations require a platform file-lock primitive"
-                );
-            }
-            Ok(WorktreeReservation {
-                file,
-                identity,
-                namespace: ReservationNamespace::Worktree,
-            })
-        }) {
-            Ok(reservation) => reservations.push(reservation),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(WorktreeReservations { reservations })
-}
-
-#[cfg(test)]
-pub(crate) fn acquire_worktree_reservations(paths: &[PathBuf]) -> Result<WorktreeReservations> {
-    acquire_worktree_reservations_inner(paths, WorktreeReservationMode::Exclusive, false)
-}
-
-/// Attempts to acquire every exclusive reservation in stable order.  Any
-/// partial acquisition is dropped on error so all previously acquired locks
-/// are released before the failure is returned.
-pub(crate) fn try_acquire_worktree_reservations(paths: &[PathBuf]) -> Result<WorktreeReservations> {
-    acquire_worktree_reservations_inner(paths, WorktreeReservationMode::Exclusive, true)
-}
-
-pub(crate) async fn try_acquire_worktree_reservations_async(
-    paths: &[PathBuf],
-) -> Result<WorktreeReservations> {
-    let paths = paths.to_vec();
-    tokio::task::spawn_blocking(move || try_acquire_worktree_reservations(&paths))
-        .await
-        .context("exclusive worktree reservations worker failed")?
 }
 
 fn path_has_git_metadata(path: &Path) -> Result<bool> {
@@ -1550,29 +1421,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn worktree_reservation_is_exclusive_and_releases_on_drop() {
-        let fixture = tempfile::tempdir().unwrap();
-        let target = fixture.path().join("repo").join("worktree");
-        std::fs::create_dir_all(&target).unwrap();
-        let target = std::fs::canonicalize(target).unwrap();
-
-        let held = acquire_worktree_reservation(&target).unwrap();
-        assert_eq!(held.identity(), target);
-        assert!(try_acquire_worktree_reservation(&target).is_err());
-
-        // Per-worktree reservations do not serialize unrelated repositories.
-        let unrelated = fixture.path().join("other");
-        std::fs::create_dir(&unrelated).unwrap();
-        let unrelated_guard = try_acquire_worktree_reservation(&unrelated).unwrap();
-        drop(unrelated_guard);
-
-        drop(held);
-        let released = try_acquire_worktree_reservation(&target).unwrap();
-        drop(released);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn stale_prune_entries_use_the_same_reservation_identity() {
         let fixture = tempfile::tempdir().unwrap();
         let stale = fixture.path().join("repo").join("removed-worktree");
@@ -1583,54 +1431,6 @@ mod tests {
         drop(held);
         let released = try_acquire_worktree_reservation(&stale).unwrap();
         drop(released);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn multi_worktree_reservation_is_sorted_and_deduplicated() {
-        let fixture = tempfile::tempdir().unwrap();
-        let first = fixture.path().join("repo").join("first");
-        let second = fixture.path().join("repo").join("second");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-
-        let reservations =
-            acquire_worktree_reservations(&[second.clone(), first.clone(), second.clone()])
-                .unwrap();
-        let identities = reservations
-            .identities()
-            .into_iter()
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            identities,
-            vec![
-                std::fs::canonicalize(&first).unwrap(),
-                std::fs::canonicalize(&second).unwrap(),
-            ]
-        );
-        drop(reservations);
-        assert!(try_acquire_worktree_reservation(&first).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_multi_reservation_releases_partial_acquisition() {
-        let fixture = tempfile::tempdir().unwrap();
-        let first = fixture.path().join("repo").join("first");
-        let second = fixture.path().join("repo").join("second");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-
-        let shared_second = acquire_shared_worktree_reservation(&second).unwrap();
-        assert!(
-            try_acquire_worktree_reservations(&[first.clone(), second.clone()]).is_err(),
-            "exclusive multi-reservation must fail on an active shared member"
-        );
-        drop(shared_second);
-
-        let first_cleanup = try_acquire_worktree_reservation(&first).unwrap();
-        drop(first_cleanup);
     }
 
     #[cfg(unix)]
@@ -1766,84 +1566,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn repository_exclusive_gate_blocks_admission_even_without_prunable_targets() {
-        let fixture = tempfile::tempdir().unwrap();
-        let repository = fixture.path().join("repo");
-        std::fs::create_dir_all(&repository).unwrap();
-        run_git_fixture(&repository, &["init", "--quiet"]);
-        let repository = std::fs::canonicalize(repository).unwrap();
-
-        let gate = try_acquire_repository_reservation_async(&repository)
-            .await
-            .unwrap();
-        let mut admission = Box::pin(acquire_worktree_admission(&repository, None));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), &mut admission)
-                .await
-                .is_err(),
-            "a prune repository gate must block admission even when no target lock exists"
-        );
-
-        drop(gate);
-        let admission = tokio::time::timeout(std::time::Duration::from_secs(2), &mut admission)
-            .await
-            .expect("admission must complete after repository gate release")
-            .unwrap();
-        drop(admission);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn repository_gate_shared_remove_conflicts_with_exclusive_prune() {
-        let fixture = tempfile::tempdir().unwrap();
-        let repository = fixture.path().join("repo");
-        std::fs::create_dir_all(&repository).unwrap();
-        run_git_fixture(&repository, &["init", "--quiet"]);
-        let repository = std::fs::canonicalize(repository).unwrap();
-
-        let remove_gate = acquire_shared_repository_reservation_async(&repository)
-            .await
-            .unwrap();
-        assert!(
-            try_acquire_repository_reservation_async(&repository)
-                .await
-                .is_err(),
-            "prune must fail closed while remove holds the shared repository gate"
-        );
-        drop(remove_gate);
-
-        let prune_gate = try_acquire_repository_reservation_async(&repository)
-            .await
-            .unwrap();
-        drop(prune_gate);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn released_admission_repository_gate_allows_prune_with_active_target_owner() {
-        let fixture = tempfile::tempdir().unwrap();
-        let repository = fixture.path().join("repo");
-        std::fs::create_dir_all(&repository).unwrap();
-        run_git_fixture(&repository, &["init", "--quiet"]);
-        let repository = std::fs::canonicalize(repository).unwrap();
-
-        let admission = acquire_worktree_admission(&repository, None).await.unwrap();
-        let WorktreeAdmission {
-            repository_reservation,
-            reservation,
-            ..
-        } = admission;
-        drop(repository_reservation);
-
-        let prune_gate = try_acquire_repository_reservation_async(&repository)
-            .await
-            .expect("active target ownership must not retain the short repository gate");
-        drop(prune_gate);
-        drop(reservation);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
     async fn shared_remove_repository_gate_allows_unrelated_same_repo_admission() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = fixture.path().join("repo");
@@ -1970,50 +1692,6 @@ mod tests {
                 .is_err(),
             "admission must fail closed after the managed target is removed"
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn prune_reservations_block_each_member_admission_until_release() {
-        let fixture = tempfile::tempdir().unwrap();
-        let first = fixture.path().join("first-repo");
-        let second = fixture.path().join("second-repo");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        run_git_fixture(&first, &["init", "--quiet"]);
-        run_git_fixture(&second, &["init", "--quiet"]);
-        let first = std::fs::canonicalize(first).unwrap();
-        let second = std::fs::canonicalize(second).unwrap();
-
-        // This models the stable, deduplicated lock set acquired for one
-        // bounded prune observation.
-        let reservations =
-            acquire_worktree_reservations(&[second.clone(), first.clone(), second.clone()])
-                .unwrap();
-        let mut first_admission = Box::pin(acquire_worktree_admission(&first, None));
-        let mut second_admission = Box::pin(acquire_worktree_admission(&second, None));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), &mut first_admission)
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), &mut second_admission)
-                .await
-                .is_err()
-        );
-
-        drop(reservations);
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), &mut first_admission)
-            .await
-            .expect("first admission must complete after prune release")
-            .unwrap();
-        let second = tokio::time::timeout(std::time::Duration::from_secs(2), &mut second_admission)
-            .await
-            .expect("second admission must complete after prune release")
-            .unwrap();
-        drop(first);
-        drop(second);
     }
 
     #[cfg(unix)]

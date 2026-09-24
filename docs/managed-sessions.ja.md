@@ -92,7 +92,7 @@ follow mode では Ctrl-C、TTY EOF、supervisor socket EOF により viewer だ
 
 ## runtime と failure isolation
 
-session Unix socket は MCP operation と host bridge の runtime boundary として維持します。local CLI session と HTTP managed session は、sandbox permission、approval state、1Password bridge、kintone bridge、metadata、socket lifecycle を同じ runtime 実装で処理します。
+session Unix socket は MCP operation と host bridge の runtime boundary として維持します。local CLI session と HTTP managed session は、sandbox permission、approval state、metadata、socket lifecycle を同じ runtime 実装で処理します。
 
 connection-local failure は runtime から隔離します。Broken pipe、connection reset、malformed message、oversized message、read timeout、client disconnect、response write failure はその connection だけを終了します。特に probe response と yolo approval response の write failure は runtime loop へ伝播しません。
 
@@ -136,7 +136,7 @@ HTTP managed session は常に `yolo=false` です。既存の approval-gated ho
 
 `session_list` / `session_info` は active だけでなく stopped / crashed の durable state も表示します。それ以外の session-bound MCP tool は従来どおり live runtime socket を要求します。
 
-`session_start` / `session_stop` は authenticated direct HTTP `serve` endpoint だけで公開します。direct `temote-mcp up` は public endpoint ごとに single-host であり、1 endpoint は1つの local lifecycle supervisor と host-local session store に対応します。同じ Cloudflare Tunnel token / hostname を複数 direct-ingress host で同時利用する構成は、Cloudflare replica routing が session-aware ではないため非対応です。stable な non-secret diagnostic identity には `TEMOTE_MCP_HOST_ID` を設定し、未設定時は OS hostname を使います。1つの public endpoint から複数 Temote host へ route する場合は `temote-mcp gateway-agent` + Worker/Durable Objects gateway を使用します。gateway の generation/lease routing contract は変更しません。公開 endpoint で `without_sandbox` を除外する既存境界も維持します。
+`session_start` / `session_stop` は authenticated direct HTTP `serve` endpoint だけで公開します。direct `temote-mcp up` は public endpoint ごとに single-host であり、1 endpoint は1つの local lifecycle supervisor と host-local session store に対応します。同じ Cloudflare Tunnel token / hostname を複数 direct-ingress host で同時利用する構成は、Cloudflare replica routing が session-aware ではないため非対応です。stable な non-secret diagnostic identity には `TEMOTE_MCP_HOST_ID` を設定し、未設定時は OS hostname を使います。1つの public endpoint から複数 Temote host へ route する場合は `temote-mcp gateway-agent` + Worker/Durable Objects gateway を使用します。gateway の generation/lease routing contract は変更しません。公開 tool surface は session-bound な delegation/discovery tool に限定されます。
 
 ## optional terminal integration
 

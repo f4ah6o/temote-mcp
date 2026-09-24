@@ -292,17 +292,17 @@ fn activity_file_roundtrip() {
 
     let mut mcp = McpClient::spawn(&binary, &fixture);
     mcp.initialize();
-    for (session_id, content) in [(&first, "first\n"), (&second, "second\n")] {
-        mcp.tool(
-            "write_file",
-            json!({"session_id": session_id, "path": "activity.txt", "content": content}),
+    for session_id in [&first, &second] {
+        assert!(
+            serde_json::from_str::<Value>(
+                &mcp.tool("job_list", json!({"session_id": session_id})),
+            )
+            .unwrap()["jobs"]
+            .is_array()
         );
-        assert_eq!(
-            mcp.tool(
-                "read_file",
-                json!({"session_id": session_id, "path": "activity.txt"}),
-            ),
-            content
+        mcp.request(
+            "tools/call",
+            json!({"name": "stop_job", "arguments": {"session_id": session_id, "job_id": "missing-job"}}),
         );
     }
 
@@ -313,20 +313,19 @@ fn activity_file_roundtrip() {
             &format!("session={first}"),
             &format!("session={second}"),
             "operation=session_start state=completed",
-            "operation=write_file state=running",
-            "operation=write_file state=completed",
-            "operation=read_file state=completed",
+            "operation=job_list state=completed",
+            "operation=stop_job state=failed",
         ],
     );
-    assert!(all.lines().count() >= 14, "{all}");
+    assert!(all.lines().count() >= 10, "{all}");
 
     let filtered = fixture.wait_for_activity(
         &binary,
         Some(&first),
         &[
             "operation=session_start state=completed",
-            "operation=write_file state=completed",
-            "operation=read_file state=completed",
+            "operation=job_list state=completed",
+            "operation=stop_job state=failed",
         ],
     );
     assert!(
@@ -336,22 +335,20 @@ fn activity_file_roundtrip() {
     );
     assert!(!filtered.contains(&format!("session={second}")));
 
-    assert_eq!(
-        mcp.tool(
-            "read_file",
-            json!({"session_id": first, "path": "activity.txt"}),
-        ),
-        "first\n"
+    assert!(
+        serde_json::from_str::<Value>(&mcp.tool("job_list", json!({"session_id": first}))).unwrap()
+            ["jobs"]
+            .is_array()
     );
     let after_disconnect = fixture.wait_for_activity_count(
         &binary,
         Some(&first),
-        "operation=read_file state=completed",
+        "operation=job_list state=completed",
         2,
     );
     assert_eq!(
         after_disconnect
-            .matches("operation=read_file state=started")
+            .matches("operation=job_list state=started")
             .count(),
         2,
         "{after_disconnect}"

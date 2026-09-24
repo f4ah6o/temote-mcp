@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Temote MCP is a Rust MCP server for operating local machines through explicit sessions. Normal sessions are path-scoped and command execution is sandboxed; `ask` keeps ordinary commands network-disabled while the default `agent` permission mode uses the network-enabled development sandbox profile and is approval-free for validated structured operations. `ask` keeps the local approval console for host/network-sensitive operations, and `--yolo` intentionally removes those Temote MCP boundaries.
+Temote MCP is a Rust MCP server for delegating local-machine work through explicit sessions. Temote does not execute files, commands, Git, or host integrations directly: machine operations run inside a coding agent on the local machine, driven through the delegation backends (Codex app-server, `opencode serve` via the OpenCode SDK, Devin ACP, and the Devin Cloud API) or the structured `local_agent_run` broker. Sessions remain path-scoped; the `ask` permission mode keeps the local approval console for host/network-sensitive operations, the default `agent` mode is approval-free for validated structured operations, and `--yolo` intentionally removes those Temote MCP boundaries.
 
 ## Repository rules
 
@@ -19,32 +19,26 @@ Temote MCP is a Rust MCP server for operating local machines through explicit se
 
 Do not weaken these without an explicit issue describing the security model change:
 
-- Session-bound execution, filesystem, Git, job, checkpoint, handoff, and work-state tools require `session_id`. Federated discovery/lifecycle tools are documented exceptions: `host_list`, `host_info`, host-aware `session_list`, and `session_start` may be sessionless only for host discovery or lifecycle scope.
+- Session-bound task, evidence, and job tools require `session_id`. Federated discovery/lifecycle tools are documented exceptions: `host_list`, `host_info`, host-aware `session_list`, and `session_start` may be sessionless only for host discovery or lifecycle scope.
 - Authenticated direct-HTTP `upgrade_preflight` and `upgrade_status` are sessionless host-lifecycle exceptions. `upgrade_apply` requires an active managed normal session and explicit local-user approval. These tools must not be exposed by stdio MCP or the gateway.
 - Remote `session_start` is host-scoped and limited to named-root-relative normal sandbox sessions; it must not create `--yolo` sessions.
 - Unqualified session routing must fail closed whenever ownership is ambiguous or cannot be determined because any relevant leased host/session status is unavailable. Explicit `host_id` routing must remain isolated from unrelated host discovery failures.
 - `host_id` is a non-secret routing identity, not a credential; authenticated host identity must stay bound to configured credentials and generation state.
 - Public tools must not inherit unrestricted local `--yolo` semantics merely because a local host/session uses yolo mode.
-- Normal-session filesystem access must remain inside permitted roots, including symlink resolution and command `cwd`.
-- Normal `execute` / `start_command` run in the sandbox. `ask` keeps them network-disabled; `agent` keeps the same sandbox and path containment with the network-enabled development profile. Neither may widen filesystem/path containment, and public HTTP must not expose `without_sandbox` or create/promote `yolo`.
-- Ordinary sandboxed commands must not gain write access to Git metadata. Use the dedicated Git tools for index/commit/remote operations.
-- `git_pull` stays fast-forward-only; `git_push` must not expose force or arbitrary URL/refspec input.
-- Public HTTP must not expose `without_sandbox`.
-- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (Git fetch/pull/push, `local_agent_run`, `dev_tool_run`, checkpoints/patches, and structured integrations) and must never widen sandbox, path, network, or tool-specific capability.
+- Delegation tools expose typed task contracts only: a caller can supply a task, model/effort/agent selectors, and typed `steer`/`resume`/`interrupt` control actions — never an executable, raw argv, environment block, network policy, or a path outside the session's canonical scope. `operation_id` is mandatory so accepted side effects stay idempotent and reconcilable.
+- Detailed task transcripts/output cross the boundary only as bounded, expiring, session-owned evidence records read through `evidence_read`; tool responses must not inline unbounded child output.
+- `local_agent_run` keeps the broker's own constraints: canonicalized `cwd` inside permitted roots, Temote-owned child filesystem profile, protected `.git`/`.agents`/`.codex` entries, no credential forwarding, and the explicit child-approval boundary in ask/yolo.
+- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (delegated task start/control and `local_agent_run`) and must never widen sandbox, path, network, or tool-specific capability.
 - New local managed and authenticated public sessions default to `agent`; public HTTP must not create or promote `yolo`.
-- `dev_tool_run` accepts only classified Cargo/Vite+ operations, never an executable or raw argv. `vp run|exec|dlx`, self-mutation operations, and unknown operations must stay rejected rather than entering an offline/safe path.
 - `--yolo` may bypass Temote MCP sandbox/path/approval boundaries, but should not silently change unrelated client authorization semantics.
 - Secrets must not be written to session metadata, audit logs, approval summaries, or ordinary tool output.
 - Child MCP approval summaries should expose argument keys, not secret values.
 
 ## Tool behavior that agents should preserve
 
-- Relative paths resolve from the selected session working directory.
-- `execute` returns inline when it completes within the foreground timeout; longer work returns a `job_id` for `poll_job` / `stop_job`.
-- Background jobs are session-owned and cancelled when the session stops or reaches its lifetime limit.
-- 1Password child MCP usage is discover-first: `onepassword_mcp_discover`, then resource/tool calls.
-- kintone child MCP usage is status/discover-first; `agent` skips only the Temote-local approval prompt for validated structured calls, while kintone authentication and argument validation remain enforced.
-- cli-kintone usage is status-first; keep credentials/session target out of agent-supplied argv, validate file paths against permitted roots, and keep `ask` approval-gated (in `agent`, only the Temote-local prompt is skipped).
+- Machine work is delegated, not executed: `*_status` probes a backend once, `*_task_start` accepts an idempotent task (fresh UUID `operation_id`), `*_task_get` reads/reconciles retained tasks, `*_task_control` applies typed steer/resume/interrupt actions.
+- Work that outlives the foreground timeout returns a session-owned `job_id` for `poll_job` / `job_list` / `stop_job`; background jobs are cancelled when the session stops or reaches its lifetime limit.
+- Delegated task detail is exposed only through bounded scoped evidence; read it with `evidence_read`.
 
 ## Development workflow
 
@@ -67,9 +61,8 @@ When Temote MCP itself is being developed from inside an already-sandboxed norma
 
 ## Documentation map
 
-- `docs/usage.md` / `docs/usage.ja.md`: sessions, permissions, tool behavior, safety boundaries.
+- `docs/usage.md` / `docs/usage.ja.md`: sessions, permissions, delegation backends, tool behavior, safety boundaries.
 - `docs/public-http.md` / `docs/public-http.ja.md`: Cloudflare Access/Tunnel public HTTP deployment.
-- `docs/integrations.md` / `docs/integrations.ja.md`: 1Password and kintone bridges.
 - `docs/gateway.md` / `docs/gateway.ja.md`: Workers/Durable Objects multi-host gateway.
 - `docs/development.md`: build, test, release, and contributor details.
 - `skills/temote-mcp/SKILL.md`: reusable Agent Skill for operating Temote MCP from a compatible agent.

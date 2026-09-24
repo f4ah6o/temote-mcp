@@ -4,15 +4,12 @@
 mod access;
 mod activity_runtime;
 mod agent_git;
-mod apply_patch;
 mod approvals;
 mod boot_identity;
-mod checkpoints;
 mod child_env;
 pub(crate) mod cli;
 mod codex_app_server;
 mod config;
-mod dev_tool;
 mod devin_acp;
 #[cfg(feature = "network")]
 mod devin_cloud;
@@ -26,11 +23,8 @@ mod host_identity;
 mod http;
 #[cfg(feature = "network")]
 mod ingress;
-mod kintone_cli;
-mod kintone_mcp;
 #[cfg(all(feature = "network", unix))]
 mod lifecycle;
-mod line_diff;
 mod line_protocol;
 mod local_agent;
 #[cfg(feature = "network")]
@@ -38,9 +32,6 @@ mod local_oauth;
 mod managed_worktree;
 mod mcp;
 mod named_roots;
-mod onepassword_cli;
-mod onepassword_mcp;
-mod onepassword_sdk;
 #[cfg(feature = "network")]
 mod openai_tunnel;
 #[cfg(feature = "network")]
@@ -49,8 +40,6 @@ mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
-mod recall;
-mod secret_broker;
 mod session_control;
 mod supervisor;
 #[cfg(test)]
@@ -58,7 +47,6 @@ mod test_support;
 #[cfg(all(feature = "network", unix))]
 mod upgrade_coordinator;
 mod upgrade_transaction;
-mod work_handoff;
 
 use temote_mcp::sandbox;
 
@@ -104,7 +92,7 @@ async fn main() -> Result<()> {
     } else {
         session_control::initialize_installed_upgrade_locator()?;
     }
-    approvals::bootstrap_service_account_process_boundary()?;
+
     match cli.command.unwrap_or(cli::Command::Start {
         session_id: None,
         yolo: false,

@@ -10,7 +10,7 @@ Temote MCP は3つの production connection profile を提供します。Cloudfl
 | `tailscale` | Tailscale Funnel public HTTPS | Temote local OAuth |
 | `openai` | OpenAI Secure MCP Tunnel | OpenAI tunnel connection + Temote local sandbox/approval |
 
-`--profile` を省略した場合は既存互換のため `cloudflare` として動作します。3 profile とも同じ provider-neutral MCP core に到達します。remote access に `without_sandbox` は出ず、managed session の named root、sandbox、tool 固有規則も profile によって変わりません。新規 public session の permission mode は sandboxed な `agent` が既定で、検証済み structured operation に local approval console は不要です。より厳格な `ask` は local の `session permission` で選べます。
+`--profile` を省略した場合は既存互換のため `cloudflare` として動作します。3 profile とも同じ provider-neutral MCP core に到達します。remote access には session-bound な delegation/discovery tool のみ公開し、managed session の named root、sandbox、tool 固有規則も profile によって変わりません。新規 public session の permission mode は sandboxed な `agent` が既定で、検証済み structured operation に local approval console は不要です。より厳格な `ask` は local の `session permission` で選べます。
 
 ## Cloudflare profile
 
@@ -191,7 +191,7 @@ Tailscale profile の未認証 `/mcp` は `401` と Bearer `WWW-Authenticate` ch
 
 `TEMOTE_MCP_ROOTS` が設定されている場合、認証済み HTTP client は `session_start` / `session_stop` / `session_restart` を利用できます。`session_start` は logical named-root-relative path のみ受け付け、yolo option はありません（新規 session は `agent` が既定）。absolute path、unknown root、traversal、symlink escape、roots 未設定時の fallback は拒否します。`session_stop` / `session_restart` は lifecycle supervisor が public-owned として保持する session に限定されます。public session-bound tool は別途起動した yolo session を拒否し、unrestricted な local semantics を remote access に引き継ぎません。
 
-remote profile に `without_sandbox` は出ません。通常 session は filesystem containment を維持し、ordinary command は `ask` では network 無効のまま、既定の `agent` では network-enabled development profile を使います。既定の `agent` は検証済み structured operation の Temote 側 approval prompt だけを省略し、tool 固有 validation、integration の authentication、sandbox 境界は引き続き有効です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。
+remote profile には session-bound な delegation/discovery tool のみ公開し、直接の command・file・Git・integration tool はありません。通常 session は filesystem containment を維持し、delegated child work は `ask` では network 無効、既定の `agent` では network-enabled development profile の session sandbox で動きます。既定の `agent` は検証済み structured operation の Temote 側 approval prompt だけを省略し、tool 固有 validation、integration の authentication、sandbox 境界は引き続き有効です。公開 HTTP authentication は identity boundary であり、Temote の session / sandbox / approval boundary の代替ではありません。
 
 ## リモートアップグレードと再接続
 

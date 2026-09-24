@@ -678,51 +678,16 @@ fn supervisor_session_lifecycle_survives_console_eof_and_records_crash() {
         canonical_project
     );
 
-    let pwd = tool_json(&client.tool_call(
-        "execute",
-        json!({
-            "session_id": session_id,
-            "command": ["pwd"],
-        }),
-    ));
-    assert_eq!(pwd["exit_code"], 0);
-    assert_eq!(
-        pwd["stdout"].as_str().unwrap().trim(),
-        canonical_project.to_string_lossy()
-    );
+    let jobs = tool_json(&client.tool_call("job_list", json!({"session_id": session_id})));
+    assert!(jobs["jobs"].is_array(), "{jobs}");
 
-    let git_status = tool_json(&client.tool_call(
-        "execute",
-        json!({
-            "session_id": session_id,
-            "command": ["git", "status", "--short"],
-        }),
-    ));
-    assert_eq!(git_status["exit_code"], 0);
-    assert!(
-        git_status["stdout"]
-            .as_str()
-            .unwrap()
-            .lines()
-            .any(|line| line == "?? marker.txt"),
-        "git did not observe the fixture through the session: {git_status}"
-    );
-
-    let outside_cwd = state.path().to_path_buf();
-    assert_ne!(fs::canonicalize(&outside_cwd).unwrap(), canonical_project);
     let rejected = client.tool_call(
-        "execute",
-        json!({
-            "session_id": session_id,
-            "command": ["pwd"],
-            "cwd": outside_cwd,
-        }),
+        "stop_job",
+        json!({"session_id": session_id, "job_id": "missing-job"}),
     );
     assert!(
-        rejected["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("outside the permitted sandbox roots")),
-        "outside cwd was not rejected: {rejected}"
+        rejected["error"]["message"].as_str().is_some(),
+        "unknown job cancellation was not rejected: {rejected}"
     );
 
     let stop_legacy = run_cli(

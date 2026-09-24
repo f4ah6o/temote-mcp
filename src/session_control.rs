@@ -1786,13 +1786,11 @@ async fn handle_upgrade_request(
         .arg("supervisor")
         .arg("--restore-plan")
         .arg(&plan_path);
-    let _exec_credential_handoff = environment.apply_to_command(&mut command)?;
+    environment.apply_to_command(&mut command)?;
     if let Some(locator) = installed_locator {
         command.env(INTERNAL_INSTALLED_LOCATOR_ENV, locator);
     }
     let exec_error = command.exec();
-    #[cfg(target_os = "linux")]
-    drop(_exec_credential_handoff);
 
     let rollback = supervisor.rollback_upgrade(&plan, true).await;
     let _ = remove_upgrade_plan(&plan_path);
@@ -4723,58 +4721,6 @@ mod tests {
         let _ = tokio::fs::remove_file(config::socket_path(id).unwrap()).await;
         let _ = tokio::fs::remove_file(config::session_path(id).unwrap()).await;
         let _ = tokio::fs::remove_file(config::session_lifecycle_path(id).unwrap()).await;
-    }
-
-    #[tokio::test]
-    async fn captured_start_environment_is_session_scoped_and_not_persisted() {
-        let (_temp, roots) = fixture();
-        let (supervisor, _approvals) = SessionSupervisor::new(roots);
-        let id = format!("captured-env-{}", uuid::Uuid::new_v4());
-        let secret = "credential-sentinel-not-for-disk";
-        let environment = CapturedStartEnvironment::from_values(BTreeMap::from([
-            (
-                "KINTONE_BASE_URL".to_owned(),
-                "https://example.cybozu.com".to_owned(),
-            ),
-            ("KINTONE_USERNAME".to_owned(), "user".to_owned()),
-            ("KINTONE_PASSWORD".to_owned(), secret.to_owned()),
-            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_default()),
-            ("HOME".to_owned(), std::env::var("HOME").unwrap_or_default()),
-        ]))
-        .unwrap();
-        assert!(!format!("{environment:?}").contains(secret));
-
-        supervisor
-            .start_with_environment("src/repo", Some(&id), environment)
-            .await
-            .unwrap();
-
-        let mcp_status = approvals::kintone_mcp_status(&id).await.unwrap();
-        assert_eq!(mcp_status["configured"], true);
-        assert_eq!(mcp_status["auth_mode"], "password");
-        let cli_status = approvals::kintone_cli_status(&id).await.unwrap();
-        assert_eq!(cli_status["configured"], true);
-        assert_eq!(cli_status["auth_mode"], "password");
-
-        let metadata = tokio::fs::read_to_string(config::session_path(&id).unwrap())
-            .await
-            .unwrap();
-        let lifecycle = tokio::fs::read_to_string(config::session_lifecycle_path(&id).unwrap())
-            .await
-            .unwrap();
-        assert!(!metadata.contains(secret));
-        assert!(!lifecycle.contains(secret));
-
-        supervisor.shutdown().await.unwrap();
-        cleanup(&id).await;
-
-        assert!(
-            CapturedStartEnvironment::from_values(BTreeMap::from([(
-                "LD_PRELOAD".to_owned(),
-                "not-allowlisted".to_owned(),
-            )]))
-            .is_err()
-        );
     }
 
     #[tokio::test]

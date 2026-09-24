@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Temote MCP は、手元のファイル・コマンド・一部のホスト連携を MCP ツールとして公開し、通常セッションではサンドボックスとローカル承認を維持する MCP サーバーです。
+Temote MCP は、local 側の coding agent が machine を操作するための MCP サーバーです。作業は明示的で sandboxed・承認管理された session 内の task backend（Codex app-server、`opencode serve`、Devin ACP、Devin Cloud API、構造化 local agent broker）へ委譲し、結果は bounded な evidence として読み戻します。
 
 ## インストール
 
@@ -122,7 +122,6 @@ gh skill install f4ah6o/temote-mcp temote-mcp --scope user
 - [session と tool の使い方](docs/usage.ja.md)
 - [managed session と named root](docs/managed-sessions.ja.md)
 - [remote connection profile: Cloudflare / Tailscale / OpenAI Secure MCP Tunnel](docs/public-http.ja.md)
-- [1Password / kintone 連携](docs/integrations.ja.md)
 - [multi-host Cloudflare gateway](docs/gateway.ja.md)
 - [Linux sandbox と crates.io packaging](docs/linux-sandbox.ja.md)
 - [build / test / release](docs/development.md)
