@@ -18,7 +18,7 @@ use crate::line_protocol::{
 use crate::opencode_server;
 use crate::{
     activity_runtime, apply_patch, approvals, checkpoints, child_env, codex_app_server, config,
-    dev_tool, evidence, friction, local_agent, managed_worktree, onepassword_cli, onepassword_mcp,
+    dev_tool, evidence, friction, managed_worktree, onepassword_cli, onepassword_mcp,
     onepassword_sdk, recall, sandbox, session_control, session_control::SessionBackend,
     work_handoff,
 };
@@ -60,7 +60,6 @@ const GIT_PULL_UPSTREAM_CONFIGURATION_ERROR: &str =
 const GIT_PUSH_REMOTE_CONFIGURATION_ERROR: &str = "Git push remote configuration is unavailable";
 const GIT_REMOTE_DESTINATION_ERROR: &str = "Git remote destination is unavailable";
 const GIT_REMOTE_DEFAULT_BRANCH_ERROR: &str = "Git remote default branch is unavailable";
-const GIT_REMOTE_TRACKING_REF_ERROR: &str = "Git remote-tracking ref is unavailable or invalid; fetch and inspect the configured remote branch before retrying";
 const GIT_REMOTE_PROTECTION_POLICY_ERROR: &str =
     "Git remote branch protection policy is unavailable";
 const GITHUB_CREDENTIAL_MAPPING_ERROR: &str = "GitHub repository credential mapping is unavailable; configure the repository-local mapping (`git config --local credential.helper '' && git config --local --add credential.helper '!gh git credential --managed' && git config --local credential.useHttpPath true`; see docs/usage.md) or request the ambient_git_credentials session grant via session_permission_request";
@@ -236,11 +235,6 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         "devin_cloud_task_control",
         ActivityOperation::DevinCloudTaskControl,
         "Devin Cloud control acceptance",
-    ),
-    activity_job_tool(
-        "local_agent_run",
-        ActivityOperation::LocalAgentRun,
-        "fake local agent worker",
     ),
     activity_job_tool(
         "dev_tool_run",
@@ -1112,44 +1106,6 @@ fn work_handoff_input_schema() -> Value {
     })
 }
 
-fn local_agent_input_schema() -> Value {
-    json!({
-        "type":"object",
-        "properties":{
-            "session_id":{"type":"string"},
-            "agent":{"type":"string","enum":["codex","opencode"]},
-            "task":{"type":"string","minLength":1,"maxLength":local_agent::MAX_TASK_BYTES},
-            "cwd":{"type":"string"},
-            "worktree":{
-                "type":"object",
-                "properties":{
-                    "branch":{"type":"string","minLength":1,"maxLength":MAX_GIT_BRANCH_NAME_BYTES},
-                    "task":{"type":"string","minLength":1,"maxLength":managed_worktree::MAX_MANAGED_TASK_BYTES}
-                },
-                "required":["branch"],
-                "additionalProperties":false
-            },
-            "access":{"type":"string","enum":["read_only","workspace_write"]},
-            "model":{"type":"string","minLength":1,"maxLength":256},
-            "effort":{"type":"string","minLength":1,"maxLength":128},
-            "profile":{"type":"string","minLength":1,"maxLength":128}
-        },
-        "required":["session_id","agent","task","access"],
-        "additionalProperties":false,
-        "allOf":[
-            {
-                "if":{
-                    "properties":{"agent":{"const":"opencode"}},
-                    "required":["agent"]
-                },
-                "then":{
-                    "properties":{"task":{"maxLength":local_agent::MAX_OPENCODE_TASK_BYTES}}
-                }
-            }
-        ]
-    })
-}
-
 fn dev_tool_input_schema() -> Value {
     json!({
         "type":"object",
@@ -1192,7 +1148,6 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"devin_cloud_task_start","title":"Start a Devin Cloud session task","description":"Accept an idempotent scoped Devin Cloud task mutation, persist acceptance before the remote side effect, then create a hosted Devin session (API v3) with a structured report schema. The session runs on Devin Cloud, not on this host; operation_id is mandatory.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"title":{"type":"string","minLength":1,"maxLength":256},"devin_mode":{"type":"string","enum":["normal","fast","lite","ultra","fusion","swe-2-medium","swe-2-high","swe-2-max"]},"repos":{"type":"array","items":{"type":"string","minLength":1,"maxLength":256},"maxItems":16},"max_acu_limit":{"type":"integer","minimum":1,"maximum":100000}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
         {"name":"devin_cloud_task_get","title":"Read a Devin Cloud session task","description":"Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"devin_cloud_task_control","title":"Control a Devin Cloud session task","description":"Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
-        {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy. With worktree.branch, Temote binds the run to the selected repository's managed worktree (<configured src root>/worktrees/<repo>/<task>) and derives the path itself: it reuses only a verified managed worktree of that repository and branch, otherwise creates one through the approved path, and rejects cwd combined with worktree.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
         {"name":"dev_tool_run","title":"Run a structured developer tool operation","description":"Run a validated Cargo, Vite+, uv, npm, pnpm, or Go operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. Package-manager operations use a narrow fixed subcommand contract and do not expose arbitrary executables or raw host commands. Optional env entries are admitted only when every name is covered by a granted dev_tool_env_prefixes session grant; broker-set variables cannot be overridden.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":dev_tool_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
         {"name":"list_directory","title":"List a local directory","description":"List up to 10,000 entries from a local directory, with at most 1 MiB of rendered names. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"}},"required":["session_id","path"],"additionalProperties":false}},
@@ -1279,25 +1234,6 @@ async fn call_tool(
     params: &Value,
     public: bool,
     sessions: Option<&SessionBackend>,
-) -> Result<Value> {
-    call_tool_with_local_agent_executable(params, public, sessions, None).await
-}
-
-#[cfg(test)]
-async fn call_tool_with_test_local_agent_executable(
-    params: &Value,
-    public: bool,
-    sessions: Option<&SessionBackend>,
-    executable: &Path,
-) -> Result<Value> {
-    call_tool_with_local_agent_executable(params, public, sessions, Some(executable)).await
-}
-
-async fn call_tool_with_local_agent_executable(
-    params: &Value,
-    public: bool,
-    sessions: Option<&SessionBackend>,
-    local_agent_executable: Option<&Path>,
 ) -> Result<Value> {
     let name = params
         .get("name")
@@ -1624,9 +1560,6 @@ async fn call_tool_with_local_agent_executable(
                 text_result(serde_json::to_string_pretty(
                     &crate::devin_cloud::task_control(&args, &session).await?,
                 )?)
-            }
-            "local_agent_run" => {
-                local_agent_run(&args, &session, local_agent_executable, activity.clone()).await
             }
             "dev_tool_run" => dev_tool_run(&args, &session, activity.clone()).await,
             "list_directory" => {
@@ -3406,8 +3339,7 @@ async fn git_fetch(
 }
 
 /// Runs the validated `fetch --prune` contract and returns the raw process
-/// outcome. Shared by the structured `git_fetch` tool and the local-agent Git
-/// broker so both surfaces use exactly one authority.
+/// outcome.
 pub(crate) async fn git_fetch_output(
     session: &config::Session,
     cwd: PathBuf,
@@ -3442,8 +3374,7 @@ async fn git_pull(
 }
 
 /// Runs the validated `pull --ff-only` contract and returns the raw process
-/// outcome. Shared by the structured `git_pull` tool and the local-agent Git
-/// broker.
+/// outcome.
 pub(crate) async fn git_pull_output(
     session: &config::Session,
     cwd: PathBuf,
@@ -3794,8 +3725,7 @@ async fn git_push(
 }
 
 /// Runs the validated current-branch push contract and returns the raw process
-/// outcome. Shared by the structured `git_push` tool and the local-agent Git
-/// broker. Force, refspecs and arbitrary URLs stay unavailable.
+/// outcome. Force, refspecs and arbitrary URLs stay unavailable.
 pub(crate) async fn git_push_output(
     session: &config::Session,
     cwd: PathBuf,
@@ -4130,17 +4060,6 @@ async fn git_branch_delete(
     run_git_branch_delete_and_report(session, pinned, branch, activity).await
 }
 
-/// Runs the structured merged-only branch deletion for the local-agent shim.
-/// The shim supplies no alternate command shape or mutation path; this remains
-/// the same approval, worktree-ownership, recheck, and pinned mutation path as
-/// the structured MCP operation.
-pub(crate) async fn git_branch_delete_for_shim(
-    session: &config::Session,
-    branch: &str,
-) -> Result<Value> {
-    git_branch_delete(&json!({"branch": branch}), session, None).await
-}
-
 async fn git_remote_branch_delete(
     args: &Value,
     session: &config::Session,
@@ -4174,92 +4093,6 @@ async fn git_remote_branch_delete(
         activity,
     )
     .await
-}
-
-/// Runs the ordinary local-agent remote-delete form. The request cwd has
-/// already been validated by the broker; derive the repository root from that
-/// cwd here so nested directories remain valid without allowing the caller to
-/// pair an unrelated root path with a pinned repository.
-pub(crate) async fn git_remote_branch_delete_for_shim(
-    session: &config::Session,
-    cwd: &Path,
-    remote: &str,
-    branch: &str,
-    activity: Option<&ActivityScope>,
-) -> Result<Value> {
-    let repository_root = sandbox::git_worktree_root(cwd)?;
-    config::ensure_permitted(session, &repository_root)
-        .context("Git repository root must be inside a permitted session root")?;
-    let pinned = sandbox::pin_git_repository(&repository_root)?;
-    let expected_remote_sha =
-        resolve_git_remote_tracking_sha_pinned(&pinned, remote, branch).await?;
-    git_remote_branch_delete_with_pinned_repository(
-        session,
-        &pinned,
-        &repository_root,
-        remote,
-        branch,
-        &expected_remote_sha,
-        activity,
-    )
-    .await
-}
-
-/// Resolves the exact fetch-established remote-tracking ref used as the
-/// ordinary shim push-delete lease. This intentionally never contacts the
-/// remote: the tracking ref is the local review snapshot, and every failure is
-/// reduced to one bounded instruction to fetch and inspect before retrying.
-pub(crate) async fn resolve_git_remote_tracking_sha_pinned(
-    pinned: &sandbox::PinnedGitRepository,
-    remote: &str,
-    branch: &str,
-) -> Result<String> {
-    validate_git_remote(remote).map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
-    validate_git_branch_name_pinned(pinned, branch)
-        .await
-        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
-    let tracking_ref = format!("refs/remotes/{remote}/{branch}");
-    let output = run_pinned_git_inspection(
-        pinned,
-        &[
-            "git".to_owned(),
-            "show-ref".to_owned(),
-            "--verify".to_owned(),
-            "--hash".to_owned(),
-            tracking_ref,
-        ],
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
-    let sha = parse_git_remote_tracking_sha(&output)
-        .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
-    let object = run_pinned_git_inspection(
-        pinned,
-        &[
-            "git".to_owned(),
-            "cat-file".to_owned(),
-            "-e".to_owned(),
-            format!("{sha}^{{object}}"),
-        ],
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!(GIT_REMOTE_TRACKING_REF_ERROR))?;
-    anyhow::ensure!(
-        object.status == 0 && !object.truncated,
-        GIT_REMOTE_TRACKING_REF_ERROR
-    );
-    Ok(sha)
-}
-
-fn parse_git_remote_tracking_sha(output: &sandbox::Output) -> Result<String> {
-    anyhow::ensure!(output.status == 0 && !output.truncated);
-    let value = output
-        .stdout
-        .strip_suffix('\n')
-        .context("missing SHA line")?;
-    anyhow::ensure!(!value.is_empty() && !value.contains(['\n', '\r']));
-    validate_git_object_id(value, "remote-tracking SHA")?;
-    Ok(value.to_ascii_lowercase())
 }
 
 /// Deletes one exact remote branch using a repository descriptor pinned by the
@@ -4620,88 +4453,6 @@ async fn git_worktree_create(
 }
 
 /// One verified managed worktree bound to a session request.
-///
-/// The repository identity, target, task and branch are pinned from Temote's
-/// own canonical resolution; no caller-supplied path participates.
-#[derive(Clone, Debug)]
-pub(crate) struct ManagedWorktreeBinding {
-    repository: managed_worktree::ManagedRepository,
-    target: PathBuf,
-    branch: String,
-}
-
-impl ManagedWorktreeBinding {
-    fn repository_name(&self) -> &str {
-        self.repository.repository_name()
-    }
-
-    fn repository_root(&self) -> &Path {
-        self.repository.primary_checkout()
-    }
-
-    fn workspace_root(&self) -> &Path {
-        &self.target
-    }
-
-    /// Derives the sandbox session for this run.
-    ///
-    /// The selected session already permits the repository's canonical
-    /// checkout (`managed_repository_for_requested`). The only addition is the
-    /// validated managed worktree this run is bound to, so ordinary session
-    /// tools keep their exact on-disk scope and no caller-supplied path can
-    /// widen it.
-    fn run_session(&self, session: &config::Session) -> config::Session {
-        let mut run = session.clone();
-        if !run
-            .permitted_directories
-            .iter()
-            .any(|root| self.target == *root || self.target.starts_with(root))
-        {
-            run.permitted_directories.push(self.target.clone());
-            run.permitted_directories.sort();
-            run.permitted_directories.dedup();
-        }
-        run
-    }
-
-    /// Re-derives and re-verifies this binding from the configured `src` root
-    /// and returns the canonical repository identity that was validated.
-    ///
-    /// Used immediately before a local agent launch so neither the pre-run
-    /// resolution nor model prompt compliance is the enforcement mechanism.
-    /// The returned identity is carried to the Git broker and the sandbox
-    /// launch, which fail closed unless they re-observe exactly this identity.
-    fn revalidate(&self, src_root: &Path) -> Result<sandbox::WorkspaceRepositoryIdentity> {
-        let repository =
-            managed_worktree::ManagedRepository::resolve(self.repository_root(), src_root)?;
-        anyhow::ensure!(
-            repository.repository_name() == self.repository_name(),
-            "managed worktree repository identity changed while approval was pending"
-        );
-        let selected_common_dir = sandbox::git_common_dir(self.repository_root())?;
-        managed_worktree::verify_reusable_managed_worktree(
-            &repository,
-            &self.target,
-            &self.branch,
-            &selected_common_dir,
-            self.repository_root(),
-        )?;
-        let expected = sandbox::WorkspaceRepositoryIdentity::for_workspace(&self.target)
-            .context("managed worktree target is no longer a supported Git worktree root")?;
-        anyhow::ensure!(
-            expected.worktree_root == self.target,
-            "managed worktree target is no longer the validated direct child: {}",
-            self.target.display()
-        );
-        anyhow::ensure!(
-            expected.common_dir == selected_common_dir
-                && expected.primary_checkout == self.repository_root(),
-            "managed worktree repository identity changed while approval was pending"
-        );
-        Ok(expected)
-    }
-}
-
 async fn git_worktree_create_in_src_root(
     args: &Value,
     session: &config::Session,
@@ -4721,7 +4472,7 @@ async fn git_worktree_create_in_src_root(
         Some(value) => Some(value.as_str().context("repository must be a string")?),
         None => None,
     };
-    let (_, value) = create_managed_worktree(
+    create_managed_worktree(
         session,
         src_root,
         branch,
@@ -4729,12 +4480,11 @@ async fn git_worktree_create_in_src_root(
         requested_repository,
         activity,
     )
-    .await?;
-    Ok(value)
+    .await
 }
 
 /// Creates one managed worktree through the approved host-side path and returns
-/// the verified binding plus the tool result document.
+/// the tool result document.
 ///
 /// Every pre-approval step is read-only, the caller can never supply a path,
 /// and the created target is re-verified against the trusted managed root and
@@ -4746,7 +4496,7 @@ pub(crate) async fn create_managed_worktree(
     task: Option<&str>,
     requested_repository: Option<&str>,
     activity: Option<&ActivityScope>,
-) -> Result<(ManagedWorktreeBinding, Value)> {
+) -> Result<Value> {
     let cwd = config::resolve_cwd(session, None)?;
     let repository =
         managed_repository_for_requested(requested_repository, session, &cwd, src_root)?;
@@ -4851,7 +4601,7 @@ async fn run_managed_git_worktree_create_and_report(
     branch: String,
     command: Vec<String>,
     activity: Option<&ActivityScope>,
-) -> Result<(ManagedWorktreeBinding, Value)> {
+) -> Result<Value> {
     let rendered_command = render_command(&command);
     approvals::activity(
         &session.id,
@@ -4918,13 +4668,7 @@ async fn run_managed_git_worktree_create_and_report(
         Err(error) => Err(error),
     };
     report_command_finished(session.id.clone(), "git", &rendered_command, &result).await;
-    let value = text_result(result?)?;
-    let binding = ManagedWorktreeBinding {
-        repository,
-        target,
-        branch,
-    };
-    Ok((binding, value))
+    text_result(result?)
 }
 
 async fn git_worktree_list(
@@ -7406,8 +7150,8 @@ fn bounded_github_html_url(value: Option<&Value>) -> Result<&str> {
 
 // --- Bounded GitHub pull-request broker -------------------------------------
 //
-// The local agent may only list open pull requests, read one exact pull
-// request, and close one exact pull request for the repository resolved from a
+// Only open pull requests may be listed, one exact pull request read, and one
+// exact pull request closed for the repository resolved from a
 // configured GitHub remote. There is no caller-supplied repository, path,
 // query, method or header: every request is built here from a fixed shape, and
 // every response is reduced to bounded, secret-free fields.
@@ -8340,8 +8084,8 @@ fn resolve_git_add_path(session: &config::Session, path: &str) -> Result<String>
     Ok(validate_git_path(session, path)?.display().to_string())
 }
 
-/// Bounded, option-free Git path syntax shared by the structured `git_add`
-/// tool and the local-agent Git broker.
+/// Bounded, option-free Git path syntax used by the structured `git_add`
+/// tool.
 pub(crate) fn validate_git_path_syntax(path: &str) -> Result<()> {
     validate_path_argument(path, "Git path")?;
     anyhow::ensure!(!path.is_empty(), "Git path must not be empty");
@@ -8356,8 +8100,7 @@ pub(crate) fn validate_git_path_syntax(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Commit message bounds shared by the structured `git_commit` tool and the
-/// local-agent Git broker.
+/// Commit message bounds used by the structured `git_commit` tool.
 pub(crate) fn validate_git_commit_message(message: &str) -> Result<()> {
     anyhow::ensure!(!message.trim().is_empty(), "message must not be empty");
     anyhow::ensure!(
@@ -8590,324 +8333,6 @@ async fn start_command(
     .await
 }
 
-/// Resolves the optional managed-worktree workspace for one `local_agent_run`.
-///
-/// The caller supplies only an existing local branch and an optional task name;
-/// Temote derives the managed path, reuses only a verified managed worktree of
-/// the selected repository and branch, and otherwise creates one through the
-/// approved `git_worktree_create` path. A caller-supplied `cwd` together with
-/// `worktree` is rejected, so no request can inject a path around the managed
-/// workspace authority.
-async fn local_agent_managed_worktree_binding(
-    args: &Value,
-    session: &config::Session,
-    activity: Option<&ActivityScope>,
-) -> Result<Option<ManagedWorktreeBinding>> {
-    if args.get("worktree").is_none() {
-        return Ok(None);
-    }
-    let src_root = configured_src_root()?;
-    local_agent_managed_worktree_binding_with_src_root(args, session, &src_root, activity).await
-}
-
-async fn local_agent_managed_worktree_binding_with_src_root(
-    args: &Value,
-    session: &config::Session,
-    src_root: &Path,
-    activity: Option<&ActivityScope>,
-) -> Result<Option<ManagedWorktreeBinding>> {
-    let Some(request) = args.get("worktree") else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        args.get("cwd").is_none(),
-        "local_agent_run accepts cwd or worktree, not both; the managed worktree path is always derived by Temote"
-    );
-    let request = request.as_object().context("worktree must be an object")?;
-    anyhow::ensure!(
-        request
-            .keys()
-            .all(|key| matches!(key.as_str(), "branch" | "task")),
-        "worktree accepts only branch and task"
-    );
-    let branch = request
-        .get("branch")
-        .and_then(Value::as_str)
-        .context("worktree.branch is required")?;
-    let task = match request.get("task") {
-        Some(value) => Some(value.as_str().context("worktree.task must be a string")?),
-        None => None,
-    };
-
-    let cwd = config::resolve_cwd(session, None)?;
-    let repository = managed_repository_for_requested(None, session, &cwd, src_root)?;
-    validate_git_branch_name(session, repository.primary_checkout(), branch).await?;
-    ensure_local_branch_exists(session, repository.primary_checkout(), branch).await?;
-    let task = match task {
-        Some(task) => task.to_owned(),
-        None => managed_worktree::derive_task_name(branch)?,
-    };
-    let target = repository.target(&task)?;
-
-    if std::fs::symlink_metadata(&target).is_ok() {
-        // Reuse is allowed only for the selected repository's own managed
-        // worktree on the requested branch. Legacy, wrong-repository or
-        // wrong-branch targets fail closed instead of being adopted.
-        let selected_common_dir = sandbox::git_common_dir(repository.primary_checkout())?;
-        managed_worktree::verify_reusable_managed_worktree(
-            &repository,
-            &target,
-            branch,
-            &selected_common_dir,
-            repository.primary_checkout(),
-        )
-        .context("the existing managed worktree target cannot be reused")?;
-        return Ok(Some(ManagedWorktreeBinding {
-            repository,
-            target,
-            branch: branch.to_owned(),
-        }));
-    }
-
-    let (binding, _) =
-        create_managed_worktree(session, src_root, branch, Some(&task), None, activity).await?;
-    Ok(Some(binding))
-}
-
-async fn local_agent_run(
-    args: &Value,
-    session: &config::Session,
-    executable: Option<&Path>,
-    activity: Option<ActivityScope>,
-) -> Result<Value> {
-    local_agent_run_with_src_root(args, session, executable, activity, None).await
-}
-
-async fn local_agent_run_with_src_root(
-    args: &Value,
-    session: &config::Session,
-    executable: Option<&Path>,
-    activity: Option<ActivityScope>,
-    src_root: Option<&Path>,
-) -> Result<Value> {
-    local_agent_run_with_src_root_at_boundary(args, session, executable, activity, src_root, || {})
-        .await
-}
-
-/// Internal variant of [`local_agent_run_with_src_root`] used by the
-/// launch-boundary regression tests.
-///
-/// `boundary` runs after the final managed-worktree identity validation has
-/// been attached to the prepared run and before the local agent task is
-/// spawned. Production always passes a no-op; the callback observes the same
-/// authority state, so it cannot bypass or weaken any validation.
-async fn local_agent_run_with_src_root_at_boundary<F>(
-    args: &Value,
-    session: &config::Session,
-    executable: Option<&Path>,
-    activity: Option<ActivityScope>,
-    src_root: Option<&Path>,
-    boundary: F,
-) -> Result<Value>
-where
-    F: FnOnce(),
-{
-    let binding = match src_root {
-        Some(src_root) => {
-            local_agent_managed_worktree_binding_with_src_root(
-                args,
-                session,
-                src_root,
-                activity.as_ref(),
-            )
-            .await?
-        }
-        None => local_agent_managed_worktree_binding(args, session, activity.as_ref()).await?,
-    };
-    let effective_args = match &binding {
-        Some(binding) => {
-            let mut value = args.clone();
-            if let Some(object) = value.as_object_mut() {
-                object.remove("worktree");
-                object.insert(
-                    "cwd".to_owned(),
-                    json!(binding.workspace_root().to_string_lossy().into_owned()),
-                );
-            }
-            value
-        }
-        None => args.clone(),
-    };
-    // The managed binding adds exactly the validated workspace root to this
-    // run's sandbox session; the on-disk session keeps its own scope.
-    let run_session = match &binding {
-        Some(binding) => binding.run_session(session),
-        None => session.clone(),
-    };
-    let mut prepared = match executable {
-        Some(executable) => {
-            local_agent::prepare_with_executable(&effective_args, &run_session, executable)?
-        }
-        None => local_agent::prepare(&effective_args, &run_session)?,
-    };
-    if approvals::local_approval(
-        session.permission_mode,
-        approvals::ApprovalClass::LocalAgent,
-    ) != approvals::LocalApproval::Skip
-    {
-        let detail = prepared.approval_detail();
-        approvals::ensure_approval_detail_fits(&detail)?;
-        let approved = approvals::ensure_local_approval_with_activity(
-            session,
-            approvals::ApprovalClass::LocalAgent,
-            "local_agent_run",
-            detail,
-            prepared.cwd.clone(),
-            prepared.approval_metadata(),
-            activity.as_ref(),
-        )
-        .await?;
-        if !approved {
-            if let Some(activity) = &activity {
-                let _ = activity
-                    .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
-            }
-            anyhow::bail!("user denied local_agent_run");
-        }
-    }
-
-    let current_session = config::load_session(&session.id).await?;
-    anyhow::ensure!(
-        current_session.started_at == session.started_at
-            && current_session.process_id == session.process_id,
-        "session instance changed while local agent approval was pending"
-    );
-    // The on-disk session must keep its exact scope; only this run's derived
-    // session may include the validated managed workspace root.
-    anyhow::ensure!(
-        current_session.cwd == session.cwd
-            && current_session.permitted_directories == session.permitted_directories,
-        "session workspace changed while local agent approval was pending"
-    );
-    match executable {
-        Some(executable) => prepared.revalidate_with_executable(&run_session, executable)?,
-        None => prepared.revalidate(&run_session)?,
-    }
-    if let Some(binding) = &binding {
-        anyhow::ensure!(
-            prepared.cwd == binding.workspace_root(),
-            "local agent workspace changed while approval was pending"
-        );
-        let src_root = match src_root {
-            Some(src_root) => src_root.to_path_buf(),
-            None => configured_src_root()?,
-        };
-        let expected_identity = binding.revalidate(&src_root)?;
-        prepared.bind_managed_worktree_identity(expected_identity)?;
-    }
-    // The broker and the sandbox launch compare against the identity above,
-    // so the final validation and the actual spawn target cannot diverge into
-    // a different repository that happens to live at the same path.
-    boundary();
-    let (description, mut handle, completion) =
-        spawn_local_agent(prepared, &current_session, activity).await?;
-    match tokio::time::timeout(FOREGROUND_TIMEOUT, &mut handle).await {
-        Ok(joined) => {
-            joined.context("local agent task failed")?;
-            let result = completion
-                .lock()
-                .unwrap()
-                .result
-                .clone()
-                .context("local agent task completed without a cached result")?;
-            cached_job_result(result, OutputPolicy::default())
-        }
-        Err(_) => {
-            store_job(
-                session,
-                description,
-                handle,
-                completion,
-                OutputPolicy::default(),
-                "Backgrounded",
-            )
-            .await
-        }
-    }
-}
-
-async fn spawn_local_agent(
-    prepared: local_agent::PreparedRun,
-    session: &config::Session,
-    activity: Option<ActivityScope>,
-) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)> {
-    spawn_local_agent_with_controls(
-        prepared,
-        session,
-        activity,
-        wait_for_session_stop(session.id.clone()),
-        MAX_JOB_LIFETIME,
-    )
-    .await
-}
-
-async fn spawn_local_agent_with_controls<F>(
-    prepared: local_agent::PreparedRun,
-    session: &config::Session,
-    activity: Option<ActivityScope>,
-    session_stop: F,
-    max_lifetime: Duration,
-) -> Result<(String, JoinHandle<()>, Arc<Mutex<JobCompletion>>)>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let slot = reserve_job_slot_for_cwd(&session.id, &prepared.cwd).await?;
-    let description = prepared.activity_label();
-    approvals::activity(&session.id, format!("Running {description}"), None).await;
-    if let Some(activity) = &activity {
-        let _ = activity.running();
-    }
-    let session_id = session.id.clone();
-    let evidence_scope = session.cwd.clone();
-    let activity_label = description.clone();
-    let completion = Arc::new(Mutex::new(JobCompletion {
-        activity,
-        ..JobCompletion::default()
-    }));
-    let task_completion = Arc::clone(&completion);
-    let handle = tokio::spawn(async move {
-        let (result, outcome) = tokio::select! {
-            result = local_agent::run(prepared) => {
-                let result = render_local_agent_result(result);
-                let outcome = if result.is_ok() {
-                    JobActivityOutcome::Completed
-                } else {
-                    JobActivityOutcome::Failed(JobActivityFailure::ChildFailed)
-                };
-                (result, outcome)
-            }
-            _ = session_stop => {
-                (
-                    Err(anyhow::anyhow!("session stopped; local agent job cancelled")),
-                    JobActivityOutcome::Cancelled(ActivityCancellationReason::SessionStopped),
-                )
-            }
-            _ = tokio::time::sleep(max_lifetime) => {
-                (
-                    Err(anyhow::anyhow!("local agent job exceeded the two-hour lifetime limit")),
-                    JobActivityOutcome::Cancelled(ActivityCancellationReason::Timeout),
-                )
-            }
-        };
-        let cached = cache_job_result(&result, &session_id, &evidence_scope);
-        finish_job_completion(&task_completion, cached, outcome);
-        drop(slot);
-        reap_jobs();
-        report_local_agent_finished(session_id, activity_label, &result).await;
-    });
-    Ok((description, handle, completion))
-}
-
 async fn dev_tool_run(
     args: &Value,
     session: &config::Session,
@@ -9047,7 +8472,7 @@ where
         finish_job_completion(&task_completion, cached, outcome);
         drop(slot);
         reap_jobs();
-        report_local_agent_finished(session_id, activity_label, &result).await;
+        report_job_finished(session_id, activity_label, &result).await;
     });
     Ok((description, handle, completion))
 }
@@ -10004,16 +9429,12 @@ async fn report_command_finished(
     approvals::activity(&session_id, format!("Ran {command}"), detail).await;
 }
 
-async fn report_local_agent_finished(
-    session_id: String,
-    activity_label: String,
-    result: &Result<String>,
-) {
+async fn report_job_finished(session_id: String, activity_label: String, result: &Result<String>) {
     if result.is_err() {
         friction::record_observed_for_session_id(
             &session_id,
             friction::FrictionKind::ExecuteFailed,
-            Some("local_agent_run"),
+            Some("dev_tool_run"),
             None,
             friction::EventOutcome::Failed,
         )
@@ -10088,77 +9509,6 @@ fn render_output(output: sandbox::Output) -> Result<String> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LocalAgentFailureClass {
-    RunnerSpawnFailed,
-    SandboxSetupFailed,
-    AgentChildProcessDenied,
-    AgentNonzeroExit,
-}
-
-impl LocalAgentFailureClass {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::RunnerSpawnFailed => "runner_spawn_failed",
-            Self::SandboxSetupFailed => "sandbox_setup_failed",
-            Self::AgentChildProcessDenied => "agent_child_process_denied",
-            Self::AgentNonzeroExit => "agent_nonzero_exit",
-        }
-    }
-}
-
-fn local_agent_output_failure_class(output: &sandbox::Output) -> Option<LocalAgentFailureClass> {
-    if output.status == 0 {
-        return None;
-    }
-    let child_spawn_denied = [
-        "EPERM : failed to spawn process",
-        "Failed to create unified exec process: Operation not permitted",
-    ]
-    .iter()
-    .any(|sentinel| output.stderr.contains(sentinel) || output.stdout.contains(sentinel));
-    Some(if child_spawn_denied {
-        LocalAgentFailureClass::AgentChildProcessDenied
-    } else {
-        LocalAgentFailureClass::AgentNonzeroExit
-    })
-}
-
-fn render_local_agent_result(result: Result<sandbox::Output>) -> Result<String> {
-    match result {
-        Ok(output) => {
-            let failure_class = local_agent_output_failure_class(&output);
-            let text = json!({
-                "exit_code": output.status,
-                "stdout": output.stdout,
-                "stderr": output.stderr,
-                "truncated": output.truncated,
-                "failure_class": failure_class.map(LocalAgentFailureClass::as_str),
-            })
-            .to_string();
-            if output.status == 0 {
-                Ok(text)
-            } else {
-                anyhow::bail!(text)
-            }
-        }
-        Err(error) => {
-            let failure_class = if sandbox::is_local_agent_spawn_error(&error) {
-                LocalAgentFailureClass::RunnerSpawnFailed
-            } else {
-                LocalAgentFailureClass::SandboxSetupFailed
-            };
-            anyhow::bail!(
-                json!({
-                    "failure_class": failure_class.as_str(),
-                    "error": "local agent failed before a child result was available",
-                })
-                .to_string()
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10203,61 +9553,6 @@ mod tests {
             text: text.into(),
             evidence: None,
         }
-    }
-
-    #[test]
-    fn local_agent_failure_classifies_runner_child_and_generic_failures() {
-        let opencode = sandbox::Output {
-            status: 1,
-            stdout: String::new(),
-            stderr: "EPERM : failed to spawn process".to_owned(),
-            truncated: false,
-        };
-        assert_eq!(
-            local_agent_output_failure_class(&opencode),
-            Some(LocalAgentFailureClass::AgentChildProcessDenied)
-        );
-
-        let codex = sandbox::Output {
-            status: 1,
-            stdout: "Failed to create unified exec process: Operation not permitted (os error 1)"
-                .to_owned(),
-            stderr: String::new(),
-            truncated: false,
-        };
-        assert_eq!(
-            local_agent_output_failure_class(&codex),
-            Some(LocalAgentFailureClass::AgentChildProcessDenied)
-        );
-
-        let generic = sandbox::Output {
-            status: 2,
-            stdout: String::new(),
-            stderr: "provider rejected request".to_owned(),
-            truncated: false,
-        };
-        assert_eq!(
-            local_agent_output_failure_class(&generic),
-            Some(LocalAgentFailureClass::AgentNonzeroExit)
-        );
-
-        let rendered =
-            render_local_agent_result(Err(anyhow::anyhow!("invalid sandbox root"))).unwrap_err();
-        let value: Value = serde_json::from_str(&rendered.to_string()).unwrap();
-        assert_eq!(value["failure_class"], "sandbox_setup_failed");
-    }
-
-    #[test]
-    fn local_agent_failure_class_is_null_on_success() {
-        let rendered = render_local_agent_result(Ok(sandbox::Output {
-            status: 0,
-            stdout: "ok".to_owned(),
-            stderr: String::new(),
-            truncated: false,
-        }))
-        .unwrap();
-        let value: Value = serde_json::from_str(&rendered).unwrap();
-        assert!(value["failure_class"].is_null());
     }
 
     fn activity_job_session(cwd: &Path) -> config::Session {
@@ -10353,14 +9648,9 @@ mod tests {
                 .filter(|coverage| coverage.owner == ActivityOwner::JobWorker)
                 .map(|coverage| coverage.name)
                 .collect::<std::collections::BTreeSet<_>>(),
-            [
-                "dev_tool_run",
-                "execute",
-                "local_agent_run",
-                "start_command",
-            ]
-            .into_iter()
-            .collect()
+            ["dev_tool_run", "execute", "start_command"]
+                .into_iter()
+                .collect()
         );
         assert_eq!(
             ACTIVITY_TOOL_COVERAGE
@@ -10875,16 +10165,6 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn activity_delegated_local_args(session_id: &str, task: &str) -> Value {
-        json!({
-            "session_id": session_id,
-            "agent": "codex",
-            "task": task,
-            "access": "read_only"
-        })
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn activity_delegated_dev_args(session_id: &str) -> Value {
         json!({
             "session_id": session_id,
@@ -10919,14 +10199,7 @@ mod tests {
     async fn activity_delegated_job_success_is_terminal_and_omits_prompt_and_output() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_dir = tempfile::tempdir().unwrap();
-        let prompt_sentinel = "delegated-prompt-secret-sentinel";
-        let agent_output_sentinel = "delegated-agent-output-secret-sentinel";
         let dev_output_sentinel = "delegated-dev-output-secret-sentinel";
-        let fake_agent = activity_delegated_job_executable(
-            fake_dir.path(),
-            "codex",
-            &format!("#!/bin/sh\nprintf '{agent_output_sentinel}\\n'\n"),
-        );
         let fake_dev = activity_delegated_job_executable(
             fake_dir.path(),
             "cargo",
@@ -10945,29 +10218,6 @@ mod tests {
         .await
         .unwrap();
         let session = config::load_session(&id).await.unwrap();
-
-        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
-        let agent_result = local_agent_run(
-            &activity_delegated_local_args(&id, prompt_sentinel),
-            &session,
-            Some(&fake_agent),
-            Some(agent_scope),
-        )
-        .await
-        .unwrap();
-        assert!(
-            serde_json::to_string(&agent_result)
-                .unwrap()
-                .contains(agent_output_sentinel)
-        );
-        assert_eq!(
-            agent_emitter.states(),
-            vec![
-                ActivityState::Started,
-                ActivityState::Running,
-                ActivityState::Completed
-            ]
-        );
 
         let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
         let dev_result = dev_tool_run_with_executable(
@@ -10992,11 +10242,8 @@ mod tests {
             ]
         );
 
-        let updates =
-            serde_json::to_string(&(agent_emitter.updates(), dev_emitter.updates())).unwrap();
-        for sentinel in [prompt_sentinel, agent_output_sentinel, dev_output_sentinel] {
-            assert!(!updates.contains(sentinel), "activity leaked {sentinel}");
-        }
+        let updates = serde_json::to_string(&dev_emitter.updates()).unwrap();
+        assert!(!updates.contains(dev_output_sentinel));
         runtime.shutdown().await.unwrap();
     }
 
@@ -11005,8 +10252,6 @@ mod tests {
     async fn activity_delegated_job_denial_never_reaches_running() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_dir = tempfile::tempdir().unwrap();
-        let fake_agent =
-            activity_delegated_job_executable(fake_dir.path(), "codex", "#!/bin/sh\nexit 99\n");
         let fake_dev =
             activity_delegated_job_executable(fake_dir.path(), "cargo", "#!/bin/sh\nexit 99\n");
         let id = format!("activity-delegated-deny-{}", Uuid::new_v4());
@@ -11022,39 +10267,6 @@ mod tests {
         .await
         .unwrap();
         let session = config::load_session(&id).await.unwrap();
-
-        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
-        let agent_session = session.clone();
-        let agent_id = id.clone();
-        let agent_task = tokio::spawn(async move {
-            local_agent_run(
-                &activity_delegated_local_args(&agent_id, "denied-prompt-sentinel"),
-                &agent_session,
-                Some(&fake_agent),
-                Some(agent_scope),
-            )
-            .await
-        });
-        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(prompt.request.operation, "local_agent_run");
-        prompt.respond(false);
-        assert!(agent_task.await.unwrap().is_err());
-        assert_eq!(
-            agent_emitter.states(),
-            vec![
-                ActivityState::Started,
-                ActivityState::WaitingApproval,
-                ActivityState::Failed
-            ]
-        );
-        activity_delegated_job_assert_terminal(
-            &agent_emitter,
-            ActivityState::Failed,
-            "error=approval_denied",
-        );
 
         let (dev_scope, dev_emitter) = activity_job_scope(ActivityOperation::DevToolRun);
         let dev_session = session.clone();
@@ -11088,49 +10300,18 @@ mod tests {
             ActivityState::Failed,
             "error=approval_denied",
         );
-        let denial_updates =
-            serde_json::to_string(&(agent_emitter.updates(), dev_emitter.updates())).unwrap();
-        assert!(!denial_updates.contains("denied-prompt-sentinel"));
         assert!(snapshot_jobs_for_session(&id, 50).jobs.is_empty());
         runtime.shutdown().await.unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn activity_delegated_job_timeout_uses_fixed_reason_for_both_workers() {
+    async fn activity_delegated_job_timeout_uses_fixed_reason() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_dir = tempfile::tempdir().unwrap();
         let sleeper = "#!/bin/sh\nexec /bin/sleep 30\n";
-        let fake_agent = activity_delegated_job_executable(fake_dir.path(), "codex", sleeper);
         let fake_dev = activity_delegated_job_executable(fake_dir.path(), "cargo", sleeper);
         let session = activity_job_session(workspace.path());
-
-        let prepared_agent = local_agent::prepare_with_executable(
-            &activity_delegated_local_args(&session.id, "timeout-prompt-sentinel"),
-            &session,
-            &fake_agent,
-        )
-        .unwrap();
-        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
-        let (_, agent_handle, agent_completion) = spawn_local_agent_with_controls(
-            prepared_agent,
-            &session,
-            Some(agent_scope),
-            std::future::pending(),
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap();
-        activity_delegated_job_wait(agent_handle).await;
-        assert!(matches!(
-            agent_completion.lock().unwrap().result,
-            Some(CachedJobResult::Error { .. })
-        ));
-        activity_delegated_job_assert_terminal(
-            &agent_emitter,
-            ActivityState::Cancelled,
-            "reason=timeout",
-        );
 
         let prepared_dev = dev_tool::prepare_with_executable(
             &activity_delegated_dev_args(&session.id),
@@ -11162,57 +10343,12 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn activity_delegated_job_stop_cancels_both_workers_before_abort() {
+    async fn activity_delegated_job_stop_cancels_worker_before_abort() {
         let workspace = tempfile::tempdir().unwrap();
         let fake_dir = tempfile::tempdir().unwrap();
         let sleeper = "#!/bin/sh\nexec /bin/sleep 30\n";
-        let fake_agent = activity_delegated_job_executable(fake_dir.path(), "codex", sleeper);
         let fake_dev = activity_delegated_job_executable(fake_dir.path(), "cargo", sleeper);
         let session = activity_job_session(workspace.path());
-
-        let prepared_agent = local_agent::prepare_with_executable(
-            &activity_delegated_local_args(&session.id, "stop-prompt-sentinel"),
-            &session,
-            &fake_agent,
-        )
-        .unwrap();
-        let (agent_scope, agent_emitter) = activity_job_scope(ActivityOperation::LocalAgentRun);
-        let (description, handle, completion) = spawn_local_agent_with_controls(
-            prepared_agent,
-            &session,
-            Some(agent_scope),
-            std::future::pending(),
-            MAX_JOB_LIFETIME,
-        )
-        .await
-        .unwrap();
-        let started = store_job(
-            &session,
-            description,
-            handle,
-            completion,
-            OutputPolicy::default(),
-            "Backgrounded",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            agent_emitter.states(),
-            vec![ActivityState::Started, ActivityState::Running]
-        );
-        let started: Value =
-            serde_json::from_str(started["content"][0]["text"].as_str().unwrap()).unwrap();
-        stop_job(
-            &json!({"job_id": started["job_id"].as_str().unwrap()}),
-            &session,
-        )
-        .await
-        .unwrap();
-        activity_delegated_job_assert_terminal(
-            &agent_emitter,
-            ActivityState::Cancelled,
-            "reason=stop_requested",
-        );
 
         let prepared_dev = dev_tool::prepare_with_executable(
             &activity_delegated_dev_args(&session.id),
@@ -12274,7 +11410,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 75);
+        assert_eq!(tools.len(), 74);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -12326,94 +11462,16 @@ mod tests {
             "codex_task_start",
             "codex_task_get",
             "codex_task_control",
-            "local_agent_run",
         ] {
             assert!(tools.iter().any(|tool| tool["name"] == name));
         }
-        let local_agent = tools
-            .iter()
-            .find(|tool| tool["name"] == "local_agent_run")
-            .unwrap();
-        assert_eq!(
-            local_agent["annotations"],
-            json!({
-                "readOnlyHint": false,
-                "destructiveHint": true,
-                "idempotentHint": false,
-                "openWorldHint": true
-            })
-        );
-        assert_eq!(local_agent["inputSchema"]["additionalProperties"], false);
-        assert_eq!(
-            local_agent["inputSchema"]["properties"]["agent"]["enum"],
-            json!(["codex", "opencode"])
-        );
-        assert_eq!(
-            local_agent["inputSchema"]["properties"]["access"]["enum"],
-            json!(["read_only", "workspace_write"])
-        );
-        assert_eq!(
-            local_agent["inputSchema"]["properties"]["task"]["maxLength"],
-            json!(local_agent::MAX_TASK_BYTES)
-        );
-        assert_eq!(
-            local_agent["inputSchema"]["allOf"][0]["then"]["properties"]["task"]["maxLength"],
-            json!(local_agent::MAX_OPENCODE_TASK_BYTES)
-        );
+        assert!(tools.iter().all(|tool| tool["name"] != "local_agent_run"));
         assert!(tools.iter().all(|tool| tool["name"] != "without_sandbox"));
         assert!(
             tools
                 .iter()
                 .any(|tool| tool["name"] == "onepassword_secret_resolve")
         );
-    }
-
-    #[tokio::test]
-    async fn local_agent_run_requires_approval_and_denial_starts_no_job() {
-        let root = tempfile::tempdir().unwrap();
-        let fake_agent_dir = tempfile::tempdir().unwrap();
-        let fake_executable = fake_agent_dir.path().join("codex");
-        std::fs::write(&fake_executable, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = std::fs::metadata(&fake_executable).unwrap().permissions();
-        #[cfg(unix)]
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-        std::fs::set_permissions(&fake_executable, permissions).unwrap();
-        let id = format!("local-agent-approval-{}", Uuid::new_v4());
-        let (sender, mut receiver) = approvals::approval_channel();
-        let handle = approvals::spawn_runtime(root.path(), Some(&id), false, sender)
-            .await
-            .unwrap();
-
-        let request = json!({
-            "name": "local_agent_run",
-            "arguments": {
-                "session_id": id.clone(),
-                "agent": "codex",
-                "task": "approval-only test task",
-                "access": "read_only"
-            }
-        });
-        let task = tokio::spawn(async move {
-            let _fake_agent_dir = fake_agent_dir;
-            call_tool_with_test_local_agent_executable(&request, false, None, &fake_executable)
-                .await
-        });
-        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await
-            .expect("local_agent_run did not request approval")
-            .expect("approval channel closed before local_agent_run request");
-        assert_eq!(prompt.request.operation, "local_agent_run");
-        assert!(prompt.request.detail.contains("task_preview:"));
-        assert!(prompt.request.detail.contains("approval-only test task"));
-        prompt.respond(false);
-
-        let error = task
-            .await
-            .unwrap()
-            .expect_err("denied local_agent_run unexpectedly succeeded");
-        assert!(error.to_string().contains("user denied local_agent_run"));
-        assert!(snapshot_jobs_for_session(&id, 50).jobs.is_empty());
-        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -15302,126 +14360,6 @@ mod tests {
         assert_eq!(list["inputSchema"]["required"], json!(["session_id"]));
     }
 
-    #[test]
-    fn local_agent_worktree_input_is_bounded_and_path_free() {
-        let tools = tools(true, true).as_array().unwrap().to_owned();
-        let tool = tools
-            .iter()
-            .find(|tool| tool["name"] == "local_agent_run")
-            .unwrap();
-        let worktree = &tool["inputSchema"]["properties"]["worktree"];
-        assert_eq!(worktree["type"], "object");
-        assert_eq!(worktree["required"], json!(["branch"]));
-        assert_eq!(worktree["additionalProperties"], false);
-        assert_eq!(
-            worktree["properties"]["branch"]["maxLength"],
-            json!(MAX_GIT_BRANCH_NAME_BYTES)
-        );
-        assert_eq!(
-            worktree["properties"]["task"]["maxLength"],
-            json!(managed_worktree::MAX_MANAGED_TASK_BYTES)
-        );
-        assert!(
-            !worktree["properties"]
-                .as_object()
-                .unwrap()
-                .contains_key("cwd")
-        );
-        assert!(
-            !worktree["properties"]
-                .as_object()
-                .unwrap()
-                .contains_key("path")
-        );
-    }
-
-    #[tokio::test]
-    async fn local_agent_worktree_binding_reuses_and_creates_verified_managed_worktrees() {
-        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-        let target = canonical_root.join("worktrees/repo/feature-foo-bar");
-
-        // Absent target: Temote creates the managed worktree through the
-        // approved broker path without any caller-supplied path.
-        let created = local_agent_managed_worktree_binding_with_src_root(
-            &json!({"session_id": session.id, "worktree": {"branch": "feature/foo/bar"}}),
-            &session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap()
-        .expect("managed worktree binding");
-        assert_eq!(created.workspace_root(), target);
-        assert_eq!(created.branch, "feature/foo/bar");
-        assert_eq!(created.repository_name(), "repo");
-        assert_eq!(
-            git_fixture_stdout(&target, &["branch", "--show-current"]),
-            "feature/foo/bar"
-        );
-
-        // The run session gains exactly the validated managed workspace root;
-        // the on-disk session keeps its own scope.
-        let run_session = created.run_session(&session);
-        assert_eq!(
-            run_session.permitted_directories.len(),
-            session.permitted_directories.len() + 1
-        );
-        assert!(run_session.permitted_directories.contains(&target));
-        assert_eq!(session.permitted_directories, vec![checkout.clone()]);
-
-        // Existing target: reuse only the verified managed worktree.
-        let reused = local_agent_managed_worktree_binding_with_src_root(
-            &json!({"session_id": session.id, "worktree": {"branch": "feature/foo/bar"}}),
-            &session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap()
-        .expect("managed worktree binding");
-        assert_eq!(reused.workspace_root(), target);
-
-        // Primary working tree, dirty sentinel and legacy worktrees stay
-        // untouched.
-        assert!(
-            git_fixture_stdout(&checkout, &["status", "--porcelain"]).contains("?? untracked.txt")
-        );
-        assert_eq!(
-            git_fixture_stdout(&checkout.join(".wt/legacy"), &["branch", "--show-current"]),
-            "legacy-branch"
-        );
-        assert_eq!(
-            git_fixture_stdout(
-                &canonical_root.join("repo-legacy-linked"),
-                &["branch", "--show-current"]
-            ),
-            "sibling-branch"
-        );
-
-        // Immediate pre-launch revalidation succeeds for the verified target
-        // and fails closed once the workspace identity changes.
-        created.revalidate(&canonical_root).unwrap();
-        std::fs::rename(&target, canonical_root.join("worktrees/repo/moved")).unwrap();
-        assert!(created.revalidate(&canonical_root).is_err());
-    }
-
-    #[tokio::test]
-    async fn local_agent_without_worktree_intent_needs_no_managed_root_configuration() {
-        let (_root, _canonical_root, checkout, session) = managed_worktree_fixture();
-        let binding = local_agent_managed_worktree_binding(
-            &json!({
-                "session_id": session.id,
-                "cwd": checkout.to_string_lossy()
-            }),
-            &session,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(binding.is_none());
-    }
-
     fn managed_worktree_removal_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, config::Session)
     {
         let (root, canonical_root, checkout, session) = managed_worktree_fixture();
@@ -16997,983 +15935,6 @@ mod tests {
             }
             Ok(())
         })
-    }
-
-    #[tokio::test]
-    async fn local_agent_worktree_binding_rejects_path_injection_and_wrong_reuse() {
-        let (_root, canonical_root, _checkout, session) = managed_worktree_fixture();
-
-        let injection = local_agent_managed_worktree_binding_with_src_root(
-            &json!({
-                "session_id": session.id,
-                "cwd": "/tmp",
-                "worktree": {"branch": "main"}
-            }),
-            &session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(injection.to_string().contains("not both"), "{injection:#}");
-
-        let unknown = local_agent_managed_worktree_binding_with_src_root(
-            &json!({
-                "session_id": session.id,
-                "worktree": {"branch": "main", "path": "/tmp/escape"}
-            }),
-            &session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            unknown.to_string().contains("only branch and task"),
-            "{unknown:#}"
-        );
-
-        // A legacy worktree is never adopted through the derived task path.
-        #[cfg(unix)]
-        {
-            let legacy_target = canonical_root.join("worktrees/repo/legacy-task");
-            std::fs::create_dir_all(legacy_target.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(canonical_root.join("repo-legacy-linked"), &legacy_target)
-                .unwrap();
-            let legacy = local_agent_managed_worktree_binding_with_src_root(
-                &json!({
-                    "session_id": session.id,
-                    "worktree": {"branch": "sibling-branch", "task": "legacy-task"}
-                }),
-                &session,
-                &canonical_root,
-                None,
-            )
-            .await
-            .unwrap_err();
-            assert!(
-                legacy.to_string().contains("cannot be reused"),
-                "{legacy:#}"
-            );
-            assert!(
-                std::fs::symlink_metadata(&legacy_target)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn local_agent_worktree_binding_denied_approval_creates_nothing() {
-        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
-        let ask_session = config::Session {
-            permission_mode: config::PermissionMode::Ask,
-            ..session
-        };
-        let worktrees_before = git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]);
-
-        let error = local_agent_managed_worktree_binding_with_src_root(
-            &json!({"session_id": ask_session.id, "worktree": {"branch": "main", "task": "denied"}}),
-            &ask_session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("not running"), "{error:#}");
-        assert!(!canonical_root.join("worktrees/repo/denied").exists());
-        assert_eq!(
-            git_fixture_stdout(&checkout, &["worktree", "list", "--porcelain"]),
-            worktrees_before
-        );
-    }
-
-    /// Host acceptance (nested Linux/macOS sandbox required): the structured
-    /// local agent run must start inside the Temote-derived managed worktree
-    /// with no caller-supplied path, while the primary checkout is unchanged.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn local_agent_run_binds_a_managed_worktree_without_a_caller_path() {
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let checkout = src_root.join("repo");
-        std::fs::create_dir(&checkout).unwrap();
-        init_git_repository(&checkout);
-        std::fs::write(checkout.join("untracked.txt"), "keep\n").unwrap();
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-
-        let id = format!("local-agent-worktree-{}", Uuid::new_v4());
-        let (sender, _receiver) = approvals::approval_channel();
-        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
-            &checkout,
-            Some(&id),
-            config::PermissionMode::Agent,
-            sender,
-            None,
-            approvals::CapturedStartEnvironment::default(),
-        )
-        .await
-        .unwrap();
-        let session = config::load_session(&id).await.unwrap();
-
-        let fake_dir = tempfile::tempdir().unwrap();
-        let fake_agent = activity_delegated_job_executable(
-            fake_dir.path(),
-            "codex",
-            "#!/bin/sh\npwd > ran-in.txt\nprintf 'managed-worktree-agent\\n'\n",
-        );
-        let result = local_agent_run_with_src_root(
-            &json!({
-                "session_id": id,
-                "agent": "codex",
-                "task": "implement the managed worktree task",
-                "access": "workspace_write",
-                "worktree": {"branch": "feature/foo/bar"}
-            }),
-            &session,
-            Some(&fake_agent),
-            None,
-            Some(&src_root),
-        )
-        .await
-        .unwrap();
-        assert!(
-            serde_json::to_string(&result)
-                .unwrap()
-                .contains("managed-worktree-agent")
-        );
-
-        let target = src_root.join("worktrees/repo/feature-foo-bar");
-        assert_eq!(
-            std::fs::read_to_string(target.join("ran-in.txt"))
-                .unwrap()
-                .trim(),
-            target.to_string_lossy()
-        );
-        assert_eq!(
-            git_fixture_stdout(&checkout, &["branch", "--show-current"]),
-            "main"
-        );
-        assert!(
-            git_fixture_stdout(&checkout, &["status", "--porcelain"]).contains("?? untracked.txt")
-        );
-        runtime.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_agent_worktree_binding_requires_the_primary_checkout_authority() {
-        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-        // The session only permits a legacy worktree, so it has no authority
-        // over the canonical primary checkout that anchors the managed root.
-        let legacy = canonical_root.join("repo-legacy-linked");
-        let legacy_session = config::Session {
-            cwd: legacy.clone(),
-            permitted_directories: vec![legacy.clone()],
-            ..session.clone()
-        };
-
-        let error = local_agent_managed_worktree_binding_with_src_root(
-            &json!({
-                "session_id": legacy_session.id,
-                "worktree": {"branch": "feature/foo/bar"}
-            }),
-            &legacy_session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("permitted session root"),
-            "{error:#}"
-        );
-        assert!(!canonical_root.join("worktrees").exists());
-    }
-
-    /// The managed binding is re-derived from filesystem state immediately
-    /// before launch: a swapped target, managed root, `.git` pointer or
-    /// repository identity must fail closed instead of spawning in an
-    /// unauthorized workspace.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn local_agent_worktree_binding_revalidates_swapped_workspace_identity() {
-        use std::os::unix::fs::symlink;
-
-        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-        let managed_root = canonical_root.join("worktrees").join("repo");
-        let target = managed_root.join("feature-foo-bar");
-        let binding = local_agent_managed_worktree_binding_with_src_root(
-            &json!({"session_id": session.id, "worktree": {"branch": "feature/foo/bar"}}),
-            &session,
-            &canonical_root,
-            None,
-        )
-        .await
-        .unwrap()
-        .expect("managed worktree binding");
-        binding.revalidate(&canonical_root).unwrap();
-
-        // A target swapped for a symbolic link is never trusted again.
-        let moved = managed_root.join("moved-away");
-        std::fs::rename(&target, &moved).unwrap();
-        symlink(&moved, &target).unwrap();
-        let error = binding.revalidate(&canonical_root).unwrap_err();
-        assert!(error.to_string().contains("normal directory"), "{error:#}");
-        std::fs::remove_file(&target).unwrap();
-        std::fs::rename(&moved, &target).unwrap();
-        binding.revalidate(&canonical_root).unwrap();
-
-        // A swapped managed root is no longer the trusted authority.
-        let real_root = canonical_root.join("worktrees").join("repo-real");
-        std::fs::rename(&managed_root, &real_root).unwrap();
-        symlink(&real_root, &managed_root).unwrap();
-        let error = binding.revalidate(&canonical_root).unwrap_err();
-        assert!(
-            error.to_string().contains("trusted normal directory"),
-            "{error:#}"
-        );
-        std::fs::remove_file(&managed_root).unwrap();
-        std::fs::rename(&real_root, &managed_root).unwrap();
-        binding.revalidate(&canonical_root).unwrap();
-
-        // A `.git` pointer swapped to another repository's structurally valid
-        // private metadata keeps the target path but changes the identity.
-        let other = canonical_root.join("other-repo");
-        std::fs::create_dir(&other).unwrap();
-        init_git_repository(&other);
-        let other_linked = canonical_root.join("other-linked");
-        run_git_fixture(
-            &other,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                other_linked.to_str().unwrap(),
-                "-b",
-                "other-branch",
-            ],
-        );
-        let other_private = other.join(".git").join("worktrees").join("other-linked");
-        let original_pointer = std::fs::read_to_string(target.join(".git")).unwrap();
-        let original_other_gitdir = std::fs::read_to_string(other_private.join("gitdir")).unwrap();
-        std::fs::write(
-            target.join(".git"),
-            format!("gitdir: {}\n", other_private.display()),
-        )
-        .unwrap();
-        std::fs::write(
-            other_private.join("gitdir"),
-            format!("{}\n", target.join(".git").display()),
-        )
-        .unwrap();
-        let error = binding.revalidate(&canonical_root).unwrap_err();
-        assert!(
-            error.to_string().contains("common Git directory mismatch"),
-            "{error:#}"
-        );
-        std::fs::write(target.join(".git"), &original_pointer).unwrap();
-        std::fs::write(other_private.join("gitdir"), &original_other_gitdir).unwrap();
-        binding.revalidate(&canonical_root).unwrap();
-
-        // Another repository's worktree moved into the expected path is a
-        // different repository identity, not a reusable managed worktree.
-        let backup = managed_root.join("backup");
-        std::fs::rename(&target, &backup).unwrap();
-        run_git_fixture(
-            &other,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                target.to_str().unwrap(),
-                "-b",
-                "other-replacement",
-            ],
-        );
-        let error = binding.revalidate(&canonical_root).unwrap_err();
-        assert!(
-            error.to_string().contains("common Git directory mismatch"),
-            "{error:#}"
-        );
-        run_git_fixture(
-            &other,
-            &["worktree", "remove", "--force", target.to_str().unwrap()],
-        );
-        std::fs::rename(&backup, &target).unwrap();
-        binding.revalidate(&canonical_root).unwrap();
-    }
-
-    /// A rejected managed-worktree binding must fail before the agent is
-    /// prepared or spawned, even when a wrong-branch managed target already
-    /// exists at the derived path.
-    #[tokio::test]
-    async fn local_agent_run_worktree_binding_failure_starts_no_agent() {
-        let (_root, canonical_root, checkout, session) = managed_worktree_fixture();
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-        run_git_fixture(&checkout, &["branch", "wrong-branch"]);
-        let target = canonical_root.join("worktrees/repo/feature-foo-bar");
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        run_git_fixture(
-            &checkout,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                target.to_str().unwrap(),
-                "wrong-branch",
-            ],
-        );
-        let target_before = worktree_snapshot(&target);
-        let checkout_before = worktree_snapshot(&checkout);
-
-        let fake_dir = tempfile::tempdir().unwrap();
-        let fake_agent = activity_delegated_job_executable(
-            fake_dir.path(),
-            "codex",
-            "#!/bin/sh\npwd > ran-in.txt\nprintf 'must-not-run\\n'\n",
-        );
-        let error = local_agent_run_with_src_root(
-            &json!({
-                "session_id": session.id,
-                "agent": "codex",
-                "task": "must not start",
-                "access": "workspace_write",
-                "worktree": {"branch": "feature/foo/bar"}
-            }),
-            &session,
-            Some(&fake_agent),
-            None,
-            Some(&canonical_root),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("cannot be reused"), "{error:#}");
-        assert!(!target.join("ran-in.txt").exists());
-        assert!(!checkout.join("ran-in.txt").exists());
-        assert_eq!(worktree_snapshot(&target), target_before);
-        assert_eq!(worktree_snapshot(&checkout), checkout_before);
-    }
-
-    /// The approval boundary is not an authority transfer: the workspace
-    /// identity is re-derived and re-verified after approval, so a target whose
-    /// `.git` pointer is swapped while the approval is pending fails closed and
-    /// the agent never starts.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn local_agent_run_worktree_binding_swapped_during_approval_starts_no_agent() {
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let checkout = src_root.join("repo");
-        std::fs::create_dir(&checkout).unwrap();
-        init_git_repository(&checkout);
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-        std::fs::write(checkout.join("untracked.txt"), "keep\n").unwrap();
-        let managed_root = src_root.join("worktrees").join("repo");
-        std::fs::create_dir_all(&managed_root).unwrap();
-        let target = managed_root.join("feature-foo-bar");
-        run_git_fixture(
-            &checkout,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                target.to_str().unwrap(),
-                "feature/foo/bar",
-            ],
-        );
-
-        // A structurally valid private metadata directory of another
-        // repository, prepared before the run so the swap itself is a pair of
-        // bounded writes while approval is pending.
-        let other = src_root.join("other-repo");
-        std::fs::create_dir(&other).unwrap();
-        init_git_repository(&other);
-        let other_linked = src_root.join("other-linked");
-        run_git_fixture(
-            &other,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                other_linked.to_str().unwrap(),
-                "-b",
-                "other-branch",
-            ],
-        );
-        let other_private = other.join(".git").join("worktrees").join("other-linked");
-
-        let id = format!("wt-approval-{}", Uuid::new_v4());
-        let (sender, mut receiver) = approvals::approval_channel();
-        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
-            &checkout,
-            Some(&id),
-            config::PermissionMode::Ask,
-            sender,
-            None,
-            approvals::CapturedStartEnvironment::default(),
-        )
-        .await
-        .unwrap();
-        let session = config::load_session(&id).await.unwrap();
-
-        let fake_dir = tempfile::tempdir().unwrap();
-        let fake_agent = activity_delegated_job_executable(
-            fake_dir.path(),
-            "codex",
-            "#!/bin/sh\npwd > ran-in.txt\nprintf 'must-not-run\\n'\n",
-        );
-        let args = json!({
-            "session_id": id,
-            "agent": "codex",
-            "task": "approval-time identity swap",
-            "access": "workspace_write",
-            "worktree": {"branch": "feature/foo/bar"}
-        });
-        let run_root = src_root.clone();
-        let run_session = session.clone();
-        let task = tokio::spawn(async move {
-            let _fixture = fixture;
-            let _fake_dir = fake_dir;
-            local_agent_run_with_src_root(
-                &args,
-                &run_session,
-                Some(&fake_agent),
-                None,
-                Some(&run_root),
-            )
-            .await
-        });
-
-        let prompt = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-            .await
-            .expect("local_agent_run did not request approval")
-            .expect("approval channel closed before local_agent_run request");
-        assert_eq!(prompt.request.operation, "local_agent_run");
-        // The approval identifies the Temote-derived managed workspace, never a
-        // caller-supplied path. Workspace classification reads the configured
-        // named root from the environment, which the `_with_src_root` test seam
-        // intentionally bypasses, so only the identity fields are asserted.
-        assert!(
-            prompt
-                .request
-                .detail
-                .contains(&format!("workspace_root: {}", target.display())),
-            "{}",
-            prompt.request.detail
-        );
-        assert!(
-            prompt.request.detail.contains("repository: repo"),
-            "{}",
-            prompt.request.detail
-        );
-        assert!(
-            prompt.request.detail.contains("branch: feature/foo/bar"),
-            "{}",
-            prompt.request.detail
-        );
-
-        std::fs::write(
-            target.join(".git"),
-            format!("gitdir: {}\n", other_private.display()),
-        )
-        .unwrap();
-        std::fs::write(
-            other_private.join("gitdir"),
-            format!("{}\n", target.join(".git").display()),
-        )
-        .unwrap();
-        prompt.respond(true);
-
-        let error = task
-            .await
-            .unwrap()
-            .expect_err("swapped workspace unexpectedly started the agent");
-        assert!(
-            error.to_string().contains("common Git directory mismatch"),
-            "{error:#}"
-        );
-        assert!(!target.join("ran-in.txt").exists());
-        assert!(!checkout.join("ran-in.txt").exists());
-        runtime.shutdown().await.unwrap();
-    }
-
-    #[cfg(unix)]
-    const R3_APPROVAL_IDENTITY_TEST_NAME: &str =
-        "mcp::tests::local_agent_worktree_approval_identity_uses_the_configured_src_named_root";
-
-    /// Child-process body for the configured named-root integration test.
-    ///
-    /// Runs the production authority path (`local_agent_managed_worktree_binding`
-    /// reads `TEMOTE_MCP_ROOTS` from the environment) and asserts the approval
-    /// detail and metadata identity derived from it.
-    #[cfg(unix)]
-    fn run_r3_approval_identity_fixture() -> Result<()> {
-        const SRC: &str = "TEMOTE_TEST_R3_SRC_ROOT";
-        let src_root = PathBuf::from(std::env::var(SRC).context("missing src root")?);
-        let src_root = std::fs::canonicalize(&src_root)?;
-        let checkout = src_root.join("repo");
-        let session = config::Session {
-            id: format!("r3-{}", Uuid::new_v4()),
-            cwd: checkout.clone(),
-            permitted_directories: vec![checkout.clone()],
-            started_at: 1,
-            process_id: 1,
-            permission_mode: config::PermissionMode::Agent,
-            grants: config::SessionGrants::default(),
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("cannot start the R3 child runtime")?;
-        runtime.block_on(async move {
-            let binding = local_agent_managed_worktree_binding(
-                &json!({"session_id": session.id, "worktree": {"branch": "feature/r3"}}),
-                &session,
-                None,
-            )
-            .await?
-            .expect("managed worktree binding");
-            let target = src_root.join("worktrees").join("repo").join("feature-r3");
-            assert_eq!(binding.workspace_root(), target);
-
-            // The classification uses the same configured named root as the
-            // production binding resolution.
-            let workspace = managed_worktree::inspect_session_workspace(
-                binding.workspace_root(),
-                managed_worktree::configured_src_root_from_env().as_deref(),
-            )
-            .expect("workspace identity");
-            assert_eq!(
-                workspace.workspace_type,
-                managed_worktree::SessionWorkspaceType::ManagedWorktree
-            );
-            assert_eq!(workspace.repository_root, checkout);
-            assert_eq!(workspace.workspace_root, target);
-            assert_eq!(workspace.repository.as_deref(), Some("repo"));
-            assert_eq!(workspace.branch.as_deref(), Some("feature/r3"));
-            assert_eq!(workspace.task.as_deref(), Some("feature-r3"));
-
-            // The branch comes from the linked worktree's own HEAD, never from
-            // the primary checkout's HEAD.
-            assert_eq!(
-                sandbox::git_current_branch(&target)?.as_deref(),
-                Some("feature/r3")
-            );
-            assert_eq!(
-                sandbox::git_current_branch(&checkout)?.as_deref(),
-                Some("main")
-            );
-
-            let run_session = binding.run_session(&session);
-            assert_eq!(
-                run_session.permitted_directories,
-                vec![checkout.clone(), target.clone()]
-            );
-            assert_eq!(session.cwd, checkout);
-            assert_eq!(session.permitted_directories, vec![checkout.clone()]);
-
-            let fake_dir = tempfile::tempdir()?;
-            let fake_agent = activity_delegated_job_executable(
-                fake_dir.path(),
-                "codex",
-                "#!/bin/sh\nprintf 'r3\\n'\n",
-            );
-            let effective_args = json!({
-                "session_id": session.id,
-                "agent": "codex",
-                "task": "r3 identity",
-                "access": "workspace_write",
-                "cwd": target.to_string_lossy(),
-            });
-            let prepared =
-                local_agent::prepare_with_executable(&effective_args, &run_session, &fake_agent)?;
-            assert_eq!(prepared.cwd, target);
-
-            let detail = prepared.approval_detail();
-            assert!(
-                detail.contains("workspace_type: managed_worktree"),
-                "{detail}"
-            );
-            assert!(
-                detail.contains(&format!("repository_root: {}", checkout.display())),
-                "{detail}"
-            );
-            assert!(
-                detail.contains(&format!("workspace_root: {}", target.display())),
-                "{detail}"
-            );
-            assert!(detail.contains("repository: repo"), "{detail}");
-            assert!(detail.contains("branch: feature/r3"), "{detail}");
-            assert!(detail.contains("task: feature-r3"), "{detail}");
-
-            let metadata = prepared.approval_metadata();
-            let keys = metadata.keys().cloned().collect::<Vec<_>>();
-            assert_eq!(
-                keys,
-                vec![
-                    "access",
-                    "agent",
-                    "branch",
-                    "cwd",
-                    "provenance",
-                    "repository",
-                    "repository_root",
-                    "scope",
-                    "source",
-                    "task",
-                    "task_bytes",
-                    "task_sha256",
-                    "workspace_root",
-                    "workspace_type",
-                ]
-            );
-            assert_eq!(metadata["workspace_type"], "managed_worktree");
-            assert_eq!(
-                metadata["repository_root"],
-                checkout.to_string_lossy().as_ref()
-            );
-            assert_eq!(
-                metadata["workspace_root"],
-                target.to_string_lossy().as_ref()
-            );
-            assert_eq!(metadata["repository"], "repo");
-            assert_eq!(metadata["branch"], "feature/r3");
-            assert_eq!(metadata["task"], "feature-r3");
-            assert!(
-                !metadata
-                    .values()
-                    .any(|value| value.contains("TEMOTE_MCP") || value.contains("keep me")),
-                "{metadata:?}"
-            );
-            Ok(())
-        })
-    }
-
-    /// R3: the configured `TEMOTE_MCP_ROOTS` production path must classify the
-    /// derived workspace as a managed worktree and report the validated
-    /// identity in the approval detail/metadata. The child process isolates the
-    /// process-global environment from parallel tests.
-    #[cfg(unix)]
-    #[test]
-    fn local_agent_worktree_approval_identity_uses_the_configured_src_named_root() {
-        const ROLE: &str = "TEMOTE_TEST_R3_APPROVAL_IDENTITY_ROLE";
-        const SRC: &str = "TEMOTE_TEST_R3_SRC_ROOT";
-
-        if std::env::var(ROLE).as_deref() == Ok("fixture") {
-            run_r3_approval_identity_fixture().expect("R3 child fixture failed");
-            println!("R3-APPROVAL-IDENTITY-OK");
-            return;
-        }
-
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let checkout = src_root.join("repo");
-        std::fs::create_dir(&checkout).unwrap();
-        init_git_repository(&checkout);
-        run_git_fixture(&checkout, &["branch", "feature/r3"]);
-        std::fs::write(checkout.join("untracked.txt"), "keep me\n").unwrap();
-
-        let current_exe = std::env::current_exe().unwrap();
-        let output = std::process::Command::new(current_exe)
-            .arg("--exact")
-            .arg(R3_APPROVAL_IDENTITY_TEST_NAME)
-            .arg("--nocapture")
-            .env(ROLE, "fixture")
-            .env(SRC, src_root.to_string_lossy().into_owned())
-            .env("TEMOTE_MCP_ROOTS", format!("src={}", src_root.display()))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "child failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("R3-APPROVAL-IDENTITY-OK"),
-            "child did not complete\nstdout:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    /// Observable state of one repository after the attacker-equivalent swap
-    /// and immediately before the launch boundary for a regression case.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[derive(Clone, Debug, PartialEq)]
-    struct RepositorySnapshot {
-        head: String,
-        refs: String,
-        status: String,
-        config: String,
-        worktrees: String,
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn repository_snapshot(worktree: &Path) -> RepositorySnapshot {
-        let common = sandbox::git_common_dir(worktree).unwrap();
-        RepositorySnapshot {
-            head: git_fixture_stdout(worktree, &["rev-parse", "HEAD"]),
-            refs: git_fixture_stdout(
-                worktree,
-                &["for-each-ref", "--format=%(refname) %(objectname)"],
-            ),
-            status: git_fixture_stdout(worktree, &["status", "--porcelain"]),
-            config: std::fs::read_to_string(common.join("config")).unwrap(),
-            worktrees: git_fixture_stdout(worktree, &["worktree", "list", "--porcelain"]),
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    struct BoundaryRun {
-        result: Result<Value>,
-        _root: tempfile::TempDir,
-        canonical_root: PathBuf,
-        checkout: PathBuf,
-        target: PathBuf,
-        session: config::Session,
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    impl BoundaryRun {
-        /// The launch must fail before any child result exists: the tool
-        /// reports the bounded sandbox-setup failure and never the fake
-        /// agent's stdout.
-        fn assert_launch_failed_before_child(&self) {
-            let error = self
-                .result
-                .as_ref()
-                .expect_err("a swapped managed-worktree identity must not start the agent");
-            let text = error.to_string();
-            assert!(text.contains("sandbox_setup_failed"), "{text}");
-            assert!(
-                text.contains("local agent failed before a child result was available"),
-                "{text}"
-            );
-            assert!(!text.contains("boundary-agent"), "{text}");
-        }
-    }
-
-    /// Runs the production `local_agent_run` path with a managed worktree and
-    /// invokes `swap` at the last validation boundary: after the validated
-    /// repository identity has been attached to the prepared run and before
-    /// the local agent task starts.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn run_managed_worktree_at_launch_boundary<F>(swap: F) -> BoundaryRun
-    where
-        F: FnOnce(&Path, &Path),
-    {
-        let (root, canonical_root, checkout, _fixture_session) = managed_worktree_fixture();
-        run_git_fixture(&checkout, &["branch", "feature/foo/bar"]);
-        let target = canonical_root
-            .join("worktrees")
-            .join("repo")
-            .join("feature-foo-bar");
-        let id = format!("wt-boundary-{}", Uuid::new_v4());
-        let (sender, _receiver) = approvals::approval_channel();
-        let runtime = approvals::spawn_runtime_with_logical_path_and_environment(
-            &checkout,
-            Some(&id),
-            config::PermissionMode::Agent,
-            sender,
-            None,
-            approvals::CapturedStartEnvironment::default(),
-        )
-        .await
-        .unwrap();
-        let session = config::load_session(&id).await.unwrap();
-        let fake_dir = tempfile::tempdir().unwrap();
-        let fake_agent = activity_delegated_job_executable(
-            fake_dir.path(),
-            "codex",
-            "#!/bin/sh\npwd > ran-in.txt\nprintf 'boundary-agent\\n'\n",
-        );
-        let args = json!({
-            "session_id": id,
-            "agent": "codex",
-            "task": "launch boundary swap",
-            "access": "workspace_write",
-            "worktree": {"branch": "feature/foo/bar"}
-        });
-        let swap_target = target.clone();
-        let swap_root = canonical_root.clone();
-        let result = local_agent_run_with_src_root_at_boundary(
-            &args,
-            &session,
-            Some(&fake_agent),
-            None,
-            Some(&canonical_root),
-            move || swap(&swap_target, &swap_root),
-        )
-        .await;
-        runtime.shutdown().await.unwrap();
-        BoundaryRun {
-            result,
-            _root: root,
-            canonical_root,
-            checkout,
-            target,
-            session,
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn local_agent_worktree_binding_runs_in_the_validated_workspace() {
-        let run = run_managed_worktree_at_launch_boundary(|_target, _canonical_root| {}).await;
-        let result = run
-            .result
-            .expect("a validated managed worktree must start the agent");
-        assert!(
-            serde_json::to_string(&result)
-                .unwrap()
-                .contains("boundary-agent")
-        );
-        assert!(run.target.join("ran-in.txt").is_file());
-        assert_eq!(
-            git_fixture_stdout(&run.target, &["branch", "--show-current"]),
-            "feature/foo/bar"
-        );
-        assert!(!run.checkout.join("ran-in.txt").exists());
-        assert_eq!(
-            run.session.permitted_directories,
-            vec![run.checkout.clone()]
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn local_agent_worktree_identity_swap_to_other_repository_metadata_starts_no_agent() {
-        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let recorded = std::rc::Rc::clone(&snapshot);
-        let run = run_managed_worktree_at_launch_boundary(move |target, canonical_root| {
-            let other = canonical_root.join("other-repo");
-            std::fs::create_dir(&other).unwrap();
-            init_git_repository(&other);
-            let other_linked = canonical_root.join("other-linked");
-            run_git_fixture(
-                &other,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    other_linked.to_str().unwrap(),
-                    "-b",
-                    "other-branch",
-                ],
-            );
-            let other_private = other.join(".git").join("worktrees").join("other-linked");
-            std::fs::write(
-                target.join(".git"),
-                format!("gitdir: {}\n", other_private.display()),
-            )
-            .unwrap();
-            std::fs::write(
-                other_private.join("gitdir"),
-                format!("{}\n", target.join(".git").display()),
-            )
-            .unwrap();
-            *recorded.borrow_mut() = Some(repository_snapshot(&other));
-        })
-        .await;
-
-        run.assert_launch_failed_before_child();
-        assert!(!run.target.join("ran-in.txt").exists());
-        assert!(!run.checkout.join("ran-in.txt").exists());
-        let other = run.canonical_root.join("other-repo");
-        let before = snapshot.borrow().clone().expect("recorded B snapshot");
-        assert_eq!(repository_snapshot(&other), before);
-        assert_eq!(
-            run.session.permitted_directories,
-            vec![run.checkout.clone()]
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn local_agent_worktree_identity_swap_to_other_repository_worktree_starts_no_agent() {
-        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let recorded = std::rc::Rc::clone(&snapshot);
-        let run = run_managed_worktree_at_launch_boundary(move |target, canonical_root| {
-            let other = canonical_root.join("other-repo");
-            std::fs::create_dir(&other).unwrap();
-            init_git_repository(&other);
-            run_git_fixture(&other, &["branch", "other-replacement"]);
-            std::fs::rename(target, canonical_root.join("worktrees/repo/backup")).unwrap();
-            run_git_fixture(
-                &other,
-                &[
-                    "worktree",
-                    "add",
-                    "--quiet",
-                    target.to_str().unwrap(),
-                    "other-replacement",
-                ],
-            );
-            *recorded.borrow_mut() = Some(repository_snapshot(&other));
-        })
-        .await;
-
-        run.assert_launch_failed_before_child();
-        assert!(!run.target.join("ran-in.txt").exists());
-        assert!(
-            !run.canonical_root
-                .join("worktrees/repo/backup/ran-in.txt")
-                .exists()
-        );
-        assert!(!run.checkout.join("ran-in.txt").exists());
-        let other = run.canonical_root.join("other-repo");
-        let before = snapshot.borrow().clone().expect("recorded B snapshot");
-        assert_eq!(repository_snapshot(&other), before);
-        assert_eq!(
-            run.session.permitted_directories,
-            vec![run.checkout.clone()]
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn local_agent_worktree_identity_symlink_target_swap_starts_no_agent() {
-        let run = run_managed_worktree_at_launch_boundary(move |target, canonical_root| {
-            let moved = canonical_root.join("worktrees/repo/moved");
-            std::fs::rename(target, &moved).unwrap();
-            std::os::unix::fs::symlink(&moved, target).unwrap();
-        })
-        .await;
-
-        run.assert_launch_failed_before_child();
-        let moved = run.canonical_root.join("worktrees/repo/moved");
-        assert!(!moved.join("ran-in.txt").exists());
-        assert!(!run.target.join("ran-in.txt").exists());
-        assert!(!run.checkout.join("ran-in.txt").exists());
-        assert_eq!(
-            run.session.permitted_directories,
-            vec![run.checkout.clone()]
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn local_agent_worktree_identity_symlink_managed_root_swap_starts_no_agent() {
-        let run = run_managed_worktree_at_launch_boundary(move |_target, canonical_root| {
-            let managed_root = canonical_root.join("worktrees/repo");
-            let real_root = canonical_root.join("worktrees/repo-real");
-            std::fs::rename(&managed_root, &real_root).unwrap();
-            std::os::unix::fs::symlink(&real_root, &managed_root).unwrap();
-        })
-        .await;
-
-        run.assert_launch_failed_before_child();
-        let real_root = run.canonical_root.join("worktrees/repo-real");
-        assert!(!real_root.join("feature-foo-bar/ran-in.txt").exists());
-        assert!(!run.target.join("ran-in.txt").exists());
-        assert!(!run.checkout.join("ran-in.txt").exists());
-        assert_eq!(
-            run.session.permitted_directories,
-            vec![run.checkout.clone()]
-        );
     }
 
     #[test]

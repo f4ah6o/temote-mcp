@@ -72,31 +72,6 @@ pub fn developer_tool_command(
     Ok(process)
 }
 
-pub fn local_agent_command(
-    command: &[String],
-    cwd: &Path,
-    scope: &crate::sandbox::LocalAgentScope<'_>,
-) -> Result<Command> {
-    anyhow::ensure!(!command.is_empty(), "command must not be empty");
-    let policy = LinuxSandboxPolicy::for_local_agent(
-        cwd,
-        scope.writable_roots,
-        scope.temporary_roots,
-        scope.read_only_paths,
-        scope.read_only_roots,
-        scope.read_only_symlinks,
-        scope.read_only_scaffold_directories,
-        scope.read_only_files,
-        scope.hidden_roots,
-        scope.expected_repository,
-    )?;
-    let executable = helper_executable()?;
-    let args = helper::command_args(&policy, command)?;
-    let mut process = Command::new(executable);
-    process.args(args);
-    Ok(process)
-}
-
 pub fn run_main() -> ! {
     helper::run_main()
 }

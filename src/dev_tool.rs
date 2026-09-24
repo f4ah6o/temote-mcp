@@ -1,16 +1,115 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config;
+use crate::{approvals, child_env, config};
 use serde_json::Value;
 
 pub const MAX_DEV_TOOL_OPERATION_BYTES: usize = 64;
 pub const MAX_DEV_TOOL_ARGUMENT_BYTES: usize = 8 * 1024;
 pub const MAX_DEV_TOOL_ARGUMENTS: usize = 64;
+
+const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
+const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
+
+const SAFE_ENV_NAMES: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "CODEX_HOME",
+    "XDG_DATA_HOME",
+];
+
+pub(crate) fn resolve_cwd(session: &config::Session, path: Option<&Path>) -> Result<PathBuf> {
+    let candidate = path
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_owned()
+            } else {
+                session.cwd.join(path)
+            }
+        })
+        .unwrap_or_else(|| session.cwd.clone());
+    let resolved = config::canonical_directory(&candidate)?;
+    let permitted = session
+        .permitted_directories
+        .iter()
+        .map(|root| config::canonical_directory(root))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .any(|root| resolved == root || resolved.starts_with(root));
+    anyhow::ensure!(
+        permitted,
+        "cwd is outside the permitted sandbox roots: {}",
+        resolved.display()
+    );
+    anyhow::ensure!(
+        !is_protected_metadata_location(&resolved),
+        "cwd must not be inside protected metadata: {}",
+        resolved.display()
+    );
+    Ok(resolved)
+}
+
+fn is_protected_metadata_location(path: &Path) -> bool {
+    path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        matches!(name.to_str(), Some(".git" | ".agents" | ".codex"))
+    })
+}
+
+pub(crate) fn filtered_environment() -> Result<HashMap<String, String>> {
+    let captured = approvals::CapturedStartEnvironment::capture();
+    captured.validate()?;
+    filtered_environment_values(captured.values())
+}
+
+fn filtered_environment_values(
+    captured: &BTreeMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut environment = HashMap::new();
+    let mut total = 0usize;
+    for name in SAFE_ENV_NAMES {
+        if child_env::SENSITIVE_ENV_NAMES.contains(name) || name.starts_with("TEMOTE_MCP_") {
+            continue;
+        }
+        let Some(value) = captured.get(*name) else {
+            continue;
+        };
+        anyhow::ensure!(
+            value.len() <= MAX_ENV_VALUE_BYTES,
+            "environment value {name} exceeds {MAX_ENV_VALUE_BYTES} bytes"
+        );
+        total = total
+            .checked_add(name.len())
+            .and_then(|size| size.checked_add(value.len()))
+            .context("environment size overflow")?;
+        anyhow::ensure!(
+            total <= MAX_ENV_TOTAL_BYTES,
+            "environment exceeds {MAX_ENV_TOTAL_BYTES} bytes"
+        );
+        environment.insert((*name).to_owned(), value.clone());
+    }
+    anyhow::ensure!(
+        environment.contains_key("PATH"),
+        "PATH is unavailable for developer-tool execution"
+    );
+    anyhow::ensure!(
+        environment.contains_key("HOME"),
+        "HOME is unavailable for developer-tool execution"
+    );
+    environment.insert("NO_COLOR".to_owned(), "1".to_owned());
+    Ok(environment)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DevTool {
@@ -269,7 +368,7 @@ impl PreparedDevToolRun {
     }
 
     pub(crate) fn revalidate(&self, session: &config::Session) -> Result<()> {
-        let cwd = crate::local_agent::resolve_cwd(session, Some(&self.cwd))?;
+        let cwd = resolve_cwd(session, Some(&self.cwd))?;
         anyhow::ensure!(
             cwd == self.cwd,
             "developer-tool cwd changed since validation"
@@ -340,7 +439,7 @@ pub(crate) fn prepare_with_executable(
         "developer tool operation rejected: {}",
         classification.reason
     );
-    let cwd = crate::local_agent::resolve_cwd(session, request.cwd().map(PathBuf::as_path))?;
+    let cwd = resolve_cwd(session, request.cwd().map(PathBuf::as_path))?;
     let writable_roots = tool_state_roots(tool);
     let broker_state_root = package_manager_state_root(tool)?;
     let program = match executable {
@@ -348,7 +447,7 @@ pub(crate) fn prepare_with_executable(
         None => tool.executable_name().to_owned(),
     };
     let command = build_command(&request, program, broker_state_root.as_deref());
-    let mut environment = crate::local_agent::filtered_environment()?;
+    let mut environment = filtered_environment()?;
     environment.extend(requested_environment(object, session)?);
     if matches!(
         (tool, request.operation()),
