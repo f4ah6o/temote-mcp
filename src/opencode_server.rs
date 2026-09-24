@@ -20,6 +20,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 
 use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, params_from_iter, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -1989,19 +1990,26 @@ async fn spawn_serve(
 
     // Seed provider auth into the isolated data dir (fresh copy on every spawn
     // so upstream credential refreshes in the real home propagate).
-    if let Some(auth_source) = opencode_auth_source() {
+    let auth_source = opencode_auth_source();
+    if let Some(auth_source) = &auth_source {
         let target = data_dir.join("opencode");
         ensure_private_directory(&target)?;
         let target = target.join("auth.json");
-        copy_private_file(&auth_source, &target)
+        copy_private_file(auth_source, &target)
             .with_context(|| "cannot seed OpenCode auth into task state")?;
     }
 
-    let config = crate::local_agent::opencode_config(
-        crate::local_agent::Access::WorkspaceWrite,
-        &opencode_auth_source().into_iter().collect::<Vec<_>>(),
-    )?;
-    let config_content = serde_json::to_string(&config)?;
+    if let Some(source) = opencode_db_source() {
+        let target_dir = data_dir.join("opencode");
+        ensure_private_directory(&target_dir)?;
+        seed_opencode_credentials(&source, &target_dir.join("opencode.db"))
+            .context("cannot seed OpenCode credentials into task state")?;
+    }
+
+    let mut protected_paths: Vec<PathBuf> = auth_source.into_iter().collect();
+    protected_paths.push(data_dir.join("opencode/auth.json"));
+    protected_paths.push(data_dir.join("opencode/opencode.db"));
+    let config_content = serve_permission_config(&state_dir, &protected_paths)?;
 
     let contract = serve_contract_override();
     let mut last_error = None;
@@ -2028,14 +2036,171 @@ async fn spawn_serve(
         .context("cannot start opencode serve for task")
 }
 
+fn serve_permission_config(state_dir: &Path, protected_paths: &[PathBuf]) -> Result<String> {
+    let mut config = crate::local_agent::opencode_config(
+        crate::local_agent::Access::WorkspaceWrite,
+        protected_paths,
+    )?;
+    // V2 renamed `permission` to `permissions` and `bash` to `shell`.
+    // Deny all child state, not only the credential filename (SQLite sidecars
+    // and legacy auth must not become readable through the agent's tools).
+    let mut rules = vec![
+        json!({"action":"shell", "resource":"*", "effect":"deny"}),
+        json!({"action":"external_directory", "resource":"*", "effect":"deny"}),
+    ];
+    for path in protected_paths {
+        let resource = path.to_string_lossy();
+        for action in ["read", "edit"] {
+            rules.push(json!({"action":action, "resource":resource, "effect":"deny"}));
+        }
+    }
+    let state = format!("{}/*", state_dir.display());
+    for action in ["read", "edit"] {
+        rules.push(json!({"action":action, "resource":state, "effect":"deny"}));
+    }
+    config["permissions"] = Value::Array(rules);
+    Ok(serde_json::to_string(&config)?)
+}
+
 fn opencode_auth_source() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-        })?;
+    let base = opencode_host_data_home()?;
     let candidate = base.join("opencode").join("auth.json");
     candidate.is_file().then_some(candidate)
+}
+
+fn opencode_host_data_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+}
+
+fn opencode_db_source() -> Option<PathBuf> {
+    let base = opencode_host_data_home()?;
+    let path = match std::env::var_os("OPENCODE_DB") {
+        Some(value) if value == ":memory:" => return None,
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            }
+        }
+        None => base.join("opencode/opencode.db"),
+    };
+    path.exists().then_some(path)
+}
+
+/// Recreate the V2 schema with only provider credentials and migration rows.
+/// The host database can be gigabytes; never snapshot its sessions/history.
+fn seed_opencode_credentials(source: &Path, target: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "OpenCode database source is not a regular file"
+    );
+    reject_symlink_target(target)?;
+    let source_db = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_credential: bool = source_db.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='credential'",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        has_credential,
+        "unsupported OpenCode credential database schema"
+    );
+    let columns: BTreeSet<String> = source_db
+        .prepare("PRAGMA table_info(credential)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    anyhow::ensure!(
+        [
+            "id",
+            "integration_id",
+            "label",
+            "value",
+            "connector_id",
+            "method_id",
+            "active",
+            "time_created",
+            "time_updated"
+        ]
+        .into_iter()
+        .all(|column| columns.contains(column)),
+        "unsupported OpenCode credential database schema"
+    );
+    let staging = target.with_extension("seed");
+    reject_symlink_target(&staging)?;
+    let _ = std::fs::remove_file(&staging);
+    let result = (|| -> Result<()> {
+        // Schema SQL is read from the host DB, never from a caller-supplied
+        // task; no trigger or virtual table may run while copying credentials.
+        let schema: Vec<(String, String, String)> = source_db
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        anyhow::ensure!(
+            schema.len() <= 256,
+            "OpenCode database schema exceeds seed limit"
+        );
+        anyhow::ensure!(
+            schema.iter().all(|(kind, _, sql)| (kind == "table"
+                && !sql.to_ascii_uppercase().contains("VIRTUAL TABLE"))
+                || kind == "index"),
+            "unsupported OpenCode database schema"
+        );
+        let mut db = Connection::open(&staging)?;
+        db.execute_batch("PRAGMA journal_mode = MEMORY; PRAGMA foreign_keys = OFF")?;
+        for (_, _, sql) in &schema {
+            db.execute_batch(sql)?;
+        }
+        let tx = db.transaction()?;
+        for table in ["credential", "migration", "__drizzle_migrations"] {
+            if !schema
+                .iter()
+                .any(|(kind, name, _)| kind == "table" && name == table)
+            {
+                continue;
+            }
+            let name = format!("\"{table}\"");
+            let mut select = source_db.prepare(&format!("SELECT * FROM {name}"))?;
+            let columns = select.column_count();
+            let placeholders = vec!["?"; columns].join(",");
+            let insert = format!("INSERT INTO {name} VALUES ({placeholders})");
+            let mut rows = select.query([])?;
+            let mut count = 0;
+            while let Some(row) = rows.next()? {
+                count += 1;
+                anyhow::ensure!(count <= 256, "OpenCode credential seed row limit exceeded");
+                let values: Vec<SqlValue> = (0..columns)
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<_>>()?;
+                anyhow::ensure!(
+                    values.iter().all(|value| match value {
+                        SqlValue::Text(value) => value.len() <= 1024 * 1024,
+                        SqlValue::Blob(value) => value.len() <= 1024 * 1024,
+                        _ => true,
+                    }),
+                    "OpenCode credential seed value limit exceeded"
+                );
+                tx.execute(&insert, params_from_iter(values))?;
+            }
+        }
+        tx.commit()?;
+        drop(db);
+        #[cfg(unix)]
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))?;
+        reject_symlink_target(target)?;
+        std::fs::rename(&staging, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    // SQL errors may contain paths or values: only a bounded static message
+    // crosses the task API boundary.
+    result.map_err(|_| anyhow::anyhow!("OpenCode credential import failed"))
 }
 
 fn copy_private_file(source: &Path, target: &Path) -> Result<()> {
@@ -3731,6 +3896,105 @@ mod tests {
     use super::*;
     use crate::approvals;
 
+    #[test]
+    fn v2_credential_seed_keeps_only_credentials_and_migrations() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("host.db");
+        let target = root.path().join("task.db");
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, value TEXT, connector_id TEXT, method_id TEXT, active INTEGER, time_created INTEGER, time_updated INTEGER); CREATE TABLE migration (id INTEGER); CREATE TABLE session (id TEXT, content TEXT);").unwrap();
+        db.execute(
+            "INSERT INTO credential VALUES ('cred', 'openai', 'work', ?1, NULL, NULL, 1, 1, 1)",
+            ["provider-key-sentinel"],
+        )
+        .unwrap();
+        db.execute_batch("INSERT INTO migration VALUES (3); INSERT INTO session VALUES ('host-session', 'private-prompt-sentinel');").unwrap();
+        drop(db);
+
+        seed_opencode_credentials(&source, &target).unwrap();
+        let child = Connection::open(&target).unwrap();
+        let secret: String = child
+            .query_row("SELECT value FROM credential", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(secret, "provider-key-sentinel");
+        let migrations: i64 = child
+            .query_row("SELECT id FROM migration", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(migrations, 3);
+        let sessions: i64 = child
+            .query_row("SELECT count(*) FROM session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0);
+        let bytes = std::fs::read(&target).unwrap();
+        assert!(
+            !bytes
+                .windows(b"private-prompt-sentinel".len())
+                .any(|part| part == b"private-prompt-sentinel")
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let other = root.path().join("other.db");
+        seed_opencode_credentials(&source, &other).unwrap();
+        child
+            .execute(
+                "INSERT INTO session VALUES ('task-only', 'task prompt')",
+                [],
+            )
+            .unwrap();
+        let other = Connection::open(other).unwrap();
+        let sessions: i64 = other
+            .query_row("SELECT count(*) FROM session", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    #[test]
+    fn v2_credential_seed_rejects_unknown_schema_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("host.db");
+        let target = root.path().join("task.db");
+        Connection::open(&source)
+            .unwrap()
+            .execute_batch("CREATE TABLE session (id TEXT)")
+            .unwrap();
+        assert!(seed_opencode_credentials(&source, &target).is_err());
+        assert!(!target.exists());
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link.db");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(seed_opencode_credentials(&link, &target).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_credential_seed_is_accepted_by_installed_cli() {
+        let Some(binary) = find_opencode_binary() else {
+            return;
+        };
+        let Some(source) = std::env::var_os("TEMOTE_TEST_OPENCODE_DB") else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("task.db");
+        seed_opencode_credentials(Path::new(&source), &target).unwrap();
+        let output = std::process::Command::new(binary)
+            .args(["auth", "list", "--standalone", "--format", "json"])
+            .env("OPENCODE_DB", &target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated CLI rejected credential seed"
+        );
+        let connections: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(connections.as_array().is_some_and(|list| !list.is_empty()));
+    }
+
     /// Serialize tests that install the shared SPAWN_HOOK; the fake is global
     /// state and parallel installation would cross-drive other tests.
     async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
@@ -4280,10 +4544,8 @@ mod tests {
         let data_dir = root.join("data");
         std::fs::create_dir_all(&scope).unwrap();
         std::fs::create_dir_all(&data_dir).unwrap();
-        let config =
-            crate::local_agent::opencode_config(crate::local_agent::Access::WorkspaceWrite, &[])
-                .unwrap();
-        let config_content = serde_json::to_string(&config).unwrap();
+        let config_content =
+            serve_permission_config(&root, &[data_dir.join("opencode/opencode.db")]).unwrap();
 
         let serve_password = Uuid::new_v4().simple().to_string();
         let client = spawn_serve_once(
