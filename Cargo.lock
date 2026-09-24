@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "temote-mcp"
-version = "2026.8.0"
+version = "2026.9.20"
 dependencies = [
  "anyhow",
  "axum",
