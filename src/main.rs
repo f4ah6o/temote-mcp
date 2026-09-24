@@ -14,6 +14,8 @@ mod codex_app_server;
 mod config;
 mod dev_tool;
 mod devin_acp;
+#[cfg(feature = "network")]
+mod devin_cloud;
 mod doctor;
 mod evidence;
 mod friction;

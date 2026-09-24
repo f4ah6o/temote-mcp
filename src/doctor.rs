@@ -356,6 +356,8 @@ fn check_delegation_backends(report: &mut Report) {
     }
 
     check_devin_delegation(report);
+    #[cfg(feature = "network")]
+    check_devin_cloud_delegation(report);
 
     match crate::cli::codex::delegation::opencode::resolve_default_opencode_executable() {
         Ok(resolved) => {
@@ -449,6 +451,34 @@ fn check_devin_delegation(report: &mut Report) {
             "delegation devin",
             format!("cannot resolve the Devin binary: {error}"),
             "Fix TEMOTE_DEVIN_BIN or unset it to use PATH lookup.",
+        )),
+    }
+}
+
+#[cfg(feature = "network")]
+fn check_devin_cloud_delegation(report: &mut Report) {
+    use crate::devin_cloud::{API_KEY_ENV, API_KEY_FALLBACK_ENV, ORG_ID_ENV};
+    match crate::devin_cloud::readiness() {
+        Ok(readiness) => {
+            let org = if readiness.org_id_configured {
+                ORG_ID_ENV
+            } else {
+                "resolved from /v3/self"
+            };
+            report.add(Check::pass(
+                "delegation devin-cloud",
+                format!(
+                    "credential={}, org={org}, base_url={}",
+                    readiness.api_key_source, readiness.base_url
+                ),
+            ));
+        }
+        Err(error) => report.add(Check::warn(
+            "delegation devin-cloud",
+            error,
+            format!(
+                "Set {API_KEY_ENV} (or {API_KEY_FALLBACK_ENV}) to a Devin service-user/API key to enable devin_cloud_*; {ORG_ID_ENV} is optional when the key belongs to one organization."
+            ),
         )),
     }
 }

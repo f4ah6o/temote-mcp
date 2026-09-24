@@ -647,6 +647,8 @@ pub(crate) enum ApprovalClass {
     OpenCodeServer,
     /// Experimental Devin acp task operations.
     DevinAcp,
+    /// Experimental Devin Cloud (API v3) hosted session operations.
+    DevinCloud,
     /// Local-only escape hatches that leave the Temote sandbox
     /// (`without_sandbox`).
     HostUnrestricted,
@@ -686,7 +688,7 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
             _ => RequestUser,
         },
         GitNetwork | DeveloperTool | Integration | LocalStructured | CodexAppServer
-        | OpenCodeServer | DevinAcp => match mode {
+        | OpenCodeServer | DevinAcp | DevinCloud => match mode {
             config::PermissionMode::Ask => Request,
             _ => Skip,
         },
@@ -4866,6 +4868,8 @@ esac
             LocalStructured,
             CodexAppServer,
             OpenCodeServer,
+            DevinAcp,
+            DevinCloud,
         ] {
             assert_eq!(local_approval(Ask, class), Request, "{class:?}");
             assert_eq!(local_approval(Agent, class), Skip, "{class:?}");

@@ -217,6 +217,26 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         ActivityOperation::DevinTaskControl,
         "Devin control acceptance",
     ),
+    activity_tool(
+        "devin_cloud_status",
+        ActivityOperation::DevinCloudStatus,
+        "Devin Cloud status",
+    ),
+    activity_tool_accepted(
+        "devin_cloud_task_start",
+        ActivityOperation::DevinCloudTaskStart,
+        "Devin Cloud start acceptance",
+    ),
+    activity_tool(
+        "devin_cloud_task_get",
+        ActivityOperation::DevinCloudTaskGet,
+        "Devin Cloud get",
+    ),
+    activity_tool_accepted(
+        "devin_cloud_task_control",
+        ActivityOperation::DevinCloudTaskControl,
+        "Devin Cloud control acceptance",
+    ),
     activity_job_tool(
         "local_agent_run",
         ActivityOperation::LocalAgentRun,
@@ -1168,6 +1188,10 @@ fn tools(public: bool, managed_sessions: bool) -> Value {
         {"name":"devin_task_start","title":"Start a scoped Devin task","description":"Accept an idempotent scoped Devin task mutation, persist acceptance before child side effects, then start a per-task devin acp child process over stdio and create its ACP session. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"agent":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
         {"name":"devin_task_get","title":"Read a scoped Devin task","description":"Read and reconcile a retained Devin task owned by the full Temote session instance and canonical scope. Detailed session data is exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"devin_task_control","title":"Control a scoped Devin task","description":"Idempotently steer, resume, or interrupt a retained scoped Devin task. Acceptance is persisted before the acp side effect; uncertain crash gaps return reconciliation_required rather than replaying blindly. Resume requires the agent's advertised loadSession capability and fails closed without it.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
+        {"name":"devin_cloud_status","title":"Check Devin Cloud API access","description":"Verify the configured Devin Cloud API v3 credential by calling /v3/self and return the authenticated principal, organization, and API base URL. The credential value itself is never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"devin_cloud_task_start","title":"Start a Devin Cloud session task","description":"Accept an idempotent scoped Devin Cloud task mutation, persist acceptance before the remote side effect, then create a hosted Devin session (API v3) with a structured report schema. The session runs on Devin Cloud, not on this host; operation_id is mandatory.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"title":{"type":"string","minLength":1,"maxLength":256},"devin_mode":{"type":"string","enum":["normal","fast","lite","ultra","fusion"]},"repos":{"type":"array","items":{"type":"string","minLength":1,"maxLength":256},"maxItems":16},"max_acu_limit":{"type":"integer","minimum":1,"maximum":100000}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
+        {"name":"devin_cloud_task_get","title":"Read a Devin Cloud session task","description":"Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
+        {"name":"devin_cloud_task_control","title":"Control a Devin Cloud session task","description":"Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"local_agent_run","title":"Run a local coding agent","description":"Run a verified Codex or OpenCode non-interactive agent in the selected session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. The caller supplies a task and access mode, not an executable, raw argv, environment, or network policy. With worktree.branch, Temote binds the run to the selected repository's managed worktree (<configured src root>/worktrees/<repo>/<task>) and derives the path itself: it reuses only a verified managed worktree of that repository and branch, otherwise creates one through the approved path, and rejects cwd combined with worktree.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":local_agent_input_schema()},
         {"name":"dev_tool_run","title":"Run a structured developer tool operation","description":"Run a validated Cargo, Vite+, uv, npm, pnpm, or Go operation through the developer broker with canonical workspace scope and narrowly scoped tool cache state. Offline development operations run with network disabled; dependency/network operations use an explicitly classified network profile. Package-manager operations use a narrow fixed subcommand contract and do not expose arbitrary executables or raw host commands. Optional env entries are admitted only when every name is covered by a granted dev_tool_env_prefixes session grant; broker-set variables cannot be overridden.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},"inputSchema":dev_tool_input_schema()},
         {"name":"get_image","title":"Read a local image","description":"Read a local image up to 32 MiB and return it as MCP image content. Relative paths use the session working directory.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string","description":"Path to a PNG, JPEG, GIF, WebP, BMP, TIFF, or AVIF image."}},"required":["session_id","path"],"additionalProperties":false}},
@@ -1550,6 +1574,55 @@ async fn call_tool_with_local_agent_executable(
                 .await?;
                 text_result(serde_json::to_string_pretty(
                     &crate::devin_acp::task_control(&args, &session).await?,
+                )?)
+            }
+            #[cfg(feature = "network")]
+            "devin_cloud_status" => {
+                let (detail, metadata) = devin_cloud_status_approval();
+                authorize_devin_cloud_operation(
+                    &session,
+                    "devin_cloud_status",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &crate::devin_cloud::status(&session).await?,
+                )?)
+            }
+            #[cfg(feature = "network")]
+            "devin_cloud_task_start" => {
+                let (detail, metadata) = devin_cloud_task_start_approval(&args);
+                authorize_devin_cloud_operation(
+                    &session,
+                    "devin_cloud_task_start",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &crate::devin_cloud::task_start(&args, &session).await?,
+                )?)
+            }
+            #[cfg(feature = "network")]
+            "devin_cloud_task_get" => text_result(serde_json::to_string_pretty(
+                &crate::devin_cloud::task_get(&args, &session).await?,
+            )?),
+            #[cfg(feature = "network")]
+            "devin_cloud_task_control" => {
+                let (detail, metadata) = devin_cloud_task_control_approval(&args);
+                authorize_devin_cloud_operation(
+                    &session,
+                    "devin_cloud_task_control",
+                    detail,
+                    metadata,
+                    activity.as_ref(),
+                )
+                .await?;
+                text_result(serde_json::to_string_pretty(
+                    &crate::devin_cloud::task_control(&args, &session).await?,
                 )?)
             }
             "local_agent_run" => {
@@ -2490,6 +2563,107 @@ fn devin_approval_metadata(
         ("mutation".to_owned(), mutation.to_string()),
         ("read_only".to_owned(), (!mutation).to_string()),
         ("scope".to_owned(), "session_cwd".to_owned()),
+    ])
+}
+
+#[cfg(feature = "network")]
+async fn authorize_devin_cloud_operation(
+    session: &config::Session,
+    action: &str,
+    detail: String,
+    metadata: BTreeMap<String, String>,
+    activity: Option<&ActivityScope>,
+) -> Result<()> {
+    let approved = approvals::ensure_local_approval_with_activity(
+        session,
+        approvals::ApprovalClass::DevinCloud,
+        action,
+        detail,
+        session.cwd.clone(),
+        metadata,
+        activity,
+    )
+    .await?;
+    finish_activity_approval(approved, activity, "user denied Devin Cloud operation")?;
+    Ok(())
+}
+
+#[cfg(feature = "network")]
+fn devin_cloud_status_approval() -> (String, BTreeMap<String, String>) {
+    (
+        "Devin Cloud delegation request\naccess: read-only\nscope: current session\nresult: authenticated principal and organization (credential value omitted)".to_owned(),
+        devin_cloud_approval_metadata("devin_cloud_status", "status", false, "session_scope"),
+    )
+}
+
+#[cfg(feature = "network")]
+fn devin_cloud_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
+    let operation_id = safe_codex_argument(args, "operation_id");
+    let title = safe_codex_argument(args, "title");
+    let devin_mode = safe_codex_argument(args, "devin_mode");
+    let repos = args
+        .get("repos")
+        .and_then(Value::as_array)
+        .map(|items| items.len().to_string())
+        .unwrap_or_else(|| "0".to_owned());
+    let mut metadata = devin_cloud_approval_metadata(
+        "devin_cloud_task_start",
+        "task_start",
+        true,
+        "devin_cloud_session",
+    );
+    metadata.insert("operation_id".to_owned(), operation_id.clone());
+    metadata.insert("title".to_owned(), title.clone());
+    metadata.insert("devin_mode".to_owned(), devin_mode.clone());
+    metadata.insert("repos".to_owned(), repos.clone());
+    metadata.insert("task_input".to_owned(), "omitted".to_owned());
+    (
+        format!(
+            "Devin Cloud delegation request\noperation: start hosted session\nmutation: remote Devin Cloud session (consumes ACUs)\nscope: Devin Cloud organization, not this host\ntitle: {title}\ndevin_mode: {devin_mode}\nrepos: {repos}\noperation_id: {operation_id}\ntask input: omitted"
+        ),
+        metadata,
+    )
+}
+
+#[cfg(feature = "network")]
+fn devin_cloud_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
+    let task_id = safe_codex_argument(args, "task_id");
+    let operation_id = safe_codex_argument(args, "operation_id");
+    let action = safe_codex_argument(args, "action");
+    let mut metadata = devin_cloud_approval_metadata(
+        "devin_cloud_task_control",
+        "task_control",
+        true,
+        &format!("task:{task_id}"),
+    );
+    metadata.insert("task_id".to_owned(), task_id.clone());
+    metadata.insert("operation_id".to_owned(), operation_id.clone());
+    metadata.insert("action".to_owned(), action.clone());
+    metadata.insert("control_input".to_owned(), "omitted".to_owned());
+    (
+        format!(
+            "Devin Cloud delegation request\noperation: control hosted session\naction: {action}\nmutation: remote Devin Cloud session\ntarget: task {task_id}\noperation_id: {operation_id}\ncontrol input: omitted"
+        ),
+        metadata,
+    )
+}
+
+#[cfg(feature = "network")]
+fn devin_cloud_approval_metadata(
+    tool: &str,
+    operation_type: &str,
+    mutation: bool,
+    target: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("provenance".to_owned(), "devin_cloud_delegation".to_owned()),
+        ("source".to_owned(), "devin_cloud_delegation".to_owned()),
+        ("tool".to_owned(), tool.to_owned()),
+        ("operation_type".to_owned(), operation_type.to_owned()),
+        ("target".to_owned(), target.to_owned()),
+        ("mutation".to_owned(), mutation.to_string()),
+        ("read_only".to_owned(), (!mutation).to_string()),
+        ("scope".to_owned(), "devin_cloud".to_owned()),
     ])
 }
 
@@ -10195,6 +10369,8 @@ mod tests {
             [
                 "codex_task_control",
                 "codex_task_start",
+                "devin_cloud_task_control",
+                "devin_cloud_task_start",
                 "devin_task_control",
                 "devin_task_start",
                 "opencode_task_control",
@@ -12096,7 +12272,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 71);
+        assert_eq!(tools.len(), 75);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
