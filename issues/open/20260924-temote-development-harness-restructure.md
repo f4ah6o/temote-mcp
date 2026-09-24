@@ -3,7 +3,7 @@
 Status: open / umbrella tracker (polished; implementation not started)
 Model: GPT-5.6 Sol
 Created: 2026-09-24 (Asia/Tokyo)
-Updated: 2026-09-24 (Asia/Tokyo) — current `main` baseline / gh-git / gh-stack facts verified; scope / responsibility boundaries revised per PR #47 design review
+Updated: 2026-09-24 (Asia/Tokyo) — current `main` baseline / gh-git / gh-stack facts verified; scope / responsibility boundaries revised per PR #47 design review; user priorities: approve-free agent mode, caller-location independence, no local main
 Baseline inspected: `ba4c51c` (`main`, after PR #46 delegation-only tool surface)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Related:
@@ -23,6 +23,21 @@ Related:
 最終的には product / binary の中心名を `temote-mcp` から **`temote`** へ寄せ、MCP は Temote の transport / frontend の一つとして扱う。
 
 この issue は umbrella tracker であり、直接実装しない。既存の server-backed agent delegation、managed worktree、gh-git integration を捨ててやり直すのではなく、現在の `main` から責務を整理して移行する。各 Phase は Flash-sized の child issue (`issues/open/` または `issues/polished/`) に切り出してから着手する。
+
+## Top-level requirements (user-confirmed)
+
+以下の 3 要件を設計・実装順序・受入判定の最上位に置く。ここで定めるのは target contract であり、下記 current baseline の実装済み事実とは区別する。
+
+1. **yolo を使わず、極力 approve-free な agent mode。** repository / workspace / network / 操作範囲について既に与えられた許可を task に引き継ぎ、その範囲内の準備・実装・テスト・許可済み commit / push / PR 作成では操作ごとの再承認を要求しない。delivery という分類だけで毎回承認にしない。権限拡張や未許可の破壊的操作は明示的に扱い、sandbox・秘密情報保護・他作業の保護を維持する。
+2. **指示役が cloud / local のどちらでも同じように使える。** authenticated caller が同じ権限を持つ場合、transport によって task の操作能力・承認方針・状態参照が変わらない。cloud から開始した task を local から追跡・制御でき、その逆もできる。指示役の場所と agent の実行場所 (host-local / hosted) は別の軸として扱う。
+3. **独立して遅れ・未統合 commit の蓄積・分岐が生じる local main を持たない。** 新規 managed repository は bare repository store + task worktrees を標準とし、local `main` を作業・統合・追従のために維持しない。基準は fetch で確認した `origin/main` とその commit。既存 checkout は勝手に移動・削除・reset せず、明示的な移行契約で保全する。
+
+### Agent-mode authorization contract
+
+- Temote core は許可の scope / operation class / 有効性を共通に検証する。許可済み操作を client 接続・transport 切替・子操作への分割だけを理由に再承認しない。失効や scope 変更時は再評価する。
+- `agent` は上記の範囲で prompt-free、`ask` は既存の対話承認方針を維持する。通常フローの成立に `yolo` を要求しない。
+- repository / workspace 管理、environment preparation、delivery へ operation class を拡張する際も同じ方針を適用し、対応する child issue で AGENTS.md と policy tests を更新する。
+- backend 自身の承認要件や外部サービスの認可は無効化しない。対応 backend では許可範囲を保つ設定へ写像し、残る入力待ち・承認待ちは capability / state として可視化する。Temote の prompt 削減と backend の制約を区別する。
 
 ## Core value and initial scope
 
@@ -98,7 +113,7 @@ Temote の中心価値は、**どの coding agent に任せても、適切な作
 | agent backend | 実装・調査・テストの実行 |
 | delivery adapter | branch / PR の提出と状態確認 |
 
-**AGENTS.md からの境界変更**: 現行 AGENTS.md は「machine operations は agent に委譲する」としている。本 issue は workspace / environment / delivery の **管理操作** を Temote の固定 adapter が担い、実装中の **コード操作** は引き続き agent が担う、という区別を導入する。各 child issue (Phase C / D / E) は、どの操作がどちらに属するか、および固定 adapter に適用する実行権限 (sandbox profile / network / approval class) を明示し、AGENTS.md を同じ packet で更新する。
+**AGENTS.md からの境界変更**: 現行 AGENTS.md は「machine operations は agent に委譲する」としている。本 issue は workspace / environment / delivery の **管理操作** を Temote の固定 adapter が担い、実装中の **コード操作** は引き続き agent が担う、という区別を導入する。各 child issue (Phase F / C / D / E) は、どの操作がどちらに属するか、および固定 adapter に適用する実行権限 (sandbox profile / network / approval class) を明示し、AGENTS.md を同じ packet で更新する。
 
 ## Target architecture
 
@@ -226,13 +241,13 @@ rename (Phase G) 前は現 binary 名 `temote-mcp task ...` で提供する。
 --local != sessionless
 ```
 
-identity / workspace ownership / approval / credentials / evidence / activity policy は MCP / remote と共通にする。task は MCP と同じく session に束縛する。
+identity / workspace ownership / approval / credentials / evidence / activity policy は MCP / remote と共通にする。task は MCP と同じく session に束縛する。接続ごとの認証と session ownership の検証を行った上で、同じ権限を持つ cloud / local caller は同一 task / operation ID / evidence を扱う。指示役の場所だけを理由に追加承認や機能制限を設けない。
 
 ### Retry / reconciliation UX
 
 `operation_id` の CLI 自動生成だけでは、応答消失後にコマンドを再実行したとき別 ID で二重起動しうる。Phase B の契約に以下を含める (具体形は child で確定):
 
-- caller が `--operation-id <uuid>` を明示でき、同一 ID の再送は同一 receipt を返す
+- caller が `--operation-id <uuid>` を明示でき、同じ session / operation scope で同一 ID・同一 request fingerprint の再送は既存 receipt に基づく結果を返す。同一 ID で task / backend / options 等が異なる request は conflict として拒否し、副作用を再実行しない
 - 自動生成時は送信前に ID を表示 / 保存し、再実行時に再利用できる
 - 明示的な再照合 (`task get` / `task list` による再発見、または `task reconcile`) で、応答消失した操作の結果を確認できる
 
@@ -298,29 +313,26 @@ gh git workspace remove task-api
 gh git workspace prune
 ```
 
-### Worktree-only / bare-first direction
+### Worktree-only / bare-first default for new managed repositories
 
-最終的には repository と editable workspace を分離する。
+新規 managed repository は **bare repository store + task branch ごとの worktree** を標準形とする。`repository != workspace` を構造として分離し、local `main` の checkout / commit / merge / pull を通常フローに持ち込まない。bare-first は後段の opt-in 機能ではなく、最上位要件を満たす初期 workspace 基盤に含める。
 
-```text
-repository store
-    |
-    +-- worktree A -> Temote task A
-    +-- worktree B -> Temote task B
-    +-- worktree C -> Temote task C
-```
+- store 作成時に remote-tracking ref の fetch 設定を明示し、`origin/main` を更新する。`refs/heads/main` の作成・維持を必要としない構成にする。bare 化だけでこの ref 契約を満たしたと見なさない。
+- task 開始時に許可済み fetch を行い、取得した `origin/main` の commit と確認時刻を記録する。独立 task はそこから専用 branch / worktree を作る。stacked task は明示選択された親 branch / revision を直接の基点とし、stack の root が参照する `origin/main` も記録する。
+- fetch 失敗時は最後に確認した commit / 時刻と freshness 未確認を返し、最新と扱わない。開始の可否は事前に定めた freshness policy に従う。接続できないことを yolo や scope 拡張で回避しない。
+- 長期 task の再開時と delivery 前に再 fetch し、基点と現在確認できる `origin/main` の差を検査する。必要な追従を task branch 上で行い、変更後の revision に対して再検証する。remote の進行と競合しうるため「常に最新」とは保証しない。
+- 統合は GitHub の PR 経由とし、merge 済みの結果を fetch する。local `main` に未提出 commit を積み、後で同期する運用は作らない。PR merge 自体も既存の許可と repository rules に従う。
+- task branch の未統合 commit や意図した stack は local main の分岐とは区別する。未コミット変更・未提出 commit を自動破棄して追従や cleanup を成立させない。
 
-理想形では bare repository store + disposable worktrees を採用し、`repository != workspace` を構造として明確化する。
+### Existing checkout compatibility and migration
 
-ただし現在の Temote managed worktree は canonical primary checkout (`<src-root>/<repo>`) と `<src-root>/worktrees/<repo>/<name>` を前提にしているため、一気に置換しない。
+現行 managed worktree は canonical primary checkout (`<src-root>/<repo>`) と `<src-root>/worktrees/<repo>/<name>` を前提にする。この baseline は保全し、新規 managed store の標準とは分けて扱う。
 
-移行順:
-
-1. gh-git workspace layout を現行 Temote managed-worktree layout (`<src-root>/worktrees/<repo>/<name>`) と一致させる
-2. workspace creation / inspection primitive を gh-git へ寄せる (Temote は JSON contract を消費)
-3. Temote の `ManagedRepository::primary_checkout` 前提を `RepositoryStore + Workspace` abstraction へ置換
-4. bare-first を opt-in
-5. acceptance 後に default 化を検討
+1. Phase F で `RepositoryStore + Workspace` と remote-tracking ref / freshness の契約を共通コアと並行して設計する。既存 layout と owner/repo mapping は compatibility adapter で扱う。
+2. gh-git に Git primitive と versioned JSON contract を置き、Temote はそれを利用して task ownership を管理する。
+3. 新規 store を bare-first / no-local-main とし、Phase C の workspace 割当と組み合わせて初期 acceptance を通す。
+4. 既存 repo は inspect して未コミット変更・未提出 commit・worktree / identity binding を報告する。既存 local main を reset / delete / 強制同期せず、移行を明示的に行うまで保持する。
+5. 既存 checkout の保全を「no-local-main 移行完了」とは数えず、新規標準と legacy compatibility の状態を分けて報告する。
 
 ### Session / workspace mapping (Phase C の前提)
 
@@ -347,7 +359,7 @@ Git ready
 = agent-ready workspace
 ```
 
-environment preparation は Temote environment 層の責務とし、gh-git の Git 側準備の後段に置く。preparation の実行は coding agent への委譲ではなく Temote / gh-git の固定 adapter が行う (caller は argv を指定できない。AGENTS.md の typed contract invariant と同じ)。network を要する install は既存 approval class / network policy に従う。
+environment preparation は Temote environment 層の責務とし、gh-git の Git 側準備の後段に置く。preparation の実行は coding agent への委譲ではなく Temote environment の固定 adapter が行う (caller は argv を指定できない。AGENTS.md の typed contract invariant と同じ)。network を要する install は既存 approval class / network policy に従う。
 
 ### JS / TS
 
@@ -392,7 +404,7 @@ ephemeral Temote workspace では必要に応じて:
 ```text
 RUSTC_WRAPPER=sccache
 CARGO_INCREMENTAL=0
-CARGO_TARGET_DIR=<Temote/gh-git managed cache>/<repo>/<workspace>
+CARGO_TARGET_DIR=<Temote environment managed cache>/<repo>/<workspace>
 ```
 
 worktree cleanup 時に workspace-scoped target cache を回収可能にする。これらの env は backend spawn 時の child env (`src/child_env.rs`) 経由で渡し、caller 指定の env block は引き続き受けない。
@@ -418,11 +430,11 @@ task-ui                 feat/api
 
 `task graph ~= branch graph ~= PR stack` は一般には成り立たない: 調査 task は branch を持たないことがあり、実装とレビューが同じ PR に関わることも、複数 task を一つの PR にまとめることもある。したがって task graph から **delivery 対象の branch とその依存関係を明示的に選び**、それを stack へ写像する。単独 PR も通常の delivery として扱い、stack は選択された branch 依存が 2 段以上ある場合の一形態とする。
 
-gh-stack 統合と bare-first opt-in はいずれも共通コア / local frontend の成立条件にしない。
+gh-stack 統合は共通コア / local frontend の成立条件にしない。bare-first / no-local-main は初期 workspace 基盤 (Phase F + C) の必須条件とし、単独の core extraction は先行できる。
 
 注意点 (verified):
 
-- `link` は push / PR 作成 / base 修正 / Stack 作成を行う remote side effect であり、新しい approval class (delivery) として扱う。`ask` では approval、`agent` での扱いは Phase E child で決める。
+- `link` は push / PR 作成 / base 修正 / Stack 作成を行う remote side effect であり、delivery operation class として検証する。`agent` では対象 repo / branches / 操作が既存許可に含まれる限り再承認しない。`ask` は対話承認を維持する。未許可の対象や操作まで拡張せず、部分成功・再試行も receipt と remote state から照合する。
 - `link` は additive only。stack から PR を外す / 並べ替える操作は初期 scope 外。
 - `link` 運用では `gh stack view --json` が使えないため、stack / PR state evidence は GitHub API から取得する。
 - `gh` の identity は Section 6 の repository-scoped profile を使う。
@@ -528,20 +540,25 @@ transport/
 - 自律的なタスク分解、実装方針の決定、backend / model の自動選択 (初期 scope)
 - 大きな workflow engine を先に作ること
 - gh-git に言語別の環境準備を持たせること
+- 通常の agent mode を成立させるために yolo を要求すること
+- 指示役が cloud / local であることだけを理由に機能・権限・承認回数を変えること
+- 新規 managed repository の local main を作業・統合 branch として維持すること
 
 ## Suggested implementation packets
 
-優先する到達点 (この順):
+優先する到達点:
 
-1. 共通コア抽出と既存 MCP 契約の維持 (Phase A)
-2. local から同一 task lifecycle を操作 (Phase B)
-3. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)
-4. workspace 割当と書込み排他 (Phase C)
-5. environment preparation (D)、stack delivery (E)、bare-first (F) を個別に追加
+1. 共通コア抽出と既存 MCP 契約の維持 (Phase A)。repository-store / no-local-main 契約の設計 (Phase F) は並行して進める。
+2. cloud / local 共通の task lifecycle と許可済み範囲の approve-free agent mode (Phase B)。
+3. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
+4. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を初期基盤として完成させる。
+5. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
-依存関係: A → B → R → C → {D, E, F}。D / E / F は互いに独立で、いずれも A / B の成立条件ではない。C0 (gh-git identity fix) は独立した前提修正としていつでも進められる。G (rename) は A + B + R + C 完了後。
+依存関係: A → B → R。C0 (gh-git identity fix) と F の設計は独立に開始できる。F の新規 store 実装は C0 と整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
 ### Phase A — core extraction
+
+最初の child は dispatch / 承認経路の抽出と既存契約の維持に限定し、record / index 拡張は後続 child に分ける。
 
 最初の packet (推奨): 4 backend の `status` / `task_start` / `task_get` / `task_control` を 1 つの `Backend` 抽象 (enum dispatch で十分) の裏に置き、`src/mcp.rs` はそれを呼ぶだけにする。tool schema / 応答 JSON / approval metadata は byte-compatible に保つ (gateway contract snapshot が差分ゼロであること)。
 
@@ -558,7 +575,8 @@ transport/
 - [ ] `temote-mcp task ... --local` CLI (rename 前は現 binary 名で提供)
 - [ ] `--operation-id` 明示 / 再利用と再照合 UX
 - [ ] MCP と local が同じ core path を通る E2E
-- [ ] `--local` でも approval / permission mode / evidence policy が変わらないことを検証
+- [ ] 同じ権限の cloud / local caller が接続を切り替えても承認を繰り返さず、同一 task / operation / evidence を扱えることを検証
+- [ ] agent mode の既存許可内の start / control が yolo なし・Temote 追加 prompt なしで動き、scope 外操作は拒否されることを検証
 
 ### Phase R — reconciliation acceptance
 
@@ -577,7 +595,7 @@ transport/
 - [ ] session 停止時の workspace 扱い
 - [ ] 管理操作 (Temote 固定 adapter) と コード操作 (agent) の区別・実行権限を明示し AGENTS.md を更新
 - [ ] gh-git に `workspace` namespace と JSON contract を設計 (passthrough collision policy と整合)
-- [ ] current managed-worktree layout との compatibility integration
+- [ ] Phase F の新規 bare store / no-local-main 契約との integration、および既存 managed-worktree layout の保全
 - [ ] owner 付き repo 指定 (`owner/repo`) と現行 `<src-root>/<repo>` identity の mapping 方針
 - [ ] task -> workspace binding
 - [ ] reservation / concurrent task ownership を維持
@@ -590,21 +608,27 @@ transport/
 - [ ] Cargo / sccache / isolated target adapter (child env 経由)
 - [ ] cleanup policy
 - [ ] cache hit / cold start の representative benchmark
+- [ ] 許可済み workspace / network 範囲の preparation が agent mode で yolo・追加 prompt なしに完了することを検証
 
 ### Phase E — gh-stack delivery
 
 - [ ] task graph から delivery 対象 branch と依存を明示選択する mapping (単独 PR を通常 delivery として扱う)
-- [ ] `gh stack link` integration + delivery approval class
+- [ ] 単独 PR / `gh stack link` integration と delivery operation class。許可済み commit / push / PR 作成は agent mode で再承認しない
+- [ ] delivery 前の fetch / base revision 検査と、必要な追従後の再検証
 - [ ] stack / PR state evidence (GitHub API 経由)
 - [ ] agent tasks が sibling worktree を mutate しないことを確認
 - [ ] worktree-sensitive gh-stack commands (`init/add/checkout/sync/rebase`) の採用範囲を明示
 
-### Phase F — repository-store abstraction
+### Phase F — initial repository store / no-local-main foundation
 
-- [ ] `ManagedRepository::primary_checkout` 前提を RepositoryStore + Workspace へ抽象化
-- [ ] bare-first opt-in
-- [ ] normal checkout / existing repos migration contract
-- [ ] recovery / GC / orphan behavior
+- [ ] `ManagedRepository::primary_checkout` 前提を RepositoryStore + Workspace へ抽象化 (契約設計は Phase A と並行)
+- [ ] 新規 managed store は bare-first を標準とし、local `main` の作成・維持を不要にする
+- [ ] store 管理操作の実行権限・agent mode の既存許可継承を明示し、実装 packet で AGENTS.md / policy tests を更新
+- [ ] `origin/main` を取得・更新する fetch refspec と task / stack 基点の記録
+- [ ] fetch 失敗時の freshness 未確認、長期 task 再開 / delivery 前の追従・再検証契約
+- [ ] 通常操作を通して `refs/heads/main` が不要なこと、task commits が専用 branch に残ることを検証
+- [ ] normal checkout / existing repos migration contract (dirty / ahead / diverged な local main を破棄しない)
+- [ ] recovery / GC / orphan behavior (未コミット変更・未提出 commit の保護)
 - [ ] macOS / Linux acceptance
 
 ### Phase G — product rename
@@ -618,13 +642,19 @@ transport/
 
 - orchestration core を `src/delegation/` に置くか、新 module にして旧 one-shot delegate を別名に退避するか。
 - 共通 index の置き場所と、backend store との整合を崩したときの照合規則。
-- `agent` permission mode で `gh stack link` (remote push / PR 作成) を approval-free にしてよいか。
+- 既存許可を repo / branches / operation class に束縛して継承・失効させる record と、backend 固有 permission への写像 (許可済み範囲で再承認しない方針は確定)。
+- fetch 失敗時の開始可否・長期 task の freshness 検査タイミングと、事前設定する policy の具体形。
 - owner 付き repository 指定で owner 違い同名 repo をどう扱うか (現行 layout は repo 名のみ)。
 - 1 session が複数 workspace を持つ別案を採る必要があるか (採るなら scope を広げない方法)。
 - Devin Cloud task を stack delivery に参加させる場合、hosted session が作る branch をどう task graph に取り込むか。
 
 ## Acceptance criteria
 
+- [ ] yolo なしの agent mode で、既存許可内の workspace 準備・実装・テスト・許可済み commit / push / PR 作成を Temote の操作ごとの再承認なしに進められる
+- [ ] 同じ権限を持つ cloud / local caller 間で task の開始・追跡・制御・再試行を引き継げ、指示役の場所による追加承認や機能差がない
+- [ ] 新規 managed repository は bare store + task worktrees が標準で、local main の checkout / commit / merge / pull を必要としない
+- [ ] task 開始時と提出前に確認した origin/main の commit / 時刻を記録し、fetch 失敗を最新確認済みと扱わない
+- [ ] 既存の dirty / ahead / diverged な checkout は保全し、新規 no-local-main 標準とは区別して移行状態を報告する
 - [ ] MCP を通さず local client / CLI から同じ agent task lifecycle を操作できる
 - [ ] MCP / local / HTTP / Gateway が同じ orchestration core を利用する
 - [ ] Codex / OpenCode / Devin ACP が task ごとの isolated workspace で動作する
@@ -645,6 +675,6 @@ transport/
 
 Temote を「MCP server」ではなく、
 
-> どの coding agent に任せても適切な作業場所・権限・状態追跡・成果確認を提供し、isolated, prepared workspaces を coding agents に割り当て、caller が明示した task と依存関係を実行し、検証結果・evidence と PR / stacked PR まで運ぶ local / remote development harness
+> 指示役の cloud / local に依存せず、yolo なしの agent mode で許可範囲内を極力再承認なしに実行し、local main の管理を必要としない workspace 基盤から、caller が明示した task と依存関係を coding agents で実行して、検証結果・evidence と PR / stacked PR まで運ぶ development harness
 
 として再定義する。
