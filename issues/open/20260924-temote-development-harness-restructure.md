@@ -1,7 +1,7 @@
 # Temote を local / remote agentic development harness へ再構成する
 
 Status: open / umbrella tracker (polished; implementation not started)
-Model: GPT-5.6 Sol
+Execution unit: one bounded child packet per run (small-model implementation guide below)
 Created: 2026-09-24 (Asia/Tokyo)
 Updated: 2026-09-24 (Asia/Tokyo) — current `main` baseline / gh-git / gh-stack facts verified; scope / responsibility boundaries revised per PR #47 design review; user priorities: approve-free agent mode, caller-location independence, no local main
 Baseline inspected: `ba4c51c` (`main`, after PR #46 delegation-only tool surface)
@@ -22,7 +22,7 @@ Related:
 
 最終的には product / binary の中心名を `temote-mcp` から **`temote`** へ寄せ、MCP は Temote の transport / frontend の一つとして扱う。
 
-この issue は umbrella tracker であり、直接実装しない。既存の server-backed agent delegation、managed worktree、gh-git integration を捨ててやり直すのではなく、現在の `main` から責務を整理して移行する。各 Phase は Flash-sized の child issue (`issues/open/` または `issues/polished/`) に切り出してから着手する。
+この issue は umbrella tracker であり、直接実装しない。既存の server-backed agent delegation、managed worktree、gh-git integration を捨ててやり直すのではなく、現在の `main` から責務を整理して移行する。各 Phase は下記 Implementation guide に従い、入力・出力・手順・検証・完了条件を埋めた小さい child issue (`issues/open/` または `issues/polished/`) に切り出してから着手する。
 
 ## Top-level requirements (user-confirmed)
 
@@ -638,9 +638,262 @@ transport/
 - [ ] docs / package / release / plugin / skill references
 - [ ] release acceptance
 
+## Implementation guide for small-model execution
+
+この節は child issue を具体化するための作業指示であり、umbrella を一括実装する指示ではない。モデルの価格帯や名称で完了基準を下げない。**1 回の実行には 1 packet だけを渡す**。Phase A / B 等の見出し全体をそのまま実装依頼にしない。
+
+### 1. Child issue を着手可能にする条件
+
+指示役は下記テンプレートを埋め、実装役が設計判断とコーディングを同時に抱えないようにする。既に決めた 3 つの最上位要件は毎回再検討しない。
+
+1. 対象 repository、作業 branch、確認した HEAD、親 issue と packet ID を記載する。
+2. 前提 packet の成果を commit / ファイル / test 名で指す。未実装の API を存在するものとして書かない。
+3. 入力・出力・副作用・失敗時の結果を具体例で固定する。新しい永続形式は schema version と旧データの扱いも書く。
+4. 読むファイル・検索する symbol・変更対象を列挙する。行番号はずれるため symbol を優先する。
+5. 手順を順番に書き、正常系と失敗系の期待値を指定する。
+6. 実行する test の実在する名前とコマンド、必要な host / backend / credentials を記載する。
+7. 今回完了する条件と、次 packet に残す項目を分ける。
+8. commit / push / PR 操作は当該依頼の許可を記載し、そのまま引き継ぐ。禁止や追加承認を勝手に足さない。
+
+「適切に設計」「必要に応じて統合」「全 backend をよしなに対応」で済ませない。下表の将来 packet は分割案であり、未決の wire format や policy を含むものは、先行する契約 packet の成果を child に転記してから着手可能にする。
+
+### 2. 全 packet 共通の実行手順
+
+1. 現在の HEAD・branch・remote・staged / unstaged / untracked 変更と AGENTS.md を読む。既存変更を今回の差分と区別して保持する。過去に読んだ baseline を現在の実装と決めつけない。
+2. 指定 symbol とその呼出元・test を読む。shell を使える環境では下の検索例を使う。GitHub 経由の場合も同じファイルと symbol を取得する。
+3. 変更前の関連 test を実行する。既存失敗を記録し、今回の変更による失敗と分ける。環境不足なら未実行の対象と不足物を記録する。
+4. 最小の変更を行う。既存処理の抽出では、判定順序、error、JSON、receipt 保存順序、子プロセスの所有者を変えない。
+5. 指定した正常系・失敗系を検証する。test を通すために assertion / scope 検査 / approval 検査を削除しない。
+6. diff を読み、目的と無関係な rename・format・依存更新・schema 変更が入っていないか確認する。必要な修正後に関連 test を再実行する。
+7. repository の必要な gates を実行し、許可に従って commit / push する。最後に git status と保存された commit を確認する。
+8. packet の完了条件が揃った場合だけ閉じる。実装済みでも host acceptance が未実行なら、その状態を明記する。次 packet を実施したことにはしない。
+
+検索の入口 (確認済み baseline に存在するファイル / symbol。後続では前提 commit で再確認):
+
+```sh
+rg -n 'authorize_.*operation|task_start|task_control' src/mcp.rs
+rg -n 'TaskRecord|TaskStore|OperationReceipt|task_start|task_get|task_control' src/codex_app_server.rs src/opencode_server.rs src/devin_acp.rs src/devin_cloud.rs
+rg -n 'ControlRequest|run_supervisor' src/session_control.rs
+rg -n 'enum Command' src/cli.rs
+rg -n 'ManagedRepository|primary_checkout|reservation|admission' src/managed_worktree.rs
+rg --files -g AGENTS.md -g '*test*' -g '*contract*' -g '*snapshot*'
+```
+
+Temote の Rust / protocol 変更では AGENTS.md の gates を使う:
+
+```sh
+cargo fmt --all -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo check --no-default-features --all-targets
+git diff --check
+```
+
+gateway / shared protocol を変更する場合は gateway directory で `npm test` も実行する。sandbox 内では AGENTS.md の `just sandboxed-check` と host-only gates の区別を守る。gh-git はその repository の AGENTS.md と Go の検証手順を使う。文書だけの packet に runtime acceptance の PASS を付けない。モデルが実在しない test 名や未提供 credentials を補ってはいけない。
+
+### 3. 分割順と各 packet の成果
+
+以下の「前提」は着手に必要な成果を示す。設計 packet の成果は実装完了ではない。F1 は A 系と並行して設計でき、C0 も独立に実施できる。同時実行や別 agent の起動を必須にはしない。
+
+| ID | 前提 | 今回の成果 | 完了を確認する方法 |
+| --- | --- | --- | --- |
+| A1 | 現状確認 | 4 backend の dispatch と承認経路を共通入口へ抽出 | 同じ入力の JSON / approval metadata / error が維持される |
+| A2 | A1 | typed request と capability の境界 | backend 固有入力を保持し、未対応 action を副作用前に拒否 |
+| A3 | A2 | session-owned task 一覧と共通参照 | backend store を横断しても他 session の task が混ざらない |
+| A4 | A3 | execution / verification / delivery の別状態 | execution completed だけで verification PASS にならない |
+| B0 | A2、A3 | local protocol・認証 scope・実行所有者の契約 | request / response / version / error / lifetime の例が揃う |
+| B1 | B0 | supervisor socket の task request routing | local request が A 系の同じ共通入口へ到達する |
+| B2 | B1 | task CLI と operation ID の保存・再利用 | 応答消失後の再送が同じ operation を参照する |
+| R1 | B2、A4 | 切断・再送と transport 相互操作の検証 | local → MCP と MCP → local で同一 task を追跡 |
+| R2 | R1 | 再起動後の reconciliation | 観測不能な状態を成功・失敗に変えず二重起動しない |
+| C0 | gh-git 現状確認 | linked worktree の profile 解決修正 | common Git dir の同じ identity を参照 |
+| F1 | 現状確認 | store / workspace JSON と ref / path / freshness 契約 | 下記の具体的な入出力例と不変条件が揃う |
+| F2 | F1、C0 | gh-git の新規 bare store と inspect | local main なしで origin/main を fetch・参照できる |
+| F3 | F2 | task branch / worktree の ensure と再試行 | 同じ要求で同じ workspace、競合要求で上書きしない |
+| F4 | F3 | freshness と既存 checkout 保全・回収条件 | fetch 失敗を明示し、dirty / ahead / diverged を保持 |
+| C1 | F4、A2 | Temote の workspace session binding | scope が割当 workspace と一致 |
+| C2 | C1、R2 | writer 排他・停止・再起動時の所有権 | 同一 workspace の writer が二重に動かない |
+| D0 | C2 | preparation の状態・許可・cache key 契約 | 未準備 / 準備中 / ready / 失敗を区別 |
+| D1 | D0 | vp / pnpm adapter | lockfile を維持し、別 worktree の依存 view を壊さない |
+| D2 | D0 | Cargo / sccache adapter | target を分離し、共有 cache がなくても結果を偽らない |
+| E0 | C2、A4 | delivery 対象・許可・receipt の契約 | task と branch / PR の多対一を表現できる |
+| E1 | E0 | 単独 PR の提出・照合 | 許可内は再承認せず、再試行で重複 PR を作らない |
+| E2 | E1 | gh-stack link の adapter | 指定した順序・base と部分成功を remote で照合 |
+| G1 | A–C / R / F の完了 | rename 互換性表と移行手順 | 旧名・旧 state の検出と新名の対応が明確 |
+| G2 | G1 | 互換性を保つ rename と release acceptance | 旧 client / state を使う移行 test が通る |
+
+### 4. 最初に渡す A1 の実装指示
+
+**目的:** MCP の外からも同じ承認付き処理を呼べる入口を作る。local CLI、task_list、store 統合、workspace 作成はこの packet には含めない。
+
+**読む場所:** AGENTS.md、`src/mcp.rs` の 4 backend の match arm と `authorize_*_operation`、4 backend module の entry point、`src/lib.rs`、既存 approval / gateway contract tests。
+
+**実装方針:** 新規 core の入口は `src/orchestration.rs` (後続で必要なら directory module 化) とする。`src/delegation/` の旧 one-shot 実装は移動しない。既に同等の core が導入されている場合はそれを使い、重複 module を作らない。4 variant の enum dispatch を使い、動的 plugin registry や新しい外部依存は導入しない。
+
+1. 現行の status / start / get / control ごとに、入力検証・承認・backend 呼出し・応答整形の順序をメモする。get が承認不要なら抽出後も維持する。
+2. backend 呼出しと承認処理を共通入口へ移す。共通入口の error 型や session 型は既存型を再利用する。activity に必要な情報は引数等で渡し、core から MCP wire 型へ依存させない。
+3. MCP 側は tool 名を backend / action に対応付け、共通入口を呼び、既存形式へ整形する。public schema、文字列、JSON shape、approval metadata を変更しない。
+4. backend の TaskStore / receipt / fingerprint / runtime ownership は移動・再設計しない。既存の「受理を保存してから副作用」の順序をそのまま使う。
+5. 既存 test で同じ入力を確認する。必要な追加 test は、agent mode で許可済み start が prompt なし、ask で既存承認経路を通る、拒否時は backend side effect が 0 回、の境界を検証する。
+6. 全 4 backend の wiring と `network` feature 無効時の compile を確認する。1 backend だけ通った状態で A1 完了としない。
+7. diff に schema / store / runtime ownership の変更が入っていないこと、MCP 側に承認と backend 呼出しの別経路が残っていないことを確認する。
+
+**完了条件:**既存 MCP 契約を維持したまま共通入口を経由する。新しい動作がまだ利用者に見えなくても、この抽出だけで A1 は完了してよい。4 backend の実サービス接続は、必要な環境がある場合の acceptance と区別し、mock / fixture だけで実サービス PASS を報告しない。
+
+### 5. A2–A4 の具体化
+
+**A2: 入力の型と capability**
+
+1. 現在の schema と validator から各 backend の必須 / 任意 field を表にする。
+2. 共通 field と backend-specific options を分ける。既存 default と error の互換性を維持する。
+3. hosted / host-local、resume 可否、停止の意味を独立した capability として扱う。Devin ACP の cloud option を local execution と決めつけない。
+4. 不正入力、未対応 action、異なる session の task 操作では backend を呼ばない test を加える。
+
+**A3: 一覧・共通参照**
+
+1. backend store を source of truth とし、共通一覧は session scope 内の read-only projection から始める。最初から第二の authoritative task store を作らない。
+2. backend / task ID / session instance の対応を保持する。現行 task ID を振り直さない。
+3. 1 backend の取得失敗を空一覧と偽らず、部分結果と未確認 backend を区別する。paging / 件数上限は child の入出力例に固定する。
+4. session A / B、各 backend、読取失敗を fixture で検証する。
+
+**A4: 結果の状態**
+
+1. execution の既存 status を保持し、verification / delivery は独立 field または関連 record に置く。
+2. 検証がない旧 task は `not_run` とする。migration は実装前に旧 record の fixture と読取規則を固定する。
+3. verification は検証対象 revision に束縛する。dirty workspace を検証した場合は commit SHA だけで同一内容と扱わず、検証対象 snapshot を識別するか未対応を明示する。
+4. revision が変わった後に旧 PASS を現在の PASS と表示しないことを検証する。
+
+### 6. B0–R2 の具体化
+
+**B0 は契約だけを決める packet。** 以下を decision table と request / response の例にしてから B1 に渡す。
+
+1. protocol version と対応しない version の error。既存 session lifecycle request の互換性。
+2. session 指定は全 task 操作で明示する。`task get <id>` 等の略記も実際の CLI では `--session` または検証済みの接続 context が必要。ID から他 session を探索して自動選択しない。
+3. CLI / MCP client の認証と session ownership、core に渡す permission context。
+4. supervisor は routing / lifecycle を所有し、実処理は既存 session の実行境界を維持する。owner-only socket という理由だけで backend を非 sandbox の supervisor context から起動しない。
+5. client 切断と session 停止を区別する。client 切断で task を取り消さず、session 停止は既存の停止契約に従って照合する。
+6. ID 保存先、owner-only access、atomic write、保存失敗時に送信しない順序、再利用時の request fingerprint 検査。
+
+**B1:** B0 の request を追加 → session / permission を解決 → A の共通入口へ渡す → bounded response を返す。最初は fixture backend で socket routing を確認する。認証・scope・version の拒否経路も同じ test suite に置く。
+
+**B2:** CLI parsing → operation ID を送信前に保存 → request 送信 → task / operation ID と状態を表示。再送に新 ID を割り当てない。同一 ID の異なる payload は conflict。CLI が切断しても server を勝手に再起動しない。
+
+**R1 / R2 の failure injection:** 各行を個別 test にし、注入位置と backend 起動回数を確認する。
+
+| 注入位置 / 操作 | 期待結果 |
+| --- | --- |
+| 送信前に CLI が終了 | backend side effect なし。保存済み ID は再利用可能 |
+| 受理後、応答だけ消失 | 再送で同じ task を得る。backend の重複起動なし |
+| 同じ ID で異なる task 文面 | conflict。元の task は維持 |
+| local 開始 → MCP get / control | 同じ権限なら同じ task に作用 |
+| MCP 開始 → local get / control | 同上。追加の Temote 承認なし |
+| 権限のない session から get / control | 拒否。他 session の evidence を返さない |
+| client 切断 | task を継続し、再接続で発見 |
+| supervisor / backend 再起動 | receipt と backend の観測結果から照合。根拠なく再起動・完了扱いしない |
+| backend の状態取得失敗 | unknown / reconciliation_required 等で不確実性を保持 |
+
+再起動時の自動継続が backend にない場合、継続可能と偽る必要はない。停止確認済み・照合待ち等を正確に返すことが acceptance である。
+
+### 7. C0 / F1–F4 / C1–C2 の具体化
+
+**C0 (gh-git repository):** primary と linked worktree の profile 解決を同じ common Git dir に揃える。変更対象は既存 profile path の解決とその tests。binding の保存形式変更や workspace command 追加を同時に行わない。
+
+**F1 の契約書に必要な項目:**
+
+- repository の識別子は host / owner / repo を区別する。同名 repo を directory basename だけで同一視しない。
+- store path / workspace ID / canonical path / branch / base commit / last successful fetch 時刻 / freshness / schema version の具体的 JSON。
+- ensure の同一要求再送、既存 branch の衝突、path escape、fetch 失敗の具体的 error。
+- 新規標準と legacy checkout の判別、inspect が read-only であること、dirty / 未提出 commit の保全条件。
+- Temote が所有権を判断し、gh-git が Git primitive を提供する境界。F1 で Git 側 API を固定し、C で同じ API を二重設計しない。
+
+**F2 の手順:**
+
+1. test 専用 temporary remote を作り、main に少なくとも 1 commit を用意する。実ユーザー repository を fixture に使わない。
+2. 新規 bare store に origin と remote-tracking fetch を設定する。`refs/heads/main` の作成を必要としないことを検証する。
+3. inspect が base commit / freshness を返すこと、remote main を進めた後の fetch で観測値が更新されることを確認する。
+4. 外部 GitHub の認証 test は C0 / integration と分離する。local remote fixture で OAuth 成功を主張しない。
+
+**F3:** 指定 base commit から task branch と worktree を作る。同じ workspace ID / 同じ要求は再利用し、同じ ID / 異なる branch・repo・base は既存内容を上書きせず conflict。作成途中で失敗した場合も、既存 user path を削除せず inspect で照合できる状態を残す。
+
+**F4:** remote を取得不能にした test で freshness 未確認を確認する。legacy fixture は clean / dirty / ahead / diverged を用意し、inspect・失敗・cleanup 判定の前後で refs とファイル内容が保持されることを確認する。自動で force reset / force remove する修正は不可。
+
+**C1:** F の workspace 結果を canonicalize → 既存 reservation を取得 → その scope の session に bind → task を開始する。途中失敗で予約が漏れないこと、scope が親 repo 全体へ広がらないことを検証する。
+
+**C2:** 同一 workspace への並行 start では writer が 1 つ、別 workspace なら独立して動くことを検証する。session 停止後の process 生存が未確認なら writer reservation を安全と決めつけて解放しない。停止確認・再起動後の照合・未コミット保全を個別 test にする。
+
+### 8. D / E / G の具体化
+
+**D0:** readiness の key に workspace・lockfile・toolchain・adapter version 等の必要な入力を含める。変更後に古い ready を使い回さない。adapter の command / env は固定の typed input から作り、caller の raw argv を受けない。install script 等が実行される可能性を含め、既存許可内の sandbox / network 条件を維持する。
+
+**D1:** pinned vp / pnpm の実際の help / documentation で対応 flag を確認してから固定 command を実装する。本書の例を未検証のままコピーしない。正常 install、lockfile 不一致、network 失敗、2 worktree の依存差を検証する。cache reuse は測定結果として記録し、install 自体が常に不要になると保証しない。
+
+**D2:** shared CARGO_HOME / sccache と workspace-specific target を child env に設定する。sccache がない・失敗した場合の fallback または error は D0 の契約に従う。incremental を切る設定は測定対象とし、速度改善を未測定で PASS にしない。
+
+**E0:** repo / branches / operation class に対する既存許可、対象 revision、単独 PR / stack の選択、remote side effect の receipt と再照合規則を固定する。task の完了だけで勝手に提出しない。提出を含む既存依頼は再承認しない。
+
+**E1:** fetch・base 検査 → 指定 revision の検証結果確認 → 許可済み push → 既存 PR 照合 → 必要なら作成 → evidence 記録。応答消失時は remote state を照合してから再試行する。主な test は、許可内で追加 prompt なし、scope 外拒否、PR 作成直後の応答消失、検証後の revision 変更。
+
+**E2:** 明示された branch 順で link する。途中まで push / PR 作成 / base 更新が成功した fixture から再照合できることを検証する。additive-only の制約を越える削除・並替えは実装しない。実 GitHub acceptance は当該 task の許可範囲の test repo / branches を使う。
+
+**G1 / G2:** binary、env prefix、state / socket path、gateway、skill、release の旧→新対応を先に表にする。各互換項目を小さい変更に分割する。既存 state を見つけられず新規 task を重複起動する移行は不可。CalVer は既存 release workflow に従い、手作業で version を進めない。
+
+### 9. Child issue テンプレート
+
+次の項目を埋めて 1 packet を渡す。未決箇所がある場合は「設計 packet」として成果を契約書に限定する。実装役に umbrella 全体の設計判断を押し付けない。
+
+```markdown
+# <packet ID>: <今回完成する動作>
+
+Status: ready | contract-needed
+Repository:
+Branch / observed HEAD:
+Parent issue:
+Prerequisites: <完了 commit / 対象ファイル / test>
+
+## 1. Goal
+<利用者または次 packet が新しくできることを1つ>
+
+## 2. Fixed decisions
+<入力・出力例、error、権限、永続化、互換性>
+<3つの最上位要件に対する今回の責務>
+
+## 3. Read / change scope
+<実在するファイル・symbol・test>
+<既存変更と今回の変更の扱い>
+
+## 4. Steps
+1. <現状確認>
+2. <最小変更>
+3. <正常系検証>
+4. <失敗系検証>
+5. <diff / gates / 保存確認>
+
+## 5. Acceptance
+- [ ] <入力→期待結果>
+- [ ] <失敗条件→期待結果>
+- [ ] <維持する互換性>
+
+## 6. Validation commands
+<実在するコマンドと必要環境。未実行のhost gateも明記>
+
+## 7. Delivery authorization
+<今回与えられた commit / push / PR 方針>
+
+## 8. Completion report
+<commit、変更、検証 PASS / FAIL / 未実行、残件、最終status>
+```
+
+### 10. 困った場合の判断と報告
+
+1. symbol が移動した場合は repository 内で検索し、同じ責務の実装を使う。既存機能を再実装して埋めない。
+2. 前提 packet が未完了なら、その不足を具体的に記録する。別 phase を抱き合わせて補完しない。
+3. 失敗した test は原因を調べ、今回の範囲内なら修正・再テストする。目的を変える判断だけを指示役へ返す。命名や小さな内部関数分割は既存 style に従い自律的に決める。
+4. 一時的な通信失敗では既存 operation / job の状態を先に確認し、重複起動しない。running を観測できる間は追跡を継続する。
+5. 最終報告は「packet ID / commit」「新しく成立した動作」「実行コマンドと PASS・FAIL・未実行」「残件」「git status / remote 保存確認」。完了していない受入条件はチェックしない。
+
 ## Open questions
 
-- orchestration core を `src/delegation/` に置くか、新 module にして旧 one-shot delegate を別名に退避するか。
+- A1 では新規 `src/orchestration.rs` を入口とし旧 `src/delegation/` は維持する。後続で directory module に分割する際の具体的な配置。
 - 共通 index の置き場所と、backend store との整合を崩したときの照合規則。
 - 既存許可を repo / branches / operation class に束縛して継承・失効させる record と、backend 固有 permission への写像 (許可済み範囲で再承認しない方針は確定)。
 - fetch 失敗時の開始可否・長期 task の freshness 検査タイミングと、事前設定する policy の具体形。
