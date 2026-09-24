@@ -571,27 +571,27 @@ fn socket_dir() -> Result<PathBuf> {
     // system temporary directory rather than `std::env::temp_dir()`. A short
     // optional namespace exists for isolated process-boundary tests or
     // deliberately parallel supervisors owned by the same user.
-    let uid = unsafe { libc::geteuid() };
+    let euid = unsafe { libc::geteuid() };
     let namespace = std::env::var("TEMOTE_MCP_SOCKET_NAMESPACE")
         .ok()
         .filter(|value| !value.is_empty());
-    default_socket_dir(uid, namespace.as_deref())
+    default_socket_dir(euid, namespace.as_deref())
 }
 
-fn default_socket_dir(uid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
+fn default_socket_dir(euid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
     #[cfg(test)]
     if namespace.is_none() {
         return crate::test_support::private_process_root().map_err(anyhow::Error::msg);
     }
-    socket_dir_for(uid, namespace)
+    socket_dir_for(euid, namespace)
 }
 
-fn socket_dir_for(uid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
+fn socket_dir_for(euid: libc::uid_t, namespace: Option<&str>) -> Result<PathBuf> {
     match namespace {
-        None => Ok(PathBuf::from("/tmp").join(format!("temote-mcp-{uid}"))),
+        None => Ok(PathBuf::from("/tmp").join(format!("temote-mcp-{euid}"))),
         Some(namespace) => {
             validate_socket_namespace(namespace)?;
-            Ok(PathBuf::from("/tmp").join(format!("tmcp-{uid}-{namespace}")))
+            Ok(PathBuf::from("/tmp").join(format!("tmcp-{euid}-{namespace}")))
         }
     }
 }

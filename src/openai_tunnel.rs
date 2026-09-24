@@ -118,7 +118,7 @@ pub async fn setup(options: SetupOptions) -> Result<SetupResult> {
         );
     }
 
-    let admin_key = secret_from_env_or_tty(
+    let admin_key = credential_from_env_or_tty(
         "OPENAI_ADMIN_KEY",
         "OpenAI Admin API key: ",
         "OpenAI Admin API key",
@@ -477,7 +477,7 @@ fn runtime_credential(interactive: bool) -> Result<RuntimeCredential> {
         interactive,
         "CONTROL_PLANE_API_KEY is required (OPENAI_API_KEY is accepted only as the official tunnel-client fallback)"
     );
-    Ok(RuntimeCredential::Prompted(secret_from_tty(
+    Ok(RuntimeCredential::Prompted(credential_from_tty(
         "OpenAI Runtime API key: ",
         "OpenAI Runtime API key",
     )?))
@@ -493,14 +493,18 @@ fn configure_runtime_command(command: &mut Command, credential: &RuntimeCredenti
     }
 }
 
-fn secret_from_env_or_tty(env_name: &str, prompt: &str, label: &str) -> Result<Zeroizing<String>> {
-    if let Some(value) = secret_from_env_value(std::env::var_os(env_name), env_name)? {
+fn credential_from_env_or_tty(
+    env_name: &str,
+    prompt: &str,
+    label: &str,
+) -> Result<Zeroizing<String>> {
+    if let Some(value) = credential_from_env_value(std::env::var_os(env_name), env_name)? {
         return Ok(value);
     }
-    secret_from_tty(prompt, label)
+    credential_from_tty(prompt, label)
 }
 
-fn secret_from_env_value(
+fn credential_from_env_value(
     value: Option<OsString>,
     env_name: &str,
 ) -> Result<Option<Zeroizing<String>>> {
@@ -664,7 +668,7 @@ fn read_hidden_secret(reader: &mut impl Read) -> std::io::Result<SecretInput> {
 }
 
 #[cfg(unix)]
-fn secret_from_tty(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
+fn credential_from_tty(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -718,7 +722,7 @@ fn secret_from_tty(prompt: &str, label: &str) -> Result<Zeroizing<String>> {
 }
 
 #[cfg(not(unix))]
-fn secret_from_tty(_prompt: &str, label: &str) -> Result<Zeroizing<String>> {
+fn credential_from_tty(_prompt: &str, label: &str) -> Result<Zeroizing<String>> {
     anyhow::bail!(
         "cannot read {label} from the controlling terminal on this platform; set the corresponding environment variable for non-interactive use"
     )
@@ -1246,13 +1250,13 @@ mod tests {
         test_support::run(0x4f50_454e_5345_4352, 512, |ctx| {
             let value = test_support::ascii_string(ctx, 128);
             let selected =
-                secret_from_env_value(Some(OsString::from(&value)), "TEST_SECRET").unwrap();
+                credential_from_env_value(Some(OsString::from(&value)), "TEST_SECRET").unwrap();
             assert_eq!(selected.is_some(), !value.is_empty(), "value={value:?}");
             if let Some(selected) = selected {
                 assert_eq!(selected.as_str(), value);
             }
             assert!(
-                secret_from_env_value(None, "TEST_SECRET")
+                credential_from_env_value(None, "TEST_SECRET")
                     .unwrap()
                     .is_none()
             );

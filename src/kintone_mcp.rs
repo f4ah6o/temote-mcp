@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn generated_authentication_matrix_matches_bridge_policy() -> noprop::TestResult {
         test_support::run(0x4b4d_4350_4155_5448, test_support::DEFAULT_CASES, |ctx| {
-            let username = match noprop::sample_usize_in(ctx, 0..=2) {
+            let login = match noprop::sample_usize_in(ctx, 0..=2) {
                 0 => None,
                 1 => Some(String::new()),
                 _ => Some(test_support::safe_component(ctx)),
@@ -515,7 +515,7 @@ mod tests {
             };
             let mut environment =
                 vec![("KINTONE_BASE_URL", "https://example.cybozu.com".to_owned())];
-            if let Some(value) = &username {
+            if let Some(value) = &login {
                 environment.push(("KINTONE_USERNAME", value.clone()));
             }
             if let Some(value) = &password {
@@ -535,15 +535,15 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let session = session(root.path());
 
-            let password_auth = username.as_deref().is_some_and(|v| !v.trim().is_empty())
+            let password_auth = login.as_deref().is_some_and(|v| !v.trim().is_empty())
                 && password.as_deref().is_some_and(|v| !v.trim().is_empty());
             let token_auth = token.as_deref().is_some_and(|v| !v.trim().is_empty());
-            let pair_shape = username.is_some() == password.is_some();
+            let pair_shape = login.is_some() == password.is_some();
             let expected = (password_auth || token_auth) && pair_shape;
             assert_eq!(
                 bridge.validated_environment(&session).is_ok(),
                 expected,
-                "username={username:?} password_present={} token_present={}",
+                "login={login:?} password_present={} token_present={}",
                 password.is_some(),
                 token.is_some()
             );
@@ -554,14 +554,14 @@ mod tests {
     #[test]
     fn generated_status_never_exposes_kintone_credentials() -> noprop::TestResult {
         test_support::run(0x4b4d_4350_5354_4154, 512, |ctx| {
-            let host_secret = format!("{}.secret.example", test_support::safe_component(ctx));
-            let token_secret = format!(
+            let host_fixture = format!("{}.secret.example", test_support::safe_component(ctx));
+            let token_fixture = format!(
                 "token-{}-{}",
                 test_support::safe_component(ctx),
                 noprop::sample_u64(ctx)
             );
-            let user_secret = format!("user-{}", test_support::safe_component(ctx));
-            let password_secret = format!(
+            let user_fixture = format!("user-{}", test_support::safe_component(ctx));
+            let credential_fixture = format!(
                 "password-{}-{}",
                 test_support::safe_component(ctx),
                 noprop::sample_u64(ctx)
@@ -571,11 +571,11 @@ mod tests {
                 environment: [
                     (
                         "KINTONE_BASE_URL".to_owned(),
-                        format!("https://{host_secret}"),
+                        format!("https://{host_fixture}"),
                     ),
-                    ("KINTONE_USERNAME".to_owned(), user_secret.clone()),
-                    ("KINTONE_PASSWORD".to_owned(), password_secret.clone()),
-                    ("KINTONE_API_TOKEN".to_owned(), token_secret.clone()),
+                    ("KINTONE_USERNAME".to_owned(), user_fixture.clone()),
+                    ("KINTONE_PASSWORD".to_owned(), credential_fixture.clone()),
+                    ("KINTONE_API_TOKEN".to_owned(), token_fixture.clone()),
                 ]
                 .into_iter()
                 .collect(),
@@ -583,10 +583,15 @@ mod tests {
             };
             let root = tempfile::tempdir().unwrap();
             let rendered = bridge.status(&session(root.path())).to_string();
-            for secret in [&host_secret, &token_secret, &user_secret, &password_secret] {
+            for candidate in [
+                &host_fixture,
+                &token_fixture,
+                &user_fixture,
+                &credential_fixture,
+            ] {
                 assert!(
-                    !rendered.contains(secret),
-                    "secret leaked in status: {secret:?}"
+                    !rendered.contains(candidate),
+                    "secret leaked in status: {candidate:?}"
                 );
             }
             Ok(())

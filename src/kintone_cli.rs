@@ -994,13 +994,13 @@ mod tests {
             let nonce = noprop::sample_u64(ctx);
             let host = format!("pbt-secret-host-{nonce}.example.invalid");
             let token = format!("pbt-secret-token-{nonce}");
-            let username = format!("pbt-secret-user-{nonce}");
-            let password = format!("pbt-secret-password-{nonce}");
+            let login = format!("pbt-secret-user-{nonce}");
+            let credential = format!("pbt-secret-password-{nonce}");
             let guest = format!("pbt-secret-guest-{nonce}");
             let environment = [
                 ("KINTONE_BASE_URL", format!("https://{host}")),
-                ("KINTONE_USERNAME", username.clone()),
-                ("KINTONE_PASSWORD", password.clone()),
+                ("KINTONE_USERNAME", login.clone()),
+                ("KINTONE_PASSWORD", credential.clone()),
                 ("KINTONE_API_TOKEN", token.clone()),
                 ("KINTONE_GUEST_SPACE_ID", guest.clone()),
             ];
@@ -1012,10 +1012,10 @@ mod tests {
                     .collect(),
             };
             let rendered = bridge.status().to_string();
-            for secret in [&host, &token, &username, &password, &guest] {
+            for candidate in [&host, &token, &login, &credential, &guest] {
                 assert!(
-                    !rendered.contains(secret),
-                    "status leaked configured value {secret:?}: {rendered}"
+                    !rendered.contains(candidate),
+                    "status leaked configured value {candidate:?}: {rendered}"
                 );
             }
             Ok(())
