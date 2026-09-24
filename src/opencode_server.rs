@@ -2036,11 +2036,56 @@ async fn spawn_serve(
         .context("cannot start opencode serve for task")
 }
 
+fn path_argument(path: &Path, label: &str) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{label} is not valid UTF-8: {}", path.display()))
+}
+
+fn opencode_config(auth_paths: &[PathBuf]) -> Result<Value> {
+    let mut edit = serde_json::Map::from_iter([
+        ("*".to_owned(), json!("allow")),
+        (".git".to_owned(), json!("deny")),
+        (".git/**".to_owned(), json!("deny")),
+        ("**/.git".to_owned(), json!("deny")),
+        ("**/.git/**".to_owned(), json!("deny")),
+        (".agents".to_owned(), json!("deny")),
+        (".agents/**".to_owned(), json!("deny")),
+        ("**/.agents".to_owned(), json!("deny")),
+        ("**/.agents/**".to_owned(), json!("deny")),
+        (".codex".to_owned(), json!("deny")),
+        (".codex/**".to_owned(), json!("deny")),
+        ("**/.codex".to_owned(), json!("deny")),
+        ("**/.codex/**".to_owned(), json!("deny")),
+    ]);
+    for path in auth_paths {
+        edit.insert(path_argument(path, "auth path")?, json!("deny"));
+    }
+
+    let read = if auth_paths.is_empty() {
+        json!("allow")
+    } else {
+        let mut rules = serde_json::Map::new();
+        rules.insert("*".to_owned(), json!("allow"));
+        for path in auth_paths {
+            rules.insert(path_argument(path, "auth path")?, json!("deny"));
+        }
+        Value::Object(rules)
+    };
+    Ok(json!({
+        "permission": {
+            "read": read,
+            "edit": Value::Object(edit),
+            "bash": "deny",
+            "external_directory": "deny",
+            "webfetch": "allow",
+            "websearch": "allow"
+        }
+    }))
+}
+
 fn serve_permission_config(state_dir: &Path, protected_paths: &[PathBuf]) -> Result<String> {
-    let mut config = crate::local_agent::opencode_config(
-        crate::local_agent::Access::WorkspaceWrite,
-        protected_paths,
-    )?;
+    let mut config = opencode_config(protected_paths)?;
     // V2 renamed `permission` to `permissions` and `bash` to `shell`.
     // Deny all child state, not only the credential filename (SQLite sidecars
     // and legacy auth must not become readable through the agent's tools).

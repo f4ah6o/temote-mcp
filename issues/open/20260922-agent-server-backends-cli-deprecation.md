@@ -42,7 +42,7 @@ Codex および OpenCode の delegation / local-agent 経路を、長期的に s
 
 - `codex` / `opencode` binary の廃止 (serve / app-server も同一 binary 経由)。
 - parity 未実測での CLI 経路削除。
-- `local_agent_run` の sandboxed one-shot tier の即時廃止 (別途判断)。
+- ~~`local_agent_run` の sandboxed one-shot tier の即時廃止 (別途判断)。~~ → 2026-09-24 に削除済み (Progress 参照)。
 
 ## Acceptance
 
@@ -66,6 +66,8 @@ Codex および OpenCode の delegation / local-agent 経路を、長期的に s
 - 2026-09-23: `temote-mcp doctor` に delegation auth readiness チェック追加。`codex`/`opencode` binary の PATH/override (`TEMOTE_OPENCODE_BIN`) 解決 + credential 存在確認 (`$CODEX_HOME/auth.json` or `OPENAI_API_KEY`、`$XDG_DATA_HOME/opencode/auth.json`) を warn-level で報告 — binary 有り・credential 無し (401/provider 未認証で turn 失敗する状態) を事前検出できる。delegation は optional のため fail にはせず、turn 実行もしない。credential-blocked 状態での live 出力: `WARN delegation codex: binary=.../codex but no Codex credentials are visible` / `WARN delegation opencode: binary=.../opencode but no OpenCode credentials are visible`。
 - 2026-09-23: OpenCode 2.x (`api/*`) contract 対応。動機: ユーザ Mac の opencode v2.0.11 は `/global/*` を持たず `opencode_status` が `/global/health` の decode error で落ちていた (codex 側は credentialed turn まで承認操作なしで動作確認済み)。`spawn_serve_once` に contract auto-detection を実装 — 各 poll で `global/health` を先に probe し、応答があれば従来 v1 path。v1 が一度でも失敗した poll から `api/*` v2 probe も試行し、先に成功した contract を採用 (v1-only serve は v2 probe が成功しないため v1 が選ばれ続ける)。両 contract を提供する server では起動 timing 次第で v2 が選ばれることもあるが、両 adapter とも task contract を完全に normalize 済みのため機能的に等価。`TEMOTE_OPENCODE_SERVE_CONTRACT=v1|v2` で固定可。v2 message shape 差分を parser に吸収: `type`→role、`content`→parts、`model:{id,providerID}`→provider/model、`time.completed`/`error`/`id`/`tokens` は top-level でも読めることを確認。prompt id は v2 の `msg_` prefix 要求に合わせ `msg_<uuid>` に変更 (v1 の `msg` prefix 要求も満たす)。`serve_v2_contract_end_to_end` で 1.18.32 (`/global/*`+`/api/*` 両方) に対し v2 強制・Auto 共に実 turn (admission→assistant message→`content` text→`model` object→`time.completed`) まで検証。
 - 2026-09-23: v2 実装を typed SDK から raw HTTP + `serde_json::Value` に置き換え。動機: Mac の `2026.9.14` で `opencode_status` が `opencode serve did not become healthy: server listening ... OpenCode API returned HTTP 404` で再び失敗 — v2.0.11 には `api/health` が存在せず liveness は `api/info` (serve 起動直後から応答)、pending question surface は `api/question/*` ではなく `api/form`。さらに SDK 0.1.0 (1.x `api/*` preview 向けに生成) は body 形状も一致しない: prompt request は `{prompt:{text}}` だが 2.x schema は `text` を top-level に spread、prompt 応答も `{admittedSeq,...}` vs `{id,sessionID,time:{created},type:"user",payload,delivery}`、SessionInfo の `title` は 2.x で optional と SDK decode が壊れる経路が複数あった。`SdkV2Serve` を reqwest + Value の小さな client に変更し、`api/info`→`api/health` の順で JSON body が返る方を health とし (1.x は未知 path に HTML shell を返すため JSON parse まで成功条件)、question は `api/question/request`→`api/form` の順に JSON 応答を採用。prompt body は `{id, text, prompt:{text}, delivery:"queue"}` と両 schema を包含する形で送信 (余分な key は両側で無視されることを 1.18.32/2.0.11 双方の schema で確認)。messages は `api/session/:id/message?order=desc&limit` (2.x の 200 上限を尊重)、active は `{data:{sid:{type:"running"}}}` を busy に正規化。`serve_v2_contract_end_to_end` が 1.18.32 で引き続き end-to-end green。
+
+- 2026-09-24: `local_agent_run` 削除 (別途判断の決着)。per-command bwrap one-shot tier を MCP tool・broker・Git shim・dedicated sandbox profile ごと撤去し、delegation は server-backed の `codex_task_*` / `opencode_task_*` / `devin_*` に一本化。`ActivityOperation::LocalAgentRun` は recorded activity の backward-compat のため parse/render のみ残置。
 
 ## Related
 

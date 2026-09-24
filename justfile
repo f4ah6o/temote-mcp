@@ -28,7 +28,6 @@ sandboxed-check: fmt-check sandboxed-test clippy sandboxed-no-default gateway-sa
 
 sandboxed-test:
     cargo test --lib --all-features --locked -- --skip sandbox::linux_tests
-    cargo test --bin temote-mcp --all-features --locked agent_git
     cargo test --bin temote-mcp --all-features --locked activity_job
     cargo test --bin temote-mcp --all-features --locked activity_coverage
     cargo test --bin temote-mcp --all-features --locked upgrade_transaction::tests::
@@ -37,7 +36,6 @@ sandboxed-test:
     @echo "NOT RUN (host/CI gate): session_gc socket liveness acceptance (session_control::tests::host_liveness_tests)"
     @echo "NOT RUN (host/CI gate): Linux nested sandbox runtime tests (sandbox::linux_tests)"
     @echo "NOT RUN (host/CI gate): pinned-workspace path-swap bubblewrap acceptance (sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap_host_acceptance)"
-    @echo "NOT RUN (host/CI gate): local_agent real-wiring tests (nested Linux sandbox required)"
     @echo "NOT RUN (host/CI gate): agent-mode linked-worktree broker metadata acceptance (nested Linux sandbox required)"
     @echo "NOT RUN (host/CI gate): deployment-preflight CLI subprocess tests (nested process spawn required)"
     @echo "NOT RUN (host/CI gate): full binary/local Unix-socket integration suite"
@@ -49,7 +47,7 @@ sandboxed-no-default:
 
 # The complete gateway suite, including the deployment-preflight CLI subprocess
 # tests. Host/CI only: nested `node` process spawning can fail with EPERM inside
-# the local-agent sandbox.
+# a Temote sandbox.
 gateway-test:
     npm test --prefix gateway
 
@@ -65,7 +63,6 @@ linux-sandbox-acceptance:
     cargo build --bin temote-linux-sandbox --locked
     cargo test --lib --all-features --locked linux_tests -- --nocapture
     cargo test --lib --all-features --locked sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap_host_acceptance -- --exact --ignored --nocapture
-    cargo test --bin temote-mcp --all-features --locked agent_git -- --ignored --nocapture
 
 fmt-check:
     cargo fmt --all -- --check

@@ -30,7 +30,7 @@ Do not weaken these without an explicit issue describing the security model chan
 - Ordinary sandboxed commands must not gain write access to Git metadata. Use the dedicated Git tools for index/commit/remote operations.
 - `git_pull` stays fast-forward-only; `git_push` must not expose force or arbitrary URL/refspec input.
 - Public HTTP must not expose `without_sandbox`.
-- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (Git fetch/pull/push, `local_agent_run`, `dev_tool_run`, checkpoints/patches, and structured integrations) and must never widen sandbox, path, network, or tool-specific capability.
+- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (Git fetch/pull/push, `dev_tool_run`, checkpoints/patches, and structured integrations) and must never widen sandbox, path, network, or tool-specific capability.
 - New local managed and authenticated public sessions default to `agent`; public HTTP must not create or promote `yolo`.
 - `dev_tool_run` accepts only classified Cargo/Vite+ operations, never an executable or raw argv. `vp run|exec|dlx`, self-mutation operations, and unknown operations must stay rejected rather than entering an offline/safe path.
 - `--yolo` may bypass Temote MCP sandbox/path/approval boundaries, but should not silently change unrelated client authorization semantics.
@@ -63,7 +63,7 @@ git diff --check
 
 `just check` covers the normal Rust format/test/clippy/diff gates. Run gateway tests when gateway code or shared protocol behavior changes.
 
-When Temote MCP itself is being developed from inside an already-sandboxed normal Temote session, use `just sandboxed-check` for the deterministic repository-local subset. Treat every host-only line it prints as `NOT RUN`, not PASS. Nested Linux bubblewrap/userns acceptance, session-GC Unix-socket liveness (`session_control::tests::host_liveness_tests`), local-agent real-wiring, gateway deployment-preflight CLI subprocess tests, local Unix-socket integration, and process-boundary E2E remain host/CI gates; do not weaken the current session sandbox or mark those tests successful merely because the outer sandbox prevents them from starting. `just linux-sandbox-acceptance` is the explicit Linux host gate when running on a suitable unsandboxed development host.
+When Temote MCP itself is being developed from inside an already-sandboxed normal Temote session, use `just sandboxed-check` for the deterministic repository-local subset. Treat every host-only line it prints as `NOT RUN`, not PASS. Nested Linux bubblewrap/userns acceptance, session-GC Unix-socket liveness (`session_control::tests::host_liveness_tests`), gateway deployment-preflight CLI subprocess tests, local Unix-socket integration, and process-boundary E2E remain host/CI gates; do not weaken the current session sandbox or mark those tests successful merely because the outer sandbox prevents them from starting. `just linux-sandbox-acceptance` is the explicit Linux host gate when running on a suitable unsandboxed development host.
 
 ## Documentation map
 

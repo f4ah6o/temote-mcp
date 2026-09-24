@@ -3,7 +3,6 @@
 #[cfg(feature = "network")]
 mod access;
 mod activity_runtime;
-mod agent_git;
 mod apply_patch;
 mod approvals;
 mod boot_identity;
@@ -32,7 +31,6 @@ mod kintone_mcp;
 mod lifecycle;
 mod line_diff;
 mod line_protocol;
-mod local_agent;
 #[cfg(feature = "network")]
 mod local_oauth;
 mod managed_worktree;
@@ -76,9 +74,6 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if let Some(status) = agent_git::maybe_run_as_git_shim() {
-        std::process::exit(status);
-    }
     let cli = match cli::parse_env() {
         Ok(cli::ParseOutcome::Run(cli)) => cli,
         Ok(cli::ParseOutcome::Print(output)) => {
@@ -182,7 +177,6 @@ async fn main() -> Result<()> {
             cli::SessionCommand::Console => session_control::run_console().await,
         },
         cli::Command::Mcp => mcp::serve().await,
-        cli::Command::GitShim { argv } => std::process::exit(agent_git::run_shim(argv)),
         #[cfg(feature = "network")]
         cli::Command::Serve {
             profile,

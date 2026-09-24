@@ -5,8 +5,7 @@
 ### Added
 
 - `opencode_task_*` serve children now use the host CLI's provider/model configuration and seed V2 saved credentials into private task state without sharing host sessions or history; legacy `auth.json` remains supported. ([OpenCode serve shared provider](issues/done/20260924-opencode-serve-shared-provider.md))
-- The local-agent Git shim now supports merged-only `git branch -d <branch>` and lease-protected `git push <remote> --delete <branch>`. Remote deletion requires a fetch-established remote-tracking ref, preserves the structured default/protection checks, and rejects force, wildcard, arbitrary URL, and arbitrary refspec forms. ([safe Git shim cleanup commands](issues/done/20260916-git-shim-cleanup-commands.md))
-- `local_agent_run` accepts `worktree: {branch, task?}` to bind a run to the selected repository's Temote-managed worktree without any caller-supplied path: Temote derives `<configured src root>/worktrees/<repo>/<task>` from the selected session workspace, reuses only a verified managed worktree of that repository on that branch, otherwise creates one through the approved path, rejects `cwd` combined with `worktree`, and re-validates the workspace immediately before the agent starts. `session_list`/`session_info` also report a bounded non-secret `workspace` identity derived from the session working directory. ([managed worktree session integration](issues/done/20260916-managed-worktree-session-integration.md))
+- `session_list`/`session_info` report a bounded non-secret `workspace` identity derived from the session working directory (`workspace_type` of `canonical_checkout` / `managed_worktree` / `legacy_worktree`, plus repository and branch when resolvable). ([managed worktree session integration](issues/done/20260916-managed-worktree-session-integration.md))
 - Added `git_worktree_create` and `git_worktree_list` for deterministic Temote-managed worktrees below the configured `src` named root (`~/src/worktrees/<repo>/<task>` in the usual layout), with read-only pre-approval inspection, exact `src` named-root authority, existing-local-branch-only creates, post-create containment/identity verification, fail-closed path/traversal/symlink/collision validation, and legacy worktree preservation. ([managed worktree create/list](issues/done/20260916-managed-worktree-create-list.md))
 - Added `temote-mcp activity` for bounded local replay and live observation of session operations, lifecycle changes, approvals, jobs, integrations, and supervisor upgrades. Activity stays on the owner-only local control socket and is not a durable audit log. ([local activity viewer](issues/polished/20260914-local-activity-viewer.md))
 - Added authenticated direct HTTP session lifecycle and supervisor upgrade tools with explicit local approval, durable transaction status, and reconnect-after-commit behavior. ([client-safe upgrade reconnect](issues/open/20260908-07-client-safe-upgrade-reconnect.md))
@@ -28,6 +27,8 @@
 ### Deprecated
 
 ### Removed
+
+- Removed `local_agent_run`, the per-command one-shot Codex/OpenCode broker, together with its private Git shim (`git-shim`), the dedicated local-agent sandbox profile, and the parent-side Git broker. Delegation is served only by the server-backed `codex_task_*` / `opencode_task_*` / `devin_*` tools; `temote-mcp delegate` / `temote-mcp codex delegate` remain the legacy one-shot CLI fallback. ([server-primary agent backends](issues/open/20260922-agent-server-backends-cli-deprecation.md))
 
 ### Security
 

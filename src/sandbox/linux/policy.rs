@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
+use crate::sandbox::PROTECTED_METADATA_NAMES;
 
 /// Policy schema generation the helper accepts. Bump when the serialized
 /// `LinuxSandboxPolicy` shape changes; upgrade preflight compares the helper
@@ -245,103 +245,6 @@ impl LinuxSandboxPolicy {
             hidden_roots: Vec::new(),
             pinned_workspace: None,
             network: LinuxNetworkPolicy::Restricted,
-        };
-        policy.validate()?;
-        Ok(policy)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn for_local_agent(
-        cwd: &Path,
-        writable_roots: &[PathBuf],
-        temporary_roots: &[PathBuf],
-        read_only_paths: &[PathBuf],
-        read_only_roots: &[PathBuf],
-        read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
-        read_only_scaffold_directories: &[PathBuf],
-        read_only_files: &[PathBuf],
-        hidden_roots: &[PathBuf],
-        expected_repository: Option<&crate::sandbox::WorkspaceRepositoryIdentity>,
-    ) -> Result<Self> {
-        let cwd = canonical_existing_directory(cwd, "sandbox cwd")?;
-        let mut writable = writable_roots
-            .iter()
-            .map(|path| canonical_existing_directory(path, "writable root"))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_paths(&mut writable);
-
-        let mut temporary = temporary_roots
-            .iter()
-            .map(|path| canonical_existing_directory(path, "temporary root"))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_paths(&mut temporary);
-
-        let mut read_only = read_only_paths
-            .iter()
-            .map(|path| {
-                std::fs::canonicalize(path)
-                    .with_context(|| format!("cannot resolve read-only path {}", path.display()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for root in &writable {
-            read_only.extend(discover_protected_metadata_paths(root)?);
-        }
-        normalize_paths(&mut read_only);
-
-        let mut visible_roots = read_only_roots
-            .iter()
-            .map(|path| canonical_existing_directory(path, "read-only root"))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_paths(&mut visible_roots);
-        let mut hidden = hidden_roots
-            .iter()
-            .map(|path| canonical_existing_directory(path, "hidden root"))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_paths(&mut hidden);
-        let mut read_only_symlinks = read_only_symlinks
-            .iter()
-            .map(|symlink| LinuxReadOnlySymlink {
-                link: symlink.link.clone(),
-                target: symlink.target.clone(),
-            })
-            .collect::<Vec<_>>();
-        read_only_symlinks.sort_by_key(|symlink| symlink.link.clone());
-        read_only_symlinks.dedup();
-        let mut scaffold_directories = read_only_scaffold_directories.to_vec();
-        normalize_paths(&mut scaffold_directories);
-        let mut files = read_only_files.to_vec();
-        normalize_paths(&mut files);
-
-        let pinned_workspace = match expected_repository {
-            Some(expected) => {
-                anyhow::ensure!(
-                    expected.worktree_root == cwd,
-                    "pinned workspace identity does not match the local agent cwd"
-                );
-                Some(LinuxPinnedWorkspace {
-                    path: cwd.clone(),
-                    writable: writable.contains(&cwd),
-                    worktree_root: expected.worktree_root.clone(),
-                    metadata_roots: expected.metadata_roots.clone(),
-                    common_dir: expected.common_dir.clone(),
-                    primary_checkout: expected.primary_checkout.clone(),
-                })
-            }
-            None => None,
-        };
-        let policy = Self {
-            version: LINUX_SANDBOX_POLICY_VERSION,
-            cwd,
-            writable_roots: writable,
-            temporary_roots: temporary,
-            read_only_paths: read_only,
-            read_only_roots: visible_roots,
-            read_only_symlinks,
-            read_only_scaffold_directories: scaffold_directories,
-            read_only_files: files,
-            hidden_roots: hidden,
-            pinned_workspace,
-            network: LinuxNetworkPolicy::LocalAgent,
         };
         policy.validate()?;
         Ok(policy)
@@ -702,10 +605,7 @@ pub(super) fn is_linked_worktree_metadata_root(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::{
-        PROTECTED_METADATA_NAMES, ProtectedMetadataScanLimits,
-        discover_protected_metadata_paths_with_limits,
-    };
+    use crate::sandbox::PROTECTED_METADATA_NAMES;
     use crate::test_support;
 
     #[test]
@@ -730,85 +630,9 @@ mod tests {
         }
         let workspace = std::fs::canonicalize(workspace).unwrap();
 
-        assert!(
-            discover_protected_metadata_paths_with_limits(
-                &workspace,
-                ProtectedMetadataScanLimits {
-                    max_entries: 2,
-                    max_depth: 64,
-                    max_paths: 1024,
-                }
-            )
-            .is_err(),
-            "fixture must exceed the injected local-agent scan budget"
-        );
-
         let policy = LinuxSandboxPolicy::for_command(&workspace, &[], &[]).unwrap();
         for name in PROTECTED_METADATA_NAMES {
             assert!(policy.read_only_paths.contains(&workspace.join(name)));
-        }
-    }
-
-    #[test]
-    fn local_agent_policy_can_keep_a_read_only_cwd() {
-        let root = tempfile::tempdir().unwrap();
-        let temp = root.path().join("tmp");
-        std::fs::create_dir(&temp).unwrap();
-        let policy = LinuxSandboxPolicy::for_local_agent(
-            root.path(),
-            &[],
-            std::slice::from_ref(&temp),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-        )
-        .unwrap();
-
-        assert!(!policy.writable_roots.contains(&policy.cwd));
-        assert_eq!(policy.network, LinuxNetworkPolicy::LocalAgent);
-        assert!(policy.validate().is_ok());
-    }
-
-    #[test]
-    fn local_agent_policy_masks_nested_metadata_files_and_directories() {
-        let fixture = tempfile::tempdir().unwrap();
-        let workspace = fixture.path().join("workspace");
-        std::fs::create_dir_all(workspace.join("nested/.git")).unwrap();
-        std::fs::create_dir_all(workspace.join("nested/.agents")).unwrap();
-        std::fs::create_dir_all(workspace.join("nested/deep")).unwrap();
-        std::fs::write(workspace.join("nested/deep/.codex"), b"metadata").unwrap();
-        std::fs::create_dir_all(workspace.join("ordinary")).unwrap();
-        std::fs::write(workspace.join("ordinary/.git"), b"gitdir: linked").unwrap();
-
-        let workspace = std::fs::canonicalize(workspace).unwrap();
-        let policy = LinuxSandboxPolicy::for_local_agent(
-            &workspace,
-            std::slice::from_ref(&workspace),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-        )
-        .unwrap();
-
-        for expected in [
-            workspace.join("nested/.git"),
-            workspace.join("nested/.agents"),
-            workspace.join("nested/deep/.codex"),
-            workspace.join("ordinary/.git"),
-        ] {
-            assert!(
-                policy.read_only_paths.contains(&expected),
-                "missing nested protected path {expected:?}"
-            );
         }
     }
 

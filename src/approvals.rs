@@ -632,8 +632,6 @@ pub(crate) fn ensure_approval_detail_fits(detail: &str) -> Result<()> {
 pub(crate) enum ApprovalClass {
     /// Host/network Git operations through the structured Git tools.
     GitNetwork,
-    /// Structured Codex/OpenCode delegation through `local_agent_run`.
-    LocalAgent,
     /// Structured Cargo/Vite+ operations through `dev_tool_run`.
     DeveloperTool,
     /// Structured integrations with their own authentication boundary
@@ -683,10 +681,6 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
     use ApprovalClass::*;
     use LocalApproval::*;
     match class {
-        LocalAgent => match mode {
-            config::PermissionMode::Agent => Skip,
-            _ => RequestUser,
-        },
         GitNetwork | DeveloperTool | Integration | LocalStructured | CodexAppServer
         | OpenCodeServer | DevinAcp | DevinCloud => match mode {
             config::PermissionMode::Ask => Request,
@@ -4874,9 +4868,6 @@ esac
             assert_eq!(local_approval(Agent, class), Skip, "{class:?}");
             assert_eq!(local_approval(Yolo, class), Skip, "{class:?}");
         }
-        assert_eq!(local_approval(Ask, LocalAgent), RequestUser);
-        assert_eq!(local_approval(Agent, LocalAgent), Skip);
-        assert_eq!(local_approval(Yolo, LocalAgent), RequestUser);
         assert_eq!(local_approval(Ask, HostUnrestricted), Request);
         assert_eq!(local_approval(Agent, HostUnrestricted), Request);
         assert_eq!(local_approval(Yolo, HostUnrestricted), Skip);

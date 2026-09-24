@@ -921,6 +921,7 @@ pub(crate) enum SessionWorkspaceType {
 }
 
 impl SessionWorkspaceType {
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CanonicalCheckout => "canonical_checkout",
@@ -1251,64 +1252,6 @@ pub(crate) fn trusted_canonical_managed_root(repository: &ManagedRepository) -> 
     }
     let canonical = std::fs::canonicalize(repository.managed_root()).ok()?;
     (canonical == repository.managed_root()).then_some(canonical)
-}
-
-/// Verifies that an existing target may be reused as the selected repository's
-/// managed worktree for `branch`.
-///
-/// Reuse never adopts legacy or unrelated state: the target must be a normal
-/// canonical directory at the exact direct-child path below the trusted managed
-/// root, and its canonical common Git directory, primary checkout and current
-/// branch must equal the selected repository identity. Anything else fails
-/// closed, so `<repository>/.wt/<name>`, `<src>/<repo>-*`, `/tmp` worktrees and
-/// wrong-repository collisions are never adopted.
-pub(crate) fn verify_reusable_managed_worktree(
-    repository: &ManagedRepository,
-    target: &Path,
-    branch: &str,
-    selected_common_dir: &Path,
-    selected_primary_checkout: &Path,
-) -> Result<()> {
-    anyhow::ensure!(
-        trusted_canonical_managed_root(repository).as_deref() == Some(repository.managed_root()),
-        "managed worktree root is not a trusted normal directory: {}",
-        repository.managed_root().display()
-    );
-    let metadata = std::fs::symlink_metadata(target)
-        .with_context(|| format!("cannot inspect managed worktree {}", target.display()))?;
-    anyhow::ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "existing managed worktree target is not a normal directory: {}",
-        target.display()
-    );
-    let canonical_target = std::fs::canonicalize(target)
-        .with_context(|| format!("cannot resolve managed worktree {}", target.display()))?;
-    anyhow::ensure!(
-        canonical_target == target,
-        "existing managed worktree target must be canonical and not a swapped path: {}",
-        target.display()
-    );
-    anyhow::ensure!(
-        target.parent() == Some(repository.managed_root()),
-        "existing managed worktree target must be a direct child of {}",
-        repository.managed_root().display()
-    );
-    anyhow::ensure!(
-        crate::sandbox::git_common_dir(&canonical_target)? == selected_common_dir,
-        "existing worktree does not belong to the selected repository (common Git directory mismatch): {}",
-        target.display()
-    );
-    anyhow::ensure!(
-        crate::sandbox::git_primary_checkout(&canonical_target)? == selected_primary_checkout,
-        "existing worktree primary checkout mismatch: {}",
-        target.display()
-    );
-    anyhow::ensure!(
-        crate::sandbox::git_current_branch(&canonical_target)?.as_deref() == Some(branch),
-        "existing managed worktree is not attached to the requested branch {branch:?}: {}",
-        target.display()
-    );
-    Ok(())
 }
 
 /// Facts observed after the Git worktree mutation. Plain values keep the
@@ -2605,115 +2548,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reusable_managed_worktree_requires_identity_and_branch() {
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let repository = fake_repository(&src_root.join("repo"));
-        let managed_root = src_root.join("worktrees").join("repo");
-        let managed = managed_root.join("task");
-        let legacy_inside = repository.join(".wt").join("legacy");
-        fake_linked_worktree(&repository, "task", &managed, "feature/x");
-        fake_linked_worktree(&repository, "wt-legacy", &legacy_inside, "feature/x");
-        let other = fake_repository(&src_root.join("other"));
-
-        let managed_repository = ManagedRepository::resolve(&repository, &src_root).unwrap();
-        let common = crate::sandbox::git_common_dir(&repository).unwrap();
-        let primary = crate::sandbox::git_primary_checkout(&repository).unwrap();
-
-        verify_reusable_managed_worktree(
-            &managed_repository,
-            &managed,
-            "feature/x",
-            &common,
-            &primary,
-        )
-        .unwrap();
-
-        // Wrong branch, wrong repository identity and a legacy location fail
-        // closed.
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &managed,
-                "feature/other",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &managed,
-                "feature/x",
-                &crate::sandbox::git_common_dir(&other).unwrap(),
-                &primary,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &repository.join(".wt").join("legacy"),
-                "feature/x",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        #[cfg(unix)]
-        {
-            let symlinked = managed_root.join("symlinked");
-            std::os::unix::fs::symlink(&managed, &symlinked).unwrap();
-            assert!(
-                verify_reusable_managed_worktree(
-                    &managed_repository,
-                    &symlinked,
-                    "feature/x",
-                    &common,
-                    &primary,
-                )
-                .is_err()
-            );
-        }
-        // A nested descendant is never a direct child of the managed root.
-        let nested = managed.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &nested,
-                "feature/x",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        // A missing target inside the fixture and a mismatched primary
-        // checkout are not the selected repository's managed identity.
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &src_root.join("missing-target"),
-                "feature/x",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &managed,
-                "feature/x",
-                &common,
-                Path::new("/home/user/src/other"),
-            )
-            .is_err()
-        );
-    }
-
     fn run_git_fixture(cwd: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -2721,90 +2555,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
-    }
-
-    #[test]
-    fn reusable_managed_worktree_rejects_a_valid_worktree_outside_the_managed_root() {
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let repository = src_root.join("repo");
-        std::fs::create_dir(&repository).unwrap();
-        run_git_fixture(&repository, &["init", "--quiet"]);
-        run_git_fixture(&repository, &["config", "user.name", "Temote Test"]);
-        run_git_fixture(
-            &repository,
-            &["config", "user.email", "temote-test@example.invalid"],
-        );
-        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
-        run_git_fixture(&repository, &["add", "tracked.txt"]);
-        run_git_fixture(&repository, &["commit", "--quiet", "-m", "initial"]);
-        run_git_fixture(&repository, &["branch", "-M", "main"]);
-        run_git_fixture(&repository, &["branch", "outside-branch"]);
-
-        // A real, structurally valid linked worktree of the selected
-        // repository on the requested branch, but outside the trusted managed
-        // root.
-        let outside = src_root.join("elsewhere").join("task");
-        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
-        run_git_fixture(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                outside.to_str().unwrap(),
-                "outside-branch",
-            ],
-        );
-
-        let repository = std::fs::canonicalize(&repository).unwrap();
-        let outside = std::fs::canonicalize(&outside).unwrap();
-        let managed_root = src_root.join("worktrees").join("repo");
-        std::fs::create_dir_all(&managed_root).unwrap();
-        let managed_repository = ManagedRepository::resolve(&repository, &src_root).unwrap();
-        let common = crate::sandbox::git_common_dir(&repository).unwrap();
-        let primary = crate::sandbox::git_primary_checkout(&repository).unwrap();
-
-        // Preconditions: same repository identity, requested branch, normal
-        // canonical directory and a trusted managed root that does not contain
-        // the target.
-        assert_eq!(crate::sandbox::git_common_dir(&outside).unwrap(), common);
-        assert_eq!(
-            crate::sandbox::git_primary_checkout(&outside).unwrap(),
-            repository
-        );
-        assert_eq!(
-            crate::sandbox::git_current_branch(&outside)
-                .unwrap()
-                .as_deref(),
-            Some("outside-branch")
-        );
-        let metadata = std::fs::symlink_metadata(&outside).unwrap();
-        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
-        assert_eq!(std::fs::canonicalize(&outside).unwrap(), outside);
-        assert_eq!(
-            trusted_canonical_managed_root(&managed_repository),
-            Some(managed_root.clone())
-        );
-        assert!(outside.parent() != Some(managed_root.as_path()));
-
-        // The rejection reason is the managed-root / exact direct-child rule,
-        // not a missing target or broken Git metadata.
-        let error = verify_reusable_managed_worktree(
-            &managed_repository,
-            &outside,
-            "outside-branch",
-            &common,
-            &primary,
-        )
-        .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("direct child"), "{message}");
-        assert!(!message.contains("cannot inspect"), "{message}");
-        assert!(
-            !message.contains("outside the working directory"),
-            "{message}"
-        );
     }
 
     #[test]
