@@ -22,7 +22,8 @@ tool 名・approval class・task store・env 変数をすべて分離し、混�
 - approval class: `ApprovalClass::DevinCloud` (Ask では approval、Agent/Yolo では skip)
 - task store: `state_dir()/devin-cloud-tasks` (schema v1、24h retention、64KiB record 上限)
 - env: `TEMOTE_MCP_DEVIN_API_KEY` (fallback `DEVIN_API_KEY`)、`TEMOTE_MCP_DEVIN_ORG_ID` (任意、
-  未設定なら `/v3/self` から解決)、`TEMOTE_MCP_DEVIN_API_BASE_URL` (任意、`https://` 必須)
+  未設定なら `/v3/self` から解決)、`TEMOTE_MCP_DEVIN_API_BASE_URL` (任意、`https://` 必須)、
+  `TEMOTE_MCP_DEVIN_CREATE_AS_USER_ID` (任意、service-user key の session を自分の user に帰属させる)
 - feature gate: `network` (既存 `reqwest` を使用。`--no-default-features` では module 不在)
 
 ## Motivation / context
@@ -58,6 +59,14 @@ tool 名・approval class・task store・env 変数をすべて分離し、混�
 - 未実施: 実 credential での live 検証 (session 作成〜終了、`/v3/self` の org 解決、
   suspended → resume)。coordinator が `TEMOTE_MCP_DEVIN_API_KEY` を用意した後に実施し、
   結果をこの issue に追記する。
+
+## Subscription 利用について (2026-09-24 coordinator 回答「サブスクリプションの範囲で使いたい」)
+
+公式 docs (api-reference/authentication, getting-started/teams-quickstart) では、service user / PAT は
+enterprise 専用ではなく Teams / standard organization の Settings > Service users で発行できる。
+session はその organization の ACU / credit を消費するため、subscription の範囲内で利用できる。
+自分の session として扱いたい場合は PAT を使うか、service-user key + `create_as_user_id`
+(`TEMOTE_MCP_DEVIN_CREATE_AS_USER_ID`) を使う。
 
 ## Open questions
 

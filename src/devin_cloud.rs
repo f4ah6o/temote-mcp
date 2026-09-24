@@ -53,6 +53,7 @@ pub(crate) const API_KEY_ENV: &str = "TEMOTE_MCP_DEVIN_API_KEY";
 pub(crate) const API_KEY_FALLBACK_ENV: &str = "DEVIN_API_KEY";
 pub(crate) const ORG_ID_ENV: &str = "TEMOTE_MCP_DEVIN_ORG_ID";
 pub(crate) const BASE_URL_ENV: &str = "TEMOTE_MCP_DEVIN_API_BASE_URL";
+pub(crate) const CREATE_AS_USER_ID_ENV: &str = "TEMOTE_MCP_DEVIN_CREATE_AS_USER_ID";
 const SESSION_TAG: &str = "temote-mcp";
 
 const TASK_ID_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -101,6 +102,7 @@ pub(crate) struct CloudConfig {
     api_key_source: &'static str,
     org_id: Option<String>,
     base_url: String,
+    create_as_user_id: Option<String>,
 }
 
 /// Secret-free readiness view for `doctor` and `devin_cloud_status`.
@@ -109,6 +111,7 @@ pub(crate) struct CloudReadiness {
     pub api_key_source: &'static str,
     pub org_id_configured: bool,
     pub base_url: String,
+    pub create_as_user_id_configured: bool,
 }
 
 impl CloudConfig {
@@ -117,6 +120,7 @@ impl CloudConfig {
             api_key_source: self.api_key_source,
             org_id_configured: self.org_id.is_some(),
             base_url: self.base_url.clone(),
+            create_as_user_id_configured: self.create_as_user_id.is_some(),
         }
     }
 }
@@ -166,11 +170,25 @@ pub(crate) fn resolve_config() -> Result<CloudConfig, String> {
         None => DEFAULT_API_BASE_URL.to_owned(),
         Some(value) => validate_base_url(value.trim())?,
     };
+    let create_as_user_id = match env_value(CREATE_AS_USER_ID_ENV)? {
+        None => None,
+        Some(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                None
+            } else {
+                validate_org_id(&value)
+                    .map_err(|error| format!("{CREATE_AS_USER_ID_ENV}: {error}"))?;
+                Some(value)
+            }
+        }
+    };
     Ok(CloudConfig {
         api_key,
         api_key_source,
         org_id,
         base_url,
+        create_as_user_id,
     })
 }
 
@@ -1777,6 +1795,9 @@ async fn task_start_with_store(
     if let Some(limit) = max_acu_limit {
         body["max_acu_limit"] = json!(limit);
     }
+    if let Some(user_id) = config.create_as_user_id.as_deref() {
+        body["create_as_user_id"] = json!(user_id);
+    }
 
     let created = api.create_session(&org_id, &body).await.and_then(|value| {
         parse_remote_session(&value).map_err(|error| {
@@ -2192,6 +2213,7 @@ mod tests {
                 std::env::set_var(API_KEY_ENV, "cog_test_key");
                 std::env::set_var(ORG_ID_ENV, "org-test");
                 std::env::remove_var(BASE_URL_ENV);
+                std::env::remove_var(CREATE_AS_USER_ID_ENV);
             }
             Self
         }
