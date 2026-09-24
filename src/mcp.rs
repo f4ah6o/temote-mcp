@@ -2022,7 +2022,7 @@ async fn call_tool_with_local_agent_executable(
                     .map(|_| required_string_array(&args, "allowed_locators"))
                     .transpose()?
                     .unwrap_or_default();
-                approvals::validate_service_account_run_input(
+                approvals::validate_svc_acct_run_input(
                     &command,
                     &env_files,
                     &environment,

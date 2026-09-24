@@ -2433,9 +2433,9 @@ async fn service_account_run(
     // Validate caller-controlled input before resolving or inspecting the host
     // 1Password CLI. Invalid requests must fail deterministically even on hosts
     // where `op` is absent or its process boundary is not acceptable.
-    validate_service_account_run_input(&command, &env_files, &environment_refs, &allowed_locators)?;
+    validate_svc_acct_run_input(&command, &env_files, &environment_refs, &allowed_locators)?;
     let op_executable = service_account_cli_executable()?;
-    service_account_run_with_op(
+    svc_acct_run_with_op(
         session,
         token,
         ServiceAccountRunSpec {
@@ -2450,7 +2450,7 @@ async fn service_account_run(
     .await
 }
 
-async fn service_account_run_with_op(
+async fn svc_acct_run_with_op(
     session: &Session,
     token: &str,
     spec: ServiceAccountRunSpec,
@@ -2463,7 +2463,7 @@ async fn service_account_run_with_op(
         environment_refs,
         allowed_locators,
     } = spec;
-    validate_service_account_run_input(&command, &env_files, &environment_refs, &allowed_locators)?;
+    validate_svc_acct_run_input(&command, &env_files, &environment_refs, &allowed_locators)?;
     let cwd = config::resolve_cwd(session, Some(&cwd))?;
     let env_files = env_files
         .into_iter()
@@ -2752,7 +2752,7 @@ async fn service_account_read_secret_with_op(
     Ok(output.stdout)
 }
 
-pub(crate) fn validate_service_account_run_input(
+pub(crate) fn validate_svc_acct_run_input(
     command: &[String],
     env_files: &[PathBuf],
     environment_refs: &BTreeMap<String, String>,
@@ -3563,7 +3563,7 @@ esac
             "approvals::tests::nested_resolver_process_client_helper".to_owned(),
             "--nocapture".to_owned(),
         ];
-        let result = service_account_run_with_op(
+        let result = svc_acct_run_with_op(
             &session,
             "service-account-token-must-not-leak",
             ServiceAccountRunSpec {
@@ -3611,7 +3611,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&fake_op, std::fs::Permissions::from_mode(0o700)).unwrap();
         let session = test_session(root.path());
-        let result = service_account_run_with_op(
+        let result = svc_acct_run_with_op(
             &session,
             "service-account-token-must-not-leak",
             ServiceAccountRunSpec {
@@ -3674,7 +3674,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&fake_op, std::fs::Permissions::from_mode(0o700)).unwrap();
         let session = test_session(root.path());
-        let result = service_account_run_with_op(
+        let result = svc_acct_run_with_op(
             &session,
             "service-account-token-must-not-leak",
             ServiceAccountRunSpec {
@@ -3754,7 +3754,7 @@ esac
             active.display(),
             active.display()
         );
-        let run = service_account_run_with_op(
+        let run = svc_acct_run_with_op(
             &session,
             "service-account-token-must-not-leak",
             ServiceAccountRunSpec {
@@ -3894,8 +3894,7 @@ esac
                         && !reference.contains('\0')
                         && reference.starts_with("op://")
                 });
-            let result =
-                validate_service_account_run_input(&command, &env_files, &environment_refs, &[]);
+            let result = validate_svc_acct_run_input(&command, &env_files, &environment_refs, &[]);
             assert_eq!(
                 result.is_ok(),
                 expected_command && expected_files && expected_refs,

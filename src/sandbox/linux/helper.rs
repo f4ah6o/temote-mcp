@@ -81,7 +81,7 @@ pub(super) fn run_main() -> ! {
         Err(error) => fail(error.context("invalid Linux sandbox helper arguments")),
     };
 
-    let bwrap = match crate::sandbox::trusted_service_account_bwrap() {
+    let bwrap = match crate::sandbox::svc_acct_bwrap() {
         Ok(path) => path,
         Err(error) => fail(error.context("bubblewrap is required for Linux sandboxing")),
     };
@@ -1319,7 +1319,7 @@ mod tests {
         );
         std::fs::write(target.join("marker.txt"), "swapped-b").unwrap();
 
-        let bwrap = crate::sandbox::trusted_service_account_bwrap().unwrap();
+        let bwrap = crate::sandbox::svc_acct_bwrap().unwrap();
         let output = std::process::Command::new(bwrap)
             .args(&args)
             .output()

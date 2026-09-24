@@ -97,5 +97,6 @@ test("does not include target values or configuration paths in the result", () =
   });
 
   assert.equal(result.status, "target_mismatch");
-  assert.equal(JSON.stringify(result).includes("other.example.com"), false);
+  assert.deepEqual(result.target, { kind: "custom_domain", status: "target_mismatch" });
+  assert.deepEqual(result.remote, { status: "not_checked" });
 });

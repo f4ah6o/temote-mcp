@@ -114,7 +114,7 @@ fn test_isolation_process_root_nested_state_paths_are_canonical_and_private() {
     std::fs::remove_dir_all(subtree).unwrap();
 }
 
-pub fn seed(salt: u64) -> u64 {
+pub fn seed(seed_mix: u64) -> u64 {
     let base = match std::env::var("TEMOTE_PBT_SEED") {
         Ok(raw) => {
             if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
@@ -125,15 +125,15 @@ pub fn seed(salt: u64) -> u64 {
         }
         Err(_) => DEFAULT_SEED,
     };
-    base ^ salt
+    base ^ seed_mix
 }
 
 pub fn run(
-    salt: u64,
+    seed_mix: u64,
     cases: usize,
     property: impl Fn(&mut TestCaseContext) -> noprop::TestResult,
 ) -> noprop::TestResult {
-    noprop::Runner::new(seed(salt)).run(cases, property)?;
+    noprop::Runner::new(seed(seed_mix)).run(cases, property)?;
     Ok(())
 }
 

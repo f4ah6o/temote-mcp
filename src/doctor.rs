@@ -1576,15 +1576,14 @@ struct CloudflareTunnel {
 
 #[cfg(feature = "network")]
 async fn check_cloudflare_api(report: &mut Report) {
-    let account_id =
-        first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"]);
+    let acct = first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"]);
     let tunnel_id =
         first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_TUNNEL_ID", "CLOUDFLARE_TUNNEL_ID"]);
     let api_token =
         first_nonempty_env(&["TEMOTE_MCP_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"]);
 
     let mut missing = Vec::new();
-    if account_id.is_none() {
+    if acct.is_none() {
         missing.push("TEMOTE_MCP_CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_ACCOUNT_ID");
     }
     if tunnel_id.is_none() {
@@ -1602,11 +1601,11 @@ async fn check_cloudflare_api(report: &mut Report) {
         return;
     }
 
-    let account_id = account_id.expect("account ID checked above");
+    let acct = acct.expect("account ID checked above");
     let tunnel_id = tunnel_id.expect("Tunnel ID checked above");
     let api_token = api_token.expect("API token checked above");
 
-    if !is_cloudflare_account_id(&account_id) {
+    if !is_cloudflare_account_id(&acct) {
         report.add(Check::fail(
             "cloudflare API",
             "Cloudflare account ID must be a 32-character hexadecimal value",
@@ -1638,9 +1637,8 @@ async fn check_cloudflare_api(report: &mut Report) {
         }
     };
 
-    let endpoint = format!(
-        "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
-    );
+    let endpoint =
+        format!("https://api.cloudflare.com/client/v4/accounts/{acct}/cfd_tunnel/{tunnel_id}");
     let response = match client.get(endpoint).bearer_auth(api_token).send().await {
         Ok(response) => response,
         Err(error) => {

@@ -3092,7 +3092,7 @@ where
     anyhow::ensure!(!command.is_empty(), "command must not be empty");
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
-    let bwrap = trusted_service_account_bwrap()?;
+    let bwrap = svc_acct_bwrap()?;
     let mut wrapped = vec![
         bwrap.to_string_lossy().into_owned(),
         "--bind".to_owned(),
@@ -3124,9 +3124,9 @@ where
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn trusted_service_account_bwrap() -> Result<PathBuf> {
+pub(crate) fn svc_acct_bwrap() -> Result<PathBuf> {
     for candidate in [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")] {
-        if let Some(path) = trusted_bwrap_candidate(candidate)? {
+        if let Some(path) = vetted_bwrap_candidate(candidate)? {
             return Ok(path);
         }
     }
@@ -3134,7 +3134,7 @@ pub(crate) fn trusted_service_account_bwrap() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_bwrap_candidate(candidate: &Path) -> Result<Option<PathBuf>> {
+fn vetted_bwrap_candidate(candidate: &Path) -> Result<Option<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(path) = std::fs::canonicalize(candidate) else {
@@ -4048,7 +4048,7 @@ mod generic_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn untrusted_bwrap_candidate_is_rejected_even_when_executable() {
+    fn unvetted_bwrap_candidate_is_rejected_even_when_executable() {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = tempfile::tempdir().unwrap();
@@ -4056,7 +4056,7 @@ mod generic_tests {
         std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(trusted_bwrap_candidate(&fake).unwrap().is_none());
+        assert!(vetted_bwrap_candidate(&fake).unwrap().is_none());
     }
 
     #[test]

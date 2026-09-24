@@ -3916,7 +3916,7 @@ async fn filesystem_session_views_read_only() -> Result<Vec<SessionView>> {
 }
 
 async fn bounded_history_session_ids(excluded: &HashSet<String>) -> Result<Vec<String>> {
-    collect_bounded_history_session_ids(
+    collect_bounded_history_ids(
         excluded,
         MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED,
         MAX_SESSION_HISTORY_CANDIDATES,
@@ -3931,7 +3931,7 @@ async fn bounded_history_session_ids(excluded: &HashSet<String>) -> Result<Vec<S
 /// the whole candidate budget and push healthy history out of the list. Stale
 /// metadata is neither deleted nor forgotten here; it stays addressable through
 /// `session_info` and explicit lifecycle commands.
-async fn collect_bounded_history_session_ids(
+async fn collect_bounded_history_ids(
     excluded: &HashSet<String>,
     max_scanned_entries: usize,
     max_candidates: usize,
@@ -5714,7 +5714,7 @@ mod tests {
             degraded_ids.push(id);
         }
 
-        let candidates = collect_bounded_history_session_ids(
+        let candidates = collect_bounded_history_ids(
             &excluded,
             MAX_SESSION_HISTORY_DIRECTORY_ENTRIES_SCANNED,
             8,
