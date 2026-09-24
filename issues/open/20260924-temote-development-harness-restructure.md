@@ -107,16 +107,15 @@ Temote の中心価値は、**どの coding agent に任せても、適切な作
                            |
                     Orchestration Core
                            |
-        +------------------+------------------+
-        |                  |                  |
-     workspace           agent             delivery
-        |                  |                  |
-      gh-git        Codex / OpenCode /      gh-stack
-        |          Devin ACP / Devin Cloud    |
-        |                  |                  |
-   vp / Cargo cache      code             stacked PR
-        |
-        +------------ Development Harness ------------+
+   (approval / receipt / reconcile / evidence / state)
+                           |
+     +-------------+-------+-------+-------------+
+     |             |               |             |
+ workspace    environment        agent        delivery
+     |             |               |             |
+   gh-git     vp / Cargo /   Codex / OpenCode /  gh (single PR)
+ (Git prim.)    sccache      Devin ACP /        gh-stack (stack)
+                             Devin Cloud
 
 frontends / transports:
   - Local CLI / Desktop
@@ -127,12 +126,13 @@ frontends / transports:
 
 Temote の中心責務:
 
-- repository / workspace の選択
-- task / dependency graph
-- agent backend の選択と server lifecycle
-- workspace reservation / ownership
-- approval / evidence / activity
-- delivery / stacked PR orchestration
+- caller が明示した task / 依存関係の実行管理 (分解・方針・backend 選択は caller 側)
+- caller が選んだ agent backend の server lifecycle
+- workspace の割当 / reservation / 書込み排他
+- environment preparation と ready-state
+- approval / receipt / reconcile / evidence / activity
+- execution / verification / delivery state の記録
+- delivery (単独 PR / stacked PR) の提出と状態確認
 
 Devin Cloud は Temote host 上の workspace を使わない (hosted session 側で repo を clone する)。workspace / environment / reservation 系の契約は host-local backend (Codex / OpenCode / Devin ACP local) に適用し、Devin Cloud は task / evidence / delivery 契約のみを共有する。
 
@@ -148,8 +148,9 @@ Orchestrator
   task_get(...)
   task_list(...)
   task_control(...)
-  workspace_ensure(...)
-  stack_submit(...)
+  task_reconcile(...)
+  workspace_ensure(...)      # Phase C 以降
+  delivery_submit(...)       # Phase E 以降 (単独 PR / stack)
 ```
 
 frontend は薄い adapter にする。
@@ -204,13 +205,17 @@ ChatGPT Desktop や native local client から Temote を利用する場合、MC
 temote task start --local \
   --backend opencode \
   --session <session-id> \
+  --operation-id <uuid> \
   --task "implement api"
 
 temote task list --local
 temote task get --local <task-id>
 temote task steer --local <task-id> "testsも追加して"
 temote task stop --local <task-id>
+temote task reconcile --local <operation-id>
 ```
+
+rename (Phase G) 前は現 binary 名 `temote-mcp task ...` で提供する。
 
 `--local` の意味は **transport が local であることだけ**。
 
@@ -264,9 +269,9 @@ task 系 request 追加時に protocol version negotiation を入れる (現状 
 - native GUI
 - VS Code / JetBrains integration
 
-## 3. Make gh-git the repository/workspace substrate
+## 3. gh-git as the Git repository / worktree substrate
 
-`f4ah6o/gh-git` を Temote 専用品にはせず、人間単独でも使える repository/workspace substrate として発展させる。
+`f4ah6o/gh-git` を Temote 専用品にはせず、人間単独でも使える Git repository / worktree substrate として発展させる。task 割当・排他・環境準備は持たない (Responsibility boundaries 参照)。
 
 責務:
 
@@ -330,7 +335,7 @@ repository store
 
 他 task / 他 agent の worktree を勝手に remove / prune しない invariant、および Legacy worktree を adopt / move / delete しない invariant は Temote 側に残す。gh-git の `remove` / `prune` を Temote から呼ぶ場合も、Temote reservation を取得してからにする。
 
-## 4. Agent-ready workspace preparation
+## 4. Environment preparation (Temote environment layer)
 
 worktree が Git 的に存在するだけでは ready としない。
 
@@ -399,7 +404,8 @@ stacked branch / stacked PR 自体は Temote / gh-git で再実装しない。of
 初期 integration は local tracking を持たない `gh stack link` を中心にする。
 
 ```text
-Temote task graph        branches          GitHub
+delivery-selected       branches          GitHub
+tasks
 
 task-auth                main
   |                        |
@@ -477,7 +483,8 @@ rename の影響範囲 (migration packet で扱う): binary / crate / cargo-dist
 repository
 workspace
 environment
-task
+task / execution
+verification
 agent
 delivery
 transport
@@ -487,6 +494,9 @@ transport
 
 ```text
 orchestration/
+  task/
+  execution/
+  verification/
 workspace/
 environment/
 agents/
