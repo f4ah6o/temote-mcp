@@ -1132,8 +1132,18 @@ fn validate_argument(value: &str, label: &str) -> Result<()> {
 
 fn validate_devin_mode(value: &str) -> Result<()> {
     anyhow::ensure!(
-        matches!(value, "normal" | "fast" | "lite" | "ultra" | "fusion"),
-        "devin_mode must be one of normal, fast, lite, ultra, fusion"
+        matches!(
+            value,
+            "normal"
+                | "fast"
+                | "lite"
+                | "ultra"
+                | "fusion"
+                | "swe-2-medium"
+                | "swe-2-high"
+                | "swe-2-max"
+        ),
+        "devin_mode must be one of normal, fast, lite, ultra, fusion, swe-2-medium, swe-2-high, swe-2-max"
     );
     Ok(())
 }

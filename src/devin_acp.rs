@@ -390,6 +390,8 @@ struct TaskRecord {
     scope_cwd: PathBuf,
     model: Option<String>,
     agent: Option<String>,
+    #[serde(default)]
+    cloud: bool,
     status: TaskStatus,
     revision: u64,
     generation: u64,
@@ -1365,6 +1367,7 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "generation": record.generation,
         "model": record.model,
         "agent": record.agent,
+        "cloud": record.cloud,
         "acp_session_id": record.acp_session_id,
         "usage": record.usage,
         "observed_model": record.observed_model,
@@ -1714,14 +1717,20 @@ fn spawn_prompt_waiter(
     });
 }
 
+#[derive(Clone, Copy, Default)]
+struct AcpSpawnSpec<'a> {
+    model: Option<&'a str>,
+    agent: Option<&'a str>,
+    cloud: bool,
+}
+
 async fn spawn_acp(
     session: &config::Session,
     task_id: Option<Uuid>,
     store: &TaskStore,
     lease: Option<Arc<TaskRuntimeLease>>,
     binary: &Path,
-    model: Option<&str>,
-    agent: Option<&str>,
+    spec: AcpSpawnSpec<'_>,
 ) -> Result<AcpClient> {
     #[cfg(test)]
     if let Some(hook) = spawn_hook() {
@@ -1731,7 +1740,7 @@ async fn spawn_acp(
     let _permit = ensure_current_active_instance(&owner, session).await?;
     let mut last_error = None;
     for attempt in 0..ACP_SPAWN_ATTEMPTS {
-        match spawn_acp_once(session, task_id, store, lease.clone(), binary, model, agent).await {
+        match spawn_acp_once(session, task_id, store, lease.clone(), binary, spec).await {
             Ok(client) => return Ok(client),
             Err(error) => {
                 let shutting_down = session_instance_is_closing(&owner);
@@ -1754,17 +1763,20 @@ async fn spawn_acp_once(
     store: &TaskStore,
     lease: Option<Arc<TaskRuntimeLease>>,
     binary: &Path,
-    model: Option<&str>,
-    agent: Option<&str>,
+    spec: AcpSpawnSpec<'_>,
 ) -> Result<AcpClient> {
     let owner = SessionInstance::from_session(session);
     let mut command = tokio::process::Command::new(binary);
     command.arg("acp");
-    if let Some(model) = model {
-        command.arg("--model").arg(model);
-    }
-    if let Some(agent) = agent {
-        command.arg("--agent-type").arg(agent);
+    if spec.cloud {
+        command.arg("--cloud");
+    } else {
+        if let Some(model) = spec.model {
+            command.arg("--model").arg(model);
+        }
+        if let Some(agent) = spec.agent {
+            command.arg("--agent-type").arg(agent);
+        }
     }
     command
         .current_dir(record_scope_or_session(session, store, task_id))
@@ -1872,7 +1884,7 @@ async fn run_actor(
                     ClientCommand::Request { method, params, reply } => {
                         let id = next_id;
                         next_id = next_id.saturating_add(1);
-                        let message = json!({"id": id, "method": method, "params": params});
+                        let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
                         if let Err(error) = write_json_line(&mut stdin, &message).await {
                             let _ = reply.send(Err(format!("Devin ACP write failed: {error:#}")));
                             break format!("Devin ACP write failed: {error:#}");
@@ -1883,6 +1895,7 @@ async fn run_actor(
                         let id = next_id;
                         next_id = next_id.saturating_add(1);
                         let message = json!({
+                            "jsonrpc": "2.0",
                             "id": id,
                             "method": "session/prompt",
                             "params": {
@@ -1903,7 +1916,7 @@ async fn run_actor(
                         }
                     }
                     ClientCommand::Notify { method, params } => {
-                        let message = json!({"method": method, "params": params});
+                        let message = json!({"jsonrpc": "2.0", "method": method, "params": params});
                         if let Err(error) = write_json_line(&mut stdin, &message).await {
                             break format!("Devin ACP notification write failed: {error:#}");
                         }
@@ -1914,8 +1927,8 @@ async fn run_actor(
             response = server_rx.recv() => {
                 if let Some(response) = response {
                     let message = match response.payload {
-                        Ok(result) => json!({"id": response.id, "result": result}),
-                        Err((code, message)) => json!({"id": response.id, "error": {"code": code, "message": message}}),
+                        Ok(result) => json!({"jsonrpc": "2.0", "id": response.id, "result": result}),
+                        Err((code, message)) => json!({"jsonrpc": "2.0", "id": response.id, "error": {"code": code, "message": message}}),
                     };
                     if let Err(error) = write_json_line(&mut stdin, &message).await {
                         break format!("Devin ACP server-response write failed: {error:#}");
@@ -1958,6 +1971,21 @@ async fn run_actor(
                                 let _ = reply.send(Ok(result.clone()));
                             } else {
                                 let _ = reply.send(Err("Devin ACP response has neither result nor error".to_owned()));
+                            }
+                        } else if let Some(error) = value.get("error") {
+                            // Error response we cannot attribute (e.g. an
+                            // id:null parse error). Fail the only pending
+                            // request when unambiguous; otherwise surface it
+                            // instead of silently dropping it into a timeout.
+                            if pending.len() == 1 {
+                                if let Some((_, reply)) = pending.drain().next() {
+                                    let _ = reply.send(Err(format!("Devin ACP RPC error: {error}")));
+                                }
+                            } else {
+                                state.lock().unwrap().last_prompt_error = Some(bound_text(
+                                    &format!("Devin ACP server error: {error}"),
+                                    MAX_ERROR_BYTES,
+                                ));
                             }
                         }
                     }
@@ -2857,8 +2885,11 @@ async fn ensure_runtime_with_binary(
         store,
         Some(Arc::clone(&lease)),
         binary,
-        record.model.as_deref(),
-        record.agent.as_deref(),
+        AcpSpawnSpec {
+            model: record.model.as_deref(),
+            agent: record.agent.as_deref(),
+            cloud: record.cloud,
+        },
     )
     .await?;
     acp_initialize(&client).await?;
@@ -2986,7 +3017,15 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
             .try_acquire_runtime_lease(probe_id)?
             .context("cannot acquire Devin probe lease")?,
     );
-    let client = spawn_acp(session, None, &store, Some(lease), &binary, None, None).await;
+    let client = spawn_acp(
+        session,
+        None,
+        &store,
+        Some(lease),
+        &binary,
+        AcpSpawnSpec::default(),
+    )
+    .await;
     let result = match client {
         Ok(client) => {
             let initialized = acp_initialize(&client).await;
@@ -3034,6 +3073,11 @@ async fn task_start_with_store_and_binary(
     let task = required_string(args, "task")?;
     let model = optional_string(args, "model")?;
     let agent = optional_string(args, "agent")?;
+    let cloud = args
+        .get("cloud")
+        .map(|value| value.as_bool().context("cloud must be a boolean"))
+        .transpose()?
+        .unwrap_or(false);
     validate_task_input(task, "task")?;
     if let Some(model) = model {
         validate_argument(model, "model")?;
@@ -3041,6 +3085,10 @@ async fn task_start_with_store_and_binary(
     if let Some(agent) = agent {
         validate_argument(agent, "agent")?;
     }
+    anyhow::ensure!(
+        !cloud || (model.is_none() && agent.is_none()),
+        "model and agent are ignored by `devin acp --cloud`; omit them when cloud is true"
+    );
 
     let task_id = task_id_for_operation(session, operation_id)?;
     let request_fingerprint = fingerprint(&json!({
@@ -3049,6 +3097,7 @@ async fn task_start_with_store_and_binary(
         "task": task,
         "model": model,
         "agent": agent,
+        "cloud": cloud,
     }))?;
     let now = config::unix_time();
     let mut record = TaskRecord {
@@ -3058,6 +3107,7 @@ async fn task_start_with_store_and_binary(
         scope_cwd: config::canonical_directory(&session.cwd)?,
         model: model.map(str::to_owned),
         agent: agent.map(str::to_owned),
+        cloud,
         status: TaskStatus::Accepted,
         revision: 1,
         generation: 0,
@@ -3096,8 +3146,11 @@ async fn task_start_with_store_and_binary(
         store,
         Some(Arc::clone(&runtime_lease)),
         binary,
-        model,
-        agent,
+        AcpSpawnSpec {
+            model,
+            agent,
+            cloud,
+        },
     )
     .await
     {
@@ -3948,6 +4001,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn start_cloud_rejects_model_and_agent() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client(true);
+        install_fake(fake.clone());
+
+        let mut args = start_args(Uuid::new_v4(), "do the thing");
+        args["cloud"] = json!(true);
+        let error = task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ignored by `devin acp --cloud`"));
+
+        let mut args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "do the thing",
+            "cloud": true,
+        });
+        task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+            .await
+            .unwrap();
+        args["cloud"] = json!("yes");
+        let error = task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+            .await
+            .unwrap_err();
+        clear_fake();
+        assert!(format!("{error:#}").contains("cloud must be a boolean"));
+        assert!(fake.lock().unwrap().prompt_calls.len() == 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn get_completes_from_stop_reason_and_report() {
         let root = tempdir();
         let (_handle, session) = active_test_session(&root, &test_id(), false).await;
@@ -4234,6 +4320,7 @@ mod tests {
             scope_cwd: config::canonical_directory(&session.cwd).unwrap(),
             model: None,
             agent: None,
+            cloud: false,
             status,
             revision: 1,
             generation: 0,

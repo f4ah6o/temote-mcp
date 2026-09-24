@@ -65,6 +65,13 @@ tool 名・approval class・task store・env 変数をすべて分離し、混�
   `running`/`waiting_for_user` で idle するため、terminal structured report を
   `waiting_input` より優先する。
 - 未実施: suspended → resume の live 確認 (suspended 状態を再現するタイミングが取れなかった)。
+- 2026-09-24 追加検証 (temote-ebfe, temote-mcp@2026.9.19 on Mac host): `devin_cloud_status` は
+  `TEMOTE_MCP_DEVIN_API_KEY` / `DEVIN_API_KEY` が supervisor の環境に未設定のため未構成と応答。
+  利用には Mac host 側で API key を設定して supervisor を再起動する必要がある。
+- 2026-09-24 `devin_mode` に `swe-2-medium` / `swe-2-high` / `swe-2-max` を追加
+  (API v3 が受理する mode id)。swe-2-max promo を選択できるようにするための修正で、
+  tool schema enum・`validate_devin_mode`・gateway `protocol.js`・contract snapshot /
+  fingerprint を同期済み。
 
 ## Subscription 利用について (2026-09-24 coordinator 回答「サブスクリプションの範囲で使いたい」)
 

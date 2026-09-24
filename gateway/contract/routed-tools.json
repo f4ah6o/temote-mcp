@@ -640,6 +640,9 @@
             "minLength": 1,
             "type": "string"
           },
+          "cloud": {
+            "type": "boolean"
+          },
           "host_id": {
             "type": "string"
           },
@@ -791,7 +794,10 @@
               "fast",
               "lite",
               "ultra",
-              "fusion"
+              "fusion",
+              "swe-2-medium",
+              "swe-2-high",
+              "swe-2-max"
             ],
             "type": "string"
           },
