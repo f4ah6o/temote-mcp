@@ -640,6 +640,9 @@
             "minLength": 1,
             "type": "string"
           },
+          "cloud": {
+            "type": "boolean"
+          },
           "host_id": {
             "type": "string"
           },

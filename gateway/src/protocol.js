@@ -466,6 +466,7 @@ export const PUBLIC_TOOLS = [
         task: { type: "string", minLength: 1, maxLength: 1048576 },
         model: { type: "string", minLength: 1, maxLength: 256 },
         agent: { type: "string", minLength: 1, maxLength: 256 },
+        cloud: { type: "boolean" },
       },
       ["session_id", "operation_id", "task"],
     ),

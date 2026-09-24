@@ -139,6 +139,8 @@ The opt-in `devin_status`, `devin_task_start`, `devin_task_get`, and `devin_task
 
 This is an experimental stdio adapter, not the OS-level boundary of Temote's direct `execute` sandbox: the ACP child communicates with the Devin service outside that direct command sandbox, and authentication comes from the installed CLI's own credential state (`devin auth login`, `DEVIN_API_KEY`, or `WINDSURF_API_KEY`). Keep these surfaces opt-in until the host's installed Devin CLI has been validated end-to-end.
 
+`devin_task_start` also accepts `cloud: true`, which spawns `devin acp --cloud` instead: the CLI relays the stdio ACP transport to the Devin Cloud ACP WebSocket, so the hosted session runs on Devin Cloud under the CLI's `auth login` account rather than as the local agent. `model` and `agent` are ignored by `devin acp --cloud` and are rejected when combined with `cloud`. The transport, ownership, and evidence contract is otherwise identical to the local mode.
+
 ### Experimental Devin Cloud tasks
 
 The `devin acp` tools above drive a *local* Devin CLI. The separate `devin_cloud_status`, `devin_cloud_task_start`, `devin_cloud_task_get`, and `devin_cloud_task_control` tools drive *hosted* Devin sessions through the Devin API v3 (`https://api.devin.ai/v3/organizations/{org_id}/sessions`) over HTTPS from the Temote host; no Devin binary is required, and the session's work happens on Devin Cloud rather than in the Temote session's working directory. These tools exist only in `network`-feature builds.

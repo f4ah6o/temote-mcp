@@ -127,6 +127,8 @@ opt-in の `devin_status`、`devin_task_start`、`devin_task_get`、`devin_task_
 
 これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な stdio adapter です。ACP child は Devin service と直接通信し、認証は install 済み CLI 自身の credential state (`devin auth login`、`DEVIN_API_KEY`、または `WINDSURF_API_KEY`) を使います。host の Devin CLI build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
 
+`devin_task_start` は `cloud: true` も受け付け、その場合は `devin acp --cloud` を spawn します。CLI が stdio ACP transport を Devin Cloud の ACP WebSocket に relay するため、local agent ではなく CLI の `auth login` account 上で hosted session が動きます。`model` と `agent` は `devin acp --cloud` では無視されるため、`cloud` と併用すると拒否されます。transport、ownership、evidence の契約は local mode と同じです。
+
 ### Experimental Devin Cloud task
 
 上の `devin acp` tool は *local* の Devin CLI を駆動します。これとは別の `devin_cloud_status`、`devin_cloud_task_start`、`devin_cloud_task_get`、`devin_cloud_task_control` は、Temote host から HTTPS で Devin API v3 (`https://api.devin.ai/v3/organizations/{org_id}/sessions`) を呼び、*hosted* な Devin session を駆動します。Devin binary は不要で、作業は Temote session の working directory ではなく Devin Cloud 側で行われます。これらの tool は `network` feature build にのみ存在します。
