@@ -113,6 +113,8 @@ starting -> active -> stopping -> stopped
 
 Temote binary を更新した後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` を使います。target executable が running supervisor と同じ local control protocol / lifecycle schema / restore-plan schema を申告する場合だけ続行し、非互換 generation は active runtime を停止する前に拒否します。
 
+`upgrade --dry-run` で `blocked_session_count` が正の場合は、存在しない workspace や失われた restart context を持つ session を `session info <id>` で確認します。復元不要な session は `session stop <id>` で終了してから再試行します。`helper_generation` は Linux sandbox helper の互換性を示します。古い supervisor がこの値を返さない場合、upgrade CLI は installed binary に同梱された helper を検査します。
+
 実装は live な in-process task transfer ではなく coordinated restart/restore です。旧 supervisor は lifecycle mutation を fence し、named-root/cwd resolution と memory-only restart context を検証して全 active runtime を quiesce します。integration call または approval が in-flight なら fail closed で中止します。owner-only restore plan に含めるのは session identity、path/permission/restart metadata、restart-context のキー名だけで、credential value は保存しません。graceful drain 後、同じ PID のまま `temote-mcp supervisor --restore-plan ...` を `exec` し、replacement は planned active session だけを復元して metadata と全 session socket probe を確認してから plan を削除します。
 
 direct `serve/up` ingress は別 process のままで、control protocol が compatible なら稼働継続できます。protocol/lifecycle schema をまたぐ handoff は ingress restart を推測せず拒否します。`exec` 自体が失敗した場合、旧 supervisor は memory 上の restart specification から drained session の再作成を試みて fence を解除します。`exec` 後の replacement startup/restore failure では non-secret restore plan を診断・復旧用に残します。supervisor/session health check 成功後、`upgrade` は binary-owned Codex Plugin を transactionally refresh し、既に起動中の Codex client の再起動が必要であることを報告します。handoff protocol 導入前の supervisor からは最初の1回だけ手動 restart が必要です。
