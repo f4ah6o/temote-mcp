@@ -111,11 +111,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 28);
+  assert.equal(names.length, 27);
   for (const required of ["host_list", "host_info", "session_list", "session_start", "session_stop", "session_restart", "session_info"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "local_agent_run", "poll_job", "job_list", "stop_job"]) {
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "stop_job"]) {
     assert.equal(names.includes(required), true, required);
   }
   for (const removed of ["execute", "start_command", "read_file", "write_file", "git_push", "github_pr_list", "dev_tool_run", "session_permission_request", "onepassword_item_get", "kintone_mcp_status", "checkpoint_save", "work_handoff", "recall"]) {
@@ -124,18 +124,6 @@ test("gateway routed tools and protocol versions match the Rust contract", () =>
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_status").annotations.openWorldHint, true);
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_start").inputSchema.required.includes("operation_id"), true);
   assert.deepEqual(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_control").inputSchema.properties.action.enum, ["steer", "resume", "interrupt"]);
-  const localAgent = PUBLIC_TOOLS.find((tool) => tool.name === "local_agent_run");
-  assert.deepEqual(localAgent.annotations, {
-    readOnlyHint: false,
-    destructiveHint: true,
-    idempotentHint: false,
-    openWorldHint: true,
-  });
-  assert.equal(localAgent.inputSchema.additionalProperties, false);
-  assert.deepEqual(localAgent.inputSchema.properties.agent.enum, ["codex", "opencode"]);
-  assert.deepEqual(localAgent.inputSchema.properties.access.enum, ["read_only", "workspace_write"]);
-  assert.equal(localAgent.inputSchema.properties.task.maxLength, 1048576);
-  assert.equal(localAgent.inputSchema.allOf[0].then.properties.task.maxLength, 65536);
   assert.equal(names.includes("without_sandbox"), false);
 });
 
@@ -1661,7 +1649,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 28);
+  assert.equal(rpc.result.tools.length, 27);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

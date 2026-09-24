@@ -1,6 +1,6 @@
 ---
 name: temote-mcp
-description: Delegate local-machine work to coding agents through Temote MCP sessions. Use when the user mentions Temote MCP or temote-mcp, asks an agent to work on a local repository/session through Temote, supplies a Temote session ID, or when tools such as session_list, session_info, local_agent_run, codex_task_start, opencode_task_start, devin_task_start, or devin_cloud_task_start are available.
+description: Delegate local-machine work to coding agents through Temote MCP sessions. Use when the user mentions Temote MCP or temote-mcp, asks an agent to work on a local repository/session through Temote, supplies a Temote session ID, or when tools such as session_list, session_info, codex_task_start, opencode_task_start, devin_task_start, or devin_cloud_task_start are available.
 license: MIT AND Apache-2.0
 compatibility: Requires an MCP connection to Temote MCP. A serve endpoint may create normal sessions from host-configured named roots; otherwise tools using session_id require an existing local session.
 metadata:
@@ -36,21 +36,12 @@ Every backend follows the same contract: `*_status` probes the installed backend
 - `opencode_*` runs a per-task `opencode serve` on loopback.
 - `devin_*` runs a per-task `devin acp` child over stdio; `cloud: true` relays through `devin acp --cloud` (omit `model`/`agent` in cloud mode).
 - `devin_cloud_*` uses the Devin Cloud API directly.
-- `local_agent_run` is the structured single-run broker for a local Codex/OpenCode CLI invocation when the task-oriented backends are unnecessary.
 
 Call the matching `*_status` first and treat its version/model/effort result as diagnostic compatibility metadata, not as a version allowlist or proof that a task will succeed. Start and control require a fresh UUID `operation_id`; preserve it for an exact retry and never retry an uncertain side effect with a new ID. Pre-thread startup failures may be retried with the same start ID; once a thread/turn request may have been sent, keep the task in reconciliation and do not blindly replay it.
 
 Use `*_task_get` to reconcile remote truth, `reconciliation_required`, `unknown`, approval waits, and process restarts before deciding whether to control a task. If it returns `reconciliation_deferred: true`, another Temote process owns the live runtime: use the persisted status and revision, and do not issue control through the secondary process. A session stop/restart finalizes nonterminal tasks owned by the ended full session instance as `interrupted`; while another process holds the runtime lease, its owner observes session termination, shuts down the child, and finalizes the task. Retained records remain fenced from a replacement instance. Unexpired terminal records are not evicted to make capacity; when no expired terminal record is available, a new start is rejected.
 
 Temote yolo does not authorize delegated child mutations: command/file-change approval requests still use the explicit user-approval path and fail closed if it is unavailable. Control is limited to typed actions; do not attempt to tunnel arbitrary backend JSON-RPC or a remote shell through these tools.
-
-### Structured local agent broker
-
-Use `local_agent_run` for a single local Codex or OpenCode run with `{session_id, agent, task, cwd?, worktree?, access, model?, profile?}`. `agent` is only `codex` or `opencode`, and `access` is only `read_only` or `workspace_write`. The caller cannot provide an executable, raw argv, environment, or network policy; Temote constructs and bounds the adapter command. Use `worktree: {branch, task?}` (never a path) when the task needs an isolated Temote-managed worktree: Temote derives `<configured src root>/worktrees/<repo>/<task>` from the selected session workspace, reuses only a verified managed worktree of that repository on that branch, and otherwise creates one through the approved path; do not combine it with `cwd`.
-
-The broker canonicalizes `cwd` and keeps it inside the selected session's permitted roots after symlink resolution, including in yolo sessions. Permitted roots authorize which cwd may be selected; they are not automatically exposed to the child. Its Temote-owned filesystem profile hides the host temporary and user-agent state roots, re-exposes only the selected canonical cwd, the bounded executable path graph (including verified intermediate symlinks, empty normal-directory scaffolds needed for traversal, and exact verified launcher metadata files), and private run state, makes the selected cwd writable for `workspace_write`, and keeps it read-only for `read_only`. Other permitted roots are not automatically visible. Every `.git`, `.agents`, and `.codex` entry under the selected workspace, including nested entries and metadata files, remains protected. It does not forward Temote-held credentials, tokens, or proxy settings by default. Existing standard Codex/OpenCode auth files are imported as bounded read-only inputs for the top-level runtime and denied to generated command/tool execution by the broker-controlled adapter policy. In `ask` and `yolo` sessions the child starts only after the explicit user-approval boundary returns allow; in the default `agent` mode an otherwise-valid structured request skips only the Temote-local prompt. In every mode denial means no child process is started.
-
-Codex accepts tasks up to 1 MiB through stdin (`codex exec ... -`); OpenCode's verified `run [message..]` contract has no stdin prompt transport, so its positional task is limited to 64 KiB. Combined output is also bounded to 1 MiB. A run that exceeds the foreground timeout returns a session-owned `job_id`; use `poll_job` or `stop_job` as with other jobs. Interactive approval shows a bounded sanitized task preview; durable approval/activity metadata contains only bounded scope, task byte count, and task SHA-256, never the task body, preview, or environment values.
 
 ## Jobs
 
@@ -60,7 +51,7 @@ Do not tell the user that work is complete while a required job is still running
 
 ## Approval model
 
-`ask` uses Temote MCP's local approval boundary for host/network-sensitive structured operations. The default sandboxed `agent` mode skips only that Temote-local prompt for otherwise-valid structured operations; it never widens sandbox, path, network, or tool-specific capability. Yolo sessions intentionally skip Temote MCP approval prompts and path/sandbox restrictions; the structured `local_agent_run` broker deliberately retains its explicit child-approval boundary in ask/yolo.
+`ask` uses Temote MCP's local approval boundary for host/network-sensitive structured operations. The default sandboxed `agent` mode skips only that Temote-local prompt for otherwise-valid structured operations; it never widens sandbox, path, network, or tool-specific capability. Yolo sessions intentionally skip Temote MCP approval prompts and path/sandbox restrictions.
 
 Do not add a redundant conversational confirmation for an operation the user already explicitly requested merely because Temote MCP may also display its own host approval UI. Still follow any confirmation or authorization rules imposed by the current agent/client.
 

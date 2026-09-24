@@ -383,26 +383,12 @@ fn encode_session_result(result: Result<Value>, label: &str) -> Vec<u8> {
     }
 }
 
-pub(crate) fn ensure_approval_detail_fits(detail: &str) -> Result<()> {
-    anyhow::ensure!(
-        detail.len() <= MAX_APPROVAL_DETAIL_BYTES,
-        "approval detail exceeds {MAX_APPROVAL_DETAIL_BYTES} bytes; exact nested resolver locator scope cannot be displayed safely"
-    );
-    Ok(())
-}
-
 /// Explicit operation classes for the Temote-local approval layer. A class
 /// describes which authorization invariant a tool operation belongs to; mode
 /// policy is applied centrally by [`local_approval`] instead of handlers
 /// special-casing individual permission modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApprovalClass {
-    /// Host/network Git operations through the structured Git tools.
-    GitNetwork,
-    /// Structured Codex/OpenCode delegation through `local_agent_run`.
-    LocalAgent,
-    /// Session-local structured Git mutations (branch/worktree management).
-    LocalStructured,
     /// Experimental Codex app-server task operations.
     CodexAppServer,
     /// Experimental OpenCode serve task operations.
@@ -442,36 +428,16 @@ pub(crate) fn local_approval(mode: config::PermissionMode, class: ApprovalClass)
     use ApprovalClass::*;
     use LocalApproval::*;
     match class {
-        LocalAgent => match mode {
-            config::PermissionMode::Agent => Skip,
-            _ => RequestUser,
+        CodexAppServer | OpenCodeServer | DevinAcp | DevinCloud => match mode {
+            config::PermissionMode::Ask => Request,
+            _ => Skip,
         },
-        GitNetwork | LocalStructured | CodexAppServer | OpenCodeServer | DevinAcp | DevinCloud => {
-            match mode {
-                config::PermissionMode::Ask => Request,
-                _ => Skip,
-            }
-        }
         RemoteUpgrade => RequestUser,
         SessionGrant => match mode {
             config::PermissionMode::Yolo => Skip,
             _ => Request,
         },
     }
-}
-
-/// Apply the centralized permission-mode policy, then request approval when
-/// the policy requires it. Returns `true` when the operation may proceed.
-pub(crate) async fn ensure_local_approval(
-    session: &Session,
-    class: ApprovalClass,
-    operation: &str,
-    detail: String,
-    cwd: PathBuf,
-    metadata: BTreeMap<String, String>,
-) -> Result<bool> {
-    ensure_local_approval_with_activity(session, class, operation, detail, cwd, metadata, None)
-        .await
 }
 
 pub(crate) async fn ensure_local_approval_with_activity(
@@ -2964,51 +2930,5 @@ mod tests {
             );
             Ok(())
         })
-    }
-
-    #[tokio::test]
-    async fn agent_structured_operations_skip_the_local_console_and_ask_fails_closed() {
-        let cwd = tempfile::tempdir().unwrap();
-        let agent_session = config::Session {
-            id: format!("agent-no-console-{}", uuid::Uuid::new_v4()),
-            cwd: cwd.path().to_owned(),
-            permitted_directories: vec![cwd.path().to_owned()],
-            started_at: 0,
-            process_id: 0,
-            permission_mode: config::PermissionMode::Agent,
-            grants: config::SessionGrants::default(),
-        };
-        let approved = ensure_local_approval(
-            &agent_session,
-            ApprovalClass::GitNetwork,
-            "git_fetch",
-            "argv: test".to_owned(),
-            cwd.path().to_owned(),
-            BTreeMap::new(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            approved,
-            "agent mode must not require a local approval console"
-        );
-
-        let ask_session = config::Session {
-            permission_mode: config::PermissionMode::Ask,
-            ..agent_session
-        };
-        assert!(
-            ensure_local_approval(
-                &ask_session,
-                ApprovalClass::GitNetwork,
-                "git_fetch",
-                "argv: test".to_owned(),
-                cwd.path().to_owned(),
-                BTreeMap::new(),
-            )
-            .await
-            .is_err(),
-            "ask mode must still fail closed without a running approval console"
-        );
     }
 }

@@ -299,26 +299,6 @@ pub(crate) fn record_observed(
     }
 }
 
-pub(crate) async fn record_observed_for_session_id(
-    session_id: &str,
-    kind: FrictionKind,
-    operation_class: Option<&str>,
-    tool_name: Option<&str>,
-    outcome: EventOutcome,
-) {
-    if let Ok(session) = config::load_session(session_id).await {
-        record_observed(
-            &session,
-            kind,
-            operation_class,
-            tool_name,
-            outcome,
-            None,
-            None,
-        );
-    }
-}
-
 fn validate_session_scope(session: &config::Session) -> Result<()> {
     config::validate_session_id(&session.id)?;
     let canonical = config::canonical_directory(&session.cwd)?;

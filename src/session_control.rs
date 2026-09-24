@@ -6981,7 +6981,7 @@ mod tests {
     /// Host/CI-only session-GC liveness acceptance.
     ///
     /// These tests bind and probe Unix-domain sockets (`session_is_active`), which
-    /// the local-agent sandbox denies. They are deliberately separated from the
+    /// a Temote sandbox denies. They are deliberately separated from the
     /// pure policy tests so `just sandboxed-check` can skip the whole module and
     /// report it as NOT RUN instead of faking a PASS.
     mod host_liveness_tests {

@@ -904,7 +904,7 @@ fn build_seccomp_filter(network: LinuxNetworkPolicy) -> Result<BpfProgram> {
         rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
         rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
     } else {
-        // The network-enabled local-agent profile has no inherited IPC file
+        // The network-enabled development profile has no inherited IPC file
         // descriptors and must not create path-based Unix sockets, which could
         // reach host control sockets. Runtimes use connected unnamed AF_UNIX
         // socketpairs for signal handling and child-process stdio. libuv may
@@ -1447,56 +1447,6 @@ mod tests {
     }
 
     #[test]
-    fn local_agent_policy_keeps_network_and_uses_only_explicit_temp_roots() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let temp = root.path().join("tmp");
-        std::fs::create_dir(&workspace).unwrap();
-        std::fs::create_dir(&temp).unwrap();
-        let hidden = root.path().to_path_buf();
-        let policy = LinuxSandboxPolicy::for_local_agent(
-            &workspace,
-            &[],
-            std::slice::from_ref(&temp),
-            &[],
-            std::slice::from_ref(&workspace),
-            &[],
-            &[],
-            &[],
-            std::slice::from_ref(&hidden),
-            None,
-        )
-        .unwrap();
-        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
-
-        assert!(!args.iter().any(|arg| arg == "--unshare-net"));
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["--tmpfs", root.path().to_str().unwrap()])
-        );
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["--dir", workspace.to_str().unwrap()])
-        );
-        assert!(args.windows(3).any(|window| {
-            window
-                == [
-                    "--ro-bind",
-                    workspace.to_str().unwrap(),
-                    workspace.to_str().unwrap(),
-                ]
-        }));
-        assert!(args.windows(3).any(|window| {
-            window == ["--bind", temp.to_str().unwrap(), temp.to_str().unwrap()]
-        }));
-        assert!(
-            !args
-                .windows(3)
-                .any(|window| window == ["--bind", "/tmp", "/tmp"])
-        );
-    }
-
-    #[test]
     fn ordinary_command_network_policy_controls_network_namespace_and_seccomp() {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
@@ -1534,99 +1484,6 @@ mod tests {
             !build_seccomp_filter(LinuxNetworkPolicy::LocalAgent)
                 .unwrap()
                 .is_empty()
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn local_agent_policy_recreates_only_verified_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        let hidden = root.path().join("home");
-        let bin = hidden.join("bin");
-        let version = hidden.join("0.3.1");
-        let scratch = hidden.join("scratch");
-        let current = hidden.join("current");
-        let metadata_file = hidden.join("bins/codex.json");
-        let unrelated_file = hidden.join("bins/unrelated.json");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(version.join("bin")).unwrap();
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir(&scratch).unwrap();
-        std::fs::create_dir_all(metadata_file.parent().unwrap()).unwrap();
-        std::fs::write(&metadata_file, b"verified").unwrap();
-        std::fs::write(&unrelated_file, b"must not be mounted").unwrap();
-        std::fs::write(scratch.join("secret"), b"must not be mounted").unwrap();
-        std::fs::write(version.join("bin/vp"), b"#!/bin/sh\n").unwrap();
-        symlink(Path::new("../current/bin/vp"), bin.join("codex")).unwrap();
-        symlink(Path::new("0.3.1"), &current).unwrap();
-        let canonical_version = std::fs::canonicalize(&version).unwrap();
-        let hidden = std::fs::canonicalize(&hidden).unwrap();
-
-        let symlinks = [crate::sandbox::LocalAgentSymlink {
-            link: hidden.join("current"),
-            target: canonical_version.clone(),
-        }];
-        let hidden = std::fs::canonicalize(&hidden).unwrap();
-        let policy = LinuxSandboxPolicy::for_local_agent(
-            &workspace,
-            &[],
-            &[],
-            &[],
-            std::slice::from_ref(&bin),
-            &symlinks,
-            std::slice::from_ref(&scratch),
-            std::slice::from_ref(&metadata_file),
-            std::slice::from_ref(&hidden),
-            None,
-        )
-        .unwrap();
-        let args = build_bwrap_args(&policy, vec!["/bin/true".to_owned()], 42, None, &[]).unwrap();
-
-        assert!(args.windows(3).any(|window| {
-            window
-                == [
-                    "--symlink",
-                    canonical_version.to_str().unwrap(),
-                    hidden.join("current").to_str().unwrap(),
-                ]
-        }));
-        assert!(
-            args.windows(2)
-                .any(|window| { window == ["--dir", hidden.join("0.3.1").to_str().unwrap()] })
-        );
-        assert!(
-            args.windows(2)
-                .any(|window| { window == ["--dir", scratch.to_str().unwrap()] })
-        );
-        assert!(!args.windows(3).any(|window| {
-            window
-                == [
-                    "--ro-bind",
-                    scratch.to_str().unwrap(),
-                    scratch.to_str().unwrap(),
-                ]
-        }));
-        assert!(!args.iter().any(|argument| argument == "secret"));
-        assert!(args.windows(3).any(|window| {
-            window
-                == [
-                    "--ro-bind",
-                    metadata_file.to_str().unwrap(),
-                    metadata_file.to_str().unwrap(),
-                ]
-        }));
-        assert!(
-            !args
-                .iter()
-                .any(|argument| argument == unrelated_file.to_str().unwrap())
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|argument| Path::new(argument) == hidden.join("bin/codex"))
         );
     }
 }

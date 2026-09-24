@@ -87,7 +87,7 @@ named root は Temote MCP 起動前に host 側の `TEMOTE_MCP_ROOTS` で設定�
 
 ## delegation と job
 
-Temote は file、command、Git、integration を直接実行しません。machine 上の作業は下記の task backend、または1回実行用の構造化 broker `local_agent_run` を通じて local 側の coding agent に委譲します。task の transcript や child output は bounded で期限付きの session/scope 限定 evidence としてだけ境界を越え、`evidence_read({session_id, evidence_id, offset_bytes?, max_bytes?})` で読みます。
+Temote は file、command、Git、integration を直接実行しません。machine 上の作業は下記の task backendを通じて local 側の coding agent に委譲します。task の transcript や child output は bounded で期限付きの session/scope 限定 evidence としてだけ境界を越え、`evidence_read({session_id, evidence_id, offset_bytes?, max_bytes?})` で読みます。
 
 foreground timeout を超える作業は session 所有の `job_id` を返します。完了が必要なら `poll_job` で確認し、不要になったら `stop_job` で停止します。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。
 
@@ -109,7 +109,7 @@ Temote の yolo は Temote 自身の local sandbox と approval behavior だけ�
 
 opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`opencode_task_control` は、task ごとの `opencode serve` child を loopback 上に起動し、`unofficial-opencode-sdk` HTTP client 経由で操作します。各 serve child は 127.0.0.1 の動的 port、child 環境変数経由のみで渡す instance ごとの random Basic-auth password、task ごとの隔離 data directory、`OPENCODE_CONFIG_CONTENT` で注入される上限付き serve permission 設定で動きます。host の OpenCode global 設定（provider/model 定義を含む）を読み、従来の `auth.json` と OpenCode V2 の SQLite 保存資格情報を task 専用 state に取り込みます。host の session や履歴は取り込みません。先に host の CLI で `opencode auth login` を行ってください。資格情報は spawn 時点の copy であり、child による token 更新は host のアカウントへ戻りません。未対応の V2 credential schema は安全側に失敗します。task record、ownership、lease、receipt、retention、scoped evidence は上記 Codex app-server task と同じ契約です。task は完全な session instance と canonical working directory に所有され、別 session、別 process generation、別 scope から resume できません。
 
-`opencode_task_start` と `opencode_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み session に追加の prompt を送り、resume は保持済み session を reconcile した上で同じ task 用 state directory を使う新しい serve child に spawn し直します (新しい task の開始や終了済み child の再起動ではありません)。prompt には operation 由来の deterministic `messageID` が付くため、`opencode_task_get` は start prompt が server に受理されたかを判定してから `reconciliation_required` を決めます。terminal state の report は `local_agent_run` と同じ bounded report contract の下、最後の assistant message から抽出します。usage と observed model は self-reported 値ではなく session message から読みます。`ask` mode では Codex task と同じ provenance/scope/mutation metadata を伴う local approval が必要で、`agent` と `yolo` session では Temote-local prompt を skip します。`opencode_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
+`opencode_task_start` と `opencode_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み session に追加の prompt を送り、resume は保持済み session を reconcile した上で同じ task 用 state directory を使う新しい serve child に spawn し直します (新しい task の開始や終了済み child の再起動ではありません)。prompt には operation 由来の deterministic `messageID` が付くため、`opencode_task_get` は start prompt が server に受理されたかを判定してから `reconciliation_required` を決めます。terminal state の report は 他の delegation backend と同じ bounded report contract の下、最後の assistant message から抽出します。usage と observed model は self-reported 値ではなく session message から読みます。`ask` mode では Codex task と同じ provenance/scope/mutation metadata を伴う local approval が必要で、`agent` と `yolo` session では Temote-local prompt を skip します。`opencode_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
 
 これは Temote の session sandbox と同じ OS-level boundary ではなく、experimental な serve adapter です。serve process 自体は provider API と直接通信します。保留中の OpenCode permission/question request は auto-approval ではなく `waiting_approval` task state として表面化します。host の OpenCode build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
 
@@ -132,37 +132,6 @@ opt-in の `devin_status`、`devin_task_start`、`devin_task_get`、`devin_task_
 credential は `TEMOTE_MCP_DEVIN_API_KEY` (Devin service-user key または personal API key。fallback として `DEVIN_API_KEY` も受け付けます) で設定します。`TEMOTE_MCP_DEVIN_ORG_ID` で organization を固定でき、未設定なら `/v3/self` から一度だけ解決します (曖昧な場合は fail closed)。`https://` の `TEMOTE_MCP_DEVIN_API_BASE_URL` で API origin を上書きできます。service user と personal access token はどちらも通常の (Teams / self-serve) subscription の organization settings で発行でき、session はその subscription の ACU を消費します。service-user key を使う場合は `TEMOTE_MCP_DEVIN_CREATE_AS_USER_ID` に自分の Devin user ID を設定すると、session が service user ではなく自分に帰属します (`create_as_user_id`。service user の role が許可している必要があります)。`devin_cloud_status` と `temote-mcp doctor` が報告するのは credential の *source* (変数名)、organization、base URL だけで、key の値は task record、approval、evidence、tool output のどこにも現れません。
 
 `devin_cloud_task_start` には opaque な `operation_id` と `task` が必須で、`title`、`devin_mode`、`repos`、`max_acu_limit` は任意で session 作成に転送されます。Temote は API 呼び出し前に acceptance を永続化し、`temote-mcp` tag 付きの resumable session を1つ作成します。prompt では他の delegation backend と同じ bounded JSON report contract を要求し、structured output としても要求します。task record は Codex / OpenCode / Devin ACP task と同様に完全な session instance と canonical working directory に所有され、`devin-cloud-tasks` 配下に保存され、他 session からは見えません。`devin_cloud_task_get` は保持済み task を hosted session の status と reconcile します (`running`/`claimed` → `running`、`waiting_for_user` → `waiting_input` (ただし terminal report が公開済みなら `completed`/`failed` — Devin は turn 終了後に exit せず idle するため)、`waiting_for_approval` → `waiting_approval`、inactivity による `suspended` → `waiting_input`、`exit` → `completed`、`error`/quota/payment failure → `failed`、user による terminate → `interrupted`)。report は structured output を優先し、無ければ最後の Devin message から抽出します。最後の message は bounded な scoped evidence 経由でのみ公開します。control action は `steer` (follow-up message を送信)、`resume` (suspended session に message を送り Devin 側で resume)、`interrupt` (hosted session を terminate) です。API の明確な reject は `retryable_failed`、remote 効果が不確定な transport failure は `reconciliation_required` になり、blind replay は行いません。`ask` mode では Devin Cloud provenance metadata (`scope: devin_cloud`) 付きの local approval が必要で、その mutation が local workspace ではなく hosted organization の ACU を消費することを operator が確認できます。
-
-### 構造化ローカルエージェント broker
-
-`local_agent_run({session_id, agent, task, cwd?, access, model?, effort?, profile?})` は、インストール済みの Codex または OpenCode を構造化された broker 経由で1回実行します。`model` は adapter の model identifier、`effort` は Codex 専用の reasoning effort 名（他 agent では拒否）、`profile` は child に適用する名前付き provider/auth profile を選びます。
-`worktree: {branch, task?}` を指定した場合、caller は path を一切渡しません。Temote が selected session workspace から canonical repository を解決し、`<configured src root>/worktrees/<repo>/<task>` を自ら導出して、その repository と branch の検証済み managed worktree だけを再利用し、存在しなければ承認済みの managed-worktree 経路で作成します。`cwd` と `worktree` の同時指定は拒否し、検証済み workspace は agent 起動直前に再検証します。`<repository>/.wt/<name>` や `<src>/<repo>-*` などの legacy worktree はこの選択で adopt・移動・削除しません。
-`agent` は `codex` と `opencode` に限定し、呼び出し側が渡せるのは bounded な task と access mode だけです。
-実行ファイル、raw argv、environment、network policy は Temote が構築し、caller から指定できません。
-実装対象の non-interactive CLI contract は、インストール済み CLI の help 出力で検証します。
-
-指定した `cwd` は canonicalize し、symlink 解決後も yolo を含むすべての session で permitted root 内に限定します。
-permitted root は選択可能な `cwd` の範囲を認可するものであり、child に自動公開する path の一覧ではありません。
-Temote 側の agent profile では、選択した canonical `cwd` だけを agent workspace として再公開します。
-`workspace_write` では選択 cwd だけを書き込み可能にし、`read_only` では選択 cwd を読み取り専用にします。
-他の permitted root は agent に自動公開しません。
-どちらの mode でも agent の state と cache は毎回専用 directory に分離して書き込み可能にし、選択 workspace 以下のすべての `.git`、`.agents`、`.codex`（nested を含む）は保護したままにします。
-
-`ask` と `yolo` では local agent の request が local approval boundary を通ります。`agent` では otherwise-valid な構造化 request が Temote 側の local approval prompt だけを省略し、以下の broker contract は変わりません。
-deny の場合は child process を起動せずに終了します。
-Codex の task は 1 MiB まで受け付け、検証済みの `codex exec ... -` contract に従って stdin で渡すため argv には載せません。
-インストール済み OpenCode の `run [message..]` には検証済みの stdin prompt transport がないため、positional message の task は 64 KiB に制限します。
-child の stdout/stderr 合計は 1 MiB に制限します。
-foreground timeout を超える場合は通常の Temote `job_id` を返し、`poll_job` または `stop_job` で確認または停止できます。
-interactive approval detail には control character を sanitize した bounded な task preview を表示します。
-永続化する activity / metadata には agent、scope、access mode、task byte数、SHA-256 だけを記録し、task 本文・preview・environment value は記録しません。
-
-child environment は一度消去して最小限の allow-list から再構成するため、Temote が保持する credential、token、proxy 設定を暗黙には渡しません。
-外側の agent profile は host の temporary root と user-agent state root を隠し、今回必要な workspace、実行ファイル directory、private run state だけを再公開します。
-既存の Codex (`~/.codex/auth.json`) と OpenCode (`~/.local/share/opencode/auth.json`) の login file は、top-level agent runtime が使える bounded な read-only input として private な run state に取り込みます。
-broker が Codex の strict permission profile と OpenCode の read / external-directory restriction を固定するため、model-generated command/tool execution から imported auth file は読めません。
-元の user file は hidden にし、child から書き込みできません。
-agent の編集は Git remote 変更の承認を含みません。managed Git remote 操作は agent 内の credential mapping と approval 境界に従います。
 
 ### Delegation backend (ローカル CLI)
 

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::sandbox::{PROTECTED_METADATA_NAMES, discover_protected_metadata_paths};
+use crate::sandbox::PROTECTED_METADATA_NAMES;
 
 const GIT_READ_ONLY_PATHS: &[&str] = &[
     "config",
@@ -42,7 +42,6 @@ pub(super) struct SandboxSpec {
     read_only_scaffold_directories: Vec<PathBuf>,
     read_only_files: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
-    discovered_protected_metadata_paths: Vec<PathBuf>,
     network_access: bool,
     listen_ports: Vec<u16>,
 }
@@ -92,149 +91,7 @@ impl SandboxSpec {
             read_only_scaffold_directories: Vec::new(),
             read_only_files: Vec::new(),
             hidden_roots: Vec::new(),
-            discovered_protected_metadata_paths: Vec::new(),
             network_access,
-            listen_ports: Vec::new(),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn local_agent(
-        cwd: &Path,
-        writable_roots: &[PathBuf],
-        temporary_roots: &[PathBuf],
-        read_only_paths: &[PathBuf],
-        read_only_roots: &[PathBuf],
-        read_only_symlinks: &[crate::sandbox::LocalAgentSymlink],
-        read_only_scaffold_directories: &[PathBuf],
-        read_only_files: &[PathBuf],
-        hidden_roots: &[PathBuf],
-    ) -> Result<Self> {
-        let _cwd = canonical_existing_root(cwd)?;
-        let mut writable = writable_roots
-            .iter()
-            .map(|root| canonical_existing_root(root))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_roots(&mut writable);
-        let discovered_protected_metadata_paths =
-            discover_local_agent_metadata_for_roots(&writable)?;
-        let mut roots = Vec::with_capacity(writable.len() + temporary_roots.len());
-        roots.extend(writable);
-        roots.extend(
-            temporary_roots
-                .iter()
-                .map(|root| canonical_existing_root(root))
-                .collect::<Result<Vec<_>>>()?,
-        );
-        normalize_roots(&mut roots);
-        let mut read_only_overrides = read_only_paths
-            .iter()
-            .map(|path| {
-                std::fs::canonicalize(path)
-                    .with_context(|| format!("cannot resolve read-only path {}", path.display()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        normalize_paths(&mut read_only_overrides);
-        let mut visible_roots = read_only_roots
-            .iter()
-            .map(|root| canonical_existing_root(root))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_roots(&mut visible_roots);
-        let mut hidden = hidden_roots
-            .iter()
-            .map(|root| canonical_existing_root(root))
-            .collect::<Result<Vec<_>>>()?;
-        normalize_roots(&mut hidden);
-        let mut read_only_symlinks = read_only_symlinks
-            .iter()
-            .map(|symlink| symlink.link.clone())
-            .collect::<Vec<_>>();
-        normalize_paths(&mut read_only_symlinks);
-        for link in &read_only_symlinks {
-            anyhow::ensure!(
-                link.is_absolute(),
-                "read-only symlink is not absolute: {}",
-                link.display()
-            );
-            anyhow::ensure!(
-                !roots
-                    .iter()
-                    .chain(visible_roots.iter())
-                    .any(|root| link.starts_with(root)),
-                "read-only symlink is inside a visible root: {}",
-                link.display()
-            );
-            let canonical = std::fs::canonicalize(link)
-                .with_context(|| format!("cannot resolve read-only symlink {}", link.display()))?;
-            anyhow::ensure!(
-                canonical.is_dir(),
-                "read-only symlink target is not a directory: {}",
-                link.display()
-            );
-        }
-        let mut scaffold_directories = read_only_scaffold_directories.to_vec();
-        normalize_paths(&mut scaffold_directories);
-        let mut files = read_only_files.to_vec();
-        normalize_paths(&mut files);
-        for file in &files {
-            anyhow::ensure!(
-                file.is_absolute(),
-                "read-only file is not absolute: {}",
-                file.display()
-            );
-            anyhow::ensure!(
-                !roots
-                    .iter()
-                    .chain(visible_roots.iter())
-                    .any(|root| file.starts_with(root)),
-                "read-only file is inside a visible root: {}",
-                file.display()
-            );
-            let metadata = std::fs::symlink_metadata(file)
-                .with_context(|| format!("cannot inspect read-only file {}", file.display()))?;
-            anyhow::ensure!(
-                metadata.file_type().is_file(),
-                "read-only path is not a regular file: {}",
-                file.display()
-            );
-            anyhow::ensure!(
-                std::fs::canonicalize(file)
-                    .with_context(|| format!("cannot resolve read-only file {}", file.display()))?
-                    == *file,
-                "read-only file is not canonical: {}",
-                file.display()
-            );
-        }
-        for root in &visible_roots {
-            anyhow::ensure!(
-                !roots.iter().any(|writable| writable == root),
-                "read-only root cannot be a writable root: {}",
-                root.display()
-            );
-        }
-        for hidden_root in &hidden {
-            anyhow::ensure!(
-                hidden_root != Path::new("/"),
-                "hidden root cannot be the filesystem root"
-            );
-            for visible in roots.iter().chain(visible_roots.iter()) {
-                anyhow::ensure!(
-                    hidden_root != visible && !hidden_root.starts_with(visible),
-                    "hidden root is inside a visible root: {}",
-                    hidden_root.display()
-                );
-            }
-        }
-        Ok(Self {
-            writable_roots: roots,
-            read_only_overrides,
-            read_only_roots: visible_roots,
-            read_only_symlinks,
-            read_only_scaffold_directories: scaffold_directories,
-            read_only_files: files,
-            hidden_roots: hidden,
-            discovered_protected_metadata_paths,
-            network_access: true,
             listen_ports: Vec::new(),
         })
     }
@@ -250,8 +107,6 @@ impl SandboxSpec {
         for root in git_metadata_roots {
             let root = canonical_existing_root(root)?;
             spec.writable_roots.push(root.clone());
-            spec.discovered_protected_metadata_paths
-                .retain(|path| path != &root);
             if root.join("gitdir").is_file() {
                 spec.read_only_overrides.push(root.join("gitdir"));
                 spec.read_only_overrides.push(root.join("commondir"));
@@ -278,8 +133,6 @@ impl SandboxSpec {
         for root in git_metadata_roots {
             let root = canonical_existing_root(root)?;
             spec.writable_roots.push(root.clone());
-            spec.discovered_protected_metadata_paths
-                .retain(|path| path != &root);
             if root.join("gitdir").is_file() {
                 spec.read_only_overrides.push(root.join("gitdir"));
                 spec.read_only_overrides.push(root.join("commondir"));
@@ -356,28 +209,11 @@ impl SandboxSpec {
     }
 
     pub(super) fn protected_metadata_paths(&self, root: &Path) -> Vec<PathBuf> {
-        let mut paths = PROTECTED_METADATA_NAMES
+        PROTECTED_METADATA_NAMES
             .iter()
             .map(|name| root.join(name))
-            .collect::<Vec<_>>();
-        paths.extend(
-            self.discovered_protected_metadata_paths
-                .iter()
-                .filter(|path| path.starts_with(root))
-                .cloned(),
-        );
-        normalize_paths(&mut paths);
-        paths
+            .collect()
     }
-}
-
-fn discover_local_agent_metadata_for_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for root in roots {
-        paths.extend(discover_protected_metadata_paths(root)?);
-    }
-    normalize_paths(&mut paths);
-    Ok(paths)
 }
 
 fn canonical_existing_root(path: &Path) -> Result<PathBuf> {
@@ -414,9 +250,6 @@ fn normalize_paths(paths: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::{
-        ProtectedMetadataScanLimits, discover_protected_metadata_paths_with_limits,
-    };
     use crate::test_support;
 
     #[test]
@@ -436,19 +269,6 @@ mod tests {
             std::fs::create_dir(workspace.join(format!("entry-{index}"))).unwrap();
         }
         let workspace = std::fs::canonicalize(workspace).unwrap();
-
-        assert!(
-            discover_protected_metadata_paths_with_limits(
-                &workspace,
-                ProtectedMetadataScanLimits {
-                    max_entries: 2,
-                    max_depth: 64,
-                    max_paths: 1024,
-                }
-            )
-            .is_err(),
-            "fixture must exceed the injected local-agent scan budget"
-        );
 
         let spec = SandboxSpec::command(&workspace, &[], false).unwrap();
         for name in PROTECTED_METADATA_NAMES {

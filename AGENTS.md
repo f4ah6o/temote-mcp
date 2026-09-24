@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Temote MCP is a Rust MCP server for delegating local-machine work through explicit sessions. Temote does not execute files, commands, Git, or host integrations directly: machine operations run inside a coding agent on the local machine, driven through the delegation backends (Codex app-server, `opencode serve` via the OpenCode SDK, Devin ACP, and the Devin Cloud API) or the structured `local_agent_run` broker. Sessions remain path-scoped; the `ask` permission mode keeps the local approval console for host/network-sensitive operations, the default `agent` mode is approval-free for validated structured operations, and `--yolo` intentionally removes those Temote MCP boundaries.
+Temote MCP is a Rust MCP server for delegating local-machine work through explicit sessions. Temote does not execute files, commands, Git, or host integrations directly: machine operations run inside a coding agent on the local machine, driven through the delegation backends (Codex app-server, `opencode serve` via the OpenCode SDK, Devin ACP, and the Devin Cloud API). Sessions remain path-scoped; the `ask` permission mode keeps the local approval console for host/network-sensitive operations, the default `agent` mode is approval-free for validated structured operations, and `--yolo` intentionally removes those Temote MCP boundaries.
 
 ## Repository rules
 
@@ -27,8 +27,7 @@ Do not weaken these without an explicit issue describing the security model chan
 - Public tools must not inherit unrestricted local `--yolo` semantics merely because a local host/session uses yolo mode.
 - Delegation tools expose typed task contracts only: a caller can supply a task, model/effort/agent selectors, and typed `steer`/`resume`/`interrupt` control actions — never an executable, raw argv, environment block, network policy, or a path outside the session's canonical scope. `operation_id` is mandatory so accepted side effects stay idempotent and reconcilable.
 - Detailed task transcripts/output cross the boundary only as bounded, expiring, session-owned evidence records read through `evidence_read`; tool responses must not inline unbounded child output.
-- `local_agent_run` keeps the broker's own constraints: canonicalized `cwd` inside permitted roots, Temote-owned child filesystem profile, protected `.git`/`.agents`/`.codex` entries, no credential forwarding, and the explicit child-approval boundary in ask/yolo.
-- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (delegated task start/control and `local_agent_run`) and must never widen sandbox, path, network, or tool-specific capability.
+- Permission policy is centralized on operation class x `PermissionMode`. `ask` keeps approval-gated host/network/structured operations. The default `agent` mode removes only the Temote-local approval prompt for otherwise-valid structured operations (delegated task start/control) and must never widen sandbox, path, network, or tool-specific capability.
 - New local managed and authenticated public sessions default to `agent`; public HTTP must not create or promote `yolo`.
 - `--yolo` may bypass Temote MCP sandbox/path/approval boundaries, but should not silently change unrelated client authorization semantics.
 - Secrets must not be written to session metadata, audit logs, approval summaries, or ordinary tool output.

@@ -21,6 +21,7 @@ const WORKTREE_RESERVATION_DIRECTORY_NAME: &str = "worktree-reservations";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorktreeReservationMode {
     Shared,
+    #[allow(dead_code)]
     Exclusive,
 }
 
@@ -52,7 +53,12 @@ impl std::fmt::Debug for WorktreeReservation {
     }
 }
 
-impl WorktreeReservation {}
+impl WorktreeReservation {
+    #[allow(dead_code)]
+    pub(crate) fn identity(&self) -> &Path {
+        &self.identity
+    }
+}
 
 impl Drop for WorktreeReservation {
     fn drop(&mut self) {
@@ -78,6 +84,33 @@ impl std::fmt::Debug for RepositoryReservation {
             .debug_struct("RepositoryReservation")
             .field("identity", &self.reservation.identity)
             .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)]
+/// A sorted set of per-worktree reservations.  Keeping all guards in one RAII
+/// value makes it difficult for a caller to accidentally release one lock
+/// before its mutation and post-verification have completed.
+pub(crate) struct WorktreeReservations {
+    reservations: Vec<WorktreeReservation>,
+}
+
+impl std::fmt::Debug for WorktreeReservations {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorktreeReservations")
+            .field("identities", &self.identities())
+            .finish()
+    }
+}
+
+impl WorktreeReservations {
+    #[allow(dead_code)]
+    pub(crate) fn identities(&self) -> Vec<&Path> {
+        self.reservations
+            .iter()
+            .map(WorktreeReservation::identity)
+            .collect()
     }
 }
 
@@ -243,6 +276,11 @@ fn reservation_identity(path: &Path) -> Result<PathBuf> {
             )
         }),
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn worktree_reservation_identity(path: &Path) -> Result<PathBuf> {
+    reservation_identity(path)
 }
 
 fn reservation_path(directory: &Path, namespace: ReservationNamespace, identity: &Path) -> PathBuf {
@@ -421,6 +459,19 @@ pub(crate) async fn acquire_shared_repository_reservation_async(
     .context("shared repository gate worker failed")?
 }
 
+#[allow(dead_code)]
+pub(crate) async fn try_acquire_repository_reservation_async(
+    path: &Path,
+) -> Result<RepositoryReservation> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        acquire_repository_reservation_inner(&path, WorktreeReservationMode::Exclusive, true)
+    })
+    .await
+    .context("exclusive repository gate worker failed")?
+}
+
+#[allow(dead_code)]
 /// Attempts an exclusive cleanup reservation without waiting for an active
 /// session/job in another process.  Cleanup must fail closed at this point
 /// instead of waiting indefinitely for an unknown owner.
@@ -438,6 +489,95 @@ pub(crate) async fn try_acquire_worktree_reservation_async(
     })
     .await
     .context("exclusive worktree reservation worker failed")?
+}
+
+#[allow(dead_code)]
+fn reservation_identities(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut identities = paths
+        .iter()
+        .map(|path| reservation_identity(path))
+        .collect::<Result<Vec<_>>>()?;
+    identities.sort();
+    identities.dedup();
+    Ok(identities)
+}
+
+#[allow(dead_code)]
+fn acquire_worktree_reservations_inner(
+    paths: &[PathBuf],
+    mode: WorktreeReservationMode,
+    nonblocking: bool,
+) -> Result<WorktreeReservations> {
+    let identities = reservation_identities(paths)?;
+    let directory = reservation_directory()?;
+    let mut reservations = Vec::with_capacity(identities.len());
+    for identity in identities {
+        let lock_path = reservation_path(&directory, ReservationNamespace::Worktree, &identity);
+        match open_reservation_file(&lock_path).and_then(|file| {
+            #[cfg(unix)]
+            {
+                let lock_type = match mode {
+                    WorktreeReservationMode::Shared => libc::LOCK_SH,
+                    WorktreeReservationMode::Exclusive => libc::LOCK_EX,
+                };
+                let operation = lock_type | if nonblocking { libc::LOCK_NB } else { 0 };
+                let locked = unsafe { libc::flock(file.as_raw_fd(), operation) } == 0;
+                if nonblocking {
+                    anyhow::ensure!(
+                        locked,
+                        "another Temote operation owns this Git worktree reservation: {}",
+                        identity.display()
+                    );
+                } else {
+                    anyhow::ensure!(
+                        locked,
+                        "failed to acquire Git worktree reservation: {}",
+                        identity.display()
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = mode;
+                let _ = nonblocking;
+                anyhow::bail!(
+                    "Git worktree lifecycle reservations require a platform file-lock primitive"
+                );
+            }
+            Ok(WorktreeReservation {
+                file,
+                identity,
+                namespace: ReservationNamespace::Worktree,
+            })
+        }) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(WorktreeReservations { reservations })
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_worktree_reservations(paths: &[PathBuf]) -> Result<WorktreeReservations> {
+    acquire_worktree_reservations_inner(paths, WorktreeReservationMode::Exclusive, false)
+}
+
+#[allow(dead_code)]
+/// Attempts to acquire every exclusive reservation in stable order.  Any
+/// partial acquisition is dropped on error so all previously acquired locks
+/// are released before the failure is returned.
+pub(crate) fn try_acquire_worktree_reservations(paths: &[PathBuf]) -> Result<WorktreeReservations> {
+    acquire_worktree_reservations_inner(paths, WorktreeReservationMode::Exclusive, true)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn try_acquire_worktree_reservations_async(
+    paths: &[PathBuf],
+) -> Result<WorktreeReservations> {
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || try_acquire_worktree_reservations(&paths))
+        .await
+        .context("exclusive worktree reservations worker failed")?
 }
 
 fn path_has_git_metadata(path: &Path) -> Result<bool> {
@@ -756,6 +896,7 @@ pub(crate) async fn acquire_worktree_admission(
     })
 }
 
+#[allow(dead_code)]
 /// Classification for one registered Git worktree of the selected repository.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorktreeClassification {
@@ -765,6 +906,7 @@ pub(crate) enum WorktreeClassification {
 }
 
 impl WorktreeClassification {
+    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Primary => "primary",
@@ -792,6 +934,7 @@ pub(crate) enum SessionWorkspaceType {
 }
 
 impl SessionWorkspaceType {
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CanonicalCheckout => "canonical_checkout",
@@ -958,10 +1101,12 @@ impl ManagedRepository {
         &self.managed_root
     }
 
+    #[allow(dead_code)]
     fn namespace_parent(&self) -> PathBuf {
         self.src_root.join(MANAGED_WORKTREE_ROOT_NAME)
     }
 
+    #[allow(dead_code)]
     /// Cross-checks an optional caller-supplied repository name against the
     /// canonical identity. The input never contributes path components.
     pub(crate) fn ensure_requested_repository(&self, requested: &str) -> Result<()> {
@@ -973,6 +1118,7 @@ impl ManagedRepository {
         Ok(self.managed_root.join(task))
     }
 
+    #[allow(dead_code)]
     /// Read-only pre-approval inspection. Verifies repository authority, the
     /// target shape, the existing managed namespace and target collisions
     /// without creating, moving or deleting anything.
@@ -984,6 +1130,7 @@ impl ManagedRepository {
         self.ensure_target_absent(target)
     }
 
+    #[allow(dead_code)]
     /// Mutating preparation performed only after approval. Creates the managed
     /// namespace and re-verifies repository authority and target collision so a
     /// pre-approval inspection result is never trusted across the approval
@@ -996,11 +1143,13 @@ impl ManagedRepository {
         self.ensure_target_absent(target)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn ensure_authority(&self) -> Result<()> {
         ensure_normal_directory(&self.src_root, "configured src root")?;
         ensure_normal_directory(&self.primary_checkout, "canonical repository checkout")
     }
 
+    #[allow(dead_code)]
     fn ensure_target_shape(&self, target: &Path) -> Result<()> {
         anyhow::ensure!(
             target.parent() == Some(self.managed_root.as_path())
@@ -1013,6 +1162,7 @@ impl ManagedRepository {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn ensure_target_absent(&self, target: &Path) -> Result<()> {
         match std::fs::symlink_metadata(target) {
             Ok(_) => anyhow::bail!(
@@ -1097,6 +1247,7 @@ pub(crate) fn validate_task_name(task: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 /// Derives a deterministic task directory from a validated branch name. A
 /// branch `/` never becomes directory hierarchy; it is flattened to `-`.
 pub(crate) fn derive_task_name(branch: &str) -> Result<String> {
@@ -1124,64 +1275,7 @@ pub(crate) fn trusted_canonical_managed_root(repository: &ManagedRepository) -> 
     (canonical == repository.managed_root()).then_some(canonical)
 }
 
-/// Verifies that an existing target may be reused as the selected repository's
-/// managed worktree for `branch`.
-///
-/// Reuse never adopts legacy or unrelated state: the target must be a normal
-/// canonical directory at the exact direct-child path below the trusted managed
-/// root, and its canonical common Git directory, primary checkout and current
-/// branch must equal the selected repository identity. Anything else fails
-/// closed, so `<repository>/.wt/<name>`, `<src>/<repo>-*`, `/tmp` worktrees and
-/// wrong-repository collisions are never adopted.
-pub(crate) fn verify_reusable_managed_worktree(
-    repository: &ManagedRepository,
-    target: &Path,
-    branch: &str,
-    selected_common_dir: &Path,
-    selected_primary_checkout: &Path,
-) -> Result<()> {
-    anyhow::ensure!(
-        trusted_canonical_managed_root(repository).as_deref() == Some(repository.managed_root()),
-        "managed worktree root is not a trusted normal directory: {}",
-        repository.managed_root().display()
-    );
-    let metadata = std::fs::symlink_metadata(target)
-        .with_context(|| format!("cannot inspect managed worktree {}", target.display()))?;
-    anyhow::ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "existing managed worktree target is not a normal directory: {}",
-        target.display()
-    );
-    let canonical_target = std::fs::canonicalize(target)
-        .with_context(|| format!("cannot resolve managed worktree {}", target.display()))?;
-    anyhow::ensure!(
-        canonical_target == target,
-        "existing managed worktree target must be canonical and not a swapped path: {}",
-        target.display()
-    );
-    anyhow::ensure!(
-        target.parent() == Some(repository.managed_root()),
-        "existing managed worktree target must be a direct child of {}",
-        repository.managed_root().display()
-    );
-    anyhow::ensure!(
-        crate::sandbox::git_common_dir(&canonical_target)? == selected_common_dir,
-        "existing worktree does not belong to the selected repository (common Git directory mismatch): {}",
-        target.display()
-    );
-    anyhow::ensure!(
-        crate::sandbox::git_primary_checkout(&canonical_target)? == selected_primary_checkout,
-        "existing worktree primary checkout mismatch: {}",
-        target.display()
-    );
-    anyhow::ensure!(
-        crate::sandbox::git_current_branch(&canonical_target)?.as_deref() == Some(branch),
-        "existing managed worktree is not attached to the requested branch {branch:?}: {}",
-        target.display()
-    );
-    Ok(())
-}
-
+#[allow(dead_code)]
 /// Facts observed after the Git worktree mutation. Plain values keep the
 /// verification predicate testable without a repository fixture.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1194,6 +1288,7 @@ pub(crate) struct CreatedTargetObservation {
     pub(crate) observed_primary_checkout: Option<PathBuf>,
 }
 
+#[allow(dead_code)]
 /// Post-create verification. Git success alone is never enough: the created
 /// target must resolve as a direct child of the exact trusted managed root with
 /// the expected task component, and it must belong to the selected repository
@@ -1252,6 +1347,7 @@ pub(crate) fn verify_created_managed_target(
     Ok(())
 }
 
+#[allow(dead_code)]
 /// Identity facts for one registered worktree used by list classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegisteredWorktreeIdentity<'a> {
@@ -1260,6 +1356,7 @@ pub(crate) struct RegisteredWorktreeIdentity<'a> {
     pub(crate) primary_checkout: Option<&'a Path>,
 }
 
+#[allow(dead_code)]
 /// Classifies one registered worktree using direct-child containment of the
 /// canonical managed root plus the canonical common Git directory and primary
 /// checkout as repository identity. The managed root itself and nested
@@ -1294,6 +1391,7 @@ pub(crate) fn classify_registered_worktree(
     WorktreeClassification::Managed
 }
 
+#[allow(dead_code)]
 /// One entry of `git worktree list --porcelain`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegisteredWorktree {
@@ -1305,6 +1403,7 @@ pub(crate) struct RegisteredWorktree {
     pub(crate) prunable: bool,
 }
 
+#[allow(dead_code)]
 pub(crate) fn parse_worktree_list(porcelain: &str) -> Result<Vec<RegisteredWorktree>> {
     let mut entries = Vec::new();
     let mut current: Option<RegisteredWorktree> = None;
@@ -1363,6 +1462,7 @@ pub(crate) fn parse_worktree_list(porcelain: &str) -> Result<Vec<RegisteredWorkt
     Ok(entries)
 }
 
+#[allow(dead_code)]
 fn inspect_existing_normal_directory(path: &Path, label: &str) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => ensure_normal_directory_metadata(path, label, &metadata),
@@ -1373,12 +1473,14 @@ fn inspect_existing_normal_directory(path: &Path, label: &str) -> Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn ensure_normal_directory(path: &Path, label: &str) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
     ensure_normal_directory_metadata(path, label, &metadata)
 }
 
+#[allow(dead_code)]
 fn ensure_normal_directory_metadata(
     path: &Path,
     label: &str,
@@ -1399,6 +1501,7 @@ fn ensure_normal_directory_metadata(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn create_normal_directory(path: &Path, label: &str) -> Result<()> {
     match std::fs::create_dir(path) {
         Ok(()) => {}
@@ -1421,6 +1524,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn worktree_reservation_is_exclusive_and_releases_on_drop() {
+        let fixture = tempfile::tempdir().unwrap();
+        let target = fixture.path().join("repo").join("worktree");
+        std::fs::create_dir_all(&target).unwrap();
+        let target = std::fs::canonicalize(target).unwrap();
+
+        let held = acquire_worktree_reservation(&target).unwrap();
+        assert_eq!(held.identity(), target);
+        assert!(try_acquire_worktree_reservation(&target).is_err());
+
+        // Per-worktree reservations do not serialize unrelated repositories.
+        let unrelated = fixture.path().join("other");
+        std::fs::create_dir(&unrelated).unwrap();
+        let unrelated_guard = try_acquire_worktree_reservation(&unrelated).unwrap();
+        drop(unrelated_guard);
+
+        drop(held);
+        let released = try_acquire_worktree_reservation(&target).unwrap();
+        drop(released);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_prune_entries_use_the_same_reservation_identity() {
         let fixture = tempfile::tempdir().unwrap();
         let stale = fixture.path().join("repo").join("removed-worktree");
@@ -1431,6 +1557,54 @@ mod tests {
         drop(held);
         let released = try_acquire_worktree_reservation(&stale).unwrap();
         drop(released);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_worktree_reservation_is_sorted_and_deduplicated() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("repo").join("first");
+        let second = fixture.path().join("repo").join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let reservations =
+            acquire_worktree_reservations(&[second.clone(), first.clone(), second.clone()])
+                .unwrap();
+        let identities = reservations
+            .identities()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                std::fs::canonicalize(&first).unwrap(),
+                std::fs::canonicalize(&second).unwrap(),
+            ]
+        );
+        drop(reservations);
+        assert!(try_acquire_worktree_reservation(&first).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_multi_reservation_releases_partial_acquisition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("repo").join("first");
+        let second = fixture.path().join("repo").join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let shared_second = acquire_shared_worktree_reservation(&second).unwrap();
+        assert!(
+            try_acquire_worktree_reservations(&[first.clone(), second.clone()]).is_err(),
+            "exclusive multi-reservation must fail on an active shared member"
+        );
+        drop(shared_second);
+
+        let first_cleanup = try_acquire_worktree_reservation(&first).unwrap();
+        drop(first_cleanup);
     }
 
     #[cfg(unix)]
@@ -1566,6 +1740,84 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn repository_exclusive_gate_blocks_admission_even_without_prunable_targets() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        let repository = std::fs::canonicalize(repository).unwrap();
+
+        let gate = try_acquire_repository_reservation_async(&repository)
+            .await
+            .unwrap();
+        let mut admission = Box::pin(acquire_worktree_admission(&repository, None));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut admission)
+                .await
+                .is_err(),
+            "a prune repository gate must block admission even when no target lock exists"
+        );
+
+        drop(gate);
+        let admission = tokio::time::timeout(std::time::Duration::from_secs(2), &mut admission)
+            .await
+            .expect("admission must complete after repository gate release")
+            .unwrap();
+        drop(admission);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn repository_gate_shared_remove_conflicts_with_exclusive_prune() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        let repository = std::fs::canonicalize(repository).unwrap();
+
+        let remove_gate = acquire_shared_repository_reservation_async(&repository)
+            .await
+            .unwrap();
+        assert!(
+            try_acquire_repository_reservation_async(&repository)
+                .await
+                .is_err(),
+            "prune must fail closed while remove holds the shared repository gate"
+        );
+        drop(remove_gate);
+
+        let prune_gate = try_acquire_repository_reservation_async(&repository)
+            .await
+            .unwrap();
+        drop(prune_gate);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn released_admission_repository_gate_allows_prune_with_active_target_owner() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        run_git_fixture(&repository, &["init", "--quiet"]);
+        let repository = std::fs::canonicalize(repository).unwrap();
+
+        let admission = acquire_worktree_admission(&repository, None).await.unwrap();
+        let WorktreeAdmission {
+            repository_reservation,
+            reservation,
+            ..
+        } = admission;
+        drop(repository_reservation);
+
+        let prune_gate = try_acquire_repository_reservation_async(&repository)
+            .await
+            .expect("active target ownership must not retain the short repository gate");
+        drop(prune_gate);
+        drop(reservation);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn shared_remove_repository_gate_allows_unrelated_same_repo_admission() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = fixture.path().join("repo");
@@ -1692,6 +1944,50 @@ mod tests {
                 .is_err(),
             "admission must fail closed after the managed target is removed"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn prune_reservations_block_each_member_admission_until_release() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = fixture.path().join("first-repo");
+        let second = fixture.path().join("second-repo");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        run_git_fixture(&first, &["init", "--quiet"]);
+        run_git_fixture(&second, &["init", "--quiet"]);
+        let first = std::fs::canonicalize(first).unwrap();
+        let second = std::fs::canonicalize(second).unwrap();
+
+        // This models the stable, deduplicated lock set acquired for one
+        // bounded prune observation.
+        let reservations =
+            acquire_worktree_reservations(&[second.clone(), first.clone(), second.clone()])
+                .unwrap();
+        let mut first_admission = Box::pin(acquire_worktree_admission(&first, None));
+        let mut second_admission = Box::pin(acquire_worktree_admission(&second, None));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut first_admission)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut second_admission)
+                .await
+                .is_err()
+        );
+
+        drop(reservations);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), &mut first_admission)
+            .await
+            .expect("first admission must complete after prune release")
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), &mut second_admission)
+            .await
+            .expect("second admission must complete after prune release")
+            .unwrap();
+        drop(first);
+        drop(second);
     }
 
     #[cfg(unix)]
@@ -2283,115 +2579,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reusable_managed_worktree_requires_identity_and_branch() {
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let repository = fake_repository(&src_root.join("repo"));
-        let managed_root = src_root.join("worktrees").join("repo");
-        let managed = managed_root.join("task");
-        let legacy_inside = repository.join(".wt").join("legacy");
-        fake_linked_worktree(&repository, "task", &managed, "feature/x");
-        fake_linked_worktree(&repository, "wt-legacy", &legacy_inside, "feature/x");
-        let other = fake_repository(&src_root.join("other"));
-
-        let managed_repository = ManagedRepository::resolve(&repository, &src_root).unwrap();
-        let common = crate::sandbox::git_common_dir(&repository).unwrap();
-        let primary = crate::sandbox::git_primary_checkout(&repository).unwrap();
-
-        verify_reusable_managed_worktree(
-            &managed_repository,
-            &managed,
-            "feature/x",
-            &common,
-            &primary,
-        )
-        .unwrap();
-
-        // Wrong branch, wrong repository identity and a legacy location fail
-        // closed.
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &managed,
-                "feature/other",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &managed,
-                "feature/x",
-                &crate::sandbox::git_common_dir(&other).unwrap(),
-                &primary,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &repository.join(".wt").join("legacy"),
-                "feature/x",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        #[cfg(unix)]
-        {
-            let symlinked = managed_root.join("symlinked");
-            std::os::unix::fs::symlink(&managed, &symlinked).unwrap();
-            assert!(
-                verify_reusable_managed_worktree(
-                    &managed_repository,
-                    &symlinked,
-                    "feature/x",
-                    &common,
-                    &primary,
-                )
-                .is_err()
-            );
-        }
-        // A nested descendant is never a direct child of the managed root.
-        let nested = managed.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &nested,
-                "feature/x",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        // A missing target inside the fixture and a mismatched primary
-        // checkout are not the selected repository's managed identity.
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &src_root.join("missing-target"),
-                "feature/x",
-                &common,
-                &primary,
-            )
-            .is_err()
-        );
-        assert!(
-            verify_reusable_managed_worktree(
-                &managed_repository,
-                &managed,
-                "feature/x",
-                &common,
-                Path::new("/home/user/src/other"),
-            )
-            .is_err()
-        );
-    }
-
     fn run_git_fixture(cwd: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -2399,90 +2586,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
-    }
-
-    #[test]
-    fn reusable_managed_worktree_rejects_a_valid_worktree_outside_the_managed_root() {
-        let fixture = tempfile::tempdir().unwrap();
-        let src_root = std::fs::canonicalize(fixture.path()).unwrap();
-        let repository = src_root.join("repo");
-        std::fs::create_dir(&repository).unwrap();
-        run_git_fixture(&repository, &["init", "--quiet"]);
-        run_git_fixture(&repository, &["config", "user.name", "Temote Test"]);
-        run_git_fixture(
-            &repository,
-            &["config", "user.email", "temote-test@example.invalid"],
-        );
-        std::fs::write(repository.join("tracked.txt"), "base\n").unwrap();
-        run_git_fixture(&repository, &["add", "tracked.txt"]);
-        run_git_fixture(&repository, &["commit", "--quiet", "-m", "initial"]);
-        run_git_fixture(&repository, &["branch", "-M", "main"]);
-        run_git_fixture(&repository, &["branch", "outside-branch"]);
-
-        // A real, structurally valid linked worktree of the selected
-        // repository on the requested branch, but outside the trusted managed
-        // root.
-        let outside = src_root.join("elsewhere").join("task");
-        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
-        run_git_fixture(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                outside.to_str().unwrap(),
-                "outside-branch",
-            ],
-        );
-
-        let repository = std::fs::canonicalize(&repository).unwrap();
-        let outside = std::fs::canonicalize(&outside).unwrap();
-        let managed_root = src_root.join("worktrees").join("repo");
-        std::fs::create_dir_all(&managed_root).unwrap();
-        let managed_repository = ManagedRepository::resolve(&repository, &src_root).unwrap();
-        let common = crate::sandbox::git_common_dir(&repository).unwrap();
-        let primary = crate::sandbox::git_primary_checkout(&repository).unwrap();
-
-        // Preconditions: same repository identity, requested branch, normal
-        // canonical directory and a trusted managed root that does not contain
-        // the target.
-        assert_eq!(crate::sandbox::git_common_dir(&outside).unwrap(), common);
-        assert_eq!(
-            crate::sandbox::git_primary_checkout(&outside).unwrap(),
-            repository
-        );
-        assert_eq!(
-            crate::sandbox::git_current_branch(&outside)
-                .unwrap()
-                .as_deref(),
-            Some("outside-branch")
-        );
-        let metadata = std::fs::symlink_metadata(&outside).unwrap();
-        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
-        assert_eq!(std::fs::canonicalize(&outside).unwrap(), outside);
-        assert_eq!(
-            trusted_canonical_managed_root(&managed_repository),
-            Some(managed_root.clone())
-        );
-        assert!(outside.parent() != Some(managed_root.as_path()));
-
-        // The rejection reason is the managed-root / exact direct-child rule,
-        // not a missing target or broken Git metadata.
-        let error = verify_reusable_managed_worktree(
-            &managed_repository,
-            &outside,
-            "outside-branch",
-            &common,
-            &primary,
-        )
-        .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("direct child"), "{message}");
-        assert!(!message.contains("cannot inspect"), "{message}");
-        assert!(
-            !message.contains("outside the working directory"),
-            "{message}"
-        );
     }
 
     #[test]

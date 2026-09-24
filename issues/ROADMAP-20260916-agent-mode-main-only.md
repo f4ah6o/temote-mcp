@@ -39,7 +39,7 @@ Current `main` already contains the source-side fix (`81356a2` allow libuv local
 
 - rebuild/install/deploy the current Temote runtime using the supported release/deployment path;
 - reconnect/restart the managed Temote session using that runtime;
-- confirm the connected tool schema includes the current `local_agent_run` contract;
+- confirm the connected tool schema includes the current `local_agent_run` contract (obsolete — `local_agent_run` removed 2026-09-24);
 - run read-only OpenCode canary with `opencode-go/deepseek-v4.1-flash`;
 - run workspace-write canary that creates/removes one temporary workspace file only;
 - record the canary in `issues/doing/20260916-local-agent-opencode-eperm.md` and the live matrix.
@@ -129,8 +129,8 @@ Before running the matrix, finish these existing `doing` trackers without reimpl
 
 At minimum re-run:
 
-- OpenCode local agent on rebuilt runtime;
-- Codex/Vite+ local agent on supported Linux/macOS environments;
+- ~~OpenCode local agent on rebuilt runtime~~ (obsolete — `local_agent_run` removed 2026-09-24);
+- ~~Codex/Vite+ local agent on supported Linux/macOS environments~~ (obsolete — `local_agent_run` removed 2026-09-24);
 - connected public tool-schema parity;
 - package-manager structured network operations;
 - repo-scoped GitHub workflow/tag operations without changing global `gh` active account;

@@ -65,8 +65,8 @@ The source issues are archived under `issues/done/` after this consolidation.
 ### Developer broker / installed runtime
 
 - [ ] On a host with Vite+ `vp` installed, a rebuilt Temote normal (`yolo=false`) session completes representative `dev_tool_run` `vp check`, `vp test`, and `vp build` operations without whole-session yolo or broad HOME exposure; record the installed version, operation class, and non-secret result.
-- [ ] On a macOS host with a Vite+-managed Codex installation, a rebuilt Temote `local_agent_run(agent=codex)` completes after authorization with the verified bounded launcher dependency closure; record only non-secret launcher/runtime evidence and the result.
-- [ ] On a Linux host or outer-sandbox backend that supports nested user namespaces while retaining the Codex named-profile auth deny, a rebuilt Temote `local_agent_run(agent=codex)` completes a representative read-only canary and one bounded workspace write. 2026-09-15 salvaged evidence: on `ms-01-alpha` (`kernel.apparmor_restrict_unprivileged_userns=1` + `bwrap-userns-restrict`) the nested unified-exec returned `Operation not permitted` even for `pwd`, while the same installed Codex and named profile worked outside the outer sandbox — see `docs/evaluations/completion-20260915-salvaged-evidence.md`.
+- [ ] ~~On a macOS host with a Vite+-managed Codex installation, a rebuilt Temote `local_agent_run(agent=codex)` completes after authorization with the verified bounded launcher dependency closure~~ (obsolete — `local_agent_run` removed 2026-09-24).
+- [ ] ~~On a Linux host or outer-sandbox backend that supports nested user namespaces while retaining the Codex named-profile auth deny, a rebuilt Temote `local_agent_run(agent=codex)` completes a representative read-only canary and one bounded workspace write~~ (obsolete — `local_agent_run` removed 2026-09-24). 2026-09-15 salvaged evidence: on `ms-01-alpha` (`kernel.apparmor_restrict_unprivileged_userns=1` + `bwrap-userns-restrict`) the nested unified-exec returned `Operation not permitted` even for `pwd`, while the same installed Codex and named profile worked outside the outer sandbox — see `docs/evaluations/completion-20260915-salvaged-evidence.md`.
 
 ### Agent-mode development network
 
@@ -74,7 +74,7 @@ The source issues are archived under `issues/done/` after this consolidation.
 
 ### Agent-mode Git shim
 
-- [ ] On a rebuilt runtime, an installed Codex/OpenCode `local_agent_run` invokes ordinary `git switch` / `git switch -c` through the private shim and completes the branch change while direct `.git` writes remain denied (from `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`).
+- [ ] ~~On a rebuilt runtime, an installed Codex/OpenCode `local_agent_run` invokes ordinary `git switch` / `git switch -c` through the private shim~~ (obsolete — `local_agent_run` and the private Git shim removed 2026-09-24) (from `issues/open/20260916-agent-mode-git-broker-gh-git-integration.md`).
 
 ### Repository-completion live residuals (agent-mode consolidation)
 
@@ -84,8 +84,8 @@ Live evidence left open by issues closed at the 2026-09-22 consolidation; each r
 - [ ] Codex delegation Phase-4 dogfood and Phase-D three-arm adoption evaluation on the current rebuilt runtime: T07-C, T08-C, T08-A, T09, T10 arms still unattempted; resume from the frozen manifest `docs/evaluations/completion-evaluation-manifest-20260915.md` (from `issues/done/20260908-08-codex-delegation-dogfood-and-app-server.md`).
 - [ ] Local activity viewer S16 live gates: real supervisor activity stream with retention/disconnect evidence on a live host (from `issues/done/20260914-local-activity-viewer.md`).
 - [ ] GitHub PR broker installed-runtime read-only canary plus live fixture close on a disposable repo (from `issues/done/20260916-github-pr-broker.md`).
-- [ ] OpenCode `local_agent_run` read-only and bounded `workspace_write` canary against a rebuilt runtime (EPERM classification verified live) (from `issues/done/20260916-local-agent-opencode-eperm.md`).
-- [ ] Codex `local_agent_run(model=..., effort="max")` live canary on a rebuilt runtime (from `issues/done/20260916-local-agent-reasoning-effort.md`).
+- [ ] ~~OpenCode `local_agent_run` read-only and bounded `workspace_write` canary against a rebuilt runtime~~ (obsolete — `local_agent_run` removed 2026-09-24) (from `issues/done/20260916-local-agent-opencode-eperm.md`).
+- [ ] ~~Codex `local_agent_run(model=..., effort="max")` live canary on a rebuilt runtime~~ (obsolete — `local_agent_run` removed 2026-09-24) (from `issues/done/20260916-local-agent-reasoning-effort.md`).
 - [ ] Package-manager broker live acceptance: `uv`, `npm`, `pnpm`, `go` supported dependency operations from a normal `agent` session (from `issues/done/20260916-package-manager-broker-coverage-and-state.md`).
 - [ ] Repo-scoped GitHub account selection live acceptance: multiple GitHub accounts on one host, repo-mapped credential wins without touching global `gh auth` active account (from `issues/done/20260916-repo-scoped-github-account-selection.md`).
 - [ ] OpenCode `run`/`resume` CLI rebuilt-runtime canary including `delegate --backend opencode --session` resume preflight on real session state (from `issues/done/20260922-opencode-run-cli-compatibility.md`).
