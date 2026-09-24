@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- Upgrading from an older, protocol-compatible supervisor now checks the installed Linux sandbox helper locally when that supervisor does not report its helper generation, so a compatible bundle is not incorrectly blocked as `unavailable`. ([legacy upgrade helper preflight](issues/open/20260924-upgrade-legacy-helper-preflight.md))
 - Linked-worktree Git broker mutations now succeed in the default `agent` mode: the broker pins the selected worktree's validated repository identity and the sandbox authorizes only that repository's own Git metadata, while swapped or symlinked metadata still fails closed. Missing protected metadata masks (for example `packed-refs`) also stay readable inside the Linux sandbox instead of failing with `EACCES`. ([linked worktree broker metadata scope](issues/done/20260917-linked-worktree-broker-metadata-scope.md))
 - `session_list` no longer fails when a supervisor-owned session's working directory is gone, and `session_info` reports the same bounded `degraded` view while leaving the stale metadata untouched. ([session list missing cwd](issues/done/20260917-session-list-supervisor-owned-missing-cwd.md))
 - Codex task cleanup and recovery now preserve accepted operations through process and session transitions without replaying uncertain side effects.

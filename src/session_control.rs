@@ -2423,11 +2423,7 @@ async fn upgrade_preflight_with_force(
         expected_sessions: None,
     })
     .await?;
-    let helper_generation = preview_value
-        .get("helper_generation")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<HelperGeneration>(value).ok())
-        .unwrap_or(HelperGeneration::Unavailable);
+    let helper_generation = preview_helper_generation(&preview_value, &executable.path);
     let preview: crate::supervisor::SupervisorUpgradePreview =
         serde_json::from_value(preview_value).context("invalid supervisor upgrade preview")?;
     #[cfg(all(feature = "network", unix))]
@@ -2475,6 +2471,19 @@ async fn upgrade_preflight_with_force(
         direct_ingress: Some(ingress.plan().clone()),
         planned_sessions,
     })
+}
+
+fn preview_helper_generation(preview: &Value, installed_locator: &Path) -> HelperGeneration {
+    // Older, protocol-compatible supervisors do not report this field. Inspect
+    // the installed bundle locally in that case, using the same bounded helper
+    // checks as a newer supervisor. An explicit unavailable/invalid report
+    // must still fail closed rather than being overridden by the local check.
+    match preview.get("helper_generation") {
+        None => classify_helper_generation(installed_locator),
+        Some(value) => {
+            serde_json::from_value(value.clone()).unwrap_or(HelperGeneration::Unavailable)
+        }
+    }
 }
 
 pub(crate) async fn verify_planned_upgrade_sessions(
@@ -5895,6 +5904,36 @@ mod tests {
         let unparseable = write_bundle(Some("not-json".to_owned()));
         assert_eq!(
             classify_helper_generation(&unparseable.path().join("temote-mcp")),
+            HelperGeneration::Unavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_upgrade_preview_checks_installed_helper_locally() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("temote-mcp");
+        let helper = temp.path().join("temote-linux-sandbox");
+        std::fs::write(&helper, b"#!/bin/sh\necho '{\"policy_schema\":1}'\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            preview_helper_generation(&json!({}), &executable),
+            HelperGeneration::Compatible
+        );
+        assert_eq!(
+            preview_helper_generation(&json!({"helper_generation": "unavailable"}), &executable),
+            HelperGeneration::Unavailable
+        );
+        assert_eq!(
+            preview_helper_generation(&json!({"helper_generation": "unexpected"}), &executable),
+            HelperGeneration::Unavailable
+        );
+        std::fs::remove_file(helper).unwrap();
+        assert_eq!(
+            preview_helper_generation(&json!({}), &executable),
             HelperGeneration::Unavailable
         );
     }
