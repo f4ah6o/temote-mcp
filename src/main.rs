@@ -34,6 +34,7 @@ mod named_roots;
 mod openai_tunnel;
 #[cfg(feature = "network")]
 mod opencode_server;
+mod orchestration;
 mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
