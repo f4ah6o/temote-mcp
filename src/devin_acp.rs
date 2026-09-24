@@ -1872,7 +1872,7 @@ async fn run_actor(
                     ClientCommand::Request { method, params, reply } => {
                         let id = next_id;
                         next_id = next_id.saturating_add(1);
-                        let message = json!({"id": id, "method": method, "params": params});
+                        let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
                         if let Err(error) = write_json_line(&mut stdin, &message).await {
                             let _ = reply.send(Err(format!("Devin ACP write failed: {error:#}")));
                             break format!("Devin ACP write failed: {error:#}");
@@ -1883,6 +1883,7 @@ async fn run_actor(
                         let id = next_id;
                         next_id = next_id.saturating_add(1);
                         let message = json!({
+                            "jsonrpc": "2.0",
                             "id": id,
                             "method": "session/prompt",
                             "params": {
@@ -1903,7 +1904,7 @@ async fn run_actor(
                         }
                     }
                     ClientCommand::Notify { method, params } => {
-                        let message = json!({"method": method, "params": params});
+                        let message = json!({"jsonrpc": "2.0", "method": method, "params": params});
                         if let Err(error) = write_json_line(&mut stdin, &message).await {
                             break format!("Devin ACP notification write failed: {error:#}");
                         }
@@ -1914,8 +1915,8 @@ async fn run_actor(
             response = server_rx.recv() => {
                 if let Some(response) = response {
                     let message = match response.payload {
-                        Ok(result) => json!({"id": response.id, "result": result}),
-                        Err((code, message)) => json!({"id": response.id, "error": {"code": code, "message": message}}),
+                        Ok(result) => json!({"jsonrpc": "2.0", "id": response.id, "result": result}),
+                        Err((code, message)) => json!({"jsonrpc": "2.0", "id": response.id, "error": {"code": code, "message": message}}),
                     };
                     if let Err(error) = write_json_line(&mut stdin, &message).await {
                         break format!("Devin ACP server-response write failed: {error:#}");
@@ -1958,6 +1959,21 @@ async fn run_actor(
                                 let _ = reply.send(Ok(result.clone()));
                             } else {
                                 let _ = reply.send(Err("Devin ACP response has neither result nor error".to_owned()));
+                            }
+                        } else if let Some(error) = value.get("error") {
+                            // Error response we cannot attribute (e.g. an
+                            // id:null parse error). Fail the only pending
+                            // request when unambiguous; otherwise surface it
+                            // instead of silently dropping it into a timeout.
+                            if pending.len() == 1 {
+                                if let Some((_, reply)) = pending.drain().next() {
+                                    let _ = reply.send(Err(format!("Devin ACP RPC error: {error}")));
+                                }
+                            } else {
+                                state.lock().unwrap().last_prompt_error = Some(bound_text(
+                                    &format!("Devin ACP server error: {error}"),
+                                    MAX_ERROR_BYTES,
+                                ));
                             }
                         }
                     }
