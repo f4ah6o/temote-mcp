@@ -10,7 +10,7 @@ Temote MCP supports three production connection profiles. Cloudflare and Tailsca
 | `tailscale` | Tailscale Funnel public HTTPS | Temote local OAuth |
 | `openai` | OpenAI Secure MCP Tunnel | OpenAI tunnel connection + Temote local sandbox/approval |
 
-Omitting `--profile` keeps the existing `cloudflare` behavior for compatibility. All three profiles terminate at the same provider-neutral MCP core. Remote access never exposes `without_sandbox`; managed sessions keep the same named-root, sandbox, and tool-specific rules regardless of profile. New public sessions default to the sandboxed `agent` permission mode, so validated structured operations do not need a local approval console; the stricter `ask` mode remains available through a local `session permission` transition.
+Omitting `--profile` keeps the existing `cloudflare` behavior for compatibility. All three profiles terminate at the same provider-neutral MCP core. Remote access exposes only the session-bound delegation and discovery tools; managed sessions keep the same named-root, sandbox, and tool-specific rules regardless of profile. New public sessions default to the sandboxed `agent` permission mode, so validated structured operations do not need a local approval console; the stricter `ask` mode remains available through a local `session permission` transition.
 
 ## Cloudflare profile
 
@@ -193,7 +193,7 @@ For the Tailscale profile, an unauthenticated `/mcp` request returns `401` with 
 
 With `TEMOTE_MCP_ROOTS` configured, authenticated HTTP clients can use `session_start`, `session_stop`, and `session_restart`. `session_start` accepts only logical named-root-relative paths and has no yolo option. Absolute paths, unknown roots, traversal, symlink escape, and roots-unset fallback are rejected. `session_stop` and `session_restart` are limited to sessions marked HTTP-owned by the lifecycle supervisor. Public session-bound tools reject separately started yolo sessions instead of inheriting their unrestricted local semantics. New public sessions default to `agent`.
 
-Remote profiles do not expose `without_sandbox`. Normal sessions keep filesystem containment; ordinary commands stay network-disabled in `ask` and use the network-enabled development profile in the default `agent` mode. The default `agent` mode skips only the Temote-local approval prompt for validated structured operations; tool-specific validation, integration authentication, and the sandbox boundary remain authoritative. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.
+Remote profiles expose only session-bound delegation and discovery tools — there are no direct command, file, Git, or integration tools. Normal sessions keep filesystem containment; delegated child work runs under the session sandbox profile selected by `ask` (network-disabled) or the default `agent` (network-enabled development profile). The default `agent` mode skips only the Temote-local approval prompt for validated structured operations; tool-specific validation, integration authentication, and the sandbox boundary remain authoritative. Public HTTP authentication is therefore an identity boundary, not a replacement for Temote's session/sandbox/approval boundaries.
 
 ## Remote upgrade and reconnect
 

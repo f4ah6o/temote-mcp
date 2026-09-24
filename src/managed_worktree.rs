@@ -21,6 +21,7 @@ const WORKTREE_RESERVATION_DIRECTORY_NAME: &str = "worktree-reservations";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorktreeReservationMode {
     Shared,
+    #[allow(dead_code)]
     Exclusive,
 }
 
@@ -53,6 +54,7 @@ impl std::fmt::Debug for WorktreeReservation {
 }
 
 impl WorktreeReservation {
+    #[allow(dead_code)]
     pub(crate) fn identity(&self) -> &Path {
         &self.identity
     }
@@ -85,6 +87,7 @@ impl std::fmt::Debug for RepositoryReservation {
     }
 }
 
+#[allow(dead_code)]
 /// A sorted set of per-worktree reservations.  Keeping all guards in one RAII
 /// value makes it difficult for a caller to accidentally release one lock
 /// before its mutation and post-verification have completed.
@@ -102,6 +105,7 @@ impl std::fmt::Debug for WorktreeReservations {
 }
 
 impl WorktreeReservations {
+    #[allow(dead_code)]
     pub(crate) fn identities(&self) -> Vec<&Path> {
         self.reservations
             .iter()
@@ -274,6 +278,7 @@ fn reservation_identity(path: &Path) -> Result<PathBuf> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn worktree_reservation_identity(path: &Path) -> Result<PathBuf> {
     reservation_identity(path)
 }
@@ -454,6 +459,7 @@ pub(crate) async fn acquire_shared_repository_reservation_async(
     .context("shared repository gate worker failed")?
 }
 
+#[allow(dead_code)]
 pub(crate) async fn try_acquire_repository_reservation_async(
     path: &Path,
 ) -> Result<RepositoryReservation> {
@@ -465,6 +471,7 @@ pub(crate) async fn try_acquire_repository_reservation_async(
     .context("exclusive repository gate worker failed")?
 }
 
+#[allow(dead_code)]
 /// Attempts an exclusive cleanup reservation without waiting for an active
 /// session/job in another process.  Cleanup must fail closed at this point
 /// instead of waiting indefinitely for an unknown owner.
@@ -484,6 +491,7 @@ pub(crate) async fn try_acquire_worktree_reservation_async(
     .context("exclusive worktree reservation worker failed")?
 }
 
+#[allow(dead_code)]
 fn reservation_identities(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut identities = paths
         .iter()
@@ -494,6 +502,7 @@ fn reservation_identities(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(identities)
 }
 
+#[allow(dead_code)]
 fn acquire_worktree_reservations_inner(
     paths: &[PathBuf],
     mode: WorktreeReservationMode,
@@ -553,6 +562,7 @@ pub(crate) fn acquire_worktree_reservations(paths: &[PathBuf]) -> Result<Worktre
     acquire_worktree_reservations_inner(paths, WorktreeReservationMode::Exclusive, false)
 }
 
+#[allow(dead_code)]
 /// Attempts to acquire every exclusive reservation in stable order.  Any
 /// partial acquisition is dropped on error so all previously acquired locks
 /// are released before the failure is returned.
@@ -560,6 +570,7 @@ pub(crate) fn try_acquire_worktree_reservations(paths: &[PathBuf]) -> Result<Wor
     acquire_worktree_reservations_inner(paths, WorktreeReservationMode::Exclusive, true)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn try_acquire_worktree_reservations_async(
     paths: &[PathBuf],
 ) -> Result<WorktreeReservations> {
@@ -885,6 +896,7 @@ pub(crate) async fn acquire_worktree_admission(
     })
 }
 
+#[allow(dead_code)]
 /// Classification for one registered Git worktree of the selected repository.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorktreeClassification {
@@ -894,6 +906,7 @@ pub(crate) enum WorktreeClassification {
 }
 
 impl WorktreeClassification {
+    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Primary => "primary",
@@ -1088,10 +1101,12 @@ impl ManagedRepository {
         &self.managed_root
     }
 
+    #[allow(dead_code)]
     fn namespace_parent(&self) -> PathBuf {
         self.src_root.join(MANAGED_WORKTREE_ROOT_NAME)
     }
 
+    #[allow(dead_code)]
     /// Cross-checks an optional caller-supplied repository name against the
     /// canonical identity. The input never contributes path components.
     pub(crate) fn ensure_requested_repository(&self, requested: &str) -> Result<()> {
@@ -1103,6 +1118,7 @@ impl ManagedRepository {
         Ok(self.managed_root.join(task))
     }
 
+    #[allow(dead_code)]
     /// Read-only pre-approval inspection. Verifies repository authority, the
     /// target shape, the existing managed namespace and target collisions
     /// without creating, moving or deleting anything.
@@ -1114,6 +1130,7 @@ impl ManagedRepository {
         self.ensure_target_absent(target)
     }
 
+    #[allow(dead_code)]
     /// Mutating preparation performed only after approval. Creates the managed
     /// namespace and re-verifies repository authority and target collision so a
     /// pre-approval inspection result is never trusted across the approval
@@ -1126,11 +1143,13 @@ impl ManagedRepository {
         self.ensure_target_absent(target)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn ensure_authority(&self) -> Result<()> {
         ensure_normal_directory(&self.src_root, "configured src root")?;
         ensure_normal_directory(&self.primary_checkout, "canonical repository checkout")
     }
 
+    #[allow(dead_code)]
     fn ensure_target_shape(&self, target: &Path) -> Result<()> {
         anyhow::ensure!(
             target.parent() == Some(self.managed_root.as_path())
@@ -1143,6 +1162,7 @@ impl ManagedRepository {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn ensure_target_absent(&self, target: &Path) -> Result<()> {
         match std::fs::symlink_metadata(target) {
             Ok(_) => anyhow::bail!(
@@ -1227,6 +1247,7 @@ pub(crate) fn validate_task_name(task: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 /// Derives a deterministic task directory from a validated branch name. A
 /// branch `/` never becomes directory hierarchy; it is flattened to `-`.
 pub(crate) fn derive_task_name(branch: &str) -> Result<String> {
@@ -1254,6 +1275,7 @@ pub(crate) fn trusted_canonical_managed_root(repository: &ManagedRepository) -> 
     (canonical == repository.managed_root()).then_some(canonical)
 }
 
+#[allow(dead_code)]
 /// Facts observed after the Git worktree mutation. Plain values keep the
 /// verification predicate testable without a repository fixture.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1266,6 +1288,7 @@ pub(crate) struct CreatedTargetObservation {
     pub(crate) observed_primary_checkout: Option<PathBuf>,
 }
 
+#[allow(dead_code)]
 /// Post-create verification. Git success alone is never enough: the created
 /// target must resolve as a direct child of the exact trusted managed root with
 /// the expected task component, and it must belong to the selected repository
@@ -1324,6 +1347,7 @@ pub(crate) fn verify_created_managed_target(
     Ok(())
 }
 
+#[allow(dead_code)]
 /// Identity facts for one registered worktree used by list classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RegisteredWorktreeIdentity<'a> {
@@ -1332,6 +1356,7 @@ pub(crate) struct RegisteredWorktreeIdentity<'a> {
     pub(crate) primary_checkout: Option<&'a Path>,
 }
 
+#[allow(dead_code)]
 /// Classifies one registered worktree using direct-child containment of the
 /// canonical managed root plus the canonical common Git directory and primary
 /// checkout as repository identity. The managed root itself and nested
@@ -1366,6 +1391,7 @@ pub(crate) fn classify_registered_worktree(
     WorktreeClassification::Managed
 }
 
+#[allow(dead_code)]
 /// One entry of `git worktree list --porcelain`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegisteredWorktree {
@@ -1377,6 +1403,7 @@ pub(crate) struct RegisteredWorktree {
     pub(crate) prunable: bool,
 }
 
+#[allow(dead_code)]
 pub(crate) fn parse_worktree_list(porcelain: &str) -> Result<Vec<RegisteredWorktree>> {
     let mut entries = Vec::new();
     let mut current: Option<RegisteredWorktree> = None;
@@ -1435,6 +1462,7 @@ pub(crate) fn parse_worktree_list(porcelain: &str) -> Result<Vec<RegisteredWorkt
     Ok(entries)
 }
 
+#[allow(dead_code)]
 fn inspect_existing_normal_directory(path: &Path, label: &str) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => ensure_normal_directory_metadata(path, label, &metadata),
@@ -1445,12 +1473,14 @@ fn inspect_existing_normal_directory(path: &Path, label: &str) -> Result<()> {
     }
 }
 
+#[allow(dead_code)]
 fn ensure_normal_directory(path: &Path, label: &str) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
     ensure_normal_directory_metadata(path, label, &metadata)
 }
 
+#[allow(dead_code)]
 fn ensure_normal_directory_metadata(
     path: &Path,
     label: &str,
@@ -1471,6 +1501,7 @@ fn ensure_normal_directory_metadata(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn create_normal_directory(path: &Path, label: &str) -> Result<()> {
     match std::fs::create_dir(path) {
         Ok(()) => {}

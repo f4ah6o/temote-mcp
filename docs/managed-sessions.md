@@ -80,7 +80,7 @@ temote-mcp activity my-project --tail 0 --no-follow
 
 The optional session ID is an exact filter. `--tail` is applied after filtering, accepts `0` through `1024`, and defaults to `100`; replay is shown oldest first. The command follows new activity by default. `--no-follow` prints the bounded replay and exits after its end marker. The viewer does not start or reconnect a supervisor, and a valid session ID with no retained events produces an empty replay rather than an error.
 
-Each event is one line in local time and contains the session routing ID, shortened instance and operation IDs, operation, state, and a fixed safe summary when one applies. Covered operations include session lifecycle and permissions, file and Git tools, commands and jobs, delegated developer tools, supported integrations, accepted Codex task calls, and supervisor upgrade phases. A completed Codex start or control event means that Temote accepted the call; it does not mean the Codex turn finished.
+Each event is one line in local time and contains the session routing ID, shortened instance and operation IDs, operation, state, and a fixed safe summary when one applies. Covered operations include session lifecycle and permissions, delegated task backends (Codex, OpenCode, Devin, Devin Cloud), the structured local-agent broker, jobs, evidence reads, and supervisor upgrade phases. A completed Codex start or control event means that Temote accepted the call; it does not mean the Codex turn finished.
 
 Activity is a best-effort, process-memory diagnostic stream. The supervisor retains at most 4096 events and 8 MiB; one serialized event is at most 2048 bytes and its summary at most 512 UTF-8 bytes. Live broadcast capacity is 1024 events, each producer queue holds 256 typed updates, and at most 16 viewers may attach. Queue saturation, process termination, ingress failure, or broker contention can drop an update before it receives a sequence number, so no later gap can count that loss. A history-truncated notice means older retained events were evicted. A live gap reports a global sequence interval and must not be read as the exact number of matching events omitted by a session filter. An intentional tail limit and a quiet session are not gap reports.
 
@@ -92,7 +92,7 @@ This attachment exists only on the owner-only local Unix control socket. It is n
 
 ## Runtime and failure isolation
 
-The session Unix socket remains the runtime boundary for MCP operations and host bridges. CLI and HTTP-managed sessions use the same runtime implementation for sandbox permissions, approval state, 1Password bridge state, kintone bridges, metadata, and socket lifecycle.
+The session Unix socket remains the runtime boundary for MCP operations and host bridges. CLI and HTTP-managed sessions use the same runtime implementation for sandbox permissions, approval state, metadata, and socket lifecycle.
 
 Per-connection failures are isolated from the runtime. Broken pipes, connection resets, malformed messages, oversized messages, read timeouts, client disconnects, and response write failures terminate only that connection. In particular, probe and yolo-approval response writes do not propagate through the runtime loop.
 
@@ -136,7 +136,7 @@ HTTP managed sessions are always `yolo=false` and default to `agent`, so the nor
 
 `session_list` and `session_info` expose durable stopped/crashed state as well as active sessions. Other session-bound MCP tools still require a live runtime socket.
 
-`session_start` and `session_stop` are exposed only by the authenticated direct HTTP `serve` endpoint. Direct `temote-mcp up` is single-host per public endpoint: one endpoint maps to one local lifecycle supervisor and host-local session store. Reusing one Cloudflare Tunnel token/hostname concurrently across multiple direct-ingress hosts is unsupported because Cloudflare replica routing is not session-aware. Set `TEMOTE_MCP_HOST_ID` for a stable non-secret diagnostic identity (OS hostname is the fallback). For a single public endpoint routing to multiple Temote hosts, use `temote-mcp gateway-agent` with the Worker/Durable Objects gateway. The gateway generation/lease routing contract is unchanged. The existing public exclusion of `without_sandbox` remains unchanged.
+`session_start` and `session_stop` are exposed only by the authenticated direct HTTP `serve` endpoint. Direct `temote-mcp up` is single-host per public endpoint: one endpoint maps to one local lifecycle supervisor and host-local session store. Reusing one Cloudflare Tunnel token/hostname concurrently across multiple direct-ingress hosts is unsupported because Cloudflare replica routing is not session-aware. Set `TEMOTE_MCP_HOST_ID` for a stable non-secret diagnostic identity (OS hostname is the fallback). For a single public endpoint routing to multiple Temote hosts, use `temote-mcp gateway-agent` with the Worker/Durable Objects gateway. The gateway generation/lease routing contract is unchanged. The public tool surface remains limited to session-bound delegation and discovery tools.
 
 ## Optional terminal integration
 

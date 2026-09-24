@@ -922,17 +922,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "onepassword-sdk-unofficial"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aae615b374c6c687936ebfe3be819750ecae6a8cc6ef03bbc593a1801755c3c"
-dependencies = [
- "base64 0.22.1",
- "libc",
- "serde_json",
-]
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1591,7 +1580,6 @@ dependencies = [
  "libc",
  "noargs",
  "noprop",
- "onepassword-sdk-unofficial",
  "reqwest 0.12.28",
  "ring",
  "rusqlite",

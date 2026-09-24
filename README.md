@@ -2,7 +2,7 @@
 
 [日本語](README.ja.md)
 
-Temote MCP exposes local files, commands, and selected host integrations as MCP tools while keeping normal sessions sandboxed and approval-aware.
+Temote MCP lets a local coding agent operate the machine inside explicit, sandboxed, approval-aware sessions: work is delegated through task backends (Codex app-server, `opencode serve`, Devin ACP, the Devin Cloud API, or the structured local-agent broker) and read back as bounded evidence.
 
 ## Install
 
@@ -123,7 +123,6 @@ Specify `--agent codex`, `--agent claude-code`, or another supported agent when 
 - [Using sessions and tools](docs/usage.md)
 - [Managed sessions and named roots](docs/managed-sessions.md)
 - [Remote connection profiles: Cloudflare, Tailscale, or OpenAI Secure MCP Tunnel](docs/public-http.md)
-- [1Password and kintone integrations](docs/integrations.md)
 - [Multi-host Cloudflare gateway](docs/gateway.md)
 - [Linux sandbox and crates.io packaging](docs/linux-sandbox.md)
 - [Building, testing, and releasing](docs/development.md)

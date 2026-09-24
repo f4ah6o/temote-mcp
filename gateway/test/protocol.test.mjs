@@ -111,58 +111,16 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 76);
-  for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
+  assert.equal(names.length, 27);
+  for (const required of ["host_list", "host_info", "session_list", "session_start", "session_stop", "session_restart", "session_info"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "dev_tool_run"]) {
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "stop_job"]) {
     assert.equal(names.includes(required), true, required);
   }
-  const gitPushTag = PUBLIC_TOOLS.find((tool) => tool.name === "git_push_tag");
-  assert.ok(gitPushTag);
-  assert.deepEqual(gitPushTag.inputSchema.required, ["session_id", "tag", "source_sha"]);
-  assert.equal(gitPushTag.inputSchema.properties.remote.default, "origin");
-  assert.equal(gitPushTag.inputSchema.additionalProperties, false);
-  for (const name of ["git_branch_create", "git_branch_delete", "git_remote_branch_delete", "git_switch", "git_worktree_add", "git_worktree_create", "git_worktree_list", "git_worktree_remove", "git_worktree_prune"]) {
-    assert.ok(PUBLIC_TOOLS.find((tool) => tool.name === name), name);
+  for (const removed of ["execute", "start_command", "read_file", "write_file", "git_push", "github_pr_list", "dev_tool_run", "session_permission_request", "onepassword_item_get", "kintone_mcp_status", "checkpoint_save", "work_handoff", "recall"]) {
+    assert.equal(names.includes(removed), false, removed);
   }
-  const remoteBranchDelete = PUBLIC_TOOLS.find((tool) => tool.name === "git_remote_branch_delete");
-  assert.deepEqual(remoteBranchDelete.inputSchema.required, ["session_id", "branch", "expected_remote_sha"]);
-  assert.equal(remoteBranchDelete.inputSchema.properties.remote.default, "origin");
-  const worktreeCreate = PUBLIC_TOOLS.find((tool) => tool.name === "git_worktree_create");
-  assert.deepEqual(worktreeCreate.inputSchema.required, ["session_id", "branch"]);
-  assert.deepEqual(Object.keys(worktreeCreate.inputSchema.properties).sort(), [
-    "branch",
-    "host_id",
-    "repository",
-    "session_id",
-    "task",
-  ]);
-  const worktreeList = PUBLIC_TOOLS.find((tool) => tool.name === "git_worktree_list");
-  assert.deepEqual(worktreeList.inputSchema.required, ["session_id"]);
-  assert.deepEqual(Object.keys(worktreeList.inputSchema.properties).sort(), [
-    "host_id",
-    "repository",
-    "session_id",
-  ]);
-  const workflowDispatch = PUBLIC_TOOLS.find((tool) => tool.name === "github_workflow_dispatch");
-  assert.ok(workflowDispatch);
-  assert.deepEqual(workflowDispatch.inputSchema.required, ["session_id", "workflow", "ref"]);
-  const workflowRunGet = PUBLIC_TOOLS.find((tool) => tool.name === "github_workflow_run_get");
-  assert.ok(workflowRunGet);
-  assert.deepEqual(workflowRunGet.inputSchema.required, ["session_id", "run_id"]);
-  assert.deepEqual(
-    PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties,
-    {
-      host_id: PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties.host_id,
-      session_id: PUBLIC_TOOLS.find((tool) => tool.name === "read_file").inputSchema.properties.session_id,
-      path: { type: "string" },
-      start_line: { type: "integer", minimum: 1 },
-      end_line: { type: "integer", minimum: 1 },
-      offset_bytes: { type: "integer", minimum: 0 },
-      max_bytes: { type: "integer", minimum: 4, maximum: 8388608 },
-    },
-  );
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_status").annotations.openWorldHint, true);
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_start").inputSchema.required.includes("operation_id"), true);
   assert.deepEqual(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_control").inputSchema.properties.action.enum, ["steer", "resume", "interrupt"]);
@@ -188,8 +146,8 @@ test("gateway contract parity detects schema, forbidden-tool, and protocol drift
   );
 });
 
-test("job discovery, checkpoints, and handoff remain session-scoped in the gateway contract", () => {
-  const names = ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff", "apply_patch", "friction_summary", "learning_candidate_list", "recall", "recall_feedback"];
+test("job and evidence tools remain session-scoped in the gateway contract", () => {
+  const names = ["session_info", "evidence_read", "poll_job", "job_list", "stop_job"];
   for (const name of names) {
     const routed = PUBLIC_TOOLS.find((candidate) => candidate.name === name);
     assert.ok(routed, name);
@@ -198,9 +156,8 @@ test("job discovery, checkpoints, and handoff remain session-scoped in the gatew
     assert.equal(routed.annotations.openWorldHint, false, name);
   }
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "job_list").annotations.readOnlyHint, true);
-  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "checkpoint_load").annotations.readOnlyHint, true);
-  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "work_handoff").annotations.readOnlyHint, true);
-  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "checkpoint_save").annotations.readOnlyHint, false);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "evidence_read").annotations.readOnlyHint, true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "stop_job").annotations.readOnlyHint, false);
 });
 
 test("gateway identity comes only from deployment version metadata", () => {
@@ -1319,7 +1276,7 @@ test("timed-out queued requests are removed before a host can execute them", asy
       jsonrpc: "2.0",
       id: 99,
       method: "tools/call",
-      params: { name: "git_push", arguments: { session_id: "timeout-safe" } },
+      params: { name: "stop_job", arguments: { session_id: "timeout-safe" } },
     },
   }));
   assert.equal(timedOut.status, 504);
@@ -1533,7 +1490,7 @@ test("session status reflects the current host lease", async () => {
   assert.equal(await storage.get("host"), undefined);
 });
 
-test("host respond budget covers maximum get_image payload without widening other host APIs", async () => {
+test("host respond budget covers maximum binary payload without widening other host APIs", async () => {
   const rawImageBytes = 32 * 1024 * 1024;
   const maximumBase64Bytes = 4 * Math.ceil(rawImageBytes / 3);
   assert.equal(hostApiBodyLimit("connect"), 8 * 1024 * 1024);
@@ -1692,7 +1649,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 76);
+  assert.equal(rpc.result.tools.length, 27);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }
@@ -1760,25 +1717,13 @@ test("session-scoped work-state tools route by explicit host_id and reject missi
   };
   const argumentsByTool = {
     job_list: { host_id: "mac-main", session_id: "project-a", limit: 1 },
-    checkpoint_save: {
+    session_info: { host_id: "mac-main", session_id: "project-a" },
+    evidence_read: {
       host_id: "mac-main",
       session_id: "project-a",
-      operation_id: "00000000-0000-4000-8000-000000000001",
-      expected_revision: 0,
-      checkpoint: {
-        title: "reported",
-        base_commit: null,
-        steps: [],
-        checks: [],
-        next_step_id: null,
-      },
+      evidence_id: "00000000-0000-4000-8000-000000000001",
     },
-    checkpoint_load: {
-      host_id: "mac-main",
-      session_id: "project-a",
-      checkpoint_id: "00000000-0000-4000-8000-000000000001",
-    },
-    work_handoff: { host_id: "mac-main", session_id: "project-a" },
+    stop_job: { host_id: "mac-main", session_id: "project-a", job_id: "job-1" },
   };
   for (const [name, toolArguments] of Object.entries(argumentsByTool)) {
     const response = await worker.fetch(legacyToolCallRequest(name, toolArguments), env);
@@ -1791,7 +1736,7 @@ test("session-scoped work-state tools route by explicit host_id and reject missi
     assert.equal(rejected.status, 200, name);
     assert.equal((await rejected.json()).error.code, -32602, name);
   }
-  assert.deepEqual(routed, ["job_list", "checkpoint_save", "checkpoint_load", "work_handoff"]);
+  assert.deepEqual(routed, ["job_list", "session_info", "evidence_read", "stop_job"]);
   assert.deepEqual(selected, ["host:mac-main", "host:mac-main", "host:mac-main", "host:mac-main"]);
 });
 

@@ -1451,17 +1451,20 @@ mod tests {
             assert!(tools.iter().any(|tool| tool["name"] == name));
         }
         assert!(!tools.iter().any(|tool| tool["name"] == "without_sandbox"));
+        for name in ["read_file", "write_file", "execute", "git_push"] {
+            assert!(!tools.iter().any(|tool| tool["name"] == name));
+        }
         assert_eq!(
             tools
                 .iter()
-                .find(|tool| tool["name"] == "write_file")
+                .find(|tool| tool["name"] == "session_start")
                 .unwrap()["annotations"]["readOnlyHint"],
             false
         );
         assert_eq!(
             tools
                 .iter()
-                .find(|tool| tool["name"] == "read_file")
+                .find(|tool| tool["name"] == "evidence_read")
                 .unwrap()["annotations"]["readOnlyHint"],
             true
         );
@@ -1643,7 +1646,6 @@ mod tests {
         let volume = fixture.path().join("volume");
         std::fs::create_dir_all(volume.join("repo-a")).unwrap();
         std::fs::create_dir_all(volume.join("repo-b")).unwrap();
-        std::fs::write(volume.join("repo-a/note.txt"), "hello managed session\n").unwrap();
         let (runtime, supervisor, _approvals) = runtime_with_root(volume.clone());
         let first_id = format!("http-a-{}", uuid::Uuid::new_v4());
         let second_id = format!("http-b-{}", uuid::Uuid::new_v4());
@@ -1696,42 +1698,12 @@ mod tests {
         assert_eq!(info["yolo"], false);
         assert_eq!(info["permission_mode"], "agent");
 
-        let read = call_public_tool(
-            &runtime,
-            "read_file",
-            json!({"session_id": first_id, "path": "note.txt"}),
-        )
-        .await;
-        assert_eq!(tool_text(&read), "hello managed session\n");
-
-        let executed = call_public_tool(
-            &runtime,
-            "execute",
-            json!({"session_id": first_id, "command": ["/bin/pwd"]}),
-        )
-        .await;
-        let executed: Value = serde_json::from_str(tool_text(&executed)).unwrap();
-        assert_eq!(executed["exit_code"], 0);
-        assert_eq!(
-            executed["stdout"].as_str().unwrap().trim(),
-            std::fs::canonicalize(volume.join("repo-a"))
-                .unwrap()
-                .to_string_lossy()
-        );
-
         let restarted =
             call_public_tool(&runtime, "session_restart", json!({"session_id": first_id})).await;
         let restarted: Value = serde_json::from_str(tool_text(&restarted)).unwrap();
         assert_eq!(restarted["status"], "active");
         assert_eq!(restarted["yolo"], false);
         assert_eq!(restarted["permission_mode"], "agent");
-        let reread = call_public_tool(
-            &runtime,
-            "read_file",
-            json!({"session_id": first_id, "path": "note.txt"}),
-        )
-        .await;
-        assert_eq!(tool_text(&reread), "hello managed session\n");
 
         let root_id = format!("http-root-{}", uuid::Uuid::new_v4());
         let root_session = call_public_tool(

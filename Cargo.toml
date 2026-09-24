@@ -40,7 +40,6 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 base64 = "0.22"
 noargs = "0.4.3"
-onepassword-sdk-unofficial = "0.3.0"
 dotenvy = { version = "0.15", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 ring = { version = "0.17", optional = true }

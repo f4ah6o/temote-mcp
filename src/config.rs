@@ -82,22 +82,6 @@ impl PermissionMode {
     pub fn is_yolo(self) -> bool {
         matches!(self, Self::Yolo)
     }
-
-    /// Network policy for ordinary sandboxed `execute` / `start_command` runs.
-    ///
-    /// This is the single permission-mode decision both tools share. `None`
-    /// means the session uses the local-only unrestricted path (`yolo`), which
-    /// is not a sandbox network policy at all. `ask` stays restricted; `agent`
-    /// uses the existing network-enabled development sandbox profile while
-    /// keeping filesystem/path containment.
-    pub const fn command_network_policy(self) -> Option<temote_mcp::sandbox::CommandNetworkPolicy> {
-        use temote_mcp::sandbox::CommandNetworkPolicy;
-        match self {
-            Self::Ask => Some(CommandNetworkPolicy::Restricted),
-            Self::Agent => Some(CommandNetworkPolicy::Development),
-            Self::Yolo => None,
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1169,72 +1153,6 @@ pub fn canonical_directory(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn resolve_existing_path(session: &Session, path: &Path) -> Result<PathBuf> {
-    let candidate = resolve_from_cwd(&session.cwd, path);
-    let resolved = std::fs::canonicalize(&candidate)
-        .with_context(|| format!("cannot resolve {}", candidate.display()))?;
-    ensure_permitted(session, &resolved)?;
-    Ok(resolved)
-}
-
-pub fn resolve_write_path(session: &Session, path: &Path) -> Result<PathBuf> {
-    let candidate = resolve_from_cwd(&session.cwd, path);
-    let parent = candidate.parent().context("file has no parent directory")?;
-    let parent = std::fs::canonicalize(parent)
-        .with_context(|| format!("parent does not exist: {}", parent.display()))?;
-    ensure_permitted(session, &parent)?;
-    let name = candidate.file_name().context("file name is missing")?;
-    anyhow::ensure!(
-        name != "." && name != "..",
-        "file name must not be '.' or '..'"
-    );
-    let target = parent.join(name);
-    if target.exists() || std::fs::symlink_metadata(&target).is_ok() {
-        let resolved = std::fs::canonicalize(&target)
-            .with_context(|| format!("cannot resolve {}", target.display()))?;
-        ensure_permitted(session, &resolved)?;
-    }
-    Ok(target)
-}
-
-pub fn resolve_cwd(session: &Session, path: Option<&Path>) -> Result<PathBuf> {
-    let candidate = path
-        .map(|path| resolve_from_cwd(&session.cwd, path))
-        .unwrap_or_else(|| session.cwd.clone());
-    let resolved = std::fs::canonicalize(&candidate)
-        .with_context(|| format!("cannot resolve cwd {}", candidate.display()))?;
-    ensure_permitted(session, &resolved)?;
-    anyhow::ensure!(
-        resolved.is_dir(),
-        "cwd is not a directory: {}",
-        resolved.display()
-    );
-    Ok(resolved)
-}
-
-pub fn ensure_permitted(session: &Session, path: &Path) -> Result<()> {
-    if session.permission_mode.is_yolo() {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        session
-            .permitted_directories
-            .iter()
-            .any(|root| path == root || path.starts_with(root)),
-        "path is outside the permitted sandbox roots: {}",
-        path.display()
-    );
-    Ok(())
-}
-
-fn resolve_from_cwd(cwd: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    }
-}
-
 pub fn unix_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1427,75 +1345,6 @@ mod tests {
 
         server.await.unwrap();
         tokio::fs::remove_file(path).await.unwrap();
-    }
-
-    #[test]
-    fn path_resolution_stays_inside_permitted_roots() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let root = canonical_directory(root.path()).unwrap();
-        let outside = canonical_directory(outside.path()).unwrap();
-        let session = Session {
-            id: "test".to_owned(),
-            cwd: root.clone(),
-            permitted_directories: vec![root.clone()],
-            started_at: 0,
-            process_id: 0,
-            permission_mode: PermissionMode::Ask,
-            grants: SessionGrants::default(),
-        };
-        std::fs::write(root.join("inside.txt"), "ok").unwrap();
-
-        assert!(resolve_existing_path(&session, Path::new("inside.txt")).is_ok());
-        assert!(resolve_existing_path(&session, &outside).is_err());
-        assert!(resolve_write_path(&session, Path::new("new.txt")).is_ok());
-        assert!(resolve_write_path(&session, &outside.join("new.txt")).is_err());
-    }
-
-    #[test]
-    fn yolo_session_allows_paths_outside_configured_roots() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let root = canonical_directory(root.path()).unwrap();
-        let outside = canonical_directory(outside.path()).unwrap();
-        let session = Session {
-            id: "test-yolo".to_owned(),
-            cwd: root.clone(),
-            permitted_directories: vec![root],
-            started_at: 0,
-            process_id: 0,
-            permission_mode: PermissionMode::Yolo,
-            grants: SessionGrants::default(),
-        };
-        std::fs::write(outside.join("outside.txt"), "ok").unwrap();
-
-        assert!(resolve_existing_path(&session, &outside.join("outside.txt")).is_ok());
-        assert!(resolve_write_path(&session, &outside.join("new.txt")).is_ok());
-        assert_eq!(resolve_cwd(&session, Some(&outside)).unwrap(), outside);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn path_resolution_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
-        symlink(outside.path(), root.path().join("outside")).unwrap();
-        let canonical_root = canonical_directory(root.path()).unwrap();
-        let session = Session {
-            id: "test".to_owned(),
-            cwd: canonical_root.clone(),
-            permitted_directories: vec![canonical_root],
-            started_at: 0,
-            process_id: 0,
-            permission_mode: PermissionMode::Ask,
-            grants: SessionGrants::default(),
-        };
-
-        assert!(resolve_existing_path(&session, Path::new("outside/secret.txt")).is_err());
-        assert!(resolve_write_path(&session, Path::new("outside/new.txt")).is_err());
     }
 
     #[test]
@@ -1878,46 +1727,6 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn generated_read_and_write_paths_never_follow_symlinks_outside_sandbox() -> noprop::TestResult
-    {
-        use std::os::unix::fs::symlink;
-
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("root");
-        let outside = fixture.path().join("outside");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        symlink(&outside, root.join("escape")).unwrap();
-        let canonical_root = canonical_directory(&root).unwrap();
-        let session = Session {
-            id: "pbt".to_owned(),
-            cwd: canonical_root.clone(),
-            permitted_directories: vec![canonical_root],
-            started_at: 0,
-            process_id: 0,
-            permission_mode: PermissionMode::Ask,
-            grants: SessionGrants::default(),
-        };
-
-        test_support::run(0x5041_5448_4553_4301, 512, |ctx| {
-            let leaf = test_support::safe_component(ctx);
-            std::fs::write(outside.join(&leaf), b"secret").unwrap();
-            let escaped = PathBuf::from(format!("escape/{leaf}"));
-            assert!(
-                resolve_existing_path(&session, &escaped).is_err(),
-                "read escape unexpectedly allowed: {escaped:?}"
-            );
-            let write = PathBuf::from(format!("escape/{leaf}.new"));
-            assert!(
-                resolve_write_path(&session, &write).is_err(),
-                "write escape unexpectedly allowed: {write:?}"
-            );
-            Ok(())
-        })
-    }
-
     #[test]
     fn permission_mode_parses_and_serializes_all_modes() {
         for (mode, text) in [
@@ -1938,23 +1747,6 @@ mod tests {
         assert!(serde_json::from_str::<PermissionMode>("\"root\"").is_err());
         assert!(!PermissionMode::Ask.is_yolo() && !PermissionMode::Agent.is_yolo());
         assert!(PermissionMode::Yolo.is_yolo());
-    }
-
-    #[test]
-    fn permission_modes_select_the_ordinary_command_network_policy() {
-        use temote_mcp::sandbox::CommandNetworkPolicy;
-        for (mode, expected) in [
-            (PermissionMode::Ask, Some(CommandNetworkPolicy::Restricted)),
-            (
-                PermissionMode::Agent,
-                Some(CommandNetworkPolicy::Development),
-            ),
-            (PermissionMode::Yolo, None),
-        ] {
-            assert_eq!(mode.command_network_policy(), expected, "{mode:?}");
-        }
-        assert!(!CommandNetworkPolicy::Restricted.development_enabled());
-        assert!(CommandNetworkPolicy::Development.development_enabled());
     }
 
     fn session_with_mode(id: &str, permission_mode: PermissionMode) -> Session {

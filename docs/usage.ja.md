@@ -80,22 +80,18 @@ named root は Temote MCP 起動前に host 側の `TEMOTE_MCP_ROOTS` で設定�
 
 ## session capability grant
 
-実行中の sandboxed session は `session_permission_request({session_id, listen_ports?, dev_tool_env_prefixes?, ambient_git_credentials?, directories?})` で個別スコープの追加 capability を request できます。各 field は additive で、empty でない field はすべて local approval console を通ります。host は承認前に正確な port、prefix、path を確認します。field を束ねると1つの approval prompt にまとまるため、automation が必要な capability を一度の host 操作で集められます。承認された grant は session metadata に永続化され、session restart 後も維持され、`session_info` の `grants` に表示されます。local CLI では `temote-mcp session permission <id> grant|ungrant` と対応する option が同等の操作です。permitted directory の削除は従来どおり `session permission revoke <path>` を使います。
+実行中の sandboxed session は、local `temote-mcp session permission <id> grant|ungrant` 経由の host approval で個別スコープの capability grant を session metadata に永続化できます。承認された grant は session restart 後も維持され、`session_info` の `grants` に表示されます。permitted directory の削除は従来どおり `session permission revoke <path>` を使います。
 
-- `listen_ports: [5173, ...]`（最大64）を grant すると、`execute` / `start_command` の `allow_loopback_listen: true` を併用した call に限り、その port の TCP listener bind を許可します。macOS の sandbox は bind を loopback に限定できないため、granted port はすべての interface で bind 可能です。workload が必要とする port だけを grant してください。Linux の development profile はもともと listen を許可するため、この option は no-op です。`port_check({session_id, port})` は host から `127.0.0.1:<port>` に接続して accept されるかを報告します。probe できるのは granted port のみで、workspace の観測 tool として機能し、汎用 port scanner にはなりません。
-- `dev_tool_env_prefixes: ["MADOBE_", "CARGO_"]`（最大32、各 prefix は `[A-Za-z0-9_]` のみの 1〜64 byte）を grant すると、`dev_tool_run` が granted prefix で始まる名前の `env` object を受け付けます。name/value は bounded で NUL を含めず、`npm_config_ignore_scripts` など broker が設定する変数は上書きできません。
-- `ambient_git_credentials: true` を grant すると、validated `git_fetch` / `git_pull` / `git_push` / `git_push_tag` は repository に managed GitHub credential mapping がない場合に限り ambient な host Git credential（credential helper、forward された `ssh-agent`）に fallback します。managed mapping が設定されている場合はそちらが優先され、global な `gh` auth state は一切変更しません。
-- `directories: ["/abs/path", ...]`（最大16、absolute path のみ）は session の permitted root を実行中に拡張します。
+- `directories`（最大16、absolute path のみ）は session の permitted root を実行中に拡張します。起動 directory の原則は変わりません。最初から広い root で起動するのではなく、host approval で必要な directory を追加してください。
+- `ambient_git_credentials` を grant すると、delegated agent 内の managed Git 操作は repository に managed GitHub credential mapping がない場合に限り ambient な host Git credential（credential helper、forward された `ssh-agent`）に fallback します。managed mapping が設定されている場合はそちらが優先され、global な `gh` auth state は一切変更しません。
 
-起動 directory の原則は変わりません。最初から広い root で起動するのではなく、host approval で必要な directory を追加してください。
+## delegation と job
 
-## command
+Temote は file、command、Git、integration を直接実行しません。machine 上の作業は下記の task backendを通じて local 側の coding agent に委譲します。task の transcript や child output は bounded で期限付きの session/scope 限定 evidence としてだけ境界を越え、`evidence_read({session_id, evidence_id, offset_bytes?, max_bytes?})` で読みます。
 
-`execute` は shell を介さず argv を実行します。`ask` では network 無効の sandbox 内で動き、既定の `agent` では同じ sandbox と path containment を維持したまま localhost / LAN / Internet の開発通信を許可する network-enabled development profile を使います。`yolo` は host 上で制限なく実行する local-only path のままです。foreground timeout 内に終了すれば結果を直接返し、それ以上かかる場合は `job_id` を返します。
+foreground timeout を超える作業は session 所有の `job_id` を返します。完了が必要なら `poll_job` で確認し、不要になったら `stop_job` で停止します。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。
 
-最初から background 実行する場合は `start_command` を使います。`poll_job` で完了を確認し、`stop_job` で停止できます。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。1 session あたり同時に8 jobまで実行できます。
-
-`job_list({session_id, limit?})` は current session が所有する in-memory job の redacted snapshot を返します。返すのは `job_id` と `running` / `completed` / `failed` / `unknown` だけで、running を先頭に並べ、上限超過は `truncated` で示します。command text、argv、stdout/stderr、raw error は返さず、list しても completed result は消費しません。`retention="in_memory"` なので、空のlistを「過去に何も実行していない証拠」とは扱わないでください。restartやcache expiry以前の履歴ではありません。
+`job_list({session_id, limit?})` は current session が所有する in-memory job の redacted snapshot を返します。返すのは `job_id` と `running` / `completed` / `failed` / `unknown` だけで、running を先頭に並べ、上限超過は `truncated` で示します。command text、argv、stdout/stderr、raw error は返さず、list しても completed result は消費しません。`retention="in_memory"` なので、空のlistを「過去に何も実行していない証拠」とは扱わないでください。
 
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 
@@ -107,15 +103,15 @@ opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_
 
 Temote の yolo は Temote 自身の local sandbox と approval behavior だけを変更し、Codex child の mutation を認可しません。Codex app-server の command/file-change approval request は child 側の approval boundary を維持し、user approval transport が利用できない場合は fail closed します。thread 作成前の initialization または model/list の失敗は `retryable_failed` として同じ start operation を再試行できます。一方、thread/start または turn/start の request 送信後に成否が不明になった場合は replay せず `reconciliation_required` を維持します。`codex_task_get` は `after_revision` / `not_modified` を判定する前に remote thread を reconcile します。別の Temote process が live app-server runtime を所有している場合は、競合する resume を起動せず、永続化済み revision と `reconciliation_deferred: true` を返します。typed control は operation receipt の永続化前に失敗します。その lease が live の間、session cleanup は task record を上書きせず、runtime owner が session 終了を検知して child を停止し task を finalize します。task record は task retention の全期間、unexpired の terminal record を含めて保持され、expired かつ live child runtime のない terminal record だけが prune 対象です。scope が retention limit に達した場合は、unexpired record を削除せず新しい start を拒否します。compact された operation receipt も retention 中の exact replay/conflict 検出を維持します。
 
-生成される turn には Codex の `workspaceWrite`、session の canonical directory を writable root、network disabled を指定します。これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な app-server adapter です。app-server process 自体は inference service と直接通信するため、Codex build と sandbox behavior を検証できない場合はこの surface を無効または opt-in のままにしてください。generic JSON-RPC、remote shell、automatic approval は公開しません。
+生成される turn には Codex の `workspaceWrite`、session の canonical directory を writable root、network disabled を指定します。これは Temote の session sandbox と同じ OS-level boundary ではなく、experimental な app-server adapter です。app-server process 自体は inference service と直接通信するため、Codex build と sandbox behavior を検証できない場合はこの surface を無効または opt-in のままにしてください。generic JSON-RPC、remote shell、automatic approval は公開しません。
 
 ### Experimental OpenCode task
 
 opt-in の `opencode_status`、`opencode_task_start`、`opencode_task_get`、`opencode_task_control` は、task ごとの `opencode serve` child を loopback 上に起動し、`unofficial-opencode-sdk` HTTP client 経由で操作します。各 serve child は 127.0.0.1 の動的 port、child 環境変数経由のみで渡す instance ごとの random Basic-auth password、task ごとの隔離 data directory、`OPENCODE_CONFIG_CONTENT` で注入される上限付き serve permission 設定で動きます。host の OpenCode global 設定（provider/model 定義を含む）を読み、従来の `auth.json` と OpenCode V2 の SQLite 保存資格情報を task 専用 state に取り込みます。host の session や履歴は取り込みません。先に host の CLI で `opencode auth login` を行ってください。資格情報は spawn 時点の copy であり、child による token 更新は host のアカウントへ戻りません。未対応の V2 credential schema は安全側に失敗します。task record、ownership、lease、receipt、retention、scoped evidence は上記 Codex app-server task と同じ契約です。task は完全な session instance と canonical working directory に所有され、別 session、別 process generation、別 scope から resume できません。
 
-`opencode_task_start` と `opencode_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み session に追加の prompt を送り、resume は保持済み session を reconcile した上で同じ task 用 state directory を使う新しい serve child に spawn し直します (新しい task の開始や終了済み child の再起動ではありません)。prompt には operation 由来の deterministic `messageID` が付くため、`opencode_task_get` は start prompt が server に受理されたかを判定してから `reconciliation_required` を決めます。terminal state の report は他の delegation backend と同じ bounded report contract の下、最後の assistant message から抽出します。usage と observed model は self-reported 値ではなく session message から読みます。`ask` mode では Codex task と同じ provenance/scope/mutation metadata を伴う local approval が必要で、`agent` と `yolo` session では Temote-local prompt を skip します。`opencode_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
+`opencode_task_start` と `opencode_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み session に追加の prompt を送り、resume は保持済み session を reconcile した上で同じ task 用 state directory を使う新しい serve child に spawn し直します (新しい task の開始や終了済み child の再起動ではありません)。prompt には operation 由来の deterministic `messageID` が付くため、`opencode_task_get` は start prompt が server に受理されたかを判定してから `reconciliation_required` を決めます。terminal state の report は 他の delegation backend と同じ bounded report contract の下、最後の assistant message から抽出します。usage と observed model は self-reported 値ではなく session message から読みます。`ask` mode では Codex task と同じ provenance/scope/mutation metadata を伴う local approval が必要で、`agent` と `yolo` session では Temote-local prompt を skip します。`opencode_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
 
-これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な serve adapter です。serve process 自体は provider API と直接通信します。保留中の OpenCode permission/question request は auto-approval ではなく `waiting_approval` task state として表面化します。host の OpenCode build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
+これは Temote の session sandbox と同じ OS-level boundary ではなく、experimental な serve adapter です。serve process 自体は provider API と直接通信します。保留中の OpenCode permission/question request は auto-approval ではなく `waiting_approval` task state として表面化します。host の OpenCode build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
 
 OpenCode 1.x と 2.x では HTTP contract が異なります (`global/*` と `api/*`)。起動時に各 poll で `global/health` を先に probe し、v1 probe が失敗した poll から `api/*` の liveness route (`api/info`、次に `api/health`) も試行して、先に応答した contract を採用します。両 adapter は同じ task interface を提供するため、両 contract を提供する build ではどちらが選ばれても正しく動作します。`TEMOTE_OPENCODE_SERVE_CONTRACT` に `v1` または `v2` を設定すると auto-detection を skip して contract を固定できます。それ以外の値または未設定では auto-detection のままです。
 
@@ -125,7 +121,7 @@ opt-in の `devin_status`、`devin_task_start`、`devin_task_get`、`devin_task_
 
 `devin_task_start` と `devin_task_control` には opaque な `operation_id` が必須です。control action は型付きの `steer` / `resume` / `interrupt` だけです。steer は保持済み ACP session に追加の `session/prompt` を送り、resume は agent が `loadSession` capability を advertise する場合に限り `session/load` で reattach します (advertise が無ければ replay せず fail closed)、interrupt は `session/cancel` を送ります。各 `session/prompt` は blocking の ACP request で、その `stopReason` result が task status に対応します (`end_turn` は completed、`cancelled` は interrupted、それ以外は `retryable_failed`)。送信済みの可能性がある turn の応答を失った場合は replay せず保持済み session state から reconcile します。agent 側の `session/request_permission` は auto-approval ではなく Temote-local approval console 経由の `waiting_approval` task state として表面化します。terminal report は他の delegation backend と同じ bounded report contract の下、蓄積した assistant message から抽出します。`ask` mode では同じ Devin provenance/scope/mutation metadata を伴う local approval が必要で、`agent` と `yolo` session では Temote-local prompt を skip します。`devin_task_get` の詳細は bounded・期限付き・session/scope限定の evidence だけです。
 
-これは Temote の直接 `execute` sandbox と同じ OS-level boundary ではなく、experimental な stdio adapter です。ACP child は Devin service と直接通信し、認証は install 済み CLI 自身の credential state (`devin auth login`、`DEVIN_API_KEY`、または `WINDSURF_API_KEY`) を使います。host の Devin CLI build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
+これは Temote の session sandbox と同じ OS-level boundary ではなく、experimental な stdio adapter です。ACP child は Devin service と直接通信し、認証は install 済み CLI 自身の credential state (`devin auth login`、`DEVIN_API_KEY`、または `WINDSURF_API_KEY`) を使います。host の Devin CLI build を end-to-end で検証するまでは、この surface を opt-in のままにしてください。
 
 `devin_task_start` は `cloud: true` も受け付け、その場合は `devin acp --cloud` を spawn します。CLI が stdio ACP transport を Devin Cloud の ACP WebSocket に relay するため、local agent ではなく CLI の `auth login` account 上で hosted session が動きます。`model` と `agent` は `devin acp --cloud` では無視されるため、`cloud` と併用すると拒否されます。transport、ownership、evidence の契約は local mode と同じです。
 
@@ -137,20 +133,6 @@ credential は `TEMOTE_MCP_DEVIN_API_KEY` (Devin service-user key または pers
 
 `devin_cloud_task_start` には opaque な `operation_id` と `task` が必須で、`title`、`devin_mode`、`repos`、`max_acu_limit` は任意で session 作成に転送されます。Temote は API 呼び出し前に acceptance を永続化し、`temote-mcp` tag 付きの resumable session を1つ作成します。prompt では他の delegation backend と同じ bounded JSON report contract を要求し、structured output としても要求します。task record は Codex / OpenCode / Devin ACP task と同様に完全な session instance と canonical working directory に所有され、`devin-cloud-tasks` 配下に保存され、他 session からは見えません。`devin_cloud_task_get` は保持済み task を hosted session の status と reconcile します (`running`/`claimed` → `running`、`waiting_for_user` → `waiting_input` (ただし terminal report が公開済みなら `completed`/`failed` — Devin は turn 終了後に exit せず idle するため)、`waiting_for_approval` → `waiting_approval`、inactivity による `suspended` → `waiting_input`、`exit` → `completed`、`error`/quota/payment failure → `failed`、user による terminate → `interrupted`)。report は structured output を優先し、無ければ最後の Devin message から抽出します。最後の message は bounded な scoped evidence 経由でのみ公開します。control action は `steer` (follow-up message を送信)、`resume` (suspended session に message を送り Devin 側で resume)、`interrupt` (hosted session を terminate) です。API の明確な reject は `retryable_failed`、remote 効果が不確定な transport failure は `reconciliation_required` になり、blind replay は行いません。`ask` mode では Devin Cloud provenance metadata (`scope: devin_cloud`) 付きの local approval が必要で、その mutation が local workspace ではなく hosted organization の ACU を消費することを operator が確認できます。
 
-### 構造化 developer tool broker
-
-`dev_tool_run({session_id, tool, operation, args?, cwd?})` は、検証済みの Cargo / Vite+ / uv / npm / pnpm / Go operation を developer broker 経由で実行します。caller は executable や raw host command を指定できません。cwd は permitted root 内に canonicalize し、child output は bounded、長時間 operation は通常の `job_id` を返します。
-
-operation class:
-
-- offline development（`cargo fmt|check|clippy|test|build`、`vp check|lint|fmt|format|test|build|pack`）は network 無効の developer sandbox で実行し、workspace write と限定的な tool cache/state write だけを許可します。
-- dependency/network（`cargo fetch|install|update`、`vp install|add|update|outdated|info|rebuild`）は明示的に分類された network profile を使い、write scope は同じです。
-- package-manager の first slice として `uv lock`、`npm install|ci|update|ping|outdated`、`pnpm install|fetch|update|outdated`、`go mod_download`（実 argv は `go mod download`）を追加します。初期 contract では caller-supplied args を受け付けず、`uv lock` は `--no-build --no-python-downloads`、npm/pnpm の install/update 系は `--ignore-scripts` と `npm_config_ignore_scripts=true`、pnpm install/update/fetch はさらに `--ignore-pnpmfile` を broker 側で強制して project hook の実行も防ぎます。
-- lifecycle build script は別の offline phase に分離します。`npm rebuild` と `pnpm rebuild_pending`（実 argv は `pnpm rebuild --pending`）は developer sandbox の network を無効にしたまま実行するため、依存取得時には script を止め、必要な build script だけを後段で outbound network なしに実行できます。
-- `vp run|exec|dlx`、`vp upgrade|implode`、その他の未知 operation は offline/safe path に入れず拒否します。
-
-`ask` では検証済み operation に local approval が必要で、`agent` では local approval console なしで実行し、`yolo` は従来の local behavior を維持します。分類と containment の規則はどの mode でも同一です。
-
 ### Delegation backend (ローカル CLI)
 
 `temote-mcp delegate --backend codex|opencode ...` は、ローカル CLI から bounded な非対話 delegation を1回実行し、bounded な JSON result を1つ出力します。OpenCode は明示的な `--session <id>` resume も受け付けます。resume 前に bounded な read-only `opencode session list --format json` preflight を行い、session の canonical directory が現在の canonical delegation directory と一致する場合だけ `run` を起動します。metadata の欠落、曖昧さ、不正 JSON、サイズ超過、probe失敗、directory不一致は fail closed で、`run` より前に拒否します。`--fork` を使うには `--session` が必要で、指定した session の context を継承した新しい session を開始します。`run` の前に、同じ fail closed の directory preflight を親 session に対して実行します。`--continue` と `--attach` はサポートしません。OpenCode backend の executable は次の順で解決します。
@@ -160,60 +142,9 @@ operation class:
 
 明示された `TEMOTE_OPENCODE_BIN` が不正（空、相対 path、存在しない、regular file でない、実行可能でない）な場合は fail closed とし、PATH 上の別 executable へ暗黙に fallback しません。設定された path は diagnostics や error に出力しません。`temote-mcp delegate diagnose --backend opencode` が示すのは `available` / `unavailable`、source (`env_override` / `path` / `invalid_override`)、invalid override の bounded な reason だけです。`TEMOTE_OPENCODE_BIN` は parent process が読むだけで、OpenCode child の environment には渡しません。
 
-## work checkpoint / handoff
+## delegated session 内の Git
 
-`checkpoint_save` は client が申告した bounded checkpoint を Temote の private state に保存し、session の current canonical working directory をscopeにします。すべてのsaveで opaque UUID `operation_id` が必須です。新規作成は `checkpoint_id` を省略して `expected_revision=0`、更新は既存UUIDとcurrent revisionを指定します。同じlogical mutationを同一`operation_id`かつ同一canonical requestで再送すると、checkpoint/revisionを増やさず以前のcommit結果を返します。同じoperation IDを異なるrequestで再利用すると `OPERATION_CONFLICT`、通常のstale revisionは `CHECKPOINT_CONFLICT` になります。operation receiptはcheckpointと同じatomic write境界で永続化し、bounded historyとして保持します。通常sessionではlocal approvalが必要で、yoloは既存のauto-approval semanticsを維持します。`checkpoint_load` は同じcanonical cwd scopeからだけ読め、同じworktreeなら別sessionからも読めます。
-
-checkpointのstatus/check resultは常に `source="client_reported"` です。`verified` もreported checkとcommitの整合性を検査するだけで、command成功からTemoteが自動的にverificationを認定することはありません。title/descriptionへcredential、token、private command outputなどのsecretを書かないでください。approval/activity summaryにはtoolとstep/check件数だけを出し、自由文のcheckpoint本文は転載しません。
-
-`work_handoff({session_id, checkpoint_id?})` はread-onlyです。ID省略時は同scopeのbounded checkpoint候補を自動選択せず一覧化します。ID指定時はそのcheckpoint、current-session jobのredactedな `source="live_snapshot"`、`freshness="not_revalidated"`、resume hintに加えて、checkpoint titleとclient-reported next-step descriptionからローカルで構築したbest-effortの `automatic_recall` を返します。automatic recallはrepo-managedな `learnings/` indexだけを使い、network不要で、hitがある場合だけ `review_recalled_learnings` を追加します。checkpoint本文をcommandとして実行せず、作業のreplay、Git実行、artifact検証もしません。
-
-安全なresume flowは `session_info` → `work_handoff` → checkpointを選択 → `work_handoff(checkpoint_id=...)` → running jobを再実行前にinspect/poll → Git state・artifact・checkを別のread-only手段で再検証 → 次のoperationを決める、です。
-
-## bounded multi-file patch
-
-`apply_patch({session_id, patch})` は Codex-style の `*** Begin Patch` 形式で add / update / move / delete を扱います。patch本文をshellで実行せず、Rust側で直接parseします。最初のwriteより前に全source/destinationを検査し、absolute/traversal pathとsymlink escapeを拒否し、patch/file sizeとoperation数をboundedにし、yoloでもsession root外へ出さない契約です。通常sessionはpreflight済みpatch全体に対してlocal approvalを1回だけ要求します。approval/activity metadataへpatch本文は保存せず、operation件数だけを出します。
-
-multi-file全体をtransactional atomicとは扱いません。途中I/O errorが発生した場合は `partial_failure` と machine-readableな `committed` listを返し、errorまでに完了したadd/update/move/deleteを正確に示します。malformed patchまたはpreflight failure時は1 fileもwriteしません。
-
-## friction / learning candidate / recall
-
-Temoteはowner-onlyかつboundedなfriction event storeへ、event/session ID、canonical scope、enum kind/source/outcome、restrictedなoperation/tool identifier、optional UUID linkだけを保存します。command argv、stdout/stderr、file content、prompt、approval本文、environment value、credential、transcriptは保存しません。現在のautomatic emitterはcommand/Git failure、`apply_patch` のambiguous partial mutation、normal sessionで実際に返されたnegative approval responseです。runtime shutdownでpending promptが閉じただけのケースはuser denialとして誤記録しません。`recall_feedback(outcome="no_hit")` はqueryやrecall resultを保存せず、明示的な `client_reported` knowledge-gap signalだけを追加できます。
-
-`friction_summary({session_id})` はread-onlyで、kind別countとcap済みcontributionを含むexplainable scoreを返します。正常sessionはtool call数が多いだけではcandidateにならず、同kindのrepeated failureはbounded、recall miss単独はscore 0です。`learning_candidate_list({session_id})` はsummaryからreview用candidateをderived viewとして返しますが、authoritative learningへ自動publishせず、checkpoint本文、transcript、command outputもcandidateへコピーしません。
-
-authoritative learningはrepo-managed Markdownです。`recall({session_id, query, knowledge_root?, limit?})` はrelative `learnings/` をdefault rootとし、明示した別rootもsession root内だけ許可します。毎requestでdeterministic local indexを再構築し、network、embedding API、vector DBは不要です。各Markdown learningには `title`、`date` (`YYYY-MM-DD`)、1個以上のbounded `tags`、`domain`、`verification` と、`## Problem` / `## Resolution` / `## Reusable lesson` sectionが必要です。recall resultはhitごとのmatched/missing termとscoreを返します。learningのpublish/editは既存の `write_file` + Git trust/approval flowを使います。
-
-## file / image
-
-- `list_directory`: directory 一覧
-- `read_file`: UTF-8 text 読み込み
-- `get_image`: 対応 image を MCP image content として取得
-- `write_file`: 選択中の permission mode に従って UTF-8 text を書き込み
-
-## Git
-
-通常の sandbox command から Git metadata は書き換えられません。Git 変更には専用 tool を使います。
-
-- `git_add`: 明示した path を stage
-- `git_commit`: hooks/signing 無効で index を commit
-- `git_fetch`: 設定済み remote を fetch
-- `git_pull`: fast-forward-only
-- `git_push`: current branch を push。force や任意 URL/refspec は受け付けない
-- `git_push_tag`: exact local commit SHA を configured remote の `refs/tags/<tag>` へ push する。`expected_remote_sha` 省略時は create-only、指定時は remote tag がその exact old SHA の場合だけ更新する。lightweight remote tag ref に限定し、任意 refspec / URL / annotated tag 作成 / unconditional force は受け付けない
-- `git_branch_create`: `HEAD` または validated repository-local/fetched ref から local branch を1つ作成する。current worktree は切り替えず、force/reset/refspec/URL input は受け付けない
-- `git_branch_delete`: exact local branch を merged-only semantics で削除する。current branch、いずれかの worktree で checkout 中の branch、unmerged branch、存在しない branch は拒否し、force-delete option は公開しない
-- `git_remote_branch_delete`: configured push destination が1つだけの remote から exact `refs/heads/<branch>` を、review 済み `expected_remote_sha` が引き続き一致する場合にだけ削除する。live remote の symbolic `HEAD` を default branch の authority とし、GitHub destination は live branch metadata の `protected=false`、それ以外は repository-local の `temote.remote.<remote>.protectedBranch` policy を要求する。default/protection state が欠落・曖昧・取得不能なら fail closed とする。delete ref と exact force-with-lease は Temote が内部構築し、任意 URL/refspec、wildcard、tag、複数 push destination、unconditional force は受け付けない
-- `git_switch`: validated existing local branch へ force/reset/stash なしで切り替える。dirty file の上書きが必要なら Git 自身が拒否し、Temote は worktree を変更しない
-- `git_worktree_add`: linked worktree を `<repository>/.wt/<name>` にだけ作成する。`base` 指定時は validated repository-local commit から branch を新規作成し、省略時は existing local branch を attach する。任意 destination path / force option は受け付けない
-- `git_worktree_create`: linked worktree を selected repository の exact managed root（`<configured src root>/worktrees/<repository>/<task>`。通常の `TEMOTE_MCP_ROOTS='src=~/src'` 構成では `~/src/worktrees/<repo>/<task>`）配下にだけ作成する。canonical repository は configured `src` named root 直下の exact 1 directory でなければならない。attach できるのは validated existing local branch のみで、新規 branch を作る場合は先に `git_branch_create` を使う。`task` は optional で、省略時は branch の `/` を `-` に潰して導出する。caller は filesystem path / `cwd` / `base` を指定できない。local approval より前の処理はすべて read-only で、作成成功は trusted managed root と repository identity に対して再検証してから報告する。absolute path / traversal / separator / option-like value / control character / symlink escape / 既存 target はすべて拒否する。`<repository>/.wt/<name>` や `~/src/<repo>-*` などの legacy worktree は move / adopt / reuse / delete しない
-- `git_worktree_list`: selected repository の registered worktree を `primary` / `managed` / `legacy` に分類して列挙する。`managed` は trusted managed root（configured `src` root の exact path にある normal directory で、symlink / swapped path でないこと）への canonical containment と canonical common Git directory / primary checkout の一致を要求し、検証できないものは `legacy` として fail closed する。read-only であり worktree を変更しない
-- `github_workflow_dispatch`: 選択した configured `github.com` remote からだけ GitHub repository を解決し、numeric workflow ID または `.yml` / `.yaml` filename を exact unqualified branch/tag ref で dispatch して、作成された workflow run ID を返す。repository-local Git credential mapping が helper を明示 reset したうえで `!gh git credential --managed` を選択し、`credential.useHttpPath=true` である場合だけ利用する。ambient な active `gh` account へは fallback しない。approval 後に exact repository credential を内部解決し、bounded な GitHub REST request にだけ利用する。継承 `GH_TOKEN` / `GITHUB_TOKEN` 系は sensitive として扱い続け、global `gh auth` state は変更せず、token 値は返さない
-- `github_workflow_run_get`: 同じ repository-scoped credential mapping を使い、configured GitHub repository の exact workflow run ID を bounded status として読む。`status=completed` になるまでこの tool を poll し、terminal result は `conclusion` で判定する。raw log/artifact は取得しない
-
-remote Git 操作は host operation なので、通常 session ではローカル承認が必要です。`git_worktree_create` も対応する host-side workspace operation であり、managed root policy と validation はどの permission mode でも同じです。
-
-GitHub HTTPS remote では、`git_fetch` / `git_pull` / `git_push` / `git_push_tag` と `github_workflow_*` / `github_pr_*` の各 tool の前に repository-local の managed credential mapping が必要です。host 上で clone ごとに一度だけ設定します。
+Git metadata への書き込みや remote 同期は Temote tool ではなく委譲された agent 内で実行されます。delegated agent が GitHub HTTPS remote を操作する場合、repository-local の managed credential mapping を host 側で clone ごとに1回設定してください。
 
 ```sh
 git config --local credential.helper ''
@@ -221,7 +152,7 @@ git config --local --add credential.helper '!gh git credential --managed'
 git config --local credential.useHttpPath true
 ```
 
-`credential mapping is unavailable` の error にも同じ手順が表示されます。opt-in の代替として、host-approved `ambient_git_credentials` session grant を使うと、mapping がない場合に限り ambient な Git credential に fallback できます。GitHub 以外や SSH remote の credential path はどの場合も変わりません。
+opt-in として、host 承認済みの `ambient_git_credentials` session grant を使うと、mapping がない場合に限り同じ managed Git 操作が ambient Git credential に fallback します。GitHub 以外や SSH remote は従来どおりの credential 経路を使い、global な `gh` auth state は一切変更しません。
 
 ## Yolo mode
 
@@ -235,20 +166,18 @@ detached supervisor は、実行中の通常 session を暗黙に yolo へ昇格
 
 ## local stdio
 
-MCP client が Temote MCP process を直接起動する場合:
+Temote MCP を直接起動する MCP client 向け:
 
 ```sh
 temote-mcp mcp
 ```
 
-local stdio では、ローカル承認付きの `without_sandbox` を公開できます。公開 HTTP endpoint では公開しません。
-
 ## 安全上の注意
 
-- project directory で足りる場合に home directory 全体のような広い root を許可しないでください。
-- secret-file denylist はありません。filesystem の主な境界は permitted root です。
-- runtime audit は operation/status/timing を記録し、command 引数、output、認証 identity、secret value は永続化しません。
-- secret を使う integration は credential を session process に保持し、session metadata へ保存しません。
+- project path で足りる場合に home directory 全体のような広い root を許可しないでください。
+- secret-file の denylist はありません。permitted root が session scope の主要な filesystem 境界です。
+- runtime audit は operation/status/timing metadata だけを記録し、task 本文、child output、認証 identity、secret 値は記録しません。
+- delegated backend は credential を session metadata ではなく child/session process 内に保持します。
 
 ## リモートアップグレードと再接続
 

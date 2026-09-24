@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -18,10 +17,6 @@ const MAX_EVENTS: usize = 512;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 64;
 const MAX_SCOPE_PATH_BYTES: usize = 4096;
-const CANDIDATE_THRESHOLD: u64 = 4;
-const CANDIDATE_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x16, 0xba, 0x3a, 0x2a, 0xf5, 0xdf, 0x4a, 0xb5, 0xb4, 0x98, 0x21, 0x0f, 0x87, 0xd4, 0xc4, 0x63,
-]);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -38,38 +33,6 @@ pub(crate) enum FrictionKind {
     ClientOperationRetried,
     AmbiguousMutationDetected,
     RecallMiss,
-}
-
-impl FrictionKind {
-    fn weight(self) -> u64 {
-        match self {
-            Self::ApprovalDenied => 2,
-            Self::SandboxDenied | Self::PathEscapeRejected => 2,
-            Self::ExecuteFailed | Self::JobFailed | Self::GitOperationFailed => 2,
-            Self::JobCancelled => 1,
-            Self::SessionCrashed | Self::AmbiguousMutationDetected => 4,
-            Self::IntegrationFailed => 2,
-            Self::ClientOperationRetried => 1,
-            Self::RecallMiss => 0,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ApprovalDenied => "approval_denied",
-            Self::SandboxDenied => "sandbox_denied",
-            Self::PathEscapeRejected => "path_escape_rejected",
-            Self::ExecuteFailed => "execute_failed",
-            Self::JobFailed => "job_failed",
-            Self::JobCancelled => "job_cancelled",
-            Self::SessionCrashed => "session_crashed",
-            Self::GitOperationFailed => "git_operation_failed",
-            Self::IntegrationFailed => "integration_failed",
-            Self::ClientOperationRetried => "client_operation_retried",
-            Self::AmbiguousMutationDetected => "ambiguous_mutation_detected",
-            Self::RecallMiss => "recall_miss",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,39 +68,6 @@ pub(crate) struct FrictionEvent {
     pub outcome: EventOutcome,
     pub retry_group: Option<Uuid>,
     pub related_checkpoint: Option<Uuid>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct FrictionReason {
-    pub kind: String,
-    pub count: usize,
-    pub effective_count: usize,
-    pub contribution: u64,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct FrictionSummary {
-    pub session_id: String,
-    pub scope_cwd: PathBuf,
-    pub event_count: usize,
-    pub observed_count: usize,
-    pub client_reported_count: usize,
-    pub score: u64,
-    pub candidate: bool,
-    pub reasons: Vec<FrictionReason>,
-    pub knowledge_gap_bonus: u64,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct LearningCandidate {
-    pub candidate_id: Uuid,
-    pub session_id: String,
-    pub scope_cwd: PathBuf,
-    pub created_at: u64,
-    pub status: String,
-    pub friction_summary: FrictionSummary,
-    pub related_checkpoints: Vec<Uuid>,
-    pub authoritative_learning_created: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -199,53 +129,6 @@ impl Store {
         self.write_event(&event)?;
         self.prune_locked()?;
         Ok(event)
-    }
-
-    pub(crate) fn events_for_session(
-        &self,
-        session: &config::Session,
-    ) -> Result<Vec<FrictionEvent>> {
-        validate_session_scope(session)?;
-        let mut events = self.read_all()?;
-        events.retain(|event| event.scope_cwd == session.cwd && event.session_id == session.id);
-        events.sort_by_key(|event| (event.occurred_at, event.event_id));
-        Ok(events)
-    }
-
-    pub(crate) fn summary(&self, session: &config::Session) -> Result<FrictionSummary> {
-        let events = self.events_for_session(session)?;
-        Ok(score_events(session, &events))
-    }
-
-    pub(crate) fn candidates(&self, session: &config::Session) -> Result<Vec<LearningCandidate>> {
-        let events = self.events_for_session(session)?;
-        let summary = score_events(session, &events);
-        if !summary.candidate {
-            return Ok(Vec::new());
-        }
-        let created_at = events
-            .iter()
-            .map(|event| event.occurred_at)
-            .max()
-            .unwrap_or(0);
-        let mut related_checkpoints = events
-            .iter()
-            .filter_map(|event| event.related_checkpoint)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        related_checkpoints.sort_by_key(Uuid::to_string);
-        let candidate_id = candidate_id(session);
-        Ok(vec![LearningCandidate {
-            candidate_id,
-            session_id: session.id.clone(),
-            scope_cwd: session.cwd.clone(),
-            created_at,
-            status: "candidate".to_owned(),
-            friction_summary: summary,
-            related_checkpoints,
-            authoritative_learning_created: false,
-        }])
     }
 
     fn ensure_directory(&self) -> Result<()> {
@@ -416,92 +299,6 @@ pub(crate) fn record_observed(
     }
 }
 
-pub(crate) async fn record_observed_for_session_id(
-    session_id: &str,
-    kind: FrictionKind,
-    operation_class: Option<&str>,
-    tool_name: Option<&str>,
-    outcome: EventOutcome,
-) {
-    if let Ok(session) = config::load_session(session_id).await {
-        record_observed(
-            &session,
-            kind,
-            operation_class,
-            tool_name,
-            outcome,
-            None,
-            None,
-        );
-    }
-}
-
-pub(crate) fn record_client_reported_recall_miss(
-    session: &config::Session,
-    retry_group: Option<Uuid>,
-) -> Result<FrictionEvent> {
-    Store::default_store()?.record(
-        session,
-        FrictionKind::RecallMiss,
-        ObservationSource::ClientReported,
-        Some("recall"),
-        Some("recall_feedback"),
-        EventOutcome::NoHit,
-        retry_group,
-        None,
-    )
-}
-
-fn score_events(session: &config::Session, events: &[FrictionEvent]) -> FrictionSummary {
-    let mut counts = BTreeMap::<FrictionKind, usize>::new();
-    let mut observed_count = 0usize;
-    let mut client_reported_count = 0usize;
-    for event in events {
-        *counts.entry(event.kind).or_default() += 1;
-        match event.source {
-            ObservationSource::Observed => observed_count += 1,
-            ObservationSource::ClientReported => client_reported_count += 1,
-        }
-    }
-
-    let mut score = 0u64;
-    let mut reasons = Vec::new();
-    for (kind, count) in counts {
-        let effective_count = count.min(3);
-        let contribution = kind.weight() * effective_count as u64;
-        score = score.saturating_add(contribution);
-        reasons.push(FrictionReason {
-            kind: kind.as_str().to_owned(),
-            count,
-            effective_count,
-            contribution,
-        });
-    }
-    let has_recall_miss = events
-        .iter()
-        .any(|event| event.kind == FrictionKind::RecallMiss);
-    let knowledge_gap_bonus = u64::from(has_recall_miss && score > 0);
-    score = score.saturating_add(knowledge_gap_bonus);
-    FrictionSummary {
-        session_id: session.id.clone(),
-        scope_cwd: session.cwd.clone(),
-        event_count: events.len(),
-        observed_count,
-        client_reported_count,
-        score,
-        candidate: score >= CANDIDATE_THRESHOLD,
-        reasons,
-        knowledge_gap_bonus,
-    }
-}
-
-fn candidate_id(session: &config::Session) -> Uuid {
-    let mut bytes = session.cwd.to_string_lossy().as_bytes().to_vec();
-    bytes.push(0);
-    bytes.extend_from_slice(session.id.as_bytes());
-    Uuid::new_v5(&CANDIDATE_NAMESPACE, &bytes)
-}
-
 fn validate_session_scope(session: &config::Session) -> Result<()> {
     config::validate_session_id(&session.id)?;
     let canonical = config::canonical_directory(&session.cwd)?;
@@ -651,41 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn friction_event_distinguishes_observed_from_client_reported() {
-        let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let store = Store::new(state.path().join("friction"));
-        let session = session(root.path(), "sources");
-        store
-            .record(
-                &session,
-                FrictionKind::ApprovalDenied,
-                ObservationSource::Observed,
-                Some("approval"),
-                Some("write_file"),
-                EventOutcome::Denied,
-                None,
-                None,
-            )
-            .unwrap();
-        store
-            .record(
-                &session,
-                FrictionKind::RecallMiss,
-                ObservationSource::ClientReported,
-                Some("recall"),
-                Some("recall_feedback"),
-                EventOutcome::NoHit,
-                None,
-                None,
-            )
-            .unwrap();
-        let summary = store.summary(&session).unwrap();
-        assert_eq!(summary.observed_count, 1);
-        assert_eq!(summary.client_reported_count, 1);
-    }
-
-    #[test]
     fn friction_retention_is_bounded() {
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -706,70 +468,6 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.read_all().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn deleted_historical_scope_does_not_break_current_summary_candidate_or_prune() {
-        let stale_root = tempfile::tempdir().unwrap();
-        let current_root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let store = Store::new(state.path().join("friction")).with_max_events(2);
-        let stale_session = session(stale_root.path(), "stale-scope");
-        let stale_event = store
-            .record(
-                &stale_session,
-                FrictionKind::ExecuteFailed,
-                ObservationSource::Observed,
-                Some("execute"),
-                Some("execute"),
-                EventOutcome::Failed,
-                None,
-                None,
-            )
-            .unwrap();
-        let mut persisted_stale_event = stale_event.clone();
-        persisted_stale_event.occurred_at = 0;
-        std::fs::write(
-            store
-                .directory
-                .join(format!("{}.json", persisted_stale_event.event_id)),
-            serde_json::to_vec_pretty(&persisted_stale_event).unwrap(),
-        )
-        .unwrap();
-        let stale_scope = stale_session.cwd.clone();
-        drop(stale_root);
-        assert!(!stale_scope.exists());
-
-        let current_session = session(current_root.path(), "current-scope");
-        let summary = store.summary(&current_session).unwrap();
-        assert_eq!(summary.event_count, 0);
-        assert_eq!(summary.score, 0);
-        assert!(store.candidates(&current_session).unwrap().is_empty());
-
-        for _ in 0..2 {
-            store
-                .record(
-                    &current_session,
-                    FrictionKind::ExecuteFailed,
-                    ObservationSource::Observed,
-                    Some("execute"),
-                    Some("execute"),
-                    EventOutcome::Failed,
-                    None,
-                    None,
-                )
-                .unwrap();
-        }
-        let retained = store.read_all().unwrap();
-        assert_eq!(retained.len(), 2);
-        assert!(
-            retained
-                .iter()
-                .all(|event| event.event_id != stale_event.event_id)
-        );
-        assert!(retained.iter().all(|event| {
-            event.session_id == current_session.id && event.scope_cwd == current_session.cwd
-        }));
     }
 
     #[test]
@@ -884,155 +582,5 @@ mod tests {
         std::fs::rename(&symlink_path, &target).unwrap();
         std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
         assert!(symlink_store.read_all().is_err());
-    }
-
-    #[test]
-    fn clean_high_tool_count_session_does_not_trigger_candidate() {
-        let root = tempfile::tempdir().unwrap();
-        let session = session(root.path(), "clean");
-        let summary = score_events(&session, &[]);
-        assert_eq!(summary.score, 0);
-        assert!(!summary.candidate);
-    }
-
-    #[test]
-    fn repeated_same_root_failure_is_bounded_and_explainable() {
-        let root = tempfile::tempdir().unwrap();
-        let session = session(root.path(), "bounded-score");
-        let mut events = Vec::new();
-        for _ in 0..100 {
-            events.push(FrictionEvent {
-                schema_version: FRICTION_SCHEMA_VERSION,
-                event_id: Uuid::new_v4(),
-                session_id: session.id.clone(),
-                scope_cwd: session.cwd.clone(),
-                occurred_at: 1,
-                kind: FrictionKind::ExecuteFailed,
-                source: ObservationSource::Observed,
-                operation_class: Some("execute".to_owned()),
-                tool_name: Some("execute".to_owned()),
-                outcome: EventOutcome::Failed,
-                retry_group: None,
-                related_checkpoint: None,
-            });
-        }
-        let summary = score_events(&session, &events);
-        assert_eq!(summary.score, 6);
-        assert_eq!(summary.reasons[0].count, 100);
-        assert_eq!(summary.reasons[0].effective_count, 3);
-        assert_eq!(summary.reasons[0].contribution, 6);
-    }
-
-    #[test]
-    fn approval_denial_contributes_without_recording_approval_body() {
-        let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let store = Store::new(state.path().join("friction"));
-        let session = session(root.path(), "approval");
-        store
-            .record(
-                &session,
-                FrictionKind::ApprovalDenied,
-                ObservationSource::Observed,
-                Some("approval"),
-                Some("git_push"),
-                EventOutcome::Denied,
-                None,
-                None,
-            )
-            .unwrap();
-        let serialized = std::fs::read_to_string(
-            std::fs::read_dir(&store.directory)
-                .unwrap()
-                .filter_map(|entry| entry.ok())
-                .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-                .unwrap()
-                .path(),
-        )
-        .unwrap();
-        assert!(!serialized.contains("approval body sentinel"));
-        assert_eq!(store.summary(&session).unwrap().score, 2);
-    }
-
-    #[test]
-    fn ambiguous_mutation_is_high_value_friction() {
-        let root = tempfile::tempdir().unwrap();
-        let session = session(root.path(), "ambiguous");
-        let event = FrictionEvent {
-            schema_version: FRICTION_SCHEMA_VERSION,
-            event_id: Uuid::new_v4(),
-            session_id: session.id.clone(),
-            scope_cwd: session.cwd.clone(),
-            occurred_at: 1,
-            kind: FrictionKind::AmbiguousMutationDetected,
-            source: ObservationSource::Observed,
-            operation_class: Some("filesystem".to_owned()),
-            tool_name: Some("apply_patch".to_owned()),
-            outcome: EventOutcome::Ambiguous,
-            retry_group: None,
-            related_checkpoint: None,
-        };
-        let summary = score_events(&session, &[event]);
-        assert!(summary.candidate);
-        assert_eq!(summary.score, 4);
-    }
-
-    #[test]
-    fn recall_no_hit_alone_does_not_create_candidate_but_can_bonus_real_friction() {
-        let root = tempfile::tempdir().unwrap();
-        let session = session(root.path(), "gap");
-        let miss = FrictionEvent {
-            schema_version: FRICTION_SCHEMA_VERSION,
-            event_id: Uuid::new_v4(),
-            session_id: session.id.clone(),
-            scope_cwd: session.cwd.clone(),
-            occurred_at: 1,
-            kind: FrictionKind::RecallMiss,
-            source: ObservationSource::ClientReported,
-            operation_class: Some("recall".to_owned()),
-            tool_name: Some("recall_feedback".to_owned()),
-            outcome: EventOutcome::NoHit,
-            retry_group: None,
-            related_checkpoint: None,
-        };
-        let only_miss = score_events(&session, std::slice::from_ref(&miss));
-        assert_eq!(only_miss.score, 0);
-        assert!(!only_miss.candidate);
-        let mut failure = miss.clone();
-        failure.event_id = Uuid::new_v4();
-        failure.kind = FrictionKind::ExecuteFailed;
-        failure.source = ObservationSource::Observed;
-        failure.outcome = EventOutcome::Failed;
-        let combined = score_events(&session, &[miss, failure]);
-        assert_eq!(combined.knowledge_gap_bonus, 1);
-        assert_eq!(combined.score, 3);
-    }
-
-    #[test]
-    fn candidate_does_not_become_learning_automatically_or_copy_transcript() {
-        let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let store = Store::new(state.path().join("friction"));
-        let session = session(root.path(), "candidate");
-        let checkpoint = Uuid::new_v4();
-        store
-            .record(
-                &session,
-                FrictionKind::AmbiguousMutationDetected,
-                ObservationSource::Observed,
-                Some("filesystem"),
-                Some("apply_patch"),
-                EventOutcome::Ambiguous,
-                None,
-                Some(checkpoint),
-            )
-            .unwrap();
-        let candidates = store.candidates(&session).unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert!(!candidates[0].authoritative_learning_created);
-        assert_eq!(candidates[0].related_checkpoints, vec![checkpoint]);
-        let serialized = serde_json::to_string(&candidates[0]).unwrap();
-        assert!(!serialized.contains("transcript"));
-        assert!(!serialized.contains("stdout"));
     }
 }
