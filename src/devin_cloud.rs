@@ -1405,12 +1405,24 @@ fn derive_state(remote: &RemoteSession, current: TaskStatus) -> DerivedState {
             needs_messages: false,
         },
         "running" => match detail {
-            Some("waiting_for_user") => DerivedState {
-                status: TaskStatus::WaitingInput,
-                report: structured_report,
-                last_error: Some("Devin session is waiting for user input".to_owned()),
-                needs_messages: false,
-            },
+            Some("waiting_for_user") => {
+                // Devin idles after finishing a turn instead of exiting, so a
+                // terminal structured report wins over the waiting state.
+                let terminal = structured_report.as_ref().and_then(report_task_status);
+                let needs_messages = structured_report.is_none();
+                DerivedState {
+                    status: terminal.unwrap_or(TaskStatus::WaitingInput),
+                    report: structured_report,
+                    last_error: match terminal {
+                        None | Some(TaskStatus::WaitingInput) => {
+                            Some("Devin session is waiting for user input".to_owned())
+                        }
+                        Some(TaskStatus::Completed) => None,
+                        _ => Some("Devin session reported failure".to_owned()),
+                    },
+                    needs_messages,
+                }
+            }
             Some("waiting_for_approval") => DerivedState {
                 status: TaskStatus::WaitingApproval,
                 report: None,
@@ -1479,6 +1491,16 @@ fn derive_state(remote: &RemoteSession, current: TaskStatus) -> DerivedState {
             )),
             needs_messages: false,
         },
+    }
+}
+
+/// Terminal task outcome encoded in a validated report, if it declares one.
+/// `blocked` and `needs_decision` stay steerable (waiting_input).
+fn report_task_status(report: &Value) -> Option<TaskStatus> {
+    match report.get("status").and_then(Value::as_str) {
+        Some("completed") => Some(TaskStatus::Completed),
+        Some("failed") => Some(TaskStatus::Failed),
+        _ => None,
     }
 }
 
@@ -1566,6 +1588,14 @@ async fn reconcile(
         {
             derived.report = Some(report);
             if derived.status == TaskStatus::Completed {
+                derived.last_error = None;
+            }
+        }
+        if derived.status == TaskStatus::WaitingInput
+            && let Some(status) = derived.report.as_ref().and_then(report_task_status)
+        {
+            derived.status = status;
+            if status == TaskStatus::Completed {
                 derived.last_error = None;
             }
         }
@@ -2615,10 +2645,34 @@ mod tests {
             derive_state(&remote("new", None, None), running).status,
             TaskStatus::Running
         );
-        assert_eq!(
-            derive_state(&remote("running", Some("waiting_for_user"), None), running).status,
-            TaskStatus::WaitingInput
+        let waiting = derive_state(&remote("running", Some("waiting_for_user"), None), running);
+        assert_eq!(waiting.status, TaskStatus::WaitingInput);
+        assert!(waiting.needs_messages);
+        // Devin idles after a finished turn; a terminal structured report wins.
+        let done_idle = derive_state(
+            &remote("running", Some("waiting_for_user"), Some(valid_report())),
+            running,
         );
+        assert_eq!(done_idle.status, TaskStatus::Completed);
+        assert!(!done_idle.needs_messages);
+        let failed_idle = derive_state(
+            &remote(
+                "running",
+                Some("waiting_for_user"),
+                Some(json!({"status": "failed", "summary": "x"})),
+            ),
+            running,
+        );
+        assert_eq!(failed_idle.status, TaskStatus::Failed);
+        let blocked_idle = derive_state(
+            &remote(
+                "running",
+                Some("waiting_for_user"),
+                Some(json!({"status": "blocked", "summary": "need key"})),
+            ),
+            running,
+        );
+        assert_eq!(blocked_idle.status, TaskStatus::WaitingInput);
         let finished = derive_state(&remote("running", Some("finished"), None), running);
         assert_eq!(finished.status, TaskStatus::Completed);
         assert!(finished.needs_messages);

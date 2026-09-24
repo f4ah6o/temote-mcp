@@ -56,9 +56,15 @@ tool 名・approval class・task store・env 変数をすべて分離し、混�
 - Rust unit tests (fake API): create/bind、operation_id replay、rejected → `retryable_failed`、
   uncertain → `reconciliation_required`、remote status reconcile、structured/fallback report、
   steer/resume/interrupt、cross-session invisibility、status が secret を含まないこと。
-- 未実施: 実 credential での live 検証 (session 作成〜終了、`/v3/self` の org 解決、
-  suspended → resume)。coordinator が `TEMOTE_MCP_DEVIN_API_KEY` を用意した後に実施し、
-  結果をこの issue に追記する。
+- 実施済み (2026-09-24, service-user key `temote-mcp`, org `org-628d...`): `doctor` PASS、
+  `devin_cloud_status` (`/v3/self` で org 解決、credential 値は出力されない)、`task_start`
+  で hosted session 作成・bind・`running`、同一 `operation_id` + 異なる input は
+  `OPERATION_CONFLICT` で fail closed、`task_get` で remote status reconcile、
+  structured output から `completed` report 抽出、`interrupt` で remote DELETE → `interrupted`。
+  live 検証で判明した実装差異を修正済み: Devin session は turn 終了後に `exit` せず
+  `running`/`waiting_for_user` で idle するため、terminal structured report を
+  `waiting_input` より優先する。
+- 未実施: suspended → resume の live 確認 (suspended 状態を再現するタイミングが取れなかった)。
 
 ## Subscription 利用について (2026-09-24 coordinator 回答「サブスクリプションの範囲で使いたい」)
 
