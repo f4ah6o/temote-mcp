@@ -501,6 +501,61 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "devin_cloud_status",
+    "Check Devin Cloud API access",
+    "Verify the configured Devin Cloud API v3 credential and return the authenticated principal, organization, and API base URL without the credential value.",
+    networkReadOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
+    "devin_cloud_task_start",
+    "Start a Devin Cloud session task",
+    "Start an idempotent scoped Devin Cloud hosted session (API v3) with durable pre-side-effect acceptance and a structured report schema.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        operation_id: { type: "string", format: "uuid" },
+        task: { type: "string", minLength: 1, maxLength: 1048576 },
+        title: { type: "string", minLength: 1, maxLength: 256 },
+        devin_mode: { type: "string", enum: ["normal", "fast", "lite", "ultra", "fusion"] },
+        repos: { type: "array", items: { type: "string", minLength: 1, maxLength: 256 }, maxItems: 16 },
+        max_acu_limit: { type: "integer", minimum: 1, maximum: 100000 },
+      },
+      ["session_id", "operation_id", "task"],
+    ),
+  ),
+  tool(
+    "devin_cloud_task_get",
+    "Read a Devin Cloud session task",
+    "Read and reconcile a retained Devin Cloud task owned by the selected full session instance and scope against the hosted session status.",
+    networkReadOnly,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", format: "uuid" },
+        after_revision: { type: "integer", minimum: 0 },
+      },
+      ["session_id", "task_id"],
+    ),
+  ),
+  tool(
+    "devin_cloud_task_control",
+    "Control a Devin Cloud session task",
+    "Idempotently steer, resume, or interrupt the hosted Devin Cloud session of a retained scoped task.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", format: "uuid" },
+        operation_id: { type: "string", format: "uuid" },
+        action: { type: "string", enum: ["steer", "resume", "interrupt"] },
+        input: { type: "string", minLength: 1, maxLength: 1048576 },
+      },
+      ["session_id", "task_id", "operation_id", "action"],
+    ),
+  ),
+  tool(
     "local_agent_run",
     "Run a local coding agent",
     "Run a verified Codex or OpenCode non-interactive agent in the selected host session with canonical workspace scope, bounded task/output, isolated agent state, and local approval. With worktree.branch, Temote derives and validates the repository's managed worktree itself and rejects cwd combined with worktree.",

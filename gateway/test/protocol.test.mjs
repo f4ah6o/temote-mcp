@@ -111,11 +111,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 73);
+  assert.equal(names.length, 77);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "local_agent_run", "dev_tool_run"]) {
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "local_agent_run", "dev_tool_run"]) {
     assert.equal(names.includes(required), true, required);
   }
   const gitPushTag = PUBLIC_TOOLS.find((tool) => tool.name === "git_push_tag");
@@ -1704,7 +1704,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 73);
+  assert.equal(rpc.result.tools.length, 77);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }
