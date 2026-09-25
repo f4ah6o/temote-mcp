@@ -119,12 +119,15 @@ task view の field 集合はその時点の backend 実装に従う。A4 (task 
   executor (session runtime / session-scoped task executor) へ route → A 系の
   `orchestration::invoke(backend, operation, args, session, activity)` へ渡す。
   activity / approval / evidence / task runtime lease は MCP 経路と同じ session 文脈を使う。
-- **instance precondition の照合と dispatch は同じ execution owner で直列化する。** server は
-  live instance の `instance_generation` を照合し、一致した場合にその runtime handle のまま
-  dispatch する。照合と session の start / stop / restart 遷移は同一の transition guard
-  (または runtime handle) の下で行い、照合直後に別 instance へ差し替わった状態で backend を
-  呼ばない。dispatch 中に instance が停止した場合は既存の `ensure_current_active_instance` が
-  fail closed し、receipt を別 instance で受理しない。
+- **instance precondition は request 受領時と backend dispatch 直前の 2 回照合し、dispatch は
+  解決済み instance に束縛する。** server は request 受領時に session instance を解決して
+  `instance_generation` を照合し、その runtime handle / 解決済み `config::Session` のまま
+  dispatch する (`session_id` から dispatch 時に再解決しない)。approval などで待機した後、
+  backend を呼ぶ直前に再照合し、instance が変わっていれば backend を呼ばずに
+  `TASK_SESSION_INSTANCE_CHANGED` を返す。照合後・dispatch 中に instance が停止した場合も、
+  backend の既存 `ensure_current_active_instance` が approval / receipt 受理の前に fail
+  closed し、別 instance が旧 request を受理しない。長い approval 待ちの間 session の
+  start / stop をブロックしない (transition guard を dispatch 全体に保持しない)。
 - session が active でない、または instance を解決できない場合は backend を呼ばず
   `TASK_SESSION_NOT_FOUND` / `TASK_SESSION_NOT_ACTIVE` で拒否する。supervisor が代理で
   task を作らない。
@@ -148,10 +151,10 @@ B1 が追加する command (すべて snake_case):
 - すべての task command は envelope に `expected_instance_generation` (server 発行の opaque id) を
   **必須**で含む。欠落・型不一致は `TASK_PROTOCOL_INVALID`、live instance との不一致は
   approval / dispatch / receipt 受理の前に `TASK_SESSION_INSTANCE_CHANGED` で拒否する。
-  server は §2.4 の直列化の下で照合する。これは scope 指定権ではなく server 発行 identity の
-  照合条件であり、caller は generation 以外の instance field を指定できない。client 側の
-  事前比較 (§2.6) は fast path であり、Info と task 送信の間の再起動 (TOCTOU) はこの server 側
-  precondition で閉じる。
+  server は §2.4 の 2 回照合 (受領時 / dispatch 直前) で検証する。これは scope 指定権ではなく
+  server 発行 identity の照合条件であり、caller は generation 以外の instance field を
+  指定できない。client 側の事前比較 (§2.6) は fast path であり、Info と task 送信の間の
+  再起動 (TOCTOU) はこの server 側 precondition で閉じる。
 - **normalization rule**: server は envelope の field (`session_id` / `backend` /
   `expected_instance_generation`) を nested `request` へ merge しない。parser
   (`orchestration::TaskRequest::parse`) へ渡す入力は nested `request` そのものであり、
@@ -347,7 +350,7 @@ temote-mcp task reconcile --local --session <id> [<operation-id>]
 session runtime に opaque `instance_generation` を発行し `SessionView` へ追加 →
 task frame bound (16 MiB) と response timeout 分離 → peer credential / `protocol_version` /
 session / `expected_instance_generation` / backend / nested `request` normalization を dispatch
-前に検証 → precondition 照合と dispatch を同一 transition guard の下で実行 → その session の
+前に検証 → precondition を受領時と dispatch 直前の 2 回照合し、dispatch は解決済み instance の
 executor 経由で `orchestration::invoke` → bounded response。
 fixture backend で socket routing を確認し、v2 supervisor の EOF 挙動、認証・scope・version・
 ownership・instance precondition・frame 超過の拒否経路を同じ test suite に置く。特に
@@ -369,8 +372,9 @@ payload を送信しない。切断 / timeout 時に server を再起動せず�
 - [x] 4 command の envelope / nested `request` / normalization / exact fixture / error が揃っている (2.5)
 - [x] task frame 上限 (16 MiB) の導出と超過時の拒否が固定されている (2.5)
 - [x] operation record の session instance 束縛と再起動時の重複起動防止が固定されている (2.6)
-- [x] instance precondition (`expected_instance_generation`) で Info→送信間の再起動競合 (TOCTOU) を
-      server 側 dispatch 直前に拒否し、client 事前比較を fast path に限定している (2.2 / 2.4 / 2.5 / 2.6)
+- [x] instance precondition (`expected_instance_generation`) を受領時と dispatch 直前に照合して
+      Info→送信間の再起動競合 (TOCTOU) を server 側で拒否し、client 事前比較を fast path に
+      限定している (2.2 / 2.4 / 2.5 / 2.6)
 - [x] ingestion timeout と response wait の分離、切断 / session 停止 / 再起動 / retry が固定されている (2.7)
 - [x] `--local` が yolo / approval bypass / sessionless にならないことが明記されている (2.1–2.7)
 
@@ -411,10 +415,10 @@ PR #56 review 反映 2 回目 (2026-09-25):
 
 - Info と task 送信の間の再起動競合 (TOCTOU) を解消した。server 発行の opaque
   `instance_generation` を `SessionView` に追加し、すべての task command の envelope に
-  `expected_instance_generation` を必須 precondition として含める。server は session の
-  start / stop / restart 遷移と同一 guard の下で照合し、不一致は approval / dispatch /
-  receipt 受理の前に `TASK_SESSION_INSTANCE_CHANGED` で拒否する。client 側の事前比較は
-  fast path とし、retry は instance が変わった時点で新規試行として fresh な operation_id を
-  要求する (§2.2 / §2.4 / §2.5 / §2.6)。
+  `expected_instance_generation` を必須 precondition として含める。server は request 受領時と
+  backend dispatch 直前の 2 回照合し、不一致は approval / dispatch / receipt 受理の前に
+  `TASK_SESSION_INSTANCE_CHANGED` で拒否する。client 側の事前比較は fast path とし、retry は
+  instance が変わった時点で新規試行として fresh な operation_id を要求する
+  (§2.2 / §2.4 / §2.5 / §2.6)。
 - B1 の必須 regression に「Info が B を返した直後の C 再起動」と旧 operation_id retry の
   競合 fixture (backend dispatch 0 回) を追加した (§2.5 / §4)。
