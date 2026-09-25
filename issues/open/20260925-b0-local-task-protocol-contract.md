@@ -64,7 +64,8 @@ restart the lifecycle supervisor with the matching Temote version
 - task 操作は **すべて `session_id` を明示**する。task ID や cwd から session を探索して
   自動選択しない。`--session` もしくは検証済みの接続 context を必須とし、CLI が session を
   省略した場合は usage error で停止する (cwd からの推測をしない)。
-- request が運ぶのは `session_id` だけとする。`started_at` / `process_id` / scope /
+- request が instance について運ぶのは `session_id` と server 発行
+  `expected_instance_generation` (§2.5) だけとする。`started_at` / `process_id` / scope /
   permission mode を caller に指定させない。
 - server は live な session instance (`session_id` + `started_at` + `process_id` + canonical
   scope) を解決し、その `config::Session` を core へ渡す。同じ `session_id` でも restart 後の
@@ -82,7 +83,7 @@ restart the lifecycle supervisor with the matching Temote version
 
 ```json
 // request
-{"command":"task_get","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","backend":"codex","request":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","after_revision":7}}
+{"command":"task_get","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","expected_instance_generation":"3f1c0a9e-0b7d-4a1e-8c2f-6a5b4c3d2e1f","backend":"codex","request":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","after_revision":7}}
 // response (同じ権限の caller なら MCP の codex_task_get と同一 JSON)
 {"ok":true,"result":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","status":"running","revision":8,"generation":1,"evidence":null,"retention_seconds":86400},"error":null}
 ```
