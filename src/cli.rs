@@ -8,6 +8,7 @@ pub(crate) mod codex;
 use crate::config;
 #[cfg(feature = "network")]
 use crate::gateway;
+use crate::observation;
 use crate::profile;
 
 pub struct Cli {
@@ -36,6 +37,9 @@ pub enum Command {
         session_id: Option<String>,
         tail: usize,
         follow: bool,
+    },
+    Observation {
+        command: observation::cli::ObservationCommand,
     },
     UpgradeCoordinator {
         transaction_id: String,
@@ -264,6 +268,14 @@ where
         let command = parse_activity(&mut args).map_err(format_error)?;
         return finish(args, command);
     }
+    if noargs::cmd("observation")
+        .doc("Owner-only observation journal debug surface")
+        .take(&mut args)
+        .is_present()
+    {
+        let command = parse_observation(&mut args).map_err(format_error)?;
+        return finish(args, command);
+    }
     if noargs::cmd("upgrade-coordinator")
         .doc("Internal: continue one accepted remote upgrade transaction")
         .take(&mut args)
@@ -440,6 +452,120 @@ fn parse_activity(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
         tail,
         follow,
     })
+}
+
+fn parse_observation(args: &mut noargs::RawArgs) -> noargs::Result<Command> {
+    let command = if noargs::cmd("list")
+        .doc("List observation journal records for one session")
+        .take(args)
+        .is_present()
+    {
+        let kind = noargs::opt("kind")
+            .ty("KIND")
+            .doc("Filter to one observation kind")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().to_owned());
+        let kind = match kind.as_deref() {
+            Some(value) => Some(
+                observation::ObservationKind::parse(value).ok_or_else(|| {
+                    noargs::Error::other(
+                        args,
+                        format!(
+                            "unknown observation kind {value:?} (instruction, operation_accepted, execution_state, evidence, verification, delivery, reconciliation)"
+                        ),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        let task_id = noargs::opt("task")
+            .ty("TASK_ID")
+            .doc("Filter to one task")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().to_owned());
+        if task_id
+            .as_deref()
+            .is_some_and(|task| task.is_empty() || task.len() > 256)
+        {
+            return Err(noargs::Error::other(args, "--task must be a task ID"));
+        }
+        let after_revision = noargs::opt("after-revision")
+            .ty("REVISION")
+            .doc("Only records newer than this journal revision")
+            .take(args)
+            .present()
+            .map(|opt| opt.value().parse::<u64>())
+            .transpose()?;
+        let limit = noargs::opt("limit")
+            .ty("COUNT")
+            .doc("Return at most this many newest records (default: 64)")
+            .default("64")
+            .take(args)
+            .then(|opt| opt.value().parse::<usize>())?;
+        if limit > 256 {
+            return Err(noargs::Error::other(
+                args,
+                "observation limit must be an integer from 0 to 256",
+            ));
+        }
+        let include_content = noargs::flag("include-content")
+            .doc("Inline bounded observation content bodies")
+            .take(args)
+            .is_present();
+        let session_id = required_observation_session(args)?;
+        observation::cli::ObservationCommand::List {
+            session_id,
+            kind,
+            task_id,
+            after_revision,
+            limit,
+            include_content,
+        }
+    } else if noargs::cmd("get")
+        .doc("Print one observation journal record in full")
+        .take(args)
+        .is_present()
+    {
+        let session_id = required_observation_session(args)?;
+        let observation_id = noargs::arg("<OBSERVATION_ID>")
+            .doc("Observation ID")
+            .take(args)
+            .then(|arg| {
+                arg.value()
+                    .parse::<uuid::Uuid>()
+                    .map_err(|error| anyhow::anyhow!("invalid observation ID: {error}"))
+            })?;
+        observation::cli::ObservationCommand::Get {
+            session_id,
+            observation_id,
+        }
+    } else if noargs::cmd("status")
+        .doc("Show journal counters and degradation flags for one session")
+        .take(args)
+        .is_present()
+    {
+        let session_id = required_observation_session(args)?;
+        observation::cli::ObservationCommand::Status { session_id }
+    } else {
+        return Err(noargs::Error::other(
+            args,
+            "expected one of: list, get, status",
+        ));
+    };
+    Ok(Command::Observation { command })
+}
+
+fn required_observation_session(args: &mut noargs::RawArgs) -> noargs::Result<String> {
+    let session_id = noargs::arg("<SESSION_ID>")
+        .doc("Session ID")
+        .take(args)
+        .then(|arg| Ok::<_, std::convert::Infallible>(arg.value().to_owned()))?;
+    if config::validate_session_id(&session_id).is_err() {
+        return Err(noargs::Error::other(args, "invalid session ID"));
+    }
+    Ok(session_id)
 }
 
 fn parse_grant_request(
