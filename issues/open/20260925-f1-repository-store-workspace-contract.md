@@ -28,8 +28,7 @@ host / owner / name、bare Git store、origin freshness、legacy checkout 保全
 
 ## 1. Goal
 
-`RepositoryStore + Workspace` と remote-tracking ref / freshness の契約を、次の packet
-(F2–F4: gh-git 実装、C1–C2: Temote workspace binding) が再設計なしで使える形で固定する。
+`RepositoryStore + Workspace` と remote-tracking ref / freshness の generic contract を固定する。workspace substrate 固有部分は V1 の jj feasibility 結果を受けて V2 で確定し、その後 F2–F4 / C1–C2 が利用する。
 この packet は契約書だけを成果とし、実装・wire format の実動作検証は行わない。
 
 ## 2. Fixed decisions
