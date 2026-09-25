@@ -326,8 +326,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         runner: R,
         observation_sink: S,
     ) -> VcsResult<Self> {
-        let repository_root =
-            canonical_existing_directory(repository_root, "repository root")?;
+        let repository_root = canonical_existing_directory(repository_root, "repository root")?;
         let managed_root = canonical_existing_directory(managed_root, "managed workspace root")?;
         let store_root = managed_root.join(REGISTRY_DIR);
         ensure_private_directory(&store_root)?;
@@ -352,10 +351,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
                 Some(&self.repository_root),
             ) {
                 Ok(output) if output.success && output.stdout.contains("--depth") => {
-                    Capability::supported(
-                        None,
-                        Some("jj git clone advertises --depth".to_owned()),
-                    )
+                    Capability::supported(None, Some("jj git clone advertises --depth".to_owned()))
                 }
                 Ok(output) if output.success => {
                     Capability::unknown("installed jj help does not advertise --depth")
@@ -371,13 +367,16 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         } else {
             Capability::unknown("jj is unavailable")
         };
-        let git_lfs = match self
-            .runner
-            .run("git-lfs", &strings(&["--version"]), Some(&self.repository_root))
-        {
+        let git_lfs = match self.runner.run(
+            "git-lfs",
+            &strings(&["--version"]),
+            Some(&self.repository_root),
+        ) {
             Ok(output) if output.success => Capability::supported(
                 first_nonempty_line(&output.stdout).map(str::to_owned),
-                Some("git-lfs executable is available; repository usage is not inferred".to_owned()),
+                Some(
+                    "git-lfs executable is available; repository usage is not inferred".to_owned(),
+                ),
             ),
             Ok(_) | Err(_) => Capability::unknown(
                 "git-lfs executable was not positively detected; repository requirement is unknown",
@@ -466,7 +465,12 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             &request.base_revision,
             workspace_path_utf8,
         ]);
-        self.run_checked("jj", &args, Some(&self.repository_root), "create jj workspace")?;
+        self.run_checked(
+            "jj",
+            &args,
+            Some(&self.repository_root),
+            "create jj workspace",
+        )?;
 
         let canonical_path = canonical_existing_directory(&workspace_path, "jj workspace")?;
         ensure_descendant(&self.managed_root, &canonical_path, "jj workspace")?;
@@ -677,11 +681,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             Some(workspace),
             "inspect jj working-copy revision",
         )?;
-        let fields = revision
-            .stdout
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>();
+        let fields = revision.stdout.lines().map(str::trim).collect::<Vec<_>>();
         if fields.len() != 4 || fields.iter().any(|field| field.is_empty()) {
             return Err(VcsError::new(
                 VcsErrorCode::InvalidBackendOutput,
@@ -792,10 +792,9 @@ impl Drop for StoreLock {
 
 fn tool_capability<R: CommandRunner>(runner: &R, program: &str, args: &[&str]) -> Capability {
     match runner.run(program, &strings(args), None) {
-        Ok(output) if output.success => Capability::supported(
-            first_nonempty_line(&output.stdout).map(str::to_owned),
-            None,
-        ),
+        Ok(output) if output.success => {
+            Capability::supported(first_nonempty_line(&output.stdout).map(str::to_owned), None)
+        }
         Ok(output) => Capability::unsupported(format!(
             "{program} probe failed: {}",
             bounded_detail(&output.stderr)
@@ -901,9 +900,7 @@ fn validate_workspace_id(workspace_id: &str) -> VcsResult<()> {
 }
 
 fn validate_exact_revision(revision: &str) -> VcsResult<()> {
-    if matches!(revision.len(), 40 | 64)
-        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
         Err(VcsError::new(
@@ -1006,7 +1003,10 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> VcsResult<()> {
     let mut file = options.open(&temporary).map_err(|error| {
         VcsError::new(
             VcsErrorCode::Io,
-            format!("create temporary VCS record {}: {error}", temporary.display()),
+            format!(
+                "create temporary VCS record {}: {error}",
+                temporary.display()
+            ),
         )
     })?;
     file.write_all(&bytes).map_err(|error| {
@@ -1285,7 +1285,10 @@ mod tests {
             CapabilityState::Unsupported
         );
         assert_eq!(
-            manager.workspace_ensure(&request("task-a", 'a')).unwrap_err().code,
+            manager
+                .workspace_ensure(&request("task-a", 'a'))
+                .unwrap_err()
+                .code,
             VcsErrorCode::CapabilityUnsupported
         );
     }
@@ -1295,11 +1298,24 @@ mod tests {
         let fixture = Fixture::new();
         let runner = MockRunner::new();
         let manager = manager(&fixture, runner.clone(), RecordingSink::default());
-        assert!(manager.workspace_ensure(&request("task-a", 'a')).unwrap().created);
-        assert!(!manager.workspace_ensure(&request("task-a", 'a')).unwrap().created);
+        assert!(
+            manager
+                .workspace_ensure(&request("task-a", 'a'))
+                .unwrap()
+                .created
+        );
+        assert!(
+            !manager
+                .workspace_ensure(&request("task-a", 'a'))
+                .unwrap()
+                .created
+        );
         assert_eq!(runner.state.lock().unwrap().workspace_adds, 1);
         assert_eq!(
-            manager.workspace_ensure(&request("task-a", 'b')).unwrap_err().code,
+            manager
+                .workspace_ensure(&request("task-a", 'b'))
+                .unwrap_err()
+                .code,
             VcsErrorCode::WorkspaceConflict
         );
     }
