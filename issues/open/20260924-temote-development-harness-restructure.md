@@ -12,6 +12,7 @@ Related:
 - `issues/open/20260923-devin-acp-backend.md`
 - `issues/open/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
+- `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
 - `issues/done/20260916-managed-worktree-session-integration.md`
 - `issues/done/20260916-agent-mode-git-broker-gh-git-integration.md`
 - `f4ah6o/gh-git` (repository-scoped GitHub identity extension)
@@ -557,12 +558,13 @@ transport/
 
 1. 共通コア抽出と既存 MCP 契約の維持 (Phase A)。repository-store / no-local-main 契約の設計 (Phase F) は並行して進める。
 2. cloud / local 共通の task lifecycle と許可済み範囲の approve-free agent mode (Phase B)。
-3. **high priority:** A の共通 Task/Execution identity を使って Observation journal / deterministic Context Resolver (O1/O2) を並行実装する。backend ごとの個別 logger は作らない。Memory Worker (O3/O4) はその後に載せる。
-4. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
-5. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を初期基盤として完成させる。
-6. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
+3. **high priority:** V1 で jj-first VCS substrate を実測し、agent の explicit commit に依存しない workspace transaction model を確定する。V1 decision まで F2/F3 の git-worktree-specific implementation は保留する。
+4. **high priority:** A の共通 Task/Execution identity を使って Observation journal / deterministic Context Resolver (O1/O2) を並行実装する。backend ごとの個別 logger は作らない。Memory Worker (O3/O4) はその後に載せる。
+5. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
+6. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を、V1/V2 の VCS backend decision に従って完成させる。
+7. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
-依存関係: A → B → R。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の設計は独立に開始できる。F の新規 store 実装は C0 と整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
+依存関係: A → B → R。V0 は完了済みの設計 packet、V1 は独立 fixture で早期実施し、F2/F3 の workspace substrate 実装を gate する。V1 PASS → V2 で F1 の backend-specific 部分を改訂 → F2/F3/C。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
 ### Phase A — core extraction
 
@@ -576,6 +578,21 @@ transport/
 - [ ] execution / verification / delivery state と論理 task / execution の区別を record に導入
 - [ ] `task_list` を core に追加 (backend ごとの store を維持し、共通 index から始める)
 - [ ] current MCP tools の behavior を regression test / gateway contract snapshot で固定
+
+### Phase V — VCS transaction / jj-first managed workspace (high priority)
+
+詳細 contract: `issues/open/20260925-vcs-transaction-jj-first.md`。
+
+目的は agent の `git add/commit` 規律に依存せず、task workspace の working state を Temote 管理下の recoverable VCS state として捕捉すること。
+
+- [x] V0: Git snapshot broker と jj-first の設計比較、VCS abstraction / snapshot / observation / delivery boundary
+- [ ] V1: temporary fixture で jj feasibility prototype。bare Git backend、複数 `jj workspace`、change_id、crash後 snapshot、Git read-only compatibility、delivery ref を実測
+- [ ] V2: V1 PASS 後に F1 の backend-specific workspace contract を改訂
+- [ ] V3: typed Temote VCS adapter + Observation hook
+- [ ] V4: GitHub delivery integration / stacked PR strategy
+
+**V1 decision まで F2/F3 の git-worktree-specific implementation を開始しない。**
+A / O / B と F1 の repository identity・freshness・no-local-main の generic contract は並行して進めてよい。
 
 ### Phase O — observation / context continuity (high priority)
 
@@ -942,6 +959,8 @@ Prerequisites: <完了 commit / 対象ファイル / test>
 - [ ] 応答消失・切断・再起動後も二重起動せず、状態不明を成功・失敗に読み替えない
 - [ ] gh-stack integration が existing worktree ownership を壊さない
 - [ ] workspace / task cleanup が uncommitted work を勝手に破棄しない
+- [ ] agent が explicit commit を実行しなくても、managed workspace の変更を recoverable VCS state として Temote が捕捉できる
+- [ ] task/execution と VCS before/after revision を相関し、head/backend 切替後も同じ logical work を引き継げる
 - [ ] current server-backed delegation behavior (4 backend) の regression がない
 - [ ] head を切り替えても、authorized scope 内で過去の instruction・verified task/execution state・relevant current knowledge を Context Resolver から取得できる
 - [ ] coding agent に memory 保存・要約・knowledge 更新の追加 prompt/tool call を要求しない
