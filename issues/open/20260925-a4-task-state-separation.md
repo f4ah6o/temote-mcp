@@ -1,6 +1,6 @@
 # A4: execution / verification / delivery 状態の分離
 
-Status: implemented (branch `a4-task-state-separation`、PR 作成済み)
+Status: implemented (branch `a4-task-state-separation`、PR #55)
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `6df8181` (PR #54 land A2/A3 後)。作業 branch は `a4-task-state-separation`
 Parent issue: `issues/open/20260924-temote-development-harness-restructure.md` (PR #47)
@@ -171,7 +171,7 @@ mock / fixture だけで実サービス PASS を報告しない。
 ## 8. Completion report
 
 packet A4 — 実装 commit は本ファイルと同じ branch (`a4-task-state-separation`) に含む。PR は
-`main` 向け。
+`main` 向けの #55。
 
 新しく成立した動作:
 
