@@ -62,7 +62,13 @@ pub(crate) fn run_observation_command(command: ObservationCommand) -> Result<()>
                 );
             }
             if corrupt > 0 {
-                eprintln!("{corrupt} journal line(s) could not be parsed");
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "warning": "journal lines could not be parsed",
+                        "corrupt_lines": corrupt,
+                    }))?
+                );
             }
             Ok(())
         }
