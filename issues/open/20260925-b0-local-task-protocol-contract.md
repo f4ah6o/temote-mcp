@@ -1,6 +1,6 @@
 # B0: local task protocol / 認証 scope / 実行所有者の契約
 
-Status: contract delivered (設計 packet。実装コードなし)
+Status: contract delivered (設計 packet。実装コードなし。PR #56)
 Packet: B0 (Phase B — local frontend の第 1 child)
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `6df8181` (B0 は A4 PR #55 に依存しない)
@@ -285,6 +285,6 @@ fixture backend で socket routing を確認し、認証・scope・version・own
 
 ## 8. Completion report
 
-packet B0 — 契約書を `issues/open/20260925-b0-local-task-protocol-contract.md` として納品。
+packet B0 — 契約書を `issues/open/20260925-b0-local-task-protocol-contract.md` として納品 (PR #56)。
 コード変更・runtime 検証は未実施 (設計 packet のため)。B1 は §2.1–2.5、B2 は §2.6–2.8 の契約を
 そのまま実装入力にできる。残件は §7 の通り。
