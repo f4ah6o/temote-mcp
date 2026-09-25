@@ -666,6 +666,12 @@ impl TaskStore {
         Ok(record)
     }
 
+    #[cfg(test)]
+    fn save(&self, record: &TaskRecord) -> Result<()> {
+        let _guard = self.lock()?;
+        self.save_locked(record)
+    }
+
     fn save_locked(&self, record: &TaskRecord) -> Result<()> {
         self.ensure_directory()?;
         validate_record(record)?;
@@ -1122,6 +1128,61 @@ impl TaskStore {
             finalized,
             deferred,
         })
+    }
+
+    /// Read-only projection of every record owned by `session`'s full
+    /// instance and canonical scope. Unreadable record files count as
+    /// `skipped` so a partial projection stays visible; a missing store
+    /// directory is an empty list, not an error.
+    fn list_owned(&self, session: &config::Session) -> Result<(Vec<TaskRecord>, usize)> {
+        let _guard = self.lock()?;
+        let scope = config::canonical_directory(&session.cwd)?;
+        let metadata = match std::fs::symlink_metadata(&self.directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0));
+            }
+            Err(error) => return Err(error).context("cannot inspect OpenCode task store"),
+        };
+        validate_store_directory(&self.directory, &metadata)?;
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0));
+            }
+            Err(error) => return Err(error).context("cannot list OpenCode task store"),
+        };
+        let mut records = Vec::new();
+        let mut skipped = 0usize;
+        let mut count = 0usize;
+        for entry in entries {
+            count += 1;
+            anyhow::ensure!(
+                count <= MAX_TASK_DIRECTORY_ENTRIES,
+                "OpenCode task store contains more than {MAX_TASK_DIRECTORY_ENTRIES} entries"
+            );
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            match self.read_record(id) {
+                Ok(record) => {
+                    if record.owner.matches(session) && record.scope_cwd == scope {
+                        records.push(record);
+                    }
+                }
+                Err(error) if is_not_found(&error) => continue,
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok((records, skipped))
     }
 }
 
@@ -3563,6 +3624,61 @@ async fn task_get_with_store_and_binary(
     Ok(task_view(&record, evidence_ref.as_ref()))
 }
 
+/// Read-only projection of the tasks this session instance owns.
+/// Reconciliation stays in `task_get`: the list reports retained state
+/// only, so it never touches runtimes or mutates records.
+pub(crate) async fn task_list(args: &Value, session: &config::Session) -> Result<Value> {
+    let store = TaskStore::default_store()?;
+    task_list_with_store(args, session, &store)
+}
+
+fn task_list_with_store(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+) -> Result<Value> {
+    let limit = task_list_limit(args)?;
+    let (mut records, skipped) = store.list_owned(session)?;
+    records.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    let total = records.len();
+    let tasks: Vec<Value> = records.iter().take(limit).map(task_list_item).collect();
+    Ok(json!({
+        "backend": "opencode",
+        "tasks": tasks,
+        "total": total,
+        "skipped": skipped,
+        "truncated": total > tasks.len(),
+        "limit": limit,
+    }))
+}
+
+fn task_list_item(record: &TaskRecord) -> Value {
+    let mut item = task_view(record, None);
+    item["backend"] = json!("opencode");
+    item["last_updated_at"] = json!(record.updated_at);
+    item
+}
+
+fn task_list_limit(args: &Value) -> Result<usize> {
+    match args.get("limit") {
+        None => Ok(50),
+        Some(value) => {
+            let limit = value
+                .as_u64()
+                .context("task_list limit must be an integer")?;
+            anyhow::ensure!(
+                (1..=128).contains(&limit),
+                "task_list limit must be 1..=128"
+            );
+            Ok(limit as usize)
+        }
+    }
+}
+
 pub(crate) async fn task_control(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
     task_control_with_store_and_binary(args, session, &store, Path::new("opencode")).await
@@ -4504,6 +4620,41 @@ mod tests {
         assert!(format!("{error:#}").contains("OPENCODE_TASK_NOT_FOUND"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_foreign_session_denied() {
+        let root = tempdir();
+        let (_ha, session_a) = active_test_session(&root, &test_id(), false).await;
+        let (_hb, session_b) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake);
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session_a,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        // A control from a different session fails at the task store's
+        // ownership check, before any serve runtime is invoked.
+        let error = task_control_with_store_and_binary(
+            &json!({
+                "task_id": out["task_id"],
+                "operation_id": Uuid::new_v4(),
+                "action": "interrupt",
+            }),
+            &session_b,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap_err();
+        clear_fake();
+        assert!(format!("{error:#}").contains("OPENCODE_TASK_NOT_FOUND"));
+    }
+
     #[test]
     fn extract_report_accepts_embedded_json() {
         let text = "some intro\n".to_owned()
@@ -4740,5 +4891,156 @@ mod tests {
             operations: Vec::new(),
             operation_tombstones: Vec::new(),
         }
+    }
+
+    // ---------- session-owned task listing ----------
+
+    fn session(root: &Path, id: &str) -> config::Session {
+        let cwd = config::canonical_directory(root).unwrap();
+        config::Session {
+            id: id.to_owned(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
+            started_at: 1234,
+            process_id: 5678,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        }
+    }
+
+    #[test]
+    fn task_list_projects_only_the_calling_sessions_tasks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let other_workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "list-owner");
+        let other = session(workspace.path(), "list-other");
+        // Same id under a different instance is still a different
+        // session; a different scope is a different task list entirely.
+        let stale = config::Session {
+            started_at: 9999,
+            ..owner.clone()
+        };
+        let elsewhere = session(other_workspace.path(), "list-owner");
+        let owner_task = Uuid::new_v4();
+        store
+            .save(&record_for(&owner, owner_task, TaskStatus::Running, None))
+            .unwrap();
+        for session in [&other, &stale, &elsewhere] {
+            store
+                .save(&record_for(
+                    session,
+                    Uuid::new_v4(),
+                    TaskStatus::Running,
+                    None,
+                ))
+                .unwrap();
+        }
+
+        let view = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(view["backend"], "opencode");
+        assert_eq!(view["total"], 1);
+        assert_eq!(view["skipped"], 0);
+        assert_eq!(view["truncated"], false);
+        let tasks = view["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task_id"], json!(owner_task));
+        assert_eq!(tasks[0]["backend"], "opencode");
+        assert!(tasks[0]["last_updated_at"].is_u64());
+    }
+
+    #[test]
+    fn task_list_counts_unreadable_records_as_skipped() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "list-skipped");
+        store
+            .save(&record_for(
+                &owner,
+                Uuid::new_v4(),
+                TaskStatus::Running,
+                None,
+            ))
+            .unwrap();
+        // A record file that fails to parse cannot be verified as owned:
+        // it is reported as skipped, not silently dropped.
+        let corrupt = store_root
+            .path()
+            .join("tasks")
+            .join(format!("{}.json", Uuid::new_v4()));
+        std::fs::write(&corrupt, "{ not json").unwrap();
+
+        let view = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(view["total"], 1);
+        assert_eq!(view["skipped"], 1);
+        assert_eq!(view["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_list_orders_newest_first_and_truncates_at_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "list-order");
+        let now = config::unix_time();
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (index, task_id) in ids.iter().enumerate() {
+            let mut record = record_for(&owner, *task_id, TaskStatus::Running, None);
+            record.created_at = now - 100;
+            record.updated_at = now - index as u64;
+            store.save(&record).unwrap();
+        }
+
+        let view = task_list_with_store(&json!({"limit": 2}), &owner, &store).unwrap();
+        assert_eq!(view["total"], 3);
+        assert_eq!(view["truncated"], true);
+        let tasks = view["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["task_id"], json!(ids[0]));
+        assert_eq!(tasks[1]["task_id"], json!(ids[1]));
+    }
+
+    #[test]
+    fn task_list_reports_an_empty_store_as_empty() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        // The directory does not exist until the first record lands.
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "list-empty");
+
+        let view = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(view["tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(view["total"], 0);
+        assert_eq!(view["skipped"], 0);
+        assert_eq!(view["truncated"], false);
+    }
+
+    #[test]
+    fn task_list_rejects_invalid_limits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "list-limit");
+
+        assert_eq!(
+            task_list_with_store(&json!({"limit": 0}), &owner, &store)
+                .unwrap_err()
+                .to_string(),
+            "task_list limit must be 1..=128"
+        );
+        assert_eq!(
+            task_list_with_store(&json!({"limit": 129}), &owner, &store)
+                .unwrap_err()
+                .to_string(),
+            "task_list limit must be 1..=128"
+        );
+        assert_eq!(
+            task_list_with_store(&json!({"limit": "many"}), &owner, &store)
+                .unwrap_err()
+                .to_string(),
+            "task_list limit must be an integer"
+        );
     }
 }
