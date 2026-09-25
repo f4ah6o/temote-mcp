@@ -245,13 +245,13 @@ impl std::error::Error for VcsError {}
 type VcsResult<T> = Result<T, VcsError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CommandOutput {
+pub(crate) struct CommandOutput {
     stdout: String,
     stderr: String,
     success: bool,
 }
 
-trait CommandRunner: Send + Sync {
+pub(crate) trait CommandRunner: Send + Sync {
     fn run(
         &self,
         program: &str,
@@ -261,7 +261,7 @@ trait CommandRunner: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SystemCommandRunner;
+pub(crate) struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(
