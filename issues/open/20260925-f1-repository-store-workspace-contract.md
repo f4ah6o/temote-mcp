@@ -62,6 +62,10 @@ remote.origin.fetch  = +refs/heads/*:refs/remotes/origin/*
 `refs/heads/main` の作成・維持を必要としない。`git worktree add` は base commit から
 task branch を直接切るため、store に local main が存在しない状態を標準とする。
 
+初回 fetch 成功後に remote の HEAD symref を解決し (`git remote set-head --auto` 相当)、
+`remote.default_branch` へ記録する。解決不能なら `default_branch: null` を記録し
+(`base_unresolved` 参照)、推測で埋めない。
+
 gh-git は Git から導出できない field だけを registry (`<store>/gh-git/`) に保存する:
 workspace の request fingerprint、作成時の base 記録、schema_version。registry は
 secret を含まず、write は temp + rename の atomic update。registry だけを真実とせず、
@@ -103,7 +107,8 @@ secret を含まず、write は temp + rename の atomic update。registry だ�
 ### 2.3 Workspace record
 
 `gh git workspace inspect [--repo <repo>] [--id <workspace_id>] --json`
-(cwd が managed workspace 内なら省略可):
+(repo / id 省略時は cwd を検査。store-worktree ならこの record、
+legacy / unmanaged path なら 2.7 の record を返す):
 
 ```json
 {
@@ -117,13 +122,17 @@ secret を含まず、write は temp + rename の atomic update。registry だ�
   "head": { "commit": "1a2b3c...", "attached": true },
   "base": {
     "ref": "refs/remotes/origin/main",
+    "source": "remote-tracking",
     "commit": "c69bfe3b12117b70b8160091e54dce97cf49ec3a",
     "observed_at": "2026-09-25T01:30:00Z"
   },
   "status": {
     "dirty": false,
     "untracked": false,
-    "detached": false
+    "detached": false,
+    "ahead": 0,
+    "behind": 0,
+    "diverged": false
   },
   "created_request_fingerprint": "sha256:ab12..."
 }
@@ -136,7 +145,12 @@ secret を含まず、write は temp + rename の atomic update。registry だ�
   (no-local-main 前提を壊さないため)。
 - `base` は `refs/remotes/origin/*`、store 内の task branch 名 (stacked task の親)、
   または commit SHA を受理し、ensure 時に commit へ解決して記録する。
-- `base.observed_at` は解決元 ref の観測時刻 (commit SHA 指定なら ensure 時刻)。
+- `--base` 省略時は `refs/remotes/origin/<remote.default_branch>` に normalize する。
+  `default_branch: null` では省略指定を `base_unresolved` とし、明示 `--base` は受理する。
+- `base.source` は `remote-tracking` | `task-branch` | `commit` を記録する。
+  `base.observed_at` の意味は source ごとに決める: `remote-tracking` はその ref の
+  成功 fetch 観測時刻、`task-branch` / `commit` は ensure 時の解決時刻
+  (remote の観測とは区別する)。
 
 ### 2.4 ensure の同一性
 
@@ -149,7 +163,10 @@ secret を含まず、write は temp + rename の atomic update。registry だ�
 `gh git workspace ensure <repo> --name <id> --branch <b> [--base <ref|sha>] --json`:
 
 - 同一性は normalized request `{repository, workspace_id, branch, base}` の fingerprint
-  (sha256) で判定し、作成時に registry へ記録する。
+  (sha256) で判定し、作成時に registry へ記録する。`base` には normalize 後の ref 名
+  (省略なら `refs/remotes/origin/<default_branch>`) または指定された commit SHA を使い、
+  解決済み commit 自体は fingerprint に含めない。remote が進んだ後の同一再送は
+  `reused` のままとする。
 - 同一 fingerprint の再送は **再利用** (`"result": "reused"`)。新規作成は
   `"result": "created"`。応答の record 形状は 2.3 と同じ。
 - 同一 `workspace_id` で異なる request (branch / repo / base が違う) は
@@ -172,6 +189,7 @@ secret を含まず、write は temp + rename の atomic update。registry だ�
   "branch": "feat/api",
   "base": {
     "ref": "refs/remotes/origin/main",
+    "source": "remote-tracking",
     "commit": "c69bfe3b12117b70b8160091e54dce97cf49ec3a",
     "observed_at": "2026-09-25T01:30:00Z"
   }
@@ -217,7 +235,9 @@ freshness は「最後に成功した fetch の観測」と「呼出し側の po
 store 側は観測事実だけを保持する。失敗した fetch は観測を更新しない。
 
 - `fetch.last_success_at` / `observations.<ref>.{commit, observed_at}` が真実の source。
-- `store fetch` (または `store ensure`) 成功で更新。失敗は `fetch.last_attempt_at` と
+- `store fetch` は prune 意味 (`git fetch --prune` 相当) を持つ。成功時は observations を
+  現在の remote-tracking ref 集合で**置き換える**: 上流で削除された branch の ref は
+  除去され、fresh な base として残らない。失敗は `fetch.last_attempt_at` と
   `fetch.last_error` のみ更新し、last_success / observations を触らない。
 - `store inspect` の `freshness` field は caller の `--max-age-seconds` に対する評価:
   - `fresh`: last_success_at が max_age 以内
@@ -227,6 +247,37 @@ store 側は観測事実だけを保持する。失敗した fetch は観測を�
   再開・delivery 前に `store fetch` し、返った commit / observed_at を evidence に記録する。
 
 ### 2.7 Layout 判別と legacy 保全
+
+legacy / unmanaged 対象は `gh git workspace inspect --path <dir>` で指定する (省略時の
+cwd 検査と同じ規則)。`<dir>` が store-worktree なら 2.3 の record、`primary-checkout` /
+`external` なら以下の legacy record、git worktree でなければ `workspace_missing`。
+legacy record は read-only で `preserved: true` を付け、生成・変更・削除を一切しない:
+
+```json
+{
+  "schema_version": 1,
+  "layout": "primary-checkout",
+  "workspace_id": null,
+  "repository": { "host": "github.com", "owner": "f4ah6o", "name": "temote-mcp" },
+  "path": "/u/src/temote-mcp",
+  "canonical_path": "/u/src/temote-mcp",
+  "branch": "main",
+  "head": { "commit": "c69bfe3...", "attached": true },
+  "status": {
+    "dirty": false,
+    "untracked": false,
+    "detached": false,
+    "ahead": 0,
+    "behind": 0,
+    "diverged": false
+  },
+  "preserved": true
+}
+```
+
+legacy 側の `repository` は `remote.origin.url` を解析できた場合のみ埋め、不能なら
+`null` (basename や owner 名から推測しない)。`ahead` / `behind` / `diverged` は
+remote-tracking ref との比較で評価し、比較対象の観測が無い場合は `null`。
 
 inspect は対象を layout で分類する:
 
@@ -266,7 +317,7 @@ gh-git が提供する Git primitive (本 contract で固定。Phase C はこの
 | `gh git store fetch <repo>` | remote-tracking 更新 | mutating + network |
 | `gh git store inspect [repo]` / `store list` | 2.2 の record | read-only |
 | `gh git workspace ensure <repo> --name --branch [--base]` | worktree 作成 / 再利用 | mutating (network なし) |
-| `gh git workspace inspect [id]` / `list` | 2.3 の record | read-only |
+| `gh git workspace inspect [id]` / `list` / `--path <dir>` | 2.3 / 2.7 の record | read-only |
 | `gh git workspace remove <id> [--force]` | worktree 除去 | mutating |
 | `gh git workspace prune` | 条件付き回収 + 報告 | mutating |
 | `gh git bind` / `binding status` 他 | 既存 identity 系 | 変更なし (C0 で profile 解決を修正) |
