@@ -14,9 +14,9 @@ Prerequisites: 現状確認のみ (実装 packet の成果に依存しない)
 ただし `git worktree` / `store-worktree` を新規 managed workspace の最終 substrate とする部分は、
 `issues/open/20260925-vcs-transaction-jj-first.md` の V1/V2 decision 対象になった。
 
-**V1 decision まで F2/F3 の git-worktree-specific implementation を開始しない。**
+**V1 は完了し jj-first viable と判定済み。F2/F3 を git-worktree-only として実装しない。V2 contract (`issues/open/20260925-v2-vcs-workspace-contract.md`) に従って backend-neutral に実装する。**
 
-V1 が jj-first acceptance を満たす場合、F1 の以下を V2 で backend-neutral contract に改訂する:
+V1 は jj-first acceptance を満たした。以下は V2 で backend-neutral contract に改訂済み:
 
 - `git worktree add` 固定
 - `layout=store-worktree` 固定
@@ -25,6 +25,8 @@ V1 が jj-first acceptance を満たす場合、F1 の以下を V2 で backend-n
 
 host / owner / name、bare Git store、origin freshness、legacy checkout 保全、Temote reservation ownership は可能な限り保持する。
 既存 checkout を jj へ自動変換・reset・clean・stash しない。
+
+`issues/open/20260925-v2-vcs-workspace-contract.md` を workspace substrate の authoritative contract とし、本 F1 は repository identity / bare store / freshness / legacy protection の generic contract として参照する。
 
 ## 1. Goal
 
