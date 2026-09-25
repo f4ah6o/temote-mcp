@@ -1,6 +1,6 @@
 # O0: head-independent observation / context / memory plane
 
-Status: high-priority design / implementation not started  
+Status: high-priority implementation in progress — O1/O2 landed; O3/O4 pending  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
@@ -566,18 +566,18 @@ Prerequisite: O1。
 ここまでで head switch の最低価値を成立させる。
 Memory Worker が未実装でも、過去の instruction と verified state を次の head が取得できる。
 
-### O3 — Memory Worker
+### O3 — Observation worker track
 
 Prerequisite: O1 + O2。
 
-- [ ] worker checkpoint
-- [ ] batch read
-- [ ] knowledge extraction schema
-- [ ] support refs required
-- [ ] dedupe / supersession
-- [ ] stale worker reporting
-- [ ] retry idempotency
-- [ ] worker failure が task state を変更しない
+Detailed packets: `issues/open/20260926-observation-friction-worker.md`.
+
+- [ ] O3a common worker substrate: per-session revision checkpoint, bounded batch read, retry/dedupe, stale status, failure isolation
+- [ ] O3b memory extractor: support refs, knowledge extraction, dedupe/supersession
+- [ ] O3c friction observer: deterministic signals, bounded episodes, supported `FrictionCandidate`
+- [ ] O3d friction publisher: existing-issue dedupe, new-or-update Markdown, focused PR, no auto-merge
+- [ ] coding agent 自身に memory/friction maintenance を要求しない
+- [ ] worker/publisher failure が coding task state を変更しない
 
 ### O4 — Knowledge-aware resolver
 
@@ -603,7 +603,11 @@ A1/A2/A3  common orchestration + identity
        |            |
        |            +--> O2 deterministic context
        |            |         |
-       |            |         +--> O3 worker --> O4 knowledge context
+       |            |         +--> O3a worker substrate
+       |            |                    |
+       |            |                    +--> O3b memory --> O4 knowledge context
+       |            |                    |
+       |            |                    +--> O3c friction --> O3d publisher
        |            |
        +------> B local frontend
        |
@@ -629,9 +633,13 @@ O1/O2 を D (environment) / E (delivery) より優先する。
 - [x] secrets を observation metadata / ordinary output に複製しない
 - [x] raw transcript dump を通常の public surface にしない
 - [ ] worker failure 時も task execution は独立して継続できる
+- [ ] coding agent が memory / friction issue maintenance を行わなくても observation が後追い処理される
+- [ ] friction candidate は support refs と acceptance criteria を持つ
+- [ ] publisher は既存 issue を重複生成せず、失敗しても coding task に影響しない
+- [ ] friction PR は自動 merge されない
 
 ## 21. Principle
 
-> Temote が仕事をする agent に「覚えておけ」と頼むのではなく、Temote 自身が observable execution を構造化して記録し、別 worker が後から理解する。次の head は、その整理済み context と根拠を受け取って続行する。
+> Temote が仕事をする agent に「覚えておけ」「Temote の摩擦を報告しておけ」と頼むのではなく、Temote 自身が observable execution を構造化して記録し、別 worker が後から理解する。次の head は整理済み context と根拠を受け取り、friction observer は同じ根拠から Temote 自身の改善候補を作る。
 
-これにより Temote は planner や memory agent にならず、head-independent な execution substrate と context continuity を提供する。
+これにより Temote は planner や memory agent にならず、head-independent な execution substrate と context continuity を提供しつつ、coding agent の本来の作業を汚さない自己改善ループを持てる。
