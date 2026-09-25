@@ -4168,6 +4168,72 @@ for raw in sys.stdin:
         assert!(store.load(&other, task_id).is_err());
     }
 
+    #[tokio::test]
+    async fn get_and_control_foreign_session_denied() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let (_ha, session_a) = active_test_session(
+            root.path(),
+            &format!("foreign-owner-{}", Uuid::new_v4()),
+            false,
+        )
+        .await;
+        let (_hb, session_b) = active_test_session(
+            root.path(),
+            &format!("foreign-other-{}", Uuid::new_v4()),
+            false,
+        )
+        .await;
+        let task_id = Uuid::new_v4();
+        let now = config::unix_time();
+        let record = TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(&session_a),
+            scope_cwd: config::canonical_directory(&session_a.cwd).unwrap(),
+            model: "gpt-5.6-luna".to_owned(),
+            effort: "max".to_owned(),
+            status: TaskStatus::Running,
+            revision: 1,
+            generation: 1,
+            thread_id: Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa".to_owned()),
+            turn_id: Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb".to_owned()),
+            usage: None,
+            created_at: now,
+            updated_at: now,
+            operations: Vec::new(),
+            operation_tombstones: Vec::new(),
+        };
+        store.save(&record).unwrap();
+
+        // Reads and controls from a different session fail at the task
+        // store's ownership check, before any app-server runtime spawns.
+        let error = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session_b,
+            &store,
+            Path::new("codex"),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("CODEX_TASK_NOT_FOUND"));
+
+        let error = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "interrupt",
+            }),
+            &session_b,
+            &store,
+            Path::new("codex"),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("CODEX_TASK_NOT_FOUND"));
+    }
+
     #[test]
     fn accepted_operation_replay_requires_reconciliation_and_conflicts_on_change() {
         let root = tempfile::tempdir().unwrap();

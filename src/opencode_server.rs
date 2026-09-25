@@ -4504,6 +4504,41 @@ mod tests {
         assert!(format!("{error:#}").contains("OPENCODE_TASK_NOT_FOUND"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_foreign_session_denied() {
+        let root = tempdir();
+        let (_ha, session_a) = active_test_session(&root, &test_id(), false).await;
+        let (_hb, session_b) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake);
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session_a,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        // A control from a different session fails at the task store's
+        // ownership check, before any serve runtime is invoked.
+        let error = task_control_with_store_and_binary(
+            &json!({
+                "task_id": out["task_id"],
+                "operation_id": Uuid::new_v4(),
+                "action": "interrupt",
+            }),
+            &session_b,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap_err();
+        clear_fake();
+        assert!(format!("{error:#}").contains("OPENCODE_TASK_NOT_FOUND"));
+    }
+
     #[test]
     fn extract_report_accepts_embedded_json() {
         let text = "some intro\n".to_owned()
