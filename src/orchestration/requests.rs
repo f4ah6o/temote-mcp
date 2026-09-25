@@ -24,6 +24,8 @@ const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 256;
 #[cfg(feature = "network")]
 const MAX_REPOS: usize = 16;
+const DEFAULT_TASK_LIST_LIMIT: usize = 50;
+const MAX_TASK_LIST_LIMIT: u64 = 128;
 
 /// One typed operation on the shared task contract, with backend-specific
 /// input preserved as typed options.
@@ -35,6 +37,11 @@ pub(crate) enum TaskRequest<'a> {
     // follow-up packet; dispatch reads them from the raw args for now.
     #[allow(dead_code)]
     Get(TaskGetRequest<'a>),
+    /// A session-scoped read-only projection of the caller's retained
+    /// tasks. `limit` is validated at the boundary like every other
+    /// input; the dispatch then reads it from the raw args, so nothing
+    /// is retained on the request.
+    List,
     Control(TaskControlRequest<'a>),
 }
 
@@ -298,6 +305,10 @@ impl<'a> TaskRequest<'a> {
             Operation::Status => TaskRequest::Status,
             Operation::TaskStart => TaskRequest::Start(parse_task_start(backend, args)?),
             Operation::TaskGet => TaskRequest::Get(parse_task_get(backend, args)?),
+            Operation::TaskList => {
+                task_list_limit(args)?;
+                TaskRequest::List
+            }
             Operation::TaskControl => TaskRequest::Control(parse_task_control(backend, args)?),
         })
     }
@@ -533,6 +544,25 @@ fn parse_task_get<'a>(backend: Backend, args: &'a Value) -> Result<TaskGetReques
     })
 }
 
+/// The shared task-list `limit`: optional, an integer within `1..=128`,
+/// defaulting to 50 — the same bound `job_list` uses for the current
+/// session's job list. Parsing mirrors the backends' own validation.
+pub(crate) fn task_list_limit(args: &Value) -> Result<usize> {
+    match args.get("limit") {
+        None => Ok(DEFAULT_TASK_LIST_LIMIT),
+        Some(value) => {
+            let limit = value
+                .as_u64()
+                .context("task_list limit must be an integer")?;
+            anyhow::ensure!(
+                (1..=MAX_TASK_LIST_LIMIT).contains(&limit),
+                "task_list limit must be 1..={MAX_TASK_LIST_LIMIT}"
+            );
+            Ok(limit as usize)
+        }
+    }
+}
+
 fn parse_task_control<'a>(backend: Backend, args: &'a Value) -> Result<TaskControlRequest<'a>> {
     let task_id = required_uuid(args, "task_id")?;
     let operation_id = required_uuid(args, "operation_id")?;
@@ -597,6 +627,10 @@ mod tests {
 
     fn parse_control(backend: Backend, args: &Value) -> Result<TaskRequest<'_>> {
         TaskRequest::parse(backend, Operation::TaskControl, args)
+    }
+
+    fn parse_list(backend: Backend, args: &Value) -> Result<TaskRequest<'_>> {
+        TaskRequest::parse(backend, Operation::TaskList, args)
     }
 
     fn error_of(result: Result<TaskRequest<'_>>) -> String {
@@ -1032,5 +1066,40 @@ mod tests {
                 Some(InterruptSemantics::AbortSession)
             );
         }
+    }
+
+    #[test]
+    fn task_list_validates_the_limit_at_the_boundary() {
+        for backend in backends() {
+            let TaskRequest::List = parse_list(backend, &json!({})).unwrap() else {
+                panic!("task_list should parse")
+            };
+            assert!(matches!(
+                parse_list(backend, &json!({"limit": 1})).unwrap(),
+                TaskRequest::List
+            ));
+            assert!(matches!(
+                parse_list(backend, &json!({"limit": 128})).unwrap(),
+                TaskRequest::List
+            ));
+            assert_eq!(
+                error_of(parse_list(backend, &json!({"limit": "8"}))),
+                "task_list limit must be an integer"
+            );
+            assert_eq!(
+                error_of(parse_list(backend, &json!({"limit": 0}))),
+                "task_list limit must be 1..=128"
+            );
+            assert_eq!(
+                error_of(parse_list(backend, &json!({"limit": 129}))),
+                "task_list limit must be 1..=128"
+            );
+        }
+    }
+
+    #[test]
+    fn task_list_limit_defaults_and_bounds() {
+        assert_eq!(task_list_limit(&json!({})).unwrap(), 50);
+        assert_eq!(task_list_limit(&json!({"limit": 64})).unwrap(), 64);
     }
 }
