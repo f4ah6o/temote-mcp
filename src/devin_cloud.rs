@@ -2619,6 +2619,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn control_foreign_session_denied() {
+        let _serial = serial().await;
+        let _env = EnvGuard::install();
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let (_other_handle, other) = active_test_session(&root, &test_id()).await;
+        let store = test_store(&root);
+        let _fake = install_fake();
+
+        let out = task_start_with_store(&start_args(Uuid::new_v4(), "work"), &session, &store)
+            .await
+            .unwrap();
+        // A control from a different session fails at the task store's
+        // ownership check, before any Cloud API call is made.
+        let error = task_control_with_store(
+            &json!({
+                "task_id": out["task_id"],
+                "operation_id": Uuid::new_v4(),
+                "action": "interrupt",
+            }),
+            &other,
+            &store,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("DEVIN_TASK_NOT_FOUND"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn status_reports_principal_without_secret() {
         let _serial = serial().await;
         let _env = EnvGuard::install();
