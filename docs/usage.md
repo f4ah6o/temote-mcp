@@ -105,6 +105,8 @@ Work that outlives the foreground timeout returns a session-owned `job_id`; poll
 
 `job_list({session_id, limit?})` returns a redacted snapshot of the current session's in-memory jobs. It reports only `job_id` and `running` / `completed` / `failed` / `unknown`, with running jobs first and a `truncated` flag. It never returns command text, argv, stdout/stderr, or raw errors, and listing does not consume a completed result. `retention="in_memory"` is explicit: an empty list is not proof that no work ran before restart or cache expiry.
 
+`task_list({session_id, limit?})` returns a bounded read-only projection of the delegated tasks owned by the session across every task backend. Each entry carries the backend label, the store's own `task_id`, `status`, `revision`, `generation`, `created_at`, and `updated_at`, sorted by `updated_at` descending and truncated to `limit`. Entries are filtered to the full session instance and canonical scope — the same ownership `*_task_get` enforces — so other sessions' tasks never mix in. The per-backend stores stay the source of truth (`retention="per_backend_store"`); a backend whose store cannot be read is reported as `unconfirmed` with a bounded error instead of an empty page, and records that fail to read are counted in `backends.<backend>.unreadable_records`.
+
 The combined stdout/stderr retained for delegated work is capped at 1 MiB and reports when output was truncated.
 
 ### Experimental Codex tasks

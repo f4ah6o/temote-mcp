@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::orchestration::{BackendTaskPage, ListedTask};
 use crate::{approvals, config, evidence};
 
 const APP_SERVER_CLIENT_NAME: &str = "temote-mcp";
@@ -938,6 +939,59 @@ impl TaskStore {
         validate_record(&record)?;
         anyhow::ensure!(record.task_id == task_id, "Codex task record ID mismatch");
         Ok(record)
+    }
+
+    /// Read the session-owned task references in this store. The store
+    /// stays the source of truth; this is a read-only projection filtered
+    /// to the full session instance and canonical scope — the same
+    /// ownership `ensure_task_owner` applies on `load`. Records that fail
+    /// to read or validate are counted, never silently dropped.
+    fn list_tasks(&self, session: &config::Session) -> Result<BackendTaskPage> {
+        let _guard = self.lock()?;
+        let scope = config::canonical_directory(&session.cwd)?;
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BackendTaskPage::default());
+            }
+            Err(error) => return Err(error).context("cannot list Codex task store"),
+        };
+        let mut page = BackendTaskPage::default();
+        let mut count = 0usize;
+        for entry in entries {
+            count += 1;
+            anyhow::ensure!(
+                count <= MAX_TASK_DIRECTORY_ENTRIES,
+                "Codex task store contains more than {MAX_TASK_DIRECTORY_ENTRIES} entries"
+            );
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(task_id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            match self.read_record(task_id) {
+                Ok(record) => {
+                    if record.owner.matches(session) && record.scope_cwd == scope {
+                        page.entries.push(ListedTask {
+                            task_id: record.task_id,
+                            status: record.status.as_str(),
+                            revision: record.revision,
+                            generation: record.generation,
+                            created_at: record.created_at,
+                            updated_at: record.updated_at,
+                        });
+                    }
+                }
+                Err(_) => page.unreadable_records += 1,
+            }
+        }
+        Ok(page)
     }
 
     fn prune_locked(&self, current: &TaskRecord) -> Result<()> {
@@ -2833,6 +2887,11 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
     }))
 }
 
+/// This backend's page of the session-scoped shared task list.
+pub(crate) fn list_tasks(session: &config::Session) -> Result<BackendTaskPage> {
+    TaskStore::default_store()?.list_tasks(session)
+}
+
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
     task_start_with_store_and_binary_inner(args, session, &store, Path::new("codex"), true).await
@@ -4025,6 +4084,99 @@ for raw in sys.stdin:
             phase,
             outcome,
         }
+    }
+
+    #[test]
+    fn task_list_is_scope_and_full_session_instance_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let session_a = session(root.path(), "task-list-owner-a", true);
+        let session_b = session(root.path(), "task-list-owner-b", true);
+        let record_a = task_record(
+            &session_a,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            41,
+            Some("thread-a"),
+            Some("turn-a"),
+        );
+        let record_b = task_record(
+            &session_b,
+            Uuid::new_v4(),
+            TaskStatus::Completed,
+            42,
+            None,
+            None,
+        );
+        store.save(&record_a).unwrap();
+        store.save(&record_b).unwrap();
+
+        let page_a = store.list_tasks(&session_a).unwrap();
+        assert_eq!(page_a.entries.len(), 1);
+        let entry = &page_a.entries[0];
+        assert_eq!(entry.task_id, record_a.task_id);
+        assert_eq!(entry.status, "running");
+        assert_eq!(entry.revision, 41);
+        assert_eq!(entry.generation, record_a.generation);
+        assert_eq!(entry.created_at, record_a.created_at);
+        assert_eq!(entry.updated_at, record_a.updated_at);
+        assert_eq!(page_a.unreadable_records, 0);
+
+        let page_b = store.list_tasks(&session_b).unwrap();
+        assert_eq!(page_b.entries.len(), 1);
+        assert_eq!(page_b.entries[0].task_id, record_b.task_id);
+        assert_eq!(page_b.entries[0].status, "completed");
+        assert_eq!(page_b.unreadable_records, 0);
+    }
+
+    #[test]
+    fn task_list_skips_foreign_files_and_counts_unreadable_records() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(root.path(), "task-list-owner", true);
+        let record = task_record(
+            &owner,
+            Uuid::new_v4(),
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        store.save(&record).unwrap();
+
+        std::fs::write(store.path(Uuid::new_v4()), b"not json").unwrap();
+        let store_dir = store_root.path().join("tasks");
+        std::fs::write(store_dir.join("not-a-uuid.json"), b"{}").unwrap();
+        std::fs::write(store_dir.join("ignored.txt"), b"x").unwrap();
+        std::fs::create_dir_all(store_dir.join("subdir")).unwrap();
+
+        let page = store.list_tasks(&owner).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].task_id, record.task_id);
+        assert_eq!(page.unreadable_records, 1);
+    }
+
+    #[test]
+    fn task_list_reports_store_read_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        std::fs::write(store_root.path().join("blocking-file"), b"x").unwrap();
+        let store = TaskStore::new(store_root.path().join("blocking-file").join("tasks"));
+        let owner = session(root.path(), "task-list-owner", true);
+        assert!(store.list_tasks(&owner).is_err());
+    }
+
+    #[test]
+    fn task_list_empty_store_is_confirmed_not_unconfirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(root.path(), "task-list-owner", true);
+        let page = store.list_tasks(&owner).unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.unreadable_records, 0);
     }
 
     #[test]

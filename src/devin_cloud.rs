@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::orchestration::{BackendTaskPage, ListedTask};
 use crate::{config, evidence};
 
 const TASK_SCHEMA_VERSION: u64 = 1;
@@ -869,6 +870,59 @@ impl TaskStore {
         Ok(record)
     }
 
+    /// Read the session-owned task references in this store. The store
+    /// stays the source of truth; this is a read-only projection filtered
+    /// to the full session instance and canonical scope — the same
+    /// ownership `ensure_task_owner` applies on `load`. Records that fail
+    /// to read or validate are counted, never silently dropped.
+    fn list_tasks(&self, session: &config::Session) -> Result<BackendTaskPage> {
+        let _guard = self.lock()?;
+        let scope = config::canonical_directory(&session.cwd)?;
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BackendTaskPage::default());
+            }
+            Err(error) => return Err(error).context("cannot list Devin Cloud task store"),
+        };
+        let mut page = BackendTaskPage::default();
+        let mut count = 0usize;
+        for entry in entries {
+            count += 1;
+            anyhow::ensure!(
+                count <= MAX_TASK_DIRECTORY_ENTRIES,
+                "Devin Cloud task store contains more than {MAX_TASK_DIRECTORY_ENTRIES} entries"
+            );
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let Ok(task_id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            match self.read_record(task_id) {
+                Ok(record) => {
+                    if record.owner.matches(session) && record.scope_cwd == scope {
+                        page.entries.push(ListedTask {
+                            task_id: record.task_id,
+                            status: record.status.as_str(),
+                            revision: record.revision,
+                            generation: record.generation,
+                            created_at: record.created_at,
+                            updated_at: record.updated_at,
+                        });
+                    }
+                }
+                Err(_) => page.unreadable_records += 1,
+            }
+        }
+        Ok(page)
+    }
+
     fn prune_locked(&self, current: &TaskRecord) -> Result<()> {
         let entries = match std::fs::read_dir(&self.directory) {
             Ok(entries) => entries,
@@ -1711,6 +1765,11 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
         "org_id": config.org_id.as_deref().or(remote_org_id),
         "org_id_source": if config.org_id.is_some() { ORG_ID_ENV } else { "self" },
     }))
+}
+
+/// This backend's page of the session-scoped shared task list.
+pub(crate) fn list_tasks(session: &config::Session) -> Result<BackendTaskPage> {
+    TaskStore::default_store()?.list_tasks(session)
 }
 
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
@@ -2760,5 +2819,112 @@ mod tests {
             extract_report("prefix {\"status\":\"blocked\",\"summary\":\"need key\"} suffix")
                 .unwrap();
         assert_eq!(report["status"], "blocked");
+    }
+
+    fn record_for(session: &config::Session, task_id: Uuid, status: TaskStatus) -> TaskRecord {
+        let now = config::unix_time();
+        TaskRecord {
+            schema_version: TASK_SCHEMA_VERSION,
+            task_id,
+            owner: SessionInstance::from_session(session),
+            scope_cwd: config::canonical_directory(&session.cwd).unwrap(),
+            org_id: "org-test".to_owned(),
+            title: None,
+            devin_mode: Some("fast".to_owned()),
+            repos: Vec::new(),
+            status,
+            revision: 1,
+            generation: 0,
+            devin_session_id: None,
+            session_url: None,
+            remote_status: None,
+            remote_status_detail: None,
+            acus_consumed_milli: None,
+            pull_requests: Vec::new(),
+            report: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            operations: Vec::new(),
+            operation_tombstones: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_list_is_scope_and_full_session_instance_bound() {
+        let root = tempdir();
+        let (_handle_a, session_a) = active_test_session(&root, &test_id()).await;
+        let (_handle_b, session_b) = active_test_session(&root, &test_id()).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let record_a = record_for(&session_a, Uuid::new_v4(), TaskStatus::Running);
+        let record_b = record_for(&session_b, Uuid::new_v4(), TaskStatus::Completed);
+        {
+            let _guard = store.lock().unwrap();
+            store.save_locked(&record_a).unwrap();
+            store.save_locked(&record_b).unwrap();
+        }
+
+        let page_a = store.list_tasks(&session_a).unwrap();
+        assert_eq!(page_a.entries.len(), 1);
+        let entry = &page_a.entries[0];
+        assert_eq!(entry.task_id, record_a.task_id);
+        assert_eq!(entry.status, "running");
+        assert_eq!(entry.revision, record_a.revision);
+        assert_eq!(entry.generation, record_a.generation);
+        assert_eq!(entry.created_at, record_a.created_at);
+        assert_eq!(entry.updated_at, record_a.updated_at);
+        assert_eq!(page_a.unreadable_records, 0);
+
+        let page_b = store.list_tasks(&session_b).unwrap();
+        assert_eq!(page_b.entries.len(), 1);
+        assert_eq!(page_b.entries[0].task_id, record_b.task_id);
+        assert_eq!(page_b.entries[0].status, "completed");
+        assert_eq!(page_b.unreadable_records, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_list_skips_foreign_files_and_counts_unreadable_records() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let record = record_for(&session, Uuid::new_v4(), TaskStatus::Running);
+        {
+            let _guard = store.lock().unwrap();
+            store.save_locked(&record).unwrap();
+        }
+
+        std::fs::write(store.path(Uuid::new_v4()), b"not json").unwrap();
+        let store_dir = root.join("devin-cloud-tasks");
+        std::fs::write(store_dir.join("not-a-uuid.json"), b"{}").unwrap();
+        std::fs::write(store_dir.join("ignored.txt"), b"x").unwrap();
+        std::fs::create_dir_all(store_dir.join("subdir")).unwrap();
+
+        let page = store.list_tasks(&session).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].task_id, record.task_id);
+        assert_eq!(page.unreadable_records, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_list_reports_store_read_failures() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let _serial = serial().await;
+        std::fs::write(root.join("blocking-file"), b"x").unwrap();
+        let store = TaskStore::new(root.join("blocking-file").join("tasks"));
+        assert!(store.list_tasks(&session).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_list_empty_store_is_confirmed_not_unconfirmed() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let page = store.list_tasks(&session).unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.unreadable_records, 0);
     }
 }

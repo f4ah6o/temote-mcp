@@ -395,6 +395,16 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "task_list",
+    "List session-owned delegated tasks",
+    "Return a bounded read-only projection of the delegated tasks owned by the selected session across every task backend; unconfirmed backends are reported instead of being faked as empty.",
+    readOnly,
+    schema(
+      { ...sessionProperty, limit: { type: "integer", minimum: 1, maximum: 128, default: 50 } },
+      ["session_id"],
+    ),
+  ),
+  tool(
     "poll_job",
     "Poll a sandbox job",
     "Poll a background command on the selected host.",

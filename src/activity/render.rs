@@ -124,6 +124,7 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::ApplyPatch => "apply_patch",
         ActivityOperation::PollJob => "poll_job",
         ActivityOperation::JobList => "job_list",
+        ActivityOperation::TaskList => "task_list",
         ActivityOperation::CheckpointSave => "checkpoint_save",
         ActivityOperation::CheckpointLoad => "checkpoint_load",
         ActivityOperation::WorkHandoff => "work_handoff",
