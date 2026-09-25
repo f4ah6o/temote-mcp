@@ -28,6 +28,8 @@ mod line_protocol;
 #[cfg(feature = "network")]
 mod local_oauth;
 mod managed_worktree;
+#[allow(dead_code)]
+mod vcs;
 mod mcp;
 mod named_roots;
 #[cfg(feature = "network")]
