@@ -135,6 +135,17 @@ TEMOTE_PBT_SEED=0x1234 cargo test --all-features
 
 Keep example tests for named regressions; use property tests for grammars, containment/fail-closed rules, redaction, and state-machine invariants where the input space is larger than a useful example table.
 
+### Mutation testing
+
+[cargo-mutants](https://mutants.rs) measures whether the suite actually observes a change: each `MISSED` line is a rewrite no test caught. Install once with `cargo install --locked cargo-mutants`; shared settings live in `.cargo/mutants.toml` and `just mutants-list` previews what would be mutated.
+
+```sh
+just mutants -f src/mcp.rs   # mutants in one file
+just mutants-diff            # mutants on lines changed vs origin/main
+```
+
+Always scope runs — the whole tree is a long host/CI job, and the unmutated baseline must be green (`-- --skip <filter>` drops unrelated known-failing tests locally). Prefer killing survivors with one reference-model or round-trip property test rather than many examples, and keep boundary inputs (such as length 0) in the generated space so guard branches stay covered. Provably equivalent mutants are expected; note them in review rather than chasing a 100% kill rate.
+
 ## Release versioning
 
 Releases use CalVer `YYYY.MM.PATCH` in the `Asia/Tokyo` timezone through [`f4ah6o/calver-action`](https://github.com/f4ah6o/calver-action).
