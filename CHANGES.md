@@ -14,6 +14,7 @@
 
 ### Changed
 
+- Delegation task views (`*_task_get` / `*_task_list`) now report `execution`, `verification`, and `delivery` as separate states: a completed execution is not a verification PASS, a verification result applies only to the task record revision it was recorded against (older results are reported as `not_run` with `stale: true`), and delivery stays `not_started` until a delivery operation records it. Records written before these fields existed read as `not_run` / `not_started`. ([task state separation](issues/open/20260925-a4-task-state-separation.md))
 - Supervisor upgrades now coordinate session restore, direct-ingress recovery, endpoint checks, and binary-owned Codex plugin reconciliation before reporting terminal status.
 - `agent` permission mode now runs ordinary `execute`/`start_command` in the same sandbox and path containment with the network-enabled development profile, so localhost, LAN, and Internet development traffic works without yolo. `ask` keeps ordinary commands network-disabled, and public HTTP still cannot expose `without_sandbox` or create/promote `yolo`. ([agent development network access](issues/open/20260915-agent-development-network-access.md))
 

@@ -95,6 +95,8 @@ foreground timeout を超える作業は session 所有の `job_id` を返しま
 
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 
+delegation backend が返す task view は、backend の execution `status` を維持したまま、3 つの状態を分けて持ちます。`execution` は論理 task の現在の execution の安定した id と generation、`verification` は `not_run` / `passed` / `failed` と、その結果を記録した task record revision への束縛、`delivery` は `not_started` / `pending` / `submitted` / `merged` / `closed` / `failed` です。execution が `completed` でも verification PASS にはなりません。現在の revision に適用できる結果がない間は `verification.status` は `not_run` のままで、古い revision の結果は現在の PASS としてではなく `stale: true` と以前の target 付きで返します。delivery は記録された delivery 操作だけが更新し、agent が報告した pull request では変わりません。これらの field より前に書かれた record は `not_run` / `not_started` として読めます。
+
 ### Experimental Codex task
 
 opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_control` は、local `codex app-server --stdio` に接続し、名前付きの status/task 操作だけを扱います。互換性を Codex app-server の特定 version 文字列には固定しません。initialize response は上限付きで shape を検証し、version は解析できた場合だけ best-effort の診断情報として返します。互換性は、Temote が実際に使用する `model/list`、`thread/*`、`turn/*` の request/response をその場で検証して fail-closed にします。task は完全な session instance と canonical working directory に所有されるため、別 session、別 process generation、別 scope から resume できません。
