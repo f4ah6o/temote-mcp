@@ -125,7 +125,8 @@ task view の field 集合はその時点の backend 実装に従う。A4 (task 
   `instance_generation` を照合し、その runtime handle / 解決済み `config::Session` のまま
   dispatch する (`session_id` から dispatch 時に再解決しない)。approval などで待機した後、
   backend を呼ぶ直前に再照合し、instance が変わっていれば backend を呼ばずに
-  `TASK_SESSION_INSTANCE_CHANGED` を返す。照合後・dispatch 中に instance が停止した場合も、
+  `TASK_SESSION_INSTANCE_CHANGED` を返す (approval が先に完了していても、その結果を backend
+  受理に進めない)。照合後・dispatch 中に instance が停止した場合も、
   backend の既存 `ensure_current_active_instance` が approval / receipt 受理の前に fail
   closed し、別 instance が旧 request を受理しない。長い approval 待ちの間 session の
   start / stop をブロックしない (transition guard を dispatch 全体に保持しない)。
@@ -150,8 +151,12 @@ B1 が追加する command (すべて snake_case):
 | `task_control` | `protocol_version`, `session_id`, `expected_instance_generation`, `backend` | MCP `*_task_control` args から `session_id` を除いた同一 object (`task_id`, `operation_id`, `action`, 任意 `input`) | backend task view |
 
 - すべての task command は envelope に `expected_instance_generation` (server 発行の opaque id) を
-  **必須**で含む。欠落・型不一致は `TASK_PROTOCOL_INVALID`、live instance との不一致は
-  approval / dispatch / receipt 受理の前に `TASK_SESSION_INSTANCE_CHANGED` で拒否する。
+  **必須**で含む。欠落・型不一致は `TASK_PROTOCOL_INVALID`。live instance との不一致は
+  `TASK_SESSION_INSTANCE_CHANGED` で拒否し、拒否の時点は照合の時点に従う:
+  - 受領時の照合で不一致 → **approval の前に**拒否する (approval は要求しない)。
+  - approval 待ちの間に instance が変わった場合 → approval 完了後の **dispatch 直前照合**で
+    検出し、backend dispatch と receipt 受理の前に拒否する (approval 自体はすでに完了して
+    いる。approval 結果を受理や成功に読み替えない)。
   server は §2.4 の 2 回照合 (受領時 / dispatch 直前) で検証する。これは scope 指定権ではなく
   server 発行 identity の照合条件であり、caller は generation 以外の instance field を
   指定できない。client 側の事前比較 (§2.6) は fast path であり、Info と task 送信の間の
@@ -417,9 +422,17 @@ PR #56 review 反映 2 回目 (2026-09-25):
 - Info と task 送信の間の再起動競合 (TOCTOU) を解消した。server 発行の opaque
   `instance_generation` を `SessionView` に追加し、すべての task command の envelope に
   `expected_instance_generation` を必須 precondition として含める。server は request 受領時と
-  backend dispatch 直前の 2 回照合し、不一致は approval / dispatch / receipt 受理の前に
-  `TASK_SESSION_INSTANCE_CHANGED` で拒否する。client 側の事前比較は fast path とし、retry は
-  instance が変わった時点で新規試行として fresh な operation_id を要求する
+  backend dispatch 直前の 2 回照合し、不一致は `TASK_SESSION_INSTANCE_CHANGED` で拒否する。
+  受領時の不一致は approval の前に、approval 待ちの間の変更は approval 完了後の dispatch 直前
+  照合で検出し、backend dispatch / receipt 受理の前に拒否する。client 側の事前比較は fast path
+  とし、retry は instance が変わった時点で新規試行として fresh な operation_id を要求する
   (§2.2 / §2.4 / §2.5 / §2.6)。
 - B1 の必須 regression に「Info が B を返した直後の C 再起動」と旧 operation_id retry の
   競合 fixture (backend dispatch 0 回) を追加した (§2.5 / §4)。
+
+PR #56 review 反映 3 回目 (2026-09-25):
+
+- approval timing の nit を反映。受領時の不一致は **approval の前**に拒否し、approval 待ちの
+  間に instance が変わった場合は approval 完了後の **dispatch 直前照合**で検出して backend
+  dispatch / receipt 受理の前に拒否する、と §2.4 / §2.5 で時点を明記した (approval 結果を
+  受理や成功に読み替えない)。
