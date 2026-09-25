@@ -10,8 +10,11 @@ Prerequisites: A1 `51424a4` / A2 `9377bc8` / A3 `3e342d6` (すべて `main` merg
 `CONTROL_READ_TIMEOUT = CONTROL_WRITE_TIMEOUT = 5s`、`approvals::SESSION_RESPONSE_TIMEOUT = 2h`、
 `config::supervisor_socket_path()`
 
-Updated: 2026-09-25 — PR #56 review 反映: operation record の session instance 束縛、`request` の
+Updated: 2026-09-25 — PR #56 review 反映 (1): operation record の session instance 束縛、`request` の
 flat fixture 化、response lifetime の分離、task frame 上限 (16 MiB)、v2 supervisor の実挙動修正。
+Updated: 2026-09-25 — PR #56 review 反映 (2): instance precondition
+(`expected_instance_generation`) により Info → task 送信間の再起動競合 (TOCTOU) を server 側で
+クローズ。client 側の事前比較は fast path に限定。
 
 ## 1. Goal
 
@@ -66,10 +69,14 @@ restart the lifecycle supervisor with the matching Temote version
 - server は live な session instance (`session_id` + `started_at` + `process_id` + canonical
   scope) を解決し、その `config::Session` を core へ渡す。同じ `session_id` でも restart 後の
   別 instance・別 scope は別 owner であり、先行 instance の task を取得・制御できない。
+- server は session instance ごとに **opaque な `instance_generation`** を発行し、`Info` /
+  `session_list` の `SessionView` に含める。start / restart / supervisor restore のたびに
+  再生成し、同じ instance の間だけ安定する。caller はこの値の意味・値を決められず、echo して
+  照合を要求できるだけである。
 - backend の task ID と operation receipt は完全な session instance から導出される
   (`task_id_for_operation` 等)。同じ `session_id` の再起動後に同じ `operation_id` を送っても、
-  backend では **別 task として新規受理され得る**。この重複起動は client 側の instance 束縛
-  (§2.6) で防ぎ、server は instance 変更を replay と見なさない。
+  backend では **別 task として新規受理され得る**。この重複起動は §2.5 の instance
+  precondition と §2.6 の record 束縛で防ぎ、server は instance 変更を replay と見なさない。
 - 他 session の task は存在確認も含めて返さない。ownership 不一致は backend の既存 error
   (`CODEX_TASK_NOT_FOUND: task was not found` 等) をそのまま返し、task の存在を漏らさない。
 
@@ -112,6 +119,12 @@ task view の field 集合はその時点の backend 実装に従う。A4 (task 
   executor (session runtime / session-scoped task executor) へ route → A 系の
   `orchestration::invoke(backend, operation, args, session, activity)` へ渡す。
   activity / approval / evidence / task runtime lease は MCP 経路と同じ session 文脈を使う。
+- **instance precondition の照合と dispatch は同じ execution owner で直列化する。** server は
+  live instance の `instance_generation` を照合し、一致した場合にその runtime handle のまま
+  dispatch する。照合と session の start / stop / restart 遷移は同一の transition guard
+  (または runtime handle) の下で行い、照合直後に別 instance へ差し替わった状態で backend を
+  呼ばない。dispatch 中に instance が停止した場合は既存の `ensure_current_active_instance` が
+  fail closed し、receipt を別 instance で受理しない。
 - session が active でない、または instance を解決できない場合は backend を呼ばず
   `TASK_SESSION_NOT_FOUND` / `TASK_SESSION_NOT_ACTIVE` で拒否する。supervisor が代理で
   task を作らない。
@@ -125,15 +138,23 @@ default 50、task view の field 集合) を守る。
 
 B1 が追加する command (すべて snake_case):
 
-| command | envelope (routing のみ) | nested `request` (typed input) | `result` |
+| command | envelope (routing / precondition) | nested `request` (typed input) | `result` |
 | --- | --- | --- | --- |
-| `task_start` | `protocol_version`, `session_id`, `backend` | MCP `*_task_start` args から `session_id` を除いた同一 object (`operation_id`, `task`, backend 固有 field) | backend task view |
-| `task_get` | `protocol_version`, `session_id`, `backend` | MCP `*_task_get` args から `session_id` を除いた同一 object (`task_id`, 任意 `after_revision`) | backend task view (`not_modified` 含む) |
-| `task_list` | `protocol_version`, `session_id` | MCP `*_task_list` args から `session_id` を除いた同一 object (任意 `limit`) | A3 merged `{tasks, backends, total, truncated, limit}` |
-| `task_control` | `protocol_version`, `session_id`, `backend` | MCP `*_task_control` args から `session_id` を除いた同一 object (`task_id`, `operation_id`, `action`, 任意 `input`) | backend task view |
+| `task_start` | `protocol_version`, `session_id`, `expected_instance_generation`, `backend` | MCP `*_task_start` args から `session_id` を除いた同一 object (`operation_id`, `task`, backend 固有 field) | backend task view |
+| `task_get` | `protocol_version`, `session_id`, `expected_instance_generation`, `backend` | MCP `*_task_get` args から `session_id` を除いた同一 object (`task_id`, 任意 `after_revision`) | backend task view (`not_modified` 含む) |
+| `task_list` | `protocol_version`, `session_id`, `expected_instance_generation` | MCP `*_task_list` args から `session_id` を除いた同一 object (任意 `limit`) | A3 merged `{tasks, backends, total, truncated, limit}` |
+| `task_control` | `protocol_version`, `session_id`, `expected_instance_generation`, `backend` | MCP `*_task_control` args から `session_id` を除いた同一 object (`task_id`, `operation_id`, `action`, 任意 `input`) | backend task view |
 
-- **normalization rule**: server は envelope の field を nested `request` へ merge しない。
-  parser (`orchestration::TaskRequest::parse`) へ渡す入力は nested `request` そのものであり、
+- すべての task command は envelope に `expected_instance_generation` (server 発行の opaque id) を
+  **必須**で含む。欠落・型不一致は `TASK_PROTOCOL_INVALID`、live instance との不一致は
+  approval / dispatch / receipt 受理の前に `TASK_SESSION_INSTANCE_CHANGED` で拒否する。
+  server は §2.4 の直列化の下で照合する。これは scope 指定権ではなく server 発行 identity の
+  照合条件であり、caller は generation 以外の instance field を指定できない。client 側の
+  事前比較 (§2.6) は fast path であり、Info と task 送信の間の再起動 (TOCTOU) はこの server 側
+  precondition で閉じる。
+- **normalization rule**: server は envelope の field (`session_id` / `backend` /
+  `expected_instance_generation`) を nested `request` へ merge しない。parser
+  (`orchestration::TaskRequest::parse`) へ渡す入力は nested `request` そのものであり、
   `operation_id` / `task_id` / `action` / `input` は必ず `request` 内にある。envelope の
   `session_id` を `request` にも複製した場合、または envelope 側に typed field を置いた場合は
   `TASK_PROTOCOL_INVALID` として dispatch 前に拒否する。この normalization は exact fixture で
@@ -146,19 +167,19 @@ B1 が追加する command (すべて snake_case):
   projection で、各 item が `backend` を持つ。
 - 応答の `error` は backend / core の既存 error 文字列をそのまま含む。新しい prefix は
   protocol / routing 層だけが付ける (`TASK_PROTOCOL_INVALID`, `TASK_SESSION_NOT_FOUND`,
-  `TASK_SESSION_NOT_ACTIVE`, `TASK_PEER_REJECTED`, `TASK_BACKEND_UNSUPPORTED`,
-  `TASK_FRAME_TOO_LARGE`)。
+  `TASK_SESSION_NOT_ACTIVE`, `TASK_SESSION_INSTANCE_CHANGED`, `TASK_PEER_REJECTED`,
+  `TASK_BACKEND_UNSUPPORTED`, `TASK_FRAME_TOO_LARGE`)。
 
 exact fixture (B1 の mock / integration test はこの JSON をそのまま使う):
 
 ```json
-{"command":"task_start","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","backend":"opencode","request":{"operation_id":"0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa","task":"implement api","model":"anthropic/claude-sonnet-4","agent":"build"}}
+{"command":"task_start","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","expected_instance_generation":"3f1c0a9e-0b7d-4a1e-8c2f-6a5b4c3d2e1f","backend":"opencode","request":{"operation_id":"0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa","task":"implement api","model":"anthropic/claude-sonnet-4","agent":"build"}}
 {"ok":true,"result":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","status":"accepted","revision":1,"generation":0},"error":null}
 
-{"command":"task_control","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","backend":"devin","request":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","operation_id":"0199dddd-dddd-7ddd-8ddd-dddddddddddd","action":"steer","input":"add tests"}}
+{"command":"task_control","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","expected_instance_generation":"3f1c0a9e-0b7d-4a1e-8c2f-6a5b4c3d2e1f","backend":"devin","request":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","operation_id":"0199dddd-dddd-7ddd-8ddd-dddddddddddd","action":"steer","input":"add tests"}}
 {"ok":true,"result":{"task_id":"0199cccc-cccc-7ccc-8ccc-cccccccccccc","status":"running","revision":3,"generation":2},"error":null}
 
-{"command":"task_list","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","request":{"limit":50}}
+{"command":"task_list","protocol_version":3,"session_id":"0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb","expected_instance_generation":"3f1c0a9e-0b7d-4a1e-8c2f-6a5b4c3d2e1f","request":{"limit":50}}
 {"ok":true,"result":{"tasks":[],"backends":{"codex":{"status":"ok","total":0,"skipped":0},"devin_acp":{"status":"unavailable","error":"..."}},"total":0,"truncated":false,"limit":50},"error":null}
 ```
 
@@ -167,9 +188,15 @@ exact fixture (B1 の mock / integration test はこの JSON をそのまま使�
 ```json
 {"ok":false,"result":null,"error":"TASK_PROTOCOL_INVALID: task_session_id must be carried in the envelope, not in request"}
 {"ok":false,"result":null,"error":"TASK_SESSION_NOT_FOUND: session 0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb is not active"}
+{"ok":false,"result":null,"error":"TASK_SESSION_INSTANCE_CHANGED: expected instance 3f1c0a9e-0b7d-4a1e-8c2f-6a5b4c3d2e1f but the live session instance is 8a2d...; re-resolve the session and use a new operation id for a new attempt"}
 {"ok":false,"result":null,"error":"TASK_BACKEND_UNSUPPORTED: unsupported task backend \"cursor\""}
 {"ok":false,"result":null,"error":"OPERATION_CONFLICT: operation_id was already accepted with a different request"}
 ```
+
+競合 regression (B1): `Info` が instance B を返した直後、task request の dispatch 前に session が C へ
+再起動する fixture で、request は `TASK_SESSION_INSTANCE_CHANGED` で拒否され、B / C のどちらにも
+backend side effect と receipt が無いことを確認する。retry 経路 (`Info` B → 送信直前 C 再起動 →
+旧 operation_id 再送) も同じ fixture に含める。
 
 #### Frame bound
 
@@ -191,9 +218,9 @@ exact fixture (B1 の mock / integration test はこの JSON をそのまま使�
 - 保存先: `<state_dir>/task-operations/<session_id>/<operation_id>.json`。directory `0700`、
   file `0600`、`create_new` + `fsync` + rename の atomic write。secret を書かない。
 - **送信前に live session instance を解決して record に束縛する。** `session_info` / `Info` の
-  `SessionView` (`id`, `started_at`, `process_id`, canonical `cwd`) を instance identity として
-  保存する。task ID と operation receipt が完全な instance から導出されるため、record は
-  `session_id` だけでは不足する。
+  `SessionView` が返す server 発行 `instance_generation` を保存する。`started_at` /
+  `process_id` / canonical `cwd` は診断情報として併記してよい。task ID と operation receipt が
+  完全な instance から導出されるため、record は `session_id` だけでは不足する。
 
 ```json
 {
@@ -202,6 +229,7 @@ exact fixture (B1 の mock / integration test はこの JSON をそのまま使�
   "session_id": "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb",
   "session_instance": {
     "session_id": "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb",
+    "instance_generation": "3f1c0a9e-0b7d-4a1e-8c2f-6a5b4c3d2e1f",
     "started_at": 1790000000,
     "process_id": 4242,
     "canonical_scope": "/home/user/src/example"
@@ -217,17 +245,19 @@ exact fixture (B1 の mock / integration test はこの JSON をそのまま使�
   canonical JSON (key 昇順・compact・UTF-8) から client-side `request_fingerprint` を計算 →
   file を atomic に保存 → 成功した場合だけ `operation_id` を表示し、送信する。save 失敗時は
   送信しない。task 文面 / control input 自体は保存しない。
-- 再利用時は **同じ operation_id の record の `session_instance` と、いま解決した instance が
-  `session_id` / `started_at` / `process_id` / canonical scope の 4 field で完全一致することを
-  要求**する。不一致 (restart / 別 scope / 別 process) は送信せず
+- 再利用時は **同じ operation_id の record の `instance_generation` と、いま `Info` で解決した
+  live instance が返す generation が一致することを要求**する。不一致 (restart / supervisor
+  restore) は送信せず
   `operation record belongs to a previous session instance; use a new --operation-id` で拒否する。
-  これにより、同じ session ID の再起動後に旧 operation_id が新しい task を二重起動することを
-  client 側で防ぐ。故意の新規試行には fresh な operation_id を要求する。
+  この事前比較は fast path であり、Info と task 送信の間の再起動競合は §2.5 の
+  `expected_instance_generation` precondition を server が dispatch 直前に照合することで閉じる。
 - 同一 instance + 同一 operation_id + digest 一致の再送はそのまま送信し、backend の receipt
   replay を受ける。digest 不一致は送信せず client 側 conflict として拒否する。server 側の
   同一 ID / 異なる fingerprint 検査 (`OPERATION_CONFLICT`) は最終権威として維持する。
+- instance generation が変わった operation は replay ではなく新規試行である。旧 operation の
+  receipt は instance をまたいで成立しないため、fresh な `operation_id` を要求する。
 - 応答成功後は返った `task_id` を record に best-effort で atomic 追記し、`task reconcile` と
-  再発見に使う。instance が変わった record の `task_id` は照合に使わない。
+  再発見に使う。instance が変わった record の `task_id` を現在 instance の照合に使わない。
 - record の保持は task retention (24h) 以上とし、期限切れ record は opportunistic に prune する。
   operation record は authoritative task store ではなく、backend store と矛盾した場合は
   backend store / `task_get` の結果を優先する。
@@ -272,8 +302,10 @@ temote-mcp task reconcile --local --session <id> [<operation-id>]
 ```
 
 - `--local` は transport selector のみ。rename 前は現 binary 名 `temote-mcp` で提供する (G)。
-- `--operation-id` が無い場合、CLI は `Info` で instance を解決した後に UUID を生成し、
-  record 保存後に `operation_id: <uuid>` を表示してから送信する。
+- `--operation-id` が無い場合、CLI は `Info` で instance を解決した後に `instance_generation` を
+  record へ保存し、UUID を生成、record 保存後に `operation_id: <uuid>` を表示してから送信する。
+  すべての task command は record / 直前の `Info` が返した `instance_generation` を envelope の
+  `expected_instance_generation` に echo する。
 - `task reconcile` は wire command を追加せず、保存済み operation record から `task_id` を解決して
   `task_get` を呼ぶ B2 の複合操作とする。record が無い / instance 不一致 / `task_id` 未確定なら
   `task_list` を表示して不確実性を明示する。
@@ -312,12 +344,16 @@ temote-mcp task reconcile --local --session <id> [<operation-id>]
 ## 4. B1 / B2 の実装手順 (この契約の使い方)
 
 **B1:** `ControlRequest` に `Task*` を additive 追加 + `CONTROL_PROTOCOL_VERSION = 3` →
+session runtime に opaque `instance_generation` を発行し `SessionView` へ追加 →
 task frame bound (16 MiB) と response timeout 分離 → peer credential / `protocol_version` /
-session / backend / nested `request` normalization を dispatch 前に検証 →
-解決済み session を executor へ route → `orchestration::invoke` → bounded response。
+session / `expected_instance_generation` / backend / nested `request` normalization を dispatch
+前に検証 → precondition 照合と dispatch を同一 transition guard の下で実行 → その session の
+executor 経由で `orchestration::invoke` → bounded response。
 fixture backend で socket routing を確認し、v2 supervisor の EOF 挙動、認証・scope・version・
-ownership・frame 超過の拒否経路を同じ test suite に置く。lifecycle request が v2 client から
-引き続き使えることを regression で固定する。
+ownership・instance precondition・frame 超過の拒否経路を同じ test suite に置く。特に
+「`Info` が instance B を返した直後、dispatch 前に C へ再起動」と、その状態での旧 operation_id
+retry の競合 fixture を必須とし、B / C どちらにも backend dispatch と receipt が無いことを
+固定する。lifecycle request が v2 client から引き続き使えることを regression で固定する。
 
 **B2:** CLI parsing → `Info` で instance 解決 → operation ID を保存・表示 → 送信 →
 task / operation ID と状態を表示。instance 不一致の record は送信しない。同じ ID の異なる
@@ -333,6 +369,8 @@ payload を送信しない。切断 / timeout 時に server を再起動せず�
 - [x] 4 command の envelope / nested `request` / normalization / exact fixture / error が揃っている (2.5)
 - [x] task frame 上限 (16 MiB) の導出と超過時の拒否が固定されている (2.5)
 - [x] operation record の session instance 束縛と再起動時の重複起動防止が固定されている (2.6)
+- [x] instance precondition (`expected_instance_generation`) で Info→送信間の再起動競合 (TOCTOU) を
+      server 側 dispatch 直前に拒否し、client 事前比較を fast path に限定している (2.2 / 2.4 / 2.5 / 2.6)
 - [x] ingestion timeout と response wait の分離、切断 / session 停止 / 再起動 / retry が固定されている (2.7)
 - [x] `--local` が yolo / approval bypass / sessionless にならないことが明記されている (2.1–2.7)
 
@@ -358,7 +396,7 @@ packet B0 — 契約書を `issues/open/20260925-b0-local-task-protocol-contract
 コード変更・runtime 検証は未実施 (設計 packet のため)。B1 は §2.1–2.5、B2 は §2.6–2.8 の契約を
 そのまま実装入力にできる。
 
-PR #56 review 反映 (2026-09-25):
+PR #56 review 反映 1 回目 (2026-09-25):
 
 - operation record を完全な session instance (`started_at` / `process_id` / canonical scope) に
   束縛し、instance 不一致の再送を client 側で拒否する契約にした (§2.2 / §2.6)。
@@ -368,3 +406,15 @@ PR #56 review 反映 (2026-09-25):
 - task frame 上限 16 MiB を導出し、超過拒否と response への適用を固定した (§2.5)。
 - v2 supervisor は structured error を返さず EOF / connection close になることを明記し、
   structured error は v3 server の `protocol_version < 3` 拒否時とする (§2.1)。
+
+PR #56 review 反映 2 回目 (2026-09-25):
+
+- Info と task 送信の間の再起動競合 (TOCTOU) を解消した。server 発行の opaque
+  `instance_generation` を `SessionView` に追加し、すべての task command の envelope に
+  `expected_instance_generation` を必須 precondition として含める。server は session の
+  start / stop / restart 遷移と同一 guard の下で照合し、不一致は approval / dispatch /
+  receipt 受理の前に `TASK_SESSION_INSTANCE_CHANGED` で拒否する。client 側の事前比較は
+  fast path とし、retry は instance が変わった時点で新規試行として fresh な operation_id を
+  要求する (§2.2 / §2.4 / §2.5 / §2.6)。
+- B1 の必須 regression に「Info が B を返した直後の C 再起動」と旧 operation_id retry の
+  競合 fixture (backend dispatch 0 回) を追加した (§2.5 / §4)。
