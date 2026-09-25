@@ -190,6 +190,7 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
     ),
     activity_tool("poll_job", ActivityOperation::PollJob, "job poll"),
     activity_tool("job_list", ActivityOperation::JobList, "job list"),
+    activity_tool("task_list", ActivityOperation::TaskList, "task list"),
     activity_tool(
         "stop_job",
         ActivityOperation::StopJob,
@@ -781,6 +782,7 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
         {"name":"devin_cloud_task_start","title":"Start a Devin Cloud session task","description":"Accept an idempotent scoped Devin Cloud task mutation, persist acceptance before the remote side effect, then create a hosted Devin session (API v3) with a structured report schema. The session runs on Devin Cloud, not on this host; operation_id is mandatory.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"title":{"type":"string","minLength":1,"maxLength":256},"devin_mode":{"type":"string","enum":["normal","fast","lite","ultra","fusion","swe-2-medium","swe-2-high","swe-2-max"]},"repos":{"type":"array","items":{"type":"string","minLength":1,"maxLength":256},"maxItems":16},"max_acu_limit":{"type":"integer","minimum":1,"maximum":100000}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
         {"name":"devin_cloud_task_get","title":"Read a Devin Cloud session task","description":"Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"devin_cloud_task_control","title":"Control a Devin Cloud session task","description":"Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
+        {"name":"task_list","title":"List session-owned delegated tasks","description":"Return a bounded read-only projection of the delegated tasks owned by the selected session across every task backend. Unconfirmed backends are reported instead of being faked as empty; detailed data stays behind bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
         {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
@@ -938,6 +940,7 @@ async fn call_tool(
             "evidence_read" => evidence_read_tool(&args, &session),
             "poll_job" => poll_job(&args, &session).await,
             "job_list" => job_list(&args, &session),
+            "task_list" => task_list(&args, &session),
             "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
             _ => match delegation_operation(name) {
                 Some((backend, operation)) => text_result(serde_json::to_string_pretty(
@@ -1463,6 +1466,34 @@ fn take_job_for_session(job_id: Uuid, session_id: &str) -> Result<Job> {
         "job does not belong to this session"
     );
     state.jobs.remove(&job_id).context("unknown job_id")
+}
+
+fn task_list(args: &Value, session: &config::Session) -> Result<Value> {
+    let object = args
+        .as_object()
+        .context("task_list arguments must be an object")?;
+    anyhow::ensure!(
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "session_id" | "limit")),
+        "task_list accepts only session_id and limit"
+    );
+    let limit = match object.get("limit") {
+        Some(value) => {
+            let limit = value
+                .as_u64()
+                .context("task_list limit must be an integer")?;
+            anyhow::ensure!(
+                (1..=128).contains(&limit),
+                "task_list limit must be 1..=128"
+            );
+            limit as usize
+        }
+        None => 50,
+    };
+    text_result(serde_json::to_string_pretty(&orchestration::task_list(
+        session, limit,
+    ))?)
 }
 
 fn job_list(args: &Value, session: &config::Session) -> Result<Value> {
@@ -2447,7 +2478,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 26);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -3134,6 +3165,64 @@ mod tests {
 
         if let Some(job) = remove_job(job_id) {
             job.handle.abort();
+        }
+    }
+
+    #[test]
+    fn task_list_validates_limit_and_fields() {
+        let cwd = std::env::current_dir().unwrap();
+        let session = config::Session {
+            id: format!("task-list-args-{}", Uuid::new_v4()),
+            cwd,
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
+        };
+        assert!(task_list(&json!({"session_id":session.id,"limit":1}), &session).is_ok());
+        assert!(task_list(&json!({"session_id":session.id,"limit":128}), &session).is_ok());
+        assert!(task_list(&json!({"session_id":session.id,"limit":0}), &session).is_err());
+        assert!(task_list(&json!({"session_id":session.id,"limit":129}), &session).is_err());
+        assert!(task_list(&json!({"session_id":session.id,"limit":"x"}), &session).is_err());
+        assert!(
+            task_list(
+                &json!({"session_id":session.id,"limit":50,"unknown":true}),
+                &session
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn task_list_renders_session_projection_with_backend_states() {
+        let cwd = std::env::current_dir().unwrap();
+        let session = config::Session {
+            id: format!("task-list-render-{}", Uuid::new_v4()),
+            cwd,
+            permitted_directories: Vec::new(),
+            started_at: 0,
+            process_id: 0,
+            permission_mode: config::PermissionMode::Yolo,
+            grants: config::SessionGrants::default(),
+        };
+        let out = task_list(&json!({"session_id":session.id}), &session).unwrap();
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let rendered: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(rendered["tasks"], json!([]));
+        assert_eq!(rendered["truncated"], json!(false));
+        assert_eq!(rendered["retention"], json!("per_backend_store"));
+        let backends = rendered["backends"].as_object().unwrap();
+        #[cfg(feature = "network")]
+        let expected = ["codex", "opencode", "devin", "devin_cloud"];
+        #[cfg(not(feature = "network"))]
+        let expected = ["codex", "devin"];
+        for label in expected {
+            assert_eq!(
+                backends[label]["status"],
+                json!("ok"),
+                "backend {label} must be confirmed"
+            );
         }
     }
 

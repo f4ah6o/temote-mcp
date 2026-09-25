@@ -13,6 +13,7 @@
 //! unsupported actions) before any approval prompt or backend side effect.
 
 mod requests;
+mod task_list;
 
 use std::collections::BTreeMap;
 
@@ -32,6 +33,8 @@ use requests::{
 };
 #[cfg(feature = "network")]
 use requests::{DevinCloudStartOptions, OpenCodeStartOptions};
+
+pub(crate) use task_list::{BackendTaskPage, ListedTask};
 
 /// One server-backed coding agent behind the shared typed task contract.
 ///
@@ -60,19 +63,51 @@ pub(crate) enum Operation {
 }
 
 impl Backend {
-    /// Compatibility operation label shared by the public tool surface and
-    /// the approval layer (e.g. `codex_task_start`). Approval requests and
-    /// metadata keep using these labels so records stay comparable across
-    /// transports.
-    fn operation_name(self, operation: Operation) -> String {
-        let prefix = match self {
+    /// Every backend wired into the orchestration core, in a fixed order.
+    pub(crate) fn all() -> &'static [Backend] {
+        const ALL: &[Backend] = &[
+            Backend::Codex,
+            #[cfg(feature = "network")]
+            Backend::OpenCode,
+            Backend::DevinAcp,
+            #[cfg(feature = "network")]
+            Backend::DevinCloud,
+        ];
+        ALL
+    }
+
+    /// Stable backend identity label used in shared projections and
+    /// reports (`codex`, `opencode`, `devin`, `devin_cloud`). Unlike
+    /// [`Backend::operation_name`] this is not prefixed with an action.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
             Backend::Codex => "codex",
             #[cfg(feature = "network")]
             Backend::OpenCode => "opencode",
             Backend::DevinAcp => "devin",
             #[cfg(feature = "network")]
             Backend::DevinCloud => "devin_cloud",
-        };
+        }
+    }
+
+    /// This backend's page of the session-scoped shared task list.
+    fn task_list(self, session: &config::Session) -> Result<BackendTaskPage> {
+        match self {
+            Backend::Codex => codex_app_server::list_tasks(session),
+            #[cfg(feature = "network")]
+            Backend::OpenCode => opencode_server::list_tasks(session),
+            Backend::DevinAcp => devin_acp::list_tasks(session),
+            #[cfg(feature = "network")]
+            Backend::DevinCloud => devin_cloud::list_tasks(session),
+        }
+    }
+
+    /// Compatibility operation label shared by the public tool surface and
+    /// the approval layer (e.g. `codex_task_start`). Approval requests and
+    /// metadata keep using these labels so records stay comparable across
+    /// transports.
+    fn operation_name(self, operation: Operation) -> String {
+        let prefix = self.label();
         let action = match operation {
             Operation::Status => "status",
             Operation::TaskStart => "task_start",
@@ -214,6 +249,23 @@ pub(crate) async fn invoke(
             backend.task_control(args, session).await
         }
     }
+}
+
+/// List the tasks owned by the full session instance and scope across
+/// every backend as one bounded read-only projection.
+///
+/// The per-backend stores stay the source of truth; this entry only fans
+/// out the session-scoped read and merges the pages through
+/// [`task_list::render`], so no second authoritative task store exists and
+/// no task ID is renumbered. A backend whose store cannot be read is
+/// reported as unconfirmed rather than as an empty page; `limit` is the
+/// merged page bound the frontend's I/O contract fixes.
+pub(crate) fn task_list(session: &config::Session, limit: usize) -> Value {
+    let pages = Backend::all()
+        .iter()
+        .map(|backend| (*backend, backend.task_list(session)))
+        .collect();
+    task_list::render(pages, limit)
 }
 
 async fn authorize(
@@ -845,5 +897,34 @@ mod tests {
             );
         }
         assert_eq!(backend_dispatch_count(), 0);
+    }
+
+    #[test]
+    fn task_list_covers_every_backend_and_is_session_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = config::canonical_directory(root.path()).unwrap();
+        let session = config::Session {
+            id: "task-list-owner".to_owned(),
+            cwd: cwd.clone(),
+            permitted_directories: vec![cwd],
+            started_at: 1234,
+            process_id: 5678,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        let rendered = super::task_list(&session, 50);
+        assert_eq!(rendered["tasks"], json!([]));
+        assert_eq!(rendered["truncated"], json!(false));
+        assert_eq!(rendered["retention"], json!("per_backend_store"));
+        let backends = rendered["backends"].as_object().unwrap();
+        for backend in Backend::all() {
+            let entry = &backends[backend.label()];
+            assert_eq!(
+                entry["status"],
+                json!("ok"),
+                "backend {} must be confirmed",
+                backend.label()
+            );
+        }
     }
 }

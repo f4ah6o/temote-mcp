@@ -111,11 +111,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 27);
+  assert.equal(names.length, 28);
   for (const required of ["host_list", "host_info", "session_list", "session_start", "session_stop", "session_restart", "session_info"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "stop_job"]) {
+  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "task_list", "poll_job", "job_list", "stop_job"]) {
     assert.equal(names.includes(required), true, required);
   }
   for (const removed of ["execute", "start_command", "read_file", "write_file", "git_push", "github_pr_list", "dev_tool_run", "session_permission_request", "onepassword_item_get", "kintone_mcp_status", "checkpoint_save", "work_handoff", "recall"]) {
@@ -147,7 +147,7 @@ test("gateway contract parity detects schema, forbidden-tool, and protocol drift
 });
 
 test("job and evidence tools remain session-scoped in the gateway contract", () => {
-  const names = ["session_info", "evidence_read", "poll_job", "job_list", "stop_job"];
+  const names = ["session_info", "evidence_read", "task_list", "poll_job", "job_list", "stop_job"];
   for (const name of names) {
     const routed = PUBLIC_TOOLS.find((candidate) => candidate.name === name);
     assert.ok(routed, name);
@@ -156,6 +156,7 @@ test("job and evidence tools remain session-scoped in the gateway contract", () 
     assert.equal(routed.annotations.openWorldHint, false, name);
   }
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "job_list").annotations.readOnlyHint, true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "task_list").annotations.readOnlyHint, true);
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "evidence_read").annotations.readOnlyHint, true);
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "stop_job").annotations.readOnlyHint, false);
 });
@@ -1649,7 +1650,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 27);
+  assert.equal(rpc.result.tools.length, 28);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

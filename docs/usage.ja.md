@@ -93,6 +93,8 @@ foreground timeout を超える作業は session 所有の `job_id` を返しま
 
 `job_list({session_id, limit?})` は current session が所有する in-memory job の redacted snapshot を返します。返すのは `job_id` と `running` / `completed` / `failed` / `unknown` だけで、running を先頭に並べ、上限超過は `truncated` で示します。command text、argv、stdout/stderr、raw error は返さず、list しても completed result は消費しません。`retention="in_memory"` なので、空のlistを「過去に何も実行していない証拠」とは扱わないでください。
 
+`task_list({session_id, limit?})` は session が所有する delegated task を全 task backend から横断した bounded な read-only projection を返します。各 entry は backend label、store 自身の `task_id`、`status`、`revision`、`generation`、`created_at`、`updated_at` を持ち、`updated_at` の降順で並べて `limit` に切り詰めます。entry は `*_task_get` と同じ complete session instance + canonical scope の ownership で filter されるため、他 session の task は混ざりません。per-backend store が常に source of truth で (`retention="per_backend_store"`)、store が読めない backend は空 page ではなく bounded error 付きの `unconfirmed` として報告し、読み取れない record は `backends.<backend>.unreadable_records` に数えます。
+
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 
 ### Experimental Codex task
