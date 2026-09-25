@@ -434,6 +434,39 @@ A / O の共通 identity work は継続してよい。
 F1 の repository identity / bare store / freshness design も維持可能な部分は継続する。
 ただし **F2/F3 の git-worktree-specific implementation は V1 decision まで開始しない**。
 
+## V1 empirical result
+
+V1 was executed against disposable fixtures only with:
+
+- jj: `0.37.0`
+- Git: `2.50.1 (Apple Git-155)`
+- real repository: read-only; initial/final `HEAD == origin/main == cea66f2ad526ae06fa30ba2947416aef27669e65`
+
+Result: **jj-first viable**.
+
+Confirmed:
+
+- bare Git backing store + jj managed working copy without local main checkout
+- two independent jj workspaces
+- external edit + ordinary jj command snapshots the working copy
+- logical `change_id` persisted while materialized `commit_id` changed
+- crash-like unsnapshotted filesystem edit became recoverable on the next jj command
+- sibling workspace files stayed isolated
+- jj operation log / undo produced usable operation IDs for recovery correlation
+- delivery bookmark could be explicitly tracked and pushed to a disposable bare Git remote; plain Git observed `refs/heads/delivery`
+- shallow clone worked
+- stable templates can expose change ID, commit ID, conflict/empty state, workspace name/target and operation ID
+
+Caveats:
+
+- author/committer identity must be wired explicitly before delivery
+- new remote bookmark tracking is explicit
+- colocated Git is not equivalent to a normal branch checkout before a Git ref/commit exists; some `git log/show/rev-parse HEAD` calls fail in that state
+- jj `--json` is not the contract; typed adapters should use pinned templates
+- submodules / Git LFS / required Git hooks were not acceptance-tested and remain capability-gated unknowns
+
+Detailed backend-neutral contract: `issues/open/20260925-v2-vcs-workspace-contract.md`.
+
 ## 16. Implementation packets
 
 ### V0 — design comparison (this document)
@@ -447,34 +480,33 @@ F1 の repository identity / bare store / freshness design も維持可能な部
 
 ### V1 — jj feasibility prototype
 
-Goal: user repository を変更せず temporary fixture で jj-first managed workspace が Temote requirements を満たすか実測する。
+- [x] installed/pinned jj version / invocation contract
+- [x] bare Git backend + jj repository
+- [x] 2 independent `jj workspace`
+- [x] task change_id を作成/保持
+- [x] external file edit → Temote-triggered snapshot
+- [x] agent/process crash相当の edit → 次 snapshot で recovery
+- [x] concurrent workspace isolation
+- [x] operation log / undo / stale workspace behavior
+- [x] Git read-only tooling compatibilityを実測し caveat を記録
+- [x] bookmark tracking + push to temporary local Git remote
+- [x] no local main checkout
+- [x] no user dirty checkout mutation
+- [x] stable template output for typed adapter
+- [ ] submodules / Git LFS / required Git hooks acceptance (capability-gated unknown)
 
-- [ ] installed/pinned jj version / invocation contract
-- [ ] bare Git backend + jj repository
-- [ ] 2 independent `jj workspace`
-- [ ] task change_id を作成/保持
-- [ ] external file edit → Temote-triggered snapshot
-- [ ] agent/process crash相当の edit → 次 snapshot で recovery
-- [ ] concurrent workspace isolation
-- [ ] operation log / undo / stale workspace behavior
-- [ ] Git read-only tooling compatibility
-- [ ] bookmark/export/push-equivalent to temporary local Git remote
-- [ ] no local main checkout
-- [ ] no user dirty checkout mutation
-- [ ] JSON/template output stable enough for typed adapter
-
-V1 acceptance に失敗した項目は、jj を採用するために Temote が workaround を抱えるコストも記録する。
+Decision: **jj-first viable**. New managed workspace default candidate = Jujutsu; Git remains compatibility backend.
 
 ### V2 — workspace contract revision
 
 V1 PASS 後:
 
-- [ ] F1 の generic parts (RepositoryId / freshness / no-local-main) を保持
-- [ ] `layout=store-worktree` を generic workspace backend field へ変更
-- [ ] jj workspace JSON contract
-- [ ] Git compatibility backend contract
-- [ ] gh-git responsibility update
-- [ ] C1/C2 を backend-neutral に更新
+- [x] F1 の generic parts (RepositoryId / freshness / no-local-main) を保持
+- [x] `layout=store-worktree` を generic workspace backend field へ変更
+- [x] jj workspace JSON contract
+- [x] Git compatibility backend contract
+- [x] gh-git responsibility update
+- [ ] C1/C2 を backend-neutral に更新 (implementation handoff)
 
 ### V3 — Temote VCS adapter
 
