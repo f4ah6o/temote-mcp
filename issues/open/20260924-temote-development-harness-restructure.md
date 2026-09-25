@@ -592,7 +592,7 @@ transport/
 - [ ] V3: typed Temote VCS adapter + Observation hook
 - [ ] V4: GitHub delivery integration / stacked PR strategy
 
-**V1 decision まで F2/F3 の git-worktree-specific implementation を開始しない。**
+**V1/V2 は完了済み。F2/F3/C は `issues/open/20260925-v2-vcs-workspace-contract.md` に従って backend-neutral に進め、git-worktree-only 実装には戻さない。**
 A / O / B と F1 の repository identity・freshness・no-local-main の generic contract は並行して進めてよい。
 
 ### Phase O — observation / context continuity (high priority)
