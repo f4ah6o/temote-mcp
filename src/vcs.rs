@@ -1039,7 +1039,7 @@ fn read_json_record<T: for<'de> Deserialize<'de>>(path: &Path) -> VcsResult<T> {
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path).map_err(|error| {
+    let file = options.open(path).map_err(|error| {
         VcsError::new(
             VcsErrorCode::Io,
             format!("open VCS record {}: {error}", path.display()),
