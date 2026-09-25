@@ -13,6 +13,7 @@ Related:
 - `issues/open/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
+- `issues/open/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
 - `issues/done/20260916-managed-worktree-session-integration.md`
 - `issues/done/20260916-agent-mode-git-broker-gh-git-integration.md`
 - `f4ah6o/gh-git` (repository-scoped GitHub identity extension)
@@ -558,13 +559,13 @@ transport/
 
 1. 共通コア抽出と既存 MCP 契約の維持 (Phase A)。repository-store / no-local-main 契約の設計 (Phase F) は並行して進める。
 2. cloud / local 共通の task lifecycle と許可済み範囲の approve-free agent mode (Phase B)。
-3. **high priority:** V1 で jj-first VCS substrate を実測し、agent の explicit commit に依存しない workspace transaction model を確定する。V1 decision まで F2/F3 の git-worktree-specific implementation は保留する。
+3. **high priority:** V1 実測で jj-first が viable と確認済み。V2 の backend-neutral VCS/workspace contract に従い、agent の explicit commit に依存しない workspace transaction model を実装へ進める。F2/F3 の git-worktree-only 実装は行わない。
 4. **high priority:** A の共通 Task/Execution identity を使って Observation journal / deterministic Context Resolver (O1/O2) を並行実装する。backend ごとの個別 logger は作らない。Memory Worker (O3/O4) はその後に載せる。
 5. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
 6. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を、V1/V2 の VCS backend decision に従って完成させる。
 7. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
-依存関係: A → B → R。V0 は完了済みの設計 packet、V1 は独立 fixture で早期実施し、F2/F3 の workspace substrate 実装を gate する。V1 PASS → V2 で F1 の backend-specific 部分を改訂 → F2/F3/C。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
+依存関係: A → B → R。V0/V1/V2 は完了済み。V1 で jj-first viable を確認し、V2 で backend-neutral contract を固定した。次は V3 typed VCS adapter と backend-neutral F/C workspace implementation を進める。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
 ### Phase A — core extraction
 
@@ -586,8 +587,8 @@ transport/
 目的は agent の `git add/commit` 規律に依存せず、task workspace の working state を Temote 管理下の recoverable VCS state として捕捉すること。
 
 - [x] V0: Git snapshot broker と jj-first の設計比較、VCS abstraction / snapshot / observation / delivery boundary
-- [ ] V1: temporary fixture で jj feasibility prototype。bare Git backend、複数 `jj workspace`、change_id、crash後 snapshot、Git read-only compatibility、delivery ref を実測
-- [ ] V2: V1 PASS 後に F1 の backend-specific workspace contract を改訂
+- [x] V1: temporary fixture で jj feasibility prototype。**jj-first viable**。bare Git backend、複数 `jj workspace`、change_id、crash後 snapshot、Git read-only compatibility、delivery ref を実測済み
+- [x] V2: backend-neutral VCS/workspace contract を `issues/open/20260925-v2-vcs-workspace-contract.md` に固定。F1 generic parts を保持し jj-first / Git compatibility を分離
 - [ ] V3: typed Temote VCS adapter + Observation hook
 - [ ] V4: GitHub delivery integration / stacked PR strategy
 
