@@ -11,6 +11,7 @@ Related:
 - `issues/open/20260922-agent-server-backends-cli-deprecation.md` (server-primary backend umbrella)
 - `issues/open/20260923-devin-acp-backend.md`
 - `issues/open/20260924-devin-cloud-backend.md`
+- `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
 - `issues/done/20260916-managed-worktree-session-integration.md`
 - `issues/done/20260916-agent-mode-git-broker-gh-git-integration.md`
 - `f4ah6o/gh-git` (repository-scoped GitHub identity extension)
@@ -26,11 +27,12 @@ Related:
 
 ## Top-level requirements (user-confirmed)
 
-以下の 3 要件を設計・実装順序・受入判定の最上位に置く。ここで定めるのは target contract であり、下記 current baseline の実装済み事実とは区別する。
+以下の 4 要件を設計・実装順序・受入判定の最上位に置く。ここで定めるのは target contract であり、下記 current baseline の実装済み事実とは区別する。
 
 1. **yolo を使わず、極力 approve-free な agent mode。** repository / workspace / network / 操作範囲について既に与えられた許可を task に引き継ぎ、その範囲内の準備・実装・テスト・許可済み commit / push / PR 作成では操作ごとの再承認を要求しない。delivery という分類だけで毎回承認にしない。権限拡張や未許可の破壊的操作は明示的に扱い、sandbox・秘密情報保護・他作業の保護を維持する。
 2. **指示役が cloud / local のどちらでも同じように使える。** authenticated caller が同じ権限を持つ場合、transport によって task の操作能力・承認方針・状態参照が変わらない。cloud から開始した task を local から追跡・制御でき、その逆もできる。指示役の場所と agent の実行場所 (host-local / hosted) は別の軸として扱う。
 3. **独立して遅れ・未統合 commit の蓄積・分岐が生じる local main を持たない。** 新規 managed repository は bare repository store + task worktrees を標準とし、local `main` を作業・統合・追従のために維持しない。基準は fetch で確認した `origin/main` とその commit。既存 checkout は勝手に移動・削除・reset せず、明示的な移行契約で保全する。
+4. **指示役を替えても context / knowledge を失わない。** coding agent に memory 管理を要求せず、Temote の共通 orchestration 境界で instruction / execution / evidence を自動観測する。raw observation と derived knowledge を分離し、専用 worker が非同期に整理する。次の head は authorized Context Resolver から provenance 付きの relevant context を取得する。hidden chain-of-thought や Temote 外の全 transcript を収集する設計にはしない。
 
 ### Agent-mode authorization contract
 
@@ -124,6 +126,10 @@ Temote の中心価値は、**どの coding agent に任せても、適切な作
                            |
    (approval / receipt / reconcile / evidence / state)
                            |
+                  observation recorder
+                           |
+                  observation / context
+                           |
      +-------------+-------+-------+-------------+
      |             |               |             |
  workspace    environment        agent        delivery
@@ -148,6 +154,7 @@ Temote の中心責務:
 - approval / receipt / reconcile / evidence / activity
 - execution / verification / delivery state の記録
 - delivery (単独 PR / stacked PR) の提出と状態確認
+- transport-independent な instruction / execution observation と、head 切替用 Context Resolver (整理は専用 worker。planner にはしない)
 
 Devin Cloud は Temote host 上の workspace を使わない (hosted session 側で repo を clone する)。workspace / environment / reservation 系の契約は host-local backend (Codex / OpenCode / Devin ACP local) に適用し、Devin Cloud は task / evidence / delivery 契約のみを共有する。
 
@@ -550,11 +557,12 @@ transport/
 
 1. 共通コア抽出と既存 MCP 契約の維持 (Phase A)。repository-store / no-local-main 契約の設計 (Phase F) は並行して進める。
 2. cloud / local 共通の task lifecycle と許可済み範囲の approve-free agent mode (Phase B)。
+3. **high priority:** A の共通 Task/Execution identity を使って Observation journal / deterministic Context Resolver (O1/O2) を並行実装する。backend ごとの個別 logger は作らない。Memory Worker (O3/O4) はその後に載せる。
 3. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
 4. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を初期基盤として完成させる。
 5. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
-依存関係: A → B → R。C0 (gh-git identity fix) と F の設計は独立に開始できる。F の新規 store 実装は C0 と整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
+依存関係: A → B → R。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の設計は独立に開始できる。F の新規 store 実装は C0 と整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
 ### Phase A — core extraction
 
@@ -568,6 +576,19 @@ transport/
 - [ ] execution / verification / delivery state と論理 task / execution の区別を record に導入
 - [ ] `task_list` を core に追加 (backend ごとの store を維持し、共通 index から始める)
 - [ ] current MCP tools の behavior を regression test / gateway contract snapshot で固定
+
+### Phase O — observation / context continuity (high priority)
+
+詳細 contract: `issues/open/20260925-observation-context-memory-plane.md`。
+
+- [x] O0: observation boundary / raw-vs-derived authority / worker / Context Resolver contract
+- [ ] O1: common orchestration boundary の owner-only observation journal。instruction は canonical task/evidence への reference-first とし、secret-bearing structured field を複製しない
+- [ ] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + verified task/execution/verification state だけで head switch を成立させる
+- [ ] O3: asynchronous Memory Worker。checkpoint / support refs / dedupe / supersession / retry idempotency
+- [ ] O4: knowledge-aware Context Resolver。current facts / decisions / constraints / unresolved / failure pattern を provenance 付きで返す
+- [ ] worker failure / stale projection を task failure に読み替えず、last processed observation revision を明示する
+
+実装上の優先順位は O1/O2 > D/E。ただし A の共通 identity を飛ばして各 backend に個別 logger を追加しない。
 
 ### Phase B — local frontend
 
