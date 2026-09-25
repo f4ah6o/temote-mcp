@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,10 +12,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
-#[cfg(feature = "network")]
-use crate::opencode_server;
 use crate::{
-    activity_runtime, approvals, codex_app_server, config, evidence, sandbox,
+    activity_runtime, approvals, config, evidence, orchestration, sandbox,
     session_control::SessionBackend,
 };
 use temote_mcp::activity::contract::{
@@ -938,198 +936,16 @@ async fn call_tool(
     let result = async {
         match name {
             "evidence_read" => evidence_read_tool(&args, &session),
-            "codex_status" => {
-                let (detail, metadata) = codex_status_approval();
-                authorize_codex_operation(
-                    &session,
-                    "codex_status",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &codex_app_server::status(&session).await?,
-                )?)
-            }
-            "codex_task_start" => {
-                let (detail, metadata) = codex_task_start_approval(&args);
-                authorize_codex_operation(
-                    &session,
-                    "codex_task_start",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &codex_app_server::task_start(&args, &session).await?,
-                )?)
-            }
-            "codex_task_get" => text_result(serde_json::to_string_pretty(
-                &codex_app_server::task_get(&args, &session).await?,
-            )?),
-            "codex_task_control" => {
-                let (detail, metadata) = codex_task_control_approval(&args);
-                authorize_codex_operation(
-                    &session,
-                    "codex_task_control",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &codex_app_server::task_control(&args, &session).await?,
-                )?)
-            }
-            #[cfg(feature = "network")]
-            "opencode_status" => {
-                let (detail, metadata) = opencode_status_approval();
-                authorize_opencode_operation(
-                    &session,
-                    "opencode_status",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &opencode_server::status(&session).await?,
-                )?)
-            }
-            #[cfg(feature = "network")]
-            "opencode_task_start" => {
-                let (detail, metadata) = opencode_task_start_approval(&args);
-                authorize_opencode_operation(
-                    &session,
-                    "opencode_task_start",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &opencode_server::task_start(&args, &session).await?,
-                )?)
-            }
-            #[cfg(feature = "network")]
-            "opencode_task_get" => text_result(serde_json::to_string_pretty(
-                &opencode_server::task_get(&args, &session).await?,
-            )?),
-            #[cfg(feature = "network")]
-            "opencode_task_control" => {
-                let (detail, metadata) = opencode_task_control_approval(&args);
-                authorize_opencode_operation(
-                    &session,
-                    "opencode_task_control",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &opencode_server::task_control(&args, &session).await?,
-                )?)
-            }
-            "devin_status" => {
-                let (detail, metadata) = devin_status_approval();
-                authorize_devin_operation(
-                    &session,
-                    "devin_status",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &crate::devin_acp::status(&session).await?,
-                )?)
-            }
-            "devin_task_start" => {
-                let (detail, metadata) = devin_task_start_approval(&args);
-                authorize_devin_operation(
-                    &session,
-                    "devin_task_start",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &crate::devin_acp::task_start(&args, &session).await?,
-                )?)
-            }
-            "devin_task_get" => text_result(serde_json::to_string_pretty(
-                &crate::devin_acp::task_get(&args, &session).await?,
-            )?),
-            "devin_task_control" => {
-                let (detail, metadata) = devin_task_control_approval(&args);
-                authorize_devin_operation(
-                    &session,
-                    "devin_task_control",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &crate::devin_acp::task_control(&args, &session).await?,
-                )?)
-            }
-            #[cfg(feature = "network")]
-            "devin_cloud_status" => {
-                let (detail, metadata) = devin_cloud_status_approval();
-                authorize_devin_cloud_operation(
-                    &session,
-                    "devin_cloud_status",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &crate::devin_cloud::status(&session).await?,
-                )?)
-            }
-            #[cfg(feature = "network")]
-            "devin_cloud_task_start" => {
-                let (detail, metadata) = devin_cloud_task_start_approval(&args);
-                authorize_devin_cloud_operation(
-                    &session,
-                    "devin_cloud_task_start",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &crate::devin_cloud::task_start(&args, &session).await?,
-                )?)
-            }
-            #[cfg(feature = "network")]
-            "devin_cloud_task_get" => text_result(serde_json::to_string_pretty(
-                &crate::devin_cloud::task_get(&args, &session).await?,
-            )?),
-            #[cfg(feature = "network")]
-            "devin_cloud_task_control" => {
-                let (detail, metadata) = devin_cloud_task_control_approval(&args);
-                authorize_devin_cloud_operation(
-                    &session,
-                    "devin_cloud_task_control",
-                    detail,
-                    metadata,
-                    activity.as_ref(),
-                )
-                .await?;
-                text_result(serde_json::to_string_pretty(
-                    &crate::devin_cloud::task_control(&args, &session).await?,
-                )?)
-            }
             "poll_job" => poll_job(&args, &session).await,
             "job_list" => job_list(&args, &session),
             "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
-            _ => anyhow::bail!("unknown tool: {name}"),
+            _ => match delegation_operation(name) {
+                Some((backend, operation)) => text_result(serde_json::to_string_pretty(
+                    &orchestration::invoke(backend, operation, &args, &session, activity.as_ref())
+                        .await?,
+                )?),
+                None => anyhow::bail!("unknown tool: {name}"),
+            },
         }
     }
     .await;
@@ -1196,414 +1012,42 @@ fn push_session_list_entry(
     Ok(())
 }
 
-async fn authorize_codex_operation(
-    session: &config::Session,
-    action: &str,
-    detail: String,
-    metadata: BTreeMap<String, String>,
-    activity: Option<&ActivityScope>,
-) -> Result<()> {
-    let approved = approvals::ensure_local_approval_with_activity(
-        session,
-        approvals::ApprovalClass::CodexAppServer,
-        action,
-        detail,
-        session.cwd.clone(),
-        metadata,
-        activity,
-    )
-    .await?;
-    finish_activity_approval(approved, activity, "user denied Codex operation")?;
-    Ok(())
-}
-
-fn finish_activity_approval(
-    approved: bool,
-    activity: Option<&ActivityScope>,
-    denial: &'static str,
-) -> Result<()> {
-    if !approved {
-        if let Some(activity) = activity {
-            let _ = activity
-                .fail_with_summary(ActivitySummary::failure(ActivityErrorKind::ApprovalDenied));
-        }
-        anyhow::bail!(denial);
-    }
-    if let Some(activity) = activity {
-        let _ = activity.running();
-    }
-    Ok(())
-}
-
-fn codex_status_approval() -> (String, BTreeMap<String, String>) {
-    (
-        "Codex delegation request\naccess: read-only\nscope: current session\nresult: model and effort compatibility metadata".to_owned(),
-        codex_approval_metadata("codex_status", "status", false, "session_scope"),
-    )
-}
-
-fn codex_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let model = safe_codex_argument(args, "model");
-    let effort = safe_codex_argument(args, "effort");
-    let mut metadata =
-        codex_approval_metadata("codex_task_start", "task_start", true, "session_scope");
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("model".to_owned(), model.clone());
-    metadata.insert("effort".to_owned(), effort.clone());
-    metadata.insert("task_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "Codex delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\neffort: {effort}\noperation_id: {operation_id}\ntask input: omitted"
-        ),
-        metadata,
-    )
-}
-
-fn codex_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let task_id = safe_codex_argument(args, "task_id");
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let action = safe_codex_argument(args, "action");
-    let mut metadata = codex_approval_metadata(
-        "codex_task_control",
-        "task_control",
-        true,
-        &format!("task:{task_id}"),
-    );
-    metadata.insert("task_id".to_owned(), task_id.clone());
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("action".to_owned(), action.clone());
-    metadata.insert("control_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "Codex delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
-        ),
-        metadata,
-    )
-}
-
-fn codex_approval_metadata(
-    tool: &str,
-    operation_type: &str,
-    mutation: bool,
-    target: &str,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("provenance".to_owned(), "codex_delegation".to_owned()),
-        ("source".to_owned(), "codex_delegation".to_owned()),
-        ("tool".to_owned(), tool.to_owned()),
-        ("operation_type".to_owned(), operation_type.to_owned()),
-        ("target".to_owned(), target.to_owned()),
-        ("mutation".to_owned(), mutation.to_string()),
-        ("read_only".to_owned(), (!mutation).to_string()),
-        ("scope".to_owned(), "session_cwd".to_owned()),
-    ])
-}
-
-#[cfg(feature = "network")]
-async fn authorize_opencode_operation(
-    session: &config::Session,
-    action: &str,
-    detail: String,
-    metadata: BTreeMap<String, String>,
-    activity: Option<&ActivityScope>,
-) -> Result<()> {
-    let approved = approvals::ensure_local_approval_with_activity(
-        session,
-        approvals::ApprovalClass::OpenCodeServer,
-        action,
-        detail,
-        session.cwd.clone(),
-        metadata,
-        activity,
-    )
-    .await?;
-    finish_activity_approval(approved, activity, "user denied OpenCode operation")?;
-    Ok(())
-}
-
-#[cfg(feature = "network")]
-fn opencode_status_approval() -> (String, BTreeMap<String, String>) {
-    (
-        "OpenCode delegation request\naccess: read-only\nscope: current session\nresult: serve compatibility and provider metadata".to_owned(),
-        opencode_approval_metadata("opencode_status", "status", false, "session_scope"),
-    )
-}
-
-#[cfg(feature = "network")]
-fn opencode_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let model = safe_codex_argument(args, "model");
-    let agent = safe_codex_argument(args, "agent");
-    let variant = safe_codex_argument(args, "variant");
-    let mut metadata =
-        opencode_approval_metadata("opencode_task_start", "task_start", true, "session_scope");
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("model".to_owned(), model.clone());
-    metadata.insert("agent".to_owned(), agent.clone());
-    metadata.insert("variant".to_owned(), variant.clone());
-    metadata.insert("task_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "OpenCode delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\nagent: {agent}\nvariant: {variant}\noperation_id: {operation_id}\ntask input: omitted"
-        ),
-        metadata,
-    )
-}
-
-#[cfg(feature = "network")]
-fn opencode_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let task_id = safe_codex_argument(args, "task_id");
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let action = safe_codex_argument(args, "action");
-    let mut metadata = opencode_approval_metadata(
-        "opencode_task_control",
-        "task_control",
-        true,
-        &format!("task:{task_id}"),
-    );
-    metadata.insert("task_id".to_owned(), task_id.clone());
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("action".to_owned(), action.clone());
-    metadata.insert("control_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "OpenCode delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
-        ),
-        metadata,
-    )
-}
-
-#[cfg(feature = "network")]
-fn opencode_approval_metadata(
-    tool: &str,
-    operation_type: &str,
-    mutation: bool,
-    target: &str,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("provenance".to_owned(), "opencode_delegation".to_owned()),
-        ("source".to_owned(), "opencode_delegation".to_owned()),
-        ("tool".to_owned(), tool.to_owned()),
-        ("operation_type".to_owned(), operation_type.to_owned()),
-        ("target".to_owned(), target.to_owned()),
-        ("mutation".to_owned(), mutation.to_string()),
-        ("read_only".to_owned(), (!mutation).to_string()),
-        ("scope".to_owned(), "session_cwd".to_owned()),
-    ])
-}
-
-async fn authorize_devin_operation(
-    session: &config::Session,
-    action: &str,
-    detail: String,
-    metadata: BTreeMap<String, String>,
-    activity: Option<&ActivityScope>,
-) -> Result<()> {
-    let approved = approvals::ensure_local_approval_with_activity(
-        session,
-        approvals::ApprovalClass::DevinAcp,
-        action,
-        detail,
-        session.cwd.clone(),
-        metadata,
-        activity,
-    )
-    .await?;
-    finish_activity_approval(approved, activity, "user denied Devin operation")?;
-    Ok(())
-}
-
-fn devin_status_approval() -> (String, BTreeMap<String, String>) {
-    (
-        "Devin delegation request\naccess: read-only\nscope: current session\nresult: acp capability and agent metadata".to_owned(),
-        devin_approval_metadata("devin_status", "status", false, "session_scope"),
-    )
-}
-
-fn devin_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let model = safe_codex_argument(args, "model");
-    let agent = safe_codex_argument(args, "agent");
-    let cloud = args.get("cloud").and_then(Value::as_bool).unwrap_or(false);
-    let mut metadata =
-        devin_approval_metadata("devin_task_start", "task_start", true, "session_scope");
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("model".to_owned(), model.clone());
-    metadata.insert("agent".to_owned(), agent.clone());
-    metadata.insert("cloud".to_owned(), cloud.to_string());
-    metadata.insert("task_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "Devin delegation request\noperation: start task\nmutation: workspace-write\nscope: current session working directory\nmodel: {model}\nagent: {agent}\ncloud: {cloud}\noperation_id: {operation_id}\ntask input: omitted"
-        ),
-        metadata,
-    )
-}
-
-fn devin_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let task_id = safe_codex_argument(args, "task_id");
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let action = safe_codex_argument(args, "action");
-    let mut metadata = devin_approval_metadata(
-        "devin_task_control",
-        "task_control",
-        true,
-        &format!("task:{task_id}"),
-    );
-    metadata.insert("task_id".to_owned(), task_id.clone());
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("action".to_owned(), action.clone());
-    metadata.insert("control_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "Devin delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
-        ),
-        metadata,
-    )
-}
-
-fn devin_approval_metadata(
-    tool: &str,
-    operation_type: &str,
-    mutation: bool,
-    target: &str,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("provenance".to_owned(), "devin_delegation".to_owned()),
-        ("source".to_owned(), "devin_delegation".to_owned()),
-        ("tool".to_owned(), tool.to_owned()),
-        ("operation_type".to_owned(), operation_type.to_owned()),
-        ("target".to_owned(), target.to_owned()),
-        ("mutation".to_owned(), mutation.to_string()),
-        ("read_only".to_owned(), (!mutation).to_string()),
-        ("scope".to_owned(), "session_cwd".to_owned()),
-    ])
-}
-
-#[cfg(feature = "network")]
-async fn authorize_devin_cloud_operation(
-    session: &config::Session,
-    action: &str,
-    detail: String,
-    metadata: BTreeMap<String, String>,
-    activity: Option<&ActivityScope>,
-) -> Result<()> {
-    let approved = approvals::ensure_local_approval_with_activity(
-        session,
-        approvals::ApprovalClass::DevinCloud,
-        action,
-        detail,
-        session.cwd.clone(),
-        metadata,
-        activity,
-    )
-    .await?;
-    finish_activity_approval(approved, activity, "user denied Devin Cloud operation")?;
-    Ok(())
-}
-
-#[cfg(feature = "network")]
-fn devin_cloud_status_approval() -> (String, BTreeMap<String, String>) {
-    (
-        "Devin Cloud delegation request\naccess: read-only\nscope: current session\nresult: authenticated principal and organization (credential value omitted)".to_owned(),
-        devin_cloud_approval_metadata("devin_cloud_status", "status", false, "session_scope"),
-    )
-}
-
-#[cfg(feature = "network")]
-fn devin_cloud_task_start_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let title = safe_codex_argument(args, "title");
-    let devin_mode = safe_codex_argument(args, "devin_mode");
-    let repos = args
-        .get("repos")
-        .and_then(Value::as_array)
-        .map(|items| items.len().to_string())
-        .unwrap_or_else(|| "0".to_owned());
-    let mut metadata = devin_cloud_approval_metadata(
-        "devin_cloud_task_start",
-        "task_start",
-        true,
-        "devin_cloud_session",
-    );
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("title".to_owned(), title.clone());
-    metadata.insert("devin_mode".to_owned(), devin_mode.clone());
-    metadata.insert("repos".to_owned(), repos.clone());
-    metadata.insert("task_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "Devin Cloud delegation request\noperation: start hosted session\nmutation: remote Devin Cloud session (consumes ACUs)\nscope: Devin Cloud organization, not this host\ntitle: {title}\ndevin_mode: {devin_mode}\nrepos: {repos}\noperation_id: {operation_id}\ntask input: omitted"
-        ),
-        metadata,
-    )
-}
-
-#[cfg(feature = "network")]
-fn devin_cloud_task_control_approval(args: &Value) -> (String, BTreeMap<String, String>) {
-    let task_id = safe_codex_argument(args, "task_id");
-    let operation_id = safe_codex_argument(args, "operation_id");
-    let action = safe_codex_argument(args, "action");
-    let mut metadata = devin_cloud_approval_metadata(
-        "devin_cloud_task_control",
-        "task_control",
-        true,
-        &format!("task:{task_id}"),
-    );
-    metadata.insert("task_id".to_owned(), task_id.clone());
-    metadata.insert("operation_id".to_owned(), operation_id.clone());
-    metadata.insert("action".to_owned(), action.clone());
-    metadata.insert("control_input".to_owned(), "omitted".to_owned());
-    (
-        format!(
-            "Devin Cloud delegation request\noperation: control hosted session\naction: {action}\nmutation: remote Devin Cloud session\ntarget: task {task_id}\noperation_id: {operation_id}\ncontrol input: omitted"
-        ),
-        metadata,
-    )
-}
-
-#[cfg(feature = "network")]
-fn devin_cloud_approval_metadata(
-    tool: &str,
-    operation_type: &str,
-    mutation: bool,
-    target: &str,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("provenance".to_owned(), "devin_cloud_delegation".to_owned()),
-        ("source".to_owned(), "devin_cloud_delegation".to_owned()),
-        ("tool".to_owned(), tool.to_owned()),
-        ("operation_type".to_owned(), operation_type.to_owned()),
-        ("target".to_owned(), target.to_owned()),
-        ("mutation".to_owned(), mutation.to_string()),
-        ("read_only".to_owned(), (!mutation).to_string()),
-        ("scope".to_owned(), "devin_cloud".to_owned()),
-    ])
-}
-
-fn safe_codex_argument(args: &Value, key: &str) -> String {
-    let Some(value) = args.get(key).and_then(Value::as_str) else {
-        return "(not provided)".to_owned();
-    };
-    let mut rendered = String::new();
-    for character in value.chars() {
-        let part = if character.is_control() {
-            if character.is_ascii() {
-                format!("\\x{:02x}", character as u32)
-            } else {
-                format!("\\u{{{:x}}}", character as u32)
-            }
-        } else {
-            character.to_string()
-        };
-        if rendered.len().saturating_add(part.len()) > 256 {
-            rendered.push('…');
-            break;
-        }
-        rendered.push_str(&part);
-    }
-    rendered
+/// Map a public delegation tool name onto its backend and shared operation.
+///
+/// The MCP tool names stay the compatibility surface; the local control
+/// plane and future frontends normalize onto [`orchestration::Backend`] +
+/// [`orchestration::Operation`] the same way before calling
+/// [`orchestration::invoke`]. Tools outside the delegation surface return
+/// `None`.
+fn delegation_operation(name: &str) -> Option<(orchestration::Backend, orchestration::Operation)> {
+    use orchestration::{Backend, Operation};
+    Some(match name {
+        "codex_status" => (Backend::Codex, Operation::Status),
+        "codex_task_start" => (Backend::Codex, Operation::TaskStart),
+        "codex_task_get" => (Backend::Codex, Operation::TaskGet),
+        "codex_task_control" => (Backend::Codex, Operation::TaskControl),
+        #[cfg(feature = "network")]
+        "opencode_status" => (Backend::OpenCode, Operation::Status),
+        #[cfg(feature = "network")]
+        "opencode_task_start" => (Backend::OpenCode, Operation::TaskStart),
+        #[cfg(feature = "network")]
+        "opencode_task_get" => (Backend::OpenCode, Operation::TaskGet),
+        #[cfg(feature = "network")]
+        "opencode_task_control" => (Backend::OpenCode, Operation::TaskControl),
+        "devin_status" => (Backend::DevinAcp, Operation::Status),
+        "devin_task_start" => (Backend::DevinAcp, Operation::TaskStart),
+        "devin_task_get" => (Backend::DevinAcp, Operation::TaskGet),
+        "devin_task_control" => (Backend::DevinAcp, Operation::TaskControl),
+        #[cfg(feature = "network")]
+        "devin_cloud_status" => (Backend::DevinCloud, Operation::Status),
+        #[cfg(feature = "network")]
+        "devin_cloud_task_start" => (Backend::DevinCloud, Operation::TaskStart),
+        #[cfg(feature = "network")]
+        "devin_cloud_task_get" => (Backend::DevinCloud, Operation::TaskGet),
+        #[cfg(feature = "network")]
+        "devin_cloud_task_control" => (Backend::DevinCloud, Operation::TaskControl),
+        _ => return None,
+    })
 }
 
 fn text_result(text: String) -> Result<Value> {
@@ -2353,7 +1797,7 @@ mod tests {
     fn activity_coverage_explicit_approval_result_is_ordered_and_terminal_once() {
         let (allowed_scope, allowed_emitter) = activity_job_scope(ActivityOperation::StopJob);
         allowed_scope.waiting_approval().unwrap();
-        finish_activity_approval(true, Some(&allowed_scope), "denied").unwrap();
+        orchestration::finish_activity_approval(true, Some(&allowed_scope), "denied").unwrap();
         finish_covered_tool_activity(
             activity_tool_coverage("stop_job"),
             Some(&allowed_scope),
@@ -2371,7 +1815,7 @@ mod tests {
 
         let (denied_scope, denied_emitter) = activity_job_scope(ActivityOperation::StopJob);
         denied_scope.waiting_approval().unwrap();
-        let denied = finish_activity_approval(false, Some(&denied_scope), "denied");
+        let denied = orchestration::finish_activity_approval(false, Some(&denied_scope), "denied");
         assert!(denied.is_err());
         let outer_failure: Result<Value> = Err(anyhow::anyhow!("denied"));
         finish_covered_tool_activity(
@@ -2392,57 +1836,6 @@ mod tests {
             denied.last().unwrap().summary(),
             &ActivitySummary::failure(ActivityErrorKind::ApprovalDenied)
         );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn codex_approval_details_are_actionable_without_task_input() {
-        let task_marker = "prompt-secret-marker";
-        let (start_detail, start_metadata) = codex_task_start_approval(&json!({
-            "operation_id": "0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
-            "task": task_marker,
-            "model": "gpt-5.6-luna",
-            "effort": "max"
-        }));
-        assert!(start_detail.contains("operation: start task"));
-        assert!(start_detail.contains("model: gpt-5.6-luna"));
-        assert!(start_detail.contains("effort: max"));
-        assert!(start_detail.contains("task input: omitted"));
-        assert!(!start_detail.contains(task_marker));
-        assert_eq!(start_metadata["provenance"], "codex_delegation");
-        assert_eq!(start_metadata["tool"], "codex_task_start");
-        assert_eq!(start_metadata["mutation"], "true");
-        assert_eq!(start_metadata["task_input"], "omitted");
-        assert!(
-            !serde_json::to_string(&start_metadata)
-                .unwrap()
-                .contains(task_marker)
-        );
-
-        let (control_detail, control_metadata) = codex_task_control_approval(&json!({
-            "task_id": "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb",
-            "operation_id": "0199cccc-cccc-7ccc-8ccc-cccccccccccc",
-            "action": "steer",
-            "input": task_marker
-        }));
-        assert!(control_detail.contains("action: steer"));
-        assert!(control_detail.contains("target: task 0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"));
-        assert!(control_detail.contains("control input: omitted"));
-        assert!(!control_detail.contains(task_marker));
-        assert_eq!(control_metadata["operation_type"], "task_control");
-        assert_eq!(
-            control_metadata["task_id"],
-            "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"
-        );
-        assert_eq!(control_metadata["control_input"], "omitted");
-
-        let (_, status_metadata) = codex_status_approval();
-        assert_eq!(status_metadata["read_only"], "true");
-        assert_eq!(status_metadata["mutation"], "false");
     }
 
     #[tokio::test]
