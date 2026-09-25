@@ -17,7 +17,7 @@ mod requests;
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use temote_mcp::activity::contract::{ActivityErrorKind, ActivitySummary};
 use temote_mcp::activity::scope::ActivityScope;
@@ -56,6 +56,11 @@ pub(crate) enum Operation {
     Status,
     TaskStart,
     TaskGet,
+    /// Read-only projection of the caller's retained tasks. Local
+    /// protocol packets surface it as a wire operation; today only
+    /// tests and [`task_list`] reach it.
+    #[allow(dead_code)]
+    TaskList,
     TaskControl,
 }
 
@@ -77,6 +82,7 @@ impl Backend {
             Operation::Status => "status",
             Operation::TaskStart => "task_start",
             Operation::TaskGet => "task_get",
+            Operation::TaskList => "task_list",
             Operation::TaskControl => "task_control",
         };
         format!("{prefix}_{action}")
@@ -112,6 +118,19 @@ impl Backend {
         match self.capabilities().execution {
             ExecutionLocality::HostLocal => "session_cwd",
             ExecutionLocality::Hosted => "devin_cloud",
+        }
+    }
+
+    /// Stable lowercase identity used as the merge key in the common
+    /// [`task_list`] projection (`backends` map, item `backend` field).
+    fn name(self) -> &'static str {
+        match self {
+            Backend::Codex => "codex",
+            #[cfg(feature = "network")]
+            Backend::OpenCode => "opencode",
+            Backend::DevinAcp => "devin_acp",
+            #[cfg(feature = "network")]
+            Backend::DevinCloud => "devin_cloud",
         }
     }
 
@@ -166,6 +185,19 @@ impl Backend {
         }
     }
 
+    async fn task_list(self, args: &Value, session: &config::Session) -> Result<Value> {
+        #[cfg(test)]
+        tests::note_backend_dispatch();
+        match self {
+            Backend::Codex => codex_app_server::task_list(args, session).await,
+            #[cfg(feature = "network")]
+            Backend::OpenCode => opencode_server::task_list(args, session).await,
+            Backend::DevinAcp => devin_acp::task_list(args, session).await,
+            #[cfg(feature = "network")]
+            Backend::DevinCloud => devin_cloud::task_list(args, session).await,
+        }
+    }
+
     async fn task_control(self, args: &Value, session: &config::Session) -> Result<Value> {
         #[cfg(test)]
         tests::note_backend_dispatch();
@@ -208,6 +240,9 @@ pub(crate) async fn invoke(
             backend.task_start(args, session).await
         }
         TaskRequest::Get(_) => backend.task_get(args, session).await,
+        // Read-only projection of retained state: approval-free like
+        // task_get; it never reconciles or mutates.
+        TaskRequest::List => backend.task_list(args, session).await,
         TaskRequest::Control(request) => {
             let (detail, metadata) = task_control_approval(backend, request);
             authorize(backend, operation, session, detail, metadata, activity).await?;
@@ -587,6 +622,107 @@ fn render_approval_argument(value: &str) -> String {
     rendered
 }
 
+/// Every backend that can answer the shared task contract, in stable
+/// order for cross-backend projections.
+const ALL_BACKENDS: &[Backend] = &[
+    Backend::Codex,
+    #[cfg(feature = "network")]
+    Backend::OpenCode,
+    Backend::DevinAcp,
+    #[cfg(feature = "network")]
+    Backend::DevinCloud,
+];
+
+/// Session-scoped task list across every enabled backend.
+///
+/// The backend stores remain the source of truth: this is a read-only
+/// projection of the records owned by `session`'s full instance and
+/// canonical scope — no second task store, no live reconciliation. One
+/// backend's failure is reported per-backend (`unavailable`) rather than
+/// faked as an empty list, so partial results stay distinguishable. Each
+/// item carries `backend` + `task_id` so the (backend, task id, session
+/// instance) reference survives the merge without reassigning ids.
+///
+/// Local-protocol packets wire this to a frontend; today only tests
+/// reach it.
+#[allow(dead_code)]
+pub(crate) async fn task_list(args: &Value, session: &config::Session) -> Result<Value> {
+    let limit = requests::task_list_limit(args)?;
+    let mut results = Vec::with_capacity(ALL_BACKENDS.len());
+    for backend in ALL_BACKENDS {
+        results.push((*backend, backend.task_list(args, session).await));
+    }
+    Ok(merge_task_lists(results, limit))
+}
+
+/// Merge per-backend list envelopes into the common projection.
+fn merge_task_lists(results: Vec<(Backend, Result<Value>)>, limit: usize) -> Value {
+    let mut tasks = Vec::new();
+    let mut backends = serde_json::Map::new();
+    let mut total = 0usize;
+    for (backend, result) in results {
+        match result {
+            Ok(view) => {
+                let backend_total = view["total"].as_u64().unwrap_or(0) as usize;
+                let skipped = view["skipped"].as_u64().unwrap_or(0) as usize;
+                total += backend_total;
+                if let Some(items) = view["tasks"].as_array() {
+                    tasks.extend(items.iter().cloned());
+                }
+                backends.insert(
+                    backend.name().to_owned(),
+                    json!({"status": "ok", "total": backend_total, "skipped": skipped}),
+                );
+            }
+            Err(error) => {
+                backends.insert(
+                    backend.name().to_owned(),
+                    json!({"status": "unavailable", "error": bound_task_list_error(&error)}),
+                );
+            }
+        }
+    }
+    sort_task_list_items(&mut tasks);
+    let truncated = tasks.len() > limit;
+    tasks.truncate(limit);
+    json!({
+        "tasks": tasks,
+        "backends": Value::Object(backends),
+        "total": total,
+        "truncated": truncated,
+        "limit": limit,
+    })
+}
+
+/// Total deterministic order for the common projection: most recently
+/// updated first, `task_id` ascending as the tie-break.
+fn sort_task_list_items(tasks: &mut [Value]) {
+    tasks.sort_by(|a, b| {
+        let a_updated = a["last_updated_at"].as_u64().unwrap_or(0);
+        let b_updated = b["last_updated_at"].as_u64().unwrap_or(0);
+        b_updated.cmp(&a_updated).then_with(|| {
+            a["task_id"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["task_id"].as_str().unwrap_or_default())
+        })
+    });
+}
+
+/// One-line, length-bounded rendering of a backend's list failure for the
+/// `unavailable` marker.
+fn bound_task_list_error(error: &anyhow::Error) -> String {
+    let mut rendered = String::new();
+    for character in format!("{error:#}").chars() {
+        if rendered.len().saturating_add(character.len_utf8()) > 256 {
+            rendered.push('…');
+            break;
+        }
+        rendered.push(character);
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -845,5 +981,99 @@ mod tests {
             );
         }
         assert_eq!(backend_dispatch_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn invoke_task_list_rejects_invalid_limit_before_any_backend_dispatch() {
+        let session = test_session("task-list-invalid");
+        let backends = [
+            Backend::Codex,
+            #[cfg(feature = "network")]
+            Backend::OpenCode,
+            Backend::DevinAcp,
+            #[cfg(feature = "network")]
+            Backend::DevinCloud,
+        ];
+        for backend in backends {
+            for args in [
+                json!({"limit": 0}),
+                json!({"limit": 129}),
+                json!({"limit": "many"}),
+            ] {
+                assert!(
+                    invoke(backend, Operation::TaskList, &args, &session, None)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(backend_dispatch_count(), 0);
+    }
+
+    #[test]
+    fn task_list_merge_keeps_unavailable_backends_visible() {
+        let ok = Ok(json!({
+            "backend": "codex",
+            "tasks": [
+                {"task_id": "b-task", "backend": "codex", "last_updated_at": 20},
+                {"task_id": "a-task", "backend": "codex", "last_updated_at": 30},
+            ],
+            "total": 2,
+            "skipped": 1,
+        }));
+        let unavailable = Err(anyhow::anyhow!("store offline"));
+        let view = merge_task_lists(
+            vec![(Backend::Codex, ok), (Backend::DevinAcp, unavailable)],
+            50,
+        );
+
+        assert_eq!(view["total"], 2);
+        assert_eq!(view["truncated"], false);
+        let tasks = view["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        // Newest first across the whole projection.
+        assert_eq!(tasks[0]["task_id"], "a-task");
+        assert_eq!(tasks[1]["task_id"], "b-task");
+        assert_eq!(view["backends"]["codex"]["status"], "ok");
+        assert_eq!(view["backends"]["codex"]["total"], 2);
+        assert_eq!(view["backends"]["codex"]["skipped"], 1);
+        assert_eq!(view["backends"]["devin_acp"]["status"], "unavailable");
+        assert!(
+            view["backends"]["devin_acp"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("store offline"),
+            "a failed backend reports its error instead of an empty list"
+        );
+    }
+
+    #[test]
+    fn task_list_merge_orders_deterministically_and_truncates() {
+        let ok_a = Ok(json!({
+            "tasks": [
+                {"task_id": "same-time-b", "backend": "codex", "last_updated_at": 50},
+                {"task_id": "same-time-a", "backend": "devin_acp", "last_updated_at": 50},
+                {"task_id": "old", "backend": "codex", "last_updated_at": 10},
+            ],
+            "total": 3,
+            "skipped": 0,
+        }));
+        let ok_b = Ok(json!({
+            "tasks": [{"task_id": "newest", "backend": "devin_acp", "last_updated_at": 60}],
+            "total": 1,
+            "skipped": 0,
+        }));
+        let view = merge_task_lists(vec![(Backend::Codex, ok_a), (Backend::DevinAcp, ok_b)], 3);
+
+        assert_eq!(view["total"], 4);
+        assert_eq!(view["truncated"], true);
+        assert_eq!(view["limit"], 3);
+        let tasks = view["tasks"].as_array().unwrap();
+        let order: Vec<&str> = tasks
+            .iter()
+            .map(|task| task["task_id"].as_str().unwrap())
+            .collect();
+        // updated_at descending, task_id ascending as the tie-break.
+        assert_eq!(order, ["newest", "same-time-a", "same-time-b"]);
     }
 }
