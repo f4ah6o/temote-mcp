@@ -558,9 +558,9 @@ transport/
 1. 共通コア抽出と既存 MCP 契約の維持 (Phase A)。repository-store / no-local-main 契約の設計 (Phase F) は並行して進める。
 2. cloud / local 共通の task lifecycle と許可済み範囲の approve-free agent mode (Phase B)。
 3. **high priority:** A の共通 Task/Execution identity を使って Observation journal / deterministic Context Resolver (O1/O2) を並行実装する。backend ごとの個別 logger は作らない。Memory Worker (O3/O4) はその後に載せる。
-3. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
-4. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を初期基盤として完成させる。
-5. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
+4. 切断・応答消失・再起動・再試行の状態照合を検証 (Phase R)。
+5. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を初期基盤として完成させる。
+6. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
 依存関係: A → B → R。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の設計は独立に開始できる。F の新規 store 実装は C0 と整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
@@ -943,12 +943,15 @@ Prerequisites: <完了 commit / 対象ファイル / test>
 - [ ] gh-stack integration が existing worktree ownership を壊さない
 - [ ] workspace / task cleanup が uncommitted work を勝手に破棄しない
 - [ ] current server-backed delegation behavior (4 backend) の regression がない
+- [ ] head を切り替えても、authorized scope 内で過去の instruction・verified task/execution state・relevant current knowledge を Context Resolver から取得できる
+- [ ] coding agent に memory 保存・要約・knowledge 更新の追加 prompt/tool call を要求しない
+- [ ] caller/agent の claim と Temote が evidence/state から確認した事実を区別し、worker failure / stale knowledge を task success/failure に読み替えない
 - [ ] core/frontend separation 後、`temote` への rename migration が実行可能な状態になる
 
 ## Principle
 
 Temote を「MCP server」ではなく、
 
-> 指示役の cloud / local に依存せず、yolo なしの agent mode で許可範囲内を極力再承認なしに実行し、local main の管理を必要としない workspace 基盤から、caller が明示した task と依存関係を coding agents で実行して、検証結果・evidence と PR / stacked PR まで運ぶ development harness
+> 指示役の cloud / local や使用する head に依存せず、yolo なしの agent mode で許可範囲内を極力再承認なしに実行し、local main の管理を必要としない workspace 基盤から、caller が明示した task と依存関係を coding agents で実行して、検証結果・evidence と PR / stacked PR まで運び、observable instruction / execution から次の head へ provenance 付き context を引き継げる development harness
 
 として再定義する。
