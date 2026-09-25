@@ -164,6 +164,30 @@ export const PUBLIC_TOOLS = [
     schema(sessionProperty, ["session_id"]),
   ),
   tool(
+    "context_resolve",
+    "Resolve the session context bundle",
+    "Project the session-owned observation journal into a deterministic bounded context bundle: current task/execution/workspace state, recent task-scoped instruction references, unresolved items, and provenance refs. Read-only; knowledge/memory synthesis is not implemented yet, so knowledge fields are explicitly empty. Observation bodies stay in the owner-only journal and are never inlined.",
+    readOnly,
+    schema(
+      {
+        ...sessionProperty,
+        task_id: { type: "string", minLength: 1, maxLength: 256 },
+        repository: { type: "string", minLength: 1, maxLength: 256 },
+        query: { type: "string", minLength: 1, maxLength: 512 },
+        limit: { type: "integer", minimum: 1, maximum: 64, default: 16 },
+        at_least_revision: { type: "integer", minimum: 0 },
+      },
+      ["session_id"],
+    ),
+  ),
+  tool(
+    "context_status",
+    "Inspect the session context plane",
+    "Report the session observation journal's revision, size, compaction, and degradation counters plus the memory-worker status. Read-only and bounded; raw observation records are never returned.",
+    readOnly,
+    schema(sessionProperty, ["session_id"]),
+  ),
+  tool(
     "evidence_read",
     "Read scoped Temote evidence",
     "Read a bounded chunk from an opaque expiring evidence record owned by the selected session and scope.",

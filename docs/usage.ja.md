@@ -95,6 +95,14 @@ foreground timeout を超える作業は session 所有の `job_id` を返しま
 
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 
+### Context plane
+
+session 限定の delegation call はすべて単一の orchestration 境界を通過し、observation(instruction、acceptance、delivery、execution state、evidence 参照、verification、reconciliation マーク)を session 状態ディレクトリ以下の owner 専用 journal に記録します。observation の追記は best-effort で、underlying の tool call を失敗させません。
+
+`context_resolve({session_id, task_id?, repository?, query?, limit?, at_least_revision?})` はその journal を deterministic な bounded context bundle に射影します: workspace/current state、最近の related task rollup、対応が必要な unresolved item、provenance `refs`、そして `freshness` の revision カウンタです。`at_least_revision` で、呼び出し側がすでに新しい projection を保持しているかを判定できます。`context_status({session_id})` は journal の revision、size、compaction、degradation カウンタを返します。どちらの tool も raw な observation body は返さず、read-only です。memory/knowledge synthesis は未実装のため、bundle の knowledge field は明示的に空で、`memory.worker` は `not_implemented` を報告します。
+
+operator は owner 専用の `temote-mcp observation list|get|status <session_id>` debug command で session の journal を直接確認できます。`--include-content` は opt-in で、raw record が local surface の外に出ることはありません。
+
 ### Experimental Codex task
 
 opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_control` は、local `codex app-server --stdio` に接続し、名前付きの status/task 操作だけを扱います。互換性を Codex app-server の特定 version 文字列には固定しません。initialize response は上限付きで shape を検証し、version は解析できた場合だけ best-effort の診断情報として返します。互換性は、Temote が実際に使用する `model/list`、`thread/*`、`turn/*` の request/response をその場で検証して fail-closed にします。task は完全な session instance と canonical working directory に所有されるため、別 session、別 process generation、別 scope から resume できません。

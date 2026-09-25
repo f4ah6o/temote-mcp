@@ -537,14 +537,14 @@ raw observation dump を通常の remote MCP surface に出さない。
 
 Prerequisite: Phase A の common task identity / typed request boundary。
 
-- [ ] `Observation` schema + schema version
-- [ ] owner-only store
-- [ ] common orchestration entry/exit の recorder
-- [ ] task/control instruction references
-- [ ] execution/evidence/verification/delivery observation hooks
-- [ ] idempotent append key
-- [ ] gap/backfill/reconcile behavior
-- [ ] no secret-bearing structured fields test
+- [x] `Observation` schema + schema version
+- [x] owner-only store
+- [x] common orchestration entry/exit の recorder
+- [x] task/control instruction references
+- [x] execution/evidence/verification/delivery observation hooks
+- [x] idempotent append key
+- [x] gap/backfill/reconcile behavior
+- [x] no secret-bearing structured fields test
 
 Acceptance:
 
@@ -557,11 +557,11 @@ Acceptance:
 
 Prerequisite: O1。
 
-- [ ] task / execution / workspace / verification current state projection
-- [ ] repository/task scoped recent instruction lookup
-- [ ] deterministic context bundle
-- [ ] freshness / partial state
-- [ ] `context_resolve` contract
+- [x] task / execution / workspace / verification current state projection
+- [x] repository/task scoped recent instruction lookup
+- [x] deterministic context bundle
+- [x] freshness / partial state
+- [x] `context_resolve` contract
 
 ここまでで head switch の最低価値を成立させる。
 Memory Worker が未実装でも、過去の instruction と verified state を次の head が取得できる。
@@ -617,17 +617,17 @@ O1/O2 を D (environment) / E (delivery) より優先する。
 
 ## 20. Acceptance criteria
 
-- [ ] head が変わっても repository/task の relevant context を Temote から取得できる
-- [ ] coding agent に memory maintenance prompt / tool call を要求しない
-- [ ] 「誰/何が、どの backend に、どの instruction を出したか」を authorized scope 内で追跡できる
-- [ ] caller/agent claim と Temote verified execution state を区別する
-- [ ] raw observation は worker output から独立して保持される
+- [x] head が変わっても repository/task の relevant context を Temote から取得できる
+- [x] coding agent に memory maintenance prompt / tool call を要求しない
+- [x] 「誰/何が、どの backend に、どの instruction を出したか」を authorized scope 内で追跡できる
+- [x] caller/agent claim と Temote verified execution state を区別する
+- [x] raw observation は worker output から独立して保持される
 - [ ] derived knowledge は support refs を持ち、再生成可能
 - [ ] superseded/stale knowledge を current fact として返さない
-- [ ] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
-- [ ] MCP/local/HTTP/Gateway で semantic observation contract が変わらない
-- [ ] secrets を observation metadata / ordinary output に複製しない
-- [ ] raw transcript dump を通常の public surface にしない
+- [x] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
+- [x] MCP/local/HTTP/Gateway で semantic observation contract が変わらない
+- [x] secrets を observation metadata / ordinary output に複製しない
+- [x] raw transcript dump を通常の public surface にしない
 - [ ] worker failure 時も task execution は独立して継続できる
 
 ## 21. Principle

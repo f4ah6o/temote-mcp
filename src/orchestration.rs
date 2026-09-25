@@ -22,14 +22,15 @@ use serde_json::{Value, json};
 use temote_mcp::activity::contract::{ActivityErrorKind, ActivitySummary};
 use temote_mcp::activity::scope::ActivityScope;
 
-use crate::{approvals, codex_app_server, config, devin_acp};
+use crate::{approvals, codex_app_server, config, devin_acp, observation};
 #[cfg(feature = "network")]
 use crate::{devin_cloud, opencode_server};
 
 use requests::{
-    CodexStartOptions, DevinAcpStartOptions, ExecutionLocality, TaskControlRequest, TaskRequest,
+    CodexStartOptions, DevinAcpStartOptions, ExecutionLocality, TaskControlRequest,
     TaskStartRequest,
 };
+pub(crate) use requests::{ControlAction, TaskRequest};
 #[cfg(feature = "network")]
 use requests::{DevinCloudStartOptions, OpenCodeStartOptions};
 
@@ -69,7 +70,7 @@ impl Backend {
     /// the approval layer (e.g. `codex_task_start`). Approval requests and
     /// metadata keep using these labels so records stay comparable across
     /// transports.
-    fn operation_name(self, operation: Operation) -> String {
+    pub(crate) fn operation_name(self, operation: Operation) -> String {
         let prefix = match self {
             Backend::Codex => "codex",
             #[cfg(feature = "network")]
@@ -122,8 +123,9 @@ impl Backend {
     }
 
     /// Stable lowercase identity used as the merge key in the common
-    /// [`task_list`] projection (`backends` map, item `backend` field).
-    fn name(self) -> &'static str {
+    /// [`task_list`] projection (`backends` map, item `backend` field) and
+    /// as the backend identity in observation/journal records.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Backend::Codex => "codex",
             #[cfg(feature = "network")]
@@ -218,17 +220,27 @@ impl Backend {
 /// caller-owned activity scope the frontend already opened. Approval runs
 /// before any backend side effect; `TaskGet` is a read and reconciles
 /// without an approval prompt, matching the existing contract.
+///
+/// `actor` is the caller's transport identity for the observation journal:
+/// every normalized instruction and its caller-visible outcome are recorded
+/// here once, so the same semantic operation observes identically across
+/// frontends. Recording is best-effort and never fails the operation.
 pub(crate) async fn invoke(
     backend: Backend,
     operation: Operation,
     args: &Value,
     session: &config::Session,
+    actor: &observation::ActorRef,
     activity: Option<&ActivityScope>,
 ) -> Result<Value> {
     // Typed request boundary: malformed input and unsupported actions are
     // rejected before any approval prompt or backend side effect.
     let request = TaskRequest::parse(backend, operation, args)?;
-    match &request {
+    // The instruction is observed before approval: a denied or failed
+    // dispatch still leaves the caller's ask in the journal, while
+    // acceptance and outcomes are separate observations.
+    observation::record_instruction(session, actor, backend, operation, &request, args);
+    let result = match &request {
         TaskRequest::Status => {
             let (detail, metadata) = status_approval(backend);
             authorize(backend, operation, session, detail, metadata, activity).await?;
@@ -248,7 +260,9 @@ pub(crate) async fn invoke(
             authorize(backend, operation, session, detail, metadata, activity).await?;
             backend.task_control(args, session).await
         }
-    }
+    };
+    observation::record_outcome(session, actor, backend, operation, &request, &result);
+    result
 }
 
 async fn authorize(
@@ -920,9 +934,16 @@ mod tests {
         for backend in backends {
             // Malformed required input never reaches approval or dispatch.
             assert!(
-                invoke(backend, Operation::TaskStart, &json!({}), &session, None)
-                    .await
-                    .is_err()
+                invoke(
+                    backend,
+                    Operation::TaskStart,
+                    &json!({}),
+                    &session,
+                    &observation::ActorRef::mcp(false),
+                    None,
+                )
+                .await
+                .is_err()
             );
             assert!(
                 invoke(
@@ -930,6 +951,7 @@ mod tests {
                     Operation::TaskGet,
                     &json!({"task_id": "not-a-uuid"}),
                     &session,
+                    &observation::ActorRef::mcp(false),
                     None,
                 )
                 .await
@@ -941,6 +963,7 @@ mod tests {
                     Operation::TaskControl,
                     &json!({"task_id": "0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"}),
                     &session,
+                    &observation::ActorRef::mcp(false),
                     None,
                 )
                 .await
@@ -971,6 +994,7 @@ mod tests {
                     "action": "terminate",
                 }),
                 &session,
+                &observation::ActorRef::mcp(false),
                 None,
             )
             .await
@@ -1001,9 +1025,16 @@ mod tests {
                 json!({"limit": "many"}),
             ] {
                 assert!(
-                    invoke(backend, Operation::TaskList, &args, &session, None)
-                        .await
-                        .is_err()
+                    invoke(
+                        backend,
+                        Operation::TaskList,
+                        &args,
+                        &session,
+                        &observation::ActorRef::mcp(false),
+                        None,
+                    )
+                    .await
+                    .is_err()
                 );
             }
         }

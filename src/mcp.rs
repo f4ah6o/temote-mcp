@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::line_protocol::{BoundedLine, MAX_JSON_LINE_BYTES, next_bounded_line};
 use crate::{
-    activity_runtime, approvals, config, evidence, orchestration, sandbox,
+    activity_runtime, approvals, config, evidence, observation, orchestration, sandbox,
     session_control::SessionBackend,
 };
 use temote_mcp::activity::contract::{
@@ -97,6 +97,16 @@ const ACTIVITY_NON_DISPATCH_COVERAGE: &[ActivityNonDispatchCoverage] = &[
     },
     ActivityNonDispatchCoverage {
         name: "session_info",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
+    ActivityNonDispatchCoverage {
+        name: "context_resolve",
+        owner: ActivityNonDispatchOwner::Excluded,
+        fixture: "viewer query excluded",
+    },
+    ActivityNonDispatchCoverage {
+        name: "context_status",
         owner: ActivityNonDispatchOwner::Excluded,
         fixture: "viewer query excluded",
     },
@@ -764,6 +774,8 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"context_resolve","title":"Resolve the session context bundle","description":"Project the session-owned observation journal into a deterministic bounded context bundle: current task/execution/workspace state, recent task-scoped instruction references, unresolved items, and provenance refs. Read-only; knowledge/memory synthesis is not implemented yet, so knowledge fields are explicitly empty. Observation bodies stay in the owner-only journal and are never inlined.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","minLength":1,"maxLength":256},"repository":{"type":"string","minLength":1,"maxLength":256},"query":{"type":"string","minLength":1,"maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":64,"default":16},"at_least_revision":{"type":"integer","minimum":0}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"context_status","title":"Inspect the session context plane","description":"Report the session observation journal's revision, size, compaction, and degradation counters plus the memory-worker status. Read-only and bounded; raw observation records are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"evidence_read","title":"Read scoped Temote evidence","description":"Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"evidence_id":{"type":"string","format":"uuid"},"offset_bytes":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384}},"required":["session_id","evidence_id"],"additionalProperties":false}},
         {"name":"codex_status","title":"Check Codex app-server compatibility","description":"Check the locally installed Codex app-server through stdio, validate the concrete protocol response shapes Temote consumes, and return bounded model/effort plus best-effort version diagnostics without a release-number allowlist.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"codex_task_start","title":"Start a scoped Codex task","description":"Accept an idempotent scoped Codex task mutation, persist acceptance before child side effects, then start a workspace-write Codex app-server thread/turn. operation_id is mandatory; no sandbox escape option is exposed.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","task","model","effort"],"additionalProperties":false}},
@@ -935,14 +947,27 @@ async fn call_tool(
     };
     let result = async {
         match name {
+            "context_resolve" => text_result(serde_json::to_string_pretty(
+                &observation::resolver::resolve(&session, &args)?,
+            )?),
+            "context_status" => text_result(serde_json::to_string_pretty(
+                &observation::resolver::status(&session, &args)?,
+            )?),
             "evidence_read" => evidence_read_tool(&args, &session),
             "poll_job" => poll_job(&args, &session).await,
             "job_list" => job_list(&args, &session),
             "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
             _ => match delegation_operation(name) {
                 Some((backend, operation)) => text_result(serde_json::to_string_pretty(
-                    &orchestration::invoke(backend, operation, &args, &session, activity.as_ref())
-                        .await?,
+                    &orchestration::invoke(
+                        backend,
+                        operation,
+                        &args,
+                        &session,
+                        &observation::ActorRef::mcp(public),
+                        activity.as_ref(),
+                    )
+                    .await?,
                 )?),
                 None => anyhow::bail!("unknown tool: {name}"),
             },
@@ -1659,7 +1684,14 @@ mod tests {
                 .filter(|coverage| coverage.owner == ActivityNonDispatchOwner::Excluded)
                 .map(|coverage| coverage.name)
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["session_info", "session_list"].into_iter().collect()
+            [
+                "context_resolve",
+                "context_status",
+                "session_info",
+                "session_list"
+            ]
+            .into_iter()
+            .collect()
         );
         assert_eq!(
             ACTIVITY_TOOL_COVERAGE
@@ -2447,7 +2479,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 27);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -2466,6 +2498,8 @@ mod tests {
             "session_stop",
             "session_restart",
             "session_info",
+            "context_resolve",
+            "context_status",
             "evidence_read",
             "poll_job",
             "job_list",

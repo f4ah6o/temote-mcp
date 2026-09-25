@@ -107,6 +107,14 @@ Work that outlives the foreground timeout returns a session-owned `job_id`; poll
 
 The combined stdout/stderr retained for delegated work is capped at 1 MiB and reports when output was truncated.
 
+### Context plane
+
+Every session-bound delegation call passes through a single orchestration boundary that records observations (instruction, acceptance, delivery, execution state, evidence references, verification, and reconciliation marks) into a per-session owner-only journal under the session state directory. Observation appends are best-effort and never fail the underlying tool call.
+
+`context_resolve({session_id, task_id?, repository?, query?, limit?, at_least_revision?})` projects that journal into a deterministic bounded context bundle: workspace/current state, recent related task rollups, unresolved items that need attention, provenance `refs`, and `freshness` revision counters. `at_least_revision` lets a caller detect when it already holds a newer projection. `context_status({session_id})` reports journal revision, size, compaction and degradation counters. Neither tool returns raw observation bodies, and both are read-only. Memory/knowledge synthesis is not implemented yet, so the bundle's knowledge fields are explicitly empty and `memory.worker` reports `not_implemented`.
+
+Operators can inspect a session's journal directly with the owner-only `temote-mcp observation list|get|status <session_id>` debug command; `--include-content` is opt-in and raw records never leave the local surface.
+
 ### Experimental Codex tasks
 
 The opt-in `codex_status`, `codex_task_start`, `codex_task_get`, and `codex_task_control` tools connect to a local `codex app-server --stdio` and accept only the named status/task operations. Temote does not pin compatibility to a Codex app-server version string. The initialize response is bounded and shape-checked, the app-server version is reported only as best-effort diagnostic metadata when it can be parsed, and compatibility is enforced by validating the concrete `model/list`, `thread/*`, and `turn/*` requests and responses that Temote actually uses. A task is owned by the complete session instance and its canonical working directory, so it cannot be resumed from another session, process generation, or scope.
