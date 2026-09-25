@@ -36,6 +36,7 @@ Do not weaken these without an explicit issue describing the security model chan
 ## Tool behavior that agents should preserve
 
 - Machine work is delegated, not executed: `*_status` probes a backend once, `*_task_start` accepts an idempotent task (fresh UUID `operation_id`), `*_task_get` reads/reconciles retained tasks, `*_task_control` applies typed steer/resume/interrupt actions.
+- Task views keep execution, verification, and delivery as separate states: an execution `completed` is not a verification PASS, a verification result applies only to the task record revision it was recorded against (older results read as `not_run` with `stale: true`), and delivery stays `not_started` until a delivery operation records it.
 - Work that outlives the foreground timeout returns a session-owned `job_id` for `poll_job` / `job_list` / `stop_job`; background jobs are cancelled when the session stops or reaches its lifetime limit.
 - Delegated task detail is exposed only through bounded scoped evidence; read it with `evidence_read`.
 
