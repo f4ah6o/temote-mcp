@@ -76,6 +76,22 @@ clippy:
 diff-check:
     git diff --check
 
+# List the mutants cargo-mutants would generate, without running tests.
+# Scope with -f/--file or -F/-E regexes, e.g. `just mutants-list -f src/mcp.rs`.
+mutants-list *args:
+    cargo mutants --list {{ args }}
+
+# Run mutation testing. Always scope it: `just mutants -f src/mcp.rs`,
+# `just mutants -F 'line_protocol'`, or add `-- --skip <test-filter>` when the
+# local baseline has known-failing tests. A full-tree run is a long host/CI job.
+mutants *args:
+    cargo mutants {{ args }}
+
+# Mutation-test only the lines changed relative to a base ref (PR gate).
+mutants-diff base="origin/main":
+    git diff {{ quote(base) }}... > target/temote-pr.diff
+    cargo mutants --in-diff target/temote-pr.diff
+
 # Verify the private public.env file without printing any secret values.
 env-check:
     public_env_file="${TEMOTE_MCP_ENV_FILE:-${HOME}/.config/temote-mcp/public.env}"; \
