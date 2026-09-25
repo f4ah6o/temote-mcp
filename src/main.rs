@@ -28,8 +28,6 @@ mod line_protocol;
 #[cfg(feature = "network")]
 mod local_oauth;
 mod managed_worktree;
-#[allow(dead_code)]
-mod vcs;
 mod mcp;
 mod named_roots;
 #[cfg(feature = "network")]
@@ -48,6 +46,8 @@ mod test_support;
 #[cfg(all(feature = "network", unix))]
 mod upgrade_coordinator;
 mod upgrade_transaction;
+#[allow(dead_code)]
+mod vcs;
 
 use temote_mcp::sandbox;
 
