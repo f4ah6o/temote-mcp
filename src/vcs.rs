@@ -1406,8 +1406,9 @@ mod tests {
         let first = manager.workspace_ensure(&request("task-a", 'a')).unwrap();
         let second = manager.workspace_ensure(&request("task-b", 'a')).unwrap();
         assert_ne!(first.workspace.path, second.workspace.path);
-        assert!(first.workspace.path.starts_with(&fixture.managed));
-        assert!(second.workspace.path.starts_with(&fixture.managed));
+        let managed = std::fs::canonicalize(&fixture.managed).unwrap();
+        assert!(first.workspace.path.starts_with(&managed));
+        assert!(second.workspace.path.starts_with(&managed));
         assert!(!fixture.repository.join(".git").exists());
         assert_eq!(manager.inspect("task-a").unwrap().workspace_id, "task-a");
     }
