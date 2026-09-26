@@ -1354,7 +1354,12 @@ async fn read_devin_model_catalog() -> Result<Value> {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("could not start {} for Devin model discovery", binary.display()))?;
+            .with_context(|| {
+                format!(
+                    "could not start {} for Devin model discovery",
+                    binary.display()
+                )
+            })?;
         let stdout = child
             .stdout
             .take()
@@ -2737,7 +2742,9 @@ mod tests {
             "devin_mode": "swe-2-high",
             "swe_tier": "priority"
         });
-        let out = task_start_with_store(&args, &session, &store).await.unwrap();
+        let out = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap();
         assert_eq!(out["swe_tier"], "priority");
         assert_eq!(out["effective_devin_mode"], "swe-2-high-priority");
         assert_eq!(
@@ -2746,7 +2753,9 @@ mod tests {
         );
 
         set_fake_swe_priority_uid(Some(Err("catalog unavailable".to_owned())));
-        let replay = task_start_with_store(&args, &session, &store).await.unwrap();
+        let replay = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap();
         assert_eq!(replay["status"], "running");
         assert_eq!(fake.lock().unwrap().sessions.len(), 1);
 
@@ -2781,7 +2790,9 @@ mod tests {
             "devin_mode": "swe-2-max",
             "swe_tier": "promo"
         });
-        let out = task_start_with_store(&args, &session, &store).await.unwrap();
+        let out = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap();
         assert_eq!(out["swe_tier"], "promo");
         assert_eq!(out["effective_devin_mode"], "swe-2-max");
         assert_eq!(
