@@ -808,6 +808,13 @@
             "maxLength": 1048576,
             "minLength": 1,
             "type": "string"
+          },
+          "swe_tier": {
+            "enum": [
+              "promo",
+              "priority"
+            ],
+            "type": "string"
           }
         },
         "required": [
