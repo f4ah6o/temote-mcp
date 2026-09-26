@@ -1,23 +1,24 @@
-# O3C: Cloudflare-backed shared observation / knowledge plane
+# O3C: Temote Fabric shared observation / knowledge plane
 
 Status: design ready / implementation not started  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
+Naming / boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Priority: high — O1/O2 local continuity is already useful; this packet makes O3/O4 head- and host-independent  
 Created: 2026-09-26 (Asia/Tokyo)
 
 ## 1. Decision
 
-Observation / context / memory の shared plane は **既存 Cloudflare Gateway deployment を拡張して持つ**。
+Observation / context / memory の shared plane は **Temote Fabric** が持つ。
 
-ただし Gateway を execution authority にはしない。
+初期実装は既存 Cloudflare Gateway deployment (`gateway/`) を拡張して Fabric へ移行する。Fabric を execution authority にはしない。
 
 - Temote host:
   - Task / Execution / Workspace / Evidence の authority
   - O1 local observation journal の writer
   - Cloudflare が落ちても coding task を継続する
-- Gateway Worker:
+- Fabric Worker (current Gateway Worker):
   - authenticated observation ingest
   - shared context read surface
   - O3 async worker の enqueue / consumer entry point
@@ -34,7 +35,7 @@ Observation / context / memory の shared plane は **既存 Cloudflare Gateway 
   - host/session routing のまま
   - knowledge database として流用しない
 
-初期実装では同じ `temote-mcp-gateway` Worker deployment に bindings と modules を追加する。
+初期実装では現行 `temote-mcp-gateway` Worker deployment に bindings と modules を追加し、`issues/open/20260926-temote-fabric-product-boundary.md` の migration packet に従って `temote-fabric` へ移行する。
 将来 worker を別 deployment に分離しても D1 schema / replication contract は変えない。
 
 ## 2. Why this changes the previous O0 storage assumption
@@ -93,11 +94,11 @@ Cloud plane は以下を担当する。
 6. host が offline でも利用できる Context Resolver
 7. head / transport に依存しない authenticated retrieval
 
-### 3.3 Gateway is the edge, not the brain
+### 3.3 Fabric is the connective plane, not the execution brain
 
-Gateway に planner / autonomous workflow / task routing intelligence を追加しない。
+Fabric に planner / autonomous workflow / task routing intelligence を追加しない。
 
-Gateway が行うのは:
+Fabric が行うのは:
 
 - authenticate
 - ingest
@@ -121,7 +122,7 @@ Memory Worker が生成した knowledge から coding task を勝手に起動し
                     |
                     v
         +--------------------------+
-        | Temote Gateway Worker    |
+        | Temote Fabric Worker     |
         |                          |
         | MCP routing              |
         | context_resolve/status   |
@@ -173,7 +174,7 @@ Existing O1 journal remains:
 Responsibilities:
 
 - append before / independently from cloud replication
-- survive temporary Gateway / D1 / Queue outage
+- survive temporary Fabric / D1 / Queue outage
 - preserve source revision and gap metadata
 - provide local `context_resolve` fallback
 - act as replication spool
@@ -386,7 +387,7 @@ Rules:
 - unresolved repository identity may sync session/task observations, but MUST NOT promote them to repository-wide current knowledge
 - repository rebind/rename needs an explicit alias/migration record, not string guessing
 
-## 8. Host -> Gateway replication protocol
+## 8. Host -> Fabric replication protocol
 
 Add a host-authenticated endpoint under the existing host channel.
 
@@ -396,7 +397,7 @@ Conceptual endpoint:
 POST /v1/hosts/<host_id>/observations/sync
 ```
 
-The existing per-host bearer token + Access/service-token boundary is reused.
+The current Gateway implementation's per-host bearer token + Access/service-token boundary is reused as the initial Fabric Link authentication boundary.
 Do not create a second weaker host credential system.
 
 Request shape:
@@ -433,7 +434,7 @@ Response shape:
 
 1. local append happens first
 2. gateway-agent reads after its last acknowledged source revision
-3. Gateway validates host/session ownership and schema
+3. Fabric validates host/session ownership and schema
 4. structured secret-bearing fields are rejected / absent by contract
 5. D1 insert is idempotent
 6. ack advances only over a contiguous accepted source range
@@ -458,7 +459,7 @@ Context Resolver must never claim complete provenance across a known gap.
 
 ### 9.1 Trigger
 
-After an ingest commits new observations for a repository, Gateway sends a small Queue message.
+After an ingest commits new observations for a repository, Fabric sends a small Queue message.
 
 Queue payload is only a wake-up/high-watermark hint:
 
@@ -570,9 +571,9 @@ This keeps the existing reference-first safety invariant.
 
 ## 11. Context Resolver behavior
 
-### 11.1 Gateway path
+### 11.1 Fabric path
 
-When cloud bindings are enabled, Gateway should handle `context_resolve` / `context_status` as cloud-aware operations rather than blindly proxying every request to one session host.
+When cloud bindings are enabled, Fabric should handle `context_resolve` / `context_status` as cloud-aware operations rather than blindly proxying every request to one session host.
 
 Backward compatibility:
 
@@ -629,7 +630,7 @@ That is the main reason to move O3/O4 projection into the cloud plane.
 
 ### 12.1 Auth reuse
 
-Reuse current Gateway boundaries:
+Reuse the current Gateway implementation's authentication boundaries as the initial Fabric boundaries:
 
 - caller: Cloudflare Access / MCP auth
 - host: per-host bearer token + existing host identity checks
@@ -649,15 +650,15 @@ Before sync:
 
 - structured credential fields are excluded locally
 - observation schema is allow-listed
-- Gateway rejects unknown oversized/sensitive structured fields
+- Fabric rejects unknown oversized/sensitive structured fields
 - logs contain bounded identifiers, not content bodies
 
 Free text cannot be perfectly secret-scanned.
 Therefore large/full content cloud upload remains opt-in and policy-controlled.
 
-## 13. Gateway code boundary
+## 13. Fabric code boundary
 
-Do not grow `gateway/src/index.js` into one memory monolith.
+Do not grow the current `gateway/src/index.js` into one memory monolith. Split responsibilities first; the source-tree rename to `fabric/` is tracked separately in the Fabric naming/migration issue.
 
 Target modules:
 
@@ -699,18 +700,18 @@ binding = "OBSERVATION_CONTENT"
 bucket_name = "temote-observation-content"
 ```
 
-The existing:
+The current implementation still uses:
 
 ```text
 GATEWAY_SESSIONS
 GATEWAY_REGISTRY
 ```
 
-Durable Object bindings remain routing/liveness state only.
+These Durable Object bindings remain routing/liveness state only until the non-destructive Fabric naming migration. Target names are `FABRIC_SESSIONS` / `FABRIC_REGISTRY`; renaming deployed DO classes/bindings requires the migration checks in the Fabric naming issue.
 
 ## 14. Failure semantics
 
-### Gateway/D1 unavailable
+### Fabric/D1 unavailable
 
 - local O1 append succeeds
 - coding/execution continues
@@ -779,7 +780,7 @@ Do not implement automatic observation pruning until rebuild/provenance behavior
 - [ ] define sync request/ack contract
 - [ ] define freshness/degraded result contract
 
-### C1 — D1 observation ingest
+### C1 — Fabric D1 observation ingest
 
 - [ ] add D1 binding
 - [ ] add `observation_sources` / `observations`
@@ -796,13 +797,13 @@ Do not implement automatic observation pruning until rebuild/provenance behavior
 - [ ] bounded batches
 - [ ] retry without duplicate insert
 - [ ] compaction-gap reporting
-- [ ] Gateway offline does not fail task execution
+- [ ] Fabric offline does not fail task execution
 
-### C3 — cloud Context Resolver before LLM memory
+### C3 — Fabric Context Resolver before LLM memory
 
 - [ ] D1 deterministic repository/task projection
 - [ ] cloud `context_status`
-- [ ] Gateway `context_resolve` read path
+- [ ] Fabric `context_resolve` read path
 - [ ] offline-host acceptance
 - [ ] legacy session fallback
 - [ ] freshness / partial / authority labels
@@ -843,7 +844,7 @@ Implement only after C1-C5 works without it.
 
 ## 17. Tests / acceptance
 
-### Gateway tests
+### Fabric tests
 
 - [ ] same observation batch twice -> one D1 observation set
 - [ ] out-of-order/gapped source revision does not advance contiguous ack incorrectly
@@ -868,7 +869,7 @@ Implement only after C1-C5 works without it.
 2. gateway-agent syncs them.
 3. Host A goes offline.
 4. O3 produces repository knowledge.
-5. A different head calls Gateway `context_resolve`.
+5. A different head calls Fabric `context_resolve`.
 6. It receives:
    - task A instruction reference
    - replicated final observed state
@@ -903,5 +904,5 @@ This packet does not add:
 
 > Execute locally, observe durably, replicate safely, understand globally.
 
-Gateway は「仕事をする場所」ではなく、host-independent observation / context continuity の authenticated shared edge になる。
+Temote Fabric は「仕事をする場所」ではなく、host-independent observation / context continuity の authenticated shared substrate になる。
 Execution authority は host に残し、D1 knowledge は provenance 付きの rebuildable projection とする。
