@@ -622,6 +622,11 @@
           "cloud": {
             "type": "boolean"
           },
+          "effort": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
           "host_id": {
             "type": "string"
           },
@@ -635,6 +640,13 @@
             "type": "string"
           },
           "session_id": {
+            "type": "string"
+          },
+          "speed": {
+            "enum": [
+              "standard",
+              "priority"
+            ],
             "type": "string"
           },
           "task": {
