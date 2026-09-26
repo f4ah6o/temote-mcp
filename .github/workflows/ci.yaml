@@ -27,6 +27,9 @@ jobs:
       - name: Test gateway contract and runtime
         run: npm test --prefix gateway
 
+      - name: Test D1 schema integrity
+        run: python3 gateway/test/cloud_observation_schema_sqlite.py
+
   rust:
     strategy:
       fail-fast: false
