@@ -546,9 +546,40 @@
             "enum": [
               "steer",
               "resume",
-              "interrupt"
+              "interrupt",
+              "answer"
             ],
             "type": "string"
+          },
+          "answer": {
+            "additionalProperties": false,
+            "properties": {
+              "answers": {
+                "items": {
+                  "items": {
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "maxItems": 16,
+                  "type": "array"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "message": {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              "reply": {
+                "enum": [
+                  "once",
+                  "always",
+                  "reject"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
           },
           "host_id": {
             "type": "string"
@@ -556,6 +587,10 @@
           "input": {
             "maxLength": 1048576,
             "minLength": 1,
+            "type": "string"
+          },
+          "interaction_id": {
+            "format": "uuid",
             "type": "string"
           },
           "operation_id": {
