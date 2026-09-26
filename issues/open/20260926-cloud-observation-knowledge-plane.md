@@ -773,7 +773,7 @@ Do not implement automatic observation pruning until rebuild/provenance behavior
 
 ### C0 — contract / schema
 
-- [ ] add this child design to O0 / umbrella links
+- [x] add this child design to O0 / umbrella links
 - [ ] define D1 migration files
 - [ ] define cloud observation schema version
 - [ ] define owner/repository identity mapping
