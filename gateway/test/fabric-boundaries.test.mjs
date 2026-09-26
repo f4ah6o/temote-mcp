@@ -13,6 +13,7 @@ import {
   compareSessionRoute,
   withoutHostRoutingArgument,
 } from "../src/routing.js";
+import * as routingRuntime from "../src/routing-runtime.js";
 import {
   OBSERVATION_SCHEMA_VERSION,
   observationPlaneBindings,
