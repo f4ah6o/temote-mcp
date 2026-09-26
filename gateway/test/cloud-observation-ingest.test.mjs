@@ -218,6 +218,23 @@ test("ack advances only through the committed contiguous prefix and never regres
   assert.equal(result.json.acked_through_revision, 3);
 });
 
+test("nonzero compacted source base is accepted without fabricating an ACK", async () => {
+  const database = new FakeD1();
+  const result = await sync(body([record(102), record(103)], {
+    source_base_revision: 101,
+    source_head_revision: 103,
+    journal_degraded: true,
+    gap_count: 101,
+  }), { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.json.acked_through_revision, 0);
+  assert.equal(result.json.complete, false);
+  const source = database.source("owner-a", HOST, SESSION);
+  assert.equal(source.source_base_revision, 101);
+  assert.equal(source.source_head_revision, 103);
+  assert.equal(source.journal_degraded, 1);
+});
+
 test("repository identity can resolve once but cannot be rebound", async () => {
   const database = new FakeD1();
   let result = await sync(body([record(1)], { repository_key: undefined }), { db: database });
@@ -362,7 +379,7 @@ class FakeD1 {
     }
 
     if (sql.startsWith("INSERT INTO observation_sources")) {
-      const [owner, host, session, repository, base, now] = args;
+      const [owner, host, session, repository, base, head, now] = args;
       const key = owner + "\n" + host + "\n" + session;
       if (state.sources.has(key)) throw new Error("UNIQUE observation_sources");
       state.sources.set(key, {
@@ -371,7 +388,7 @@ class FakeD1 {
         session_id: session,
         repository_key: repository,
         source_base_revision: base,
-        source_head_revision: 0,
+        source_head_revision: head,
         acked_through_revision: 0,
         cloud_head_seq: 0,
         journal_degraded: 0,
