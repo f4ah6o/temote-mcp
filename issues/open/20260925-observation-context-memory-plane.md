@@ -1,8 +1,9 @@
 # O0: head-independent observation / context / memory plane
 
-Status: high-priority design / implementation not started  
+Status: high-priority / O1 + O2 implemented; O3 + O4 implementation not started  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
+Cloud extension: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
 Created: 2026-09-25 (Asia/Tokyo)
 
@@ -468,20 +469,28 @@ context_resolve --at-least-revision 381
 
 ## 15. Storage
 
-O1 の初期実装は Temote owner-only state directory の SQLite を候補とする。
+O1 の実装は Temote owner-only state directory の bounded JSONL journal を使用する。
+これは O3/O4 cloud 化後も削除せず、execution host 側の durable spool / recovery source / local fallback とする。
 
-ただし contract は storage backend に固定しない。
+Authority:
 
-初期 authority:
+- Task / Execution: existing Temote/backend stores on the owning host
+- Local raw observation: Temote O1 journal
+- Cloud observation: sanitized replicated observation, execution authority ではない
+- Knowledge: derived / rebuildable projection
 
-- Task / Execution: existing Temote/backend stores
-- Observation: Temote observation store
-- Knowledge: derived local store
+O3/O4 の shared plane は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、既存 Cloudflare Gateway deployment を拡張する。
 
-複数 host の global knowledge authority / replication は初期 scope 外。
-remote head は Temote の authenticated frontend 経由で同じ owning host の Context Resolver にアクセスする。
+初期 cloud layout:
 
-multi-host aggregation を必要とする場合は Gateway の ownership/routing contract と整合した別 packet にする。
+- D1: structured observation replica / checkpoints / knowledge / support / supersession
+- Queue: asynchronous Memory Worker trigger / retry
+- R2: large explicitly-safe content only; optional and not the primary database
+- existing Gateway Durable Objects: routing/liveness responsibility のまま
+
+Cloudflare outage や worker failure は accepted Task / Execution を failed にしてはならない。
+remote head は last successfully synced revision まで host-offline でも repository knowledge を取得できることを O3/O4 の acceptance とする。
+
 
 ## 16. Public surface
 
@@ -569,6 +578,7 @@ Memory Worker が未実装でも、過去の instruction と verified state を�
 ### O3 — Memory Worker
 
 Prerequisite: O1 + O2。
+Cloud shared implementation / replication / D1 / Queue contract は `issues/open/20260926-cloud-observation-knowledge-plane.md` を canonical child packet とする。
 
 - [ ] worker checkpoint
 - [ ] batch read
@@ -582,6 +592,7 @@ Prerequisite: O1 + O2。
 ### O4 — Knowledge-aware resolver
 
 Prerequisite: O3。
+Gateway 経由では cloud D1 projection を利用し、host offline でも last synced revision まで repository context を解決できること。
 
 - [ ] current knowledge selection
 - [ ] task-specific vs repository-wide scope policy
