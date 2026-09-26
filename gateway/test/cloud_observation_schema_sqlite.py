@@ -251,7 +251,7 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    def add_source(self, session="session-c1", repository="forge:f4ah6o/temote-mcp"):
+    def add_source(self, session="session-c1", repository="github:f4ah6o/temote-mcp"):
         self.db.execute(
             """
             INSERT INTO observation_sources (
@@ -267,7 +267,7 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
         *,
         session="session-c1",
         observation_id=None,
-        repository="forge:f4ah6o/temote-mcp",
+        repository="github:f4ah6o/temote-mcp",
         digest=None,
     ):
         observation_id = observation_id or f"obs-{revision}"
@@ -298,8 +298,8 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
         self.db.execute(
             C1_UPDATE_SOURCE,
             (
-                "forge:f4ah6o/temote-mcp",
-                "forge:f4ah6o/temote-mcp",
+                "github:f4ah6o/temote-mcp",
+                "github:f4ah6o/temote-mcp",
                 0,
                 head,
                 degraded,
