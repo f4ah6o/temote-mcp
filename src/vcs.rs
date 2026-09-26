@@ -536,18 +536,18 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         if receipt_path.exists() {
             let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
             validate_receipt(&receipt, operation_id)?;
-            let expected_fingerprint = if receipt.task_id.is_none() && receipt.execution_id.is_none()
-            {
-                if execution_id.is_some() {
-                    return Err(VcsError::new(
-                        VcsErrorCode::OperationConflict,
-                        "legacy snapshot operation cannot be rebound to an execution",
-                    ));
-                }
-                legacy_snapshot_fingerprint(workspace_id)
-            } else {
-                request_fingerprint.clone()
-            };
+            let expected_fingerprint =
+                if receipt.task_id.is_none() && receipt.execution_id.is_none() {
+                    if execution_id.is_some() {
+                        return Err(VcsError::new(
+                            VcsErrorCode::OperationConflict,
+                            "legacy snapshot operation cannot be rebound to an execution",
+                        ));
+                    }
+                    legacy_snapshot_fingerprint(workspace_id)
+                } else {
+                    request_fingerprint.clone()
+                };
             if receipt.request_fingerprint != expected_fingerprint {
                 return Err(VcsError::new(
                     VcsErrorCode::OperationConflict,
@@ -1056,9 +1056,8 @@ fn validate_workspace_id(workspace_id: &str) -> VcsResult<()> {
 
 fn validate_correlation_id(label: &str, value: &str) -> VcsResult<()> {
     const MAX_BYTES: usize = 256;
-    let valid = !value.is_empty()
-        && value.len() <= MAX_BYTES
-        && !value.chars().any(char::is_control);
+    let valid =
+        !value.is_empty() && value.len() <= MAX_BYTES && !value.chars().any(char::is_control);
     if valid {
         Ok(())
     } else {
@@ -1557,7 +1556,9 @@ mod tests {
         manager.workspace_ensure(&request("task-a", 'a')).unwrap();
 
         let operation_id = Uuid::new_v4();
-        let result = manager.snapshot("task-a", operation_id, Some("exec-a")).unwrap();
+        let result = manager
+            .snapshot("task-a", operation_id, Some("exec-a"))
+            .unwrap();
         assert_eq!(result.before.logical_change_id, "change-a");
         assert_eq!(result.after.logical_change_id, "change-a");
         assert_eq!(result.before.materialized_revision, initial);
@@ -1572,7 +1573,9 @@ mod tests {
         assert!(!result.replayed);
         assert!(!result.reconciled);
 
-        let replay = manager.snapshot("task-a", operation_id, Some("exec-a")).unwrap();
+        let replay = manager
+            .snapshot("task-a", operation_id, Some("exec-a"))
+            .unwrap();
         assert!(replay.replayed);
         assert_eq!(
             manager
@@ -1608,7 +1611,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            manager.snapshot("task-a", operation_id, Some("exec-a")).unwrap_err().code,
+            manager
+                .snapshot("task-a", operation_id, Some("exec-a"))
+                .unwrap_err()
+                .code,
             VcsErrorCode::ReconciliationRequired
         );
         assert_eq!(runner.state.lock().unwrap().status_calls, 0);
