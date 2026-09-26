@@ -36,6 +36,9 @@ const MAX_TASKS_PER_SCOPE: usize = 128;
 const MAX_OPERATION_HISTORY: usize = 32;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_INTERACTION_ANSWER_BYTES: usize = 16 * 1024;
+const MAX_INTERACTION_VIEW_BYTES: usize = 16 * 1024;
+const MAX_PENDING_INTERACTIONS: usize = 64;
 const MAX_ERROR_BYTES: usize = 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024;
 const MAX_REPORT_ARRAY_ITEMS: usize = 64;
@@ -80,6 +83,9 @@ const REQUEST_FINGERPRINT_NAMESPACE: Uuid = Uuid::from_bytes([
 ]);
 const MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x4f, 0x1b, 0x8d, 0x33, 0x5a, 0x6c, 0x49, 0x82, 0x91, 0x5e, 0x67, 0xd8, 0x20, 0xa4, 0x0f, 0xb3,
+]);
+const INTERACTION_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x8a, 0x34, 0x91, 0x5c, 0x12, 0x7f, 0x47, 0x22, 0xa8, 0xb1, 0x7e, 0x40, 0xe1, 0x3c, 0x69, 0x5d,
 ]);
 
 const SERVE_CHILD_ENV_ALLOWLIST: &[&str] = &[
@@ -1441,6 +1447,147 @@ fn fingerprint(value: &Value) -> Result<Uuid> {
     Ok(Uuid::new_v5(&REQUEST_FINGERPRINT_NAMESPACE, &bytes))
 }
 
+#[derive(Clone, Debug)]
+struct PendingInteraction {
+    interaction_id: Uuid,
+    kind: &'static str,
+    request_id: String,
+    view: Value,
+}
+
+fn interaction_session_id(value: &Value) -> Option<&str> {
+    value
+        .get("sessionID")
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("sessionId"))
+        .and_then(Value::as_str)
+}
+
+fn interaction_request_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("requestID"))
+        .or_else(|| value.get("request_id"))
+        .and_then(Value::as_str)
+}
+
+fn canonical_interaction_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(canonical_interaction_value)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_interaction_value(&map[key]));
+            }
+            Value::Object(canonical)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn interaction_id_for(
+    task_id: Uuid,
+    kind: &str,
+    request_id: &str,
+    request: &Value,
+) -> Result<Uuid> {
+    let canonical = canonical_interaction_value(request);
+    let payload = serde_json::to_vec(&canonical)?;
+    let mut bytes = Vec::with_capacity(16 + kind.len() + request_id.len() + payload.len() + 3);
+    bytes.extend_from_slice(task_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(kind.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(request_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&payload);
+    Ok(Uuid::new_v5(&INTERACTION_ID_NAMESPACE, &bytes))
+}
+
+fn interaction_detail(kind: &str, request: &Value) -> Value {
+    let detail = match kind {
+        "permission" => json!({
+            "action": request.get("action").or_else(|| request.get("permission")),
+            "resources": request.get("resources").or_else(|| request.get("patterns")),
+            "save": request.get("save").or_else(|| request.get("always")),
+        }),
+        "question" => json!({
+            "questions": request.get("questions"),
+            "title": request.get("title"),
+            "fields": request.get("fields"),
+        }),
+        _ => json!({}),
+    };
+    if serde_json::to_vec(&detail)
+        .map(|bytes| bytes.len() <= MAX_INTERACTION_VIEW_BYTES)
+        .unwrap_or(false)
+    {
+        detail
+    } else {
+        json!({"omitted": true, "reason": "detail_too_large"})
+    }
+}
+
+fn pending_interactions_from(
+    task_id: Uuid,
+    opencode_session_id: &str,
+    permissions: &[Value],
+    questions: &[Value],
+) -> Result<Vec<PendingInteraction>> {
+    let mut interactions = Vec::new();
+    for (kind, requests) in [("permission", permissions), ("question", questions)] {
+        for request in requests {
+            if interaction_session_id(request) != Some(opencode_session_id) {
+                continue;
+            }
+            let Some(request_id) = interaction_request_id(request) else {
+                continue;
+            };
+            anyhow::ensure!(
+                interactions.len() < MAX_PENDING_INTERACTIONS,
+                "OpenCode pending interactions exceed {MAX_PENDING_INTERACTIONS}"
+            );
+            let interaction_id = interaction_id_for(task_id, kind, request_id, request)?;
+            interactions.push(PendingInteraction {
+                interaction_id,
+                kind,
+                request_id: request_id.to_owned(),
+                view: json!({
+                    "interaction_id": interaction_id,
+                    "kind": kind,
+                    "detail": interaction_detail(kind, request),
+                }),
+            });
+        }
+    }
+    interactions.sort_by(|left, right| left.interaction_id.cmp(&right.interaction_id));
+    Ok(interactions)
+}
+
+async fn pending_interactions(
+    client: &ServeClient,
+    task_id: Uuid,
+    opencode_session_id: &str,
+) -> Result<Vec<PendingInteraction>> {
+    let permissions = client.permission_list().await?;
+    let questions = client.question_list().await?;
+    pending_interactions_from(task_id, opencode_session_id, &permissions, &questions)
+}
+
+fn pending_interaction_views(interactions: &[PendingInteraction]) -> Vec<Value> {
+    interactions
+        .iter()
+        .map(|interaction| interaction.view.clone())
+        .collect()
+}
+
 fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
     json!({
         "task_id": task_id,
@@ -2001,6 +2148,121 @@ impl ServeClient {
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().question_list(),
+        }
+    }
+
+    async fn permission_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
+        message: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            Self::Sdk(inner) => {
+                let accepted = sdk_call(inner.client.permission().reply(
+                    request_id,
+                    &unofficial_opencode_sdk::current::PermissionReplyRequest {
+                        reply: reply.to_owned(),
+                        message: message.map(str::to_owned),
+                    },
+                ))
+                .await
+                .context("opencode permission reply failed")?;
+                anyhow::ensure!(accepted, "OpenCode did not accept permission reply");
+                Ok(())
+            }
+            Self::SdkV2(inner) => {
+                let mut body = json!({"reply": reply});
+                if let Some(message) = message {
+                    body["message"] = json!(message);
+                }
+                let current =
+                    format!("api/session/{session_id}/permission/{request_id}/reply");
+                if v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &current,
+                    &body,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                let legacy = format!("api/permission/{request_id}/reply");
+                v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &legacy,
+                    &body,
+                )
+                .await
+                .map(|_| ())
+                .context("opencode permission reply failed")
+            }
+            #[cfg(test)]
+            Self::Fake(inner) => inner
+                .lock()
+                .unwrap()
+                .permission_reply(session_id, request_id, reply, message),
+        }
+    }
+
+    async fn question_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: &[Vec<String>],
+    ) -> Result<()> {
+        match self {
+            Self::Sdk(inner) => {
+                let accepted = sdk_call(inner.client.question().reply(
+                    request_id,
+                    &unofficial_opencode_sdk::current::QuestionReplyRequest {
+                        answers: answers.to_vec(),
+                    },
+                ))
+                .await
+                .context("opencode question reply failed")?;
+                anyhow::ensure!(accepted, "OpenCode did not accept question reply");
+                Ok(())
+            }
+            Self::SdkV2(inner) => {
+                let body = json!({"answers": answers});
+                let current =
+                    format!("api/session/{session_id}/question/{request_id}/reply");
+                if v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &current,
+                    &body,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                let legacy = format!("api/question/{request_id}/reply");
+                v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &legacy,
+                    &body,
+                )
+                .await
+                .map(|_| ())
+                .context("opencode question reply failed")
+            }
+            #[cfg(test)]
+            Self::Fake(inner) => inner
+                .lock()
+                .unwrap()
+                .question_reply(session_id, request_id, answers),
         }
     }
 
@@ -3593,6 +3855,14 @@ async fn task_get_with_store_and_binary(
         }
     };
 
+    let interactions = if record.status.is_terminal() {
+        Ok(Vec::new())
+    } else if let Some(opencode_session_id) = record.opencode_session_id.as_deref() {
+        pending_interactions(&client, task_id, opencode_session_id).await
+    } else {
+        Ok(Vec::new())
+    };
+
     // Store bounded evidence for the final assistant turn on terminal states.
     let evidence_ref = if record.status.is_terminal() {
         record
@@ -3621,7 +3891,19 @@ async fn task_get_with_store_and_binary(
             "revision": record.revision,
         }));
     }
-    Ok(task_view(&record, evidence_ref.as_ref()))
+    let mut view = task_view(&record, evidence_ref.as_ref());
+    match interactions {
+        Ok(interactions) => {
+            view["pending_interactions"] = json!(pending_interaction_views(&interactions));
+        }
+        Err(error) => {
+            view["pending_interactions"] = json!([]);
+            view["pending_interactions_unavailable"] = json!(true);
+            view["pending_interactions_error"] =
+                json!(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
+        }
+    }
+    Ok(view)
 }
 
 /// Read-only projection of the tasks this session instance owns.
@@ -3694,23 +3976,50 @@ async fn task_control_with_store_and_binary(
     let operation_id = required_uuid(args, "operation_id")?;
     let action = required_string(args, "action")?;
     anyhow::ensure!(
-        matches!(action, "steer" | "resume" | "interrupt"),
+        matches!(action, "steer" | "resume" | "interrupt" | "answer"),
         "unsupported OpenCode task action"
     );
     let input = args.get("input").and_then(Value::as_str);
-    match action {
-        "steer" => validate_task_input(input.context("steer requires input")?, "input")?,
+    let interaction_id = match action {
+        "steer" => {
+            validate_task_input(input.context("steer requires input")?, "input")?;
+            None
+        }
         "resume" | "interrupt" => {
-            anyhow::ensure!(input.is_none(), "{action} does not accept input")
+            anyhow::ensure!(input.is_none(), "{action} does not accept input");
+            None
+        }
+        "answer" => {
+            anyhow::ensure!(input.is_none(), "answer does not accept input");
+            Some(required_uuid(args, "interaction_id")?)
         }
         _ => unreachable!(),
-    }
+    };
+    let answer = if action == "answer" {
+        let answer = args
+            .get("answer")
+            .filter(|value| value.is_object())
+            .context("answer requires an object answer")?;
+        anyhow::ensure!(
+            serde_json::to_vec(answer)?.len() <= MAX_INTERACTION_ANSWER_BYTES,
+            "answer exceeds {MAX_INTERACTION_ANSWER_BYTES} bytes"
+        );
+        Some(answer)
+    } else {
+        anyhow::ensure!(
+            args.get("interaction_id").is_none() && args.get("answer").is_none(),
+            "{action} does not accept interaction_id or answer"
+        );
+        None
+    };
 
     let request_fingerprint = fingerprint(&json!({
         "kind": "control",
         "task_id": task_id,
         "action": action,
         "input": input,
+        "interaction_id": interaction_id,
+        "answer": answer,
     }))?;
     let owner = SessionInstance::from_session(session);
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
@@ -3766,6 +4075,21 @@ async fn task_control_with_store_and_binary(
         })?;
         return Ok(task_view(&record, None));
     };
+
+    if action == "answer" {
+        return answer_pending_interaction(
+            session,
+            &owner,
+            store,
+            record,
+            &client,
+            &opencode_session_id,
+            operation_id,
+            interaction_id.expect("answer validates interaction id"),
+            answer.expect("answer validates payload"),
+        )
+        .await;
+    }
 
     let message_id = prompt_message_id(operation_id);
     let result = match action {
@@ -3835,6 +4159,247 @@ async fn task_control_with_store_and_binary(
         }
     }
     Ok(task_view(&record, None))
+}
+
+fn permission_answer(answer: &Value) -> Result<(&str, Option<&str>)> {
+    let reply = answer
+        .get("reply")
+        .and_then(Value::as_str)
+        .context("permission answer requires reply")?;
+    anyhow::ensure!(
+        matches!(reply, "once" | "always" | "reject"),
+        "permission reply must be one of once, always, reject"
+    );
+    anyhow::ensure!(
+        answer.get("answers").is_none(),
+        "permission answer does not accept answers"
+    );
+    let message = match answer.get("message") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            anyhow::ensure!(value.len() <= 1024, "permission message exceeds 1024 bytes");
+            Some(value.as_str())
+        }
+        Some(_) => anyhow::bail!("permission message must be a string"),
+    };
+    Ok((reply, message))
+}
+
+fn question_answer(answer: &Value) -> Result<Vec<Vec<String>>> {
+    anyhow::ensure!(
+        answer.get("reply").is_none() && answer.get("message").is_none(),
+        "question answer does not accept reply or message"
+    );
+    let rows = answer
+        .get("answers")
+        .and_then(Value::as_array)
+        .context("question answer requires answers")?;
+    anyhow::ensure!(rows.len() <= 64, "question answer accepts at most 64 answers");
+    rows.iter()
+        .map(|row| {
+            let values = row
+                .as_array()
+                .context("question answers must be arrays of strings")?;
+            anyhow::ensure!(
+                values.len() <= 16,
+                "each question answer accepts at most 16 values"
+            );
+            values
+                .iter()
+                .map(|value| {
+                    let value = value
+                        .as_str()
+                        .context("question answer values must be strings")?;
+                    anyhow::ensure!(
+                        value.len() <= 4096,
+                        "question answer value exceeds 4096 bytes"
+                    );
+                    Ok(value.to_owned())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn interaction_result_view(
+    record: &TaskRecord,
+    interaction_id: Uuid,
+    result: &str,
+    applied: bool,
+    interactions: &[PendingInteraction],
+) -> Value {
+    let mut view = task_view(record, None);
+    view["pending_interactions"] = json!(pending_interaction_views(interactions));
+    view["interaction"] = json!({
+        "interaction_id": interaction_id,
+        "result": result,
+        "applied": applied,
+    });
+    view
+}
+
+fn finish_interaction_receipt(
+    store: &TaskStore,
+    session: &config::Session,
+    owner: &SessionInstance,
+    task_id: Uuid,
+    operation_id: Uuid,
+    pending_count: usize,
+) -> Result<TaskRecord> {
+    store.update_if_instance_live(session, task_id, owner, |record| {
+        if !record.status.is_terminal() {
+            record.status = if pending_count == 0 {
+                TaskStatus::Running
+            } else {
+                TaskStatus::WaitingApproval
+            };
+            record.last_error = (pending_count > 0)
+                .then(|| "opencode permission/question request is pending".to_owned());
+            record.revision = record.revision.saturating_add(1);
+            update_operation_receipt(record, operation_id, OperationPhase::Applied);
+        }
+        Ok(())
+    })
+}
+
+fn mark_interaction_uncertain(
+    store: &TaskStore,
+    session: &config::Session,
+    owner: &SessionInstance,
+    task_id: Uuid,
+    error: &str,
+) -> Result<TaskRecord> {
+    store.update_if_instance_live(session, task_id, owner, |record| {
+        if !record.status.is_terminal() {
+            record.status = TaskStatus::ReconciliationRequired;
+            record.last_error = Some(bound_text(error, MAX_ERROR_BYTES));
+            record.revision = record.revision.saturating_add(1);
+        }
+        Ok(())
+    })
+}
+
+async fn answer_pending_interaction(
+    session: &config::Session,
+    owner: &SessionInstance,
+    store: &TaskStore,
+    record: TaskRecord,
+    client: &ServeClient,
+    opencode_session_id: &str,
+    operation_id: Uuid,
+    interaction_id: Uuid,
+    answer: &Value,
+) -> Result<Value> {
+    let task_id = record.task_id;
+    let pending = pending_interactions(client, task_id, opencode_session_id).await?;
+    let Some(target) = pending
+        .iter()
+        .find(|interaction| interaction.interaction_id == interaction_id)
+        .cloned()
+    else {
+        let permit = ensure_current_active_instance(owner, session).await?;
+        let record = finish_interaction_receipt(
+            store,
+            session,
+            owner,
+            task_id,
+            operation_id,
+            pending.len(),
+        )?;
+        drop(permit);
+        return Ok(interaction_result_view(
+            &record,
+            interaction_id,
+            "stale",
+            false,
+            &pending,
+        ));
+    };
+
+    let reply = match target.kind {
+        "permission" => {
+            let (reply, message) = permission_answer(answer)?;
+            client
+                .permission_reply(opencode_session_id, &target.request_id, reply, message)
+                .await
+        }
+        "question" => {
+            let answers = question_answer(answer)?;
+            client
+                .question_reply(opencode_session_id, &target.request_id, &answers)
+                .await
+        }
+        _ => anyhow::bail!("unsupported OpenCode interaction kind"),
+    };
+
+    // Re-read the queue even when the transport reported an error. The server
+    // may have applied the exact request just before a connection failure.
+    // Exact interaction ids make this reconciliation non-destructive.
+    let after = match pending_interactions(client, task_id, opencode_session_id).await {
+        Ok(after) => after,
+        Err(error) => {
+            let permit = ensure_current_active_instance(owner, session).await?;
+            let record = mark_interaction_uncertain(
+                store,
+                session,
+                owner,
+                task_id,
+                &format!("cannot reconcile OpenCode interaction answer: {error:#}"),
+            )?;
+            drop(permit);
+            return Ok(interaction_result_view(
+                &record,
+                interaction_id,
+                "reconciliation_required",
+                false,
+                &[],
+            ));
+        }
+    };
+    let still_pending = after
+        .iter()
+        .any(|interaction| interaction.interaction_id == interaction_id);
+
+    if !still_pending {
+        let permit = ensure_current_active_instance(owner, session).await?;
+        let record = finish_interaction_receipt(
+            store,
+            session,
+            owner,
+            task_id,
+            operation_id,
+            after.len(),
+        )?;
+        drop(permit);
+        return Ok(interaction_result_view(
+            &record,
+            interaction_id,
+            if reply.is_ok() {
+                "answered"
+            } else {
+                "already_resolved"
+            },
+            reply.is_ok(),
+            &after,
+        ));
+    }
+
+    let message = match reply {
+        Ok(()) => "OpenCode reported interaction answer success but the exact request remains pending"
+            .to_owned(),
+        Err(error) => format!("OpenCode interaction answer failed: {error:#}"),
+    };
+    let permit = ensure_current_active_instance(owner, session).await?;
+    let record =
+        mark_interaction_uncertain(store, session, owner, task_id, &message)?;
+    drop(permit);
+    Ok(interaction_result_view(
+        &record,
+        interaction_id,
+        "reconciliation_required",
+        false,
+        &after,
+    ))
 }
 
 fn apply_control_failure(
@@ -3929,6 +4494,8 @@ struct FakeServe {
     sessions: HashMap<String, FakeSession>,
     pending_permissions: Vec<Value>,
     pending_questions: Vec<Value>,
+    permission_reply_calls: Vec<(String, String, String, Option<String>)>,
+    question_reply_calls: Vec<(String, String, Vec<Vec<String>>)>,
     prompt_calls: Vec<(String, Value)>,
     abort_calls: Vec<String>,
     create_fail: Option<String>,
@@ -4049,6 +4616,56 @@ impl FakeServe {
     fn question_list(&mut self) -> Result<Vec<Value>> {
         self.require_live()?;
         Ok(self.pending_questions.clone())
+    }
+
+    fn permission_reply(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
+        message: Option<&str>,
+    ) -> Result<()> {
+        self.require_live()?;
+        let index = self
+            .pending_permissions
+            .iter()
+            .position(|request| {
+                interaction_session_id(request) == Some(session_id)
+                    && interaction_request_id(request) == Some(request_id)
+            })
+            .context("fake permission request is not pending")?;
+        self.pending_permissions.remove(index);
+        self.permission_reply_calls.push((
+            session_id.to_owned(),
+            request_id.to_owned(),
+            reply.to_owned(),
+            message.map(str::to_owned),
+        ));
+        Ok(())
+    }
+
+    fn question_reply(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        answers: &[Vec<String>],
+    ) -> Result<()> {
+        self.require_live()?;
+        let index = self
+            .pending_questions
+            .iter()
+            .position(|request| {
+                interaction_session_id(request) == Some(session_id)
+                    && interaction_request_id(request) == Some(request_id)
+            })
+            .context("fake question request is not pending")?;
+        self.pending_questions.remove(index);
+        self.question_reply_calls.push((
+            session_id.to_owned(),
+            request_id.to_owned(),
+            answers.to_vec(),
+        ));
+        Ok(())
     }
 }
 
