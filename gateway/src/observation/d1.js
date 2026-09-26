@@ -21,7 +21,7 @@ const INSERT_SOURCE = [
   "INSERT INTO observation_sources (",
   "owner_id, host_id, session_id, repository_key, source_base_revision,",
   "source_head_revision, acked_through_revision, cloud_head_seq, journal_degraded, gap_count, last_synced_at",
-  ") VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?)",
+  ") VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)",
 ].join(" ");
 
 const INSERT_OBSERVATION = [
@@ -147,6 +147,7 @@ async function commit(db, batch, source, missing) {
       batch.sessionId,
       repositoryKey,
       batch.sourceBaseRevision,
+      batch.sourceHeadRevision,
       now,
     ));
   }
