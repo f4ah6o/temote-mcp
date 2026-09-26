@@ -1870,7 +1870,6 @@ async fn reconcile(
     Ok((record, evidence_ref))
 }
 
-
 async fn drain_catalog_stream_bounded<R>(
     mut reader: R,
     limit: usize,
@@ -2017,10 +2016,10 @@ async fn fetch_devin_model_catalog() -> Result<Value> {
             );
         }
     };
-    let (stdout, stdout_overflow) =
-        stdout.context("DEVIN_SWE_PRIORITY_DISCOVERY_FAILED: could not read Devin catalog stdout")?;
-    let (stderr, stderr_overflow) =
-        stderr.context("DEVIN_SWE_PRIORITY_DISCOVERY_FAILED: could not read Devin catalog stderr")?;
+    let (stdout, stdout_overflow) = stdout
+        .context("DEVIN_SWE_PRIORITY_DISCOVERY_FAILED: could not read Devin catalog stdout")?;
+    let (stderr, stderr_overflow) = stderr
+        .context("DEVIN_SWE_PRIORITY_DISCOVERY_FAILED: could not read Devin catalog stderr")?;
     let status =
         status.context("DEVIN_SWE_PRIORITY_DISCOVERY_FAILED: could not wait for Devin catalog")?;
     anyhow::ensure!(
@@ -2906,7 +2905,9 @@ mod tests {
         let mut args = start_args(operation_id, "priority task");
         args["devin_mode"] = json!("swe-2-high");
         args["swe_tier"] = json!("priority");
-        let first = task_start_with_store(&args, &session, &store).await.unwrap();
+        let first = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap();
         assert_eq!(first["status"], "running");
         assert_eq!(first["swe_tier"], "priority");
         assert_eq!(first["devin_mode"], "swe-2-high");
@@ -2917,7 +2918,9 @@ mod tests {
         );
 
         install_fake_model_catalog_error("catalog unavailable");
-        let replay = task_start_with_store(&args, &session, &store).await.unwrap();
+        let replay = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap();
         assert_eq!(replay["task_id"], first["task_id"]);
         assert_eq!(fake.lock().unwrap().sessions.len(), 1);
     }
@@ -2940,11 +2943,7 @@ mod tests {
         let error = task_start_with_store(&args, &session, &store)
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("DEVIN_SWE_PRIORITY_UNAVAILABLE")
-        );
+        assert!(error.to_string().contains("DEVIN_SWE_PRIORITY_UNAVAILABLE"));
         assert!(fake.lock().unwrap().calls.is_empty());
     }
 
@@ -2961,7 +2960,9 @@ mod tests {
         let mut args = start_args(Uuid::new_v4(), "promo task");
         args["devin_mode"] = json!("swe-2-max");
         args["swe_tier"] = json!("promo");
-        let out = task_start_with_store(&args, &session, &store).await.unwrap();
+        let out = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap();
         assert_eq!(out["swe_tier"], "promo");
         assert_eq!(out["effective_devin_mode"], "swe-2-max");
         assert_eq!(
