@@ -544,8 +544,8 @@ Routing DOs and memory projection remain separate state domains even though they
 - [x] choose Temote Fabric
 - [x] define Host / Fabric / Fabric Link / Context / Memory vocabulary
 - [x] define execution-vs-Fabric authority boundary
-- [ ] update relevant design docs to canonical Fabric terminology
-- [ ] record compatibility names for current gateway implementation
+- [x] update relevant design docs to canonical Fabric terminology
+- [x] record compatibility names for current gateway implementation
 
 ### FBR1 — internal module split before rename
 
