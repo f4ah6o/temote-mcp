@@ -2152,6 +2152,13 @@ async fn task_start_with_store(
     let task_id = task_id_for_operation(session, operation_id)?;
 
     if let Some(existing) = store.load_optional(session, task_id)? {
+        // A schema-v1 receipt predates swe_tier. Treating a new tier as an
+        // exact replay would silently ignore the caller's requested service
+        // lane, because the legacy fingerprint cannot contain that field.
+        anyhow::ensure!(
+            existing.schema_version >= 2 || swe_tier.is_none(),
+            "OPERATION_CONFLICT: operation_id was already accepted with a different request"
+        );
         let effective = if existing.schema_version >= 2 {
             existing.effective_devin_mode.as_deref()
         } else {
@@ -3037,6 +3044,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(conflict.to_string().contains("OPERATION_CONFLICT"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_v1_replay_rejects_new_swe_tier_before_side_effect() {
+        let _serial = serial().await;
+        let _env = EnvGuard::install();
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let store = test_store(&root);
+        let fake = install_fake();
+
+        let operation_id = Uuid::new_v4();
+        let task_id = task_id_for_operation(&session, operation_id).unwrap();
+        let mut record = record_for(&session, task_id, TaskStatus::Running);
+        record.schema_version = 1;
+        record.title = Some("test task".to_owned());
+        record.devin_mode = Some("swe-2-high".to_owned());
+        record.repos = vec!["f4ah6o/temote-mcp".to_owned()];
+        let request_fingerprint = start_request_fingerprint(
+            1,
+            task_id,
+            "same task",
+            Some("test task"),
+            Some("swe-2-high"),
+            None,
+            None,
+            &record.repos,
+            None,
+        )
+        .unwrap();
+        record.operations.push(OperationReceipt {
+            operation_id,
+            request_fingerprint,
+            action: "start".to_owned(),
+            phase: OperationPhase::Applied,
+            outcome: record.outcome(),
+        });
+        store.save(&record).unwrap();
+
+        let mut args = start_args(operation_id, "same task");
+        args["devin_mode"] = json!("swe-2-high");
+        args["swe_tier"] = json!("priority");
+        let error = task_start_with_store(&args, &session, &store)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("OPERATION_CONFLICT"));
+        assert!(fake.lock().unwrap().calls.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
