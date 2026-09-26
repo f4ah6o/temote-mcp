@@ -5096,6 +5096,276 @@ mod tests {
         assert_eq!(out["status"], "reconciliation_required");
     }
 
+    #[test]
+    fn interaction_id_is_stable_for_key_order_and_changes_with_request_payload() {
+        let task_id = Uuid::new_v4();
+        let a = json!({
+            "id": "que_1",
+            "sessionID": "ses_1",
+            "questions": [{"header": "Choice", "question": "Pick", "options": [{"label": "A"}]}],
+        });
+        let b: Value = serde_json::from_str(
+            r#"{"questions":[{"options":[{"label":"A"}],"question":"Pick","header":"Choice"}],"sessionID":"ses_1","id":"que_1"}"#,
+        )
+        .unwrap();
+        let changed = json!({
+            "id": "que_1",
+            "sessionID": "ses_1",
+            "questions": [{"header": "Choice", "question": "Pick another", "options": [{"label": "A"}]}],
+        });
+        let first = interaction_id_for(task_id, "question", "que_1", &a).unwrap();
+        assert_eq!(
+            first,
+            interaction_id_for(task_id, "question", "que_1", &b).unwrap()
+        );
+        assert_ne!(
+            first,
+            interaction_id_for(task_id, "question", "que_1", &changed).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_permission_is_inspectable_answerable_idempotent_and_stale_safe() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_permissions.push(json!({
+            "id": "per_0001",
+            "sessionID": opencode_session_id,
+            "action": "bash",
+            "resources": ["cargo test"],
+            "save": ["cargo *"],
+        }));
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked["status"], "waiting_approval");
+        assert_eq!(blocked["pending_interactions"].as_array().unwrap().len(), 1);
+        assert_eq!(blocked["pending_interactions"][0]["kind"], "permission");
+        assert_eq!(blocked["pending_interactions"][0]["detail"]["action"], "bash");
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let operation_id = Uuid::new_v4();
+        let answer_args = json!({
+            "task_id": task_id,
+            "operation_id": operation_id,
+            "action": "answer",
+            "interaction_id": interaction_id,
+            "answer": {"reply": "once"},
+        });
+        let answered = task_control_with_store_and_binary(
+            &answer_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answered["interaction"]["result"], "answered");
+        assert_eq!(answered["interaction"]["applied"], true);
+        assert_eq!(answered["pending_interactions"].as_array().unwrap().len(), 0);
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+
+        let replay = task_control_with_store_and_binary(
+            &answer_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "running");
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+
+        let stale = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"reply": "reject"},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(stale["interaction"]["result"], "stale");
+        assert_eq!(stale["interaction"]["applied"], false);
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_question_accepts_offered_and_free_form_answers() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_questions.push(json!({
+            "id": "que_0001",
+            "sessionID": opencode_session_id,
+            "questions": [
+                {
+                    "header": "Mode",
+                    "question": "Choose mode",
+                    "options": [{"label": "safe"}, {"label": "fast"}],
+                    "multiple": false,
+                    "custom": false
+                },
+                {
+                    "header": "Reason",
+                    "question": "Why?",
+                    "options": [],
+                    "multiple": false,
+                    "custom": true
+                }
+            ]
+        }));
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let answered = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"answers": [["safe"], ["because tests need it"]]},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(answered["interaction"]["result"], "answered");
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.question_reply_calls.len(), 1);
+        assert_eq!(
+            fake.question_reply_calls[0].2,
+            vec![
+                vec!["safe".to_owned()],
+                vec!["because tests need it".to_owned()]
+            ]
+        );
+        assert!(fake.pending_questions.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn steer_does_not_consume_pending_question_interaction() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_questions.push(json!({
+            "id": "que_pending",
+            "sessionID": opencode_session_id,
+            "questions": [{"header": "Need input", "question": "Pick", "options": [{"label": "A"}]}],
+        }));
+
+        let before = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let interaction_id = before["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "steer",
+                "input": "A",
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+
+        let after = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(after["status"], "waiting_approval");
+        assert_eq!(after["pending_interactions"][0]["interaction_id"], interaction_id);
+        assert_eq!(fake.lock().unwrap().question_reply_calls.len(), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn control_steer_queues_prompt_and_bumps_generation() {
         let root = tempdir();
