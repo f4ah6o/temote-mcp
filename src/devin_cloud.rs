@@ -1299,7 +1299,7 @@ fn is_swe2_priority_uid(candidate: &str, requested_mode: &str) -> bool {
     let effort = requested_mode.trim_start_matches("swe-2-");
     let tokens = normalized.split('-').collect::<Vec<_>>();
     (normalized.starts_with("swe-2-") || normalized.contains("-swe-2-"))
-        && tokens.iter().any(|token| *token == effort)
+        && tokens.contains(&effort)
         && tokens
             .iter()
             .any(|token| matches!(*token, "priority" | "fast"))
@@ -1923,10 +1923,11 @@ fn collect_model_uids(value: &Value, out: &mut BTreeSet<String>) {
                 "model_uid",
                 "modelUid",
             ] {
-                if let Some(uid) = object.get(key).and_then(Value::as_str) {
-                    if !uid.is_empty() && uid.len() <= MAX_ARGUMENT_BYTES {
-                        out.insert(uid.to_owned());
-                    }
+                if let Some(uid) = object.get(key).and_then(Value::as_str)
+                    && !uid.is_empty()
+                    && uid.len() <= MAX_ARGUMENT_BYTES
+                {
+                    out.insert(uid.to_owned());
                 }
             }
             for child in object.values() {
@@ -2571,7 +2572,9 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 #[cfg(test)]
 static FAKE_API: OnceLock<Mutex<Option<Arc<Mutex<FakeApi>>>>> = OnceLock::new();
 #[cfg(test)]
-static FAKE_MODEL_CATALOG: OnceLock<Mutex<Option<Result<Vec<u8>, String>>>> = OnceLock::new();
+type FakeModelCatalogResult = Result<Vec<u8>, String>;
+#[cfg(test)]
+static FAKE_MODEL_CATALOG: OnceLock<Mutex<Option<FakeModelCatalogResult>>> = OnceLock::new();
 
 #[cfg(test)]
 fn fake_api() -> Option<CloudApi> {
