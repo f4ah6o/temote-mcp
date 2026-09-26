@@ -92,10 +92,10 @@ const REPORT_INSTRUCTIONS: &str = r#"You are a delegated implementation worker r
 
 When finished, respond with ONLY one JSON object and nothing else: no markdown, no code fences, no text before or after the JSON.
 The JSON object must contain exactly these fields:
-{"status":"completed|failed|blocked|needs_decision","summary":"short summary, at most 1200 characters","base_commit":"","changed_files":[],"checks":[],"unresolved":[],"requested_model":__REQUESTED_MODEL__,"requested_effort":null,"observed_model":null,"observed_effort":null}
+{"status":"completed|failed|blocked|needs_decision","summary":"short summary, at most 1200 characters","base_commit":"","changed_files":[],"checks":[],"unresolved":[],"requested_model":__REQUESTED_MODEL__,"requested_effort":__REQUESTED_EFFORT__,"observed_model":null,"observed_effort":null}
 Rules:
 - All string values are plain strings; changed_files, checks, and unresolved are arrays of strings (use [] when empty).
-- Set "requested_model" to __REQUESTED_MODEL__.
+- Set "requested_model" to __REQUESTED_MODEL__ and "requested_effort" to __REQUESTED_EFFORT__.
 - Set "observed_model"/"observed_effort" only when you can actually observe them; otherwise keep null.
 - Do not include any other fields.
 
@@ -389,6 +389,10 @@ struct TaskRecord {
     owner: SessionInstance,
     scope_cwd: PathBuf,
     model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    speed: Option<String>,
     agent: Option<String>,
     #[serde(default)]
     cloud: bool,
@@ -400,6 +404,10 @@ struct TaskRecord {
     usage: Option<BTreeMap<String, u64>>,
     #[serde(default)]
     observed_model: Option<String>,
+    #[serde(default)]
+    observed_effort: Option<String>,
+    #[serde(default)]
+    observed_speed: Option<String>,
     #[serde(default)]
     report: Option<Value>,
     #[serde(default)]
@@ -1323,6 +1331,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
     if let Some(model) = &record.model {
         validate_argument(model, "model")?;
     }
+    if let Some(effort) = &record.effort {
+        validate_argument(effort, "effort")?;
+    }
+    if let Some(speed) = &record.speed {
+        validate_speed(speed)?;
+    }
     if let Some(agent) = &record.agent {
         validate_argument(agent, "agent")?;
     }
@@ -1380,6 +1394,239 @@ fn validate_task_input(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_speed(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(value, "standard" | "priority"),
+        "speed must be one of standard, priority"
+    );
+    Ok(())
+}
+
+fn config_label_matches(value: &str, candidate: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(candidate)
+}
+
+fn config_option_id(option: &Value) -> Option<&str> {
+    option.get("id").and_then(Value::as_str)
+}
+
+fn config_option_is_model(option: &Value) -> bool {
+    option.get("category").and_then(Value::as_str) == Some("model")
+        || config_option_id(option).is_some_and(|id| config_label_matches(id, "model"))
+}
+
+fn config_option_is_effort(option: &Value) -> bool {
+    option.get("category").and_then(Value::as_str) == Some("thought_level")
+        || config_option_id(option).is_some_and(|id| {
+            ["thought_level", "effort", "reasoning_effort"]
+                .iter()
+                .any(|candidate| config_label_matches(id, candidate))
+        })
+}
+
+fn config_option_is_speed(option: &Value) -> bool {
+    config_option_id(option).is_some_and(|id| {
+        ["speed", "fast", "fast_mode", "priority"]
+            .iter()
+            .any(|candidate| config_label_matches(id, candidate))
+    }) || option
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name == "speed" || name.contains("fast mode") || name.contains("priority")
+        })
+}
+
+fn config_select_values(option: &Value) -> Vec<(String, String)> {
+    let mut values = Vec::new();
+    let Some(items) = option.get("options").and_then(Value::as_array) else {
+        return values;
+    };
+    for item in items {
+        if let (Some(value), Some(name)) = (
+            item.get("value").and_then(Value::as_str),
+            item.get("name").and_then(Value::as_str),
+        ) {
+            values.push((value.to_owned(), name.to_owned()));
+            continue;
+        }
+        if let Some(group) = item.get("options").and_then(Value::as_array) {
+            for entry in group {
+                if let (Some(value), Some(name)) = (
+                    entry.get("value").and_then(Value::as_str),
+                    entry.get("name").and_then(Value::as_str),
+                ) {
+                    values.push((value.to_owned(), name.to_owned()));
+                }
+            }
+        }
+    }
+    values
+}
+
+fn exact_config_select_value(option: &Value, requested: &str) -> Option<String> {
+    config_select_values(option)
+        .into_iter()
+        .find(|(value, name)| {
+            config_label_matches(value, requested) || config_label_matches(name, requested)
+        })
+        .map(|(value, _)| value)
+}
+
+fn speed_config_select_value(option: &Value, requested: &str) -> Option<String> {
+    let aliases: &[&str] = match requested {
+        "standard" => &["standard", "normal", "default", "off"],
+        "priority" => &["priority", "fast", "on"],
+        _ => return None,
+    };
+    config_select_values(option)
+        .into_iter()
+        .find(|(value, name)| {
+            aliases.iter().any(|alias| {
+                config_label_matches(value, alias) || config_label_matches(name, alias)
+            })
+        })
+        .map(|(value, _)| value)
+}
+
+fn current_config_string(option: &Value) -> Option<String> {
+    match option.get("type").and_then(Value::as_str) {
+        Some("select") => option
+            .get("currentValue")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        Some("boolean") => option
+            .get("currentValue")
+            .and_then(Value::as_bool)
+            .map(|enabled| if enabled { "priority" } else { "standard" }.to_owned()),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct AppliedSessionConfig {
+    observed_model: Option<String>,
+    observed_effort: Option<String>,
+    observed_speed: Option<String>,
+}
+
+async fn set_session_config_option(
+    client: &AcpClient,
+    session_id: &str,
+    option: &Value,
+    value: Value,
+) -> Result<Vec<Value>> {
+    let config_id = config_option_id(option).context("Devin ACP config option is missing id")?;
+    let mut params = json!({
+        "sessionId": session_id,
+        "configId": config_id,
+        "value": value,
+    });
+    if option.get("type").and_then(Value::as_str) == Some("boolean") {
+        params["type"] = json!("boolean");
+    }
+    let response = client.request("session/set_config_option", params).await?;
+    response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("Devin ACP session/set_config_option response is missing configOptions")
+}
+
+async fn apply_requested_session_config(
+    client: &AcpClient,
+    session_id: &str,
+    created: &Value,
+    model: Option<&str>,
+    effort: Option<&str>,
+    speed: Option<&str>,
+    cloud: bool,
+) -> Result<AppliedSessionConfig> {
+    let mut options = created
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(requested) = model {
+        if let Some(option) = options.iter().find(|option| config_option_is_model(option)).cloned() {
+            anyhow::ensure!(
+                option.get("type").and_then(Value::as_str) == Some("select"),
+                "Devin ACP model config option is not selectable"
+            );
+            let value = exact_config_select_value(&option, requested).with_context(|| {
+                format!("Devin ACP does not advertise requested model {requested:?}")
+            })?;
+            options = set_session_config_option(client, session_id, &option, json!(value)).await?;
+        } else {
+            anyhow::ensure!(
+                !cloud,
+                "Devin ACP cloud session does not advertise a model config option"
+            );
+            // Local ACP retains the existing --model argv fallback for older builds.
+        }
+    }
+
+    if let Some(requested) = effort {
+        let option = options
+            .iter()
+            .find(|option| config_option_is_effort(option))
+            .cloned()
+            .context("Devin ACP session does not advertise an effort/thought-level config option")?;
+        anyhow::ensure!(
+            option.get("type").and_then(Value::as_str) == Some("select"),
+            "Devin ACP effort config option is not selectable"
+        );
+        let value = exact_config_select_value(&option, requested).with_context(|| {
+            format!("Devin ACP does not advertise requested effort {requested:?}")
+        })?;
+        options = set_session_config_option(client, session_id, &option, json!(value)).await?;
+    }
+
+    if let Some(requested) = speed {
+        let option = options
+            .iter()
+            .find(|option| config_option_is_speed(option))
+            .cloned()
+            .context("Devin ACP session does not advertise a speed config option")?;
+        match option.get("type").and_then(Value::as_str) {
+            Some("boolean") => {
+                options = set_session_config_option(
+                    client,
+                    session_id,
+                    &option,
+                    json!(requested == "priority"),
+                )
+                .await?;
+            }
+            Some("select") => {
+                let value = speed_config_select_value(&option, requested).with_context(|| {
+                    format!("Devin ACP speed config has no mapping for {requested:?}")
+                })?;
+                options =
+                    set_session_config_option(client, session_id, &option, json!(value)).await?;
+            }
+            _ => anyhow::bail!("Devin ACP speed config option has unsupported type"),
+        }
+    }
+
+    Ok(AppliedSessionConfig {
+        observed_model: options
+            .iter()
+            .find(|option| config_option_is_model(option))
+            .and_then(current_config_string),
+        observed_effort: options
+            .iter()
+            .find(|option| config_option_is_effort(option))
+            .and_then(current_config_string),
+        observed_speed: options
+            .iter()
+            .find(|option| config_option_is_speed(option))
+            .and_then(current_config_string),
+    })
+}
+
 #[cfg(unix)]
 fn append_scope_identity(bytes: &mut Vec<u8>, scope: &Path) {
     use std::os::unix::ffi::OsStrExt;
@@ -1427,11 +1674,15 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "revision": record.revision,
         "generation": record.generation,
         "model": record.model,
+        "effort": record.effort,
+        "speed": record.speed,
         "agent": record.agent,
         "cloud": record.cloud,
         "acp_session_id": record.acp_session_id,
         "usage": record.usage,
         "observed_model": record.observed_model,
+        "observed_effort": record.observed_effort,
+        "observed_speed": record.observed_speed,
         "report": record.report,
         "last_error": record.last_error,
         "reconciliation_required": record.status == TaskStatus::ReconciliationRequired,
@@ -2967,6 +3218,7 @@ async fn acp_initialize(client: &AcpClient) -> Result<Value> {
                 "clientCapabilities": {
                     "fs": {"readTextFile": false, "writeTextFile": false},
                     "terminal": false,
+                    "session": {"configOptions": {"boolean": {}}},
                     "auth": {"terminal": false},
                 },
                 "clientInfo": {"name": ACP_CLIENT_NAME, "version": ACP_CLIENT_VERSION},
@@ -3133,6 +3385,8 @@ async fn task_start_with_store_and_binary(
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
     let model = optional_string(args, "model")?;
+    let effort = optional_string(args, "effort")?;
+    let speed = optional_string(args, "speed")?;
     let agent = optional_string(args, "agent")?;
     let cloud = args
         .get("cloud")
@@ -3143,12 +3397,18 @@ async fn task_start_with_store_and_binary(
     if let Some(model) = model {
         validate_argument(model, "model")?;
     }
+    if let Some(effort) = effort {
+        validate_argument(effort, "effort")?;
+    }
+    if let Some(speed) = speed {
+        validate_speed(speed)?;
+    }
     if let Some(agent) = agent {
         validate_argument(agent, "agent")?;
     }
     anyhow::ensure!(
-        !cloud || (model.is_none() && agent.is_none()),
-        "model and agent are ignored by `devin acp --cloud`; omit them when cloud is true"
+        !cloud || agent.is_none(),
+        "agent is ignored by `devin acp --cloud`; omit it when cloud is true"
     );
 
     let task_id = task_id_for_operation(session, operation_id)?;
@@ -3157,6 +3417,8 @@ async fn task_start_with_store_and_binary(
         "task_id": task_id,
         "task": task,
         "model": model,
+        "effort": effort,
+        "speed": speed,
         "agent": agent,
         "cloud": cloud,
     }))?;
@@ -3167,6 +3429,8 @@ async fn task_start_with_store_and_binary(
         owner: SessionInstance::from_session(session),
         scope_cwd: config::canonical_directory(&session.cwd)?,
         model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+        speed: speed.map(str::to_owned),
         agent: agent.map(str::to_owned),
         cloud,
         status: TaskStatus::Accepted,
@@ -3175,6 +3439,8 @@ async fn task_start_with_store_and_binary(
         acp_session_id: None,
         usage: None,
         observed_model: None,
+        observed_effort: None,
+        observed_speed: None,
         report: None,
         last_error: None,
         created_at: now,
@@ -3259,11 +3525,24 @@ async fn task_start_with_store_and_binary(
             .and_then(Value::as_str)
             .context("devin acp session/new response is missing sessionId")?
             .to_owned();
-        let observed_model = created
+        let legacy_observed_model = created
             .get("models")
             .and_then(|models| models.get("currentModelId"))
             .and_then(Value::as_str)
             .map(|value| bound_text(value, MAX_ARGUMENT_BYTES));
+        let configured = apply_requested_session_config(
+            &client,
+            &acp_session_id,
+            &created,
+            model,
+            effort,
+            speed,
+            cloud,
+        )
+        .await?;
+        let observed_model = configured.observed_model.or(legacy_observed_model);
+        let observed_effort = configured.observed_effort;
+        let observed_speed = configured.observed_speed;
         match &client {
             AcpClient::Stdio(inner) => {
                 let mut state = inner.state.lock().unwrap();
@@ -3295,6 +3574,12 @@ async fn task_start_with_store_and_binary(
             if observed_model.is_some() {
                 record.observed_model = observed_model.clone();
             }
+            if observed_effort.is_some() {
+                record.observed_effort = observed_effort.clone();
+            }
+            if observed_speed.is_some() {
+                record.observed_speed = observed_speed.clone();
+            }
             record.revision = record.revision.saturating_add(1);
             Ok(())
         })?;
@@ -3302,7 +3587,9 @@ async fn task_start_with_store_and_binary(
 
         let prompt_text = format!(
             "{}{}{}",
-            REPORT_INSTRUCTIONS.replace("__REQUESTED_MODEL__", &serde_json::to_string(&model)?),
+            REPORT_INSTRUCTIONS
+                .replace("__REQUESTED_MODEL__", &serde_json::to_string(&model)?)
+                .replace("__REQUESTED_EFFORT__", &serde_json::to_string(&effort)?),
             "\n",
             task
         );
@@ -3834,6 +4121,8 @@ struct FakeAcp {
     new_fail: Option<String>,
     prompt_fail: Option<String>,
     prompt_calls: Vec<(String, String)>,
+    set_config_calls: Vec<Value>,
+    config_options: Vec<Value>,
     cancel_calls: Vec<String>,
     prompt_senders: HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>,
 }
@@ -3871,7 +4160,24 @@ impl FakeAcp {
                 Ok(json!({
                     "sessionId": id,
                     "models": {"currentModelId": "devin-test-model"},
+                    "configOptions": self.config_options.clone(),
                 }))
+            }
+            "session/set_config_option" => {
+                let config_id = params
+                    .get("configId")
+                    .and_then(Value::as_str)
+                    .context("missing configId")?
+                    .to_owned();
+                let value = params.get("value").cloned().context("missing config value")?;
+                let option = self
+                    .config_options
+                    .iter_mut()
+                    .find(|option| config_option_id(option) == Some(config_id.as_str()))
+                    .context("unknown configId")?;
+                option["currentValue"] = value;
+                self.set_config_calls.push(params);
+                Ok(json!({"configOptions": self.config_options.clone()}))
             }
             "session/load" => {
                 if let Some(error) = &self.load_fail {
@@ -4116,8 +4422,164 @@ mod tests {
         assert!(format!("{error:#}").contains("OPERATION_CONFLICT"));
     }
 
+    fn swe2_config_options(speed_boolean: bool) -> Vec<Value> {
+        let speed = if speed_boolean {
+            json!({
+                "id": "speed",
+                "name": "Fast Mode",
+                "type": "boolean",
+                "currentValue": false,
+            })
+        } else {
+            json!({
+                "id": "speed",
+                "name": "Speed",
+                "type": "select",
+                "currentValue": "standard",
+                "options": [
+                    {"value": "standard", "name": "Standard"},
+                    {"value": "fast", "name": "Fast"}
+                ],
+            })
+        };
+        vec![
+            json!({
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "other",
+                "options": [
+                    {"value": "other", "name": "Other"},
+                    {"value": "swe-2", "name": "SWE-2"}
+                ],
+            }),
+            json!({
+                "id": "thought_level",
+                "name": "Thinking Effort",
+                "category": "thought_level",
+                "type": "select",
+                "currentValue": "medium",
+                "options": [
+                    {"value": "medium", "name": "Medium"},
+                    {"value": "high", "name": "High"},
+                    {"value": "max", "name": "Max"}
+                ],
+            }),
+            speed,
+        ]
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn start_cloud_rejects_model_and_agent() {
+    async fn start_cloud_applies_swe2_effort_and_standard_speed() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client(true);
+        fake.lock().unwrap().config_options = swe2_config_options(false);
+        install_fake(fake.clone());
+
+        let args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "do the thing",
+            "cloud": true,
+            "model": "swe-2",
+            "effort": "high",
+            "speed": "standard",
+        });
+        let out =
+            task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+                .await
+                .unwrap();
+        clear_fake();
+
+        assert_eq!(out["model"], "swe-2");
+        assert_eq!(out["effort"], "high");
+        assert_eq!(out["speed"], "standard");
+        assert_eq!(out["observed_model"], "swe-2");
+        assert_eq!(out["observed_effort"], "high");
+        assert_eq!(out["observed_speed"], "standard");
+        let calls = &fake.lock().unwrap().set_config_calls;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["configId"], "model");
+        assert_eq!(calls[0]["value"], "swe-2");
+        assert_eq!(calls[1]["configId"], "thought_level");
+        assert_eq!(calls[1]["value"], "high");
+        assert_eq!(calls[2]["configId"], "speed");
+        assert_eq!(calls[2]["value"], "standard");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_cloud_maps_priority_to_boolean_speed() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client(true);
+        fake.lock().unwrap().config_options = swe2_config_options(true);
+        install_fake(fake.clone());
+
+        let args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "do the thing",
+            "cloud": true,
+            "model": "swe-2",
+            "effort": "max",
+            "speed": "priority",
+        });
+        let out =
+            task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+                .await
+                .unwrap();
+        clear_fake();
+
+        assert_eq!(out["observed_effort"], "max");
+        assert_eq!(out["observed_speed"], "priority");
+        let fake = fake.lock().unwrap();
+        let speed_call = fake
+            .set_config_calls
+            .iter()
+            .find(|call| call["configId"] == "speed")
+            .unwrap();
+        assert_eq!(speed_call["type"], "boolean");
+        assert_eq!(speed_call["value"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_cloud_fails_closed_without_advertised_speed() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client(true);
+        fake.lock().unwrap().config_options = swe2_config_options(false)
+            .into_iter()
+            .filter(|option| config_option_id(option) != Some("speed"))
+            .collect();
+        install_fake(fake);
+
+        let args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "do the thing",
+            "cloud": true,
+            "model": "swe-2",
+            "speed": "priority",
+        });
+        let out =
+            task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+                .await
+                .unwrap();
+        clear_fake();
+        assert_eq!(out["status"], "reconciliation_required");
+        assert!(out["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("does not advertise a speed config option"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_cloud_still_rejects_agent_and_invalid_speed() {
         let root = tempdir();
         let (_handle, session) = active_test_session(&root, &test_id(), false).await;
         let _serial = serial().await;
@@ -4125,28 +4587,25 @@ mod tests {
         let (_, fake) = fake_client(true);
         install_fake(fake.clone());
 
-        let mut args = start_args(Uuid::new_v4(), "do the thing");
-        args["cloud"] = json!(true);
-        let error = task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("ignored by `devin acp --cloud`"));
-
         let mut args = json!({
             "operation_id": Uuid::new_v4(),
             "task": "do the thing",
             "cloud": true,
+            "agent": "review",
         });
-        task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
+        let error = task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
             .await
-            .unwrap();
-        args["cloud"] = json!("yes");
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("agent is ignored"));
+
+        args["agent"] = Value::Null;
+        args["speed"] = json!("promo");
         let error = task_start_with_store_and_binary(&args, &session, &store, Path::new("devin"))
             .await
             .unwrap_err();
         clear_fake();
-        assert!(format!("{error:#}").contains("cloud must be a boolean"));
-        assert!(fake.lock().unwrap().prompt_calls.len() == 1);
+        assert!(format!("{error:#}").contains("speed must be one of standard, priority"));
+        assert!(fake.lock().unwrap().prompt_calls.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4470,6 +4929,8 @@ mod tests {
             owner: SessionInstance::from_session(session),
             scope_cwd: config::canonical_directory(&session.cwd).unwrap(),
             model: None,
+            effort: None,
+            speed: None,
             agent: None,
             cloud: false,
             status,
@@ -4478,6 +4939,8 @@ mod tests {
             acp_session_id: acp_session_id.map(str::to_owned),
             usage: None,
             observed_model: None,
+            observed_effort: None,
+            observed_speed: None,
             report: None,
             last_error: None,
             created_at: now,
