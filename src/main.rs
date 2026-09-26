@@ -47,6 +47,8 @@ mod test_support;
 #[cfg(all(feature = "network", unix))]
 mod upgrade_coordinator;
 mod upgrade_transaction;
+#[allow(dead_code)]
+mod vcs;
 
 use temote_mcp::sandbox;
 
