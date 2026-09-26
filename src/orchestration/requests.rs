@@ -101,6 +101,7 @@ pub(crate) struct DevinAcpStartOptions<'a> {
 pub(crate) struct DevinCloudStartOptions<'a> {
     pub(crate) title: Option<&'a str>,
     pub(crate) devin_mode: Option<&'a str>,
+    pub(crate) swe_tier: Option<&'a str>,
     pub(crate) repos: Vec<String>,
     // Validated (1..=100000) at parse; approvals do not render it today,
     // so it stays boundary data until a consumer reads it.
@@ -434,6 +435,27 @@ fn validate_devin_mode(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "network")]
+fn is_swe2_mode(value: &str) -> bool {
+    matches!(value, "swe-2-medium" | "swe-2-high" | "swe-2-max")
+}
+
+#[cfg(feature = "network")]
+fn validate_swe_selection(devin_mode: Option<&str>, swe_tier: Option<&str>) -> Result<()> {
+    let Some(tier) = swe_tier else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        matches!(tier, "promo" | "priority"),
+        "swe_tier must be one of promo, priority"
+    );
+    anyhow::ensure!(
+        devin_mode.is_some_and(is_swe2_mode),
+        "swe_tier is only valid with devin_mode swe-2-medium, swe-2-high, or swe-2-max"
+    );
+    Ok(())
+}
+
 fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRequest<'a>> {
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
@@ -502,6 +524,7 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
         Backend::DevinCloud => {
             let title = optional_string(args, "title")?;
             let devin_mode = optional_string(args, "devin_mode")?;
+            let swe_tier = optional_string(args, "swe_tier")?;
             let repos = optional_string_list(args, "repos", MAX_REPOS)?;
             let max_acu_limit = optional_u64_lenient(args, "max_acu_limit")?;
             validate_task_input(task, "task")?;
@@ -511,6 +534,7 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
             if let Some(mode) = devin_mode {
                 validate_devin_mode(mode)?;
             }
+            validate_swe_selection(devin_mode, swe_tier)?;
             if let Some(limit) = max_acu_limit {
                 anyhow::ensure!(
                     (1..=100_000).contains(&limit),
@@ -520,6 +544,7 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
             StartOptions::DevinCloud(DevinCloudStartOptions {
                 title,
                 devin_mode,
+                swe_tier,
                 repos,
                 max_acu_limit,
             })
@@ -821,7 +846,8 @@ mod tests {
             "operation_id": OP_ID,
             "task": "work",
             "title": "My task",
-            "devin_mode": "ultra",
+            "devin_mode": "swe-2-high",
+            "swe_tier": "priority",
             "repos": ["org/one", "org/two"],
             "max_acu_limit": 42
         });
@@ -832,8 +858,18 @@ mod tests {
             panic!("devin cloud options expected")
         };
         assert_eq!(
-            (options.title, options.devin_mode, options.max_acu_limit),
-            (Some("My task"), Some("ultra"), Some(42))
+            (
+                options.title,
+                options.devin_mode,
+                options.swe_tier,
+                options.max_acu_limit
+            ),
+            (
+                Some("My task"),
+                Some("swe-2-high"),
+                Some("priority"),
+                Some(42)
+            )
         );
         assert_eq!(
             options.repos,
@@ -850,6 +886,18 @@ mod tests {
             (
                 json!({"devin_mode": "bogus"}),
                 "devin_mode must be one of normal, fast, lite, ultra, fusion, swe-2-medium, swe-2-high, swe-2-max",
+            ),
+            (
+                json!({"devin_mode": "swe-2-high", "swe_tier": "bogus"}),
+                "swe_tier must be one of promo, priority",
+            ),
+            (
+                json!({"devin_mode": "fast", "swe_tier": "priority"}),
+                "swe_tier is only valid with devin_mode swe-2-medium, swe-2-high, or swe-2-max",
+            ),
+            (
+                json!({"swe_tier": "priority"}),
+                "swe_tier is only valid with devin_mode swe-2-medium, swe-2-high, or swe-2-max",
             ),
             (json!({"repos": 42}), "repos must be an array of strings"),
             (
