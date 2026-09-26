@@ -930,6 +930,4 @@ export {
   proxyToLegacySession,
   readOnlineHosts,
   resolveUnqualifiedSession,
-  validRpcRequestShape,
-  validRpcToolName,
 };
