@@ -569,7 +569,7 @@ transport/
 6. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を、V1/V2 の VCS backend decision に従って完成させる。
 7. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
-依存関係: A → B → R。V0/V1/V2 は完了済み。V1 で jj-first viable を確認し、V2 で backend-neutral contract を固定した。次は V3 typed VCS adapter と backend-neutral F/C workspace implementation を進める。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
+依存関係: A → B → R。V0/V1/V2 は完了済み。V1 で jj-first viable を確認し、V2 で backend-neutral contract を固定した。V3 first slice は PR #59 で実装済み。次は V3 remainder (reconcile / correlation / observation journal / workspace release / task-boundary snapshot wiring) と backend-neutral F/C workspace implementation を進める。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
 ### Phase A — core extraction
 

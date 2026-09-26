@@ -1,6 +1,6 @@
 # V0: VCS transaction layer / jj-first managed workspace design
 
-Status: high-priority design / implementation not started  
+Status: implementation underway — V0/V1/V2 complete; V3 first slice merged; V3 remainder / V4 open  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/open/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
