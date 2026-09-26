@@ -536,7 +536,19 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         if receipt_path.exists() {
             let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
             validate_receipt(&receipt, operation_id)?;
-            if receipt.request_fingerprint != request_fingerprint {
+            let expected_fingerprint = if receipt.task_id.is_none() && receipt.execution_id.is_none()
+            {
+                if execution_id.is_some() {
+                    return Err(VcsError::new(
+                        VcsErrorCode::OperationConflict,
+                        "legacy snapshot operation cannot be rebound to an execution",
+                    ));
+                }
+                legacy_snapshot_fingerprint(workspace_id)
+            } else {
+                request_fingerprint.clone()
+            };
+            if receipt.request_fingerprint != expected_fingerprint {
                 return Err(VcsError::new(
                     VcsErrorCode::OperationConflict,
                     "operation_id was already accepted for a different VCS snapshot request",
@@ -642,8 +654,11 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
 
         let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
         validate_receipt(&receipt, operation_id)?;
-        let request_fingerprint =
-            snapshot_fingerprint(workspace_id, receipt.execution_id.as_deref());
+        let request_fingerprint = if receipt.task_id.is_none() && receipt.execution_id.is_none() {
+            legacy_snapshot_fingerprint(workspace_id)
+        } else {
+            snapshot_fingerprint(workspace_id, receipt.execution_id.as_deref())
+        };
         if receipt.request_fingerprint != request_fingerprint {
             return Err(VcsError::new(
                 VcsErrorCode::OperationConflict,
@@ -726,6 +741,8 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             operation_id,
             request_fingerprint,
             state: ReceiptState::Completed,
+            task_id: Some(task_id),
+            execution_id: receipt.execution_id,
             before: None,
             result: Some(result.clone()),
         };
@@ -1081,6 +1098,13 @@ fn workspace_fingerprint(repository_root: &Path, request: &WorkspaceEnsureReques
     hex_digest(&hasher.finalize())
 }
 
+fn legacy_snapshot_fingerprint(workspace_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"temote-vcs-snapshot-v1\0");
+    hasher.update(workspace_id.as_bytes());
+    hex_digest(&hasher.finalize())
+}
+
 fn snapshot_fingerprint(workspace_id: &str, execution_id: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"temote-vcs-snapshot-v2\0");
@@ -1125,6 +1149,12 @@ fn validate_receipt(receipt: &SnapshotReceipt, operation_id: Uuid) -> VcsResult<
             VcsErrorCode::InvalidBackendOutput,
             "snapshot receipt identity/schema mismatch",
         ));
+    }
+    if let Some(task_id) = receipt.task_id.as_deref() {
+        validate_correlation_id("task_id", task_id)?;
+    }
+    if let Some(execution_id) = receipt.execution_id.as_deref() {
+        validate_correlation_id("execution_id", execution_id)?;
     }
     Ok(())
 }
@@ -1694,10 +1724,10 @@ mod tests {
             &SnapshotReceipt {
                 schema_version: SCHEMA_VERSION,
                 operation_id,
-                request_fingerprint: snapshot_fingerprint("task-a", Some("exec-a")),
+                request_fingerprint: legacy_snapshot_fingerprint("task-a"),
                 state: ReceiptState::Accepted,
-                task_id: Some("task-for-task-a".into()),
-                execution_id: Some("exec-a".into()),
+                task_id: None,
+                execution_id: None,
                 before: None,
                 result: None,
             },
@@ -1708,6 +1738,65 @@ mod tests {
             .reconcile_snapshot("task-a", operation_id)
             .unwrap_err();
         assert_eq!(error.code, VcsErrorCode::ReconciliationRequired);
+    }
+
+    #[test]
+    fn legacy_completed_receipt_replays_only_without_execution_rebinding() {
+        let fixture = Fixture::new();
+        let manager = manager(&fixture, MockRunner::new(), RecordingSink::default());
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+
+        let operation_id = Uuid::new_v4();
+        let state = manager.inspect("task-a").unwrap().jj;
+        let observation = VcsSnapshotObserved {
+            operation_id,
+            workspace_id: "task-a".into(),
+            task_id: None,
+            execution_id: None,
+            backend: VcsBackendKind::Jujutsu,
+            logical_change_id: state.logical_change_id.clone(),
+            before_revision: state.materialized_revision.clone(),
+            after_revision: state.materialized_revision.clone(),
+            vcs_operation_id: state.vcs_operation_id.clone(),
+            conflicted: state.conflicted,
+            empty: state.empty,
+        };
+        let result = SnapshotResult {
+            operation_id,
+            replayed: false,
+            reconciled: false,
+            before: state.clone(),
+            after: state,
+            observation,
+        };
+        write_json_atomic(
+            &manager.operation_receipt_path(operation_id),
+            &SnapshotReceipt {
+                schema_version: SCHEMA_VERSION,
+                operation_id,
+                request_fingerprint: legacy_snapshot_fingerprint("task-a"),
+                state: ReceiptState::Completed,
+                task_id: None,
+                execution_id: None,
+                before: None,
+                result: Some(result),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            manager
+                .snapshot("task-a", operation_id, None)
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(
+            manager
+                .snapshot("task-a", operation_id, Some("exec-a"))
+                .unwrap_err()
+                .code,
+            VcsErrorCode::OperationConflict
+        );
     }
 
     #[test]
