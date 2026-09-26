@@ -35,7 +35,7 @@ const INSERT_OBSERVATION = [
 
 const UPDATE_SOURCE = [
   "UPDATE observation_sources SET",
-  "repository_key = COALESCE(repository_key, ?),",
+  "repository_key = CASE WHEN ? IS NULL THEN repository_key ELSE ? END,",
   "source_base_revision = MAX(source_base_revision, ?),",
   "source_head_revision = MAX(source_head_revision, ?),",
   "journal_degraded = CASE WHEN journal_degraded = 1 OR ? = 1 THEN 1 ELSE 0 END,",
@@ -184,6 +184,7 @@ async function commit(db, batch, source, missing) {
   }
 
   statements.push(db.prepare(UPDATE_SOURCE).bind(
+    repositoryKey,
     repositoryKey,
     batch.sourceBaseRevision,
     batch.sourceHeadRevision,
