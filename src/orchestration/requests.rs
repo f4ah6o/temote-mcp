@@ -1107,6 +1107,7 @@ mod tests {
             "input must contain 1..=1048576 NUL-free UTF-8 bytes"
         );
         let steer_with_interaction = args(json!({
+            "input": "go",
             "interaction_id": "0199dddd-dddd-7ddd-8ddd-dddddddddddd",
             "answer": {"reply": "once"}
         }));
