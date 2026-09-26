@@ -269,7 +269,12 @@ impl Fixture {
             let active = output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout)
                     .ok()
-                    .and_then(|value| value.get("status").and_then(Value::as_str).map(str::to_owned))
+                    .and_then(|value| {
+                        value
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
                     .as_deref()
                     == Some("active");
             if active {
@@ -621,10 +626,7 @@ fn session_list_remains_bounded_and_deterministic() {
     }
     let mut supervisor = fixture.spawn_supervisor();
     fixture.wait_for_supervisor();
-    fixture.wait_for_terminal_pairs(
-        "bounded-",
-        RETAINED_TERMINAL_FIXTURE_PAIRS,
-    );
+    fixture.wait_for_terminal_pairs("bounded-", RETAINED_TERMINAL_FIXTURE_PAIRS);
     fixture.start_active("active-a");
     fixture.start_active("active-b");
 
