@@ -55,6 +55,26 @@ const DEVIN_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DEVIN_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DEVIN_CATALOG_UIDS: usize = 4096;
 const MAX_DEVIN_CATALOG_DEPTH: usize = 16;
+const DEVIN_CATALOG_ENV_ALLOWLIST: &[&str] = &[
+    "ALL_PROXY",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
 
 pub(crate) const DEFAULT_API_BASE_URL: &str = "https://api.devin.ai";
 pub(crate) const API_KEY_ENV: &str = "TEMOTE_MCP_DEVIN_API_KEY";
@@ -1347,7 +1367,14 @@ fn resolve_swe2_priority_uid_from_catalog(catalog: &Value, requested_mode: &str)
 async fn read_devin_model_catalog() -> Result<Value> {
     let binary = crate::devin_acp::resolve_devin_executable().map_err(anyhow::Error::msg)?;
     let future = async move {
-        let mut child = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command.env_clear();
+        for name in DEVIN_CATALOG_ENV_ALLOWLIST {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let mut child = command
             .args(["models", "list", "--format", "json"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
