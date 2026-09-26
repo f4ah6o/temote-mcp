@@ -1,6 +1,6 @@
 # O3C: Temote Fabric shared observation / knowledge plane
 
-Status: design ready / implementation not started  
+Status: implementation in progress / C0 complete  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
@@ -774,11 +774,18 @@ Do not implement automatic observation pruning until rebuild/provenance behavior
 ### C0 — contract / schema
 
 - [x] add this child design to O0 / umbrella links
-- [ ] define D1 migration files
-- [ ] define cloud observation schema version
-- [ ] define owner/repository identity mapping
-- [ ] define sync request/ack contract
-- [ ] define freshness/degraded result contract
+- [x] define D1 migration files
+- [x] define cloud observation schema version
+- [x] define owner/repository identity mapping
+- [x] define sync request/ack contract
+- [x] define freshness/degraded result contract
+
+C0 implementation:
+- `gateway/migrations/0001_observation_knowledge.sql`
+- `gateway/src/observation/schema.js`
+- `gateway/test/cloud-observation-schema.test.mjs`
+
+C0 intentionally does not add the D1 binding, observation ingest endpoint, Queue binding, or R2 binding. Those remain C1/C4/C6 work.
 
 ### C1 — Fabric D1 observation ingest
 
