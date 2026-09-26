@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -22,6 +23,9 @@ use std::os::unix::io::AsRawFd;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::{config, evidence};
@@ -47,6 +51,10 @@ const MAX_API_KEY_BYTES: usize = 512;
 const MAX_ORG_ID_BYTES: usize = 128;
 const MAX_BASE_URL_BYTES: usize = 512;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEVIN_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DEVIN_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DEVIN_CATALOG_UIDS: usize = 4096;
+const MAX_DEVIN_CATALOG_DEPTH: usize = 16;
 
 pub(crate) const DEFAULT_API_BASE_URL: &str = "https://api.devin.ai";
 pub(crate) const API_KEY_ENV: &str = "TEMOTE_MCP_DEVIN_API_KEY";
@@ -576,6 +584,10 @@ struct TaskRecord {
     title: Option<String>,
     devin_mode: Option<String>,
     #[serde(default)]
+    swe_tier: Option<String>,
+    #[serde(default)]
+    effective_devin_mode: Option<String>,
+    #[serde(default)]
     repos: Vec<String>,
     status: TaskStatus,
     revision: u64,
@@ -715,6 +727,22 @@ impl TaskStore {
     fn load(&self, session: &config::Session, task_id: Uuid) -> Result<TaskRecord> {
         let _guard = self.lock()?;
         self.load_locked(session, task_id)
+    }
+
+    fn existing_start(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+    ) -> Result<Option<TaskRecord>> {
+        let _guard = self.lock()?;
+        match self.read_record(task_id) {
+            Ok(record) => {
+                ensure_task_owner(&record, session)?;
+                Ok(Some(record))
+            }
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn load_locked(&self, session: &config::Session, task_id: Uuid) -> Result<TaskRecord> {
@@ -1127,6 +1155,25 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
     if let Some(mode) = &record.devin_mode {
         validate_devin_mode(mode)?;
     }
+    validate_swe_tier(record.swe_tier.as_deref(), record.devin_mode.as_deref())?;
+    if let Some(effective) = &record.effective_devin_mode {
+        validate_argument(effective, "effective_devin_mode")?;
+        if record.swe_tier.as_deref() == Some("priority") {
+            let requested = record
+                .devin_mode
+                .as_deref()
+                .context("priority SWE-2 record is missing devin_mode")?;
+            anyhow::ensure!(
+                is_swe2_priority_uid(effective, requested),
+                "priority SWE-2 record has an invalid effective Devin mode"
+            );
+        } else if let Some(requested) = record.devin_mode.as_deref() {
+            anyhow::ensure!(
+                effective == requested,
+                "non-priority Devin Cloud record changed its effective mode"
+            );
+        }
+    }
     anyhow::ensure!(record.repos.len() <= MAX_REPOS, "too many repos");
     for repo in &record.repos {
         validate_argument(repo, "repos")?;
@@ -1209,6 +1256,174 @@ fn validate_devin_mode(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_swe2_mode(value: &str) -> bool {
+    matches!(value, "swe-2-medium" | "swe-2-high" | "swe-2-max")
+}
+
+fn validate_swe_tier(tier: Option<&str>, devin_mode: Option<&str>) -> Result<()> {
+    let Some(tier) = tier else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        matches!(tier, "promo" | "priority"),
+        "swe_tier must be one of promo, priority"
+    );
+    anyhow::ensure!(
+        devin_mode.is_some_and(is_swe2_mode),
+        "swe_tier requires devin_mode to be one of swe-2-medium, swe-2-high, swe-2-max"
+    );
+    Ok(())
+}
+
+fn is_swe2_priority_uid(candidate: &str, requested_mode: &str) -> bool {
+    let Some(effort) = requested_mode.strip_prefix("swe-2-") else {
+        return false;
+    };
+    let normalized = candidate.to_ascii_lowercase().replace('_', "-");
+    let tokens = normalized.split('-').collect::<Vec<_>>();
+    tokens.starts_with(&["swe", "2"])
+        && tokens.contains(&effort)
+        && (tokens.contains(&"priority") || tokens.contains(&"fast"))
+}
+
+fn collect_model_uids(value: &Value, depth: usize, out: &mut BTreeSet<String>) -> Result<()> {
+    anyhow::ensure!(
+        depth <= MAX_DEVIN_CATALOG_DEPTH,
+        "Devin model catalog exceeds nesting limit"
+    );
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if key == "model_uid" {
+                    let uid = child
+                        .as_str()
+                        .context("Devin model catalog model_uid must be a string")?;
+                    validate_argument(uid, "model_uid")?;
+                    out.insert(uid.to_owned());
+                    anyhow::ensure!(
+                        out.len() <= MAX_DEVIN_CATALOG_UIDS,
+                        "Devin model catalog contains too many model UIDs"
+                    );
+                }
+                collect_model_uids(child, depth + 1, out)?;
+            }
+        }
+        Value::Array(items) => {
+            anyhow::ensure!(
+                items.len() <= MAX_DEVIN_CATALOG_UIDS,
+                "Devin model catalog array exceeds item limit"
+            );
+            for item in items {
+                collect_model_uids(item, depth + 1, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_swe2_priority_uid_from_catalog(catalog: &Value, requested_mode: &str) -> Result<String> {
+    anyhow::ensure!(
+        is_swe2_mode(requested_mode),
+        "priority resolution requires a SWE-2 devin_mode"
+    );
+    let mut uids = BTreeSet::new();
+    collect_model_uids(catalog, 0, &mut uids)?;
+    let matches = uids
+        .into_iter()
+        .filter(|uid| is_swe2_priority_uid(uid, requested_mode))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [uid] => Ok(uid.clone()),
+        [] => anyhow::bail!(
+            "SWE-2 priority is unavailable: Devin model catalog exposes no selectable priority/fast UID for {requested_mode}"
+        ),
+        _ => anyhow::bail!(
+            "SWE-2 priority is ambiguous: Devin model catalog exposes multiple priority/fast UIDs for {requested_mode}"
+        ),
+    }
+}
+
+async fn read_devin_model_catalog() -> Result<Value> {
+    let binary = crate::devin_acp::resolve_devin_executable().map_err(anyhow::Error::msg)?;
+    let future = async move {
+        let mut child = Command::new(&binary)
+            .args(["models", "list", "--format", "json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("could not start {} for Devin model discovery", binary.display()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Devin model discovery stdout unavailable")?;
+        let read_stdout = async move {
+            let mut bytes = Vec::new();
+            stdout
+                .take((MAX_DEVIN_CATALOG_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .context("could not read Devin model catalog")?;
+            Ok::<Vec<u8>, anyhow::Error>(bytes)
+        };
+        let (bytes, status) = tokio::try_join!(read_stdout, child.wait())?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_DEVIN_CATALOG_BYTES,
+            "Devin model catalog exceeds {MAX_DEVIN_CATALOG_BYTES} bytes"
+        );
+        anyhow::ensure!(
+            status.success(),
+            "Devin model discovery failed; run devin models list --format json interactively to verify login and connectivity"
+        );
+        serde_json::from_slice(&bytes).context("Devin model catalog is not valid JSON")
+    };
+    timeout(DEVIN_CATALOG_TIMEOUT, future)
+        .await
+        .context("Devin model discovery timed out")?
+}
+
+#[cfg(test)]
+static FAKE_SWE_PRIORITY_UID: OnceLock<Mutex<Option<Result<String, String>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn set_fake_swe_priority_uid(value: Option<Result<String, String>>) {
+    *FAKE_SWE_PRIORITY_UID
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = value;
+}
+
+async fn resolve_swe2_priority_uid(requested_mode: &str) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = FAKE_SWE_PRIORITY_UID
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        return result.map_err(anyhow::Error::msg);
+    }
+
+    let catalog = read_devin_model_catalog().await?;
+    resolve_swe2_priority_uid_from_catalog(&catalog, requested_mode)
+}
+
+async fn resolve_effective_devin_mode(
+    devin_mode: Option<&str>,
+    swe_tier: Option<&str>,
+) -> Result<Option<String>> {
+    match (devin_mode, swe_tier) {
+        (Some(mode), Some("priority")) => resolve_swe2_priority_uid(mode).await.map(Some),
+        (Some(mode), _) => Ok(Some(mode.to_owned())),
+        (None, None) => Ok(None),
+        (None, Some(_)) => anyhow::bail!(
+            "swe_tier requires devin_mode to be one of swe-2-medium, swe-2-high, swe-2-max"
+        ),
+    }
+}
+
 fn validate_task_input(value: &str, label: &str) -> Result<()> {
     anyhow::ensure!(
         !value.is_empty() && value.len() <= MAX_TASK_INPUT_BYTES && !value.contains('\0'),
@@ -1267,6 +1482,8 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "org_id": record.org_id,
         "title": record.title,
         "devin_mode": record.devin_mode,
+        "swe_tier": record.swe_tier,
+        "effective_devin_mode": record.effective_devin_mode,
         "repos": record.repos,
         "devin_session_id": record.devin_session_id,
         "session_url": record.session_url,
@@ -1809,6 +2026,7 @@ async fn task_start_with_store(
     let task = required_string(args, "task")?;
     let title = optional_string(args, "title")?;
     let devin_mode = optional_string(args, "devin_mode")?;
+    let swe_tier = optional_string(args, "swe_tier")?;
     let repos = optional_string_list(args, "repos", MAX_REPOS)?;
     let max_acu_limit = optional_u64(args, "max_acu_limit")?;
     validate_task_input(task, "task")?;
@@ -1818,6 +2036,7 @@ async fn task_start_with_store(
     if let Some(mode) = devin_mode {
         validate_devin_mode(mode)?;
     }
+    validate_swe_tier(swe_tier, devin_mode)?;
     if let Some(limit) = max_acu_limit {
         anyhow::ensure!(
             (1..=100_000).contains(&limit),
@@ -1826,9 +2045,6 @@ async fn task_start_with_store(
     }
 
     ensure_current_active_instance(&owner, session).await?;
-    let (config, api) = connect()?;
-    let org_id = resolve_org_id(&config, &api).await?;
-
     let task_id = task_id_for_operation(session, operation_id)?;
     let request_fingerprint = fingerprint(&json!({
         "kind": "start",
@@ -1836,9 +2052,18 @@ async fn task_start_with_store(
         "task": task,
         "title": title,
         "devin_mode": devin_mode,
+        "swe_tier": swe_tier,
         "repos": repos,
         "max_acu_limit": max_acu_limit,
     }))?;
+    if let Some(existing) = store.existing_start(session, task_id)? {
+        return replay_operation(&existing, operation_id, request_fingerprint);
+    }
+
+    let effective_devin_mode = resolve_effective_devin_mode(devin_mode, swe_tier).await?;
+
+    let (config, api) = connect()?;
+    let org_id = resolve_org_id(&config, &api).await?;
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
@@ -1848,6 +2073,8 @@ async fn task_start_with_store(
         org_id: org_id.clone(),
         title: title.map(str::to_owned),
         devin_mode: devin_mode.map(str::to_owned),
+        swe_tier: swe_tier.map(str::to_owned),
+        effective_devin_mode: effective_devin_mode.clone(),
         repos: repos.clone(),
         status: TaskStatus::Accepted,
         revision: 1,
@@ -1887,7 +2114,7 @@ async fn task_start_with_store(
         "structured_output_required": true,
         "resumable": true,
     });
-    if let Some(mode) = devin_mode {
+    if let Some(mode) = effective_devin_mode.as_deref() {
         body["devin_mode"] = json!(mode);
     }
     if !repos.is_empty() {
@@ -2271,6 +2498,7 @@ impl FakeApi {
                     "status_detail": null,
                     "org_id": org,
                     "title": body.get("title"),
+                    "devin_mode": body.get("devin_mode"),
                     "acus_consumed": 0.0,
                     "pull_requests": [],
                     "structured_output": null,
@@ -2383,6 +2611,7 @@ mod tests {
                 std::env::remove_var(ORG_ID_ENV);
             }
             clear_fake();
+            set_fake_swe_priority_uid(None);
         }
     }
 
@@ -2440,6 +2669,134 @@ mod tests {
             "checks": ["cargo test"],
             "unresolved": [],
         })
+    }
+
+    #[test]
+    fn swe_priority_catalog_resolution_is_exact_and_fail_closed() {
+        let catalog = json!({
+            "families": [{
+                "family_uid": "swe-2",
+                "variants": [
+                    {"model_uid": "swe-2-high"},
+                    {"model_uid": "swe-2-high-priority"},
+                    {"model_uid": "swe-2-max-fast"}
+                ]
+            }]
+        });
+        assert_eq!(
+            resolve_swe2_priority_uid_from_catalog(&catalog, "swe-2-high").unwrap(),
+            "swe-2-high-priority"
+        );
+        assert_eq!(
+            resolve_swe2_priority_uid_from_catalog(&catalog, "swe-2-max").unwrap(),
+            "swe-2-max-fast"
+        );
+
+        let promo_only = json!({"families": [{"variants": [{"model_uid": "swe-2-high"}]}]});
+        assert!(
+            resolve_swe2_priority_uid_from_catalog(&promo_only, "swe-2-high")
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
+
+        let ambiguous = json!({"families": [{"variants": [
+            {"model_uid": "swe-2-high-priority"},
+            {"model_uid": "swe-2-high-fast"}
+        ]}]});
+        assert!(
+            resolve_swe2_priority_uid_from_catalog(&ambiguous, "swe-2-high")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+
+        assert!(
+            resolve_swe2_priority_uid_from_catalog(
+                &json!({"families": [{"variants": [{"model_uid": 7}]}]}),
+                "swe-2-high"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn swe_priority_preflight_resolves_exact_uid_and_fails_before_remote_create() {
+        let _serial = serial().await;
+        let _env = EnvGuard::install();
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let store = test_store(&root);
+        let fake = install_fake();
+
+        set_fake_swe_priority_uid(Some(Ok("swe-2-high-priority".to_owned())));
+        let op = Uuid::new_v4();
+        let args = json!({
+            "operation_id": op,
+            "task": "priority work",
+            "devin_mode": "swe-2-high",
+            "swe_tier": "priority"
+        });
+        let out = task_start_with_store(&args, &session, &store).await.unwrap();
+        assert_eq!(out["swe_tier"], "priority");
+        assert_eq!(out["effective_devin_mode"], "swe-2-high-priority");
+        assert_eq!(
+            fake.lock().unwrap().sessions["devin-0001"]["devin_mode"],
+            "swe-2-high-priority"
+        );
+
+        set_fake_swe_priority_uid(Some(Err("catalog unavailable".to_owned())));
+        let replay = task_start_with_store(&args, &session, &store).await.unwrap();
+        assert_eq!(replay["status"], "running");
+        assert_eq!(fake.lock().unwrap().sessions.len(), 1);
+
+        let fresh_args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "fresh priority work",
+            "devin_mode": "swe-2-high",
+            "swe_tier": "priority"
+        });
+        let calls_before = fake.lock().unwrap().calls.len();
+        let error = task_start_with_store(&fresh_args, &session, &store)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("catalog unavailable"));
+        assert_eq!(fake.lock().unwrap().calls.len(), calls_before);
+        assert_eq!(fake.lock().unwrap().sessions.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn swe_promo_uses_requested_mode_without_priority_discovery() {
+        let _serial = serial().await;
+        let _env = EnvGuard::install();
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id()).await;
+        let store = test_store(&root);
+        let fake = install_fake();
+        set_fake_swe_priority_uid(Some(Err("must not be called".to_owned())));
+
+        let args = json!({
+            "operation_id": Uuid::new_v4(),
+            "task": "promo work",
+            "devin_mode": "swe-2-max",
+            "swe_tier": "promo"
+        });
+        let out = task_start_with_store(&args, &session, &store).await.unwrap();
+        assert_eq!(out["swe_tier"], "promo");
+        assert_eq!(out["effective_devin_mode"], "swe-2-max");
+        assert_eq!(
+            fake.lock().unwrap().sessions["devin-0001"]["devin_mode"],
+            "swe-2-max"
+        );
+    }
+
+    #[test]
+    fn swe_tier_validation_requires_swe2_mode() {
+        assert!(validate_swe_tier(None, None).is_ok());
+        assert!(validate_swe_tier(Some("promo"), Some("swe-2-medium")).is_ok());
+        assert!(validate_swe_tier(Some("priority"), Some("swe-2-max")).is_ok());
+        assert!(validate_swe_tier(Some("priority"), Some("fast")).is_err());
+        assert!(validate_swe_tier(Some("bogus"), Some("swe-2-high")).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2903,6 +3260,8 @@ mod tests {
             org_id: "org-test".to_owned(),
             title: None,
             devin_mode: None,
+            swe_tier: None,
+            effective_devin_mode: None,
             repos: Vec::new(),
             status,
             revision: 1,
