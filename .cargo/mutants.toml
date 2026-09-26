@@ -1,0 +1,14 @@
+# cargo-mutants configuration for temote-mcp.
+# See https://mutants.rs and the "Mutation testing" section of AGENTS.md.
+#
+# Mutation runs are expensive: prefer scoped runs
+# (`cargo mutants -f src/<file>.rs` or `just mutants-diff`) and read every
+# surviving mutant rather than chasing a kill percentage.
+
+# Exercise the `network`-gated modules too so mutants there are viable.
+all_features = true
+
+# The suite includes supervisor/process-boundary tests that are slower than a
+# plain unit suite; give mutants room before calling a timeout.
+timeout_multiplier = 3.0
+minimum_test_timeout = 60

@@ -30,6 +30,7 @@ mod local_oauth;
 mod managed_worktree;
 mod mcp;
 mod named_roots;
+mod observation;
 #[cfg(feature = "network")]
 mod openai_tunnel;
 #[cfg(feature = "network")]
@@ -146,6 +147,7 @@ async fn main() -> Result<()> {
             tail,
             follow,
         } => session_control::run_activity_command(session_id, tail, follow).await,
+        cli::Command::Observation { command } => observation::cli::run_observation_command(command),
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { session_id, path } => {
                 session_control::start_named(session_id, path).await

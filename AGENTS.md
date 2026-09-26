@@ -58,6 +58,16 @@ git diff --check
 
 When Temote MCP itself is being developed from inside an already-sandboxed normal Temote session, use `just sandboxed-check` for the deterministic repository-local subset. Treat every host-only line it prints as `NOT RUN`, not PASS. Nested Linux bubblewrap/userns acceptance, session-GC Unix-socket liveness (`session_control::tests::host_liveness_tests`), local-agent real-wiring, gateway deployment-preflight CLI subprocess tests, local Unix-socket integration, and process-boundary E2E remain host/CI gates; do not weaken the current session sandbox or mark those tests successful merely because the outer sandbox prevents them from starting. `just linux-sandbox-acceptance` is the explicit Linux host gate when running on a suitable unsandboxed development host.
 
+### Mutation and property testing
+
+The suite pairs [`noprop`](https://github.com/sile/noprop) property tests (see `docs/development.md` "Property-based tests") with [cargo-mutants](https://mutants.rs) mutation testing: noprop checks invariants over generated inputs, cargo-mutants checks whether any test notices when the implementation changes.
+
+- Install once with `cargo install --locked cargo-mutants`; shared settings live in `.cargo/mutants.toml`.
+- Always scope runs — a full-tree run is a long host/CI job. Use `just mutants -f src/<file>.rs` (or `-F`/`-E` regexes) for the file you changed and `just mutants-diff` for mutants touched by the current diff against `origin/main`. Preview the mutant list cheaply with `just mutants-list`. Re-running keeps prior verdicts via `--iterate`.
+- The baseline must be green: cargo-mutants runs the unmutated suite first. On machines where tests unrelated to your change are already failing (e.g. network-dependent probes), append `-- --skip <test-filter>` to exclude them, and prefer the sandboxed-safe subset from `just sandboxed-check`.
+- Read each `MISSED`/`unviable` survivor instead of chasing a kill percentage. Kill survivors with one reference-model or round-trip noprop property via `test_support::run` rather than many example tests — keep boundary values like length 0 in the generated space or guard branches escape the property. A mutant that survives because the change is provably equivalent (e.g. `>` vs `>=` where `==` gives the same result) is expected; document it in review rather than contorting tests.
+- Replay a property failure with `TEMOTE_PBT_SEED=<seed>` (decimal or hex `u64`).
+
 ## Documentation map
 
 - `docs/usage.md` / `docs/usage.ja.md`: sessions, permissions, delegation backends, tool behavior, safety boundaries.

@@ -111,11 +111,11 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 27);
+  assert.equal(names.length, 29);
   for (const required of ["host_list", "host_info", "session_list", "session_start", "session_stop", "session_restart", "session_info"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "stop_job"]) {
+  for (const required of ["evidence_read", "context_resolve", "context_status", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "stop_job"]) {
     assert.equal(names.includes(required), true, required);
   }
   for (const removed of ["execute", "start_command", "read_file", "write_file", "git_push", "github_pr_list", "dev_tool_run", "session_permission_request", "onepassword_item_get", "kintone_mcp_status", "checkpoint_save", "work_handoff", "recall"]) {
@@ -1649,7 +1649,7 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 27);
+  assert.equal(rpc.result.tools.length, 29);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

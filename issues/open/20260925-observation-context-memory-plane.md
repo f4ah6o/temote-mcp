@@ -1,8 +1,10 @@
 # O0: head-independent observation / context / memory plane
 
-Status: high-priority design / implementation not started  
+Status: high-priority / O1 + O2 implemented; O3 + O4 implementation not started  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
+Cloud extension: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
+Fabric naming / boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
 Created: 2026-09-25 (Asia/Tokyo)
 
@@ -75,7 +77,7 @@ planner ではない。task 分解、実装方針、backend/model 自動選択�
                  |
                  v
       frontend / transport
- MCP / local / HTTP / Gateway
+ MCP / local / HTTP / Temote Fabric
                  |
                  v
        normalized core request
@@ -103,7 +105,7 @@ planner ではない。task 分解、実装方針、backend/model 自動選択�
 ```
 
 「proxy」は wire transport の proxy として実装しない。
-MCP/local/HTTP/Gateway が normalization を終えて Temote core に入る共通境界で observation を作る。
+MCP/local/HTTP/Temote Fabric frontend が normalization を終えて Temote core に入る共通境界で observation を作る。
 
 理由:
 
@@ -468,20 +470,28 @@ context_resolve --at-least-revision 381
 
 ## 15. Storage
 
-O1 の初期実装は Temote owner-only state directory の SQLite を候補とする。
+O1 の実装は Temote owner-only state directory の bounded JSONL journal を使用する。
+これは O3/O4 cloud 化後も削除せず、execution host 側の durable spool / recovery source / local fallback とする。
 
-ただし contract は storage backend に固定しない。
+Authority:
 
-初期 authority:
+- Task / Execution: existing Temote/backend stores on the owning host
+- Local raw observation: Temote O1 journal
+- Cloud observation: sanitized replicated observation, execution authority ではない
+- Knowledge: derived / rebuildable projection
 
-- Task / Execution: existing Temote/backend stores
-- Observation: Temote observation store
-- Knowledge: derived local store
+O3/O4 の shared plane は Temote Fabric とする。`issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、現行 Cloudflare Gateway deployment を拡張して Fabric へ移行する。
 
-複数 host の global knowledge authority / replication は初期 scope 外。
-remote head は Temote の authenticated frontend 経由で同じ owning host の Context Resolver にアクセスする。
+初期 cloud layout:
 
-multi-host aggregation を必要とする場合は Gateway の ownership/routing contract と整合した別 packet にする。
+- D1: structured observation replica / checkpoints / knowledge / support / supersession
+- Queue: asynchronous Memory Worker trigger / retry
+- R2: large explicitly-safe content only; optional and not the primary database
+- current Gateway routing Durable Objects: routing/liveness responsibility のまま。non-destructive migration 後は Fabric naming に揃える
+
+Cloudflare outage や worker failure は accepted Task / Execution を failed にしてはならない。
+remote head は last successfully synced revision まで host-offline でも repository knowledge を取得できることを O3/O4 の acceptance とする。
+
 
 ## 16. Public surface
 
@@ -537,14 +547,14 @@ raw observation dump を通常の remote MCP surface に出さない。
 
 Prerequisite: Phase A の common task identity / typed request boundary。
 
-- [ ] `Observation` schema + schema version
-- [ ] owner-only store
-- [ ] common orchestration entry/exit の recorder
-- [ ] task/control instruction references
-- [ ] execution/evidence/verification/delivery observation hooks
-- [ ] idempotent append key
-- [ ] gap/backfill/reconcile behavior
-- [ ] no secret-bearing structured fields test
+- [x] `Observation` schema + schema version
+- [x] owner-only store
+- [x] common orchestration entry/exit の recorder
+- [x] task/control instruction references
+- [x] execution/evidence/verification/delivery observation hooks
+- [x] idempotent append key
+- [x] gap/backfill/reconcile behavior
+- [x] no secret-bearing structured fields test
 
 Acceptance:
 
@@ -557,11 +567,11 @@ Acceptance:
 
 Prerequisite: O1。
 
-- [ ] task / execution / workspace / verification current state projection
-- [ ] repository/task scoped recent instruction lookup
-- [ ] deterministic context bundle
-- [ ] freshness / partial state
-- [ ] `context_resolve` contract
+- [x] task / execution / workspace / verification current state projection
+- [x] repository/task scoped recent instruction lookup
+- [x] deterministic context bundle
+- [x] freshness / partial state
+- [x] `context_resolve` contract
 
 ここまでで head switch の最低価値を成立させる。
 Memory Worker が未実装でも、過去の instruction と verified state を次の head が取得できる。
@@ -569,6 +579,7 @@ Memory Worker が未実装でも、過去の instruction と verified state を�
 ### O3 — Memory Worker
 
 Prerequisite: O1 + O2。
+Cloud shared implementation / replication / D1 / Queue contract は `issues/open/20260926-cloud-observation-knowledge-plane.md` を canonical child packet とする。
 
 - [ ] worker checkpoint
 - [ ] batch read
@@ -582,6 +593,7 @@ Prerequisite: O1 + O2。
 ### O4 — Knowledge-aware resolver
 
 Prerequisite: O3。
+Temote Fabric 経由では cloud D1 projection を利用し、host offline でも last synced revision まで repository context を解決できること。
 
 - [ ] current knowledge selection
 - [ ] task-specific vs repository-wide scope policy
@@ -617,17 +629,17 @@ O1/O2 を D (environment) / E (delivery) より優先する。
 
 ## 20. Acceptance criteria
 
-- [ ] head が変わっても repository/task の relevant context を Temote から取得できる
-- [ ] coding agent に memory maintenance prompt / tool call を要求しない
-- [ ] 「誰/何が、どの backend に、どの instruction を出したか」を authorized scope 内で追跡できる
-- [ ] caller/agent claim と Temote verified execution state を区別する
-- [ ] raw observation は worker output から独立して保持される
+- [x] head が変わっても repository/task の relevant context を Temote から取得できる
+- [x] coding agent に memory maintenance prompt / tool call を要求しない
+- [x] 「誰/何が、どの backend に、どの instruction を出したか」を authorized scope 内で追跡できる
+- [x] caller/agent claim と Temote verified execution state を区別する
+- [x] raw observation は worker output から独立して保持される
 - [ ] derived knowledge は support refs を持ち、再生成可能
 - [ ] superseded/stale knowledge を current fact として返さない
-- [ ] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
-- [ ] MCP/local/HTTP/Gateway で semantic observation contract が変わらない
-- [ ] secrets を observation metadata / ordinary output に複製しない
-- [ ] raw transcript dump を通常の public surface にしない
+- [x] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
+- [x] MCP/local/HTTP/Fabric remote frontend で semantic observation contract が変わらない
+- [x] secrets を observation metadata / ordinary output に複製しない
+- [x] raw transcript dump を通常の public surface にしない
 - [ ] worker failure 時も task execution は独立して継続できる
 
 ## 21. Principle
