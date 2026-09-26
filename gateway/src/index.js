@@ -64,6 +64,19 @@ export {
 } from "./observation/index.js";
 export { contextPlaneBindings } from "./context/index.js";
 export { GatewayRegistry, GatewaySession } from "./routing-runtime.js";
+export {
+  gatewaySessionBodyLimit,
+  hostApiBodyLimit,
+  nextGatewayGeneration,
+  normalizeSessionAvailability,
+  pruneExpiredRegistrySessions,
+  shouldReplaceRegistrySession,
+  validHostRpcResponse,
+  validRpcId,
+  validRpcRequestShape,
+  validRpcToolName,
+} from "./routing-runtime.js";
+export { readBoundedBytes } from "./http.js";
 
 export default {
   async fetch(request, env) {
