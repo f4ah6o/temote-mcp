@@ -1373,7 +1373,13 @@ async fn read_devin_model_catalog() -> Result<Value> {
                 .context("could not read Devin model catalog")?;
             Ok::<Vec<u8>, anyhow::Error>(bytes)
         };
-        let (bytes, status) = tokio::try_join!(read_stdout, child.wait())?;
+        let wait_child = async {
+            child
+                .wait()
+                .await
+                .context("could not wait for Devin model discovery")
+        };
+        let (bytes, status) = tokio::try_join!(read_stdout, wait_child)?;
         anyhow::ensure!(
             bytes.len() <= MAX_DEVIN_CATALOG_BYTES,
             "Devin model catalog exceeds {MAX_DEVIN_CATALOG_BYTES} bytes"
