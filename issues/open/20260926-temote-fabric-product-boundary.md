@@ -1,6 +1,6 @@
 # Temote Fabric: product name / responsibility boundary / gateway migration
 
-Status: design ready / implementation not started  
+Status: implementation in progress / FBR1 complete  
 Repository: `f4ah6o/temote-mcp`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related:
@@ -549,10 +549,10 @@ Routing DOs and memory projection remain separate state domains even though they
 
 ### FBR1 — internal module split before rename
 
-- [ ] split current `gateway/src/index.js` by routing/access responsibilities
-- [ ] add observation/context modules without mixing them into DO routing classes
-- [ ] preserve public contract fingerprint
-- [ ] Node tests unchanged/green
+- [x] split current `gateway/src/index.js` by routing/access responsibilities
+- [x] add observation/context modules without mixing them into DO routing classes
+- [x] preserve public contract fingerprint
+- [x] Node tests unchanged/green
 
 This may still live under `gateway/`.
 
