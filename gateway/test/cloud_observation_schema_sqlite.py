@@ -196,7 +196,7 @@ class FabricC0SchemaIntegrityTest(unittest.TestCase):
 
 C1_UPDATE_SOURCE = """
 UPDATE observation_sources
-SET repository_key = COALESCE(repository_key, ?),
+SET repository_key = CASE WHEN ? IS NULL THEN repository_key ELSE ? END,
     source_base_revision = MAX(source_base_revision, ?),
     source_head_revision = MAX(source_head_revision, ?),
     journal_degraded = CASE WHEN journal_degraded = 1 OR ? = 1 THEN 1 ELSE 0 END,
@@ -299,6 +299,7 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
             C1_UPDATE_SOURCE,
             (
                 "forge:f4ah6o/temote-mcp",
+                "forge:f4ah6o/temote-mcp",
                 0,
                 head,
                 degraded,
@@ -346,6 +347,54 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
         self.add_source()
         with self.assertRaises(sqlite3.IntegrityError):
             self.add_observation(1, repository="forge:other/repository")
+
+    def test_c1_repository_identity_can_resolve_once(self):
+        session = "repository-adoption"
+        self.add_source(session=session, repository=None)
+        self.add_observation(
+            1,
+            session=session,
+            repository="github:f4ah6o/temote-mcp",
+        )
+        self.db.execute(
+            C1_UPDATE_SOURCE,
+            (
+                "github:f4ah6o/temote-mcp",
+                "github:f4ah6o/temote-mcp",
+                0,
+                1,
+                0,
+                0,
+                1,
+                "2026-09-26T00:00:02Z",
+                "owner-c1",
+                "host-c1",
+                session,
+            ),
+        )
+        repository = self.db.execute(
+            """
+            SELECT repository_key
+            FROM observation_sources
+            WHERE owner_id = 'owner-c1'
+              AND host_id = 'host-c1'
+              AND session_id = ?
+            """,
+            (session,),
+        ).fetchone()[0]
+        self.assertEqual(repository, "github:f4ah6o/temote-mcp")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(
+                """
+                UPDATE observation_sources
+                SET repository_key = 'github:other/repository'
+                WHERE owner_id = 'owner-c1'
+                  AND host_id = 'host-c1'
+                  AND session_id = ?
+                """,
+                (session,),
+            )
 
     def test_c1_contiguous_ack_waits_for_gap_then_advances(self):
         self.add_source()
