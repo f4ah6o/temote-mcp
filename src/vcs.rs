@@ -162,6 +162,7 @@ pub(crate) struct VcsSnapshotObserved {
 pub(crate) struct SnapshotResult {
     pub operation_id: Uuid,
     pub replayed: bool,
+    pub reconciled: bool,
     pub before: JujutsuState,
     pub after: JujutsuState,
     pub observation: VcsSnapshotObserved,
@@ -181,6 +182,8 @@ struct SnapshotReceipt {
     operation_id: Uuid,
     request_fingerprint: String,
     state: ReceiptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    before: Option<JujutsuState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<SnapshotResult>,
 }
@@ -555,6 +558,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             operation_id,
             request_fingerprint: request_fingerprint.clone(),
             state: ReceiptState::Accepted,
+            before: Some(before.clone()),
             result: None,
         };
         write_json_atomic(&receipt_path, &accepted)?;
@@ -581,6 +585,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         let result = SnapshotResult {
             operation_id,
             replayed: false,
+            reconciled: false,
             before,
             after,
             observation: observation.clone(),
@@ -590,6 +595,102 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             operation_id,
             request_fingerprint,
             state: ReceiptState::Completed,
+            before: None,
+            result: Some(result.clone()),
+        };
+        write_json_atomic(&receipt_path, &completed)?;
+        self.observation_sink.record(&observation);
+        Ok(result)
+    }
+
+    pub(crate) fn reconcile_snapshot(
+        &self,
+        workspace_id: &str,
+        operation_id: Uuid,
+    ) -> VcsResult<SnapshotResult> {
+        validate_workspace_id(workspace_id)?;
+        let request_fingerprint = snapshot_fingerprint(workspace_id);
+        let receipt_path = self.operation_receipt_path(operation_id);
+        let _lock = self.acquire_store_lock()?;
+
+        if !receipt_path.exists() {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceMissing,
+                format!("snapshot receipt {operation_id} does not exist"),
+            ));
+        }
+
+        let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
+        validate_receipt(&receipt, operation_id)?;
+        if receipt.request_fingerprint != request_fingerprint {
+            return Err(VcsError::new(
+                VcsErrorCode::OperationConflict,
+                "operation_id was accepted for a different VCS snapshot request",
+            ));
+        }
+
+        if let (ReceiptState::Completed, Some(mut result)) = (receipt.state, receipt.result.clone()) {
+            result.replayed = true;
+            return Ok(result);
+        }
+        if receipt.state == ReceiptState::Completed {
+            return Err(VcsError::new(
+                VcsErrorCode::InvalidBackendOutput,
+                "completed VCS snapshot receipt is missing its result",
+            ));
+        }
+
+        let before = receipt.before.ok_or_else(|| {
+            VcsError::new(
+                VcsErrorCode::ReconciliationRequired,
+                "accepted VCS snapshot receipt predates persisted before-state; automatic backfill is unsafe",
+            )
+        })?;
+
+        let record_path = self.workspace_record_path(workspace_id);
+        if !record_path.exists() {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceMissing,
+                format!("workspace {workspace_id} is not registered"),
+            ));
+        }
+        let record: WorkspaceRecord = read_json_record(&record_path)?;
+        validate_workspace_record(&record, &self.repository_root, &self.managed_root)?;
+        let after = self.inspect_jj(&record.path)?;
+
+        if after == before {
+            return Err(VcsError::new(
+                VcsErrorCode::ReconciliationRequired,
+                "accepted VCS snapshot has no durable state transition to attribute; refusing to replay jj status because later filesystem edits could be folded into the old operation",
+            ));
+        }
+
+        let observation = VcsSnapshotObserved {
+            workspace_id: workspace_id.to_owned(),
+            task_id: None,
+            execution_id: None,
+            backend: record.backend,
+            logical_change_id: after.logical_change_id.clone(),
+            before_revision: before.materialized_revision.clone(),
+            after_revision: after.materialized_revision.clone(),
+            vcs_operation_id: after.vcs_operation_id.clone(),
+            conflicted: after.conflicted,
+            empty: after.empty,
+        };
+        let result = SnapshotResult {
+            operation_id,
+            replayed: false,
+            reconciled: true,
+            before,
+            after,
+            observation: observation.clone(),
+        };
+        let completed = SnapshotReceipt {
+            schema_version: SCHEMA_VERSION,
+            operation_id,
+            request_fingerprint,
+            state: ReceiptState::Completed,
+            before: None,
             result: Some(result.clone()),
         };
         write_json_atomic(&receipt_path, &completed)?;
@@ -1366,6 +1467,7 @@ mod tests {
         assert_eq!(result.after.materialized_revision, updated);
         assert_eq!(result.observation.vcs_operation_id, "op-b");
         assert!(!result.replayed);
+        assert!(!result.reconciled);
 
         let replay = manager.snapshot("task-a", operation_id).unwrap();
         assert!(replay.replayed);
@@ -1387,6 +1489,7 @@ mod tests {
                 operation_id,
                 request_fingerprint: snapshot_fingerprint("task-a"),
                 state: ReceiptState::Accepted,
+                before: Some(manager.inspect("task-a").unwrap().jj),
                 result: None,
             },
         )
@@ -1397,6 +1500,130 @@ mod tests {
             VcsErrorCode::ReconciliationRequired
         );
         assert_eq!(runner.state.lock().unwrap().status_calls, 0);
+    }
+
+    #[test]
+    fn reconcile_backfills_durable_transition_without_replaying_status() {
+        let fixture = Fixture::new();
+        let initial = "a".repeat(40);
+        let updated = "b".repeat(40);
+        let runner = MockRunner::new().with_revisions(
+            [
+                ("change-a".into(), initial.clone(), false, false),
+                ("change-a".into(), updated.clone(), false, false),
+            ],
+            ["op-a".into(), "op-b".into()],
+        );
+        let sink = RecordingSink::default();
+        let manager = manager(&fixture, runner.clone(), sink.clone());
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+
+        let operation_id = Uuid::new_v4();
+        write_json_atomic(
+            &manager.operation_receipt_path(operation_id),
+            &SnapshotReceipt {
+                schema_version: SCHEMA_VERSION,
+                operation_id,
+                request_fingerprint: snapshot_fingerprint("task-a"),
+                state: ReceiptState::Accepted,
+                before: Some(JujutsuState {
+                    logical_change_id: "change-a".into(),
+                    materialized_revision: initial.clone(),
+                    vcs_operation_id: "op-a".into(),
+                    conflicted: false,
+                    empty: false,
+                }),
+                result: None,
+            },
+        )
+        .unwrap();
+
+        let result = manager
+            .reconcile_snapshot("task-a", operation_id)
+            .unwrap();
+        assert!(result.reconciled);
+        assert!(!result.replayed);
+        assert_eq!(result.before.materialized_revision, initial);
+        assert_eq!(result.after.materialized_revision, updated);
+        assert_eq!(runner.state.lock().unwrap().status_calls, 0);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+
+        let replay = manager
+            .reconcile_snapshot("task-a", operation_id)
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(replay.reconciled);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_keeps_accepted_receipt_when_no_durable_transition_exists() {
+        let fixture = Fixture::new();
+        let revision = "a".repeat(40);
+        let runner = MockRunner::new().with_revisions(
+            [("change-a".into(), revision.clone(), false, false)],
+            ["op-a".into()],
+        );
+        let manager = manager(&fixture, runner.clone(), RecordingSink::default());
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+
+        let operation_id = Uuid::new_v4();
+        write_json_atomic(
+            &manager.operation_receipt_path(operation_id),
+            &SnapshotReceipt {
+                schema_version: SCHEMA_VERSION,
+                operation_id,
+                request_fingerprint: snapshot_fingerprint("task-a"),
+                state: ReceiptState::Accepted,
+                before: Some(JujutsuState {
+                    logical_change_id: "change-a".into(),
+                    materialized_revision: revision,
+                    vcs_operation_id: "op-a".into(),
+                    conflicted: false,
+                    empty: false,
+                }),
+                result: None,
+            },
+        )
+        .unwrap();
+
+        let error = manager
+            .reconcile_snapshot("task-a", operation_id)
+            .unwrap_err();
+        assert_eq!(error.code, VcsErrorCode::ReconciliationRequired);
+        assert_eq!(runner.state.lock().unwrap().status_calls, 0);
+
+        let receipt: SnapshotReceipt =
+            read_json_record(&manager.operation_receipt_path(operation_id)).unwrap();
+        assert_eq!(receipt.state, ReceiptState::Accepted);
+        assert!(receipt.result.is_none());
+    }
+
+    #[test]
+    fn reconcile_rejects_legacy_accepted_receipt_without_before_state() {
+        let fixture = Fixture::new();
+        let runner = MockRunner::new();
+        let manager = manager(&fixture, runner, RecordingSink::default());
+        manager.workspace_ensure(&request("task-a", 'a')).unwrap();
+
+        let operation_id = Uuid::new_v4();
+        write_json_atomic(
+            &manager.operation_receipt_path(operation_id),
+            &SnapshotReceipt {
+                schema_version: SCHEMA_VERSION,
+                operation_id,
+                request_fingerprint: snapshot_fingerprint("task-a"),
+                state: ReceiptState::Accepted,
+                before: None,
+                result: None,
+            },
+        )
+        .unwrap();
+
+        let error = manager
+            .reconcile_snapshot("task-a", operation_id)
+            .unwrap_err();
+        assert_eq!(error.code, VcsErrorCode::ReconciliationRequired);
     }
 
     #[test]
