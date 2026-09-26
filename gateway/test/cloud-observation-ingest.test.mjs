@@ -407,7 +407,9 @@ class FakeD1 {
         evidenceRefs, observedAt, ingestedAt, payloadDigest,
       ] = args;
       const source = state.sources.get(owner + "\n" + host + "\n" + session);
-      if (!source || source.repository_key !== repository) throw new Error("source repository mismatch");
+      if (!source || (source.repository_key !== null && source.repository_key !== repository)) {
+        throw new Error("source repository mismatch");
+      }
       if (state.observations.some((item) =>
         item.owner_id === owner && item.host_id === host && item.session_id === session
         && (item.observation_id === id || item.source_revision === revision)
