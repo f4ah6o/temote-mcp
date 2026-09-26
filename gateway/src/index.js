@@ -17,6 +17,35 @@ import {
   validateModernRequestBody,
   validateSessionId,
 } from "./protocol.js";
+import {
+  authorizeClient,
+  authorizeFederatedHost,
+  authorizeLegacyHost,
+  boundedLogField,
+} from "./access.js";
+import {
+  agentRoute,
+  agentRouteKey,
+  compareSessionRoute,
+  hostStub,
+  registryStub,
+  sessionStub,
+  withoutHostRoutingArgument,
+} from "./routing.js";
+
+export {
+  accessEmailAllowed,
+  accessKidAllowed,
+  boundedLogField,
+  federatedHostToken,
+  normalizeAccessTeamDomain,
+  validateAccessJwtShape,
+} from "./access.js";
+export {
+  OBSERVATION_SCHEMA_VERSION,
+  observationPlaneBindings,
+} from "./observation/index.js";
+export { contextPlaneBindings } from "./context/index.js";
 
 const HOST_LEASE_MS = 90_000;
 const HOST_AGENT_PROTOCOL_VERSION = 1;
@@ -36,18 +65,10 @@ const MAX_HOST_RESPONSE_BODY_BYTES = 52 * 1024 * 1024;
 const MAX_INTERNAL_RPC_RESPONSE_BYTES = MAX_HOST_RESPONSE_BODY_BYTES;
 const MAX_INTERNAL_ERROR_RESPONSE_BYTES = 64 * 1024;
 const MAX_REGISTRY_RESPONSE_BYTES = 1024 * 1024;
-const MAX_JWKS_BYTES = 1024 * 1024;
-const MAX_ACCESS_JWT_BYTES = 64 * 1024;
-const MAX_ACCESS_JWT_HEADER_BYTES = 8 * 1024;
-const MAX_ACCESS_JWT_CLAIMS_BYTES = 32 * 1024;
-const MAX_ACCESS_JWT_SIGNATURE_BYTES = 8 * 1024;
-const MAX_ACCESS_KID_CHARS = 256;
-const MAX_LOG_FIELD_CHARS = 256;
 const MAX_RPC_METHOD_BYTES = 256;
 const MAX_RPC_ID_BYTES = 256;
 const MAX_RPC_TOOL_NAME_BYTES = 256;
 const SESSION_AVAILABILITY_VALUES = ["ready", "session_unavailable", "unavailable"];
-const jwksCache = new Map();
 
 export default {
   async fetch(request, env) {
@@ -294,13 +315,6 @@ function toolTextResponse(rpc, env, value) {
   ));
 }
 
-function withoutHostRoutingArgument(rpc) {
-  const routed = structuredClone(rpc);
-  const args = routed?.params?.arguments;
-  if (args && typeof args === "object" && !Array.isArray(args)) delete args.host_id;
-  return routed;
-}
-
 async function proxyToHost(rpc, env, hostId) {
   const routed = withoutHostRoutingArgument(rpc);
   return proxyDispatch(rpc, routed, env, hostStub(env, hostId), { host_id: hostId });
@@ -462,12 +476,6 @@ async function listGatewaySessions(env, hostId) {
   }));
   const federated = hostResults.flatMap((result) => result.sessions);
   return { ok: true, value: [...legacySessions, ...federated].sort(compareSessionRoute) };
-}
-
-function compareSessionRoute(a, b) {
-  const aHost = a.host_id ?? "";
-  const bHost = b.host_id ?? "";
-  return aHost.localeCompare(bHost) || String(a.session_id ?? "").localeCompare(String(b.session_id ?? ""));
 }
 
 async function resolveUnqualifiedSession(env, sessionId) {
@@ -1053,23 +1061,6 @@ export function pruneExpiredRegistrySessions(sessions, now) {
   return changed;
 }
 
-function agentRoute(value) {
-  if (validateHostId(value?.host_id) && !Object.hasOwn(value ?? {}, "session_id")) {
-    return { host_id: value.host_id };
-  }
-  if (validateSessionId(value?.session_id) && !Object.hasOwn(value ?? {}, "host_id")) {
-    return { session_id: value.session_id };
-  }
-  return {};
-}
-
-function agentRouteKey(value) {
-  const route = agentRoute(value);
-  if (route.host_id) return `host:${route.host_id}`;
-  if (route.session_id) return `session:${route.session_id}`;
-  return null;
-}
-
 function validateAgentIdentity(body, requireGeneration) {
   if (!agentRouteKey(body)) return jsonResponse({ error: "invalid_route_identity" }, 400);
   if (typeof body?.instance_id !== "string" || body.instance_id.length < 1 || body.instance_id.length > 128) {
@@ -1198,193 +1189,6 @@ export async function filterOnlineRegistrySessions(
     }
   }
   return { online, unavailable };
-}
-
-function sessionStub(env, sessionId) {
-  const id = env.GATEWAY_SESSIONS.idFromName(sessionId);
-  return env.GATEWAY_SESSIONS.get(id);
-}
-
-function hostStub(env, hostId) {
-  const id = env.GATEWAY_SESSIONS.idFromName(`host:${hostId}`);
-  return env.GATEWAY_SESSIONS.get(id);
-}
-
-function registryStub(env) {
-  const id = env.GATEWAY_REGISTRY.idFromName("global");
-  return env.GATEWAY_REGISTRY.get(id);
-}
-
-function authorizeLegacyHost(request, env) {
-  if (!env.HOST_TOKEN) return false;
-  const authorization = request.headers.get("authorization") || "";
-  return authorization === `Bearer ${env.HOST_TOKEN}`;
-}
-
-export function federatedHostToken(env, hostId) {
-  if (!validateHostId(hostId) || typeof env?.HOST_TOKENS_JSON !== "string") return null;
-  try {
-    const tokens = JSON.parse(env.HOST_TOKENS_JSON);
-    if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return null;
-    const token = tokens[hostId];
-    return typeof token === "string" && token.length > 0 ? token : null;
-  } catch {
-    return null;
-  }
-}
-
-function authorizeFederatedHost(request, env, hostId) {
-  const token = federatedHostToken(env, hostId);
-  if (!token) return false;
-  const authorization = request.headers.get("authorization") || "";
-  return authorization === `Bearer ${token}`;
-}
-
-async function authorizeClient(request, env) {
-  const authorization = request.headers.get("authorization") || "";
-  if (env.CLIENT_TOKEN && authorization === `Bearer ${env.CLIENT_TOKEN}`) {
-    return { subject: "client-token", email: "-" };
-  }
-  const assertion = request.headers.get("cf-access-jwt-assertion");
-  if (!assertion) return null;
-  try {
-    return await verifyAccessJwt(assertion, env);
-  } catch (error) {
-    console.error("Access JWT rejected", error);
-    return null;
-  }
-}
-
-async function verifyAccessJwt(token, env) {
-  if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUDIENCE) {
-    throw new Error("Access JWT validation is not configured");
-  }
-  const parts = validateAccessJwtShape(token);
-  const header = decodeJwtPart(parts[0]);
-  const claims = decodeJwtPart(parts[1]);
-  if (
-    header.alg !== "RS256"
-    || !accessKidAllowed(header.kid)
-  ) throw new Error("unsupported JWT key");
-
-  const issuer = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
-  const jwks = await getJwks(issuer);
-  const jwk = jwks.find((candidate) => candidate.kid === header.kid);
-  if (!jwk) throw new Error("JWT signing key not found");
-  const key = await crypto.subtle.importKey(
-    "jwk",
-    jwk,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
-  const valid = await crypto.subtle.verify(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    base64UrlBytes(parts[2]),
-    new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
-  );
-  if (!valid) throw new Error("invalid JWT signature");
-
-  const now = Math.floor(Date.now() / 1000);
-  if (typeof claims.exp !== "number" || claims.exp <= now) throw new Error("expired JWT");
-  if (typeof claims.nbf === "number" && claims.nbf > now + 60) throw new Error("JWT not active");
-  if (claims.iss !== issuer) throw new Error("invalid JWT issuer");
-  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  if (!audiences.includes(env.ACCESS_AUDIENCE)) throw new Error("invalid JWT audience");
-
-  const email = typeof claims.email === "string" ? claims.email : "";
-  if (!accessEmailAllowed(env.ACCESS_ALLOWED_EMAILS, email)) {
-    throw new Error("email is not allowed or ACCESS_ALLOWED_EMAILS is empty");
-  }
-  if (typeof claims.sub !== "string" || !claims.sub) throw new Error("JWT subject missing");
-  return { subject: claims.sub, email: claims.email || "-" };
-}
-
-export function boundedLogField(value, fallback = "-") {
-  if (typeof value !== "string") return fallback;
-  if (value.length <= MAX_LOG_FIELD_CHARS) return value;
-  return `${value.slice(0, MAX_LOG_FIELD_CHARS)}…`;
-}
-
-export function validateAccessJwtShape(token) {
-  if (typeof token !== "string" || token.length === 0 || token.length > MAX_ACCESS_JWT_BYTES) {
-    throw new Error("invalid JWT size");
-  }
-  const parts = token.split(".");
-  if (parts.length !== 3) throw new Error("invalid JWT");
-  const limits = [MAX_ACCESS_JWT_HEADER_BYTES, MAX_ACCESS_JWT_CLAIMS_BYTES, MAX_ACCESS_JWT_SIGNATURE_BYTES];
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    if (part.length === 0 || part.length > limits[index] || !/^[A-Za-z0-9_-]+$/.test(part)) {
-      throw new Error("invalid JWT segment");
-    }
-  }
-  return parts;
-}
-
-export function accessKidAllowed(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= MAX_ACCESS_KID_CHARS;
-}
-
-export function normalizeAccessTeamDomain(value) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error("ACCESS_TEAM_DOMAIN is invalid");
-  }
-  const raw = value.trim();
-  const candidate = raw.includes("://") ? raw : `https://${raw}`;
-  let parsed;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    throw new Error("ACCESS_TEAM_DOMAIN is invalid");
-  }
-  if (
-    parsed.protocol !== "https:"
-    || parsed.username !== ""
-    || parsed.password !== ""
-    || parsed.search !== ""
-    || parsed.hash !== ""
-    || parsed.pathname.replaceAll("/", "") !== ""
-    || parsed.hostname === ""
-  ) {
-    throw new Error("ACCESS_TEAM_DOMAIN must be an HTTPS origin without a path");
-  }
-  return parsed.origin;
-}
-
-export function accessEmailAllowed(configured, email) {
-  const allowedEmails = (configured || "")
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
-  if (allowedEmails.length === 0) return false;
-  const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
-  return normalizedEmail.length > 0 && allowedEmails.includes(normalizedEmail);
-}
-
-async function getJwks(teamOrigin) {
-  const cached = jwksCache.get(teamOrigin);
-  if (cached && cached.expiresAt > Date.now()) return cached.keys;
-  const response = await fetch(`${teamOrigin}/cdn-cgi/access/certs`, {
-    cf: { cacheTtl: 300, cacheEverything: true },
-  });
-  if (!response.ok) throw new Error(`failed to fetch Access keys: ${response.status}`);
-  const body = await readBoundedJson(response, MAX_JWKS_BYTES, "Access key response");
-  if (!Array.isArray(body.keys)) throw new Error("invalid Access key response");
-  jwksCache.set(teamOrigin, { keys: body.keys, expiresAt: Date.now() + 300_000 });
-  return body.keys;
-}
-
-function decodeJwtPart(value) {
-  return JSON.parse(new TextDecoder().decode(base64UrlBytes(value)));
-}
-
-function base64UrlBytes(value) {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-  const decoded = atob(padded);
-  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
 }
 
 async function readJson(request, limit = MAX_BODY_BYTES) {
