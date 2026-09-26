@@ -336,7 +336,7 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
                   kind, observed_at, ingested_at
                 ) VALUES (
                   'owner-c1', 'host-c1', 'session-c1', 'missing-digest',
-                  1, 1, 'forge:f4ah6o/temote-mcp',
+                  1, 1, 'github:f4ah6o/temote-mcp',
                   'execution_state', ?, ?
                 )
                 """,
@@ -346,7 +346,7 @@ class FabricC1IngestSqliteTest(unittest.TestCase):
     def test_c1_rejects_repository_mismatch(self):
         self.add_source()
         with self.assertRaises(sqlite3.IntegrityError):
-            self.add_observation(1, repository="forge:other/repository")
+            self.add_observation(1, repository="github:other/repository")
 
     def test_c1_repository_identity_can_resolve_once(self):
         session = "repository-adoption"
