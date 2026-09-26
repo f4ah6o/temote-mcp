@@ -49,3 +49,11 @@ test("Fabric observation and context boundaries do not depend on routing Durable
     assert.doesNotMatch(source, /GatewaySession|GatewayRegistry|GATEWAY_SESSIONS|GATEWAY_REGISTRY/);
   }
 });
+
+
+test("routing runtime owns host/session dispatch and Durable Objects", () => {
+  assert.equal(typeof routingRuntime.handleHostApi, "function");
+  assert.equal(typeof routingRuntime.listGatewaySessions, "function");
+  assert.equal(typeof routingRuntime.GatewaySession, "function");
+  assert.equal(typeof routingRuntime.GatewayRegistry, "function");
+});
