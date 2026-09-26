@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 
 import worker from "../src/index.js";
@@ -14,6 +15,10 @@ const HOST = "host-a";
 const SESSION = "session-a";
 const REPOSITORY = "forge:f4ah6o/temote-mcp";
 const TOKEN = "host-secret";
+const wrangler = fs.readFileSync(
+  new URL("../wrangler.toml", import.meta.url),
+  "utf8",
+);
 
 function observation(revision, idSuffix = revision, overrides = {}) {
   const suffix = String(idSuffix).padStart(12, "0");
@@ -121,6 +126,19 @@ test("C1 contract accepts the supported schema and rejects incompatible validati
     ),
   }));
   assert.equal(oversized.error, "invalid_records");
+
+  const ownerInjection = await validateObservationSyncRequest({
+    ...body([record(1)]),
+    owner_id: "owner-b",
+  });
+  assert.equal(ownerInjection.error, "invalid_sync_request");
+});
+
+test("C1 deployment config declares the D1 binding and migration directory", () => {
+  assert.match(wrangler, /OBSERVATION_OWNER_ID\s*=\s*"replace-with-owner-id"/);
+  assert.match(wrangler, /\[\[d1_databases\]\][\s\S]*binding\s*=\s*"OBSERVATION_DB"/);
+  assert.match(wrangler, /database_name\s*=\s*"temote-observation"/);
+  assert.match(wrangler, /migrations_dir\s*=\s*"migrations"/);
 });
 
 test("host authentication and path host identity are mandatory", async () => {
@@ -198,6 +216,37 @@ test("ack advances only through the committed contiguous prefix and never regres
   result = await sync(body([], { source_head_revision: 2 }), { db: database });
   assert.equal(result.response.status, 200);
   assert.equal(result.json.acked_through_revision, 3);
+});
+
+test("repository identity can resolve once but cannot be rebound", async () => {
+  const database = new FakeD1();
+  let result = await sync(body([record(1)], { repository_key: undefined }), { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(database.source("owner-a", HOST, SESSION).repository_key, null);
+
+  result = await sync(body([record(2)], {
+    source_head_revision: 2,
+    repository_key: REPOSITORY,
+  }), { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(database.source("owner-a", HOST, SESSION).repository_key, REPOSITORY);
+
+  result = await sync(body([], {
+    source_head_revision: 2,
+    repository_key: "github:other/repository",
+  }), { db: database });
+  assert.equal(result.response.status, 409);
+  assert.equal(database.source("owner-a", HOST, SESSION).repository_key, REPOSITORY);
+});
+
+test("D1 commit failure returns no ACK and leaves the source uncommitted", async () => {
+  const database = new FailingWriteD1();
+  const result = await sync(body([record(1)]), { db: database });
+  assert.equal(result.response.status, 500);
+  assert.equal(Object.hasOwn(result.json, "acked_through_revision"), false);
+  assert.equal(Object.hasOwn(result.json, "cloud_head_seq"), false);
+  assert.equal(database.observations.length, 0);
+  assert.equal(database.source("owner-a", HOST, SESSION), undefined);
 });
 
 test("known journal degradation is preserved and Fabric never fabricates missing revisions", async () => {
@@ -382,11 +431,17 @@ class FakeD1 {
     }
 
     if (sql.startsWith("UPDATE observation_sources")) {
-      const [repository, base, head, degraded, gapCount, _headAgain, now, owner, host, session] = args;
+      const [repository, repositoryAgain, base, head, degraded, gapCount, _headAgain, now, owner, host, session] = args;
       const key = owner + "\n" + host + "\n" + session;
       const source = state.sources.get(key);
       if (!source) throw new Error("missing source");
-      if (source.repository_key === null) source.repository_key = repository;
+      if (repository !== repositoryAgain) throw new Error("repository bind mismatch");
+      if (repository !== null) {
+        if (source.repository_key !== null && source.repository_key !== repository) {
+          throw new Error("repository_key immutable");
+        }
+        source.repository_key = repository;
+      }
       source.source_base_revision = Math.max(source.source_base_revision, base);
       source.source_head_revision = Math.max(source.source_head_revision, head);
       source.journal_degraded = source.journal_degraded || degraded ? 1 : 0;
@@ -414,5 +469,15 @@ class FakeD1 {
     }
 
     throw new Error("unexpected SQL in FakeD1: " + sql.slice(0, 80));
+  }
+}
+
+
+class FailingWriteD1 extends FakeD1 {
+  async batch(statements) {
+    if (statements.some((statement) => /^(INSERT|UPDATE)\b/.test(statement.sql.trim()))) {
+      throw new Error("simulated D1 write failure");
+    }
+    return super.batch(statements);
   }
 }
