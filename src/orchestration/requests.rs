@@ -628,6 +628,10 @@ fn parse_task_control<'a>(backend: Backend, args: &'a Value) -> Result<TaskContr
     let interaction_id = match action {
         ControlAction::Steer => {
             validate_task_input(input.context("steer requires input")?, "input")?;
+            anyhow::ensure!(
+                args.get("interaction_id").is_none() && args.get("answer").is_none(),
+                "steer does not accept interaction_id or answer"
+            );
             None
         }
         ControlAction::Resume | ControlAction::Interrupt => {
@@ -1102,6 +1106,14 @@ mod tests {
             error_of(parse_control(Backend::Codex, &args(json!({"input": ""})))),
             "input must contain 1..=1048576 NUL-free UTF-8 bytes"
         );
+        let steer_with_interaction = args(json!({
+            "interaction_id": "0199dddd-dddd-7ddd-8ddd-dddddddddddd",
+            "answer": {"reply": "once"}
+        }));
+        assert_eq!(
+            error_of(parse_control(Backend::Codex, &steer_with_interaction)),
+            "steer does not accept interaction_id or answer"
+        );
         for action in ["resume", "interrupt"] {
             assert_eq!(
                 error_of(parse_control(
@@ -1134,9 +1146,7 @@ mod tests {
         );
 
         args["answer"] = json!({"reply": "once"});
-        let TaskRequest::Control(request) =
-            parse_control(Backend::OpenCode, &args).unwrap()
-        else {
+        let TaskRequest::Control(request) = parse_control(Backend::OpenCode, &args).unwrap() else {
             panic!("OpenCode answer should parse")
         };
         assert_eq!(request.action, ControlAction::Answer);
@@ -1172,9 +1182,14 @@ mod tests {
             ] {
                 assert!(capabilities.supports_control_action(action));
             }
+            let supports_answer = match backend {
+                #[cfg(feature = "network")]
+                Backend::OpenCode => true,
+                _ => false,
+            };
             assert_eq!(
                 capabilities.supports_control_action(ControlAction::Answer),
-                backend == Backend::OpenCode
+                supports_answer
             );
         }
         assert_eq!(

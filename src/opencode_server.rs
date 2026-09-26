@@ -2177,8 +2177,7 @@ impl ServeClient {
                 if let Some(message) = message {
                     body["message"] = json!(message);
                 }
-                let current =
-                    format!("api/session/{session_id}/permission/{request_id}/reply");
+                let current = format!("api/session/{session_id}/permission/{request_id}/reply");
                 if v2_post_json(
                     &inner.client,
                     &inner.base_url,
@@ -2232,8 +2231,7 @@ impl ServeClient {
             }
             Self::SdkV2(inner) => {
                 let body = json!({"answers": answers});
-                let current =
-                    format!("api/session/{session_id}/question/{request_id}/reply");
+                let current = format!("api/session/{session_id}/question/{request_id}/reply");
                 if v2_post_json(
                     &inner.client,
                     &inner.base_url,
@@ -4194,7 +4192,10 @@ fn question_answer(answer: &Value) -> Result<Vec<Vec<String>>> {
         .get("answers")
         .and_then(Value::as_array)
         .context("question answer requires answers")?;
-    anyhow::ensure!(rows.len() <= 64, "question answer accepts at most 64 answers");
+    anyhow::ensure!(
+        rows.len() <= 64,
+        "question answer accepts at most 64 answers"
+    );
     rows.iter()
         .map(|row| {
             let values = row
@@ -4362,14 +4363,8 @@ async fn answer_pending_interaction(
 
     if !still_pending {
         let permit = ensure_current_active_instance(owner, session).await?;
-        let record = finish_interaction_receipt(
-            store,
-            session,
-            owner,
-            task_id,
-            operation_id,
-            after.len(),
-        )?;
+        let record =
+            finish_interaction_receipt(store, session, owner, task_id, operation_id, after.len())?;
         drop(permit);
         return Ok(interaction_result_view(
             &record,
@@ -4385,13 +4380,14 @@ async fn answer_pending_interaction(
     }
 
     let message = match reply {
-        Ok(()) => "OpenCode reported interaction answer success but the exact request remains pending"
-            .to_owned(),
+        Ok(()) => {
+            "OpenCode reported interaction answer success but the exact request remains pending"
+                .to_owned()
+        }
         Err(error) => format!("OpenCode interaction answer failed: {error:#}"),
     };
     let permit = ensure_current_active_instance(owner, session).await?;
-    let record =
-        mark_interaction_uncertain(store, session, owner, task_id, &message)?;
+    let record = mark_interaction_uncertain(store, session, owner, task_id, &message)?;
     drop(permit);
     Ok(interaction_result_view(
         &record,
@@ -5162,7 +5158,10 @@ mod tests {
         assert_eq!(blocked["status"], "waiting_approval");
         assert_eq!(blocked["pending_interactions"].as_array().unwrap().len(), 1);
         assert_eq!(blocked["pending_interactions"][0]["kind"], "permission");
-        assert_eq!(blocked["pending_interactions"][0]["detail"]["action"], "bash");
+        assert_eq!(
+            blocked["pending_interactions"][0]["detail"]["action"],
+            "bash"
+        );
         let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
             .as_str()
             .unwrap()
@@ -5186,7 +5185,10 @@ mod tests {
         .unwrap();
         assert_eq!(answered["interaction"]["result"], "answered");
         assert_eq!(answered["interaction"]["applied"], true);
-        assert_eq!(answered["pending_interactions"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            answered["pending_interactions"].as_array().unwrap().len(),
+            0
+        );
         assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
 
         let replay = task_control_with_store_and_binary(
@@ -5362,7 +5364,10 @@ mod tests {
         .unwrap();
         clear_fake();
         assert_eq!(after["status"], "waiting_approval");
-        assert_eq!(after["pending_interactions"][0]["interaction_id"], interaction_id);
+        assert_eq!(
+            after["pending_interactions"][0]["interaction_id"],
+            interaction_id
+        );
         assert_eq!(fake.lock().unwrap().question_reply_calls.len(), 0);
     }
 
