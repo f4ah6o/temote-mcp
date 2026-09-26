@@ -1,6 +1,6 @@
 # O3C: Temote Fabric shared observation / knowledge plane
 
-Status: design ready / implementation not started  
+Status: implementation in progress / C0 complete  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
@@ -338,6 +338,14 @@ produced_at
 source_through_cloud_seq
 ```
 
+Scope identity rules:
+
+- `scope_id` is required and non-empty
+- user scope uses `scope_id = owner_id`
+- repository scope uses `scope_id = repository_key`
+- workspace/task/execution scopes use their stable non-empty IDs
+- semantic dedupe therefore cannot be bypassed by SQLite `NULL` uniqueness semantics
+
 Statuses remain:
 
 - candidate
@@ -349,6 +357,8 @@ Statuses remain:
 ### 6.6 `knowledge_support`
 
 ```text
+owner_id
+repository_key
 knowledge_id
 observation_cloud_seq
 observation_id
@@ -357,16 +367,20 @@ support_role
 
 Every supported/current fact, decision, constraint, unresolved item and failure pattern must have at least one support row.
 
+Support rows are namespace-bound with composite foreign keys. The `observation_cloud_seq` + `observation_id` pair must identify the same observation in the same owner/repository namespace; cross-owner or cross-repository provenance links are invalid.
+
 ### 6.7 `knowledge_supersession`
 
 ```text
+owner_id
+repository_key
 new_knowledge_id
 old_knowledge_id
 relationship
 created_at
 ```
 
-Old rows are not deleted when superseded.
+Old rows are not deleted when superseded. Supersession edges use composite owner/repository foreign keys for both knowledge IDs, so an edge cannot cross tenant or repository namespaces.
 
 ## 7. Repository identity
 
@@ -774,11 +788,19 @@ Do not implement automatic observation pruning until rebuild/provenance behavior
 ### C0 — contract / schema
 
 - [x] add this child design to O0 / umbrella links
-- [ ] define D1 migration files
-- [ ] define cloud observation schema version
-- [ ] define owner/repository identity mapping
-- [ ] define sync request/ack contract
-- [ ] define freshness/degraded result contract
+- [x] define D1 migration files
+- [x] define cloud observation schema version
+- [x] define owner/repository identity mapping
+- [x] define sync request/ack contract
+- [x] define freshness/degraded result contract
+
+C0 implementation:
+- `gateway/migrations/0001_observation_knowledge.sql`
+- `gateway/src/observation/schema.js`
+- `gateway/test/cloud-observation-schema.test.mjs`
+- `gateway/test/cloud_observation_schema_sqlite.py` (SQLite constraint acceptance)
+
+C0 intentionally does not add the D1 binding, observation ingest endpoint, Queue binding, or R2 binding. Those remain C1/C4/C6 work.
 
 ### C1 — Fabric D1 observation ingest
 
