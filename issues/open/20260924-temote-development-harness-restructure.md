@@ -12,7 +12,8 @@ Related:
 - `issues/open/20260923-devin-acp-backend.md`
 - `issues/open/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
-- `issues/open/20260926-cloud-observation-knowledge-plane.md` (Gateway + D1/Queue/R2 shared observation / knowledge plane)
+- `issues/open/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
+- `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
 - `issues/open/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
 - `issues/done/20260916-managed-worktree-session-integration.md`
@@ -490,14 +491,16 @@ temote activity ...
 
 temote mcp
 temote serve
-temote gateway-agent
+temote fabric connect
 ```
 
-`mcp` / HTTP / Gateway は transport adapter として扱う。
+`mcp` / HTTP / Temote Fabric remote entry は transport/frontend adapter として扱う。
 
-rename の影響範囲 (migration packet で扱う): binary / crate / cargo-dist package、`TEMOTE_MCP_` env prefix、state / socket dir、gateway worker 名と protocol contract、`skills/temote-mcp/`、README / docs / AGENTS.md の product name 規則、release workflow。
+rename の影響範囲 (migration packet で扱う): binary / crate / cargo-dist package、`TEMOTE_MCP_` env prefix、state / socket dir、Temote Fabric Worker（現 gateway worker）名と protocol contract、`skills/temote-mcp/`、README / docs / AGENTS.md の product name 規則、release workflow。Fabric 固有の non-destructive migration は `issues/open/20260926-temote-fabric-product-boundary.md` に従う。
 
 この issue では rename を即時実施せず、core/frontend separation が成立してから migration packet を切る。
+
+Cloud/shared side の正式名称は **Temote Fabric** とする。現行 `gateway/` / `GatewaySession` / `GatewayRegistry` / `gateway-agent` は compatibility / implementation names として段階移行し、Durable Object state や既存 endpoint を命名変更だけで破棄しない。target UX と migration contract は `issues/open/20260926-temote-fabric-product-boundary.md` に固定する。
 
 ## Proposed domain boundaries
 
@@ -531,7 +534,7 @@ transport/
   local/
   mcp/
   http/
-  gateway/
+  fabric/   # target name; current implementation remains under gateway/ during migration
 ```
 
 実際の Rust module 名は既存コードとの差分を見て別 packet で決める。
@@ -603,8 +606,8 @@ A / O / B と F1 の repository identity・freshness・no-local-main の generic
 - [x] O0: observation boundary / raw-vs-derived authority / worker / Context Resolver contract
 - [x] O1: common orchestration boundary の owner-only observation journal。bounded JSONL + reference-first content + idempotent append
 - [x] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + observed task/execution/verification state で local head switch を成立
-- [ ] O3: asynchronous Memory Worker。cloud shared implementation は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、local journal -> Gateway ingest -> D1 -> Queue worker とする
-- [ ] O4: knowledge-aware Context Resolver。Gateway は D1 projection を利用し、host offline でも last synced revision まで provenance 付き repository context を返す
+- [ ] O3: asynchronous Memory Worker。cloud shared implementation は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、local journal -> Temote Fabric ingest -> D1 -> Queue worker とする
+- [ ] O4: knowledge-aware Context Resolver。Temote Fabric は D1 projection を利用し、host offline でも last synced revision まで provenance 付き repository context を返す
 - [ ] worker failure / stale projection を task failure に読み替えず、last processed observation revision を明示する
 
 実装上の優先順位は O1/O2 > D/E。ただし A の共通 identity を飛ばして各 backend に個別 logger を追加しない。
@@ -949,7 +952,7 @@ Prerequisites: <完了 commit / 対象ファイル / test>
 - [ ] task 開始時と提出前に確認した origin/main の commit / 時刻を記録し、fetch 失敗を最新確認済みと扱わない
 - [ ] 既存の dirty / ahead / diverged な checkout は保全し、新規 no-local-main 標準とは区別して移行状態を報告する
 - [ ] MCP を通さず local client / CLI から同じ agent task lifecycle を操作できる
-- [ ] MCP / local / HTTP / Gateway が同じ orchestration core を利用する
+- [ ] MCP / local / HTTP / Temote Fabric remote frontend が同じ orchestration core を利用する
 - [ ] Codex / OpenCode / Devin ACP が task ごとの isolated workspace で動作する
 - [ ] coding agent が workspace path を勝手に決めない
 - [ ] GitHub identity が repository-scoped で、linked worktree を含め global `gh auth switch` を必要としない
