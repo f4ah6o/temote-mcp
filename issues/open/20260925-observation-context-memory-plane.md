@@ -4,6 +4,7 @@ Status: high-priority / O1 + O2 implemented; O3 + O4 implementation not started
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Cloud extension: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
+Fabric naming / boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Priority: high — start contract work in parallel with Phase B/F; implementation hooks follow the common Task/Execution identity from Phase A  
 Created: 2026-09-25 (Asia/Tokyo)
 
@@ -76,7 +77,7 @@ planner ではない。task 分解、実装方針、backend/model 自動選択�
                  |
                  v
       frontend / transport
- MCP / local / HTTP / Gateway
+ MCP / local / HTTP / Temote Fabric
                  |
                  v
        normalized core request
@@ -104,7 +105,7 @@ planner ではない。task 分解、実装方針、backend/model 自動選択�
 ```
 
 「proxy」は wire transport の proxy として実装しない。
-MCP/local/HTTP/Gateway が normalization を終えて Temote core に入る共通境界で observation を作る。
+MCP/local/HTTP/Temote Fabric frontend が normalization を終えて Temote core に入る共通境界で observation を作る。
 
 理由:
 
@@ -479,14 +480,14 @@ Authority:
 - Cloud observation: sanitized replicated observation, execution authority ではない
 - Knowledge: derived / rebuildable projection
 
-O3/O4 の shared plane は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、既存 Cloudflare Gateway deployment を拡張する。
+O3/O4 の shared plane は Temote Fabric とする。`issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、現行 Cloudflare Gateway deployment を拡張して Fabric へ移行する。
 
 初期 cloud layout:
 
 - D1: structured observation replica / checkpoints / knowledge / support / supersession
 - Queue: asynchronous Memory Worker trigger / retry
 - R2: large explicitly-safe content only; optional and not the primary database
-- existing Gateway Durable Objects: routing/liveness responsibility のまま
+- current Gateway routing Durable Objects: routing/liveness responsibility のまま。non-destructive migration 後は Fabric naming に揃える
 
 Cloudflare outage や worker failure は accepted Task / Execution を failed にしてはならない。
 remote head は last successfully synced revision まで host-offline でも repository knowledge を取得できることを O3/O4 の acceptance とする。
@@ -592,7 +593,7 @@ Cloud shared implementation / replication / D1 / Queue contract は `issues/open
 ### O4 — Knowledge-aware resolver
 
 Prerequisite: O3。
-Gateway 経由では cloud D1 projection を利用し、host offline でも last synced revision まで repository context を解決できること。
+Temote Fabric 経由では cloud D1 projection を利用し、host offline でも last synced revision まで repository context を解決できること。
 
 - [ ] current knowledge selection
 - [ ] task-specific vs repository-wide scope policy
@@ -636,7 +637,7 @@ O1/O2 を D (environment) / E (delivery) より優先する。
 - [ ] derived knowledge は support refs を持ち、再生成可能
 - [ ] superseded/stale knowledge を current fact として返さない
 - [x] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
-- [x] MCP/local/HTTP/Gateway で semantic observation contract が変わらない
+- [x] MCP/local/HTTP/Fabric remote frontend で semantic observation contract が変わらない
 - [x] secrets を observation metadata / ordinary output に複製しない
 - [x] raw transcript dump を通常の public surface にしない
 - [ ] worker failure 時も task execution は独立して継続できる
