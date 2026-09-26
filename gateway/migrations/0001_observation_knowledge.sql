@@ -54,6 +54,7 @@ CREATE TABLE observations (
   ingested_at TEXT NOT NULL,
   UNIQUE(owner_id, host_id, session_id, observation_id),
   UNIQUE(owner_id, host_id, session_id, source_revision),
+  UNIQUE(owner_id, repository_key, cloud_seq, observation_id),
   FOREIGN KEY(owner_id, host_id, session_id)
     REFERENCES observation_sources(owner_id, host_id, session_id)
 );
@@ -107,7 +108,7 @@ CREATE TABLE knowledge_items (
   owner_id TEXT NOT NULL,
   repository_key TEXT NOT NULL,
   scope_type TEXT NOT NULL CHECK (scope_type IN ('user', 'repository', 'workspace', 'task', 'execution')),
-  scope_id TEXT,
+  scope_id TEXT NOT NULL CHECK (length(trim(scope_id)) > 0),
   kind TEXT NOT NULL CHECK (kind IN ('fact', 'decision', 'constraint', 'observation', 'failure_pattern', 'unresolved', 'summary')),
   semantic_key TEXT NOT NULL,
   text TEXT NOT NULL,
@@ -119,7 +120,13 @@ CREATE TABLE knowledge_items (
   producer_version TEXT NOT NULL,
   produced_at TEXT NOT NULL,
   source_through_cloud_seq INTEGER NOT NULL DEFAULT 0 CHECK (source_through_cloud_seq >= 0),
-  UNIQUE(owner_id, repository_key, scope_type, scope_id, kind, semantic_key, producer, producer_version)
+  CHECK (
+    (scope_type = 'user' AND scope_id = owner_id)
+    OR (scope_type = 'repository' AND scope_id = repository_key)
+    OR (scope_type IN ('workspace', 'task', 'execution') AND length(trim(scope_id)) > 0)
+  ),
+  UNIQUE(owner_id, repository_key, scope_type, scope_id, kind, semantic_key, producer, producer_version),
+  UNIQUE(owner_id, repository_key, knowledge_id)
 );
 
 CREATE INDEX knowledge_items_current_scope
@@ -128,28 +135,36 @@ CREATE INDEX knowledge_items_repository_seq
   ON knowledge_items(owner_id, repository_key, source_through_cloud_seq);
 
 CREATE TABLE knowledge_support (
+  owner_id TEXT NOT NULL,
+  repository_key TEXT NOT NULL,
   knowledge_id TEXT NOT NULL,
   observation_cloud_seq INTEGER NOT NULL,
   observation_id TEXT NOT NULL,
   support_role TEXT NOT NULL,
-  PRIMARY KEY(knowledge_id, observation_cloud_seq, support_role),
-  FOREIGN KEY(knowledge_id) REFERENCES knowledge_items(knowledge_id) ON DELETE CASCADE,
-  FOREIGN KEY(observation_cloud_seq) REFERENCES observations(cloud_seq)
+  PRIMARY KEY(owner_id, repository_key, knowledge_id, observation_cloud_seq, support_role),
+  FOREIGN KEY(owner_id, repository_key, knowledge_id)
+    REFERENCES knowledge_items(owner_id, repository_key, knowledge_id) ON DELETE CASCADE,
+  FOREIGN KEY(owner_id, repository_key, observation_cloud_seq, observation_id)
+    REFERENCES observations(owner_id, repository_key, cloud_seq, observation_id)
 );
 
 CREATE INDEX knowledge_support_observation
-  ON knowledge_support(observation_cloud_seq, knowledge_id);
+  ON knowledge_support(owner_id, repository_key, observation_cloud_seq, knowledge_id);
 
 CREATE TABLE knowledge_supersession (
+  owner_id TEXT NOT NULL,
+  repository_key TEXT NOT NULL,
   new_knowledge_id TEXT NOT NULL,
   old_knowledge_id TEXT NOT NULL,
   relationship TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  PRIMARY KEY(new_knowledge_id, old_knowledge_id, relationship),
+  PRIMARY KEY(owner_id, repository_key, new_knowledge_id, old_knowledge_id, relationship),
   CHECK (new_knowledge_id <> old_knowledge_id),
-  FOREIGN KEY(new_knowledge_id) REFERENCES knowledge_items(knowledge_id) ON DELETE CASCADE,
-  FOREIGN KEY(old_knowledge_id) REFERENCES knowledge_items(knowledge_id) ON DELETE CASCADE
+  FOREIGN KEY(owner_id, repository_key, new_knowledge_id)
+    REFERENCES knowledge_items(owner_id, repository_key, knowledge_id) ON DELETE CASCADE,
+  FOREIGN KEY(owner_id, repository_key, old_knowledge_id)
+    REFERENCES knowledge_items(owner_id, repository_key, knowledge_id) ON DELETE CASCADE
 );
 
 CREATE INDEX knowledge_supersession_old
-  ON knowledge_supersession(old_knowledge_id, new_knowledge_id);
+  ON knowledge_supersession(owner_id, repository_key, old_knowledge_id, new_knowledge_id);

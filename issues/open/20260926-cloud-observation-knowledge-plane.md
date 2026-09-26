@@ -338,6 +338,14 @@ produced_at
 source_through_cloud_seq
 ```
 
+Scope identity rules:
+
+- `scope_id` is required and non-empty
+- user scope uses `scope_id = owner_id`
+- repository scope uses `scope_id = repository_key`
+- workspace/task/execution scopes use their stable non-empty IDs
+- semantic dedupe therefore cannot be bypassed by SQLite `NULL` uniqueness semantics
+
 Statuses remain:
 
 - candidate
@@ -349,6 +357,8 @@ Statuses remain:
 ### 6.6 `knowledge_support`
 
 ```text
+owner_id
+repository_key
 knowledge_id
 observation_cloud_seq
 observation_id
@@ -357,16 +367,20 @@ support_role
 
 Every supported/current fact, decision, constraint, unresolved item and failure pattern must have at least one support row.
 
+Support rows are namespace-bound with composite foreign keys. The `observation_cloud_seq` + `observation_id` pair must identify the same observation in the same owner/repository namespace; cross-owner or cross-repository provenance links are invalid.
+
 ### 6.7 `knowledge_supersession`
 
 ```text
+owner_id
+repository_key
 new_knowledge_id
 old_knowledge_id
 relationship
 created_at
 ```
 
-Old rows are not deleted when superseded.
+Old rows are not deleted when superseded. Supersession edges use composite owner/repository foreign keys for both knowledge IDs, so an edge cannot cross tenant or repository namespaces.
 
 ## 7. Repository identity
 
