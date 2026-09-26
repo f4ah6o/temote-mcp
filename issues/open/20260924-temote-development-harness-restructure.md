@@ -1,9 +1,9 @@
 # Temote を local / remote agentic development harness へ再構成する
 
-Status: open / umbrella tracker (polished; implementation not started)
+Status: open / umbrella tracker (implementation underway)
 Execution unit: one bounded child packet per run (small-model implementation guide below)
 Created: 2026-09-24 (Asia/Tokyo)
-Updated: 2026-09-24 (Asia/Tokyo) — current `main` baseline / gh-git / gh-stack facts verified; scope / responsibility boundaries revised per PR #47 design review; user priorities: approve-free agent mode, caller-location independence, no local main
+Updated: 2026-09-26 (Asia/Tokyo) — Phase O O1/O2 implemented; cloud observation / knowledge child design added; earlier PR #47 scope boundaries retained
 Baseline inspected: `ba4c51c` (`main`, after PR #46 delegation-only tool surface)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Related:
@@ -12,6 +12,7 @@ Related:
 - `issues/open/20260923-devin-acp-backend.md`
 - `issues/open/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
+- `issues/open/20260926-cloud-observation-knowledge-plane.md` (Gateway + D1/Queue/R2 shared observation / knowledge plane)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
 - `issues/open/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
 - `issues/done/20260916-managed-worktree-session-integration.md`
@@ -600,10 +601,10 @@ A / O / B と F1 の repository identity・freshness・no-local-main の generic
 詳細 contract: `issues/open/20260925-observation-context-memory-plane.md`。
 
 - [x] O0: observation boundary / raw-vs-derived authority / worker / Context Resolver contract
-- [ ] O1: common orchestration boundary の owner-only observation journal。instruction は canonical task/evidence への reference-first とし、secret-bearing structured field を複製しない
-- [ ] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + verified task/execution/verification state だけで head switch を成立させる
-- [ ] O3: asynchronous Memory Worker。checkpoint / support refs / dedupe / supersession / retry idempotency
-- [ ] O4: knowledge-aware Context Resolver。current facts / decisions / constraints / unresolved / failure pattern を provenance 付きで返す
+- [x] O1: common orchestration boundary の owner-only observation journal。bounded JSONL + reference-first content + idempotent append
+- [x] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + observed task/execution/verification state で local head switch を成立
+- [ ] O3: asynchronous Memory Worker。cloud shared implementation は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、local journal -> Gateway ingest -> D1 -> Queue worker とする
+- [ ] O4: knowledge-aware Context Resolver。Gateway は D1 projection を利用し、host offline でも last synced revision まで provenance 付き repository context を返す
 - [ ] worker failure / stale projection を task failure に読み替えず、last processed observation revision を明示する
 
 実装上の優先順位は O1/O2 > D/E。ただし A の共通 identity を飛ばして各 backend に個別 logger を追加しない。
