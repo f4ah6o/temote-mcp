@@ -629,7 +629,8 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             ));
         }
 
-        if let (ReceiptState::Completed, Some(mut result)) = (receipt.state, receipt.result.clone()) {
+        if let (ReceiptState::Completed, Some(mut result)) = (receipt.state, receipt.result.clone())
+        {
             result.replayed = true;
             return Ok(result);
         }
@@ -1538,9 +1539,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = manager
-            .reconcile_snapshot("task-a", operation_id)
-            .unwrap();
+        let result = manager.reconcile_snapshot("task-a", operation_id).unwrap();
         assert!(result.reconciled);
         assert!(!result.replayed);
         assert_eq!(result.before.materialized_revision, initial);
@@ -1548,9 +1547,7 @@ mod tests {
         assert_eq!(runner.state.lock().unwrap().status_calls, 0);
         assert_eq!(sink.0.lock().unwrap().len(), 1);
 
-        let replay = manager
-            .reconcile_snapshot("task-a", operation_id)
-            .unwrap();
+        let replay = manager.reconcile_snapshot("task-a", operation_id).unwrap();
         assert!(replay.replayed);
         assert!(replay.reconciled);
         assert_eq!(sink.0.lock().unwrap().len(), 1);
