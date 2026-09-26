@@ -1869,7 +1869,6 @@ async fn reconcile(
     }
     Ok((record, evidence_ref))
 }
-
 async fn drain_catalog_stream_bounded<R>(
     mut reader: R,
     limit: usize,
