@@ -16,6 +16,14 @@ END;
 
 -- repository_key is part of the cloud namespace. Keep every new observation
 -- aligned with its owning source row even under concurrent sync attempts.
+CREATE TRIGGER observation_sources_repository_immutable
+BEFORE UPDATE OF repository_key ON observation_sources
+WHEN OLD.repository_key IS NOT NULL
+  AND NEW.repository_key IS NOT OLD.repository_key
+BEGIN
+  SELECT RAISE(ABORT, 'observation source repository_key is immutable once resolved');
+END;
+
 CREATE TRIGGER observations_source_repository_match
 BEFORE INSERT ON observations
 WHEN NOT EXISTS (
@@ -24,7 +32,10 @@ WHEN NOT EXISTS (
   WHERE source.owner_id = NEW.owner_id
     AND source.host_id = NEW.host_id
     AND source.session_id = NEW.session_id
-    AND source.repository_key IS NEW.repository_key
+    AND (
+      source.repository_key IS NULL
+      OR source.repository_key IS NEW.repository_key
+    )
 )
 BEGIN
   SELECT RAISE(ABORT, 'observation repository_key does not match source');
