@@ -798,6 +798,7 @@ C0 implementation:
 - `gateway/migrations/0001_observation_knowledge.sql`
 - `gateway/src/observation/schema.js`
 - `gateway/test/cloud-observation-schema.test.mjs`
+- `gateway/test/cloud_observation_schema_sqlite.py` (SQLite constraint acceptance)
 
 C0 intentionally does not add the D1 binding, observation ingest endpoint, Queue binding, or R2 binding. Those remain C1/C4/C6 work.
 
