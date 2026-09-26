@@ -1176,21 +1176,29 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
         validate_devin_mode(mode)?;
     }
     validate_swe_tier(record.swe_tier.as_deref(), record.devin_mode.as_deref())?;
-    if let Some(effective) = &record.effective_devin_mode {
-        validate_argument(effective, "effective_devin_mode")?;
-        if record.swe_tier.as_deref() == Some("priority") {
-            let requested = record
-                .devin_mode
-                .as_deref()
-                .context("priority SWE-2 record is missing devin_mode")?;
+    match record.effective_devin_mode.as_deref() {
+        Some(effective) => {
+            validate_argument(effective, "effective_devin_mode")?;
+            if record.swe_tier.as_deref() == Some("priority") {
+                let requested = record
+                    .devin_mode
+                    .as_deref()
+                    .context("priority SWE-2 record is missing devin_mode")?;
+                anyhow::ensure!(
+                    is_swe2_priority_uid(effective, requested),
+                    "priority SWE-2 record has an invalid effective Devin mode"
+                );
+            } else if let Some(requested) = record.devin_mode.as_deref() {
+                anyhow::ensure!(
+                    effective == requested,
+                    "non-priority Devin Cloud record changed its effective mode"
+                );
+            }
+        }
+        None => {
             anyhow::ensure!(
-                is_swe2_priority_uid(effective, requested),
-                "priority SWE-2 record has an invalid effective Devin mode"
-            );
-        } else if let Some(requested) = record.devin_mode.as_deref() {
-            anyhow::ensure!(
-                effective == requested,
-                "non-priority Devin Cloud record changed its effective mode"
+                record.swe_tier.is_none(),
+                "tiered SWE-2 record is missing effective Devin mode"
             );
         }
     }
