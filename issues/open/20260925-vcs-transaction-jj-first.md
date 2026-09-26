@@ -4,6 +4,7 @@ Status: implementation underway — V0/V1/V2 complete; V3 first slice merged; V3
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/open/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
+Delivery graph child: `issues/open/20260926-task-change-orchestration-stacked-pr.md`  
 Created: 2026-09-25 (Asia/Tokyo)
 
 ## 1. Problem
@@ -531,7 +532,8 @@ First slice merged in PR #59 (merge commit `3213c17368b3ae214de8ef1a65a1fbdf154c
 
 - [ ] jj changes → delivery bookmarks/refs
 - [ ] single PR
-- [ ] stacked PR strategy decision
+- [x] stacked PR strategy decision: Task/Change dependency graph is authoritative; agent hierarchy is not delivery topology (`issues/open/20260926-task-change-orchestration-stacked-pr.md`)
+- [ ] persistent Temote Change record + dependency-aware delivery planner
 - [ ] remote receipt/reconciliation
 - [ ] final verification binds to delivered revision
 
