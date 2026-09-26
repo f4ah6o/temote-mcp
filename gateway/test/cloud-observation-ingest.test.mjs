@@ -13,7 +13,7 @@ import { FABRIC_AUTHORITY } from "../src/observation/schema.js";
 
 const HOST = "host-a";
 const SESSION = "session-a";
-const REPOSITORY = "forge:f4ah6o/temote-mcp";
+const REPOSITORY = "github:f4ah6o/temote-mcp";
 const TOKEN = "host-secret";
 const wrangler = fs.readFileSync(
   new URL("../wrangler.toml", import.meta.url),
