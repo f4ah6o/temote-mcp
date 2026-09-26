@@ -97,6 +97,7 @@ pub(crate) struct VcsCapabilities {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceEnsureRequest {
     pub workspace_id: String,
+    pub task_id: String,
     pub backend: VcsBackendKind,
     pub base_revision: String,
 }
@@ -108,6 +109,8 @@ struct WorkspaceRecord {
     request_fingerprint: String,
     repository_root: PathBuf,
     workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
     backend: VcsBackendKind,
     path: PathBuf,
     base_revision: String,
@@ -127,6 +130,8 @@ pub(crate) struct JujutsuState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceState {
     pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub backend: VcsBackendKind,
     pub path: PathBuf,
     pub base_revision: String,
@@ -143,6 +148,7 @@ pub(crate) struct WorkspaceEnsureResult {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VcsSnapshotObserved {
+    pub operation_id: Uuid,
     pub workspace_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -182,6 +188,10 @@ struct SnapshotReceipt {
     operation_id: Uuid,
     request_fingerprint: String,
     state: ReceiptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     before: Option<JujutsuState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,6 +426,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         request: &WorkspaceEnsureRequest,
     ) -> VcsResult<WorkspaceEnsureResult> {
         validate_workspace_id(&request.workspace_id)?;
+        validate_correlation_id("task_id", &request.task_id)?;
         validate_exact_revision(&request.base_revision)?;
         self.require_backend(request.backend)?;
         self.require_jj_repository()?;
@@ -482,6 +493,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             request_fingerprint: fingerprint,
             repository_root: self.repository_root.clone(),
             workspace_id: request.workspace_id.clone(),
+            task_id: Some(request.task_id.clone()),
             backend: request.backend,
             path: canonical_path,
             base_revision: request.base_revision.clone(),
@@ -511,9 +523,13 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         &self,
         workspace_id: &str,
         operation_id: Uuid,
+        execution_id: Option<&str>,
     ) -> VcsResult<SnapshotResult> {
         validate_workspace_id(workspace_id)?;
-        let request_fingerprint = snapshot_fingerprint(workspace_id);
+        if let Some(execution_id) = execution_id {
+            validate_correlation_id("execution_id", execution_id)?;
+        }
+        let request_fingerprint = snapshot_fingerprint(workspace_id, execution_id);
         let receipt_path = self.operation_receipt_path(operation_id);
         let _lock = self.acquire_store_lock()?;
 
@@ -558,6 +574,8 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             operation_id,
             request_fingerprint: request_fingerprint.clone(),
             state: ReceiptState::Accepted,
+            task_id: record.task_id.clone(),
+            execution_id: execution_id.map(str::to_owned),
             before: Some(before.clone()),
             result: None,
         };
@@ -571,9 +589,10 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         )?;
         let after = self.inspect_jj(&record.path)?;
         let observation = VcsSnapshotObserved {
+            operation_id,
             workspace_id: workspace_id.to_owned(),
-            task_id: None,
-            execution_id: None,
+            task_id: record.task_id.clone(),
+            execution_id: execution_id.map(str::to_owned),
             backend: record.backend,
             logical_change_id: after.logical_change_id.clone(),
             before_revision: before.materialized_revision.clone(),
@@ -595,6 +614,8 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             operation_id,
             request_fingerprint,
             state: ReceiptState::Completed,
+            task_id: record.task_id.clone(),
+            execution_id: execution_id.map(str::to_owned),
             before: None,
             result: Some(result.clone()),
         };
@@ -609,7 +630,6 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         operation_id: Uuid,
     ) -> VcsResult<SnapshotResult> {
         validate_workspace_id(workspace_id)?;
-        let request_fingerprint = snapshot_fingerprint(workspace_id);
         let receipt_path = self.operation_receipt_path(operation_id);
         let _lock = self.acquire_store_lock()?;
 
@@ -622,6 +642,8 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
 
         let receipt: SnapshotReceipt = read_json_record(&receipt_path)?;
         validate_receipt(&receipt, operation_id)?;
+        let request_fingerprint =
+            snapshot_fingerprint(workspace_id, receipt.execution_id.as_deref());
         if receipt.request_fingerprint != request_fingerprint {
             return Err(VcsError::new(
                 VcsErrorCode::OperationConflict,
@@ -641,10 +663,16 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
             ));
         }
 
-        let before = receipt.before.ok_or_else(|| {
+        let before = receipt.before.clone().ok_or_else(|| {
             VcsError::new(
                 VcsErrorCode::ReconciliationRequired,
                 "accepted VCS snapshot receipt predates persisted before-state; automatic backfill is unsafe",
+            )
+        })?;
+        let task_id = receipt.task_id.clone().ok_or_else(|| {
+            VcsError::new(
+                VcsErrorCode::ReconciliationRequired,
+                "accepted VCS snapshot receipt predates persisted task correlation; automatic backfill is unsafe",
             )
         })?;
 
@@ -657,6 +685,12 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         }
         let record: WorkspaceRecord = read_json_record(&record_path)?;
         validate_workspace_record(&record, &self.repository_root, &self.managed_root)?;
+        if record.task_id.as_deref() != Some(task_id.as_str()) {
+            return Err(VcsError::new(
+                VcsErrorCode::WorkspaceConflict,
+                "snapshot receipt task correlation does not match the registered workspace",
+            ));
+        }
         let after = self.inspect_jj(&record.path)?;
 
         if after == before {
@@ -667,9 +701,10 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         }
 
         let observation = VcsSnapshotObserved {
+            operation_id,
             workspace_id: workspace_id.to_owned(),
-            task_id: None,
-            execution_id: None,
+            task_id: Some(task_id.clone()),
+            execution_id: receipt.execution_id.clone(),
             backend: record.backend,
             logical_change_id: after.logical_change_id.clone(),
             before_revision: before.materialized_revision.clone(),
@@ -759,6 +794,7 @@ impl<R: CommandRunner, S: VcsObservationSink> VcsManager<R, S> {
         ensure_descendant(&self.managed_root, &path, "registered workspace")?;
         Ok(WorkspaceState {
             workspace_id: record.workspace_id.clone(),
+            task_id: record.task_id.clone(),
             backend: record.backend,
             path,
             base_revision: record.base_revision.clone(),
@@ -1001,6 +1037,21 @@ fn validate_workspace_id(workspace_id: &str) -> VcsResult<()> {
     }
 }
 
+fn validate_correlation_id(label: &str, value: &str) -> VcsResult<()> {
+    const MAX_BYTES: usize = 256;
+    let valid = !value.is_empty()
+        && value.len() <= MAX_BYTES
+        && !value.chars().any(char::is_control);
+    if valid {
+        Ok(())
+    } else {
+        Err(VcsError::new(
+            VcsErrorCode::InvalidRequest,
+            format!("{label} must be 1..={MAX_BYTES} bytes and contain no control characters"),
+        ))
+    }
+}
+
 fn validate_exact_revision(revision: &str) -> VcsResult<()> {
     if matches!(revision.len(), 40 | 64) && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -1024,14 +1075,18 @@ fn workspace_fingerprint(repository_root: &Path, request: &WorkspaceEnsureReques
     hasher.update(b"\0");
     hasher.update(request.workspace_id.as_bytes());
     hasher.update(b"\0");
+    hasher.update(request.task_id.as_bytes());
+    hasher.update(b"\0");
     hasher.update(request.base_revision.as_bytes());
     hex_digest(&hasher.finalize())
 }
 
-fn snapshot_fingerprint(workspace_id: &str) -> String {
+fn snapshot_fingerprint(workspace_id: &str, execution_id: Option<&str>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"temote-vcs-snapshot-v1\0");
+    hasher.update(b"temote-vcs-snapshot-v2\0");
     hasher.update(workspace_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(execution_id.unwrap_or_default().as_bytes());
     hex_digest(&hasher.finalize())
 }
 
@@ -1051,6 +1106,9 @@ fn validate_workspace_record(
         ));
     }
     validate_workspace_id(&record.workspace_id)?;
+    if let Some(task_id) = record.task_id.as_deref() {
+        validate_correlation_id("task_id", task_id)?;
+    }
     validate_exact_revision(&record.base_revision)?;
     if record.repository_root != repository_root {
         return Err(VcsError::new(
@@ -1363,6 +1421,7 @@ mod tests {
     fn request(workspace_id: &str, base: char) -> WorkspaceEnsureRequest {
         WorkspaceEnsureRequest {
             workspace_id: workspace_id.into(),
+            task_id: format!("task-for-{workspace_id}"),
             backend: VcsBackendKind::Jujutsu,
             base_revision: base.to_string().repeat(40),
         }
@@ -1420,6 +1479,12 @@ mod tests {
                 .code,
             VcsErrorCode::WorkspaceConflict
         );
+        let mut changed_task = request("task-a", 'a');
+        changed_task.task_id = "other-task".into();
+        assert_eq!(
+            manager.workspace_ensure(&changed_task).unwrap_err().code,
+            VcsErrorCode::WorkspaceConflict
+        );
     }
 
     #[test]
@@ -1434,6 +1499,7 @@ mod tests {
         );
         request = WorkspaceEnsureRequest {
             workspace_id: "task-b".into(),
+            task_id: "logical-task-b".into(),
             backend: VcsBackendKind::Jujutsu,
             base_revision: "origin/main".into(),
         };
@@ -1461,17 +1527,30 @@ mod tests {
         manager.workspace_ensure(&request("task-a", 'a')).unwrap();
 
         let operation_id = Uuid::new_v4();
-        let result = manager.snapshot("task-a", operation_id).unwrap();
+        let result = manager.snapshot("task-a", operation_id, Some("exec-a")).unwrap();
         assert_eq!(result.before.logical_change_id, "change-a");
         assert_eq!(result.after.logical_change_id, "change-a");
         assert_eq!(result.before.materialized_revision, initial);
         assert_eq!(result.after.materialized_revision, updated);
         assert_eq!(result.observation.vcs_operation_id, "op-b");
+        assert_eq!(
+            result.observation.task_id.as_deref(),
+            Some("task-for-task-a")
+        );
+        assert_eq!(result.observation.execution_id.as_deref(), Some("exec-a"));
+        assert_eq!(result.observation.operation_id, operation_id);
         assert!(!result.replayed);
         assert!(!result.reconciled);
 
-        let replay = manager.snapshot("task-a", operation_id).unwrap();
+        let replay = manager.snapshot("task-a", operation_id, Some("exec-a")).unwrap();
         assert!(replay.replayed);
+        assert_eq!(
+            manager
+                .snapshot("task-a", operation_id, Some("exec-b"))
+                .unwrap_err()
+                .code,
+            VcsErrorCode::OperationConflict
+        );
         assert_eq!(runner.state.lock().unwrap().status_calls, 1);
         assert_eq!(sink.0.lock().unwrap().len(), 1);
     }
@@ -1488,8 +1567,10 @@ mod tests {
             &SnapshotReceipt {
                 schema_version: SCHEMA_VERSION,
                 operation_id,
-                request_fingerprint: snapshot_fingerprint("task-a"),
+                request_fingerprint: snapshot_fingerprint("task-a", Some("exec-a")),
                 state: ReceiptState::Accepted,
+                task_id: Some("task-for-task-a".into()),
+                execution_id: Some("exec-a".into()),
                 before: Some(manager.inspect("task-a").unwrap().jj),
                 result: None,
             },
@@ -1497,7 +1578,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            manager.snapshot("task-a", operation_id).unwrap_err().code,
+            manager.snapshot("task-a", operation_id, Some("exec-a")).unwrap_err().code,
             VcsErrorCode::ReconciliationRequired
         );
         assert_eq!(runner.state.lock().unwrap().status_calls, 0);
@@ -1525,8 +1606,10 @@ mod tests {
             &SnapshotReceipt {
                 schema_version: SCHEMA_VERSION,
                 operation_id,
-                request_fingerprint: snapshot_fingerprint("task-a"),
+                request_fingerprint: snapshot_fingerprint("task-a", Some("exec-a")),
                 state: ReceiptState::Accepted,
+                task_id: Some("task-for-task-a".into()),
+                execution_id: Some("exec-a".into()),
                 before: Some(JujutsuState {
                     logical_change_id: "change-a".into(),
                     materialized_revision: initial.clone(),
@@ -1570,8 +1653,10 @@ mod tests {
             &SnapshotReceipt {
                 schema_version: SCHEMA_VERSION,
                 operation_id,
-                request_fingerprint: snapshot_fingerprint("task-a"),
+                request_fingerprint: snapshot_fingerprint("task-a", Some("exec-a")),
                 state: ReceiptState::Accepted,
+                task_id: Some("task-for-task-a".into()),
+                execution_id: Some("exec-a".into()),
                 before: Some(JujutsuState {
                     logical_change_id: "change-a".into(),
                     materialized_revision: revision,
@@ -1609,8 +1694,10 @@ mod tests {
             &SnapshotReceipt {
                 schema_version: SCHEMA_VERSION,
                 operation_id,
-                request_fingerprint: snapshot_fingerprint("task-a"),
+                request_fingerprint: snapshot_fingerprint("task-a", Some("exec-a")),
                 state: ReceiptState::Accepted,
+                task_id: Some("task-for-task-a".into()),
+                execution_id: Some("exec-a".into()),
                 before: None,
                 result: None,
             },
@@ -1634,6 +1721,8 @@ mod tests {
         assert!(first.workspace.path.starts_with(&managed));
         assert!(second.workspace.path.starts_with(&managed));
         assert!(!fixture.repository.join(".git").exists());
-        assert_eq!(manager.inspect("task-a").unwrap().workspace_id, "task-a");
+        let inspected = manager.inspect("task-a").unwrap();
+        assert_eq!(inspected.workspace_id, "task-a");
+        assert_eq!(inspected.task_id.as_deref(), Some("task-for-task-a"));
     }
 }
