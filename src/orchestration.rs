@@ -542,6 +542,7 @@ fn devin_cloud_task_start_approval(
     let operation_id = render_approval_argument(request.operation_id);
     let title = render_optional_approval_argument(options.title);
     let devin_mode = render_optional_approval_argument(options.devin_mode);
+    let swe_tier = render_optional_approval_argument(options.swe_tier);
     let repos = options.repos.len().to_string();
     let mut metadata = approval_metadata(
         Backend::DevinCloud,
@@ -553,11 +554,12 @@ fn devin_cloud_task_start_approval(
     metadata.insert("operation_id".to_owned(), operation_id.clone());
     metadata.insert("title".to_owned(), title.clone());
     metadata.insert("devin_mode".to_owned(), devin_mode.clone());
+    metadata.insert("swe_tier".to_owned(), swe_tier.clone());
     metadata.insert("repos".to_owned(), repos.clone());
     metadata.insert("task_input".to_owned(), "omitted".to_owned());
     (
         format!(
-            "Devin Cloud delegation request\noperation: start hosted session\nmutation: remote Devin Cloud session (consumes ACUs)\nscope: Devin Cloud organization, not this host\ntitle: {title}\ndevin_mode: {devin_mode}\nrepos: {repos}\noperation_id: {operation_id}\ntask input: omitted"
+            "Devin Cloud delegation request\noperation: start hosted session\nmutation: remote Devin Cloud session (consumes ACUs)\nscope: Devin Cloud organization, not this host\ntitle: {title}\ndevin_mode: {devin_mode}\nswe_tier: {swe_tier}\nrepos: {repos}\noperation_id: {operation_id}\ntask input: omitted"
         ),
         metadata,
     )
