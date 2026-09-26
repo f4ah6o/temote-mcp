@@ -593,7 +593,7 @@ transport/
 - [x] V0: Git snapshot broker と jj-first の設計比較、VCS abstraction / snapshot / observation / delivery boundary
 - [x] V1: temporary fixture で jj feasibility prototype。**jj-first viable**。bare Git backend、複数 `jj workspace`、change_id、crash後 snapshot、Git read-only compatibility、delivery ref を実測済み
 - [x] V2: backend-neutral VCS/workspace contract を `issues/open/20260925-v2-vcs-workspace-contract.md` に固定。F1 generic parts を保持し jj-first / Git compatibility を分離
-- [ ] V3: typed Temote VCS adapter + Observation hook
+- [ ] V3: **first slice merged in PR #59** — typed jj-first core / capability / workspace ensure / inspect / snapshot receipts / observation seam are implemented. Remaining: reconcile, durable Observation journal emission, Task/Execution/VCS correlation, workspace release, automatic task-boundary snapshot wiring
 - [ ] V4: GitHub delivery integration / stacked PR strategy
 
 **V1/V2 は完了済み。F2/F3/C は `issues/open/20260925-v2-vcs-workspace-contract.md` に従って backend-neutral に進め、git-worktree-only 実装には戻さない。**
