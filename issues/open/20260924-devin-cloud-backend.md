@@ -70,7 +70,7 @@ tool 名・approval class・task store・env 変数をすべて分離し、混�
   利用には Mac host 側で API key を設定して supervisor を再起動する必要がある。
 - 2026-09-24 `devin_mode` に `swe-2-medium` / `swe-2-high` / `swe-2-max` を追加
   (API v3 が受理する mode id)。この 3 値は SWE-2 の reasoning effort を選ぶもので、promo の課金/利用資格や priority/fast service lane を選ぶ値ではない。tool schema enum・`validate_devin_mode`・gateway `protocol.js`・contract snapshot / fingerprint を同期済み。
-- 2026-09-26: SWE-2 の promo と priority/fast は upstream では effort と別軸として扱われることを確認。Temote の verified Cloud contract では `devin_mode` から promo/priority を明示選択しない。2026-09-17 の `devin models list --format json` snapshot では SWE-2 UID は `swe-2-medium` / `swe-2-high` / `swe-2-max` のみで、SWE-2 priority UID は未観測。2026-09-26 live catalog は sandbox network 制限で再取得できなかったため、未確認の priority wire identifier / API field は追加しない。
+- 2026-09-26: SWE-2 の promo と priority/fast は effort と別軸として扱う。`devin_cloud_task_start.swe_tier` に `promo|priority` を追加する実装 packet に着手。`promo` は requested `swe-2-medium/high/max` をそのまま使用し、promo eligibility は upstream account に委ねる。`priority` は hard-coded suffix を持たず、local `devin models list --format json` の account-visible catalog から requested effort + `priority|fast` token を持つ exact `model_uid` が一意に見つかった場合だけ使用する。CLI/login/network/catalog parse/候補なし/複数候補は remote session create 前に fail closed する。既存 snapshot と Devin 3000.11.1 binary inspection では SWE-2 priority UID は未観測なので、live account で priority が提供されていない場合は明示的に unavailable となる。
 
 ## Subscription 利用について (2026-09-24 coordinator 回答「サブスクリプションの範囲で使いたい」)
 
