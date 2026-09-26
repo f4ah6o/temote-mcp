@@ -1,10 +1,17 @@
 // Fabric observation boundary.
 //
-// FBR1 only establishes the module boundary. Durable observation ingestion,
-// D1 schema, replication cursors, and Queue delivery are implemented by the
-// O3C C0+ packets; routing Durable Objects must not own that state.
+// FBR1 establishes the module boundary. C0 adds the cloud schema/contracts only;
+// durable D1 ingestion, bindings, replication cursors, and Queue delivery remain
+// C1+ work. Routing Durable Objects must not own that state.
 
-export const OBSERVATION_SCHEMA_VERSION = 1;
+export {
+  FABRIC_AUTHORITY,
+  FABRIC_FRESHNESS_CONTRACT,
+  OBSERVATION_SCHEMA_VERSION,
+  OBSERVATION_SYNC_CONTRACT,
+  OWNER_REPOSITORY_IDENTITY_CONTRACT,
+  canonicalRepositoryKey,
+} from "./schema.js";
 
 export function observationPlaneBindings(env) {
   return {
