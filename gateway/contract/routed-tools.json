@@ -804,6 +804,13 @@
           "session_id": {
             "type": "string"
           },
+          "swe_tier": {
+            "enum": [
+              "promo",
+              "priority"
+            ],
+            "type": "string"
+          },
           "task": {
             "maxLength": 1048576,
             "minLength": 1,
