@@ -1567,7 +1567,7 @@ fn pending_interactions_from(
             });
         }
     }
-    interactions.sort_by(|left, right| left.interaction_id.cmp(&right.interaction_id));
+    interactions.sort_by_key(|interaction| interaction.interaction_id);
     Ok(interactions)
 }
 
@@ -4076,15 +4076,19 @@ async fn task_control_with_store_and_binary(
 
     if action == "answer" {
         return answer_pending_interaction(
-            session,
-            &owner,
-            store,
+            InteractionAnswerContext {
+                session,
+                owner: &owner,
+                store,
+                client: &client,
+                opencode_session_id: &opencode_session_id,
+            },
             record,
-            &client,
-            &opencode_session_id,
-            operation_id,
-            interaction_id.expect("answer validates interaction id"),
-            answer.expect("answer validates payload"),
+            InteractionAnswerRequest {
+                operation_id,
+                interaction_id: interaction_id.expect("answer validates interaction id"),
+                answer: answer.expect("answer validates payload"),
+            },
         )
         .await;
     }
@@ -4280,17 +4284,37 @@ fn mark_interaction_uncertain(
     })
 }
 
-async fn answer_pending_interaction(
-    session: &config::Session,
-    owner: &SessionInstance,
-    store: &TaskStore,
-    record: TaskRecord,
-    client: &ServeClient,
-    opencode_session_id: &str,
+struct InteractionAnswerContext<'a> {
+    session: &'a config::Session,
+    owner: &'a SessionInstance,
+    store: &'a TaskStore,
+    client: &'a ServeClient,
+    opencode_session_id: &'a str,
+}
+
+struct InteractionAnswerRequest<'a> {
     operation_id: Uuid,
     interaction_id: Uuid,
-    answer: &Value,
+    answer: &'a Value,
+}
+
+async fn answer_pending_interaction(
+    context: InteractionAnswerContext<'_>,
+    record: TaskRecord,
+    request: InteractionAnswerRequest<'_>,
 ) -> Result<Value> {
+    let InteractionAnswerContext {
+        session,
+        owner,
+        store,
+        client,
+        opencode_session_id,
+    } = context;
+    let InteractionAnswerRequest {
+        operation_id,
+        interaction_id,
+        answer,
+    } = request;
     let task_id = record.task_id;
     let pending = pending_interactions(client, task_id, opencode_session_id).await?;
     let Some(target) = pending
