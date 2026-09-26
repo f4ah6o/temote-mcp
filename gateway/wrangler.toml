@@ -10,6 +10,15 @@ binding = "GATEWAY_DEPLOYMENT"
 ACCESS_TEAM_DOMAIN = "replace-me.cloudflareaccess.com"
 ACCESS_AUDIENCE = "replace-with-access-application-aud"
 ACCESS_ALLOWED_EMAILS = "replace@example.com"
+OBSERVATION_OWNER_ID = "replace-with-owner-id"
+
+# Replace the sentinel database_id after provisioning `temote-observation`
+# (for example with `wrangler d1 create temote-observation`) before remote deploy.
+[[d1_databases]]
+binding = "OBSERVATION_DB"
+database_name = "temote-observation"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
 
 [[durable_objects.bindings]]
 name = "GATEWAY_SESSIONS"
