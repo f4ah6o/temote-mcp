@@ -327,6 +327,8 @@ export const PUBLIC_TOOLS = [
         operation_id: { type: "string", format: "uuid" },
         task: { type: "string", minLength: 1, maxLength: 1048576 },
         model: { type: "string", minLength: 1, maxLength: 256 },
+        effort: { type: "string", minLength: 1, maxLength: 256 },
+        speed: { type: "string", enum: ["standard", "priority"] },
         agent: { type: "string", minLength: 1, maxLength: 256 },
         cloud: { type: "boolean" },
       },
