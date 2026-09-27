@@ -1,73 +1,112 @@
 # S1: single backend-neutral source for the task report schema
 
-Status: ready
+Status: ready (revised 2026-09-27 per PR #73 review: profile split; the
+single-validator/identical-fixture design was dropped because it conflicts
+with no-behavior-change).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`
 Parent issue: `issues/open/20260927-native-structured-output-agent-backends.md`
-Prerequisites: none (refactor-only slice; no wire change)
+Prerequisites: none (refactor-only slice; no wire or validation-behavior change)
 
 ## 1. Goal
 
-The Temote task report contract (field list, bound constants, validator, and the
-JSON Schema sent to backends that support native structured output) is produced
-from exactly one backend-neutral module. Per-backend copies stop drifting.
+The Temote task report contract (field catalog, bound constants, validators,
+and the JSON Schema sent to backends that support native structured output) is
+produced from exactly one backend-neutral module. Per-backend copies stop
+drifting — but each backend keeps its current acceptance contract, because the
+contracts are *not* identical today (see Fixed decisions).
 
 ## 2. Fixed decisions
 
-- One canonical module (new `src/report_contract.rs`, or a clearly named
-  section in `src/delegation/mod.rs`) owns:
-  - the required field list (currently `REPORT_FIELDS` at
-    `src/delegation/mod.rs:25`),
-  - the bound constants (`MAX_REPORT_*` at `src/delegation/mod.rs:37-41`,
+- One canonical module (new `src/report_contract.rs`) owns:
+  - the field catalog (currently `REPORT_FIELDS` at `src/delegation/mod.rs:25`),
+  - the bound constants (`MAX_REPORT_*` at `src/delegation/mod.rs:37-41`;
     `MAX_SUMMARY_CHARS`/`MAX_REPORT_ARRAY_ITEMS`/`MAX_REPORT_BYTES` at
-    `src/opencode_server.rs:43-45` and their devin counterparts),
-  - `validate_report_schema` (`src/delegation/mod.rs:1021`) as the shared
-    validator,
-  - a `report_json_schema()` producer equivalent to today's
-    `devin_cloud::report_schema()` (`src/devin_cloud.rs:85`).
-- `devin_cloud::report_schema()` is replaced by the shared producer; the
-  serialized JSON Schema sent to Devin API v3 must be byte-identical to the
-  current output (pin with a snapshot test).
-- `opencode_server::report_shape_valid` (~line 3377), `devin_acp`'s copy of the
-  same validator, and `delegation`'s `ReportState` checks all delegate to the
-  shared validator. Where bounds differ today (e.g. 4 KiB vs 8 KiB report caps),
-  keep each backend's existing bound — do not silently unify limits; document
-  any discovered divergence in the parent issue.
-- No backend gains or loses a field; public `report` object shape is unchanged.
+    `src/opencode_server.rs:43-45`, `src/devin_acp.rs:42-43`,
+    `src/devin_cloud.rs:41-43`),
+  - a profile-parameterized validator,
+  - a `report_json_schema()` producer replacing `devin_cloud::report_schema()`
+    (`src/devin_cloud.rs:85`).
+- Two named compatibility profiles, chosen explicitly at each callsite:
+  - `ReportProfile::Delegation` — today's strict evidence-file contract:
+    exactly the 10 `REPORT_FIELDS`, all required, `status` enum, bounded
+    strings/arrays, `observed_*` nullable (currently
+    `delegation::validate_report_schema`, `src/delegation/mod.rs:1021`, consumed
+    by `read_report` at line 981 → `ReportState` at line 215).
+  - `ReportProfile::TaskReport` — today's lenient task-report contract shared
+    identically by `opencode_server::report_shape_valid`
+    (`src/opencode_server.rs:3377`), `devin_acp`'s copy
+    (`src/devin_acp.rs:2774`), and `devin_cloud`'s copy
+    (`src/devin_cloud.rs:1483`): required `status` (enum) + `summary`
+    (≤ `MAX_SUMMARY_CHARS`); optional `base_commit` and
+    `changed_files`/`checks`/`unresolved` bounded string arrays; serialized
+    byte bound.
+- These profiles are *intentionally different* — the Delegation profile
+  requires requested/observed model+effort fields the TaskReport profile does
+  not define, and Devin Cloud's wire schema cannot even carry them
+  (`additionalProperties: false`, required `["status","summary"]` at
+  `src/devin_cloud.rs:95-97`). This packet pins the divergence; unifying the
+  contracts is a separate change with its own migration decision (recorded as a
+  parent-issue question for S2+).
+- `report_json_schema()` output for Devin Cloud is byte-identical to today's
+  `report_schema()` output — pinned by a snapshot test.
+- Bound constants that differ per backend stay parameterized inputs to the
+  validator (or per-backend overrides), never silently unified; remaining
+  divergences are documented in the parent issue.
+- `src/codex_app_server.rs` has **no** report validation path today (no
+  `extract_report`/`report_shape_valid` — Codex tasks do not produce the shared
+  report object). Nothing to migrate there; record this finding in the parent
+  issue as input to S2.
+- No backend gains or loses a field; public `report` object shape and the
+  `ReportState` classification are unchanged.
 
 ## 3. Read / change scope
 
-- `src/delegation/mod.rs`: `REPORT_FIELDS`, `MAX_REPORT_*`,
-  `validate_report_schema`, `ReportState`.
-- `src/devin_cloud.rs`: `report_schema()` (line 85), `report_shape_valid`
-  (line 1483), `structured_output_schema` callsite (line ~2246).
-- `src/opencode_server.rs`: `report_shape_valid` (~line 3377), bound consts
-  (lines 43-45), `REPORT_INSTRUCTIONS` (line 112) stays as prompt text.
-- `src/devin_acp.rs`: `extract_report`/`report_shape_valid` (lines ~2724+).
-- `src/codex_app_server.rs`: locate its report validation path and route it to
-  the shared validator; note whether it currently has one at all (the parent
-  issue flags this gap — finding it is part of the packet).
-- `src/main.rs`: register the new module if a new file is introduced.
+- `src/report_contract.rs` (new): field catalog, bound constants, profiles,
+  validator, `report_json_schema()`.
+- `src/delegation/mod.rs`: `REPORT_FIELDS` (25), `MAX_REPORT_*` (37-41),
+  `validate_report_schema` (1021), `ReportState` (215), `read_report` (981) —
+  delegate to `ReportProfile::Delegation`.
+- `src/opencode_server.rs`: `report_shape_valid` (3377) and its callsite in
+  `extract_report` (3327/3333), bound consts (43-45); `REPORT_INSTRUCTIONS`
+  (line 112) stays as prompt text.
+- `src/devin_acp.rs`: `extract_report`/`report_shape_valid` (2724/2774), bound
+  consts (42-43).
+- `src/devin_cloud.rs`: `report_schema()` (85), `report_shape_valid` (1483),
+  `structured_output_schema` callsite (~2246), bound consts (41-43).
+- `src/main.rs`: register the new module.
+- `src/codex_app_server.rs`: read-only — confirm the no-validation finding.
 
 ## 4. Steps
 
-1. Diff the four validator/schema implementations; table the divergences in the
-   parent issue before writing code.
-2. Move the shared contract to one module; re-export only what callers need.
-3. Migrate each backend's callsite; snapshot the Devin JSON Schema output.
-4. Add a parity test asserting the validator accepts/rejects identical fixtures
-   across backends.
+1. Diff the validator/schema implementations; write the divergence table
+   (fields required, optional fields, bounds, byte caps) into the parent issue
+   before writing code.
+2. Create `src/report_contract.rs` with the field catalog, constants, the two
+   profiles, the parameterized validator, and `report_json_schema()`;
+   re-export only what callers need.
+3. Migrate each callsite to its profile; add the snapshot test pinning Devin
+   Cloud's serialized JSON Schema byte-for-byte.
+4. Add per-profile characterization tests: fixtures pinned against each
+   backend's *current* accept/reject outcome (e.g. a report missing
+   `requested_model` must still be accepted under TaskReport and rejected under
+   Delegation — that divergence is the pinned contract, not a bug).
 5. Focused tests; `just sandboxed-check`; host gates recorded as NOT RUN.
 
 ## 5. Acceptance
 
-- [ ] Exactly one module defines the report field set and its validator.
+- [ ] Exactly one module defines the field catalog, bound constants, profiles,
+      and the JSON-Schema producer.
 - [ ] Devin Cloud emits a `structured_output_schema` identical to the pinned
       snapshot (no wire change).
-- [ ] OpenCode serve / Devin ACP / legacy delegation validators reject and
-      accept the same fixtures.
-- [ ] Bound differences between backends, if any remain, are explicit constants
-      documented in the parent issue — not accidental drift.
+- [ ] Each backend's validator accepts and rejects exactly the fixture set it
+      accepts/rejects on `main` — per-profile characterization tests pin this;
+      the Delegation↔TaskReport divergence is asserted explicitly, not
+      unified.
+- [ ] Bound differences between backends, if any remain, are explicit named
+      parameters documented in the parent issue — not accidental drift.
+- [ ] The codex_app_server no-validation finding is recorded in the parent
+      issue for S2.
 - [ ] `cargo test --locked`, clippy, fmt, no-default-features check, and
       `git diff --check` are clean.
 
@@ -83,8 +122,8 @@ from exactly one backend-neutral module. Per-backend copies stop drifting.
 
 ## 7. Delivery authorization
 
-One feature branch + one PR to `main`. Refactor only; behavior parity is the
-acceptance bar.
+One feature branch + one PR to `main`. Refactor only; per-backend behavior
+parity is the acceptance bar — do NOT unify the two profiles in this packet.
 
 ## 8. Completion report
 
