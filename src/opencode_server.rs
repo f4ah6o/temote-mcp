@@ -6835,6 +6835,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn serve_v2_api_contract_is_deterministic_without_provider() {
         let (base_url, server) = spawn_mock_v2_serve().await;
+        let password = Uuid::new_v4().simple().to_string();
         let mut command = tokio::process::Command::new("sleep");
         command.arg("600").kill_on_drop(true);
         let child = command
@@ -6843,7 +6844,7 @@ mod tests {
         let client = ServeClient::SdkV2(Arc::new(SdkV2Serve {
             client: reqwest::Client::builder().build().unwrap(),
             base_url: base_url.clone(),
-            password: "test-password".to_owned(),
+            password: password.clone(),
             directory: "/tmp".to_owned(),
             child: tokio::sync::Mutex::new(child),
             tail: Arc::new(Mutex::new(String::new())),
@@ -6931,11 +6932,11 @@ mod tests {
         // mistaken for an `api/*` route that answered.
         let http = reqwest::Client::builder().build().unwrap();
         assert!(
-            v2_get_json(&http, &base_url, "test-password", "api/non_json")
+            v2_get_json(&http, &base_url, &password, "api/non_json")
                 .await
                 .is_err()
         );
-        let error = v2_get_json(&http, &base_url, "test-password", "api/boom")
+        let error = v2_get_json(&http, &base_url, &password, "api/boom")
             .await
             .unwrap_err()
             .to_string();
