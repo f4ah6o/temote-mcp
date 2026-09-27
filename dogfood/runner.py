@@ -12,6 +12,8 @@ from pathlib import Path
 
 from .protocol import Recorder, TERMINAL, metrics, snapshot
 
+RELEASE_GATES = frozenset({"final_diff", "tests", "git_status", "ci", "action_result"})
+
 
 class AdapterError(Exception):
     def __init__(self, code: str, retryable: bool = False):
@@ -28,7 +30,7 @@ class FakeAdapter:
 
     def call(self, tool: str, arguments: dict) -> dict:
         if tool == "session_info":
-            return {"session_id": arguments["session_id"], "server_contract_fingerprint": "fixture-contract"}
+            return {"session_id": arguments["session_id"], "server_contract_fingerprint": "f" * 64}
         if tool == "task_list":
             return {"tasks": list(self.tasks.values()), "backends": {
                 name: {"status": "ok"} for name in ("codex", "opencode", "devin")}}
@@ -153,7 +155,7 @@ def execute(scenario_data: dict, phase: str, adapter: FakeAdapter | LiveAdapter,
     prior_ids: set[str] = set()
     assertions = {key: "not_run" for key in scenario_data["assertions"]}
     outcome = "pass"
-    contract = "fixture-contract" if isinstance(adapter, FakeAdapter) else "unknown"
+    contract = "f" * 64 if isinstance(adapter, FakeAdapter) else "unknown"
     last_state = "not_run"
     terminal_view: dict | None = None
     recover_next_poll = False
@@ -274,9 +276,11 @@ def execute(scenario_data: dict, phase: str, adapter: FakeAdapter | LiveAdapter,
         if "no_duplicate_task" in assertions:
             assertions["no_duplicate_task"] = "pass" if len(accepted_start_ids) == 1 else "fail"
         if "identity_is_separate" in assertions:
-            assertions["identity_is_separate"] = "pass" if repository_head and binary_identity else "fail"
+            assertions["identity_is_separate"] = "pass" if repository_head != binary_identity else "fail"
         if "repository_gates_recorded" in assertions:
-            assertions["repository_gates_recorded"] = "pass" if gates and all(v == "pass" for v in gates.values()) else "blocked"
+            assertions["repository_gates_recorded"] = (
+                "pass" if gates and RELEASE_GATES <= gates.keys()
+                and all(gates[key] == "pass" for key in RELEASE_GATES) else "blocked")
         if any(v != "pass" for v in assertions.values()):
             outcome = "blocked" if any(v in {"blocked", "not_run"} for v in assertions.values()) else "fail"
     except AdapterError as error:

@@ -12,8 +12,9 @@ SCENARIOS = Path(__file__).parent / "scenarios"
 def fixture(name: str, phase: str = "baseline") -> dict:
     data = scenario(SCENARIOS / f"{name}.json")
     return execute(data, phase, FakeAdapter(), session_id="fixture", repository_head="a" * 40,
-                   binary_identity="fixture-binary", poll_interval=0,
-                   gates={"rust": "pass", "gateway": "pass"})
+                   binary_identity="b" * 64, poll_interval=0,
+                   gates={"rust": "pass", "gateway": "pass", "final_diff": "pass",
+                          "tests": "pass", "git_status": "pass", "ci": "pass", "action_result": "pass"})
 
 
 class ProtocolTests(unittest.TestCase):
@@ -73,7 +74,7 @@ class ProtocolTests(unittest.TestCase):
     def test_terminal_reuse_reduces_one_call_with_same_scenario(self):
         data = scenario(SCENARIOS / "delegation-lifecycle.json")
         options = {"session_id": "fixture", "repository_head": "a" * 40,
-                   "binary_identity": "fixture-binary", "poll_interval": 0}
+                   "binary_identity": "b" * 64, "poll_interval": 0}
         old = execute(data, "baseline", FakeAdapter(), terminal_read_strategy="reread", **options)
         new = execute(data, "candidate", FakeAdapter(), terminal_read_strategy="reuse", **options)
         self.assertEqual(old["metrics"]["tool_calls"] - new["metrics"]["tool_calls"], 1)
@@ -93,6 +94,14 @@ class ProtocolTests(unittest.TestCase):
         recorder.call("inspect_session", "session_info", {"session_id": "secret-value"},
                       {"api_key": "secret-value"}, state="secret-value")
         self.assertNotIn("secret-value", str(recorder.events))
+
+    def test_release_qualification_requires_ci_and_action(self):
+        data = scenario(SCENARIOS / "release-qualification.json")
+        run = execute(data, "candidate", FakeAdapter(), session_id="fixture",
+                      repository_head="a" * 40, binary_identity="b" * 64,
+                      poll_interval=0, gates={"tests": "pass", "ci": "not_run"})
+        self.assertEqual(run["outcome"], "blocked")
+        self.assertEqual(run["assertions"]["repository_gates_recorded"], "blocked")
 
 
 if __name__ == "__main__":

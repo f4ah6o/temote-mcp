@@ -63,6 +63,10 @@ keeps source event references for every numeric value; it is a vector, not a
 single friction score. `qualified` means the candidate met these acceptance
 conditions. It does not publish a release. Release qualification uses the
 repository's normal checks and existing CalVer workflow.
+The `release-qualification` scenario additionally requires separate
+`final_diff`, `tests`, `git_status`, `ci`, and `action_result` gate results.
+Missing or `not_run` CI/action evidence blocks that scenario; a local
+self-improvement comparison does not invoke the release workflow.
 
 The fixture fault cases model an uncertain accepted start and a transient poll
 error. They test idempotent replay and safe recovery, while provider-specific
