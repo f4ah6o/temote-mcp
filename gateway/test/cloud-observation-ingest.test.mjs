@@ -325,6 +325,120 @@ class FakeStatement {
   }
 }
 
+
+test("sensitive keys in evidence_refs are rejected before D1 mutation", async () => {
+  const database = new FakeD1();
+  const result = await sync(body([record(1, 1, {
+    evidence_refs: [{
+      evidence_id: "evidence-1",
+      bytes: 1,
+      retention_seconds: 60,
+      api_token: "secret",
+    }],
+  })]), { db: database });
+
+  assert.equal(result.response.status, 422);
+  assert.equal(result.json.error, "sensitive_observation_field");
+  assert.equal(database.observations.length, 0);
+});
+
+test("deeply nested sensitive keys are rejected before D1 mutation", async () => {
+  const database = new FakeD1();
+  const result = await sync(body([record(1, 1, {
+    content: {
+      kind: "view",
+      view: { rows: [{ details: { nested: { authorization: "secret" } } }] },
+    },
+  })]), { db: database });
+
+  assert.equal(result.response.status, 422);
+  assert.equal(result.json.error, "sensitive_observation_field");
+  assert.equal(database.observations.length, 0);
+});
+
+test("unknown evidence reference keys are rejected before D1 mutation", async () => {
+  const database = new FakeD1();
+  const result = await sync(body([record(1, 1, {
+    evidence_refs: [{
+      evidence_id: "evidence-1",
+      bytes: 1,
+      retention_seconds: 60,
+      extra: "not allowed",
+    }],
+  })]), { db: database });
+
+  assert.equal(result.response.status, 422);
+  assert.equal(result.json.error, "invalid_observation");
+  assert.equal(database.observations.length, 0);
+});
+
+test("oversized evidence references are rejected before D1 mutation", async () => {
+  const database = new FakeD1();
+  const result = await sync(body([record(1, 1, {
+    evidence_refs: [{
+      evidence_id: "\u0000".repeat(256),
+      bytes: 0,
+      retention_seconds: 0,
+    }],
+  })]), { db: database });
+
+  assert.equal(result.response.status, 422);
+  assert.equal(result.json.error, "invalid_observation");
+  assert.equal(database.observations.length, 0);
+});
+
+test("oversized serialized evidence aggregates are rejected before D1 mutation", async () => {
+  const database = new FakeD1();
+  const evidence_refs = Array.from({ length: 64 }, (_, index) => ({
+    evidence_id: "evidence-" + String(index).padStart(2, "0") + "x".repeat(200),
+    bytes: index,
+    retention_seconds: 60,
+  }));
+  const result = await sync(body([record(1, 1, { evidence_refs })]), { db: database });
+
+  assert.equal(result.response.status, 422);
+  assert.equal(result.json.error, "invalid_observation");
+  assert.equal(database.observations.length, 0);
+});
+
+test("valid evidence references are accepted and persisted", async () => {
+  const database = new FakeD1();
+  const evidence = {
+    evidence_id: "evidence-1",
+    bytes: 42,
+    retention_seconds: 3600,
+  };
+  const result = await sync(body([record(1, 1, {
+    task_id: "task-1",
+    operation_id: "operation-1",
+    state_ref: {
+      task_id: "task-1",
+      status: "running",
+      revision: 1,
+      generation: 0,
+    },
+    evidence_refs: [evidence],
+  })]), { db: database });
+
+  assert.equal(result.response.status, 200);
+  assert.equal(database.observations.length, 1);
+  assert.deepEqual(JSON.parse(database.observations[0].evidence_refs), [evidence]);
+});
+
+test("unknown keys in other nested members are rejected before D1 mutation", async () => {
+  const database = new FakeD1();
+  const result = await sync(body([record(1, 1, {
+    actor: {
+      transport: "mcp-stdio",
+      unexpected: "not allowed",
+    },
+  })]), { db: database });
+
+  assert.equal(result.response.status, 422);
+  assert.equal(result.json.error, "invalid_observation");
+  assert.equal(database.observations.length, 0);
+});
+
 class FakeD1 {
   constructor() {
     this.state = { sources: new Map(), observations: [], nextSeq: 1 };
