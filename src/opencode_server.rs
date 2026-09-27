@@ -3220,9 +3220,9 @@ fn derive_serve_state(
     questions: &[Value],
 ) -> DerivedServeState {
     let session_pending = |items: &[Value]| {
-        items.iter().any(|item| {
-            interaction_session_id(item).is_some_and(|id| session_ids.contains(id))
-        })
+        items
+            .iter()
+            .any(|item| interaction_session_id(item).is_some_and(|id| session_ids.contains(id)))
     };
     if session_pending(permissions) || session_pending(questions) {
         return DerivedServeState {
@@ -4595,11 +4595,7 @@ async fn answer_pending_interaction(
                 applied: false,
                 error: None,
             };
-            return Ok(interaction_result_view(
-                &record,
-                &interaction_result,
-                &[],
-            ));
+            return Ok(interaction_result_view(&record, &interaction_result, &[]));
         }
     };
     let still_pending = after
