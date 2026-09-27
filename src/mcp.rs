@@ -200,6 +200,7 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
     ),
     activity_tool("poll_job", ActivityOperation::PollJob, "job poll"),
     activity_tool("job_list", ActivityOperation::JobList, "job list"),
+    activity_tool("task_list", ActivityOperation::TaskList, "task list"),
     activity_tool(
         "stop_job",
         ActivityOperation::StopJob,
@@ -795,6 +796,7 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
         {"name":"devin_cloud_task_control","title":"Control a Devin Cloud session task","description":"Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
         {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"task_list","title":"List session delegated tasks","description":"Return a bounded read-only projection of the delegated tasks owned by this full session instance and canonical scope, merged across every delegation backend. Each item carries backend and task_id for use with the matching *_task_get tool. A backend whose retained store cannot be read is reported per-backend as unavailable instead of failing the whole list. Listing reads retained records only; it never reconciles or mutates tasks.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
         {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
     ]);
     if !managed_sessions {
@@ -956,6 +958,7 @@ async fn call_tool(
             "evidence_read" => evidence_read_tool(&args, &session),
             "poll_job" => poll_job(&args, &session).await,
             "job_list" => job_list(&args, &session),
+            "task_list" => task_list_tool(&args, &session).await,
             "stop_job" => stop_job_with_activity(&args, &session, activity.as_ref()).await,
             _ => match delegation_operation(name) {
                 Some((backend, operation)) => text_result(serde_json::to_string_pretty(
@@ -1516,6 +1519,44 @@ fn job_list(args: &Value, session: &config::Session) -> Result<Value> {
         "truncated": snapshot.truncated,
         "retention": "in_memory"
     }))?)
+}
+
+/// Read-only cross-backend projection of the session's retained delegated
+/// tasks. Ownership (full session instance + canonical scope) and
+/// per-backend `unavailable` reporting live in
+/// [`orchestration::task_list`]; this adapter only bounds the argument
+/// surface to the advertised schema.
+async fn task_list_tool(args: &Value, session: &config::Session) -> Result<Value> {
+    let object = args
+        .as_object()
+        .context("task_list arguments must be an object")?;
+    anyhow::ensure!(
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "session_id" | "limit")),
+        "task_list accepts only session_id and limit"
+    );
+    let mut view = orchestration::task_list(args, session).await?;
+    compact_task_list_view(&mut view);
+    text_result(serde_json::to_string_pretty(&view)?)
+}
+
+fn compact_task_list_view(view: &mut Value) {
+    if let Some(tasks) = view.get_mut("tasks").and_then(Value::as_array_mut) {
+        for task in tasks {
+            // Listing is for rediscovery, not result delivery. Keep the MCP
+            // response compact even when retained reports are near their
+            // per-task bound; callers use *_task_get and evidence_read for
+            // detail after selecting the backend and task ID.
+            *task = json!({
+                "backend": task["backend"],
+                "task_id": task["task_id"],
+                "status": task["status"],
+                "revision": task["revision"],
+                "last_updated_at": task["last_updated_at"],
+            });
+        }
+    }
 }
 
 async fn poll_job(args: &Value, session: &config::Session) -> Result<Value> {
@@ -2479,7 +2520,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 28);
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()
@@ -2503,6 +2544,7 @@ mod tests {
             "evidence_read",
             "poll_job",
             "job_list",
+            "task_list",
             "stop_job",
         ] {
             assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
@@ -2511,6 +2553,37 @@ mod tests {
             assert!(!tools.iter().any(|tool| tool["name"] == name), "{name}");
         }
         assert!(tools.iter().all(|tool| tool["name"] != "without_sandbox"));
+    }
+
+    #[test]
+    fn task_list_public_view_keeps_rediscovery_fields_without_result_detail() {
+        let mut view = json!({
+            "tasks": [{
+                "backend": "opencode",
+                "task_id": Uuid::new_v4(),
+                "status": "completed",
+                "revision": 9,
+                "last_updated_at": 42,
+                "report": {"summary": "private result"},
+                "last_error": "private error",
+                "raw_result": "private output"
+            }],
+            "backends": {"opencode": {"status": "ok", "total": 1, "skipped": 0}},
+            "total": 1,
+            "truncated": false,
+            "limit": 50
+        });
+        compact_task_list_view(&mut view);
+        let item = &view["tasks"][0];
+        assert_eq!(item["backend"], "opencode");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["revision"], 9);
+        assert_eq!(item["last_updated_at"], 42);
+        assert!(item["task_id"].is_string());
+        assert!(item.get("report").is_none());
+        assert!(item.get("last_error").is_none());
+        assert!(item.get("raw_result").is_none());
+        assert_eq!(view["backends"]["opencode"]["status"], "ok");
     }
 
     #[tokio::test]

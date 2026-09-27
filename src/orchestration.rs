@@ -670,9 +670,8 @@ const ALL_BACKENDS: &[Backend] = &[
 /// item carries `backend` + `task_id` so the (backend, task id, session
 /// instance) reference survives the merge without reassigning ids.
 ///
-/// Local-protocol packets wire this to a frontend; today only tests
-/// reach it.
-#[allow(dead_code)]
+/// The MCP `task_list` tool and local-protocol packets wire this to
+/// frontends.
 pub(crate) async fn task_list(args: &Value, session: &config::Session) -> Result<Value> {
     let limit = requests::task_list_limit(args)?;
     let mut results = Vec::with_capacity(ALL_BACKENDS.len());
@@ -710,7 +709,9 @@ fn merge_task_lists(results: Vec<(Backend, Result<Value>)>, limit: usize) -> Val
         }
     }
     sort_task_list_items(&mut tasks);
-    let truncated = tasks.len() > limit;
+    // Each backend has already applied its own limit. A single backend can
+    // therefore have omitted records even when the merged vector fits.
+    let truncated = total > limit;
     tasks.truncate(limit);
     json!({
         "tasks": tasks,
@@ -1144,5 +1145,24 @@ mod tests {
             .collect();
         // updated_at descending, task_id ascending as the tie-break.
         assert_eq!(order, ["newest", "same-time-a", "same-time-b"]);
+    }
+
+    #[test]
+    fn task_list_merge_reports_backend_truncation_even_with_one_backend() {
+        let view = merge_task_lists(
+            vec![(
+                Backend::Codex,
+                Ok(json!({
+                    "tasks": [{"task_id": "newest", "backend": "codex", "last_updated_at": 2}],
+                    "total": 2,
+                    "skipped": 0,
+                    "truncated": true,
+                })),
+            )],
+            1,
+        );
+        assert_eq!(view["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(view["total"], 2);
+        assert_eq!(view["truncated"], true);
     }
 }

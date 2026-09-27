@@ -89,9 +89,11 @@ named root は Temote MCP 起動前に host 側の `TEMOTE_MCP_ROOTS` で設定�
 
 Temote は file、command、Git、integration を直接実行しません。machine 上の作業は下記の task backendを通じて local 側の coding agent に委譲します。task の transcript や child output は bounded で期限付きの session/scope 限定 evidence としてだけ境界を越え、`evidence_read({session_id, evidence_id, offset_bytes?, max_bytes?})` で読みます。
 
-foreground timeout を超える作業は session 所有の `job_id` を返します。完了が必要なら `poll_job` で確認し、不要になったら `stop_job` で停止します。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。
+foreground timeout を超える sandbox 作業は session 所有の `job_id` を返す場合があります。完了が必要なら `poll_job` で確認し、不要になったら `stop_job` で停止します。delegated agent task は `task_id` を返し、対応する backend の `*_task_get` で追跡します。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。
 
 `job_list({session_id, limit?})` は current session が所有する in-memory job の redacted snapshot を返します。返すのは `job_id` と `running` / `completed` / `failed` / `unknown` だけで、running を先頭に並べ、上限超過は `truncated` で示します。command text、argv、stdout/stderr、raw error は返さず、list しても completed result は消費しません。`retention="in_memory"` なので、空のlistを「過去に何も実行していない証拠」とは扱わないでください。
+
+`task_list({session_id, limit?})` は同じ完全な session instance と canonical scope が所有する retained delegated task を、利用可能な backend 全体から再発見します。bounded な各項目の `backend`、`task_id`、state を見て、対応する `*_task_get` で reconcile と結果取得を行います。limit は既定 50、最大 128 です。読めない store は `backends` 内で `unavailable` として表示し、空の list と混同しません。list 自体は task を開始・reconcile せず、transcript や raw output も返しません。
 
 stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated として返します。
 

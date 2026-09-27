@@ -4,6 +4,7 @@
 
 ### Added
 
+- `task_list` rediscovers session-owned delegated tasks across backends through the existing bounded task projection, with per-backend availability and no transcript or output. ([development harness](issues/open/20260924-temote-development-harness-restructure.md))
 - `opencode_task_*` serve children now use the host CLI's provider/model configuration and seed V2 saved credentials into private task state without sharing host sessions or history; legacy `auth.json` remains supported. ([OpenCode serve shared provider](issues/done/20260924-opencode-serve-shared-provider.md))
 - `session_list`/`session_info` report a bounded non-secret `workspace` identity derived from the session working directory (`workspace_type` of `canonical_checkout` / `managed_worktree` / `legacy_worktree`, plus repository and branch when resolvable). ([managed worktree session integration](issues/done/20260916-managed-worktree-session-integration.md))
 - Added `git_worktree_create` and `git_worktree_list` for deterministic Temote-managed worktrees below the configured `src` named root (`~/src/worktrees/<repo>/<task>` in the usual layout), with read-only pre-approval inspection, exact `src` named-root authority, existing-local-branch-only creates, post-create containment/identity verification, fail-closed path/traversal/symlink/collision validation, and legacy worktree preservation. ([managed worktree create/list](issues/done/20260916-managed-worktree-create-list.md))

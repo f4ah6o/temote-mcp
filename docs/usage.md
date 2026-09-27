@@ -101,9 +101,11 @@ A running sandboxed session can hold additional, individually scoped capability 
 
 Temote does not execute files, commands, Git, or integrations directly. Machine work is delegated to a coding agent on the local machine through the task backends below. Task transcripts and child output cross the boundary only as bounded, expiring, session-and-scope-bound evidence; read them with `evidence_read({session_id, evidence_id, offset_bytes?, max_bytes?})`.
 
-Work that outlives the foreground timeout returns a session-owned `job_id`; poll it with `poll_job` until completion or cancel it with `stop_job`. Jobs belong to their session, have a two-hour lifetime limit, and are cancelled when the session stops.
+Sandbox work that outlives the foreground timeout can return a session-owned `job_id`; poll it with `poll_job` until completion or cancel it with `stop_job`. Delegated agent tasks return `task_id` and are tracked with the matching backend's `*_task_get`. Jobs belong to their session, have a two-hour lifetime limit, and are cancelled when the session stops.
 
 `job_list({session_id, limit?})` returns a redacted snapshot of the current session's in-memory jobs. It reports only `job_id` and `running` / `completed` / `failed` / `unknown`, with running jobs first and a `truncated` flag. It never returns command text, argv, stdout/stderr, or raw errors, and listing does not consume a completed result. `retention="in_memory"` is explicit: an empty list is not proof that no work ran before restart or cache expiry.
+
+`task_list({session_id, limit?})` rediscovers retained delegated tasks across enabled backends for the same full session instance and canonical scope. It returns bounded entries with `backend`, `task_id`, and state; use that backend's `*_task_get` to reconcile and retrieve a task. The limit defaults to 50 and is at most 128. `backends` reports an unreadable store as `unavailable` instead of treating it as empty. Listing never starts or reconciles a task and does not include transcripts or raw output.
 
 The combined stdout/stderr retained for delegated work is capped at 1 MiB and reports when output was truncated.
 

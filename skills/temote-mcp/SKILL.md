@@ -43,11 +43,13 @@ Call the matching `*_status` first and treat its version/model/effort result as 
 
 Use `*_task_get` to reconcile remote truth, `reconciliation_required`, `unknown`, approval waits, and process restarts before deciding whether to control a task. If it returns `reconciliation_deferred: true`, another Temote process owns the live runtime: use the persisted status and revision, and do not issue control through the secondary process. A session stop/restart finalizes nonterminal tasks owned by the ended full session instance as `interrupted`; while another process holds the runtime lease, its owner observes session termination, shuts down the child, and finalizes the task. Retained records remain fenced from a replacement instance. Unexpired terminal records are not evicted to make capacity; when no expired terminal record is available, a new start is rejected.
 
+If a task ID is lost after reconnect, call `task_list({session_id, limit?})` on the selected host. It lists retained tasks owned by that full session instance, with `backend` and `task_id` for the matching `*_task_get`. Inspect `backends` for `unavailable`; an empty `tasks` array with an unavailable backend is not proof that no task exists. `job_list` covers sandbox jobs, not delegated-agent tasks. Listing does not reconcile or restart work.
+
 Temote yolo does not authorize delegated child mutations: command/file-change approval requests still use the explicit user-approval path and fail closed if it is unavailable. Control is limited to typed actions; do not attempt to tunnel arbitrary backend JSON-RPC or a remote shell through these tools.
 
 ## Jobs
 
-A task or run that exceeds the foreground timeout returns a session-owned `job_id`. Poll it with `poll_job` until it finishes when completion is needed for the user's current task; use `job_list` for the bounded snapshot of session jobs and `stop_job` when running work is no longer needed or must be cancelled. Jobs are session-owned and cancelled when the session stops.
+Sandbox work that exceeds the foreground timeout can return a session-owned `job_id`. Poll it with `poll_job` until it finishes when completion is needed for the user's current task; use `job_list` for the bounded snapshot of session jobs and `stop_job` when running work is no longer needed or must be cancelled. Delegated agent tasks use `task_id` and `*_task_get`, with `task_list` for rediscovery. Jobs are session-owned and cancelled when the session stops.
 
 Do not tell the user that work is complete while a required job is still running. Do not ask the user to wait instead of polling a job that can be completed in the current turn.
 
