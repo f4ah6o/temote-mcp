@@ -10,16 +10,16 @@ Temote could run and steer an OpenCode-backed session, but it had no
 first-class API for answering an individual OpenCode permission or question
 request once OpenCode is waiting for that interaction.
 
-This is not equivalent to ordinary agent steering. We confirmed that sending
-`steer` while OpenCode has a pending permission/question does not satisfy the
-interaction: execution returns to the same pending request.
+This was not equivalent to ordinary agent steering. We confirmed that sending
+`steer` while OpenCode had a pending permission/question did not satisfy the
+interaction: execution returned to the same pending request.
 
-As a result, a Temote caller can observe that OpenCode is blocked but cannot
+As a result, a Temote caller could observe that OpenCode was blocked but could not
 resolve the block through Temote.
 
 ## Confirmed behavior before implementation
 
-1. OpenCode emitted a permission or question request and waits for an answer.
+1. OpenCode emitted a permission or question request and waited for an answer.
 2. Temote could observe the backend/session state sufficiently to see that work is
    blocked on the interaction.
 3. Temote exposed no operation that targets and answers that specific pending
