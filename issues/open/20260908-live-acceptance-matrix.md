@@ -3,7 +3,7 @@
 - Status: Open / tracking; external evidence pending
 - Model: deepseek-v4.1-flash
 - Date: 2026-09-08 (Asia/Tokyo)
-- Updated: 2026-09-16
+- Updated: 2026-09-27
 - Priority: P2
 - Type: validation / deployment tracking
 
@@ -89,6 +89,7 @@ Live evidence left open by issues closed at the 2026-09-22 consolidation; each r
 - [ ] Package-manager broker live acceptance: `uv`, `npm`, `pnpm`, `go` supported dependency operations from a normal `agent` session (from `issues/done/20260916-package-manager-broker-coverage-and-state.md`).
 - [ ] Repo-scoped GitHub account selection live acceptance: multiple GitHub accounts on one host, repo-mapped credential wins without touching global `gh auth` active account (from `issues/done/20260916-repo-scoped-github-account-selection.md`).
 - [ ] OpenCode `run`/`resume` CLI rebuilt-runtime canary including `delegate --backend opencode --session` resume preflight on real session state (from `issues/done/20260922-opencode-run-cli-compatibility.md`).
+- [ ] OpenCode pending-interaction installed-runtime canary: provoke one permission request and one question request on a real supported OpenCode backend, confirm `opencode_task_get` exposes the exact stable `interaction_id`, answer each through `opencode_task_control(action="answer")`, confirm execution advances instead of returning to the same request, and verify a stale/already-resolved answer is non-destructive (from `issues/done/20260927-opencode-pending-interaction-answer-api.md`; implementation PR #71).
 - [ ] Server-backend live parity: `codex exec` vs `codex app-server` and `opencode run` vs `opencode serve` task APIs — structured report, usage, observed model/effort, permission denial, interrupt, orphan-free (from `issues/open/20260922-agent-server-backends-cli-deprecation.md`, Phase 2). Partial evidence 2026-09-23 on Ubuntu VM (opencode 1.18.32, codex-cli 0.156.1, main worktree + timeout/messageID fixes): server-side wiring verified end-to-end through real MCP stdio + approval console — `codex_status`/`opencode_status` return compatible:true with real model/provider lists and clean child shutdown; `codex_task_start` → thread/start + turn/start accepted and `codex_task_get` reconciles terminal state with bounded evidence; `opencode_task_start` → session create + prompt_async accepted and `opencode_task_get` reconciles to `retryable_failed` with usage fields populated. Model execution on both backends is credential-blocked on this host (codex turn `401 Unauthorized` from api.openai.com; opencode model call `APIError`, no provider auth), so structured-report/usage-success/permission-denial/interrupt parity items remain unproven. Orphan-free shutdown observed for status probes (no lingering serve/app-server children).
 
 ## Evidence requirements
