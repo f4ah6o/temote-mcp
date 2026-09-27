@@ -1,13 +1,13 @@
 # Completed task result must remain retrievable when final report JSON is malformed
 
-Status: open — confirmed result-delivery contract gap  
+Status: done — implemented on `main` 2026-09-27 (see "Implementation notes (2026-09-27)" below)
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)  
-Related: `issues/open/20260927-native-structured-output-agent-backends.md`
+Related: `issues/open/20260927-native-structured-output-agent-backends.md`, `issues/open/20260927-bound-task-record-with-raw-result.md` (residual record-size risk)
 
 Triage: keep this issue independent from native structured-output work. Native schemas reduce malformed reports; this issue owns the stronger fallback guarantee that an already-completed task never loses its bounded raw result when structured decoding fails.
 
-Polished child packet: `issues/polished/20260927-completed-task-raw-result-preservation.md` (R1, ready)。
+2026-09-27 polish: the former polished child packet (R1) was dropped — the fix landed on `main` directly (`report_status`, bounded `raw_result`/`raw_result_truncated` on the OpenCode/Devin ACP `TaskRecord`s, `extract_report` decode classification, and `terminal_evidence_ref` minting a fresh session-scoped evidence record on every terminal `task_get`). `devin_cloud.rs` was intentionally left unchanged. Remaining 64 KiB persisted-record risk is owned by the bound-record issue above.
 
 ## Summary
 
