@@ -1,0 +1,7 @@
+{
+  "id": "delegation-lifecycle",
+  "revision": 1,
+  "goal": "Start one bounded read-only delegated task and recover its result",
+  "operations": ["inspect_session", "start_agent", "wait_until_terminal", "read_terminal_result"],
+  "assertions": ["terminal_state_is_unambiguous", "no_duplicate_task", "bounded_result"]
+}

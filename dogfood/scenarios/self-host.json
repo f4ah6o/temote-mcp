@@ -1,0 +1,7 @@
+{
+  "id": "self-host",
+  "revision": 1,
+  "goal": "Keep repository and running server identities distinct while exercising a task",
+  "operations": ["inspect_session", "start_agent", "wait_until_terminal", "read_terminal_result"],
+  "assertions": ["identity_is_separate", "terminal_state_is_unambiguous", "no_duplicate_task"]
+}

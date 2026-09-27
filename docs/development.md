@@ -47,6 +47,11 @@ This uses the official Cloudflare Cloudflared Tunnel API. Set `TEMOTE_MCP_CLOUDF
 
 ## Checks
 
+The repository-owned self-improvement scenario, observation, and comparison
+harness is described in [self-improvement dogfood](self-improvement-dogfood.md).
+Run its deterministic gate with `python3 -m unittest dogfood.test_protocol`;
+live provider checks use an existing active session and are reported separately.
+
 ```sh
 cargo fmt --all -- --check
 cargo test

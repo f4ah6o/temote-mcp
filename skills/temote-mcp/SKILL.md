@@ -83,6 +83,12 @@ When a tool fails:
 
 ## Feed Temote friction back into Temote
 
+When developing Temote itself, use the repository-owned scenarios and local
+harness in `docs/self-improvement-dogfood.md` for reproducible before/after
+measurements. Keep scenario logic and metrics in the harness; use this Skill for
+session choice, safe delegation, observation review, and follow-up decisions.
+Do not invent measured values when the harness or a live provider is unavailable.
+
 When Temote MCP itself adds meaningful friction to a development task, treat that friction as product feedback instead of normalizing a repeated workaround.
 
 Record it when the problem is Temote-specific and is reproducible, likely to recur, or has a generally useful fix. Examples include unnecessary approval/interaction, awkward session or workspace lifecycle, missing task/job observability, a confusing recovery path, avoidable backend-specific handling, or a workflow that forces callers to understand Temote internals. Do not file the target project's own bug, a one-off upstream outage, or an unverified guess as Temote friction.
@@ -104,6 +110,7 @@ If no authorized Temote repository workspace or GitHub write path is available, 
 ## Completion
 
 For delegated tasks, drive the task to a terminal state in the same turn when tools permit it: start, poll `*_task_get` or `job_id`, reconcile, then report the concrete result, evidence references, and any remaining limitation.
+When a terminal `*_task_get` response already includes the evidence reference, read that reference directly. Repeating `*_task_get` before `evidence_read` adds a call without improving the result.
 
 ## Direct-HTTP remote upgrade
 

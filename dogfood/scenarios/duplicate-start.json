@@ -1,0 +1,7 @@
+{
+  "id": "duplicate-start",
+  "revision": 1,
+  "goal": "Retry an uncertain start with its original operation ID",
+  "operations": ["inspect_session", "start_agent_uncertain", "retry_same_start", "wait_until_terminal", "read_terminal_result"],
+  "assertions": ["no_duplicate_task", "exact_retry", "terminal_state_is_unambiguous"]
+}
