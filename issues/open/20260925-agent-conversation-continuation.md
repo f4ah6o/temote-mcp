@@ -1,6 +1,6 @@
 # Codex app-server: related tasks should optionally continue an existing conversation thread
 
-Status: open  
+Status: open — polished child packet: `issues/polished/20260927-codex-task-conversation-continuation.md` (CC1, ready)  
 Created: 2026-09-25 (Asia/Tokyo)  
 Repository: `f4ah6o/temote-mcp`  
 Related:

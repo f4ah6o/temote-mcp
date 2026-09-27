@@ -82,6 +82,8 @@ session はその organization の ACU / credit を消費するため、subscrip
 自分の session として扱いたい場合は PAT を使うか、service-user key + `create_as_user_id`
 (`TEMOTE_MCP_DEVIN_CREATE_AS_USER_ID`) を使う。
 
+- 2026-09-27 polish: 残 live 検証 (suspended→resume、`waiting_for_approval` 表面化、`swe_tier` live account 確認) は live acceptance matrix「Delegation backends — Devin and interaction answers」に fold した。
+
 ## Open questions
 
 - `max_acu_limit` の default を Temote 側で強制するか (現状は caller 指定のみ、未指定なら Devin 側 default)。

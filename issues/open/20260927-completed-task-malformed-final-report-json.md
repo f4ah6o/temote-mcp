@@ -7,6 +7,8 @@ Related: `issues/open/20260927-native-structured-output-agent-backends.md`
 
 Triage: keep this issue independent from native structured-output work. Native schemas reduce malformed reports; this issue owns the stronger fallback guarantee that an already-completed task never loses its bounded raw result when structured decoding fails.
 
+Polished child packet: `issues/polished/20260927-completed-task-raw-result-preservation.md` (R1, ready)。
+
 ## Summary
 
 検証 task 自体は `completed` に到達しているのに、最終レポート JSON の形式不正だけを理由に結果本体が取得できないケースが再発した。
