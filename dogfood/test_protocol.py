@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .protocol import compare, load, save, scenario, validate_run
+from .protocol import compare, load, metrics, save, scenario, validate_run
 from .runner import FakeAdapter, execute
 
 SCENARIOS = Path(__file__).parent / "scenarios"
@@ -94,6 +94,16 @@ class ProtocolTests(unittest.TestCase):
         recorder.call("inspect_session", "session_info", {"session_id": "secret-value"},
                       {"api_key": "secret-value"}, state="secret-value")
         self.assertNotIn("secret-value", str(recorder.events))
+
+    def test_undecidable_baseline_response_is_p2_candidate(self):
+        old = fixture("delegation-lifecycle")
+        new = fixture("delegation-lifecycle", "candidate")
+        old["events"][0]["decision"]["next_action_decidable"] = False
+        old["metrics"] = metrics(old["events"])
+        report = compare(old, new, gates={"deterministic": "pass"},
+                         target_assertions=["bounded_result"])
+        self.assertTrue(any(f.get("condition") == "undecidable_response" and
+                            f["severity_candidate"] == "P2" for f in report["friction_inventory"]))
 
     def test_release_qualification_requires_ci_and_action(self):
         data = scenario(SCENARIOS / "release-qualification.json")

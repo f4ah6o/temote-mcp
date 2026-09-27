@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 OPERATIONS = frozenset({
@@ -57,8 +58,10 @@ def scenario(path: Path) -> dict:
 
 def snapshot(repository_head: str, server_build_identity: str, contract_fingerprint: str,
              capabilities: dict) -> dict:
-    if not all((repository_head, server_build_identity, contract_fingerprint)):
-        raise ValueError("repository, running binary and contract identities are each required")
+    if not (isinstance(repository_head, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", repository_head)
+            and isinstance(server_build_identity, str) and re.fullmatch(r"[0-9a-f]{64}", server_build_identity)
+            and isinstance(contract_fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", contract_fingerprint)):
+        raise ValueError("repository, running binary and contract fingerprints are required")
     return {
         "repository_head": repository_head,
         "server_build_identity": server_build_identity,
@@ -253,6 +256,17 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
             frictions.append({"assertion": key, "baseline": baseline["assertions"][key],
                               "candidate": "pass", "severity_candidate": "P0",
                               "event_refs": [e["ref"] for e in baseline["events"]]})
+    for name, predicate in (
+        ("undecidable_response", lambda e: not e["decision"]["next_action_decidable"]),
+        ("unstructured_error", lambda e: e["response"]["state"] == "error"
+         and e["response"]["structured_error"] is None),
+    ):
+        old_refs = [e["ref"] for e in baseline["events"] if predicate(e)]
+        new_refs = [e["ref"] for e in candidate["events"] if predicate(e)]
+        if len(old_refs) > len(new_refs):
+            frictions.append({"condition": name, "baseline": len(old_refs),
+                              "candidate": len(new_refs), "severity_candidate": "P2",
+                              "event_refs": old_refs})
     return {
         "schema_version": 1, "baseline_run_id": baseline["run_id"], "candidate_run_id": candidate["run_id"],
         "scenario_fingerprint": baseline["scenario_fingerprint"],

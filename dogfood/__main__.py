@@ -72,7 +72,7 @@ def main() -> None:
         binary_identity = hashlib.sha256(binary.read_bytes()).hexdigest()
         adapter = LiveAdapter(binary)
     else:
-        binary_identity = "fixture-binary"
+        binary_identity = "b" * 64
         adapter = FakeAdapter()
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
                           capture_output=True, check=True).stdout.strip()

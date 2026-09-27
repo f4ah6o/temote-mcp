@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added a repository-owned dogfood harness for versioned logical scenarios, bounded call observations, deterministic fault fixtures, live MCP runs, and evidence-linked before/after comparison. ([self-improvement protocol](issues/open/20260928-self-improvement-dogfood-protocol.md))
+- Added a repository-owned dogfood harness for versioned logical scenarios, bounded call observations, deterministic fault fixtures, live MCP runs, and evidence-linked before/after comparison. ([self-improvement protocol](issues/done/20260928-self-improvement-dogfood-protocol.md))
 - `task_list` rediscovers session-owned delegated tasks across backends through the existing bounded task projection, with per-backend availability and no transcript or output. ([development harness](issues/open/20260924-temote-development-harness-restructure.md))
 - `opencode_task_*` serve children now use the host CLI's provider/model configuration and seed V2 saved credentials into private task state without sharing host sessions or history; legacy `auth.json` remains supported. ([OpenCode serve shared provider](issues/done/20260924-opencode-serve-shared-provider.md))
 - `session_list`/`session_info` report a bounded non-secret `workspace` identity derived from the session working directory (`workspace_type` of `canonical_checkout` / `managed_worktree` / `legacy_worktree`, plus repository and branch when resolvable). ([managed worktree session integration](issues/done/20260916-managed-worktree-session-integration.md))

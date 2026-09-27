@@ -1,8 +1,11 @@
 # Temote self-improvement dogfood protocol: scenario + observation + evaluator
 
-Status: open / design
-Created: 2026-09-28 (Asia/Tokyo)
-Scope: design the repository-owned self-improvement/dogfood protocol; implementation is intentionally deferred
+Status: done
+Model: unknown
+Created: 2026-09-28
+Updated: 2026-09-28
+Branch: feat/20260928-self-improvement-dogfood
+Scope: repository-owned self-improvement/dogfood protocol and first live cycle
 Related:
 
 - `skills/temote-mcp/SKILL.md` (current operating guidance and friction feedback)
@@ -812,3 +815,9 @@ Acceptance:
 - follow-up friction
 
 その時点で「Temote が自己改善できる」とは、agent が自称することではなく、**同じ repository-owned experiment を baseline/candidate に適用し、観測可能な friction reduction と invariant preservation を再現できること**を意味する。
+
+## Implementation record
+
+2026-09-28: D1-D7 の repository-owned harness、fixture、live MCP adapter、比較器、Skill guidance、release qualification gate を実装した。実 live cycle の baseline/candidate snapshot、bounded observation、friction inventory、変更参照、before/after、回帰チェック、判定、follow-up は [評価記録](../../docs/evaluations/self-improvement-20260928/README.md) に保存した。対象は端末結果の evidence 参照を再利用する client workflow で、`read_terminal_result` は 2 call から 1 call に減った。candidate assertion とローカル回帰ゲートは PASS、評価器はこの対象変更を `qualified` と判定した。リリースは実行していない。
+
+Live task rediscovery、transient poll fault、duplicate start、self-host identity の各 artifact も同評価記録にある。CI/action の結果がない release-qualification scenario は `blocked` と記録した。別 server build の同時運用、他 provider の live acceptance、cross-process terminal evidence handoff、bounded wait は残存 follow-up であり、この client workflow の改善を超えて完了したとは扱わない。

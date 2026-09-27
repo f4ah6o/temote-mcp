@@ -1,0 +1,9 @@
+{
+  "cargo_fmt": "pass",
+  "cargo_test": "pass",
+  "cargo_clippy": "pass",
+  "cargo_check_no_default_features": "pass",
+  "gateway_npm_test": "pass",
+  "python_unittest": "pass",
+  "git_diff_check": "pass"
+}

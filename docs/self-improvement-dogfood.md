@@ -1,7 +1,7 @@
 # Self-improvement dogfood harness
 
 `dogfood/` is the repository-owned scenario and observation harness for the
-[self-improvement protocol](../issues/open/20260928-self-improvement-dogfood-protocol.md).
+[self-improvement protocol](../issues/done/20260928-self-improvement-dogfood-protocol.md).
 It uses Python 3's standard library. It does not add an MCP tool or a release path.
 
 ## Run
