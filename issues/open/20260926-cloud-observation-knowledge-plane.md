@@ -1,6 +1,6 @@
 # O3C: Temote Fabric shared observation / knowledge plane
 
-Status: implementation in progress / C0 complete  
+Status: implementation in progress / C0-C1 complete  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
@@ -804,13 +804,29 @@ C0 intentionally does not add the D1 binding, observation ingest endpoint, Queue
 
 ### C1 — Fabric D1 observation ingest
 
-- [ ] add D1 binding
-- [ ] add `observation_sources` / `observations`
-- [ ] host-authenticated sync endpoint
-- [ ] idempotent batch ingest
-- [ ] contiguous ack
-- [ ] gap/degraded tracking
-- [ ] no secret-bearing structured field tests
+- [x] add D1 binding
+- [x] add `observation_sources` / `observations`
+- [x] host-authenticated sync endpoint
+- [x] idempotent batch ingest
+- [x] contiguous ack
+- [x] gap/degraded tracking
+- [x] no secret-bearing structured field tests
+
+C1 implementation:
+- `gateway/wrangler.toml` — `OBSERVATION_DB` / owner namespace declaration
+- `gateway/migrations/0002_observation_ingest.sql` — replay digest and repository identity constraints
+- `gateway/src/observation/ingest.js` — authenticated/validated host sync HTTP boundary
+- `gateway/src/observation/d1.js` — transactional D1 persistence, idempotency, contiguous ACK
+- `gateway/test/cloud-observation-ingest.test.mjs` — endpoint/FakeD1 acceptance
+- `gateway/test/cloud_observation_schema_sqlite.py` — real SQLite migration/transaction acceptance
+
+C1 acceptance includes D1 commit failure returning no ACK, compacted/gapped source bootstrap,
+sticky degraded state, exact replay idempotency, conflicting replay rejection, owner injection
+rejection, and one-way unresolved -> canonical repository identity adoption.
+
+C1 intentionally does not add the host replicator, Queue producer/consumer, memory worker,
+or R2. Those remain C2/C4/C6. The checked-in D1 `database_id` is a deployment sentinel;
+remote deployment must replace it with the provisioned `temote-observation` database UUID.
 
 ### C2 — host replicator
 

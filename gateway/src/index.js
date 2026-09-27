@@ -49,6 +49,10 @@ import {
   unauthorizedClient,
   withCors,
 } from "./http.js";
+import {
+  handleObservationSync,
+  observationSyncHostId,
+} from "./observation/index.js";
 
 export {
   accessEmailAllowed,
@@ -105,6 +109,10 @@ async function handleRequest(request, env) {
     const identity = await authorizeClient(request, env);
     if (!identity) return unauthorizedClient();
     return handleMcp(request, env, identity);
+  }
+  const observationHostId = observationSyncHostId(url.pathname);
+  if (observationHostId) {
+    return handleObservationSync(request, env, observationHostId);
   }
   if (url.pathname.startsWith("/v1/hosts/")) {
     return handleHostApi(request, env, url.pathname.slice("/v1/hosts/".length));
