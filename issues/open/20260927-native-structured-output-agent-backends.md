@@ -4,6 +4,8 @@
 
 open — implementation required
 
+Polished child packet: `issues/polished/20260927-common-task-report-schema.md` (S1: backend-neutral report schema 単一ソース化, ready)。S2-S4 (Codex app-server / OpenCode serve / Devin ACP の native surface 実測+実装) は S1 の共通 contract に依存するため後続 packet とする。
+
 Created: 2026-09-27 (Asia/Tokyo)
 
 Related:

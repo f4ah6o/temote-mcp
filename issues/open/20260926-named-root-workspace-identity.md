@@ -1,6 +1,6 @@
 # Require named-root-backed workspace identity for all managed sessions
 
-Status: design ready / implementation not started  
+Status: design ready / implementation not started — NR1 を polished packet 化: `issues/polished/20260927-named-root-reverse-resolution.md` (ready)。NR0 は `NamedRoots` (`src/named_roots.rs`) + supervisor 集約でほぼ充足しており、残存の ad-hoc 解析が無いことの確認を NR1 packet の step 1 に含めた。
 Repository: `f4ah6o/temote-mcp`  
 Related:
 - `issues/open/20260924-temote-development-harness-restructure.md`

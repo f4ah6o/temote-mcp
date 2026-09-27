@@ -2,7 +2,16 @@
 
 ## Status
 
-open — confirmed product gap.
+done — implemented 2026-09-27 (PR #71). `opencode_task_control` gained the
+`answer` action (`interaction_id` + structured `answer` object); task views
+expose `pending_interactions` with stable, payload-derived IDs; steer no longer
+consumes a pending interaction. Repo-local coverage:
+`pending_permission_is_inspectable_answerable_idempotent_and_stale_safe`,
+`pending_question_accepts_offered_and_free_form_answers`,
+`invalid_interaction_answer_finishes_receipt_without_consuming_request`,
+`steer_does_not_consume_pending_question_interaction` et al. in
+`src/opencode_server.rs`. Live `opencode serve` parity is tracked as a
+live-acceptance-matrix row.
 
 ## Problem
 

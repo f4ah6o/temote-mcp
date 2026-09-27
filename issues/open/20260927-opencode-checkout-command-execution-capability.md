@@ -7,6 +7,8 @@ Related: `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, `iss
 
 Triage: this is not a duplicate of bare-repository provisioning. The bare-repo issue owns caller-side repository-store preparation; this issue owns execution-time binding of a writable checkout, effective cwd, and command capability to an OpenCode implementation task.
 
+Polished child packet: `issues/polished/20260927-opencode-task-preflight-capability-blockers.md` (OC1, ready)。preflight / blocker 分類のみを先に実装し、実際の checkout provisioning は Phase F/C 側に残す。
+
 ## Summary
 
 OpenCode を実装に使うには、Temote 側で対象 repository の checkout と command-execution capability を事前に用意する必要がある。
