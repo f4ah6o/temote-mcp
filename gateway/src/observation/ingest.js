@@ -15,6 +15,24 @@ const MAX_ID = 256;
 const MAX_REPOSITORY_KEY = 512;
 const MAX_PREVIEW_BYTES = 8192;
 const MAX_EVIDENCE_REFS = 64;
+const MAX_EVIDENCE_REF_JSON_BYTES = 1024;
+const MAX_EVIDENCE_REFS_JSON_BYTES = 8192;
+const MAX_TEXT_PREVIEW_BYTES = 4096;
+const MAX_ERROR_PREVIEW_BYTES = 512;
+
+const OBSERVATION_SESSION_INSTANCE_FIELDS = new Set(["started_at", "process_id"]);
+const OBSERVATION_ACTOR_FIELDS = new Set(["transport", "principal"]);
+const OBSERVATION_TARGET_FIELDS = new Set(["backend"]);
+const OBSERVATION_PROVENANCE_FIELDS = new Set(["tool", "source", "control_action"]);
+const OBSERVATION_STATE_REF_FIELDS = new Set(["task_id", "status", "revision", "generation"]);
+const OBSERVATION_EVIDENCE_REF_FIELDS = new Set(["evidence_id", "bytes", "retention_seconds"]);
+const OBSERVATION_CONTENT_FIELDS = new Map([
+  ["text", new Set(["kind", "preview", "total_bytes", "sha256", "truncated"])],
+  ["view", new Set(["kind", "view"])],
+  ["view_digest", new Set(["kind", "sha256", "total_bytes", "truncated"])],
+  ["error", new Set(["kind", "preview"])],
+  ["none", new Set(["kind"])],
+]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
 const KINDS = new Set([
@@ -189,6 +207,10 @@ export async function validateObservationSyncRequest(body) {
 
 function validateObservation(value, sessionId, sourceRevision) {
   if (!object(value)) return invalid("invalid_observation", "observation must be an object");
+  if (hasSensitiveStructuredKey(value)) {
+    return invalid("sensitive_observation_field", "secret-bearing structured field rejected", 422);
+  }
+
   const unknown = Object.keys(value).find((key) => !TOP_LEVEL_FIELDS.has(key));
   if (unknown) return invalid("invalid_observation", "unknown observation field: " + unknown);
 
@@ -211,21 +233,25 @@ function validateObservation(value, sessionId, sourceRevision) {
     return invalid("invalid_observation", "invalid action or dedupe_key");
   }
 
-  if (!object(value.session_instance)
+  if (!exactObservationKeys(value.session_instance, OBSERVATION_SESSION_INSTANCE_FIELDS)
       || !nonNegativeInt(value.session_instance.started_at)
       || !nonNegativeInt(value.session_instance.process_id)) {
-    return invalid("invalid_observation", "invalid session_instance");
+    return invalidNestedObservation("invalid session_instance");
   }
-  if (!object(value.actor) || !bounded(value.actor.transport, 128)
+  if (!exactObservationKeys(value.actor, OBSERVATION_ACTOR_FIELDS, ["transport"])
+      || !bounded(value.actor.transport, 128)
       || !optionalBounded(value.actor.principal, MAX_ID)) {
-    return invalid("invalid_observation", "invalid actor");
+    return invalidNestedObservation("invalid actor");
   }
-  if (!object(value.target) || !bounded(value.target.backend, 128)) {
-    return invalid("invalid_observation", "invalid target");
+  if (!exactObservationKeys(value.target, OBSERVATION_TARGET_FIELDS)
+      || !bounded(value.target.backend, 128)) {
+    return invalidNestedObservation("invalid target");
   }
-  if (!object(value.provenance) || !bounded(value.provenance.tool, 128)
-      || value.provenance.source !== "orchestration") {
-    return invalid("invalid_observation", "invalid provenance");
+  if (!exactObservationKeys(value.provenance, OBSERVATION_PROVENANCE_FIELDS, ["tool", "source"])
+      || !bounded(value.provenance.tool, 128)
+      || value.provenance.source !== "orchestration"
+      || !optionalBounded(value.provenance.control_action, 128)) {
+    return invalidNestedObservation("invalid provenance");
   }
 
   for (const field of ["workspace_id", "task_id", "execution_id", "operation_id"]) {
@@ -235,10 +261,25 @@ function validateObservation(value, sessionId, sourceRevision) {
   }
 
   if (!Array.isArray(value.evidence_refs) || value.evidence_refs.length > MAX_EVIDENCE_REFS) {
-    return invalid("invalid_observation", "invalid evidence_refs");
+    return invalidNestedObservation("invalid evidence_refs");
   }
-  if (hasSensitiveStructuredKey(value.content)) {
-    return invalid("sensitive_observation_field", "secret-bearing structured field rejected", 422);
+  for (const evidenceRef of value.evidence_refs) {
+    if (!exactObservationKeys(evidenceRef, OBSERVATION_EVIDENCE_REF_FIELDS)
+        || typeof evidenceRef.evidence_id !== "string"
+        || evidenceRef.evidence_id.length === 0
+        || !bounded(evidenceRef.evidence_id, MAX_ID)
+        || !nonNegativeInt(evidenceRef.bytes)
+        || !nonNegativeInt(evidenceRef.retention_seconds)) {
+      return invalidNestedObservation("invalid evidence_ref");
+    }
+    const serialized = JSON.stringify(evidenceRef);
+    if (bytes(serialized) > MAX_EVIDENCE_REF_JSON_BYTES) {
+      return invalidNestedObservation("evidence_ref exceeds serialized bound");
+    }
+  }
+  const evidenceRefsJson = JSON.stringify(value.evidence_refs);
+  if (bytes(evidenceRefsJson) > MAX_EVIDENCE_REFS_JSON_BYTES) {
+    return invalidNestedObservation("evidence_refs exceed serialized bound");
   }
 
   const content = normalizeContent(value.content);
@@ -265,48 +306,66 @@ function validateObservation(value, sessionId, sourceRevision) {
       contentDigest: content.value.digest,
       stateStatus: state.value.status,
       stateRevision: state.value.revision,
-      evidenceRefs: JSON.stringify(value.evidence_refs),
+      evidenceRefs: evidenceRefsJson,
     },
   };
 }
 
 function normalizeContent(value) {
   if (!object(value) || !bounded(value.kind, 32)) {
-    return invalid("invalid_observation", "invalid content");
+    return invalidNestedObservation("invalid content");
   }
-  if (value.kind === "none") return { ok: true, value: { kind: "none", preview: null, digest: null } };
+  const fields = OBSERVATION_CONTENT_FIELDS.get(value.kind);
+  if (!fields || !exactObservationKeys(value, fields)) {
+    return invalidNestedObservation("invalid " + value.kind + " content");
+  }
+  if (value.kind === "none") {
+    return { ok: true, value: { kind: "none", preview: null, digest: null } };
+  }
   if (value.kind === "text") {
-    if (typeof value.preview !== "string" || bytes(value.preview) > 4096 || !SHA256.test(value.sha256)) {
-      return invalid("invalid_observation", "invalid text content");
+    if (typeof value.preview !== "string"
+        || bytes(value.preview) > MAX_TEXT_PREVIEW_BYTES
+        || !nonNegativeInt(value.total_bytes)
+        || typeof value.truncated !== "boolean"
+        || !SHA256.test(value.sha256)) {
+      return invalidNestedObservation("invalid text content");
     }
     return { ok: true, value: { kind: "text", preview: value.preview, digest: value.sha256 } };
   }
   if (value.kind === "error") {
-    if (typeof value.preview !== "string" || bytes(value.preview) > 512) {
-      return invalid("invalid_observation", "invalid error content");
+    if (typeof value.preview !== "string" || bytes(value.preview) > MAX_ERROR_PREVIEW_BYTES) {
+      return invalidNestedObservation("invalid error content");
     }
     return { ok: true, value: { kind: "error", preview: value.preview, digest: null } };
   }
   if (value.kind === "view") {
-    if (!Object.hasOwn(value, "view")) return invalid("invalid_observation", "missing view content");
     const serialized = JSON.stringify(value.view);
-    if (bytes(serialized) > MAX_PREVIEW_BYTES) return invalid("invalid_observation", "view content exceeds bound");
+    if (bytes(serialized) > MAX_PREVIEW_BYTES) {
+      return invalidNestedObservation("view content exceeds bound");
+    }
     return { ok: true, value: { kind: "view", preview: serialized, digest: null } };
   }
   if (value.kind === "view_digest") {
-    if (!SHA256.test(value.sha256)) return invalid("invalid_observation", "invalid view digest");
+    if (!SHA256.test(value.sha256)
+        || !nonNegativeInt(value.total_bytes)
+        || typeof value.truncated !== "boolean") {
+      return invalidNestedObservation("invalid view digest");
+    }
     return { ok: true, value: { kind: "view_digest", preview: null, digest: value.sha256 } };
   }
-  return invalid("invalid_observation", "unknown content kind");
+  return invalidNestedObservation("unknown content kind");
 }
 
 function normalizeState(value) {
   if (value === undefined || value === null) {
     return { ok: true, value: { status: null, revision: null } };
   }
-  if (!object(value) || !optionalBounded(value.status, MAX_ID)
-      || (value.revision !== undefined && value.revision !== null && !nonNegativeInt(value.revision))) {
-    return invalid("invalid_observation", "invalid state_ref");
+  if (!exactObservationKeys(value, OBSERVATION_STATE_REF_FIELDS, [])
+      || !optionalBounded(value.task_id, MAX_ID)
+      || !optionalBounded(value.status, MAX_ID)
+      || (value.revision !== undefined && value.revision !== null && !nonNegativeInt(value.revision))
+      || (value.generation !== undefined && value.generation !== null && !nonNegativeInt(value.generation))) {
+    return invalidNestedObservation("invalid state_ref");
   }
   return {
     ok: true,
@@ -315,6 +374,21 @@ function normalizeState(value) {
       revision: value.revision ?? null,
     },
   };
+}
+
+function exactObservationKeys(value, allowed, required = allowed) {
+  if (!object(value)) return false;
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) return false;
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) return false;
+  }
+  return true;
+}
+
+function invalidNestedObservation(detail) {
+  return invalid("invalid_observation", detail, 422);
 }
 
 function trustedOwnerId(env) {
