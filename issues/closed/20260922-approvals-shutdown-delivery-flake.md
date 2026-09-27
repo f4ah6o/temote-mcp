@@ -2,7 +2,7 @@
 
 ## Status
 
-open — observed once on ubuntu-latest CI, cleared on rerun; watch for recurrence.
+closed without product change — no confirmed recurrence in the recent failure set reviewed on 2026-09-27.
 
 ## Evidence
 
@@ -27,3 +27,8 @@ delivery is correct when timing is unpressured.
   whether the delivery timeout needs a load-tolerant bound or whether the
   broker ordering has a real gap.
 - Close without action if it does not recur.
+
+
+## Closure (2026-09-27)
+
+PR #66 investigated the then-current macOS flake set and intentionally did not modify this watcher because `generated_shutdown_denies_all_pending_approvals` passed in the recent failed jobs inspected. With only the original one-off failure and a successful rerun recorded here, there is no actionable defect to keep in the open backlog. If the named test recurs, reopen this watcher or create a new issue with the new run/job/seed evidence before changing production behavior.

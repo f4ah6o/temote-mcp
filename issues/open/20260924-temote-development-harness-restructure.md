@@ -15,7 +15,7 @@ Related:
 - `issues/open/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
 - `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
-- `issues/open/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
+- `issues/done/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
 - `issues/open/20260926-task-change-orchestration-stacked-pr.md` (Task/Change graph as source of truth for executor assignment and stacked PR delivery)
 - `issues/done/20260916-managed-worktree-session-integration.md`
 - `issues/done/20260916-agent-mode-git-broker-gh-git-integration.md`
@@ -593,11 +593,11 @@ transport/
 
 - [x] V0: Git snapshot broker と jj-first の設計比較、VCS abstraction / snapshot / observation / delivery boundary
 - [x] V1: temporary fixture で jj feasibility prototype。**jj-first viable**。bare Git backend、複数 `jj workspace`、change_id、crash後 snapshot、Git read-only compatibility、delivery ref を実測済み
-- [x] V2: backend-neutral VCS/workspace contract を `issues/open/20260925-v2-vcs-workspace-contract.md` に固定。F1 generic parts を保持し jj-first / Git compatibility を分離
+- [x] V2: backend-neutral VCS/workspace contract を `issues/done/20260925-v2-vcs-workspace-contract.md` に固定。F1 generic parts を保持し jj-first / Git compatibility を分離
 - [ ] V3: **first slice merged in PR #59** — typed jj-first core / capability / workspace ensure / inspect / snapshot receipts / observation seam are implemented. Remaining: reconcile, durable Observation journal emission, Task/Execution/VCS correlation, workspace release, automatic task-boundary snapshot wiring
 - [ ] V4: GitHub delivery integration / stacked PR strategy
 
-**V1/V2 は完了済み。F2/F3/C は `issues/open/20260925-v2-vcs-workspace-contract.md` に従って backend-neutral に進め、git-worktree-only 実装には戻さない。**
+**V1/V2 は完了済み。F2/F3/C は `issues/done/20260925-v2-vcs-workspace-contract.md` に従って backend-neutral に進め、git-worktree-only 実装には戻さない。**
 A / O / B と F1 の repository identity・freshness・no-local-main の generic contract は並行して進めてよい。
 
 ### Phase O — observation / context continuity (high priority)

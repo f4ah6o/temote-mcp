@@ -2,12 +2,13 @@
 
 ## Status
 
-open / implementation proposed
+open — implementation landed; post-fix live parity and cloud-mode verification remain
 
 Model: coordinator decision (f4ah6o)
 Created: 2026-09-23 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Umbrella: `issues/open/20260922-agent-server-backends-cli-deprecation.md`
+Triage (2026-09-27): keep open only for current-binary live acceptance after the JSON-RPC envelope fix and for `devin acp --cloud` parity; the backend implementation itself is no longer proposed work.
 
 ## Decision
 

@@ -1,10 +1,10 @@
 # 旧 supervisor からの upgrade で helper 世代判定が unavailable になる
 
-Status: open
+Status: open — implementation merged in PR #40; live-host handoff validation remains
 Model: openai/gpt-6-sol
 Created: 2026-09-24
 Updated: 2026-09-24
-Branch: fix/20260924-upgrade-legacy-helper-preflight
+Implementation: PR #40 / merge commit `2513117a6812fb79e521a6faac4003d4fcda5c41`
 
 ## 概要
 
@@ -34,8 +34,8 @@ Branch: fix/20260924-upgrade-legacy-helper-preflight
 
 ## 受け入れ条件
 
-- [ ] 旧 supervisor 応答に `helper_generation` がなく、同梱 helper の schema が一致する場合に dry-run が `compatible` を返す。
-- [ ] 旧応答でも helper 欠落・非互換を拒否し、新 supervisor の明示的な `unavailable` を上書きしない。
+- [x] 旧 supervisor 応答に `helper_generation` がなく、同梱 helper の schema が一致する場合に dry-run が `compatible` を返す。
+- [x] 旧応答でも helper 欠落・非互換を拒否し、新 supervisor の明示的な `unavailable` を上書きしない。
 - [ ] 修正版を導入したホストで dry-run の `blocked_session_count: 0` と `helper_generation: compatible` を確認し、実際の upgrade で計画したセッションの復元と ingress の health を確認する。
 
 ## テスト計画
@@ -59,3 +59,8 @@ Branch: fix/20260924-upgrade-legacy-helper-preflight
 ## 注記
 
 関連: `issues/done/20260916-upgrade-helper-generation-preflight.md`、`docs/managed-sessions.ja.md`。
+
+
+## Triage update (2026-09-27)
+
+Implementation and repository validation landed in PR #40. The issue stays open only because the destructive/live acceptance on the host with the legacy supervisor has not been recorded yet. Do not redo the merged code work; next action is the documented `upgrade --dry-run` → `upgrade` → session/ingress health verification on an explicitly accepted host.
