@@ -118,3 +118,21 @@ report decode failure は、少なくとも次を区別する。
 - parse failure 時に raw payload が破棄される箇所
 
 修正後は、実際の failure path と regression test の対応箇所をこの issue に記録する。
+
+## Implementation notes (2026-09-27)
+
+Failure path: `derive_serve_state` (`src/opencode_server.rs`) and `derive_acp_state` (`src/devin_acp.rs`) reached `TaskStatus::Completed` and then called `extract_report` on the final assistant text; when decoding failed, only `last_error` was persisted and the raw text was dropped, leaving `report: null` and evidence with normalized metadata only.
+
+Fix, applied to both local agent backends so the contract is not backend-scoped:
+
+- `TaskRecord` retains `report_status` (`valid` / `missing_report` / `invalid_json` / `invalid_report_schema`), a bounded `raw_result` (`MAX_RAW_RESULT_BYTES` = 16 KiB), and `raw_result_truncated`; all `#[serde(default)]` so schema version 1 records stay compatible.
+- `extract_report` now distinguishes missing reply vs malformed JSON vs schema-invalid object.
+- `task_view` exposes `report_status`, `raw_result_bytes`, and `raw_result_truncated` only; the raw reply crosses the boundary exclusively through `evidence_read` via `terminal_evidence_ref`, which mints a session-scoped evidence record on every terminal `task_get` (including repeat/post-reconnect reads).
+- Task lifecycle status is unchanged: `completed` stays `completed`; report decode failure is never reclassified as an execution failure.
+
+Regression tests:
+
+- `opencode_server.rs`: `get_completed_with_malformed_report_preserves_bounded_raw_result` (invalid JSON + repeat terminal get mints fresh evidence), `get_completed_with_schema_invalid_report_preserves_raw_result`, `get_completed_with_empty_reply_reports_missing_report`, `derive_completed_truncates_oversized_raw_result_explicitly`, `extract_report_distinguishes_decode_failure_kinds`, `truncate_text_bounds_output_and_marks_truncation`, and the valid-report assertions in `get_completes_from_assistant_message`.
+- `devin_acp.rs`: `get_completed_with_malformed_report_preserves_bounded_raw_result` (including repeat terminal get), `get_completed_with_schema_invalid_report_preserves_raw_result`, `extract_report_distinguishes_decode_failure_kinds`, `truncate_text_bounds_output_and_marks_truncation`, and the updated `get_completes_from_stop_reason_and_report`.
+
+`devin_cloud.rs` extracts its report opportunistically from hosted session messages and does not gate `completed` on the local decode, so it was left unchanged.

@@ -41,6 +41,7 @@ const MAX_INTERACTION_VIEW_BYTES: usize = 16 * 1024;
 const MAX_PENDING_INTERACTIONS: usize = 64;
 const MAX_ERROR_BYTES: usize = 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024;
+const MAX_RAW_RESULT_BYTES: usize = 16 * 1024;
 const MAX_REPORT_ARRAY_ITEMS: usize = 64;
 const MAX_SUMMARY_CHARS: usize = 1200;
 const MAX_MESSAGES_SCAN: u32 = 16;
@@ -371,6 +372,29 @@ impl TaskStatus {
     }
 }
 
+/// Final-report decode state, tracked independently from the task lifecycle
+/// status so a completed turn whose structured report is malformed keeps its
+/// `completed` status and exposes a recoverable raw result instead.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReportStatus {
+    Valid,
+    MissingReport,
+    InvalidJson,
+    InvalidReportSchema,
+}
+
+impl ReportStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::MissingReport => "missing_report",
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidReportSchema => "invalid_report_schema",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum OperationPhase {
@@ -434,6 +458,12 @@ struct TaskRecord {
     report: Option<Value>,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    report_status: Option<ReportStatus>,
+    #[serde(default)]
+    raw_result: Option<String>,
+    #[serde(default)]
+    raw_result_truncated: bool,
     created_at: u64,
     updated_at: u64,
     operations: Vec<OperationReceipt>,
@@ -1376,6 +1406,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             "OpenCode task report exceeds {MAX_REPORT_BYTES} bytes"
         );
     }
+    if let Some(raw_result) = &record.raw_result {
+        anyhow::ensure!(
+            raw_result.len() <= MAX_RAW_RESULT_BYTES,
+            "OpenCode task raw result exceeds {MAX_RAW_RESULT_BYTES} bytes"
+        );
+    }
     anyhow::ensure!(
         record.revision > 0,
         "OpenCode task revision must be positive"
@@ -1680,6 +1716,9 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "usage": record.usage,
         "observed_model": record.observed_model,
         "report": record.report,
+        "report_status": record.report_status.map(ReportStatus::as_str),
+        "raw_result_bytes": record.raw_result.as_ref().map(String::len),
+        "raw_result_truncated": record.raw_result_truncated,
         "last_error": record.last_error,
         "reconciliation_required": record.status == TaskStatus::ReconciliationRequired,
         "evidence": evidence_ref,
@@ -1703,6 +1742,31 @@ fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Va
         object.insert("reconciliation_deferred".to_owned(), json!(true));
     }
     view
+}
+
+/// Bounded, expiring, session-scoped evidence for a terminal task's final
+/// assistant turn. The raw reply and report decode detail cross the boundary
+/// only through this evidence record, never inline in the task view, so it is
+/// minted on every terminal read — including repeat and post-reconnect gets.
+fn terminal_evidence_ref(
+    owner: &SessionInstance,
+    session: &config::Session,
+    record: &TaskRecord,
+) -> Option<evidence::EvidenceRef> {
+    let opencode_session_id = record.opencode_session_id.clone()?;
+    let payload = json!({
+        "kind": "opencode_task_final_state",
+        "task_id": record.task_id,
+        "opencode_session_id": opencode_session_id,
+        "status": record.status.as_str(),
+        "report": record.report,
+        "report_status": record.report_status.map(ReportStatus::as_str),
+        "raw_result": record.raw_result,
+        "raw_result_truncated": record.raw_result_truncated,
+        "usage": record.usage,
+        "observed_model": record.observed_model,
+    });
+    store_evidence_for_instance(owner, session, &payload)
 }
 
 fn store_evidence_for_instance(
@@ -3111,6 +3175,9 @@ struct DerivedServeState {
     usage: Option<BTreeMap<String, u64>>,
     observed_model: Option<String>,
     report: Option<Value>,
+    report_status: Option<ReportStatus>,
+    raw_result: Option<String>,
+    raw_result_truncated: bool,
     last_error: Option<String>,
 }
 
@@ -3230,6 +3297,9 @@ fn derive_serve_state(
             usage: None,
             observed_model: None,
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some("opencode permission/question request is pending".to_owned()),
         };
     }
@@ -3256,6 +3326,9 @@ fn derive_serve_state(
             usage,
             observed_model,
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: None,
         };
     }
@@ -3274,6 +3347,9 @@ fn derive_serve_state(
             usage,
             observed_model,
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: (status == TaskStatus::RetryableFailed)
                 .then(|| "opencode turn ended without an assistant reply".to_owned()),
         };
@@ -3285,6 +3361,9 @@ fn derive_serve_state(
             usage,
             observed_model,
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some(error),
         };
     }
@@ -3296,17 +3375,26 @@ fn derive_serve_state(
             usage,
             observed_model,
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some("opencode turn ended without completion".to_owned()),
         };
     }
 
     let text = message_text(assistant);
-    let (report, report_error) = extract_report(&text);
+    // Retain the bounded raw reply before report decoding so a malformed
+    // structured report cannot strand a completed task's result.
+    let (raw_result, raw_result_truncated) = truncate_text(&text, MAX_RAW_RESULT_BYTES);
+    let (report, report_status, report_error) = extract_report(&text);
     DerivedServeState {
         status: TaskStatus::Completed,
         usage,
         observed_model,
         report,
+        report_status: Some(report_status),
+        raw_result: Some(raw_result),
+        raw_result_truncated,
         last_error: report_error,
     }
 }
@@ -3322,26 +3410,62 @@ fn bound_text(value: &str, max: usize) -> String {
     format!("{}…", &value[..end])
 }
 
+/// Bound a retained raw result to `max` bytes total (including the truncation
+/// marker) and report whether the tail was dropped, so oversized output is an
+/// explicit truncation rather than a silent loss.
+fn truncate_text(value: &str, max: usize) -> (String, bool) {
+    if value.len() <= max {
+        return (value.to_owned(), false);
+    }
+    let limit = max.saturating_sub('…'.len_utf8());
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &value[..end]), true)
+}
+
 /// Extract the last balanced JSON object from assistant text and validate the
-/// bounded delegation report contract.
-fn extract_report(text: &str) -> (Option<Value>, Option<String>) {
+/// bounded delegation report contract. The decode status is returned alongside
+/// the report so a completed turn can distinguish an empty reply, malformed
+/// JSON, and a schema-invalid object instead of conflating them.
+fn extract_report(text: &str) -> (Option<Value>, ReportStatus, Option<String>) {
     let mut best: Option<Value> = None;
+    let mut parsed_object = false;
     for (index, _) in text.match_indices('{') {
         let Some(value) = parse_balanced_json(&text[index..]) else {
             continue;
         };
+        parsed_object = true;
         if report_shape_valid(&value) {
             best = Some(value);
         }
     }
-    match best {
-        Some(report) => (Some(report), None),
-        None if text.trim().is_empty() => (None, Some("assistant reply was empty".to_owned())),
-        None => (
-            None,
-            Some("assistant reply did not contain a valid report JSON object".to_owned()),
-        ),
+    if let Some(report) = best {
+        return (Some(report), ReportStatus::Valid, None);
     }
+    if text.trim().is_empty() {
+        return (
+            None,
+            ReportStatus::MissingReport,
+            Some("assistant reply was empty".to_owned()),
+        );
+    }
+    if parsed_object {
+        return (
+            None,
+            ReportStatus::InvalidReportSchema,
+            Some(
+                "assistant reply contained a JSON object that did not satisfy the report schema"
+                    .to_owned(),
+            ),
+        );
+    }
+    (
+        None,
+        ReportStatus::InvalidJson,
+        Some("assistant reply did not contain a valid report JSON object".to_owned()),
+    )
 }
 
 fn parse_balanced_json(text: &str) -> Option<Value> {
@@ -3519,6 +3643,13 @@ async fn apply_derived(
         }
         if derived.report.is_some() {
             record.report = derived.report.clone();
+        }
+        if derived.report_status.is_some() {
+            record.report_status = derived.report_status;
+        }
+        if derived.raw_result.is_some() {
+            record.raw_result = derived.raw_result.clone();
+            record.raw_result_truncated = derived.raw_result_truncated;
         }
         if derived.last_error.is_some() {
             record.last_error = derived.last_error.clone();
@@ -3705,6 +3836,9 @@ async fn task_start_with_store_and_binary(
         observed_model: None,
         report: None,
         last_error: None,
+        report_status: None,
+        raw_result: None,
+        raw_result_truncated: false,
         created_at: now,
         updated_at: now,
         operations: Vec::new(),
@@ -3912,7 +4046,8 @@ async fn task_get_with_store_and_binary(
                 "revision": record.revision,
             }));
         }
-        return Ok(task_view(&record, None));
+        let evidence_ref = terminal_evidence_ref(&owner, session, &record);
+        return Ok(task_view(&record, evidence_ref.as_ref()));
     }
 
     let acquired_lease = match runtime_access {
@@ -3965,27 +4100,6 @@ async fn task_get_with_store_and_binary(
         Ok(Vec::new())
     };
 
-    // Store bounded evidence for the final assistant turn on terminal states.
-    let evidence_ref = if record.status.is_terminal() {
-        record
-            .opencode_session_id
-            .clone()
-            .map(|opencode_session_id| {
-                json!({
-                    "kind": "opencode_task_final_state",
-                    "task_id": task_id,
-                    "opencode_session_id": opencode_session_id,
-                    "status": record.status.as_str(),
-                    "report": record.report,
-                    "usage": record.usage,
-                    "observed_model": record.observed_model,
-                })
-            })
-            .and_then(|payload| store_evidence_for_instance(&owner, session, &payload))
-    } else {
-        None
-    };
-
     if after_revision == Some(record.revision) {
         return Ok(json!({
             "task_id": task_id,
@@ -3993,6 +4107,14 @@ async fn task_get_with_store_and_binary(
             "revision": record.revision,
         }));
     }
+
+    // Store bounded evidence for the final assistant turn on terminal states.
+    let evidence_ref = if record.status.is_terminal() {
+        terminal_evidence_ref(&owner, session, &record)
+    } else {
+        None
+    };
+
     let mut view = task_view(&record, evidence_ref.as_ref());
     match interactions {
         Ok(interactions) => {
@@ -5091,6 +5213,15 @@ mod tests {
         report: &Value,
         tokens: Option<Value>,
     ) {
+        complete_turn_with_text(fake, session_id, &report.to_string(), tokens);
+    }
+
+    fn complete_turn_with_text(
+        fake: &Arc<Mutex<FakeServe>>,
+        session_id: &str,
+        text: &str,
+        tokens: Option<Value>,
+    ) {
         let mut fake = fake.lock().unwrap();
         let session = fake.sessions.get_mut(session_id).unwrap();
         session.busy = false;
@@ -5106,7 +5237,7 @@ mod tests {
         }
         session.messages.push(json!({
             "info": info,
-            "parts": [{"type": "text", "text": report.to_string()}],
+            "parts": [{"type": "text", "text": text}],
         }));
     }
 
@@ -5289,9 +5420,218 @@ mod tests {
 
         assert_eq!(out["status"], "completed");
         assert_eq!(out["report"]["summary"], "done");
+        assert_eq!(out["report_status"], "valid");
+        assert_eq!(out["raw_result_bytes"], report.to_string().len() as u64);
+        assert_eq!(out["raw_result_truncated"], false);
+        assert!(out.get("raw_result").is_none());
         assert_eq!(out["usage"]["totalTokens"], 15);
         assert_eq!(out["observed_model"], "anthropic/claude-sonnet-4");
         assert!(out["evidence"].is_object());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_completed_with_malformed_report_preserves_bounded_raw_result() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "do the thing"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = out["task_id"].as_str().unwrap().to_owned();
+        let session_id = {
+            let fake = fake.lock().unwrap();
+            fake.sessions.keys().next().unwrap().clone()
+        };
+        let raw_text = "I inspected the tree; everything is already correct.";
+        complete_turn_with_text(&fake, &session_id, raw_text, None);
+
+        let out = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+
+        // The task completed; only the structured report decode failed. The
+        // view stays concise and the raw reply is retrievable only through
+        // bounded, session-scoped evidence.
+        assert_eq!(out["status"], "completed");
+        assert!(out["report"].is_null());
+        assert_eq!(out["report_status"], "invalid_json");
+        assert_eq!(out["raw_result_bytes"], raw_text.len() as u64);
+        assert_eq!(out["raw_result_truncated"], false);
+        assert!(out.get("raw_result").is_none());
+        assert!(
+            out["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("valid report JSON object")
+        );
+        let evidence_id = out["evidence"]["evidence_id"].as_str().unwrap().to_owned();
+        let evidence = evidence::read(
+            &session.id,
+            &session.cwd,
+            Uuid::parse_str(&evidence_id).unwrap(),
+            0,
+            evidence::MAX_READ_BYTES,
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&evidence.content).unwrap();
+        assert_eq!(payload["report_status"], "invalid_json");
+        assert_eq!(payload["raw_result"], raw_text);
+
+        // A terminal record re-reads the retained result without re-running
+        // or contacting the backend, and mints fresh scoped evidence for the
+        // same raw result.
+        clear_fake();
+        let reread = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reread["status"], "completed");
+        assert_eq!(reread["report_status"], "invalid_json");
+        assert!(reread.get("raw_result").is_none());
+        let reread_evidence_id = reread["evidence"]["evidence_id"].as_str().unwrap();
+        let reread_evidence = evidence::read(
+            &session.id,
+            &session.cwd,
+            Uuid::parse_str(reread_evidence_id).unwrap(),
+            0,
+            evidence::MAX_READ_BYTES,
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&reread_evidence.content).unwrap();
+        assert_eq!(payload["raw_result"], raw_text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_completed_with_schema_invalid_report_preserves_raw_result() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "do the thing"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = out["task_id"].as_str().unwrap().to_owned();
+        let session_id = {
+            let fake = fake.lock().unwrap();
+            fake.sessions.keys().next().unwrap().clone()
+        };
+        let raw_text = r#"notes {"status":"weird","summary":"x"}"#;
+        complete_turn_with_text(&fake, &session_id, raw_text, None);
+
+        let out = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+
+        assert_eq!(out["status"], "completed");
+        assert!(out["report"].is_null());
+        assert_eq!(out["report_status"], "invalid_report_schema");
+        assert_eq!(out["raw_result_bytes"], raw_text.len() as u64);
+        assert!(
+            out["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("did not satisfy the report schema")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_completed_with_empty_reply_reports_missing_report() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "do the thing"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = out["task_id"].as_str().unwrap().to_owned();
+        let session_id = {
+            let fake = fake.lock().unwrap();
+            fake.sessions.keys().next().unwrap().clone()
+        };
+        complete_turn_with_text(&fake, &session_id, "", None);
+
+        let out = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+
+        assert_eq!(out["status"], "completed");
+        assert!(out["report"].is_null());
+        assert_eq!(out["report_status"], "missing_report");
+        assert_eq!(out["raw_result_bytes"], 0);
+    }
+
+    #[test]
+    fn derive_completed_truncates_oversized_raw_result_explicitly() {
+        let root = tempdir();
+        let session = session(&root, "derive-owner");
+        let task_id = Uuid::new_v4();
+        let record = record_for(&session, task_id, TaskStatus::Running, Some("ses_1"));
+        let report = json!({"status": "completed", "summary": "done"}).to_string();
+        let text = format!("{}{}", "x".repeat(MAX_RAW_RESULT_BYTES * 2), report);
+        let messages = vec![json!({
+            "info": {"id": "m1", "role": "assistant", "time": {"created": 1, "completed": 2}},
+            "parts": [{"type": "text", "text": text}],
+        })];
+        let derived = derive_serve_state(
+            &record,
+            "ses_1",
+            &BTreeSet::new(),
+            &json!({}),
+            &messages,
+            &[],
+            &[],
+        );
+        assert_eq!(derived.status, TaskStatus::Completed);
+        assert_eq!(derived.report_status, Some(ReportStatus::Valid));
+        assert_eq!(derived.report.unwrap()["summary"], "done");
+        assert!(derived.raw_result_truncated);
+        assert!(derived.raw_result.unwrap().len() <= MAX_RAW_RESULT_BYTES);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6129,15 +6469,66 @@ mod tests {
                 "observed_effort": "oe",
             })
             .to_string();
-        let (report, error) = extract_report(&text);
+        let (report, status, error) = extract_report(&text);
         assert!(error.is_none());
+        assert_eq!(status, ReportStatus::Valid);
         assert_eq!(report.unwrap()["summary"], "s");
     }
 
     #[test]
     fn extract_report_rejects_non_json_text() {
-        let (_report, error) = extract_report("no report here");
+        let (_report, status, error) = extract_report("no report here");
+        assert_eq!(status, ReportStatus::InvalidJson);
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn extract_report_distinguishes_decode_failure_kinds() {
+        let (_report, status, error) = extract_report("");
+        assert_eq!(status, ReportStatus::MissingReport);
+        assert!(error.is_some());
+
+        let (_report, status, _) = extract_report("   \n  ");
+        assert_eq!(status, ReportStatus::MissingReport);
+
+        // Unbalanced JSON is malformed, not schema-invalid.
+        let (_report, status, _) = extract_report("prefix {\"status\":\"completed\"");
+        assert_eq!(status, ReportStatus::InvalidJson);
+
+        let (_report, status, error) =
+            extract_report("worked on it\n{\"status\":\"weird\",\"summary\":\"x\"}");
+        assert_eq!(status, ReportStatus::InvalidReportSchema);
+        assert!(error.is_some());
+
+        let (_report, status, _) = extract_report("{\"status\":\"completed\",\"summary\": 42}");
+        assert_eq!(status, ReportStatus::InvalidReportSchema);
+
+        // A valid report later in the text still wins over earlier debris.
+        let (report, status, error) =
+            extract_report("{\"status\":\"weird\"}\n{\"status\":\"completed\",\"summary\":\"ok\"}");
+        assert_eq!(status, ReportStatus::Valid);
+        assert!(error.is_none());
+        assert_eq!(report.unwrap()["summary"], "ok");
+    }
+
+    #[test]
+    fn truncate_text_bounds_output_and_marks_truncation() {
+        let short = "short";
+        let (kept, truncated) = truncate_text(short, MAX_RAW_RESULT_BYTES);
+        assert_eq!(kept, short);
+        assert!(!truncated);
+
+        let long = "x".repeat(MAX_RAW_RESULT_BYTES * 2);
+        let (kept, truncated) = truncate_text(&long, MAX_RAW_RESULT_BYTES);
+        assert!(truncated);
+        assert!(kept.len() <= MAX_RAW_RESULT_BYTES);
+        assert!(kept.ends_with('…'));
+
+        // Multibyte characters split at a UTF-8 boundary.
+        let wide = "水".repeat(MAX_RAW_RESULT_BYTES);
+        let (kept, truncated) = truncate_text(&wide, MAX_RAW_RESULT_BYTES);
+        assert!(truncated);
+        assert!(kept.len() <= MAX_RAW_RESULT_BYTES);
     }
 
     #[test]
@@ -6183,10 +6574,18 @@ mod tests {
             })
     }
 
-    /// Live contract check against a real `opencode serve`: when the env
-    /// override forces V2 the probe must land on the `api/*` client and every
-    /// transport call the task machinery uses must answer. Skips when no
-    /// opencode binary is installed.
+    /// Host-only live provider acceptance against a real `opencode serve`: when
+    /// the env override forces V2 the probe must land on the `api/*` client,
+    /// every transport call the task machinery uses must answer, and the
+    /// configured provider must return a non-empty assistant turn. Ignored by
+    /// default because it depends on the host's installed OpenCode build and
+    /// provider credentials, so it is not a deterministic CI signal; run it
+    /// explicitly with
+    /// `cargo test -- --ignored serve_v2_contract_end_to_end`. The
+    /// deterministic `serve_v2_api_contract_is_deterministic_without_provider`
+    /// test below covers the same transport paths and message shapes without a
+    /// provider. Skips when no opencode binary is installed.
+    #[ignore = "host-only live OpenCode provider acceptance; run explicitly with --ignored"]
     #[tokio::test(flavor = "current_thread")]
     async fn serve_v2_contract_end_to_end() {
         let _serial = serial().await;
@@ -6322,6 +6721,228 @@ mod tests {
         client.shutdown().await;
     }
 
+    /// Deterministic in-process stand-in for the OpenCode `api/*` V2 surface.
+    /// It answers exactly one request per connection and closes, so the
+    /// reqwest-backed V2 client exercises real HTTP paths and JSON envelopes
+    /// without a provider or an OpenCode binary.
+    #[cfg(unix)]
+    async fn spawn_mock_v2_serve() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 1024];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(read) => {
+                                request.extend_from_slice(&chunk[..read]);
+                                if request.windows(2).any(|window| window == b"\r\n")
+                                    || request.len() > 8192
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or_default();
+                    let path = parts
+                        .next()
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default();
+                    let (status, body) = mock_v2_response(method, path);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
+                });
+            }
+        });
+        (format!("http://{address}/"), handle)
+    }
+
+    #[cfg(unix)]
+    fn mock_v2_response(method: &str, path: &str) -> (&'static str, String) {
+        if matches!(
+            (method, path),
+            ("GET", "/api/info") | ("GET", "/api/health")
+        ) {
+            return ("200 OK", "{}".to_owned());
+        }
+        if method == "GET" && path == "/api/provider" {
+            let body = r#"{"data":[{"id":"mock-provider","name":"Mock"}]}"#;
+            return ("200 OK", body.to_owned());
+        }
+        if method == "POST" && path == "/api/session" {
+            let body = r#"{"data":{"id":"ses_mock"}}"#;
+            return ("200 OK", body.to_owned());
+        }
+        if method == "POST" && path.ends_with("/prompt") {
+            return ("200 OK", "{}".to_owned());
+        }
+        if method == "POST" && path.ends_with("/interrupt") {
+            return ("200 OK", "{}".to_owned());
+        }
+        if method == "GET" && path.ends_with("/message") {
+            let body = r#"{"data":[
+                {"type":"user","id":"msg_test","content":[{"type":"text","text":"say hi"}]},
+                {"type":"assistant","time":{"created":1,"completed":2},"model":{"providerID":"mock-provider","id":"mock-model"},"content":[{"type":"text","text":"hello from v2"}]}
+            ]}"#;
+            return ("200 OK", body.to_owned());
+        }
+        if method == "GET" && path == "/api/session/active" {
+            return ("200 OK", "{}".to_owned());
+        }
+        if method == "GET" && path == "/api/permission/request" {
+            return ("200 OK", r#"{"data":[]}"#.to_owned());
+        }
+        if method == "GET" && path == "/api/question/request" {
+            return ("200 OK", r#"{"data":[]}"#.to_owned());
+        }
+        if method == "GET" && path == "/api/non_json" {
+            return ("200 OK", "<html>not json</html>".to_owned());
+        }
+        if method == "GET" && path == "/api/boom" {
+            return ("500 Internal Server Error", "{}".to_owned());
+        }
+        ("404 Not Found", "{}".to_owned())
+    }
+
+    /// Deterministic replacement for the provider-dependent half of the live V2
+    /// contract. It drives the real `ServeClient::SdkV2` HTTP client against the
+    /// mock above, which only answers the `api/*` routes the task machinery
+    /// uses, so a wrong path or a wrong response envelope fails the test even
+    /// when no OpenCode binary or provider credential exists.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_v2_api_contract_is_deterministic_without_provider() {
+        let (base_url, server) = spawn_mock_v2_serve().await;
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("600").kill_on_drop(true);
+        let child = command
+            .spawn()
+            .expect("placeholder child for the V2 client");
+        let client = ServeClient::SdkV2(Arc::new(SdkV2Serve {
+            client: reqwest::Client::builder().build().unwrap(),
+            base_url: base_url.clone(),
+            password: "test-password".to_owned(),
+            directory: "/tmp".to_owned(),
+            child: tokio::sync::Mutex::new(child),
+            tail: Arc::new(Mutex::new(String::new())),
+        }));
+
+        let health = client.health().await.unwrap();
+        assert_eq!(health["healthy"], true);
+        assert_eq!(health["contract"], "v2");
+
+        let providers = client.provider_list().await.unwrap();
+        assert!(
+            providers["all"].is_array(),
+            "provider list shape: {providers}"
+        );
+        assert_eq!(providers["all"][0]["id"], "mock-provider");
+
+        let created = client
+            .session_create(&json!({"title": "v2-wire", "agent": "build"}))
+            .await
+            .unwrap();
+        let session_id = created["id"].as_str().unwrap().to_owned();
+        assert_eq!(session_id, "ses_mock");
+
+        // The provider-dependent half of the old live test is replaced by a
+        // mock that echoes this deterministic prompt id in its message list.
+        let message_id = "msg_test".to_owned();
+        client
+            .prompt_async(
+                &session_id,
+                &json!({
+                    "messageID": message_id,
+                    "parts": [{"type": "text", "text": "say hi"}],
+                }),
+            )
+            .await
+            .expect("v2 prompt admission failed");
+
+        let messages = client.messages(&session_id, 16).await.unwrap();
+        assert!(
+            messages.iter().any(|message| {
+                message
+                    .get("info")
+                    .unwrap_or(message)
+                    .get("id")
+                    .and_then(Value::as_str)
+                    == Some(message_id.as_str())
+            }),
+            "prompt id must appear in the message list: {messages:?}"
+        );
+        let assistant = messages
+            .iter()
+            .find(|message| message_is_assistant(message))
+            .expect("assistant message missing");
+        assert!(
+            message_completed(assistant),
+            "assistant message must expose a completed time: {assistant}"
+        );
+        assert_eq!(
+            message_text(assistant),
+            "hello from v2",
+            "assistant text must be extracted from v2 content parts: {assistant}"
+        );
+        assert_eq!(
+            observed_model_from(assistant).as_deref(),
+            Some("mock-provider/mock-model"),
+            "observed model must parse from the v2 model object: {assistant}"
+        );
+
+        let status = client.session_status().await.unwrap();
+        assert!(status.is_object(), "session status shape: {status}");
+
+        let permissions = client.permission_list().await.unwrap();
+        assert!(
+            permissions.is_empty(),
+            "permission list shape: {permissions:?}"
+        );
+        let questions = client.question_list().await.unwrap();
+        assert!(questions.is_empty(), "question list shape: {questions:?}");
+
+        client.abort(&session_id).await.unwrap();
+        client.shutdown().await;
+
+        // The V2 JSON contract rejects a non-JSON body even on HTTP 200 and
+        // surfaces non-success statuses, so an HTML shell page cannot be
+        // mistaken for an `api/*` route that answered.
+        let http = reqwest::Client::builder().build().unwrap();
+        assert!(
+            v2_get_json(&http, &base_url, "test-password", "api/non_json")
+                .await
+                .is_err()
+        );
+        let error = v2_get_json(&http, &base_url, "test-password", "api/boom")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 500"), "{error}");
+        server.abort();
+    }
+
     fn record_for(
         owner_session: &config::Session,
         task_id: Uuid,
@@ -6345,6 +6966,9 @@ mod tests {
             observed_model: None,
             report: None,
             last_error: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),

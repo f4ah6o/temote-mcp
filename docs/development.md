@@ -58,6 +58,14 @@ git diff --check
 
 `just check`, pull-request CI, and release validation all run the gateway suite. The checked-in `gateway/contract/routed-tools.json` snapshot is generated from Rust's public non-supervisor tool surface and compared with the Worker export. Regenerate an intentional contract change with `TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test routed_gateway_contract_matches_checked_in_snapshot`, then review the structural diff.
 
+### OpenCode V2 contract and live provider gate
+
+The V2 `api/*` transport and message-shape contract is covered deterministically by `opencode_server::tests::serve_v2_api_contract_is_deterministic_without_provider`, which drives the real V2 HTTP client against an in-process mock of the routes the task machinery uses (no OpenCode binary, no provider). Real provider acceptance is a separate host gate: `opencode_server::tests::serve_v2_contract_end_to_end` is `#[ignore]`d because it spawns the installed `opencode serve` and depends on the host's OpenCode build and provider credentials, so it is not a deterministic CI signal. Run it explicitly on a suitable host:
+
+```sh
+cargo test -- --ignored serve_v2_contract_end_to_end
+```
+
 ### Rust toolchain contract
 
 `rust-toolchain.toml` is the single source of truth for the Rust/Clippy version used by local development, normal CI (`.github/workflows/ci.yaml`), the release allocation workflow (`.github/workflows/release.yaml`), and the cargo-dist build. Both workflows run `rustup show`, which installs and activates the pinned channel plus its `rustfmt` and `clippy` components from that file; the generated `.github/workflows/release.yml` inherits the same toolchain because `dist build` runs inside the checkout.
