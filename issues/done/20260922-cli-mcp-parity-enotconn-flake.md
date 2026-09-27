@@ -2,7 +2,7 @@
 
 ## Status
 
-doing — recurrence confirmed on macos-latest CI; fix implemented on `fix/20260926-macos-session-flakes` and awaiting CI verification.
+done — fixed by PR #66; CI green and merged 2026-09-27.
 
 ## Evidence
 
@@ -52,3 +52,8 @@ The retention/session E2E fixture also waits, with a bounded deadline, until a
 newly-started session is observable as `active` before parity assertions. This
 addresses the separate establishment race seen in run `35901733559` without
 weakening the parity assertion.
+
+
+## Closure (2026-09-27)
+
+PR #66 merged the bounded `NotConnected` half-close handling and active-session readiness wait. Its full CI passed before merge. Reopen only with new recurrence evidence on a post-#66 commit.

@@ -1,9 +1,9 @@
 # V2: backend-neutral VCS / workspace contract
 
-Status: contract delivered / V3 first slice implemented  
+Status: done — contract delivered; V3 implementation tracked by the parent VCS issue  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
-Related: `issues/open/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
+Related: `issues/done/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
 Created: 2026-09-25 (Asia/Tokyo)
 
 ## 1. Goal

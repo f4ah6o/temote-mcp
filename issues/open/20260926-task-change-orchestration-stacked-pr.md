@@ -4,7 +4,7 @@ Status: design ready / implementation not started
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
-Related: `issues/open/20260925-v2-vcs-workspace-contract.md`  
+Related: `issues/done/20260925-v2-vcs-workspace-contract.md`  
 Created: 2026-09-26 (Asia/Tokyo)
 
 ## 1. Problem

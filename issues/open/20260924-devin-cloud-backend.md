@@ -2,13 +2,15 @@
 
 ## Status
 
-open / implemented, live verification pending
+open — core backend implemented and live-tested; suspended→resume and SWE-2 tier follow-up remain
 
 Model: coordinator decision (f4ah6o)
 Created: 2026-09-24 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Umbrella: `issues/open/20260922-agent-server-backends-cli-deprecation.md`
 Related: `issues/open/20260923-devin-acp-backend.md` (local `devin acp`; 別系統)
+SWE-2 service-tier follow-up: PR #63 (`swe_tier=promo|priority`; current draft must regain green contract snapshots before merge)
+Triage (2026-09-27): keep open for the remaining live suspended→resume case and the SWE-2 tier follow-up; core create/get/control live acceptance is already recorded below.
 
 ## Decision
 

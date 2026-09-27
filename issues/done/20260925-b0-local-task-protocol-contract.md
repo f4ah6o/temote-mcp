@@ -1,6 +1,6 @@
 # B0: local task protocol / 認証 scope / 実行所有者の契約
 
-Status: contract delivered (設計 packet。実装コードなし。PR #56)
+Status: done — contract delivered (設計 packet。実装コードなし。PR #56 merged 2026-09-27)
 Packet: B0 (Phase B — local frontend の第 1 child)
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `6df8181` (B0 は A4 PR #55 に依存しない)

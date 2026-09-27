@@ -2,8 +2,7 @@
 
 ## Status
 
-doing — both failure families recurred on macos-latest through 2026-09-26;
-fixture/transport mitigations are implemented on `fix/20260926-macos-session-flakes` and awaiting CI verification.
+done — both reproduced failure families fixed by PR #66; CI green and merged 2026-09-27.
 
 ## Evidence
 
@@ -32,7 +31,7 @@ fixture/transport mitigations are implemented on `fix/20260926-macos-session-fla
 Both assertions involve a fresh CLI/MCP client reaching the supervisor while
 fixture state is settling (metadata materialization and post-GC scans). On a
 loaded macOS runner the client connect/read can race the supervisor, in the
-same connect-race family as `20260922-cli-mcp-parity-enotconn-flake.md`. No
+same connect-race family as `issues/done/20260922-cli-mcp-parity-enotconn-flake.md`. No
 product gap was identified from single observations; ubuntu-latest and local
 runs are consistently green.
 
@@ -62,3 +61,8 @@ The fixture's active-session helper now uses a bounded read-only `session info`
 poll after each successful start, and the post-GC list/info assertions include
 both stdout and stderr so any future recurrence preserves the transport
 evidence requested by this issue.
+
+
+## Closure (2026-09-27)
+
+PR #66 merged the control half-close fix, bounded active-session readiness wait, terminal-pair quiescence wait, and preserved post-GC diagnostics. Full CI passed before merge. Reopen only with a post-#66 recurrence that identifies which family returned.

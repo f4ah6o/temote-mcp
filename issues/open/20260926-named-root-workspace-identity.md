@@ -4,8 +4,8 @@ Status: design ready / implementation not started
 Repository: `f4ah6o/temote-mcp`  
 Related:
 - `issues/open/20260924-temote-development-harness-restructure.md`
-- `issues/open/20260925-f1-repository-store-workspace-contract.md`
-- `issues/open/20260925-v2-vcs-workspace-contract.md`
+- `issues/done/20260925-f1-repository-store-workspace-contract.md`
+- `issues/done/20260925-v2-vcs-workspace-contract.md`
 - `issues/open/20260926-temote-fabric-product-boundary.md`
 Created: 2026-09-26 (Asia/Tokyo)
 
