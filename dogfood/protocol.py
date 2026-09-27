@@ -176,6 +176,7 @@ def load(path: Path) -> dict:
 
 def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = None,
             target_metrics: list[str] | None = None,
+            target_operations: list[str] | None = None,
             target_assertions: list[str] | None = None) -> dict:
     validate_run(baseline)
     validate_run(candidate)
@@ -189,13 +190,19 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
     if any(value not in OUTCOMES for value in gate_results.values()):
         raise ValueError("invalid gate result")
     target_metrics = target_metrics or []
+    target_operations = target_operations or []
     target_assertions = target_assertions or []
     if any(key not in baseline["metrics"] or key == "tool_calls_per_operation" for key in target_metrics):
         raise ValueError("unknown scalar target metric")
     if any(key not in baseline["assertions"] or key not in candidate["assertions"] for key in target_assertions):
         raise ValueError("unknown target assertion")
-    targets_met = bool(target_metrics or target_assertions)
+    if any(key not in OPERATIONS for key in target_operations):
+        raise ValueError("unknown target operation")
+    targets_met = bool(target_metrics or target_operations or target_assertions)
     targets_met &= all(candidate["metrics"][key] < baseline["metrics"][key] for key in target_metrics)
+    targets_met &= all(candidate["metrics"]["tool_calls_per_operation"].get(key, 0)
+                       < baseline["metrics"]["tool_calls_per_operation"].get(key, 0)
+                       for key in target_operations)
     targets_met &= all(baseline["assertions"][key] != "pass" and candidate["assertions"][key] == "pass"
                        for key in target_assertions)
     no_assertion_regression = all(value != "pass" or candidate["assertions"].get(key) == "pass"
@@ -216,6 +223,15 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
         measures[key] = {"baseline": value, "candidate": candidate["metrics"][key],
                          "baseline_refs": [e["ref"] for e in baseline["events"]],
                          "candidate_refs": [e["ref"] for e in candidate["events"]]}
+    measures["tool_calls_per_operation"] = {}
+    for operation in sorted(set(baseline["metrics"]["tool_calls_per_operation"])
+                            | set(candidate["metrics"]["tool_calls_per_operation"])):
+        measures["tool_calls_per_operation"][operation] = {
+            "baseline": baseline["metrics"]["tool_calls_per_operation"].get(operation, 0),
+            "candidate": candidate["metrics"]["tool_calls_per_operation"].get(operation, 0),
+            "baseline_refs": [e["ref"] for e in baseline["events"] if e["logical_operation"] == operation],
+            "candidate_refs": [e["ref"] for e in candidate["events"] if e["logical_operation"] == operation],
+        }
     frictions = []
     for key in ("duplicate_start_attempts", "ambiguous_terminal_states", "recovery_calls",
                 "unchanged_poll_count", "opaque_id_handoffs", "tool_calls"):
@@ -224,6 +240,14 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
             frictions.append({"metric": key, "baseline": old, "candidate": new,
                               "severity_candidate": "P0" if key in {"duplicate_start_attempts", "ambiguous_terminal_states"} else "P1",
                               "event_refs": measures[key]["baseline_refs"]})
+    for key in target_operations:
+        old = baseline["metrics"]["tool_calls_per_operation"].get(key, 0)
+        new = candidate["metrics"]["tool_calls_per_operation"].get(key, 0)
+        if old > new:
+            frictions.append({"operation": key, "baseline": old, "candidate": new,
+                              "severity_candidate": "P1",
+                              "event_refs": [e["ref"] for e in baseline["events"]
+                                             if e["logical_operation"] == key]})
     for key in target_assertions:
         if baseline["assertions"][key] != "pass" and candidate["assertions"][key] == "pass":
             frictions.append({"assertion": key, "baseline": baseline["assertions"][key],
@@ -233,7 +257,8 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
         "schema_version": 1, "baseline_run_id": baseline["run_id"], "candidate_run_id": candidate["run_id"],
         "scenario_fingerprint": baseline["scenario_fingerprint"],
         "comparison": measures, "friction_inventory": frictions,
-        "target_metrics": target_metrics, "target_assertions": target_assertions,
+        "target_metrics": target_metrics, "target_operations": target_operations,
+        "target_assertions": target_assertions,
         "environment_comparable": environment_comparable,
         "regression_gates": gate_results, "qualification": "qualified" if safe else "blocked",
         "reason": "assertions and gates passed" if safe else "missing, failed or incomparable acceptance evidence",

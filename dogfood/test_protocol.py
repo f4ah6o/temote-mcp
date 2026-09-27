@@ -80,6 +80,8 @@ class ProtocolTests(unittest.TestCase):
         report = compare(old, new, gates={"deterministic": "pass"}, target_metrics=["tool_calls"])
         self.assertEqual(report["qualification"], "qualified")
         self.assertTrue(report["comparison"]["tool_calls"]["baseline_refs"])
+        self.assertEqual(compare(old, new, gates={"deterministic": "pass"},
+                                 target_operations=["read_terminal_result"])["qualification"], "qualified")
         new["snapshot"]["environment_capabilities"]["model"] = "different-model"
         self.assertEqual(compare(old, new, gates={"deterministic": "pass"},
                                  target_metrics=["tool_calls"])["qualification"], "blocked")

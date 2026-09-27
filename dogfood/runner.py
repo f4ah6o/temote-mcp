@@ -156,6 +156,7 @@ def execute(scenario_data: dict, phase: str, adapter: FakeAdapter | LiveAdapter,
     contract = "fixture-contract" if isinstance(adapter, FakeAdapter) else "unknown"
     last_state = "not_run"
     terminal_view: dict | None = None
+    recover_next_poll = False
 
     def observed(operation: str, tool: str, args: dict, *, recovery: bool = False) -> dict:
         nonlocal outcome, last_state
@@ -229,12 +230,14 @@ def execute(scenario_data: dict, phase: str, adapter: FakeAdapter | LiveAdapter,
                               state="error", error_code="TRANSIENT_POLL", retryable=True,
                               next_action="retry_get", recovery=True)
                 assertions["retry_is_machine_decidable"] = "pass"
+                recover_next_poll = True
             elif operation == "wait_until_terminal":
                 if not task_id:
                     raise AdapterError("TASK_ID_MISSING")
                 for index in range(max_polls):
                     view = observed(operation, f"{backend}_task_get",
-                                    {"session_id": session_id, "task_id": task_id}, recovery=index > 0)
+                                    {"session_id": session_id, "task_id": task_id}, recovery=recover_next_poll)
+                    recover_next_poll = False
                     last_state = view.get("status", "unknown")
                     if last_state in TERMINAL:
                         terminal_view = view

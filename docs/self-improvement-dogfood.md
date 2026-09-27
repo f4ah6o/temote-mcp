@@ -49,11 +49,14 @@ Compare the same scenario revision with independently observed gate results:
 
 ```sh
 python3 -m dogfood compare baseline.json candidate.json \
-  --target-metric tool_calls --gates gates.json --output comparison.json
+  --target-operation read_terminal_result --gates gates.json --output comparison.json
 ```
 
 `gates.json` maps gate names to `pass`, `fail`, `blocked`, or `not_run`. An
 assertion fixed by the candidate can be targeted with `--target-assertion`.
+Scalar metrics can be targeted with `--target-metric`; operation call counts
+use `--target-operation`. Per-operation goals avoid mistaking variation in
+poll timing for a regression or an improvement in the targeted step.
 Qualification requires a measured target improvement, passing candidate
 assertions, no assertion regression, and explicit passing gates. The comparison
 keeps source event references for every numeric value; it is a vector, not a

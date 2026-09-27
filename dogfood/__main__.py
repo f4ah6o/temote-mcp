@@ -39,6 +39,7 @@ def main() -> None:
     comparison.add_argument("candidate", type=Path)
     comparison.add_argument("--gates", type=Path)
     comparison.add_argument("--target-metric", action="append", default=[])
+    comparison.add_argument("--target-operation", action="append", default=[])
     comparison.add_argument("--target-assertion", action="append", default=[])
     comparison.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -50,7 +51,8 @@ def main() -> None:
     if args.command == "compare":
         gates = json.loads(args.gates.read_text()) if args.gates else {}
         result = compare(load(args.baseline), load(args.candidate), gates=gates,
-                         target_metrics=args.target_metric, target_assertions=args.target_assertion)
+                         target_metrics=args.target_metric, target_operations=args.target_operation,
+                         target_assertions=args.target_assertion)
         if args.output:
             if args.output.exists():
                 raise FileExistsError(args.output)
