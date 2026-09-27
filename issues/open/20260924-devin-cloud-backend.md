@@ -9,8 +9,9 @@ Created: 2026-09-24 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Umbrella: `issues/open/20260922-agent-server-backends-cli-deprecation.md`
 Related: `issues/open/20260923-devin-acp-backend.md` (local `devin acp`; 別系統)
-SWE-2 service-tier follow-up: PR #63 (`swe_tier=promo|priority`; current draft must regain green contract snapshots before merge)
+SWE-2 service-tier follow-up: PR #63 (`swe_tier=promo|priority`; current draft must regain green contract snapshots and preserve exact replay compatibility for pre-tier start receipts before merge)
 Triage (2026-09-27): keep open for the remaining live suspended→resume case and the SWE-2 tier follow-up; core create/get/control live acceptance is already recorded below.
+PR #63 review blocker (2026-09-27): adding `swe_tier: null` to the Devin Cloud start request fingerprint changes the fingerprint for requests accepted by pre-#63 binaries. An unchanged replay with the same `operation_id` can therefore become `OPERATION_CONFLICT` after upgrade. Preserve the legacy fingerprint when `swe_tier` is absent, or explicitly accept the legacy fingerprint for existing receipts, and add a pre-change receipt replay regression fixture.
 
 ## Decision
 
