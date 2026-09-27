@@ -40,6 +40,7 @@ const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024;
+const MAX_RAW_RESULT_BYTES: usize = 16 * 1024;
 const MAX_REPORT_ARRAY_ITEMS: usize = 64;
 const MAX_SUMMARY_CHARS: usize = 1200;
 const MAX_ASSISTANT_TEXT_BYTES: usize = MAX_REPORT_BYTES * 4;
@@ -351,6 +352,29 @@ impl TaskStatus {
     }
 }
 
+/// Final-report decode state, tracked independently from the task lifecycle
+/// status so a completed turn whose structured report is malformed keeps its
+/// `completed` status and exposes a recoverable raw result instead.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReportStatus {
+    Valid,
+    MissingReport,
+    InvalidJson,
+    InvalidReportSchema,
+}
+
+impl ReportStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::MissingReport => "missing_report",
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidReportSchema => "invalid_report_schema",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum OperationPhase {
@@ -404,6 +428,12 @@ struct TaskRecord {
     report: Option<Value>,
     #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    report_status: Option<ReportStatus>,
+    #[serde(default)]
+    raw_result: Option<String>,
+    #[serde(default)]
+    raw_result_truncated: bool,
     created_at: u64,
     updated_at: u64,
     operations: Vec<OperationReceipt>,
@@ -1339,6 +1369,12 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             "Devin task report exceeds {MAX_REPORT_BYTES} bytes"
         );
     }
+    if let Some(raw_result) = &record.raw_result {
+        anyhow::ensure!(
+            raw_result.len() <= MAX_RAW_RESULT_BYTES,
+            "Devin task raw result exceeds {MAX_RAW_RESULT_BYTES} bytes"
+        );
+    }
     anyhow::ensure!(record.revision > 0, "Devin task revision must be positive");
     anyhow::ensure!(
         record.operations.len() <= MAX_OPERATION_HISTORY,
@@ -1433,6 +1469,9 @@ fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) 
         "usage": record.usage,
         "observed_model": record.observed_model,
         "report": record.report,
+        "report_status": record.report_status.map(ReportStatus::as_str),
+        "raw_result_bytes": record.raw_result.as_ref().map(String::len),
+        "raw_result_truncated": record.raw_result_truncated,
         "last_error": record.last_error,
         "reconciliation_required": record.status == TaskStatus::ReconciliationRequired,
         "evidence": evidence_ref,
@@ -1456,6 +1495,31 @@ fn task_view_at_revision(record: &TaskRecord, after_revision: Option<u64>) -> Va
         object.insert("reconciliation_deferred".to_owned(), json!(true));
     }
     view
+}
+
+/// Bounded, expiring, session-scoped evidence for a terminal task's final
+/// assistant turn. The raw reply and report decode detail cross the boundary
+/// only through this evidence record, never inline in the task view, so it is
+/// minted on every terminal read — including repeat and post-reconnect gets.
+fn terminal_evidence_ref(
+    owner: &SessionInstance,
+    session: &config::Session,
+    record: &TaskRecord,
+) -> Option<evidence::EvidenceRef> {
+    let acp_session_id = record.acp_session_id.clone()?;
+    let payload = json!({
+        "kind": "devin_acp_task_final_state",
+        "task_id": record.task_id,
+        "acp_session_id": acp_session_id,
+        "status": record.status.as_str(),
+        "report": record.report,
+        "report_status": record.report_status.map(ReportStatus::as_str),
+        "raw_result": record.raw_result,
+        "raw_result_truncated": record.raw_result_truncated,
+        "usage": record.usage,
+        "observed_model": record.observed_model,
+    });
+    store_evidence_for_instance(owner, session, &payload)
 }
 
 fn store_evidence_for_instance(
@@ -2609,6 +2673,9 @@ struct DerivedAcpState {
     usage: Option<BTreeMap<String, u64>>,
     observed_model: Option<String>,
     report: Option<Value>,
+    report_status: Option<ReportStatus>,
+    raw_result: Option<String>,
+    raw_result_truncated: bool,
     last_error: Option<String>,
 }
 
@@ -2619,6 +2686,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
             usage: snap.usage.clone(),
             observed_model: snap.observed_model.clone(),
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some("devin acp permission request is pending".to_owned()),
         };
     }
@@ -2628,18 +2698,29 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
             usage: snap.usage.clone(),
             observed_model: snap.observed_model.clone(),
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: None,
         };
     }
     if let Some(reason) = &snap.last_stop_reason {
         return match reason.as_str() {
             "end_turn" => {
-                let (report, report_error) = extract_report(&snap.assistant_text);
+                // Retain the bounded raw reply before report decoding so a
+                // malformed structured report cannot strand a completed
+                // task's result.
+                let (raw_result, raw_result_truncated) =
+                    truncate_text(&snap.assistant_text, MAX_RAW_RESULT_BYTES);
+                let (report, report_status, report_error) = extract_report(&snap.assistant_text);
                 DerivedAcpState {
                     status: TaskStatus::Completed,
                     usage: snap.usage.clone(),
                     observed_model: snap.observed_model.clone(),
                     report,
+                    report_status: Some(report_status),
+                    raw_result: Some(raw_result),
+                    raw_result_truncated,
                     last_error: report_error,
                 }
             }
@@ -2648,6 +2729,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
                 usage: snap.usage.clone(),
                 observed_model: snap.observed_model.clone(),
                 report: None,
+                report_status: None,
+                raw_result: None,
+                raw_result_truncated: false,
                 last_error: None,
             },
             other => DerivedAcpState {
@@ -2655,6 +2739,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
                 usage: snap.usage.clone(),
                 observed_model: snap.observed_model.clone(),
                 report: None,
+                report_status: None,
+                raw_result: None,
+                raw_result_truncated: false,
                 last_error: Some(bound_text(
                     &format!("devin acp turn ended with stop reason {other}"),
                     MAX_ERROR_BYTES,
@@ -2668,6 +2755,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
             usage: snap.usage.clone(),
             observed_model: snap.observed_model.clone(),
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some(error.clone()),
         };
     }
@@ -2677,6 +2767,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
             usage: snap.usage.clone(),
             observed_model: snap.observed_model.clone(),
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some(error.clone()),
         };
     }
@@ -2696,6 +2789,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
             usage: snap.usage.clone(),
             observed_model: snap.observed_model.clone(),
             report: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             last_error: Some("devin acp turn state was lost across a reload".to_owned()),
         };
     }
@@ -2704,6 +2800,9 @@ fn derive_acp_state(record: &TaskRecord, snap: &AcpShared) -> DerivedAcpState {
         usage: snap.usage.clone(),
         observed_model: snap.observed_model.clone(),
         report: None,
+        report_status: None,
+        raw_result: None,
+        raw_result_truncated: false,
         last_error: None,
     }
 }
@@ -2719,26 +2818,62 @@ fn bound_text(value: &str, max: usize) -> String {
     format!("{}…", &value[..end])
 }
 
+/// Bound a retained raw result to `max` bytes total (including the truncation
+/// marker) and report whether the tail was dropped, so oversized output is an
+/// explicit truncation rather than a silent loss.
+fn truncate_text(value: &str, max: usize) -> (String, bool) {
+    if value.len() <= max {
+        return (value.to_owned(), false);
+    }
+    let limit = max.saturating_sub('…'.len_utf8());
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &value[..end]), true)
+}
+
 /// Extract the last balanced JSON object from assistant text and validate the
-/// bounded delegation report contract.
-fn extract_report(text: &str) -> (Option<Value>, Option<String>) {
+/// bounded delegation report contract. The decode status is returned alongside
+/// the report so a completed turn can distinguish an empty reply, malformed
+/// JSON, and a schema-invalid object instead of conflating them.
+fn extract_report(text: &str) -> (Option<Value>, ReportStatus, Option<String>) {
     let mut best: Option<Value> = None;
+    let mut parsed_object = false;
     for (index, _) in text.match_indices('{') {
         let Some(value) = parse_balanced_json(&text[index..]) else {
             continue;
         };
+        parsed_object = true;
         if report_shape_valid(&value) {
             best = Some(value);
         }
     }
-    match best {
-        Some(report) => (Some(report), None),
-        None if text.trim().is_empty() => (None, Some("assistant reply was empty".to_owned())),
-        None => (
-            None,
-            Some("assistant reply did not contain a valid report JSON object".to_owned()),
-        ),
+    if let Some(report) = best {
+        return (Some(report), ReportStatus::Valid, None);
     }
+    if text.trim().is_empty() {
+        return (
+            None,
+            ReportStatus::MissingReport,
+            Some("assistant reply was empty".to_owned()),
+        );
+    }
+    if parsed_object {
+        return (
+            None,
+            ReportStatus::InvalidReportSchema,
+            Some(
+                "assistant reply contained a JSON object that did not satisfy the report schema"
+                    .to_owned(),
+            ),
+        );
+    }
+    (
+        None,
+        ReportStatus::InvalidJson,
+        Some("assistant reply did not contain a valid report JSON object".to_owned()),
+    )
 }
 
 fn parse_balanced_json(text: &str) -> Option<Value> {
@@ -2898,6 +3033,13 @@ async fn apply_derived(
         }
         if derived.report.is_some() {
             record.report = derived.report.clone();
+        }
+        if derived.report_status.is_some() {
+            record.report_status = derived.report_status;
+        }
+        if derived.raw_result.is_some() {
+            record.raw_result = derived.raw_result.clone();
+            record.raw_result_truncated = derived.raw_result_truncated;
         }
         if derived.last_error.is_some() {
             record.last_error = derived.last_error.clone();
@@ -3177,6 +3319,9 @@ async fn task_start_with_store_and_binary(
         observed_model: None,
         report: None,
         last_error: None,
+        report_status: None,
+        raw_result: None,
+        raw_result_truncated: false,
         created_at: now,
         updated_at: now,
         operations: Vec::new(),
@@ -3420,7 +3565,8 @@ async fn task_get_with_store_and_binary(
                 "revision": record.revision,
             }));
         }
-        return Ok(task_view(&record, None));
+        let evidence_ref = terminal_evidence_ref(&owner, session, &record);
+        return Ok(task_view(&record, evidence_ref.as_ref()));
     }
 
     let acquired_lease = match runtime_access {
@@ -3465,27 +3611,6 @@ async fn task_get_with_store_and_binary(
         }
     };
 
-    // Store bounded evidence for the final assistant turn on terminal states.
-    let evidence_ref = if record.status.is_terminal() {
-        record
-            .acp_session_id
-            .clone()
-            .map(|acp_session_id| {
-                json!({
-                    "kind": "devin_acp_task_final_state",
-                    "task_id": task_id,
-                    "acp_session_id": acp_session_id,
-                    "status": record.status.as_str(),
-                    "report": record.report,
-                    "usage": record.usage,
-                    "observed_model": record.observed_model,
-                })
-            })
-            .and_then(|payload| store_evidence_for_instance(&owner, session, &payload))
-    } else {
-        None
-    };
-
     if after_revision == Some(record.revision) {
         return Ok(json!({
             "task_id": task_id,
@@ -3493,6 +3618,14 @@ async fn task_get_with_store_and_binary(
             "revision": record.revision,
         }));
     }
+
+    // Store bounded evidence for the final assistant turn on terminal states.
+    let evidence_ref = if record.status.is_terminal() {
+        terminal_evidence_ref(&owner, session, &record)
+    } else {
+        None
+    };
+
     Ok(task_view(&record, evidence_ref.as_ref()))
 }
 
@@ -4200,8 +4333,149 @@ mod tests {
 
         assert_eq!(out["status"], "completed");
         assert_eq!(out["report"]["summary"], "done");
+        assert_eq!(out["report_status"], "valid");
+        assert_eq!(out["raw_result_bytes"], report.to_string().len() as u64);
+        assert_eq!(out["raw_result_truncated"], false);
+        assert!(out.get("raw_result").is_none());
         assert_eq!(out["observed_model"], "devin-test-model");
         assert!(out["evidence"].is_object());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_completed_with_malformed_report_preserves_bounded_raw_result() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client(true);
+        install_fake(fake.clone());
+
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "do the thing"),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+        let task_id = out["task_id"].as_str().unwrap().to_owned();
+        let session_id = {
+            let fake = fake.lock().unwrap();
+            fake.sessions.keys().next().unwrap().clone()
+        };
+        let raw_text = "I inspected the tree; everything is already correct.";
+        fake.lock()
+            .unwrap()
+            .complete_prompt(&session_id, "end_turn", Some(raw_text));
+        wait_for_prompt_idle(&fake).await;
+
+        let out = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+
+        // The task completed; only the structured report decode failed. The
+        // view stays concise and the raw reply is retrievable only through
+        // bounded, session-scoped evidence.
+        assert_eq!(out["status"], "completed");
+        assert!(out["report"].is_null());
+        assert_eq!(out["report_status"], "invalid_json");
+        assert_eq!(out["raw_result_bytes"], raw_text.len() as u64);
+        assert_eq!(out["raw_result_truncated"], false);
+        assert!(out.get("raw_result").is_none());
+        let evidence_id = out["evidence"]["evidence_id"].as_str().unwrap().to_owned();
+        let evidence = evidence::read(
+            &session.id,
+            &session.cwd,
+            Uuid::parse_str(&evidence_id).unwrap(),
+            0,
+            evidence::MAX_READ_BYTES,
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&evidence.content).unwrap();
+        assert_eq!(payload["report_status"], "invalid_json");
+        assert_eq!(payload["raw_result"], raw_text);
+
+        // A terminal record re-reads the retained result without re-running
+        // or contacting the backend, and mints fresh scoped evidence for the
+        // same raw result.
+        clear_fake();
+        let reread = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reread["status"], "completed");
+        assert_eq!(reread["report_status"], "invalid_json");
+        assert!(reread.get("raw_result").is_none());
+        let reread_evidence_id = reread["evidence"]["evidence_id"].as_str().unwrap();
+        let reread_evidence = evidence::read(
+            &session.id,
+            &session.cwd,
+            Uuid::parse_str(reread_evidence_id).unwrap(),
+            0,
+            evidence::MAX_READ_BYTES,
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&reread_evidence.content).unwrap();
+        assert_eq!(payload["raw_result"], raw_text);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_completed_with_schema_invalid_report_preserves_raw_result() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client(true);
+        install_fake(fake.clone());
+
+        let out = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "do the thing"),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+        let task_id = out["task_id"].as_str().unwrap().to_owned();
+        let session_id = {
+            let fake = fake.lock().unwrap();
+            fake.sessions.keys().next().unwrap().clone()
+        };
+        let raw_text = r#"notes {"status":"weird","summary":"x"}"#;
+        fake.lock()
+            .unwrap()
+            .complete_prompt(&session_id, "end_turn", Some(raw_text));
+        wait_for_prompt_idle(&fake).await;
+
+        let out = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("devin"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+
+        assert_eq!(out["status"], "completed");
+        assert!(out["report"].is_null());
+        assert_eq!(out["report_status"], "invalid_report_schema");
+        assert_eq!(out["raw_result_bytes"], raw_text.len() as u64);
+        assert!(
+            out["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("did not satisfy the report schema")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4480,6 +4754,9 @@ mod tests {
             observed_model: None,
             report: None,
             last_error: None,
+            report_status: None,
+            raw_result: None,
+            raw_result_truncated: false,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
@@ -4498,16 +4775,47 @@ mod tests {
                 "unresolved": [],
             })
             .to_string();
-        let (report, error) = extract_report(&text);
+        let (report, status, error) = extract_report(&text);
         assert!(error.is_none());
+        assert_eq!(status, ReportStatus::Valid);
         assert_eq!(report.unwrap()["summary"], "s");
     }
 
     #[test]
     fn extract_report_rejects_invalid() {
-        let (report, error) = extract_report("no json here");
+        let (report, status, error) = extract_report("no json here");
         assert!(report.is_none());
+        assert_eq!(status, ReportStatus::InvalidJson);
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn extract_report_distinguishes_decode_failure_kinds() {
+        let (_report, status, error) = extract_report("");
+        assert_eq!(status, ReportStatus::MissingReport);
+        assert!(error.is_some());
+
+        let (_report, status, _) = extract_report("prefix {\"status\":\"completed\"");
+        assert_eq!(status, ReportStatus::InvalidJson);
+
+        let (_report, status, error) =
+            extract_report("worked on it\n{\"status\":\"weird\",\"summary\":\"x\"}");
+        assert_eq!(status, ReportStatus::InvalidReportSchema);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn truncate_text_bounds_output_and_marks_truncation() {
+        let short = "short";
+        let (kept, truncated) = truncate_text(short, MAX_RAW_RESULT_BYTES);
+        assert_eq!(kept, short);
+        assert!(!truncated);
+
+        let long = "x".repeat(MAX_RAW_RESULT_BYTES * 2);
+        let (kept, truncated) = truncate_text(&long, MAX_RAW_RESULT_BYTES);
+        assert!(truncated);
+        assert!(kept.len() <= MAX_RAW_RESULT_BYTES);
+        assert!(kept.ends_with('…'));
     }
 
     #[test]

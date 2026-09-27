@@ -463,6 +463,16 @@ export const PUBLIC_TOOLS = [
     ),
   ),
   tool(
+    "task_list",
+    "List session delegated tasks",
+    "Return a bounded read-only projection of the delegated tasks owned by the selected full session instance and scope, merged across every delegation backend; an unreadable backend is reported per-backend as unavailable.",
+    readOnly,
+    schema(
+      { ...sessionProperty, limit: { type: "integer", minimum: 1, maximum: 128, default: 50 } },
+      ["session_id"],
+    ),
+  ),
+  tool(
     "stop_job",
     "Stop a sandbox job",
     "Stop a background command on the selected host.",

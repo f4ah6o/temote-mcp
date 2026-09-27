@@ -4,6 +4,7 @@
 
 ### Added
 
+- `task_list` rediscovers session-owned delegated tasks across backends through the existing bounded task projection, with per-backend availability and no transcript or output. ([development harness](issues/open/20260924-temote-development-harness-restructure.md))
 - `opencode_task_*` serve children now use the host CLI's provider/model configuration and seed V2 saved credentials into private task state without sharing host sessions or history; legacy `auth.json` remains supported. ([OpenCode serve shared provider](issues/done/20260924-opencode-serve-shared-provider.md))
 - `session_list`/`session_info` report a bounded non-secret `workspace` identity derived from the session working directory (`workspace_type` of `canonical_checkout` / `managed_worktree` / `legacy_worktree`, plus repository and branch when resolvable). ([managed worktree session integration](issues/done/20260916-managed-worktree-session-integration.md))
 - Added `git_worktree_create` and `git_worktree_list` for deterministic Temote-managed worktrees below the configured `src` named root (`~/src/worktrees/<repo>/<task>` in the usual layout), with read-only pre-approval inspection, exact `src` named-root authority, existing-local-branch-only creates, post-create containment/identity verification, fail-closed path/traversal/symlink/collision validation, and legacy worktree preservation. ([managed worktree create/list](issues/done/20260916-managed-worktree-create-list.md))
@@ -19,6 +20,7 @@
 
 ### Fixed
 
+- Completed OpenCode and Devin ACP tasks keep malformed final replies recoverable through scoped evidence. Task responses show report decode status and truncation without changing execution status. ([completed task result recovery](issues/open/20260927-completed-task-malformed-final-report-json.md))
 - Local supervisor control requests no longer fail when macOS reports `ENOTCONN` while half-closing an already-written request; the client still requires the supervisor response and never replays the mutation. Session metadata E2E fixtures also wait for active-session and retention quiescence before parity/determinism assertions. ([CLI/MCP parity flake](issues/open/20260922-cli-mcp-parity-enotconn-flake.md), [retention macOS flakes](issues/open/20260923-retention-e2e-macos-race-flakes.md))
 - Upgrading from an older, protocol-compatible supervisor now checks the installed Linux sandbox helper locally when that supervisor does not report its helper generation, so a compatible bundle is not incorrectly blocked as `unavailable`. ([legacy upgrade helper preflight](issues/open/20260924-upgrade-legacy-helper-preflight.md))
 - Linked-worktree Git broker mutations now succeed in the default `agent` mode: the broker pins the selected worktree's validated repository identity and the sandbox authorizes only that repository's own Git metadata, while swapped or symlinked metadata still fails closed. Missing protected metadata masks (for example `packed-refs`) also stay readable inside the Linux sandbox instead of failing with `EACCES`. ([linked worktree broker metadata scope](issues/done/20260917-linked-worktree-broker-metadata-scope.md))
