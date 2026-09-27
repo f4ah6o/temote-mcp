@@ -5,8 +5,8 @@ Repository: `f4ah6o/temote-mcp`
 Created: 2026-09-27 (Asia/Tokyo)
 
 Related:
-- `issues/open/20260925-f1-repository-store-workspace-contract.md`
-- `issues/open/20260925-v2-vcs-workspace-contract.md`
+- `issues/done/20260925-f1-repository-store-workspace-contract.md`
+- `issues/done/20260925-v2-vcs-workspace-contract.md`
 - `issues/open/20260926-named-root-workspace-identity.md`
 
 ## 1. Problem
