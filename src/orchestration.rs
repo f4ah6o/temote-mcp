@@ -454,9 +454,20 @@ fn opencode_task_control_approval(
     metadata.insert("operation_id".to_owned(), operation_id.clone());
     metadata.insert("action".to_owned(), action.clone());
     metadata.insert("control_input".to_owned(), "omitted".to_owned());
+    if let Some(interaction_id) = request.interaction_id {
+        metadata.insert(
+            "interaction_id".to_owned(),
+            render_approval_argument(interaction_id),
+        );
+        metadata.insert("interaction_answer".to_owned(), "omitted".to_owned());
+    }
+    let interaction = request
+        .interaction_id
+        .map(|id| format!("\ninteraction_id: {}", render_approval_argument(id)))
+        .unwrap_or_default();
     (
         format!(
-            "OpenCode delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
+            "OpenCode delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}{interaction}\ncontrol input: omitted"
         ),
         metadata,
     )

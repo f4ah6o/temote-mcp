@@ -22,6 +22,7 @@ use super::{Backend, Operation};
 // rendered error strings so these cannot silently diverge.
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 256;
+const MAX_INTERACTION_ANSWER_BYTES: usize = 16 * 1024;
 #[cfg(feature = "network")]
 const MAX_REPOS: usize = 16;
 const DEFAULT_TASK_LIST_LIMIT: usize = 50;
@@ -128,6 +129,10 @@ pub(crate) enum ControlAction {
     Steer,
     Resume,
     Interrupt,
+    /// Answer one exact pending OpenCode permission/question interaction.
+    /// This is deliberately distinct from `steer`: structured backend
+    /// interactions must never be encoded as ordinary prompt text.
+    Answer,
 }
 
 impl ControlAction {
@@ -137,6 +142,7 @@ impl ControlAction {
             ControlAction::Steer => "steer",
             ControlAction::Resume => "resume",
             ControlAction::Interrupt => "interrupt",
+            ControlAction::Answer => "answer",
         }
     }
 }
@@ -148,6 +154,10 @@ pub(crate) struct TaskControlRequest<'a> {
     pub(crate) task_id: &'a str,
     pub(crate) operation_id: &'a str,
     pub(crate) action: ControlAction,
+    /// Present only for the OpenCode `answer` action. The answer payload is
+    /// validated but intentionally not retained so approval/observation
+    /// metadata cannot accidentally copy user response text.
+    pub(crate) interaction_id: Option<&'a str>,
 }
 
 /// Where task execution runs relative to this host.
@@ -216,6 +226,8 @@ pub(crate) struct BackendCapabilities {
     pub(crate) resume: Option<ResumeSemantics>,
     /// `None` when the backend has no interrupt action.
     pub(crate) interrupt: Option<InterruptSemantics>,
+    /// Whether this backend exposes exact pending-interaction answers.
+    pub(crate) interaction_answer: bool,
     /// Wait-for-input states the backend can surface. Declared for the
     /// shared boundary; the MCP adapter does not read it yet.
     #[allow(dead_code)]
@@ -231,6 +243,7 @@ impl BackendCapabilities {
             ControlAction::Steer => true,
             ControlAction::Resume => self.resume.is_some(),
             ControlAction::Interrupt => self.interrupt.is_some(),
+            ControlAction::Answer => self.interaction_answer,
         }
     }
 }
@@ -243,6 +256,7 @@ impl Backend {
                 execution: ExecutionLocality::HostLocal,
                 resume: Some(ResumeSemantics::ReconcileThread),
                 interrupt: Some(InterruptSemantics::CancelTurn),
+                interaction_answer: false,
                 input_wait: InputWait::ApprovalOnly,
             },
             #[cfg(feature = "network")]
@@ -250,12 +264,14 @@ impl Backend {
                 execution: ExecutionLocality::HostLocal,
                 resume: Some(ResumeSemantics::ResumeMessage),
                 interrupt: Some(InterruptSemantics::AbortSession),
+                interaction_answer: true,
                 input_wait: InputWait::ApprovalOnly,
             },
             Backend::DevinAcp => BackendCapabilities {
                 execution: ExecutionLocality::HostLocal,
                 resume: Some(ResumeSemantics::AgentLoadSession),
                 interrupt: Some(InterruptSemantics::AbortSession),
+                interaction_answer: false,
                 input_wait: InputWait::ApprovalOnly,
             },
             #[cfg(feature = "network")]
@@ -263,6 +279,7 @@ impl Backend {
                 execution: ExecutionLocality::Hosted,
                 resume: Some(ResumeSemantics::ResumeMessage),
                 interrupt: Some(InterruptSemantics::TerminateHosted),
+                interaction_answer: false,
                 input_wait: InputWait::UserInput,
             },
         }
@@ -596,6 +613,7 @@ fn parse_task_control<'a>(backend: Backend, args: &'a Value) -> Result<TaskContr
         "steer" => ControlAction::Steer,
         "resume" => ControlAction::Resume,
         "interrupt" => ControlAction::Interrupt,
+        "answer" => ControlAction::Answer,
         _ => anyhow::bail!("unsupported {} task action", backend.action_label()),
     };
     // An action outside the backend's contract is rejected here rather
@@ -607,18 +625,44 @@ fn parse_task_control<'a>(backend: Backend, args: &'a Value) -> Result<TaskContr
         backend.action_label()
     );
     let input = args.get("input").and_then(Value::as_str);
-    match action {
+    let interaction_id = match action {
         ControlAction::Steer => {
-            validate_task_input(input.context("steer requires input")?, "input")?
+            validate_task_input(input.context("steer requires input")?, "input")?;
+            anyhow::ensure!(
+                args.get("interaction_id").is_none() && args.get("answer").is_none(),
+                "steer does not accept interaction_id or answer"
+            );
+            None
         }
         ControlAction::Resume | ControlAction::Interrupt => {
-            anyhow::ensure!(input.is_none(), "{} does not accept input", action.as_str())
+            anyhow::ensure!(input.is_none(), "{} does not accept input", action.as_str());
+            anyhow::ensure!(
+                args.get("interaction_id").is_none() && args.get("answer").is_none(),
+                "{} does not accept interaction_id or answer",
+                action.as_str()
+            );
+            None
         }
-    }
+        ControlAction::Answer => {
+            anyhow::ensure!(input.is_none(), "answer does not accept input");
+            let interaction_id = required_uuid(args, "interaction_id")?;
+            let answer = args
+                .get("answer")
+                .filter(|value| value.is_object())
+                .context("answer requires an object answer")?;
+            let bytes = serde_json::to_vec(answer)?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_INTERACTION_ANSWER_BYTES,
+                "answer exceeds {MAX_INTERACTION_ANSWER_BYTES} bytes"
+            );
+            Some(interaction_id)
+        }
+    };
     Ok(TaskControlRequest {
         task_id,
         operation_id,
         action,
+        interaction_id,
     })
 }
 
@@ -1062,6 +1106,15 @@ mod tests {
             error_of(parse_control(Backend::Codex, &args(json!({"input": ""})))),
             "input must contain 1..=1048576 NUL-free UTF-8 bytes"
         );
+        let steer_with_interaction = args(json!({
+            "input": "go",
+            "interaction_id": "0199dddd-dddd-7ddd-8ddd-dddddddddddd",
+            "answer": {"reply": "once"}
+        }));
+        assert_eq!(
+            error_of(parse_control(Backend::Codex, &steer_with_interaction)),
+            "steer does not accept interaction_id or answer"
+        );
         for action in ["resume", "interrupt"] {
             assert_eq!(
                 error_of(parse_control(
@@ -1071,6 +1124,42 @@ mod tests {
                 format!("{action} does not accept input")
             );
         }
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn opencode_answer_requires_stable_interaction_and_structured_answer() {
+        let base = json!({
+            "task_id": TASK_ID,
+            "operation_id": OP_ID,
+            "action": "answer",
+        });
+        assert_eq!(
+            error_of(parse_control(Backend::OpenCode, &base)),
+            "missing or invalid interaction_id"
+        );
+
+        let mut args = base.clone();
+        args["interaction_id"] = json!("0199dddd-dddd-7ddd-8ddd-dddddddddddd");
+        assert_eq!(
+            error_of(parse_control(Backend::OpenCode, &args)),
+            "answer requires an object answer"
+        );
+
+        args["answer"] = json!({"reply": "once"});
+        let TaskRequest::Control(request) = parse_control(Backend::OpenCode, &args).unwrap() else {
+            panic!("OpenCode answer should parse")
+        };
+        assert_eq!(request.action, ControlAction::Answer);
+        assert_eq!(
+            request.interaction_id,
+            Some("0199dddd-dddd-7ddd-8ddd-dddddddddddd")
+        );
+
+        assert_eq!(
+            error_of(parse_control(Backend::Codex, &args)),
+            "unsupported Codex task action"
+        );
     }
 
     #[test]
@@ -1094,6 +1183,15 @@ mod tests {
             ] {
                 assert!(capabilities.supports_control_action(action));
             }
+            let supports_answer = match backend {
+                #[cfg(feature = "network")]
+                Backend::OpenCode => true,
+                _ => false,
+            };
+            assert_eq!(
+                capabilities.supports_control_action(ControlAction::Answer),
+                supports_answer
+            );
         }
         assert_eq!(
             Backend::Codex.capabilities().resume,

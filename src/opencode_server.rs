@@ -36,6 +36,9 @@ const MAX_TASKS_PER_SCOPE: usize = 128;
 const MAX_OPERATION_HISTORY: usize = 32;
 const MAX_ARGUMENT_BYTES: usize = 256;
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_INTERACTION_ANSWER_BYTES: usize = 16 * 1024;
+const MAX_INTERACTION_VIEW_BYTES: usize = 16 * 1024;
+const MAX_PENDING_INTERACTIONS: usize = 64;
 const MAX_ERROR_BYTES: usize = 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024;
 const MAX_REPORT_ARRAY_ITEMS: usize = 64;
@@ -80,6 +83,9 @@ const REQUEST_FINGERPRINT_NAMESPACE: Uuid = Uuid::from_bytes([
 ]);
 const MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x4f, 0x1b, 0x8d, 0x33, 0x5a, 0x6c, 0x49, 0x82, 0x91, 0x5e, 0x67, 0xd8, 0x20, 0xa4, 0x0f, 0xb3,
+]);
+const INTERACTION_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x8a, 0x34, 0x91, 0x5c, 0x12, 0x7f, 0x47, 0x22, 0xa8, 0xb1, 0x7e, 0x40, 0xe1, 0x3c, 0x69, 0x5d,
 ]);
 
 const SERVE_CHILD_ENV_ALLOWLIST: &[&str] = &[
@@ -382,12 +388,23 @@ struct OperationOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct InteractionOperationResult {
+    interaction_id: Uuid,
+    result: String,
+    applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct OperationReceipt {
     operation_id: Uuid,
     request_fingerprint: Uuid,
     action: String,
     phase: OperationPhase,
     outcome: OperationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interaction_result: Option<InteractionOperationResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -879,9 +896,8 @@ impl TaskStore {
                 outcome.status = TaskStatus::ReconciliationRequired;
                 return Ok(ControlAcceptance::Replay(operation_view(task_id, &outcome)));
             }
-            return Ok(ControlAcceptance::Replay(operation_view(
-                task_id,
-                &receipt.outcome,
+            return Ok(ControlAcceptance::Replay(operation_receipt_view(
+                task_id, receipt,
             )));
         }
         if let Some(tombstone) = record
@@ -945,6 +961,7 @@ impl TaskStore {
             action: action.to_owned(),
             phase: OperationPhase::Accepted,
             outcome: accepted_outcome,
+            interaction_result: None,
         });
         self.save_locked(&record)?;
         Ok(ControlAcceptance::Accepted(Box::new(record), runtime_lease))
@@ -1441,6 +1458,196 @@ fn fingerprint(value: &Value) -> Result<Uuid> {
     Ok(Uuid::new_v5(&REQUEST_FINGERPRINT_NAMESPACE, &bytes))
 }
 
+#[derive(Clone, Debug)]
+struct PendingInteraction {
+    interaction_id: Uuid,
+    kind: &'static str,
+    request_id: String,
+    session_id: String,
+    request: Value,
+    view: Value,
+}
+
+fn interaction_session_id(value: &Value) -> Option<&str> {
+    value
+        .get("sessionID")
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("sessionId"))
+        .and_then(Value::as_str)
+}
+
+fn interaction_request_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("requestID"))
+        .or_else(|| value.get("request_id"))
+        .and_then(Value::as_str)
+}
+
+fn session_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("sessionID"))
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("sessionId"))
+        .and_then(Value::as_str)
+}
+
+fn session_parent_id(value: &Value) -> Option<&str> {
+    value
+        .get("parentID")
+        .or_else(|| value.get("parent_id"))
+        .or_else(|| value.get("parentId"))
+        .and_then(Value::as_str)
+}
+
+fn descendant_session_ids(root_session_id: &str, sessions: &[Value]) -> BTreeSet<String> {
+    let mut descendants = BTreeSet::from([root_session_id.to_owned()]);
+    loop {
+        let before = descendants.len();
+        for session in sessions {
+            let Some(id) = session_id(session) else {
+                continue;
+            };
+            let Some(parent_id) = session_parent_id(session) else {
+                continue;
+            };
+            if descendants.contains(parent_id) {
+                descendants.insert(id.to_owned());
+            }
+        }
+        if descendants.len() == before {
+            break;
+        }
+    }
+    descendants
+}
+
+fn canonical_interaction_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(canonical_interaction_value)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_interaction_value(&map[key]));
+            }
+            Value::Object(canonical)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn interaction_id_for(
+    task_id: Uuid,
+    kind: &str,
+    request_id: &str,
+    request: &Value,
+) -> Result<Uuid> {
+    let canonical = canonical_interaction_value(request);
+    let payload = serde_json::to_vec(&canonical)?;
+    let mut bytes = Vec::with_capacity(16 + kind.len() + request_id.len() + payload.len() + 3);
+    bytes.extend_from_slice(task_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(kind.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(request_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&payload);
+    Ok(Uuid::new_v5(&INTERACTION_ID_NAMESPACE, &bytes))
+}
+
+fn interaction_detail(kind: &str, request: &Value) -> Value {
+    let detail = match kind {
+        "permission" => json!({
+            "action": request.get("action").or_else(|| request.get("permission")),
+            "resources": request.get("resources").or_else(|| request.get("patterns")),
+            "save": request.get("save").or_else(|| request.get("always")),
+        }),
+        "question" => json!({
+            "questions": request.get("questions"),
+            "title": request.get("title"),
+            "fields": request.get("fields"),
+        }),
+        _ => json!({}),
+    };
+    if serde_json::to_vec(&detail)
+        .map(|bytes| bytes.len() <= MAX_INTERACTION_VIEW_BYTES)
+        .unwrap_or(false)
+    {
+        detail
+    } else {
+        json!({"omitted": true, "reason": "detail_too_large"})
+    }
+}
+
+fn pending_interactions_from(
+    task_id: Uuid,
+    session_ids: &BTreeSet<String>,
+    permissions: &[Value],
+    questions: &[Value],
+) -> Result<Vec<PendingInteraction>> {
+    let mut interactions = Vec::new();
+    for (kind, requests) in [("permission", permissions), ("question", questions)] {
+        for request in requests {
+            let Some(request_session_id) = interaction_session_id(request) else {
+                continue;
+            };
+            if !session_ids.contains(request_session_id) {
+                continue;
+            }
+            let Some(request_id) = interaction_request_id(request) else {
+                continue;
+            };
+            anyhow::ensure!(
+                interactions.len() < MAX_PENDING_INTERACTIONS,
+                "OpenCode pending interactions exceed {MAX_PENDING_INTERACTIONS}"
+            );
+            let interaction_id = interaction_id_for(task_id, kind, request_id, request)?;
+            interactions.push(PendingInteraction {
+                interaction_id,
+                kind,
+                request_id: request_id.to_owned(),
+                session_id: request_session_id.to_owned(),
+                request: request.clone(),
+                view: json!({
+                    "interaction_id": interaction_id,
+                    "kind": kind,
+                    "session_id": request_session_id,
+                    "detail": interaction_detail(kind, request),
+                }),
+            });
+        }
+    }
+    interactions.sort_by_key(|interaction| interaction.interaction_id);
+    Ok(interactions)
+}
+
+async fn pending_interactions(
+    client: &ServeClient,
+    task_id: Uuid,
+    opencode_session_id: &str,
+) -> Result<Vec<PendingInteraction>> {
+    let sessions = client.session_list().await?;
+    let session_ids = descendant_session_ids(opencode_session_id, &sessions);
+    let permissions = client.permission_list().await?;
+    let questions = client.question_list().await?;
+    pending_interactions_from(task_id, &session_ids, &permissions, &questions)
+}
+
+fn pending_interaction_views(interactions: &[PendingInteraction]) -> Vec<Value> {
+    interactions
+        .iter()
+        .map(|interaction| interaction.view.clone())
+        .collect()
+}
+
 fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
     json!({
         "task_id": task_id,
@@ -1450,6 +1657,14 @@ fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
         "opencode_session_id": outcome.opencode_session_id,
         "reconciliation_required": outcome.status == TaskStatus::ReconciliationRequired,
     })
+}
+
+fn operation_receipt_view(task_id: Uuid, receipt: &OperationReceipt) -> Value {
+    let mut view = operation_view(task_id, &receipt.outcome);
+    if let Some(interaction_result) = &receipt.interaction_result {
+        view["interaction"] = json!(interaction_result);
+    }
+    view
 }
 
 fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) -> Value {
@@ -1884,6 +2099,40 @@ impl ServeClient {
         }
     }
 
+    async fn session_list(&self) -> Result<Vec<Value>> {
+        match self {
+            Self::Sdk(inner) => {
+                let sessions = sdk_call(inner.client.session().list())
+                    .await
+                    .context("opencode session list failed")?;
+                sessions
+                    .into_iter()
+                    .map(|session| serde_json::to_value(session).map_err(Into::into))
+                    .collect()
+            }
+            Self::SdkV2(inner) => {
+                let body = v2_get_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    "api/session",
+                )
+                .await
+                .context("opencode session list failed")?;
+                let data = body.get("data").unwrap_or(&body);
+                if let Some(items) = data.as_array() {
+                    return Ok(items.clone());
+                }
+                if let Some(items) = data.get("items").and_then(Value::as_array) {
+                    return Ok(items.clone());
+                }
+                Ok(Vec::new())
+            }
+            #[cfg(test)]
+            Self::Fake(inner) => inner.lock().unwrap().session_list(),
+        }
+    }
+
     async fn session_status(&self) -> Result<Value> {
         match self {
             Self::Sdk(inner) => {
@@ -2001,6 +2250,119 @@ impl ServeClient {
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().question_list(),
+        }
+    }
+
+    async fn permission_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
+        message: Option<&str>,
+    ) -> Result<()> {
+        match self {
+            Self::Sdk(inner) => {
+                let accepted = sdk_call(inner.client.permission().reply(
+                    request_id,
+                    &unofficial_opencode_sdk::current::PermissionReplyRequest {
+                        reply: reply.to_owned(),
+                        message: message.map(str::to_owned),
+                    },
+                ))
+                .await
+                .context("opencode permission reply failed")?;
+                anyhow::ensure!(accepted, "OpenCode did not accept permission reply");
+                Ok(())
+            }
+            Self::SdkV2(inner) => {
+                let mut body = json!({"reply": reply});
+                if let Some(message) = message {
+                    body["message"] = json!(message);
+                }
+                let current = format!("api/session/{session_id}/permission/{request_id}/reply");
+                if v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &current,
+                    &body,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                let legacy = format!("api/permission/{request_id}/reply");
+                v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &legacy,
+                    &body,
+                )
+                .await
+                .map(|_| ())
+                .context("opencode permission reply failed")
+            }
+            #[cfg(test)]
+            Self::Fake(inner) => inner
+                .lock()
+                .unwrap()
+                .permission_reply(session_id, request_id, reply, message),
+        }
+    }
+
+    async fn question_reply(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: &[Vec<String>],
+    ) -> Result<()> {
+        match self {
+            Self::Sdk(inner) => {
+                let accepted = sdk_call(inner.client.question().reply(
+                    request_id,
+                    &unofficial_opencode_sdk::current::QuestionReplyRequest {
+                        answers: answers.to_vec(),
+                    },
+                ))
+                .await
+                .context("opencode question reply failed")?;
+                anyhow::ensure!(accepted, "OpenCode did not accept question reply");
+                Ok(())
+            }
+            Self::SdkV2(inner) => {
+                let body = json!({"answers": answers});
+                let current = format!("api/session/{session_id}/question/{request_id}/reply");
+                if v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &current,
+                    &body,
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                let legacy = format!("api/question/{request_id}/reply");
+                v2_post_json(
+                    &inner.client,
+                    &inner.base_url,
+                    &inner.password,
+                    &legacy,
+                    &body,
+                )
+                .await
+                .map(|_| ())
+                .context("opencode question reply failed")
+            }
+            #[cfg(test)]
+            Self::Fake(inner) => inner
+                .lock()
+                .unwrap()
+                .question_reply(session_id, request_id, answers),
         }
     }
 
@@ -2851,18 +3213,16 @@ fn observed_model_from(message: &Value) -> Option<String> {
 fn derive_serve_state(
     record: &TaskRecord,
     session_id: &str,
+    session_ids: &BTreeSet<String>,
     status: &Value,
     messages: &[Value],
     permissions: &[Value],
     questions: &[Value],
 ) -> DerivedServeState {
     let session_pending = |items: &[Value]| {
-        items.iter().any(|item| {
-            item.get("sessionID")
-                .or_else(|| item.get("session_id"))
-                .and_then(Value::as_str)
-                == Some(session_id)
-        })
+        items
+            .iter()
+            .any(|item| interaction_session_id(item).is_some_and(|id| session_ids.contains(id)))
     };
     if session_pending(permissions) || session_pending(questions) {
         return DerivedServeState {
@@ -3086,12 +3446,15 @@ async fn reconcile_task(
         .messages(&opencode_session_id, MAX_MESSAGES_SCAN)
         .await
         .unwrap_or_default();
+    let sessions = client.session_list().await.unwrap_or_default();
+    let session_ids = descendant_session_ids(&opencode_session_id, &sessions);
     let permissions = client.permission_list().await.unwrap_or_default();
     let questions = client.question_list().await.unwrap_or_default();
 
     let derived = derive_serve_state(
         &record,
         &opencode_session_id,
+        &session_ids,
         &status,
         &messages,
         &permissions,
@@ -3353,6 +3716,7 @@ async fn task_start_with_store_and_binary(
         action: "start".to_owned(),
         phase: OperationPhase::Accepted,
         outcome: record.outcome(),
+        interaction_result: None,
     });
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
     let acceptance = store.accept_start_if_instance_live(session, record, &owner)?;
@@ -3520,7 +3884,7 @@ fn replay_operation(record: &TaskRecord, operation_id: Uuid, fingerprint: Uuid) 
         outcome.status = TaskStatus::ReconciliationRequired;
         return Ok(operation_view(record.task_id, &outcome));
     }
-    Ok(operation_view(record.task_id, &receipt.outcome))
+    Ok(operation_receipt_view(record.task_id, receipt))
 }
 
 pub(crate) async fn task_get(args: &Value, session: &config::Session) -> Result<Value> {
@@ -3593,6 +3957,14 @@ async fn task_get_with_store_and_binary(
         }
     };
 
+    let interactions = if record.status.is_terminal() {
+        Ok(Vec::new())
+    } else if let Some(opencode_session_id) = record.opencode_session_id.as_deref() {
+        pending_interactions(&client, task_id, opencode_session_id).await
+    } else {
+        Ok(Vec::new())
+    };
+
     // Store bounded evidence for the final assistant turn on terminal states.
     let evidence_ref = if record.status.is_terminal() {
         record
@@ -3621,7 +3993,19 @@ async fn task_get_with_store_and_binary(
             "revision": record.revision,
         }));
     }
-    Ok(task_view(&record, evidence_ref.as_ref()))
+    let mut view = task_view(&record, evidence_ref.as_ref());
+    match interactions {
+        Ok(interactions) => {
+            view["pending_interactions"] = json!(pending_interaction_views(&interactions));
+        }
+        Err(error) => {
+            view["pending_interactions"] = json!([]);
+            view["pending_interactions_unavailable"] = json!(true);
+            view["pending_interactions_error"] =
+                json!(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES));
+        }
+    }
+    Ok(view)
 }
 
 /// Read-only projection of the tasks this session instance owns.
@@ -3694,23 +4078,50 @@ async fn task_control_with_store_and_binary(
     let operation_id = required_uuid(args, "operation_id")?;
     let action = required_string(args, "action")?;
     anyhow::ensure!(
-        matches!(action, "steer" | "resume" | "interrupt"),
+        matches!(action, "steer" | "resume" | "interrupt" | "answer"),
         "unsupported OpenCode task action"
     );
     let input = args.get("input").and_then(Value::as_str);
-    match action {
-        "steer" => validate_task_input(input.context("steer requires input")?, "input")?,
+    let interaction_id = match action {
+        "steer" => {
+            validate_task_input(input.context("steer requires input")?, "input")?;
+            None
+        }
         "resume" | "interrupt" => {
-            anyhow::ensure!(input.is_none(), "{action} does not accept input")
+            anyhow::ensure!(input.is_none(), "{action} does not accept input");
+            None
+        }
+        "answer" => {
+            anyhow::ensure!(input.is_none(), "answer does not accept input");
+            Some(required_uuid(args, "interaction_id")?)
         }
         _ => unreachable!(),
-    }
+    };
+    let answer = if action == "answer" {
+        let answer = args
+            .get("answer")
+            .filter(|value| value.is_object())
+            .context("answer requires an object answer")?;
+        anyhow::ensure!(
+            serde_json::to_vec(answer)?.len() <= MAX_INTERACTION_ANSWER_BYTES,
+            "answer exceeds {MAX_INTERACTION_ANSWER_BYTES} bytes"
+        );
+        Some(answer)
+    } else {
+        anyhow::ensure!(
+            args.get("interaction_id").is_none() && args.get("answer").is_none(),
+            "{action} does not accept interaction_id or answer"
+        );
+        None
+    };
 
     let request_fingerprint = fingerprint(&json!({
         "kind": "control",
         "task_id": task_id,
         "action": action,
         "input": input,
+        "interaction_id": interaction_id,
+        "answer": answer,
     }))?;
     let owner = SessionInstance::from_session(session);
     let acceptance_permit = ensure_current_active_instance(&owner, session).await?;
@@ -3766,6 +4177,25 @@ async fn task_control_with_store_and_binary(
         })?;
         return Ok(task_view(&record, None));
     };
+
+    if action == "answer" {
+        return answer_pending_interaction(
+            InteractionAnswerContext {
+                session,
+                owner: &owner,
+                store,
+                client: &client,
+                opencode_session_id: &opencode_session_id,
+            },
+            record,
+            InteractionAnswerRequest {
+                operation_id,
+                interaction_id: interaction_id.expect("answer validates interaction id"),
+                answer: answer.expect("answer validates payload"),
+            },
+        )
+        .await;
+    }
 
     let message_id = prompt_message_id(operation_id);
     let result = match action {
@@ -3835,6 +4265,393 @@ async fn task_control_with_store_and_binary(
         }
     }
     Ok(task_view(&record, None))
+}
+
+fn permission_answer(answer: &Value) -> Result<(&str, Option<&str>)> {
+    let reply = answer
+        .get("reply")
+        .and_then(Value::as_str)
+        .context("permission answer requires reply")?;
+    anyhow::ensure!(
+        matches!(reply, "once" | "always" | "reject"),
+        "permission reply must be one of once, always, reject"
+    );
+    anyhow::ensure!(
+        answer.get("answers").is_none(),
+        "permission answer does not accept answers"
+    );
+    let message = match answer.get("message") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            anyhow::ensure!(value.len() <= 1024, "permission message exceeds 1024 bytes");
+            Some(value.as_str())
+        }
+        Some(_) => anyhow::bail!("permission message must be a string"),
+    };
+    Ok((reply, message))
+}
+
+fn question_answer(answer: &Value, request: &Value) -> Result<Vec<Vec<String>>> {
+    anyhow::ensure!(
+        answer.get("reply").is_none() && answer.get("message").is_none(),
+        "question answer does not accept reply or message"
+    );
+    let rows = answer
+        .get("answers")
+        .and_then(Value::as_array)
+        .context("question answer requires answers")?;
+    let questions = request
+        .get("questions")
+        .and_then(Value::as_array)
+        .context("pending question request has no questions")?;
+    anyhow::ensure!(
+        questions.len() <= 64,
+        "pending question request exceeds 64 questions"
+    );
+    anyhow::ensure!(
+        rows.len() == questions.len(),
+        "question answer count must match pending question count"
+    );
+
+    rows.iter()
+        .zip(questions)
+        .enumerate()
+        .map(|(index, (row, question))| {
+            let values = row
+                .as_array()
+                .context("question answers must be arrays of strings")?;
+            let multiple = question
+                .get("multiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if multiple {
+                anyhow::ensure!(
+                    !values.is_empty() && values.len() <= 16,
+                    "question {} requires 1..=16 selected values",
+                    index + 1
+                );
+            } else {
+                anyhow::ensure!(
+                    values.len() == 1,
+                    "question {} requires exactly one selected value",
+                    index + 1
+                );
+            }
+
+            let custom = question
+                .get("custom")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let offered = question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("label").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>();
+            let mut seen = BTreeSet::new();
+            values
+                .iter()
+                .map(|value| {
+                    let value = value
+                        .as_str()
+                        .context("question answer values must be strings")?;
+                    anyhow::ensure!(
+                        !value.is_empty() && value.len() <= 4096,
+                        "question answer value must contain 1..=4096 bytes"
+                    );
+                    anyhow::ensure!(
+                        seen.insert(value),
+                        "question {} contains a duplicate selected value",
+                        index + 1
+                    );
+                    anyhow::ensure!(
+                        custom || offered.contains(value),
+                        "question {} only accepts offered option labels",
+                        index + 1
+                    );
+                    Ok(value.to_owned())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+enum ValidatedInteractionAnswer {
+    Permission {
+        reply: String,
+        message: Option<String>,
+    },
+    Question {
+        answers: Vec<Vec<String>>,
+    },
+}
+
+fn validate_interaction_answer(
+    target: &PendingInteraction,
+    answer: &Value,
+) -> Result<ValidatedInteractionAnswer> {
+    match target.kind {
+        "permission" => {
+            let (reply, message) = permission_answer(answer)?;
+            Ok(ValidatedInteractionAnswer::Permission {
+                reply: reply.to_owned(),
+                message: message.map(str::to_owned),
+            })
+        }
+        "question" => Ok(ValidatedInteractionAnswer::Question {
+            answers: question_answer(answer, &target.request)?,
+        }),
+        _ => anyhow::bail!("unsupported OpenCode interaction kind"),
+    }
+}
+
+fn interaction_result_view(
+    record: &TaskRecord,
+    interaction_result: &InteractionOperationResult,
+    interactions: &[PendingInteraction],
+) -> Value {
+    let mut view = task_view(record, None);
+    view["pending_interactions"] = json!(pending_interaction_views(interactions));
+    view["interaction"] = json!(interaction_result);
+    view
+}
+
+fn finish_interaction_receipt(
+    store: &TaskStore,
+    session: &config::Session,
+    owner: &SessionInstance,
+    task_id: Uuid,
+    operation_id: Uuid,
+    pending_count: usize,
+    interaction_result: &InteractionOperationResult,
+) -> Result<TaskRecord> {
+    store.update_if_instance_live(session, task_id, owner, |record| {
+        if !record.status.is_terminal() {
+            record.status = if pending_count == 0 {
+                TaskStatus::Running
+            } else {
+                TaskStatus::WaitingApproval
+            };
+            record.last_error = (pending_count > 0)
+                .then(|| "opencode permission/question request is pending".to_owned());
+            record.revision = record.revision.saturating_add(1);
+            update_operation_receipt(record, operation_id, OperationPhase::Applied);
+            if let Some(receipt) = record
+                .operations
+                .iter_mut()
+                .find(|receipt| receipt.operation_id == operation_id)
+            {
+                receipt.interaction_result = Some(interaction_result.clone());
+            }
+        }
+        Ok(())
+    })
+}
+
+fn mark_interaction_uncertain(
+    store: &TaskStore,
+    session: &config::Session,
+    owner: &SessionInstance,
+    task_id: Uuid,
+    error: &str,
+) -> Result<TaskRecord> {
+    store.update_if_instance_live(session, task_id, owner, |record| {
+        if !record.status.is_terminal() {
+            record.status = TaskStatus::ReconciliationRequired;
+            record.last_error = Some(bound_text(error, MAX_ERROR_BYTES));
+            record.revision = record.revision.saturating_add(1);
+        }
+        Ok(())
+    })
+}
+
+struct InteractionAnswerContext<'a> {
+    session: &'a config::Session,
+    owner: &'a SessionInstance,
+    store: &'a TaskStore,
+    client: &'a ServeClient,
+    opencode_session_id: &'a str,
+}
+
+struct InteractionAnswerRequest<'a> {
+    operation_id: Uuid,
+    interaction_id: Uuid,
+    answer: &'a Value,
+}
+
+async fn answer_pending_interaction(
+    context: InteractionAnswerContext<'_>,
+    record: TaskRecord,
+    request: InteractionAnswerRequest<'_>,
+) -> Result<Value> {
+    let InteractionAnswerContext {
+        session,
+        owner,
+        store,
+        client,
+        opencode_session_id,
+    } = context;
+    let InteractionAnswerRequest {
+        operation_id,
+        interaction_id,
+        answer,
+    } = request;
+    let task_id = record.task_id;
+    let pending = pending_interactions(client, task_id, opencode_session_id).await?;
+    let Some(target) = pending
+        .iter()
+        .find(|interaction| interaction.interaction_id == interaction_id)
+        .cloned()
+    else {
+        let interaction_result = InteractionOperationResult {
+            interaction_id,
+            result: "stale".to_owned(),
+            applied: false,
+            error: None,
+        };
+        let permit = ensure_current_active_instance(owner, session).await?;
+        let record = finish_interaction_receipt(
+            store,
+            session,
+            owner,
+            task_id,
+            operation_id,
+            pending.len(),
+            &interaction_result,
+        )?;
+        drop(permit);
+        return Ok(interaction_result_view(
+            &record,
+            &interaction_result,
+            &pending,
+        ));
+    };
+
+    let validated = match validate_interaction_answer(&target, answer) {
+        Ok(validated) => validated,
+        Err(error) => {
+            let interaction_result = InteractionOperationResult {
+                interaction_id,
+                result: "invalid_answer".to_owned(),
+                applied: false,
+                error: Some(bound_text(&format!("{error:#}"), MAX_ERROR_BYTES)),
+            };
+            let permit = ensure_current_active_instance(owner, session).await?;
+            let record = finish_interaction_receipt(
+                store,
+                session,
+                owner,
+                task_id,
+                operation_id,
+                pending.len(),
+                &interaction_result,
+            )?;
+            drop(permit);
+            return Ok(interaction_result_view(
+                &record,
+                &interaction_result,
+                &pending,
+            ));
+        }
+    };
+
+    let reply = match validated {
+        ValidatedInteractionAnswer::Permission { reply, message } => {
+            client
+                .permission_reply(
+                    &target.session_id,
+                    &target.request_id,
+                    &reply,
+                    message.as_deref(),
+                )
+                .await
+        }
+        ValidatedInteractionAnswer::Question { answers } => {
+            client
+                .question_reply(&target.session_id, &target.request_id, &answers)
+                .await
+        }
+    };
+
+    // Re-read the queue even when the transport reported an error. The server
+    // may have applied the exact request just before a connection failure.
+    // Exact interaction ids make this reconciliation non-destructive.
+    let after = match pending_interactions(client, task_id, opencode_session_id).await {
+        Ok(after) => after,
+        Err(error) => {
+            let permit = ensure_current_active_instance(owner, session).await?;
+            let record = mark_interaction_uncertain(
+                store,
+                session,
+                owner,
+                task_id,
+                &format!("cannot reconcile OpenCode interaction answer: {error:#}"),
+            )?;
+            drop(permit);
+            let interaction_result = InteractionOperationResult {
+                interaction_id,
+                result: "reconciliation_required".to_owned(),
+                applied: false,
+                error: None,
+            };
+            return Ok(interaction_result_view(&record, &interaction_result, &[]));
+        }
+    };
+    let still_pending = after
+        .iter()
+        .any(|interaction| interaction.interaction_id == interaction_id);
+
+    if !still_pending {
+        let interaction_result = InteractionOperationResult {
+            interaction_id,
+            result: if reply.is_ok() {
+                "answered".to_owned()
+            } else {
+                "already_resolved".to_owned()
+            },
+            applied: reply.is_ok(),
+            error: None,
+        };
+        let permit = ensure_current_active_instance(owner, session).await?;
+        let record = finish_interaction_receipt(
+            store,
+            session,
+            owner,
+            task_id,
+            operation_id,
+            after.len(),
+            &interaction_result,
+        )?;
+        drop(permit);
+        return Ok(interaction_result_view(
+            &record,
+            &interaction_result,
+            &after,
+        ));
+    }
+
+    let message = match reply {
+        Ok(()) => {
+            "OpenCode reported interaction answer success but the exact request remains pending"
+                .to_owned()
+        }
+        Err(error) => format!("OpenCode interaction answer failed: {error:#}"),
+    };
+    let permit = ensure_current_active_instance(owner, session).await?;
+    let record = mark_interaction_uncertain(store, session, owner, task_id, &message)?;
+    drop(permit);
+    let interaction_result = InteractionOperationResult {
+        interaction_id,
+        result: "reconciliation_required".to_owned(),
+        applied: false,
+        error: None,
+    };
+    Ok(interaction_result_view(
+        &record,
+        &interaction_result,
+        &after,
+    ))
 }
 
 fn apply_control_failure(
@@ -3919,6 +4736,7 @@ static SPAWN_HOOK: OnceLock<Mutex<Option<Arc<SpawnHook>>>> = OnceLock::new();
 struct FakeSession {
     busy: bool,
     messages: Vec<Value>,
+    parent_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -3929,6 +4747,8 @@ struct FakeServe {
     sessions: HashMap<String, FakeSession>,
     pending_permissions: Vec<Value>,
     pending_questions: Vec<Value>,
+    permission_reply_calls: Vec<(String, String, String, Option<String>)>,
+    question_reply_calls: Vec<(String, String, Vec<Vec<String>>)>,
     prompt_calls: Vec<(String, Value)>,
     abort_calls: Vec<String>,
     create_fail: Option<String>,
@@ -3959,17 +4779,24 @@ impl FakeServe {
         Ok(self.providers.clone())
     }
 
-    fn session_create(&mut self, _body: &Value) -> Result<Value> {
+    fn session_create(&mut self, body: &Value) -> Result<Value> {
         self.require_live()?;
         if let Some(error) = &self.create_fail {
             anyhow::bail!("{error}");
         }
         let id = self.session_id_of();
+        let parent_id = body
+            .get("parentID")
+            .or_else(|| body.get("parent_id"))
+            .or_else(|| body.get("parentId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         self.sessions.insert(
             id.clone(),
             FakeSession {
                 busy: false,
                 messages: Vec::new(),
+                parent_id,
             },
         );
         Ok(json!({"id": id}))
@@ -4016,6 +4843,20 @@ impl FakeServe {
         Ok(())
     }
 
+    fn session_list(&mut self) -> Result<Vec<Value>> {
+        self.require_live()?;
+        Ok(self
+            .sessions
+            .iter()
+            .map(|(id, session)| {
+                json!({
+                    "id": id,
+                    "parentID": session.parent_id,
+                })
+            })
+            .collect())
+    }
+
     fn session_status(&mut self) -> Result<Value> {
         self.require_live()?;
         let status = self
@@ -4049,6 +4890,56 @@ impl FakeServe {
     fn question_list(&mut self) -> Result<Vec<Value>> {
         self.require_live()?;
         Ok(self.pending_questions.clone())
+    }
+
+    fn permission_reply(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        reply: &str,
+        message: Option<&str>,
+    ) -> Result<()> {
+        self.require_live()?;
+        let index = self
+            .pending_permissions
+            .iter()
+            .position(|request| {
+                interaction_session_id(request) == Some(session_id)
+                    && interaction_request_id(request) == Some(request_id)
+            })
+            .context("fake permission request is not pending")?;
+        self.pending_permissions.remove(index);
+        self.permission_reply_calls.push((
+            session_id.to_owned(),
+            request_id.to_owned(),
+            reply.to_owned(),
+            message.map(str::to_owned),
+        ));
+        Ok(())
+    }
+
+    fn question_reply(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        answers: &[Vec<String>],
+    ) -> Result<()> {
+        self.require_live()?;
+        let index = self
+            .pending_questions
+            .iter()
+            .position(|request| {
+                interaction_session_id(request) == Some(session_id)
+                    && interaction_request_id(request) == Some(request_id)
+            })
+            .context("fake question request is not pending")?;
+        self.pending_questions.remove(index);
+        self.question_reply_calls.push((
+            session_id.to_owned(),
+            request_id.to_owned(),
+            answers.to_vec(),
+        ));
+        Ok(())
     }
 }
 
@@ -4464,6 +5355,7 @@ mod tests {
             action: "start".to_owned(),
             phase: OperationPhase::Accepted,
             outcome: record.outcome(),
+            interaction_result: None,
         });
         store.accept_start(&session, record).unwrap();
 
@@ -4477,6 +5369,573 @@ mod tests {
         .unwrap();
         clear_fake();
         assert_eq!(out["status"], "reconciliation_required");
+    }
+
+    #[test]
+    fn interaction_id_is_stable_for_key_order_and_changes_with_request_payload() {
+        let task_id = Uuid::new_v4();
+        let a = json!({
+            "id": "que_1",
+            "sessionID": "ses_1",
+            "questions": [{"header": "Choice", "question": "Pick", "options": [{"label": "A"}]}],
+        });
+        let b: Value = serde_json::from_str(
+            r#"{"questions":[{"options":[{"label":"A"}],"question":"Pick","header":"Choice"}],"sessionID":"ses_1","id":"que_1"}"#,
+        )
+        .unwrap();
+        let changed = json!({
+            "id": "que_1",
+            "sessionID": "ses_1",
+            "questions": [{"header": "Choice", "question": "Pick another", "options": [{"label": "A"}]}],
+        });
+        let first = interaction_id_for(task_id, "question", "que_1", &a).unwrap();
+        assert_eq!(
+            first,
+            interaction_id_for(task_id, "question", "que_1", &b).unwrap()
+        );
+        assert_ne!(
+            first,
+            interaction_id_for(task_id, "question", "que_1", &changed).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn descendant_pending_interaction_is_visible_and_replies_to_child_session() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let root_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        let child_session_id = {
+            let mut fake = fake.lock().unwrap();
+            let child_session_id = fake.session_id_of();
+            fake.sessions.insert(
+                child_session_id.clone(),
+                FakeSession {
+                    busy: false,
+                    messages: Vec::new(),
+                    parent_id: Some(root_session_id.clone()),
+                },
+            );
+            let unrelated_session_id = fake.session_id_of();
+            fake.sessions.insert(
+                unrelated_session_id.clone(),
+                FakeSession {
+                    busy: false,
+                    messages: Vec::new(),
+                    parent_id: None,
+                },
+            );
+            fake.pending_permissions.push(json!({
+                "id": "per_child",
+                "sessionID": child_session_id,
+                "action": "bash",
+                "resources": ["cargo test"],
+            }));
+            fake.pending_permissions.push(json!({
+                "id": "per_unrelated",
+                "sessionID": unrelated_session_id,
+                "action": "bash",
+                "resources": ["echo unrelated"],
+            }));
+            child_session_id
+        };
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked["status"], "waiting_approval");
+        assert_eq!(blocked["pending_interactions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            blocked["pending_interactions"][0]["session_id"],
+            child_session_id
+        );
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let answered = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"reply": "once"},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(answered["interaction"]["result"], "answered");
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.permission_reply_calls.len(), 1);
+        assert_eq!(fake.permission_reply_calls[0].0, child_session_id);
+        assert_eq!(fake.pending_permissions.len(), 1);
+        assert_eq!(
+            interaction_request_id(&fake.pending_permissions[0]),
+            Some("per_unrelated")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_interaction_answer_finishes_receipt_without_consuming_request() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_permissions.push(json!({
+            "id": "per_invalid",
+            "sessionID": opencode_session_id,
+            "action": "bash",
+        }));
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let operation_id = Uuid::new_v4();
+        let invalid_args = json!({
+            "task_id": task_id,
+            "operation_id": operation_id,
+            "action": "answer",
+            "interaction_id": interaction_id,
+            "answer": {"answers": [["not-a-permission-reply"]]},
+        });
+
+        let invalid = task_control_with_store_and_binary(
+            &invalid_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid["interaction"]["result"], "invalid_answer");
+        assert_eq!(invalid["interaction"]["applied"], false);
+        assert_eq!(invalid["status"], "waiting_approval");
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 0);
+
+        let replay = task_control_with_store_and_binary(
+            &invalid_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["interaction"]["result"], "invalid_answer");
+        assert_eq!(replay["interaction"]["applied"], false);
+        assert_eq!(replay["status"], "waiting_approval");
+        assert_eq!(replay["reconciliation_required"], false);
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 0);
+
+        let corrected = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"reply": "once"},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(corrected["interaction"]["result"], "answered");
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_question_answers_are_rejected_before_reply() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_questions.push(json!({
+            "id": "que_validate",
+            "sessionID": opencode_session_id,
+            "questions": [
+                {
+                    "header": "Mode",
+                    "question": "Choose one",
+                    "options": [{"label": "safe"}, {"label": "fast"}],
+                    "multiple": false,
+                    "custom": false
+                },
+                {
+                    "header": "Tags",
+                    "question": "Choose tags",
+                    "options": [{"label": "a"}, {"label": "b"}],
+                    "multiple": true,
+                    "custom": false
+                }
+            ]
+        }));
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        for answers in [
+            json!([["safe"]]),
+            json!([["safe", "fast"], ["a"]]),
+            json!([["other"], ["a"]]),
+        ] {
+            let invalid = task_control_with_store_and_binary(
+                &json!({
+                    "task_id": task_id,
+                    "operation_id": Uuid::new_v4(),
+                    "action": "answer",
+                    "interaction_id": interaction_id,
+                    "answer": {"answers": answers},
+                }),
+                &session,
+                &store,
+                Path::new("opencode"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(invalid["interaction"]["result"], "invalid_answer");
+            assert_eq!(invalid["interaction"]["applied"], false);
+            assert_eq!(fake.lock().unwrap().question_reply_calls.len(), 0);
+            assert_eq!(fake.lock().unwrap().pending_questions.len(), 1);
+        }
+
+        let valid = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"answers": [["safe"], ["a", "b"]]},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(valid["interaction"]["result"], "answered");
+        assert_eq!(fake.lock().unwrap().question_reply_calls.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_permission_is_inspectable_answerable_idempotent_and_stale_safe() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_permissions.push(json!({
+            "id": "per_0001",
+            "sessionID": opencode_session_id,
+            "action": "bash",
+            "resources": ["cargo test"],
+            "save": ["cargo *"],
+        }));
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked["status"], "waiting_approval");
+        assert_eq!(blocked["pending_interactions"].as_array().unwrap().len(), 1);
+        assert_eq!(blocked["pending_interactions"][0]["kind"], "permission");
+        assert_eq!(
+            blocked["pending_interactions"][0]["detail"]["action"],
+            "bash"
+        );
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let operation_id = Uuid::new_v4();
+        let answer_args = json!({
+            "task_id": task_id,
+            "operation_id": operation_id,
+            "action": "answer",
+            "interaction_id": interaction_id,
+            "answer": {"reply": "once"},
+        });
+        let answered = task_control_with_store_and_binary(
+            &answer_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answered["interaction"]["result"], "answered");
+        assert_eq!(answered["interaction"]["applied"], true);
+        assert_eq!(
+            answered["pending_interactions"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+
+        let replay = task_control_with_store_and_binary(
+            &answer_args,
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "running");
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+
+        let stale = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"reply": "reject"},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(stale["interaction"]["result"], "stale");
+        assert_eq!(stale["interaction"]["applied"], false);
+        assert_eq!(fake.lock().unwrap().permission_reply_calls.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_question_accepts_offered_and_free_form_answers() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_questions.push(json!({
+            "id": "que_0001",
+            "sessionID": opencode_session_id,
+            "questions": [
+                {
+                    "header": "Mode",
+                    "question": "Choose mode",
+                    "options": [{"label": "safe"}, {"label": "fast"}],
+                    "multiple": false,
+                    "custom": false
+                },
+                {
+                    "header": "Reason",
+                    "question": "Why?",
+                    "options": [],
+                    "multiple": false,
+                    "custom": true
+                }
+            ]
+        }));
+
+        let blocked = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let interaction_id = blocked["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let answered = task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "answer",
+                "interaction_id": interaction_id,
+                "answer": {"answers": [["safe"], ["because tests need it"]]},
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(answered["interaction"]["result"], "answered");
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.question_reply_calls.len(), 1);
+        assert_eq!(
+            fake.question_reply_calls[0].2,
+            vec![
+                vec!["safe".to_owned()],
+                vec!["because tests need it".to_owned()]
+            ]
+        );
+        assert!(fake.pending_questions.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn steer_does_not_consume_pending_question_interaction() {
+        let root = tempdir();
+        let (_handle, session) = active_test_session(&root, &test_id(), false).await;
+        let _serial = serial().await;
+        let store = test_store(&root);
+        let (_, fake) = fake_client();
+        install_fake(fake.clone());
+
+        let start = task_start_with_store_and_binary(
+            &start_args(Uuid::new_v4(), "task"),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let task_id = start["task_id"].as_str().unwrap().to_owned();
+        let opencode_session_id = start["opencode_session_id"].as_str().unwrap().to_owned();
+        fake.lock().unwrap().pending_questions.push(json!({
+            "id": "que_pending",
+            "sessionID": opencode_session_id,
+            "questions": [{"header": "Need input", "question": "Pick", "options": [{"label": "A"}]}],
+        }));
+
+        let before = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        let interaction_id = before["pending_interactions"][0]["interaction_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        task_control_with_store_and_binary(
+            &json!({
+                "task_id": task_id,
+                "operation_id": Uuid::new_v4(),
+                "action": "steer",
+                "input": "A",
+            }),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+
+        let after = task_get_with_store_and_binary(
+            &json!({"task_id": task_id}),
+            &session,
+            &store,
+            Path::new("opencode"),
+        )
+        .await
+        .unwrap();
+        clear_fake();
+        assert_eq!(after["status"], "waiting_approval");
+        assert_eq!(
+            after["pending_interactions"][0]["interaction_id"],
+            interaction_id
+        );
+        assert_eq!(fake.lock().unwrap().question_reply_calls.len(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

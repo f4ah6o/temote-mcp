@@ -296,15 +296,33 @@ export const PUBLIC_TOOLS = [
   tool(
     "opencode_task_control",
     "Control a scoped OpenCode task",
-    "Idempotently steer, resume, or interrupt the retained opencode serve session of a scoped task.",
+    "Idempotently steer, resume, interrupt, or answer one exact pending OpenCode interaction on the retained serve session.",
     idempotentNetworkMutation,
     schema(
       {
         ...sessionProperty,
         task_id: { type: "string", format: "uuid" },
         operation_id: { type: "string", format: "uuid" },
-        action: { type: "string", enum: ["steer", "resume", "interrupt"] },
+        action: { type: "string", enum: ["steer", "resume", "interrupt", "answer"] },
         input: { type: "string", minLength: 1, maxLength: 1048576 },
+        interaction_id: { type: "string", format: "uuid" },
+        answer: {
+          type: "object",
+          properties: {
+            reply: { type: "string", enum: ["once", "always", "reject"] },
+            message: { type: "string", maxLength: 1024 },
+            answers: {
+              type: "array",
+              maxItems: 64,
+              items: {
+                type: "array",
+                maxItems: 16,
+                items: { type: "string", maxLength: 4096 },
+              },
+            },
+          },
+          additionalProperties: false,
+        },
       },
       ["session_id", "task_id", "operation_id", "action"],
     ),
