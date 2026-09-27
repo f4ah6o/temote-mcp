@@ -7,6 +7,8 @@ Related: `issues/open/20260927-instruction-side-bare-repo-provisioning.md`, `iss
 
 Triage: this is not a duplicate of bare-repository provisioning. The bare-repo issue owns caller-side repository-store preparation; this issue owns execution-time binding of a writable checkout, effective cwd, and command capability to an OpenCode implementation task.
 
+Current-main evidence (2026-09-27): `src/opencode_server.rs::serve_permission_config` explicitly adds an OpenCode V2 `shell` deny rule for `*`, while the serve child is rooted at the Temote session cwd. Command execution is therefore deliberately unavailable in the current task contract rather than merely absent by accident. The fix must not simply delete that deny rule: it must provide a workspace-scoped execution path that preserves Temote's protected-state, cwd, approval, and containment boundaries.
+
 ## Summary
 
 OpenCode を実装に使うには、Temote 側で対象 repository の checkout と command-execution capability を事前に用意する必要がある。
