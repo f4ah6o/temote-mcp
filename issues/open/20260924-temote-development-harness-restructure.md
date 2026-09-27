@@ -16,6 +16,7 @@ Related:
 - `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
 - `issues/open/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
+- `issues/open/20260926-task-change-orchestration-stacked-pr.md` (Task/Change graph as source of truth for executor assignment and stacked PR delivery)
 - `issues/done/20260916-managed-worktree-session-integration.md`
 - `issues/done/20260916-agent-mode-git-broker-gh-git-integration.md`
 - `f4ah6o/gh-git` (repository-scoped GitHub identity extension)
