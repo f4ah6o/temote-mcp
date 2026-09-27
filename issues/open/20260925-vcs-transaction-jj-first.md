@@ -3,7 +3,7 @@
 Status: implementation underway — V0/V1/V2 complete; V3 first slice merged; V3 remainder / V4 open  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
-Related: `issues/open/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
+Related: `issues/done/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
 Delivery graph child: `issues/open/20260926-task-change-orchestration-stacked-pr.md`  
 Created: 2026-09-25 (Asia/Tokyo)
 
@@ -466,7 +466,7 @@ Caveats:
 - jj `--json` is not the contract; typed adapters should use pinned templates
 - submodules / Git LFS / required Git hooks were not acceptance-tested and remain capability-gated unknowns
 
-Detailed backend-neutral contract: `issues/open/20260925-v2-vcs-workspace-contract.md`.
+Detailed backend-neutral contract: `issues/done/20260925-v2-vcs-workspace-contract.md`.
 
 ## 16. Implementation packets
 
