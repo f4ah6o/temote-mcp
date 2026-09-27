@@ -1,6 +1,6 @@
 # F1: repository store / workspace JSON・ref / path / freshness 契約
 
-Status: contract delivered (設計 packet。実装コードなし)
+Status: done — contract delivered (設計 packet。実装コードなし)
 Packet: F1 (Phase F — initial repository store / no-local-main foundation の第 1 child)
 Repository: `f4ah6o/temote-mcp` (この文書) / `f4ah6o/gh-git` (Git 側 API の実装対象)
 Branch / observed HEAD: temote-mcp `main` `c69bfe3` (A1 merge 後), gh-git `main` `890d2f5`
@@ -14,7 +14,7 @@ Prerequisites: 現状確認のみ (実装 packet の成果に依存しない)
 ただし `git worktree` / `store-worktree` を新規 managed workspace の最終 substrate とする部分は、
 `issues/open/20260925-vcs-transaction-jj-first.md` の V1/V2 decision 対象になった。
 
-**V1 は完了し jj-first viable と判定済み。F2/F3 を git-worktree-only として実装しない。V2 contract (`issues/open/20260925-v2-vcs-workspace-contract.md`) に従って backend-neutral に実装する。**
+**V1 は完了し jj-first viable と判定済み。F2/F3 を git-worktree-only として実装しない。V2 contract (`issues/done/20260925-v2-vcs-workspace-contract.md`) に従って backend-neutral に実装する。**
 
 V1 は jj-first acceptance を満たした。以下は V2 で backend-neutral contract に改訂済み:
 
@@ -26,7 +26,7 @@ V1 は jj-first acceptance を満たした。以下は V2 で backend-neutral co
 host / owner / name、bare Git store、origin freshness、legacy checkout 保全、Temote reservation ownership は可能な限り保持する。
 既存 checkout を jj へ自動変換・reset・clean・stash しない。
 
-`issues/open/20260925-v2-vcs-workspace-contract.md` を workspace substrate の authoritative contract とし、本 F1 は repository identity / bare store / freshness / legacy protection の generic contract として参照する。
+`issues/done/20260925-v2-vcs-workspace-contract.md` を workspace substrate の authoritative contract とし、本 F1 は repository identity / bare store / freshness / legacy protection の generic contract として参照する。
 
 ## 1. Goal
 
@@ -412,6 +412,6 @@ gh-git (`main` `890d2f5`):
 
 ## 8. Completion report
 
-packet F1 — 契約書を `issues/open/20260925-f1-repository-store-workspace-contract.md`
+packet F1 — 契約書を `issues/done/20260925-f1-repository-store-workspace-contract.md`
 として納品。実装・runtime 検証は未実施 (設計 packet のため)。残件は §7 の通り F2–F4 /
 C1–C2 / Temote 側抽象化 packet。

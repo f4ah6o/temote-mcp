@@ -2,11 +2,12 @@
 
 ## Status
 
-open / direction decision and umbrella tracker
+open — server-primary backends implemented; residual live parity and legacy CLI cleanup tracked here
 
 Model: coordinator decision (f4ah6o)
 Created: 2026-09-22 (Asia/Tokyo)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
+Triage (2026-09-27): keep open for credentialed parity residuals and final legacy one-shot argv cleanup; do not treat already-landed server backends as unfinished.
 
 ## Decision
 

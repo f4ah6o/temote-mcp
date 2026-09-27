@@ -15,6 +15,8 @@ use tempfile::TempDir;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const RETAINED_TERMINAL_FIXTURE_PAIRS: usize = 512;
+const FIXTURE_READINESS_POLL: Duration = Duration::from_millis(50);
 static NEXT_NAMESPACE: AtomicUsize = AtomicUsize::new(1);
 
 fn unique_namespace() -> String {
@@ -245,7 +247,7 @@ impl Fixture {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(FIXTURE_READINESS_POLL);
         }
     }
 
@@ -257,6 +259,73 @@ impl Fixture {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        self.wait_for_active(id);
+    }
+
+    fn wait_for_active(&self, id: &str) {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let output = self.run_cli(&["session", "info", id]);
+            let active = output.status.success()
+                && serde_json::from_slice::<Value>(&output.stdout)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("active");
+            if active {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "session {id} did not become active: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            thread::sleep(FIXTURE_READINESS_POLL);
+        }
+    }
+
+    fn wait_for_terminal_pairs(&self, prefix: &str, expected: usize) {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let mut metadata = BTreeSet::new();
+            let mut lifecycle = BTreeSet::new();
+            if let Ok(entries) = fs::read_dir(self.metadata_dir()) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    if !id.starts_with(prefix) {
+                        continue;
+                    }
+                    match path.extension().and_then(|value| value.to_str()) {
+                        Some("json") => {
+                            metadata.insert(id.to_owned());
+                        }
+                        Some("state") => {
+                            lifecycle.insert(id.to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if metadata == lifecycle && metadata.len() == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terminal fixture metadata did not settle: prefix={prefix} json={} state={} expected={expected}",
+                metadata.len(),
+                lifecycle.len()
+            );
+            thread::sleep(FIXTURE_READINESS_POLL);
+        }
     }
 
     fn stop_active(&self, id: &str) {
@@ -557,6 +626,7 @@ fn session_list_remains_bounded_and_deterministic() {
     }
     let mut supervisor = fixture.spawn_supervisor();
     fixture.wait_for_supervisor();
+    fixture.wait_for_terminal_pairs("bounded-", RETAINED_TERMINAL_FIXTURE_PAIRS);
     fixture.start_active("active-a");
     fixture.start_active("active-b");
 
@@ -678,8 +748,8 @@ fn metadata_retention_bounds_repeated_ephemeral_sessions() {
             _ => {}
         }
     }
-    assert_eq!(json_count, 512);
-    assert_eq!(state_count, 512);
+    assert_eq!(json_count, RETAINED_TERMINAL_FIXTURE_PAIRS);
+    assert_eq!(state_count, RETAINED_TERMINAL_FIXTURE_PAIRS);
 
     supervisor.interrupt();
     assert!(supervisor.wait_for_exit(SHUTDOWN_TIMEOUT).success());
@@ -858,14 +928,32 @@ fn session_gc_dry_run_and_apply_remove_only_old_orphans_and_survive_restart() {
     assert!(directory.join(format!("{pair}.json")).exists());
     assert!(directory.join(format!("{pair}.state")).exists());
 
-    assert!(fixture.run_cli(&["session", "list"]).status.success());
-    assert!(fixture.run_cli(&["session", "info", pair]).status.success());
+    let list_output = fixture.run_cli(&["session", "list"]);
+    assert!(
+        list_output.status.success(),
+        "post-GC session list failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&list_output.stdout),
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let info_output = fixture.run_cli(&["session", "info", pair]);
+    assert!(
+        info_output.status.success(),
+        "post-GC session info failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&info_output.stdout),
+        String::from_utf8_lossy(&info_output.stderr)
+    );
 
     supervisor.interrupt();
     assert!(supervisor.wait_for_exit(SHUTDOWN_TIMEOUT).success());
     let mut supervisor = fixture.spawn_supervisor();
     fixture.wait_for_supervisor();
-    assert!(fixture.run_cli(&["session", "list"]).status.success());
+    let restart_list_output = fixture.run_cli(&["session", "list"]);
+    assert!(
+        restart_list_output.status.success(),
+        "post-restart session list failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&restart_list_output.stdout),
+        String::from_utf8_lossy(&restart_list_output.stderr)
+    );
     supervisor.interrupt();
     assert!(supervisor.wait_for_exit(SHUTDOWN_TIMEOUT).success());
 }

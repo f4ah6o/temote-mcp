@@ -1,5 +1,12 @@
 # Completed task result must remain retrievable when final report JSON is malformed
 
+Status: open — confirmed result-delivery contract gap  
+Repository: `f4ah6o/temote-mcp`  
+Created: 2026-09-27 (Asia/Tokyo)  
+Related: `issues/open/20260927-native-structured-output-agent-backends.md`
+
+Triage: keep this issue independent from native structured-output work. Native schemas reduce malformed reports; this issue owns the stronger fallback guarantee that an already-completed task never loses its bounded raw result when structured decoding fails.
+
 ## Summary
 
 検証 task 自体は `completed` に到達しているのに、最終レポート JSON の形式不正だけを理由に結果本体が取得できないケースが再発した。

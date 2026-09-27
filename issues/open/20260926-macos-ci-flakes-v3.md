@@ -1,9 +1,10 @@
 # macOS CI flakes observed during V3 VCS adapter work
 
-Status: open  
+Status: open — retention/parity family has a fix in PR #66; Codex restart-drain `Broken pipe` remains open  
 Repository: `f4ah6o/temote-mcp`  
 Observed: 2026-09-26 (Asia/Tokyo)  
 Related PR: #59 (`feat: add jj-first VCS transaction core`)
+Triage (2026-09-27): PR #66 now owns the reproduced ENOTCONN/retention-determinism family. Keep this tracker open for the independent Codex restart-drain failure until it is reproduced/fixed or explicitly closed as non-recurrent.
 
 ## Summary
 
