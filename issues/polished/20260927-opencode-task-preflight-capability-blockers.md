@@ -1,9 +1,9 @@
 # OC1: preflight + capability-blocker classification for OpenCode tasks
 
-Status: ready (revised 2026-09-27 per PR #73 review: narrowed to checks that
-are derivable and side-effect-free under the current `opencode_task_start`
-contract; `repository_unresolvable`/`cwd_mismatch` and refusal-on-checkout
-deferred to a typed workspace-input follow-up).
+Status: ready (revised 2026-09-27 per PR #73 review: narrowed to derivable,
+side-effect-free checks; `scope_unresolvable` is a structured pre-acceptance
+error, not a persisted blocker — the record cannot exist before `scope_cwd`
+canonicalizes).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`
 Parent issue: `issues/open/20260927-opencode-checkout-command-execution-capability.md`
@@ -33,9 +33,14 @@ instead of spending a model turn that ends in an apparent model failure.
   `VcsManager::open` (`src/vcs.rs:325`) is explicitly NOT a detector: it
   requires a managed root and creates `.temote` registry directories).
 - Blocker classes for this slice:
-  - `scope_unresolvable` — `scope_cwd` cannot be canonicalized / does not exist
-    (currently surfaces as a generic error from `canonical_directory`).
-    **Hard blocker**: serve spawn would fail regardless.
+  - `scope_unresolvable` — `scope_cwd` cannot be canonicalized / does not
+    exist. **Hard blocker**, delivered as a *structured pre-acceptance error*:
+    `TaskRecord.scope_cwd` is populated by
+    `config::canonical_directory(&session.cwd)?` while constructing the record
+    (`src/opencode_server.rs:3696`), so on failure no TaskRecord/receipt can
+    exist — this class is returned in the tool error payload (same blocker
+    shape: class, backend, attempted path, missing_capability, recovery_hint)
+    and is never persisted as a task.
   - `execution_unavailable` — the resolved serve binary cannot be probed
     (spawn/`--version` fails, times out, or is not executable), reusing the
     `CommandRunner`-style probe pattern of `tool_capability`
@@ -53,12 +58,15 @@ instead of spending a model turn that ends in an apparent model failure.
   `repository`/`requires_workspace` input, so a hard refusal would
   misclassify legitimate non-repository tasks. They become refusal-grade in
   the follow-up that adds the typed input.
-- Blocker surface: a structured `blocker` object in the task view / operation
-  receipt with `class`, `backend: "opencode"`, resolved/attempted path,
-  `missing_capability`, and a `recovery_hint`. This is a capability blocker,
-  never `retryable_failed`/`failed` model framing (parent §5). Prefer an
-  additive view field over a new `TaskStatus` wire value
-  (`src/opencode_server.rs:342`).
+- Blocker surface: a structured `blocker` object with `class`,
+  `backend: "opencode"`, resolved/attempted path, `missing_capability`, and a
+  `recovery_hint`. For classes where a record exists (all except
+  `scope_unresolvable`) it is persisted on the task record and surfaced in the
+  task view / operation receipt — prefer an additive view field over a new
+  `TaskStatus` wire value (`src/opencode_server.rs:342`). For
+  `scope_unresolvable` it is a structured pre-acceptance error only. This is a
+  capability blocker, never `retryable_failed`/`failed` model framing
+  (parent §5).
 - The blocker enum/serialization is extensible: `repository_unresolvable` and
   `cwd_mismatch` must be addable later without a schema break.
 
@@ -97,8 +105,9 @@ instead of spending a model turn that ends in an apparent model failure.
 
 ## 5. Acceptance
 
-- [ ] A start whose `scope_cwd` no longer exists fails fast with
-      `scope_unresolvable` before serve spawn.
+- [ ] A start whose `scope_cwd` no longer exists fails fast with a structured
+      `scope_unresolvable` pre-acceptance error before serve spawn — no task
+      record or operation receipt is persisted.
 - [ ] A start with an unspawnable/unprobesable serve binary fails fast with
       `execution_unavailable`.
 - [ ] A start in a non-checkout scope still starts and carries a classified

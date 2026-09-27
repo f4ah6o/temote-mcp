@@ -1,6 +1,8 @@
 # R1: completed task keeps a bounded raw result when the final report is malformed
 
-Status: ready
+Status: ready (revised 2026-09-27 per PR #73 review: durable record-field
+persistence is now required — evidence-only is not retrievable on later
+terminal reads).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`
 Parent issue: `issues/open/20260927-completed-task-malformed-final-report-json.md`
@@ -22,10 +24,21 @@ re-running the task.
     `ReportState` in `src/delegation/mod.rs:215`).
 - Bounded raw final output is preserved when structured extraction fails:
   - store a bounded copy of the final assistant text (truncated with explicit
-    `truncated: true` metadata when over the report bound) on the terminal task
-    record or in the existing scoped-evidence payload written by
-    `store_evidence_for_instance` (`src/opencode_server.rs:1708`), which today
-    stores only the parsed `report`.
+    `truncated: true` metadata when over the report bound) **on the terminal
+    task record**. This is required, not optional: once a record is terminal,
+    `task_get` takes the fast path and returns `task_view(&record, None)`
+    (`src/opencode_server.rs:3907-3914`; same shape in `devin_acp.rs` and
+    `devin_cloud.rs`), so an evidence ref created only during the transition
+    call is not reachable on later reads — an evidence-only copy would violate
+    the parent's re-fetch-without-rerun requirement.
+  - the terminal scoped-evidence payload written by
+    `store_evidence_for_instance` (`src/opencode_server.rs:1708`) also carries
+    the bounded raw output + report state, so `evidence_read` returns the same
+    data — but the record field is the durable source of truth.
+  - (rejected alternative: persisting only a durable evidence id on the record
+    and re-attaching it on every terminal read — equivalent durability, more
+    indirection; revisit only if the record field proves too large in
+    practice.)
 - `task_get` keeps returning the task with `status: "completed"`; the report
   failure is exposed as report status + raw output + decode error, not by
   rewriting the task status.
@@ -65,7 +78,9 @@ re-running the task.
    `delegation::ReportState` names or introduce a small backend-neutral enum).
 3. Persist bounded raw output + `report_state` on terminal records; serialize
    with `#[serde(default)]` for backward compatibility.
-4. Include the raw output + state in the terminal evidence payload.
+4. Include the raw output + state in the terminal evidence payload, and verify
+   a second `task_get` after the transition (fast-path `task_view(&record,
+   None)`) still exposes the raw output.
 5. Focused tests; then `just sandboxed-check`; record host-only gates as NOT
    RUN.
 
@@ -75,8 +90,9 @@ re-running the task.
       back as `completed` and exposes the decode failure class.
 - [ ] `invalid_json`, `invalid_schema`, `oversized`/`truncated`, and `missing`
       are distinguishable to the caller.
-- [ ] Bounded raw final output is retrievable via `task_get`/evidence without
-      re-running the task.
+- [ ] Bounded raw final output is retrievable via `task_get` on a *later*
+      terminal read (fast path, no evidence ref) and via `evidence_read`,
+      without re-running the task.
 - [ ] `schema-invalid` JSON exercises the same raw-result path as non-JSON.
 - [ ] Valid reports keep the existing behavior and shape byte-for-byte.
 - [ ] Records written before this change still load and show a report state.
