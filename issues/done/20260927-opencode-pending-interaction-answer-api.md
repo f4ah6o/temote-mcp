@@ -4,9 +4,9 @@
 
 done — implemented by PR #71 (`9963f7fca2771401abf4bf0eaab1c50bae362c6f`); repository acceptance complete, installed-runtime live canary tracked in `issues/open/20260908-live-acceptance-matrix.md`.
 
-## Problem
+## Original problem (before PR #71)
 
-Temote can run and steer an OpenCode-backed session, but it currently has no
+Temote could run and steer an OpenCode-backed session, but it had no
 first-class API for answering an individual OpenCode permission or question
 request once OpenCode is waiting for that interaction.
 
@@ -17,15 +17,15 @@ interaction: execution returns to the same pending request.
 As a result, a Temote caller can observe that OpenCode is blocked but cannot
 resolve the block through Temote.
 
-## Confirmed behavior
+## Confirmed behavior before implementation
 
-1. OpenCode emits a permission or question request and waits for an answer.
-2. Temote can observe the backend/session state sufficiently to see that work is
+1. OpenCode emitted a permission or question request and waits for an answer.
+2. Temote could observe the backend/session state sufficiently to see that work is
    blocked on the interaction.
-3. Temote exposes no operation that targets and answers that specific pending
+3. Temote exposed no operation that targets and answers that specific pending
    request.
-4. Sending `steer` does not consume the permission/question request.
-5. The same request remains pending and the job cannot make progress without an
+4. Sending `steer` did not consume the permission/question request.
+5. The same request remained pending and the job could not make progress without an
    out-of-band OpenCode interaction.
 
 ## Desired behavior
