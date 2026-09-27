@@ -1,7 +1,9 @@
 # CC1: explicit Codex conversation continuation for a new task
 
-Status: ready (revised 2026-09-27 per PR #73 review: conversation fencing
-decision added — continuation requires a quiescent source task).
+Status: ready (revised 2026-09-27 per PR #73 review: conversation fencing +
+explicit terminal-runtime handoff — a bare quiescence gate would block
+continuation for up to `CHILD_LIFETIME` (2h) because a terminal task's runtime
+keeps its lease in `runtimes()` until lifetime expiry or session stop).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`
 Parent issue: `issues/open/20260925-agent-conversation-continuation.md`
@@ -26,16 +28,28 @@ verification, delivery, receipts, and ownership fully independent.
   input; `thread/resume` then a fresh `turn/start` for task B.
 - Fail closed: non-resumable/absent conversation is an explicit error or an
   `unsupported` capability result — never a silent fresh thread.
-- Conversation fencing: continuation is only legal when the source task is
-  quiescent — `record.status.is_terminal()` AND no runtime lease currently
-  held for A (`runtime-locks/<task_id>.lock`, `src/codex_app_server.rs:516`) AND
-  no in-flight turn/control operation on A's record. Runtime leases are keyed
-  by `task_id`, so task B gets a different lock file from A; without this gate
-  B could `thread/resume`/`turn/start` the same Codex thread while A's runtime
-  is still live. Checked under the store lock at resolution time (step 2).
-  - (rejected alternative: a thread/conversation-level lease serializing
-    turn ownership across all tasks sharing a thread — more machinery, only
-    needed if concurrent multi-task threads become a goal; revisit then.)
+- Conversation fencing + explicit handoff: continuation is only legal when
+  the source task is quiescent — `record.status.is_terminal()` AND no
+  in-flight turn/control operation on A's record (terminal status implies no
+  in-flight turn). Runtime leases are keyed by `task_id`
+  (`runtime-locks/<task_id>.lock`, `src/codex_app_server.rs:516`), so task B
+  gets a different lock file from A.
+  - Terminal does NOT imply lease-free: `insert_runtime_unchecked`
+    (`src/codex_app_server.rs:1819`) keeps the `RuntimeHandle` (holding its
+    `_lease`) in `runtimes()` until `CHILD_LIFETIME` (line 42, 2h) or session
+    stop; reconciliation marking A `completed` does not remove it.
+  - Handoff: when A is terminal, B's start retires A's runtime under
+    `store_lock` — remove the handle from `runtimes()`, `client.shutdown()`
+    the child, drop the lease — then B spawns its own runtime, `thread/resume`s
+    A's retained `thread_id`, and opens a new `turn/start`. If A is
+    non-terminal, or its runtime cannot be retired cleanly, B's start fails
+    closed with an explicit error — two task runtimes can never drive the same
+    Codex thread concurrently.
+  - (rejected alternatives: refusing while the terminal runtime is still
+    registered — blocks the primary implement→follow-up flow for up to 2h; or
+    a thread/conversation-level lease serializing turn ownership across tasks
+    — more machinery, revisit only if concurrent multi-task threads become a
+    goal.)
 - Task B gets its own `task_id`, record, receipts, and bounded lineage metadata
   (`continued_from_task_id` on the record; see parent §6). No inheritance of
   A's status / verification / delivery state.
@@ -59,8 +73,9 @@ verification, delivery, receipts, and ownership fully independent.
 1. Extend the tool schema and orchestration request type for `continuation`.
 2. Resolve `previous_task` through the store with owner/scope checks
    (`ensure_task_owner`-equivalent rules); enforce the fencing gate — source
-   task terminal, no held runtime lease for its `task_id`, no in-flight
-   turn/control — and read its retained `thread_id`.
+   task terminal, no in-flight turn/control — and perform the handoff: retire
+   A's still-registered runtime under `store_lock` (map removal + child
+   shutdown + lease drop), then read its retained `thread_id`.
 3. Drive `thread/resume` + new `turn/start`; persist B's lineage metadata with
    `#[serde(default)]` for old records.
 4. Reject cross-session, backend-mismatch, and unresumable cases explicitly.
@@ -77,9 +92,12 @@ verification, delivery, receipts, and ownership fully independent.
 - [ ] Idempotent replay of a continued start does not duplicate the turn.
 - [ ] Cross-session / wrong-backend / non-resumable continuations fail closed
       with explicit errors.
-- [ ] Continuation while the source task is non-terminal, holds a live runtime
-      lease, or has an in-flight turn/control fails closed — two task runtimes
-      can never drive the same Codex thread concurrently.
+- [ ] Continuation while the source task is non-terminal or has an in-flight
+      turn/control fails closed — two task runtimes can never drive the same
+      Codex thread concurrently.
+- [ ] A just became completed while its runtime is still registered → B can
+      safely continue immediately: the handoff retires A's runtime/lease and
+      B's fresh runtime resumes the thread.
 - [ ] Same-task runtime reconstruction via `thread/resume` is unchanged.
 - [ ] Gateway contract/fingerprint regenerated; tool count updated.
 - [ ] Old task records without lineage fields still load.

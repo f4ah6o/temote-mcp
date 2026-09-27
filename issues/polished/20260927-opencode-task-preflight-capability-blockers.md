@@ -1,9 +1,10 @@
 # OC1: preflight + capability-blocker classification for OpenCode tasks
 
 Status: ready (revised 2026-09-27 per PR #73 review: narrowed to derivable,
-side-effect-free checks; `scope_unresolvable` is a structured pre-acceptance
-error, not a persisted blocker — the record cannot exist before `scope_cwd`
-canonicalizes).
+non-destructive probes; both hard blockers are structured pre-acceptance
+errors — no record exists yet, and a persisted hard blocker would be a
+non-terminal `accepted` record that `task_get` would re-drive into
+`ensure_runtime_with_binary`).
 Repository: `f4ah6o/temote-mcp`
 Branch / observed HEAD: `main` `c305e41`
 Parent issue: `issues/open/20260927-opencode-checkout-command-execution-capability.md`
@@ -24,14 +25,21 @@ instead of spending a model turn that ends in an apparent model failure.
 ## 2. Fixed decisions
 
 - Preflight runs inside `task_start_with_store_and_binary`
-  (`src/opencode_server.rs:3655`) after argument validation and before the
-  serve child / session create side effect — the record may persist the
-  accepted operation receipt, but no `opencode serve` spawn happens when a
-  hard blocker is found.
-- Only checks derivable from the current contract are implemented here, and
-  only side-effect-free ones (no provisioning, no registry/directory creation —
-  `VcsManager::open` (`src/vcs.rs:325`) is explicitly NOT a detector: it
-  requires a managed root and creates `.temote` registry directories).
+  (`src/opencode_server.rs:3655`) after argument validation and *before the
+  `TaskRecord` is constructed/persisted*: hard blockers abort before the
+  record exists, so there is no retained `accepted` record to reconcile or
+  re-drive. (A hard blocker persisted as `accepted`+`blocker` would be
+  non-terminal — the next `task_get` would retry `ensure_runtime_with_binary`
+  and could mutate the record to `unknown`; and `TaskStatus` has no `blocked`
+  value. Pre-acceptance avoids that state-machine change.)
+- All checks are derivable from the current contract and *non-provisioning,
+  non-destructive*: no VCS registry/directory creation (`VcsManager::open`,
+  `src/vcs.rs:325`, is explicitly NOT a detector — it requires a managed root
+  and creates `.temote` registry directories), no mutation of workspace
+  contents. The two probes do have bounded process/FS effects — the binary
+  probe spawns a short-lived `--version` child, and the writability probe
+  creates+unlinks a tempfile via `create_new` with cleanup-on-error (unlink on
+  drop/all exits).
 - Blocker classes for this slice:
   - `scope_unresolvable` — `scope_cwd` cannot be canonicalized / does not
     exist. **Hard blocker**, delivered as a *structured pre-acceptance error*:
@@ -44,7 +52,9 @@ instead of spending a model turn that ends in an apparent model failure.
   - `execution_unavailable` — the resolved serve binary cannot be probed
     (spawn/`--version` fails, times out, or is not executable), reusing the
     `CommandRunner`-style probe pattern of `tool_capability`
-    (`src/vcs.rs:948`). **Hard blocker**.
+    (`src/vcs.rs:948`). **Hard blocker**, delivered as a *structured
+    pre-acceptance error* exactly like `scope_unresolvable` — preflight runs
+    before record construction, so no task record or receipt is persisted.
   - `checkout_missing` — `scope_cwd` is not inside a VCS worktree, detected
     read-only via `git -C <scope_cwd> rev-parse --is-inside-work-tree`
     (CommandRunner probe) with a `.git`/`.jj` marker fallback — no
@@ -60,13 +70,15 @@ instead of spending a model turn that ends in an apparent model failure.
   the follow-up that adds the typed input.
 - Blocker surface: a structured `blocker` object with `class`,
   `backend: "opencode"`, resolved/attempted path, `missing_capability`, and a
-  `recovery_hint`. For classes where a record exists (all except
-  `scope_unresolvable`) it is persisted on the task record and surfaced in the
+  `recovery_hint`. Advisory classes (`checkout_missing`,
+  `checkout_read_only`) are persisted on the task record and surfaced in the
   task view / operation receipt — prefer an additive view field over a new
-  `TaskStatus` wire value (`src/opencode_server.rs:342`). For
-  `scope_unresolvable` it is a structured pre-acceptance error only. This is a
-  capability blocker, never `retryable_failed`/`failed` model framing
-  (parent §5).
+  `TaskStatus` wire value (`src/opencode_server.rs:342`). Hard classes are
+  structured pre-acceptance errors only. This is a capability blocker, never
+  `retryable_failed`/`failed` model framing (parent §5).
+- Idempotent replay note: a hard blocker persists no receipt, so replaying the
+  same `operation_id` re-runs preflight and deterministically returns the same
+  structured error — consistent with idempotent start semantics.
 - The blocker enum/serialization is extensible: `repository_unresolvable` and
   `cwd_mismatch` must be addable later without a schema break.
 
@@ -108,15 +120,20 @@ instead of spending a model turn that ends in an apparent model failure.
 - [ ] A start whose `scope_cwd` no longer exists fails fast with a structured
       `scope_unresolvable` pre-acceptance error before serve spawn — no task
       record or operation receipt is persisted.
-- [ ] A start with an unspawnable/unprobesable serve binary fails fast with
-      `execution_unavailable`.
+- [ ] A start with an unspawnable/unprobesable serve binary fails fast with a
+      structured `execution_unavailable` pre-acceptance error — no task record
+      or operation receipt is persisted, and a later `task_get` for that
+      `task_id` returns not-found (the blocker cannot mutate into a
+      model/runtime failure).
 - [ ] A start in a non-checkout scope still starts and carries a classified
       `checkout_missing` advisory record on the task view.
 - [ ] `scope_unresolvable` vs `execution_unavailable` vs `checkout_missing` vs
       `checkout_read_only` are separately observable.
 - [ ] Blocker output carries backend, path, missing capability, and a recovery
       hint — and is never presented as a model failure.
-- [ ] No VCS registry/provisioning side effects occur during preflight.
+- [ ] No VCS registry/provisioning side effects occur during preflight; probe
+      side effects are bounded (process spawn with timeout; `create_new`
+      tempfile with unlink-on-error cleanup).
 - [ ] Existing uncommitted work in the workspace is never reset/cleaned.
 - [ ] Regression tests cover the success path plus each blocker class.
 
