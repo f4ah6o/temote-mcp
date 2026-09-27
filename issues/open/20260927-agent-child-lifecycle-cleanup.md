@@ -14,7 +14,7 @@ Fix confirmed Codex, OpenCode, and Devin ACP child-runtime lifecycle bugs so unc
 
 The Codex and OpenCode server-backed child runtimes use `SessionInstance` ownership, lifecycle closing fences, runtime leases, and durable task stores. A read-only investigation confirmed related cleanup failures in `src/codex_app_server.rs`, `src/opencode_server.rs`, `src/devin_acp.rs`, and `src/supervisor.rs`.
 
-The related issue [`issues/done/20260927-opencode-sandboxed-shell.md`](../done/20260927-opencode-sandboxed-shell.md) covers shell permission for sandboxed local OpenCode runs. That capability/configuration change is separate from the server-backed child lifecycle bugs here.
+The related issue [`issues/open/20260927-opencode-checkout-command-execution-capability.md`](20260927-opencode-checkout-command-execution-capability.md) owns execution-time checkout/cwd/command capability for OpenCode implementation tasks. Current `opencode serve` task configuration explicitly denies the shell capability, so that provisioning/capability gap is real but separate from the child lifecycle bugs here.
 
 ## 問題
 
@@ -31,7 +31,7 @@ Make child shutdown depend on confirmed parent inactivity or generation change, 
 ## 対象外
 
 - Proving that the previously observed Devin symptom was caused by this exact mechanism. The implementation scope does include fixing the confirmed Devin ACP parity defect in the watcher/lifecycle code.
-- Changing OpenCode shell permissions or the local-agent sandbox capability described in `issues/done/20260927-opencode-sandboxed-shell.md`.
+- Changing OpenCode checkout/shell capability or implementation-task provisioning; that remains owned by `issues/open/20260927-opencode-checkout-command-execution-capability.md`.
 - Weakening `SessionInstance` generation checks, canonical scope validation, lifecycle fences, or runtime-lease ownership.
 
 ## 提案する方針
