@@ -1,0 +1,7 @@
+{
+  "id": "task-rediscovery",
+  "revision": 1,
+  "goal": "Recover an accepted task after discarding the local task ID",
+  "operations": ["inspect_session", "start_agent", "lose_task_id", "rediscover_task", "wait_until_terminal", "read_terminal_result"],
+  "assertions": ["tasks_can_be_rediscovered", "no_duplicate_task", "terminal_state_is_unambiguous"]
+}

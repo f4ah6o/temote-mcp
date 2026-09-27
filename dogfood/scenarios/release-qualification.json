@@ -1,0 +1,7 @@
+{
+  "id": "release-qualification",
+  "revision": 1,
+  "goal": "Compose scenario evidence and external repository gates before a release decision",
+  "operations": ["inspect_session", "start_agent", "wait_until_terminal", "read_terminal_result"],
+  "assertions": ["identity_is_separate", "terminal_state_is_unambiguous", "no_duplicate_task", "repository_gates_recorded"]
+}

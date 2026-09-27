@@ -1,0 +1,7 @@
+{
+  "id": "transient-poll-failure",
+  "revision": 1,
+  "goal": "Recover a transient poll failure without replaying the start",
+  "operations": ["inspect_session", "start_agent", "inject_poll_failure", "wait_until_terminal", "read_terminal_result"],
+  "assertions": ["no_duplicate_task", "terminal_state_is_unambiguous", "retry_is_machine_decidable"]
+}
