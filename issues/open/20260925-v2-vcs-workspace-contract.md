@@ -1,6 +1,6 @@
 # V2: backend-neutral VCS / workspace contract
 
-Status: contract delivered / implementation not started  
+Status: contract delivered / V3 first slice implemented  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-vcs-transaction-jj-first.md`  
 Related: `issues/open/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
@@ -432,15 +432,23 @@ raw `jj <argv>` / `git <argv>` public proxy は作らない。
 
 ## 17. Next packet
 
-V3 は実装 packet。
+V3 first slice は PR #59 で実装済み。
 
-V3 の最初の slice は jj adapter 全体ではなく、temporary fixture + typed parser を使って:
+実装済み:
 
 1. `vcs_capabilities`
 2. `vcs_workspace_ensure`
 3. `vcs_snapshot`
 4. `vcs_inspect`
+5. minimal `VcsSnapshotObserved` seam
+6. snapshot receipt / idempotent replay / `reconciliation_required`
 
-までを成立させる。
+次の V3 slice:
+
+- `vcs_reconcile` / accepted-receipt backfill
+- Task / Execution / VCS correlation persistence
+- durable Observation journal への VCS snapshot emission
+- controlled workspace remove / release
+- task lifecycle boundary への automatic snapshot wiring
 
 delivery / GitHub PR は V4 に残す。

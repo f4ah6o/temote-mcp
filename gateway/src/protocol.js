@@ -296,15 +296,33 @@ export const PUBLIC_TOOLS = [
   tool(
     "opencode_task_control",
     "Control a scoped OpenCode task",
-    "Idempotently steer, resume, or interrupt the retained opencode serve session of a scoped task.",
+    "Idempotently steer, resume, interrupt, or answer one exact pending OpenCode interaction on the retained serve session.",
     idempotentNetworkMutation,
     schema(
       {
         ...sessionProperty,
         task_id: { type: "string", format: "uuid" },
         operation_id: { type: "string", format: "uuid" },
-        action: { type: "string", enum: ["steer", "resume", "interrupt"] },
+        action: { type: "string", enum: ["steer", "resume", "interrupt", "answer"] },
         input: { type: "string", minLength: 1, maxLength: 1048576 },
+        interaction_id: { type: "string", format: "uuid" },
+        answer: {
+          type: "object",
+          properties: {
+            reply: { type: "string", enum: ["once", "always", "reject"] },
+            message: { type: "string", maxLength: 1024 },
+            answers: {
+              type: "array",
+              maxItems: 64,
+              items: {
+                type: "array",
+                maxItems: 16,
+                items: { type: "string", maxLength: 4096 },
+              },
+            },
+          },
+          additionalProperties: false,
+        },
       },
       ["session_id", "task_id", "operation_id", "action"],
     ),
@@ -381,7 +399,8 @@ export const PUBLIC_TOOLS = [
         operation_id: { type: "string", format: "uuid" },
         task: { type: "string", minLength: 1, maxLength: 1048576 },
         title: { type: "string", minLength: 1, maxLength: 256 },
-        devin_mode: { type: "string", enum: ["normal", "fast", "lite", "ultra", "fusion", "swe-2-medium", "swe-2-high", "swe-2-max"] },
+        devin_mode: { type: "string", description: "Devin session mode. The swe-2-medium/high/max values select SWE-2 reasoning effort only; they do not by themselves select promo or priority.", enum: ["normal", "fast", "lite", "ultra", "fusion", "swe-2-medium", "swe-2-high", "swe-2-max"] },
+        swe_tier: { type: "string", description: "Optional SWE-2 service tier. promo preserves the selected SWE-2 mode and lets upstream account eligibility determine promotional pricing; priority resolves one exact account-visible SWE-2 priority/fast UID from the local Devin model catalog and fails closed if unavailable or ambiguous.", enum: ["promo", "priority"] },
         repos: { type: "array", items: { type: "string", minLength: 1, maxLength: 256 }, maxItems: 16 },
         max_acu_limit: { type: "integer", minimum: 1, maximum: 100000 },
       },

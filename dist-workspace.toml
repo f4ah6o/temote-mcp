@@ -6,6 +6,9 @@ cargo-dist-version = "0.31.0"
 ci = "github"
 installers = []
 dispatch-releases = true
+# Keep cargo-dist's generated release workflow out of pull requests.
+# PRs run a lightweight, artifact-free `dist plan` in release-plan.yml instead.
+pr-run-mode = "skip"
 targets = [
     "aarch64-apple-darwin",
     "aarch64-unknown-linux-gnu",

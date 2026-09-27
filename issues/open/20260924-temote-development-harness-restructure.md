@@ -1,9 +1,9 @@
 # Temote を local / remote agentic development harness へ再構成する
 
-Status: open / umbrella tracker (polished; implementation not started)
+Status: open / umbrella tracker (implementation underway)
 Execution unit: one bounded child packet per run (small-model implementation guide below)
 Created: 2026-09-24 (Asia/Tokyo)
-Updated: 2026-09-24 (Asia/Tokyo) — current `main` baseline / gh-git / gh-stack facts verified; scope / responsibility boundaries revised per PR #47 design review; user priorities: approve-free agent mode, caller-location independence, no local main
+Updated: 2026-09-26 (Asia/Tokyo) — Phase O O1/O2 implemented; cloud observation / knowledge child design added; earlier PR #47 scope boundaries retained
 Baseline inspected: `ba4c51c` (`main`, after PR #46 delegation-only tool surface)
 Roadmap: `issues/ROADMAP-20260916-agent-mode-main-only.md`
 Related:
@@ -12,8 +12,11 @@ Related:
 - `issues/open/20260923-devin-acp-backend.md`
 - `issues/open/20260924-devin-cloud-backend.md`
 - `issues/open/20260925-observation-context-memory-plane.md` (high-priority head-independent observation / context / memory plane)
+- `issues/open/20260926-cloud-observation-knowledge-plane.md` (Temote Fabric + D1/Queue/R2 shared observation / knowledge plane)
+- `issues/open/20260926-temote-fabric-product-boundary.md` (Temote Fabric naming / responsibility / gateway migration)
 - `issues/open/20260925-vcs-transaction-jj-first.md` (high-priority VCS transaction / jj-first evaluation)
 - `issues/open/20260925-v2-vcs-workspace-contract.md` (backend-neutral VCS/workspace contract after V1)
+- `issues/open/20260926-task-change-orchestration-stacked-pr.md` (Task/Change graph as source of truth for executor assignment and stacked PR delivery)
 - `issues/done/20260916-managed-worktree-session-integration.md`
 - `issues/done/20260916-agent-mode-git-broker-gh-git-integration.md`
 - `f4ah6o/gh-git` (repository-scoped GitHub identity extension)
@@ -489,14 +492,16 @@ temote activity ...
 
 temote mcp
 temote serve
-temote gateway-agent
+temote fabric connect
 ```
 
-`mcp` / HTTP / Gateway は transport adapter として扱う。
+`mcp` / HTTP / Temote Fabric remote entry は transport/frontend adapter として扱う。
 
-rename の影響範囲 (migration packet で扱う): binary / crate / cargo-dist package、`TEMOTE_MCP_` env prefix、state / socket dir、gateway worker 名と protocol contract、`skills/temote-mcp/`、README / docs / AGENTS.md の product name 規則、release workflow。
+rename の影響範囲 (migration packet で扱う): binary / crate / cargo-dist package、`TEMOTE_MCP_` env prefix、state / socket dir、Temote Fabric Worker（現 gateway worker）名と protocol contract、`skills/temote-mcp/`、README / docs / AGENTS.md の product name 規則、release workflow。Fabric 固有の non-destructive migration は `issues/open/20260926-temote-fabric-product-boundary.md` に従う。
 
 この issue では rename を即時実施せず、core/frontend separation が成立してから migration packet を切る。
+
+Cloud/shared side の正式名称は **Temote Fabric** とする。現行 `gateway/` / `GatewaySession` / `GatewayRegistry` / `gateway-agent` は compatibility / implementation names として段階移行し、Durable Object state や既存 endpoint を命名変更だけで破棄しない。target UX と migration contract は `issues/open/20260926-temote-fabric-product-boundary.md` に固定する。
 
 ## Proposed domain boundaries
 
@@ -530,7 +535,7 @@ transport/
   local/
   mcp/
   http/
-  gateway/
+  fabric/   # target name; current implementation remains under gateway/ during migration
 ```
 
 実際の Rust module 名は既存コードとの差分を見て別 packet で決める。
@@ -565,7 +570,7 @@ transport/
 6. bare-first / no-local-main の新規 store (Phase F) と workspace 割当・書込み排他 (Phase C) を、V1/V2 の VCS backend decision に従って完成させる。
 7. environment preparation (D)、delivery (E) を個別に追加し、各操作の既存許可を引き継ぐ agent mode を検証する。
 
-依存関係: A → B → R。V0/V1/V2 は完了済み。V1 で jj-first viable を確認し、V2 で backend-neutral contract を固定した。次は V3 typed VCS adapter と backend-neutral F/C workspace implementation を進める。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
+依存関係: A → B → R。V0/V1/V2 は完了済み。V1 で jj-first viable を確認し、V2 で backend-neutral contract を固定した。V3 first slice は PR #59 で実装済み。次は V3 remainder (reconcile / correlation / observation journal / workspace release / task-boundary snapshot wiring) と backend-neutral F/C workspace implementation を進める。O0 は完了済みの設計 packet、O1 は A2/A3 の common identity 後に開始し、O2 → O3 → O4 と進める。O1/O2 は B/F/C と並行でき、D/E より優先する。C0 (gh-git identity fix) と F の generic repository/freshness 設計は独立に開始できる。F の新規 store 実装は C0 と V2 に整合させ、C 完了には R + F + C0 を必要とする。C → {D, E}。G (rename) は A + B + R + F + C 完了後。F は後回しの opt-in ではない。各 phase は複数の小さい child packet に分け、設計・契約の決定と実装完了を区別する。
 
 ### Phase A — core extraction
 
@@ -589,7 +594,7 @@ transport/
 - [x] V0: Git snapshot broker と jj-first の設計比較、VCS abstraction / snapshot / observation / delivery boundary
 - [x] V1: temporary fixture で jj feasibility prototype。**jj-first viable**。bare Git backend、複数 `jj workspace`、change_id、crash後 snapshot、Git read-only compatibility、delivery ref を実測済み
 - [x] V2: backend-neutral VCS/workspace contract を `issues/open/20260925-v2-vcs-workspace-contract.md` に固定。F1 generic parts を保持し jj-first / Git compatibility を分離
-- [ ] V3: typed Temote VCS adapter + Observation hook
+- [ ] V3: **first slice merged in PR #59** — typed jj-first core / capability / workspace ensure / inspect / snapshot receipts / observation seam are implemented. Remaining: reconcile, durable Observation journal emission, Task/Execution/VCS correlation, workspace release, automatic task-boundary snapshot wiring
 - [ ] V4: GitHub delivery integration / stacked PR strategy
 
 **V1/V2 は完了済み。F2/F3/C は `issues/open/20260925-v2-vcs-workspace-contract.md` に従って backend-neutral に進め、git-worktree-only 実装には戻さない。**
@@ -600,10 +605,10 @@ A / O / B と F1 の repository identity・freshness・no-local-main の generic
 詳細 contract: `issues/open/20260925-observation-context-memory-plane.md`。
 
 - [x] O0: observation boundary / raw-vs-derived authority / worker / Context Resolver contract
-- [ ] O1: common orchestration boundary の owner-only observation journal。instruction は canonical task/evidence への reference-first とし、secret-bearing structured field を複製しない
-- [ ] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + verified task/execution/verification state だけで head switch を成立させる
-- [ ] O3: asynchronous Memory Worker。checkpoint / support refs / dedupe / supersession / retry idempotency
-- [ ] O4: knowledge-aware Context Resolver。current facts / decisions / constraints / unresolved / failure pattern を provenance 付きで返す
+- [x] O1: common orchestration boundary の owner-only observation journal。bounded JSONL + reference-first content + idempotent append
+- [x] O2: LLM worker なしの deterministic Context Resolver。過去 instruction + observed task/execution/verification state で local head switch を成立
+- [ ] O3: asynchronous Memory Worker。cloud shared implementation は `issues/open/20260926-cloud-observation-knowledge-plane.md` に従い、local journal -> Temote Fabric ingest -> D1 -> Queue worker とする
+- [ ] O4: knowledge-aware Context Resolver。Temote Fabric は D1 projection を利用し、host offline でも last synced revision まで provenance 付き repository context を返す
 - [ ] worker failure / stale projection を task failure に読み替えず、last processed observation revision を明示する
 
 実装上の優先順位は O1/O2 > D/E。ただし A の共通 identity を飛ばして各 backend に個別 logger を追加しない。
@@ -948,7 +953,7 @@ Prerequisites: <完了 commit / 対象ファイル / test>
 - [ ] task 開始時と提出前に確認した origin/main の commit / 時刻を記録し、fetch 失敗を最新確認済みと扱わない
 - [ ] 既存の dirty / ahead / diverged な checkout は保全し、新規 no-local-main 標準とは区別して移行状態を報告する
 - [ ] MCP を通さず local client / CLI から同じ agent task lifecycle を操作できる
-- [ ] MCP / local / HTTP / Gateway が同じ orchestration core を利用する
+- [ ] MCP / local / HTTP / Temote Fabric remote frontend が同じ orchestration core を利用する
 - [ ] Codex / OpenCode / Devin ACP が task ごとの isolated workspace で動作する
 - [ ] coding agent が workspace path を勝手に決めない
 - [ ] GitHub identity が repository-scoped で、linked worktree を含め global `gh auth switch` を必要としない

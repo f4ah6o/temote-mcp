@@ -1,0 +1,36 @@
+name: Release PR plan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install cargo-dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh \
+            | sh
+
+      - name: Validate release plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist plan --output-format=json > "$RUNNER_TEMP/plan-dist-manifest.json"
+          jq -e . "$RUNNER_TEMP/plan-dist-manifest.json" >/dev/null
+          echo "cargo-dist release plan is valid"

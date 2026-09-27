@@ -2835,12 +2835,26 @@ async fn request(request: ControlRequest) -> Result<Value> {
 async fn request_at_path(path: &Path, request: ControlRequest) -> Result<Value> {
     let mut stream = connect_supervisor_at(path).await?;
     stream.write_all(&encode_line(&request)?).await?;
-    stream.shutdown().await?;
+    finish_control_request_half_close(stream.shutdown().await)?;
     let mut reader = BufReader::new(stream);
     let line = read_line_limited(&mut reader, "supervisor response").await?;
     let response: ControlResponse =
         serde_json::from_str(line.trim()).context("invalid supervisor response")?;
     ensure_response_ok(response)
+}
+
+fn finish_control_request_half_close(result: std::io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {
+            // The request line is already fully written. macOS may report
+            // ENOTCONN here when the supervisor has already completed its side
+            // of the exchange. Continue to the mandatory response read instead
+            // of replaying a potentially mutating request.
+            Ok(())
+        }
+        Err(error) => Err(error).context("failed to half-close supervisor control request"),
+    }
 }
 
 #[allow(dead_code)]
@@ -4592,6 +4606,27 @@ mod tests {
             std::future::pending::<()>().await;
         });
         (server, accepted)
+    }
+
+    #[test]
+    fn control_request_half_close_only_tolerates_not_connected() {
+        assert!(finish_control_request_half_close(Ok(())).is_ok());
+        assert!(
+            finish_control_request_half_close(Err(std::io::Error::from(
+                std::io::ErrorKind::NotConnected,
+            )))
+            .is_ok()
+        );
+
+        let error = finish_control_request_half_close(Err(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to half-close supervisor control request")
+        );
     }
 
     #[tokio::test]

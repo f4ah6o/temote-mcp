@@ -1,9 +1,10 @@
 # V0: VCS transaction layer / jj-first managed workspace design
 
-Status: high-priority design / implementation not started  
+Status: implementation underway — V0/V1/V2 complete; V3 first slice merged; V3 remainder / V4 open  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Related: `issues/open/20260925-f1-repository-store-workspace-contract.md`, `issues/open/20260925-observation-context-memory-plane.md`  
+Delivery graph child: `issues/open/20260926-task-change-orchestration-stacked-pr.md`  
 Created: 2026-09-25 (Asia/Tokyo)
 
 ## 1. Problem
@@ -510,25 +511,35 @@ V1 PASS 後:
 
 ### V3 — Temote VCS adapter
 
-- [ ] typed `VcsBackend`
-- [ ] snapshot/checkpoint/reconcile
-- [ ] Task/Execution/VCS correlation
-- [ ] VCS Observation hook
-- [ ] workspace lifecycle
-- [ ] capability gate
-- [ ] no mutating raw argv surface
+First slice merged in PR #59 (merge commit `3213c17368b3ae214de8ef1a65a1fbdf154c9d1e`).
+
+- [x] typed backend-neutral VCS core with Jujutsu as the first real backend; Git remains explicit unsupported compatibility backend
+- [x] `vcs_capabilities` internal core
+- [x] idempotent `vcs_workspace_ensure` with request fingerprint / conflict detection
+- [x] typed `vcs_inspect` using pinned jj templates
+- [x] `vcs_snapshot` with Accepted-before-side-effect / Completed-after receipt and retry replay
+- [x] uncertain accepted snapshot fails closed as `reconciliation_required`
+- [x] minimal `VcsSnapshotObserved` seam without raw diff duplication
+- [x] capability gate / no silent Git fallback
+- [x] no caller-supplied mutating raw argv surface
+- [ ] `vcs_reconcile` implementation / accepted-receipt backfill
+- [ ] Task/Execution/VCS correlation persistence (task_id / execution_id are not populated yet)
+- [ ] VCS snapshot emission into the durable Observation journal
+- [ ] remaining workspace lifecycle, including controlled remove/release
+- [ ] real task lifecycle binding so agent edits are automatically snapshotted at Temote boundaries
 
 ### V4 — delivery integration
 
 - [ ] jj changes → delivery bookmarks/refs
 - [ ] single PR
-- [ ] stacked PR strategy decision
+- [x] stacked PR strategy decision: Task/Change dependency graph is authoritative; agent hierarchy is not delivery topology (`issues/open/20260926-task-change-orchestration-stacked-pr.md`)
+- [ ] persistent Temote Change record + dependency-aware delivery planner
 - [ ] remote receipt/reconciliation
 - [ ] final verification binds to delivered revision
 
 ## 17. Acceptance criteria
 
-- [ ] agent が explicit commit を実行しなくても、Temote は task workspace の変更を recoverable VCS state として捕捉できる
+- [ ] agent が explicit commit を実行しなくても、Temote は task workspace の変更を recoverable VCS state として捕捉できる（internal snapshot primitive は実装済み。task lifecycle 自動接続は未実装）
 - [ ] task/execution と before/after revision を correlation できる
 - [ ] head/backend を切り替えても同じ logical work を引き継げる
 - [ ] concurrent task が同じ mutable working copy を共有しない

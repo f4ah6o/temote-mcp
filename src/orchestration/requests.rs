@@ -22,6 +22,7 @@ use super::{Backend, Operation};
 // rendered error strings so these cannot silently diverge.
 const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 256;
+const MAX_INTERACTION_ANSWER_BYTES: usize = 16 * 1024;
 #[cfg(feature = "network")]
 const MAX_REPOS: usize = 16;
 const DEFAULT_TASK_LIST_LIMIT: usize = 50;
@@ -101,6 +102,7 @@ pub(crate) struct DevinAcpStartOptions<'a> {
 pub(crate) struct DevinCloudStartOptions<'a> {
     pub(crate) title: Option<&'a str>,
     pub(crate) devin_mode: Option<&'a str>,
+    pub(crate) swe_tier: Option<&'a str>,
     pub(crate) repos: Vec<String>,
     // Validated (1..=100000) at parse; approvals do not render it today,
     // so it stays boundary data until a consumer reads it.
@@ -127,6 +129,10 @@ pub(crate) enum ControlAction {
     Steer,
     Resume,
     Interrupt,
+    /// Answer one exact pending OpenCode permission/question interaction.
+    /// This is deliberately distinct from `steer`: structured backend
+    /// interactions must never be encoded as ordinary prompt text.
+    Answer,
 }
 
 impl ControlAction {
@@ -136,6 +142,7 @@ impl ControlAction {
             ControlAction::Steer => "steer",
             ControlAction::Resume => "resume",
             ControlAction::Interrupt => "interrupt",
+            ControlAction::Answer => "answer",
         }
     }
 }
@@ -147,6 +154,10 @@ pub(crate) struct TaskControlRequest<'a> {
     pub(crate) task_id: &'a str,
     pub(crate) operation_id: &'a str,
     pub(crate) action: ControlAction,
+    /// Present only for the OpenCode `answer` action. The answer payload is
+    /// validated but intentionally not retained so approval/observation
+    /// metadata cannot accidentally copy user response text.
+    pub(crate) interaction_id: Option<&'a str>,
 }
 
 /// Where task execution runs relative to this host.
@@ -215,6 +226,8 @@ pub(crate) struct BackendCapabilities {
     pub(crate) resume: Option<ResumeSemantics>,
     /// `None` when the backend has no interrupt action.
     pub(crate) interrupt: Option<InterruptSemantics>,
+    /// Whether this backend exposes exact pending-interaction answers.
+    pub(crate) interaction_answer: bool,
     /// Wait-for-input states the backend can surface. Declared for the
     /// shared boundary; the MCP adapter does not read it yet.
     #[allow(dead_code)]
@@ -230,6 +243,7 @@ impl BackendCapabilities {
             ControlAction::Steer => true,
             ControlAction::Resume => self.resume.is_some(),
             ControlAction::Interrupt => self.interrupt.is_some(),
+            ControlAction::Answer => self.interaction_answer,
         }
     }
 }
@@ -242,6 +256,7 @@ impl Backend {
                 execution: ExecutionLocality::HostLocal,
                 resume: Some(ResumeSemantics::ReconcileThread),
                 interrupt: Some(InterruptSemantics::CancelTurn),
+                interaction_answer: false,
                 input_wait: InputWait::ApprovalOnly,
             },
             #[cfg(feature = "network")]
@@ -249,12 +264,14 @@ impl Backend {
                 execution: ExecutionLocality::HostLocal,
                 resume: Some(ResumeSemantics::ResumeMessage),
                 interrupt: Some(InterruptSemantics::AbortSession),
+                interaction_answer: true,
                 input_wait: InputWait::ApprovalOnly,
             },
             Backend::DevinAcp => BackendCapabilities {
                 execution: ExecutionLocality::HostLocal,
                 resume: Some(ResumeSemantics::AgentLoadSession),
                 interrupt: Some(InterruptSemantics::AbortSession),
+                interaction_answer: false,
                 input_wait: InputWait::ApprovalOnly,
             },
             #[cfg(feature = "network")]
@@ -262,6 +279,7 @@ impl Backend {
                 execution: ExecutionLocality::Hosted,
                 resume: Some(ResumeSemantics::ResumeMessage),
                 interrupt: Some(InterruptSemantics::TerminateHosted),
+                interaction_answer: false,
                 input_wait: InputWait::UserInput,
             },
         }
@@ -434,6 +452,27 @@ fn validate_devin_mode(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "network")]
+fn is_swe2_mode(value: &str) -> bool {
+    matches!(value, "swe-2-medium" | "swe-2-high" | "swe-2-max")
+}
+
+#[cfg(feature = "network")]
+fn validate_swe_selection(devin_mode: Option<&str>, swe_tier: Option<&str>) -> Result<()> {
+    let Some(tier) = swe_tier else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        matches!(tier, "promo" | "priority"),
+        "swe_tier must be one of promo, priority"
+    );
+    anyhow::ensure!(
+        devin_mode.is_some_and(is_swe2_mode),
+        "swe_tier is only valid with devin_mode swe-2-medium, swe-2-high, or swe-2-max"
+    );
+    Ok(())
+}
+
 fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRequest<'a>> {
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
@@ -502,6 +541,7 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
         Backend::DevinCloud => {
             let title = optional_string(args, "title")?;
             let devin_mode = optional_string(args, "devin_mode")?;
+            let swe_tier = optional_string(args, "swe_tier")?;
             let repos = optional_string_list(args, "repos", MAX_REPOS)?;
             let max_acu_limit = optional_u64_lenient(args, "max_acu_limit")?;
             validate_task_input(task, "task")?;
@@ -511,6 +551,7 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
             if let Some(mode) = devin_mode {
                 validate_devin_mode(mode)?;
             }
+            validate_swe_selection(devin_mode, swe_tier)?;
             if let Some(limit) = max_acu_limit {
                 anyhow::ensure!(
                     (1..=100_000).contains(&limit),
@@ -520,6 +561,7 @@ fn parse_task_start<'a>(backend: Backend, args: &'a Value) -> Result<TaskStartRe
             StartOptions::DevinCloud(DevinCloudStartOptions {
                 title,
                 devin_mode,
+                swe_tier,
                 repos,
                 max_acu_limit,
             })
@@ -571,6 +613,7 @@ fn parse_task_control<'a>(backend: Backend, args: &'a Value) -> Result<TaskContr
         "steer" => ControlAction::Steer,
         "resume" => ControlAction::Resume,
         "interrupt" => ControlAction::Interrupt,
+        "answer" => ControlAction::Answer,
         _ => anyhow::bail!("unsupported {} task action", backend.action_label()),
     };
     // An action outside the backend's contract is rejected here rather
@@ -582,18 +625,44 @@ fn parse_task_control<'a>(backend: Backend, args: &'a Value) -> Result<TaskContr
         backend.action_label()
     );
     let input = args.get("input").and_then(Value::as_str);
-    match action {
+    let interaction_id = match action {
         ControlAction::Steer => {
-            validate_task_input(input.context("steer requires input")?, "input")?
+            validate_task_input(input.context("steer requires input")?, "input")?;
+            anyhow::ensure!(
+                args.get("interaction_id").is_none() && args.get("answer").is_none(),
+                "steer does not accept interaction_id or answer"
+            );
+            None
         }
         ControlAction::Resume | ControlAction::Interrupt => {
-            anyhow::ensure!(input.is_none(), "{} does not accept input", action.as_str())
+            anyhow::ensure!(input.is_none(), "{} does not accept input", action.as_str());
+            anyhow::ensure!(
+                args.get("interaction_id").is_none() && args.get("answer").is_none(),
+                "{} does not accept interaction_id or answer",
+                action.as_str()
+            );
+            None
         }
-    }
+        ControlAction::Answer => {
+            anyhow::ensure!(input.is_none(), "answer does not accept input");
+            let interaction_id = required_uuid(args, "interaction_id")?;
+            let answer = args
+                .get("answer")
+                .filter(|value| value.is_object())
+                .context("answer requires an object answer")?;
+            let bytes = serde_json::to_vec(answer)?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_INTERACTION_ANSWER_BYTES,
+                "answer exceeds {MAX_INTERACTION_ANSWER_BYTES} bytes"
+            );
+            Some(interaction_id)
+        }
+    };
     Ok(TaskControlRequest {
         task_id,
         operation_id,
         action,
+        interaction_id,
     })
 }
 
@@ -821,7 +890,8 @@ mod tests {
             "operation_id": OP_ID,
             "task": "work",
             "title": "My task",
-            "devin_mode": "ultra",
+            "devin_mode": "swe-2-high",
+            "swe_tier": "priority",
             "repos": ["org/one", "org/two"],
             "max_acu_limit": 42
         });
@@ -832,8 +902,18 @@ mod tests {
             panic!("devin cloud options expected")
         };
         assert_eq!(
-            (options.title, options.devin_mode, options.max_acu_limit),
-            (Some("My task"), Some("ultra"), Some(42))
+            (
+                options.title,
+                options.devin_mode,
+                options.swe_tier,
+                options.max_acu_limit
+            ),
+            (
+                Some("My task"),
+                Some("swe-2-high"),
+                Some("priority"),
+                Some(42)
+            )
         );
         assert_eq!(
             options.repos,
@@ -850,6 +930,18 @@ mod tests {
             (
                 json!({"devin_mode": "bogus"}),
                 "devin_mode must be one of normal, fast, lite, ultra, fusion, swe-2-medium, swe-2-high, swe-2-max",
+            ),
+            (
+                json!({"devin_mode": "swe-2-high", "swe_tier": "bogus"}),
+                "swe_tier must be one of promo, priority",
+            ),
+            (
+                json!({"devin_mode": "fast", "swe_tier": "priority"}),
+                "swe_tier is only valid with devin_mode swe-2-medium, swe-2-high, or swe-2-max",
+            ),
+            (
+                json!({"swe_tier": "priority"}),
+                "swe_tier is only valid with devin_mode swe-2-medium, swe-2-high, or swe-2-max",
             ),
             (json!({"repos": 42}), "repos must be an array of strings"),
             (
@@ -1014,6 +1106,15 @@ mod tests {
             error_of(parse_control(Backend::Codex, &args(json!({"input": ""})))),
             "input must contain 1..=1048576 NUL-free UTF-8 bytes"
         );
+        let steer_with_interaction = args(json!({
+            "input": "go",
+            "interaction_id": "0199dddd-dddd-7ddd-8ddd-dddddddddddd",
+            "answer": {"reply": "once"}
+        }));
+        assert_eq!(
+            error_of(parse_control(Backend::Codex, &steer_with_interaction)),
+            "steer does not accept interaction_id or answer"
+        );
         for action in ["resume", "interrupt"] {
             assert_eq!(
                 error_of(parse_control(
@@ -1023,6 +1124,42 @@ mod tests {
                 format!("{action} does not accept input")
             );
         }
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn opencode_answer_requires_stable_interaction_and_structured_answer() {
+        let base = json!({
+            "task_id": TASK_ID,
+            "operation_id": OP_ID,
+            "action": "answer",
+        });
+        assert_eq!(
+            error_of(parse_control(Backend::OpenCode, &base)),
+            "missing or invalid interaction_id"
+        );
+
+        let mut args = base.clone();
+        args["interaction_id"] = json!("0199dddd-dddd-7ddd-8ddd-dddddddddddd");
+        assert_eq!(
+            error_of(parse_control(Backend::OpenCode, &args)),
+            "answer requires an object answer"
+        );
+
+        args["answer"] = json!({"reply": "once"});
+        let TaskRequest::Control(request) = parse_control(Backend::OpenCode, &args).unwrap() else {
+            panic!("OpenCode answer should parse")
+        };
+        assert_eq!(request.action, ControlAction::Answer);
+        assert_eq!(
+            request.interaction_id,
+            Some("0199dddd-dddd-7ddd-8ddd-dddddddddddd")
+        );
+
+        assert_eq!(
+            error_of(parse_control(Backend::Codex, &args)),
+            "unsupported Codex task action"
+        );
     }
 
     #[test]
@@ -1046,6 +1183,15 @@ mod tests {
             ] {
                 assert!(capabilities.supports_control_action(action));
             }
+            let supports_answer = match backend {
+                #[cfg(feature = "network")]
+                Backend::OpenCode => true,
+                _ => false,
+            };
+            assert_eq!(
+                capabilities.supports_control_action(ControlAction::Answer),
+                supports_answer
+            );
         }
         assert_eq!(
             Backend::Codex.capabilities().resume,

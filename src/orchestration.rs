@@ -454,9 +454,20 @@ fn opencode_task_control_approval(
     metadata.insert("operation_id".to_owned(), operation_id.clone());
     metadata.insert("action".to_owned(), action.clone());
     metadata.insert("control_input".to_owned(), "omitted".to_owned());
+    if let Some(interaction_id) = request.interaction_id {
+        metadata.insert(
+            "interaction_id".to_owned(),
+            render_approval_argument(interaction_id),
+        );
+        metadata.insert("interaction_answer".to_owned(), "omitted".to_owned());
+    }
+    let interaction = request
+        .interaction_id
+        .map(|id| format!("\ninteraction_id: {}", render_approval_argument(id)))
+        .unwrap_or_default();
     (
         format!(
-            "OpenCode delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}\ncontrol input: omitted"
+            "OpenCode delegation request\noperation: control task\naction: {action}\nmutation: task control\ntarget: task {task_id}\nscope: current session working directory\noperation_id: {operation_id}{interaction}\ncontrol input: omitted"
         ),
         metadata,
     )
@@ -542,6 +553,7 @@ fn devin_cloud_task_start_approval(
     let operation_id = render_approval_argument(request.operation_id);
     let title = render_optional_approval_argument(options.title);
     let devin_mode = render_optional_approval_argument(options.devin_mode);
+    let swe_tier = render_optional_approval_argument(options.swe_tier);
     let repos = options.repos.len().to_string();
     let mut metadata = approval_metadata(
         Backend::DevinCloud,
@@ -553,11 +565,12 @@ fn devin_cloud_task_start_approval(
     metadata.insert("operation_id".to_owned(), operation_id.clone());
     metadata.insert("title".to_owned(), title.clone());
     metadata.insert("devin_mode".to_owned(), devin_mode.clone());
+    metadata.insert("swe_tier".to_owned(), swe_tier.clone());
     metadata.insert("repos".to_owned(), repos.clone());
     metadata.insert("task_input".to_owned(), "omitted".to_owned());
     (
         format!(
-            "Devin Cloud delegation request\noperation: start hosted session\nmutation: remote Devin Cloud session (consumes ACUs)\nscope: Devin Cloud organization, not this host\ntitle: {title}\ndevin_mode: {devin_mode}\nrepos: {repos}\noperation_id: {operation_id}\ntask input: omitted"
+            "Devin Cloud delegation request\noperation: start hosted session\nmutation: remote Devin Cloud session (consumes ACUs)\nscope: Devin Cloud organization, not this host\ntitle: {title}\ndevin_mode: {devin_mode}\nswe_tier: {swe_tier}\nrepos: {repos}\noperation_id: {operation_id}\ntask input: omitted"
         ),
         metadata,
     )
@@ -826,6 +839,31 @@ mod tests {
         let (_, status_metadata) = codex_status_approval();
         assert_eq!(status_metadata["read_only"], "true");
         assert_eq!(status_metadata["mutation"], "false");
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn devin_cloud_approval_shows_requested_swe_tier() {
+        let task_marker = "prompt-secret-marker";
+        let args = json!({
+            "operation_id": "0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+            "task": task_marker,
+            "devin_mode": "swe-2-high",
+            "swe_tier": "priority"
+        });
+        let TaskRequest::Start(request) =
+            TaskRequest::parse(Backend::DevinCloud, Operation::TaskStart, &args).unwrap()
+        else {
+            panic!("devin cloud start request should parse")
+        };
+        let (detail, metadata) = task_start_approval(&request);
+        assert!(detail.contains("devin_mode: swe-2-high"));
+        assert!(detail.contains("swe_tier: priority"));
+        assert!(detail.contains("task input: omitted"));
+        assert!(!detail.contains(task_marker));
+        assert_eq!(metadata["devin_mode"], "swe-2-high");
+        assert_eq!(metadata["swe_tier"], "priority");
+        assert_eq!(metadata["task_input"], "omitted");
     }
 
     #[test]
