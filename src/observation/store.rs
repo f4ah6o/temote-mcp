@@ -103,6 +103,20 @@ pub(crate) struct ObservationStore {
     directory: PathBuf,
 }
 
+/// One consistent read of a journal plus its compaction/degradation markers,
+/// used to build an idempotent cloud replication request.
+#[cfg(feature = "network")]
+#[derive(Debug)]
+pub(crate) struct ReplicationSnapshot {
+    pub base_revision: u64,
+    pub head_revision: u64,
+    /// Total known source-revision holes inside the retained record range.
+    pub gap_count: u64,
+    pub write_failures: u64,
+    pub corrupt_lines: u64,
+    pub records: Vec<Observation>,
+}
+
 struct HeldLock {
     file: fs::File,
 }
@@ -401,6 +415,96 @@ impl ObservationStore {
         Ok(records.into_iter().find(|record| record.id == id))
     }
 
+    /// Lists retained journal files, including sessions whose runtime has
+    /// already stopped. Invalid names, symlinks, and non-file entries are
+    /// ignored so directory contents cannot become paths outside this store.
+    #[cfg(feature = "network")]
+    pub(crate) fn retained_sessions(&self) -> Result<Vec<String>> {
+        ensure_private_directory(&self.directory)?;
+        let mut sessions = Vec::new();
+        for entry in fs::read_dir(&self.directory).with_context(|| {
+            format!(
+                "cannot list observation directory {}",
+                self.directory.display()
+            )
+        })? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(session_id) = name
+                .strip_prefix("obs-")
+                .and_then(|name| name.strip_suffix(".jsonl"))
+            else {
+                continue;
+            };
+            if config::validate_session_id(session_id).is_err() {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_file() {
+                sessions.push(session_id.to_owned());
+            }
+        }
+        sessions.sort();
+        Ok(sessions)
+    }
+
+    /// Reads a bounded replication page and its source gap metadata under the
+    /// journal lock, so compaction cannot make the cursor and page disagree.
+    #[cfg(feature = "network")]
+    pub(crate) fn replication_snapshot(
+        &self,
+        session_id: &str,
+        after_revision: u64,
+        limit: usize,
+    ) -> Result<ReplicationSnapshot> {
+        let journal = self.journal_path(session_id)?;
+        let lock = match fs::metadata(&journal) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "observation journal is not a regular file"
+                );
+                Some(self.prepare(session_id)?)
+            }
+            Err(error) if is_not_found(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let meta = self.read_meta(session_id);
+        let (mut records, corrupt_lines) = if lock.is_some() {
+            read_journal(&journal)?
+        } else {
+            (Vec::new(), 0)
+        };
+        records.retain(|record| record.session_id == session_id);
+        records.sort_by_key(|record| record.revision);
+        let head_revision = records
+            .last()
+            .map(|record| record.revision)
+            .unwrap_or(meta.base_revision);
+        let mut gap_count = 0u64;
+        let mut expected_revision = meta.base_revision.saturating_add(1);
+        for record in &records {
+            if record.revision > expected_revision {
+                gap_count = gap_count.saturating_add(record.revision - expected_revision);
+            }
+            expected_revision = expected_revision.max(record.revision.saturating_add(1));
+        }
+        records
+            .retain(|record| record.session_id == session_id && record.revision > after_revision);
+        records.truncate(limit);
+        Ok(ReplicationSnapshot {
+            base_revision: meta.base_revision,
+            head_revision,
+            gap_count,
+            write_failures: meta.write_failures,
+            corrupt_lines,
+            records,
+        })
+    }
+
     /// Journal counters for `context_status` and the debug CLI.
     pub(crate) fn status(&self, session_id: &str) -> Result<JournalStatus> {
         let journal = self.journal_path(session_id)?;
@@ -630,6 +734,7 @@ mod tests {
                 process_id: 0,
             },
             repository: None,
+            repository_key: None,
             workspace_id: None,
             task_id: Some("task-1".to_owned()),
             execution_id: None,

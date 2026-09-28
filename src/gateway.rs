@@ -14,7 +14,10 @@ use uuid::Uuid;
 use crate::{approvals, config, host_identity, mcp, session_control};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
+const OBSERVATION_SYNC_TIMEOUT: Duration = Duration::from_secs(8);
+const OBSERVATION_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_GATEWAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GATEWAY_SYNC_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_POLL_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_POLL_RESPONSE_BYTES: usize =
     MAX_GATEWAY_RESPONSE_BYTES + MAX_GATEWAY_POLL_ENVELOPE_BYTES;
@@ -81,6 +84,7 @@ pub struct AgentOptions {
 #[derive(Clone)]
 struct GatewayClient {
     client: Client,
+    sync_client: Client,
     base_url: String,
     host_token: String,
     access_client_id: Option<String>,
@@ -247,6 +251,10 @@ pub async fn run_agent(options: AgentOptions) -> Result<()> {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("failed to create gateway HTTP client")?,
+        sync_client: Client::builder()
+            .timeout(OBSERVATION_SYNC_TIMEOUT)
+            .build()
+            .context("failed to create observation sync HTTP client")?,
         base_url,
         host_token: options.host_token,
         access_client_id: options.access_client_id,
@@ -748,6 +756,66 @@ async fn run_host_generation(
     generation: u64,
     connected_metadata: &HostSupervisorMetadata,
 ) -> Result<GenerationExit> {
+    let gateway_for_sync = gateway.clone();
+    let host_id_for_sync = host_id.to_owned();
+    let sync_task = tokio::spawn(async move {
+        run_host_observation_sync(&gateway_for_sync, &host_id_for_sync).await;
+    });
+    let result = run_host_generation_poll(
+        gateway,
+        sessions,
+        host_id,
+        instance_id,
+        generation,
+        connected_metadata,
+    )
+    .await;
+    sync_task.abort();
+    let _ = sync_task.await;
+    result
+}
+
+async fn run_host_observation_sync(gateway: &GatewayClient, host_id: &str) {
+    let mut replicator =
+        match crate::observation::replicator::HostReplicator::new(host_id, &gateway.base_url) {
+            Ok(replicator) => replicator,
+            Err(_) => {
+                eprintln!("observation sync unavailable: code=local_store");
+                return;
+            }
+        };
+    let mut interval = tokio::time::interval(OBSERVATION_SYNC_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        match replicator
+            .sync_next(|batch| gateway.sync_observations(host_id, batch))
+            .await
+        {
+            Ok(crate::observation::replicator::SyncOutcome::Acked {
+                session_id,
+                records,
+                through_revision,
+            }) if records > 0 => eprintln!(
+                "observation sync acked: session={session_id} records={records} through_revision={through_revision}"
+            ),
+            Ok(crate::observation::replicator::SyncOutcome::NoWork)
+            | Ok(crate::observation::replicator::SyncOutcome::Busy)
+            | Ok(crate::observation::replicator::SyncOutcome::Backoff { .. })
+            | Ok(crate::observation::replicator::SyncOutcome::Acked { .. }) => {}
+            Err(error) => eprintln!("observation sync deferred: code={}", error.code.as_str()),
+        }
+    }
+}
+
+async fn run_host_generation_poll(
+    gateway: &GatewayClient,
+    sessions: &session_control::SessionBackend,
+    host_id: &str,
+    instance_id: &str,
+    generation: u64,
+    connected_metadata: &HostSupervisorMetadata,
+) -> Result<GenerationExit> {
     loop {
         if let Some(exit) = verify_host_generation_metadata(
             gateway,
@@ -1012,8 +1080,17 @@ fn status_named_roots(status: &Value) -> Result<Vec<String>> {
 
 impl GatewayClient {
     fn request(&self, method: Method, path: &str, host_id: Option<&str>) -> RequestBuilder {
-        let mut request = self
-            .client
+        self.request_with_client(&self.client, method, path, host_id)
+    }
+
+    fn request_with_client(
+        &self,
+        client: &Client,
+        method: Method,
+        path: &str,
+        host_id: Option<&str>,
+    ) -> RequestBuilder {
+        let mut request = client
             .request(method, format!("{}{}", self.base_url, path))
             .bearer_auth(&self.host_token);
         if let Some(host_id) = host_id {
@@ -1028,6 +1105,47 @@ impl GatewayClient {
                 .header("CF-Access-Client-Secret", client_secret);
         }
         request
+    }
+
+    async fn sync_observations(
+        &self,
+        host_id: &str,
+        batch: crate::observation::replicator::SyncRequest,
+    ) -> std::result::Result<
+        crate::observation::replicator::SyncResponse,
+        crate::observation::replicator::SyncFailure,
+    > {
+        use crate::observation::replicator::{SyncFailure, SyncFailureCode, SyncResponse};
+
+        let path = format!("/v1/hosts/{host_id}/observations/sync");
+        let response = self
+            .request_with_client(&self.sync_client, Method::POST, &path, Some(host_id))
+            .json(&batch)
+            .send()
+            .await
+            .map_err(|error| {
+                SyncFailure::new(if error.is_timeout() {
+                    SyncFailureCode::Timeout
+                } else {
+                    SyncFailureCode::Transport
+                })
+            })?;
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(SyncFailure::new(SyncFailureCode::Authentication));
+        }
+        if !status.is_success() {
+            return Err(SyncFailure::new(SyncFailureCode::RemoteRejected));
+        }
+        let bytes = read_bounded_body(
+            response,
+            MAX_GATEWAY_SYNC_RESPONSE_BYTES,
+            "observation sync",
+        )
+        .await
+        .map_err(|_| SyncFailure::new(SyncFailureCode::InvalidResponse))?;
+        serde_json::from_slice::<SyncResponse>(&bytes)
+            .map_err(|_| SyncFailure::new(SyncFailureCode::InvalidResponse))
     }
 }
 
