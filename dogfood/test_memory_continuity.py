@@ -414,6 +414,51 @@ class MemoryContinuityTests(unittest.TestCase):
             self.assertIn("failed", [event["state"] for event in result["events"]])
             self.assertFalse(marker.exists())
 
+    def test_repository_reader_is_sessionless_before_task_b_starts(self):
+        class FakeClient:
+            calls = []
+            starts = 0
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def call(self, name, arguments):
+                if name == "opencode_task_start":
+                    type(self).starts += 1
+                    type(self).calls.append((name, arguments.get("session_id")))
+                    return {"task_id": "task-a"}
+                if name == "opencode_task_get":
+                    type(self).calls.append((name, arguments.get("session_id")))
+                    return {"status": "completed"}
+                if name == "context_status":
+                    type(self).calls.append((name, None))
+                    return {"memory": {"state": "ready"}}
+                if name == "context_resolve":
+                    type(self).calls.append((name, dict(arguments)))
+                    raise RuntimeError("TEST_STOP_AFTER_INITIAL_REPOSITORY_READ")
+                raise AssertionError(f"unexpected candidate tool: {name}")
+
+        with patch("dogfood.memory_continuity.McpHttpClient", FakeClient):
+            result = live_run(
+                phase="candidate", endpoint="https://fabric.example/mcp", token="test-token",
+                session_a="candidate-session-a", session_b="candidate-session-b",
+                backend="opencode", model="gpt-5.6-luna", effort="max",
+                extractor_profile="openai_compatible:glm-5.3-flash",
+                synthesis_mode="live", binary=Path(__file__), max_polls=1,
+                poll_interval=0,
+            )
+
+        self.assertEqual(result["outcome"], "fail")
+        self.assertEqual(FakeClient.starts, 1)
+        self.assertEqual([call[0] for call in FakeClient.calls], [
+            "opencode_task_start", "opencode_task_get", "context_status", "context_resolve",
+        ])
+        self.assertEqual(FakeClient.calls[0][1], "candidate-session-a")
+        self.assertEqual(FakeClient.calls[1][1], "candidate-session-a")
+        reader_args = FakeClient.calls[3][1]
+        self.assertEqual(reader_args["repository"], load_scenario()["repository_key"])
+        self.assertNotIn("session_id", reader_args)
+
     def test_replay_manifest_requires_real_dispatch_and_unchanged_projection(self):
         RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
         manifest = {

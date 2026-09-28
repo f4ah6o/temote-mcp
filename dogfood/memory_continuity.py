@@ -648,15 +648,13 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
         _event(run_id, events, tool, list(args), "ok", len(_canonical(result)), started)
         return result
 
-    def resolve(query: str | None = None, session_id: str | None = None) -> Any:
+    def resolve(query: str | None = None) -> Any:
         args: dict[str, Any] = {
             "repository": data["repository_key"],
             "limit": data["limits"]["knowledge_items"],
         }
         if query is not None:
             args["query"] = query
-        if session_id is not None:
-            args["session_id"] = session_id
         return context_call("context_resolve", args)
 
     def context_status() -> Any:
@@ -791,7 +789,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
         cross_head_item = None
         unresolved_item = None
         while time.monotonic() <= deadline:
-            cross_head_context = resolve(query, session_id=session_b)
+            cross_head_context = resolve(query)
             cross_head_item = _supported_item(
                 cross_head_context, data["task_a"]["constraint"], data["repository_key"],
                 "constraint", first["task_id"],
@@ -805,7 +803,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
             sleep(min(poll_interval, max(deadline - time.monotonic(), 0)))
         if cross_head_context is None:
             raise RuntimeError("CONTEXT_MISSING")
-        query_context = resolve("report", session_id=session_b)
+        query_context = resolve("report")
         queried_policy = _supported_item(
             query_context, data["task_a"]["constraint"], data["repository_key"],
             "constraint", first["task_id"],
@@ -866,7 +864,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
         new_context = None
         deadline = time.monotonic() + data["limits"]["context_wait_seconds"]
         while time.monotonic() <= deadline:
-            new_context = resolve(query, session_id=session_b)
+            new_context = resolve(query)
             toml_item = _supported_item(
                 new_context, data["task_b"]["constraint"], data["repository_key"],
                 "constraint", second["task_id"],
