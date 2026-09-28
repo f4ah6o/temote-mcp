@@ -111,7 +111,17 @@ function assertGatewayContractParity(tools = PUBLIC_TOOLS, versions = {}) {
 test("gateway routed tools and protocol versions match the Rust contract", () => {
   assertGatewayContractParity();
   const names = PUBLIC_TOOLS.map((tool) => tool.name);
-  assert.equal(names.length, 30);
+  assert.ok(names.length > 2);
+  assert.ok(PUBLIC_TOOLS.every((tool) =>
+    typeof tool.title === "string"
+    && tool.title.length > 0
+    && typeof tool.description === "string"
+    && tool.description.length > 0
+    && tool.annotations !== null
+    && typeof tool.annotations === "object"
+    && tool.inputSchema !== null
+    && typeof tool.inputSchema === "object",
+  ));
   for (const required of ["host_list", "host_info", "session_list", "session_start", "session_stop", "session_restart", "session_info"]) {
     assert.equal(names.includes(required), true, required);
   }
@@ -1650,7 +1660,11 @@ test("the single MCP endpoint publishes the gateway tool list", async () => {
 
   assert.equal(response.status, 200);
   const rpc = await response.json();
-  assert.equal(rpc.result.tools.length, 30);
+  const metadata = JSON.parse(fs.readFileSync(
+    new URL("../contract/routed-tool-metadata.json", import.meta.url),
+    "utf8",
+  ));
+  assert.deepEqual(rpc.result.tools, metadata);
   for (const required of ["host_list", "host_info", "session_start", "session_stop", "session_restart"]) {
     assert.equal(rpc.result.tools.some((tool) => tool.name === required), true, required);
   }

@@ -2,7 +2,7 @@
 
 [日本語](gateway.ja.md)
 
-The optional `gateway/` Worker exposes one MCP endpoint for a federated set of Temote hosts. A macOS machine, a Linux machine, and a Windows 11 machine running Temote in WSL2 can each run one supervisor plus one host-level gateway agent. The MCP client discovers hosts and selects a host and session without configuring a separate MCP server entry per machine.
+Temote Fabric is currently implemented under `gateway/`. This optional Worker exposes one MCP endpoint for a federated set of Temote hosts. A macOS machine, a Linux machine, and a Windows 11 machine running Temote in WSL2 can each run one supervisor plus one host-level gateway agent. The MCP client discovers hosts and selects a host and session without configuring a separate MCP server entry per machine.
 
 Native Windows execution remains a later milestone. Windows 11 federation currently means Temote running inside WSL2.
 
@@ -32,34 +32,49 @@ Each local host receives only its own token through `TEMOTE_MCP_GATEWAY_HOST_TOK
 
 ## Deploy
 
-1. Set the non-secret Access values in `gateway/wrangler.toml`: `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, and `ACCESS_ALLOWED_EMAILS`.
-2. Store the per-host token map:
+Run repository `just` commands from the repository root. Run npm and Wrangler commands from `gateway/`, where the pinned package, lockfile, and `wrangler.toml` live; the working directory does not carry between separate code blocks.
+
+1. Use Node.js 22 or newer and install the pinned deploy tooling:
 
 ```sh
-cd gateway
-npx wrangler secret put HOST_TOKENS_JSON
+(cd gateway && npm ci)
 ```
 
-3. If old per-session agents must remain online during migration, also keep their existing `HOST_TOKEN` Worker secret.
-4. Run tests and a dry-run before deployment:
+2. Select a public target, inspect its existing ownership, and configure Cloudflare Access for the whole hostname **before publishing**. Enable Managed OAuth for human MCP clients and a Service Auth policy for host agents. See [Deployment target](#deployment-target). Keep `workers_dev = false`.
+3. Set the non-secret `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, `ACCESS_ALLOWED_EMAILS` and `OBSERVATION_OWNER_ID` in the deployment config. Provision `OBSERVATION_DB`, replace its sentinel D1 database ID, and review/apply the additive migrations using the pinned Wrangler from `gateway/`. Keep existing Durable Object class names and bindings when updating a deployed Worker.
 
 ```sh
-npm test
-npx wrangler deploy --dry-run --keep-vars
-npx wrangler deploy --keep-vars
+(cd gateway && npx wrangler d1 migrations apply temote-observation --remote)
 ```
 
-5. Select a public deployment target before deploying. `gateway/wrangler.toml` keeps `workers_dev = false`, so a deploy without a target uploads a version without publishing it. See [Deployment target](#deployment-target).
-6. Protect the deployed hostname with a self-hosted Cloudflare Access application and enable Managed OAuth for the intended MCP clients.
-7. Allow host agents through Access using a service-token policy. The Access service token and Temote host bearer token are independent credentials.
+4. Store the per-host token map interactively; preserve `HOST_TOKEN` only if legacy per-session agents still need it. The Access service token and Temote host bearer token are independent credentials.
 
-The public MCP URL is `https://<gateway-host>/mcp`.
+```sh
+(cd gateway && npx wrangler secret put HOST_TOKENS_JSON)
+```
+
+5. Generate and check metadata, run tests, then bundle without publishing. After remote configuration and secrets are verified, deploy with the selected target:
+
+```sh
+# Repository root
+just generate-tools
+just check-generated
+
+# gateway/
+(cd gateway && npm test)
+(cd gateway && npm run deploy:dry-run -- --keep-vars)
+(cd gateway && npm run deploy -- --keep-vars)
+```
+
+6. Verify health and authenticated MCP reachability using the checks below. A deploy without a target can upload a version without publishing it.
+
+The public MCP URL is `https://<gateway-host>/mcp`. The Worker imports `gateway/contract/routed-tool-metadata.json` generated from Rust; see [generation and stale checks](development.md#connected-runtime-contract-parity). A bundle dry-run proves configuration/build validity, not remote authentication, secret presence or endpoint readiness.
 
 ## Deployment target
 
 `workers_dev = false` means a deploy without a route or custom domain does not publish the Worker and can print `No targets deployed`. Treat that output as a failure even when the command exits 0, and choose exactly one target:
 
-Before invoking Wrangler, run the repository-local preflight with the intended target:
+Before invoking Wrangler, run the repository-local preflight with the intended target. This command runs from `gateway/`:
 
 ```sh
 cd gateway
@@ -70,7 +85,7 @@ The preflight reports `target_missing`, `target_mismatch`, or `remote_unknown` a
 
 | Option | Use when | Target setup | Access | Verification |
 | --- | --- | --- | --- | --- |
-| A. Custom domain | The Worker should own a dedicated hostname, or no DNS record exists yet. | Declare the hostname as a Worker custom domain, for example `routes = [{ pattern = "<gateway-host>", custom_domain = true }]` in `gateway/wrangler.toml`, or create it in the Cloudflare dashboard. | Protect the whole hostname with a Cloudflare Access application. | `npx wrangler deployments status --name temote-mcp-gateway` and `curl -sSf https://<gateway-host>/healthz`. |
+| A. Custom domain | The Worker should own a dedicated hostname, or no DNS record exists yet. | Declare the hostname as a Worker custom domain, for example `routes = [{ pattern = "<gateway-host>", custom_domain = true }]` in `gateway/wrangler.toml`, or create it in the Cloudflare dashboard. | Protect the whole hostname with a Cloudflare Access application. | Run Wrangler status from `gateway/`; use the Access-authenticated `/healthz` check below. |
 | B. Existing DNS + Worker route | A DNS record already exists and must not be deleted. | Pass the exact pattern to the deploy, for example `npx wrangler deploy --keep-vars --routes '<gateway-host>/*'`. | Protect the whole hostname with a Cloudflare Access application. | Same as A; also confirm the route pattern points at `temote-mcp-gateway` in the Cloudflare dashboard. |
 
 Both options follow the same rules:
@@ -83,12 +98,19 @@ Both options follow the same rules:
 
 ### Verify a deployment (read-only)
 
+Run the Wrangler command from `gateway/`. The whole hostname is protected by Access, so send the service-token credentials accepted by its Service Auth policy for the health check. Keep these values in a protected environment or secret store; do not paste them into the command or logs:
+
 ```sh
-npx wrangler deployments status --name temote-mcp-gateway
-curl -sSf https://<gateway-host>/healthz
+(cd gateway && npx wrangler deployments status --name temote-mcp-gateway)
+curl --silent --show-error --fail \
+  --header "CF-Access-Client-Id: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID:?set the Access service-token client ID}" \
+  --header "CF-Access-Client-Secret: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET:?set the Access service-token client secret}" \
+  "https://<gateway-host>/healthz"
 ```
 
-`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`). A direct-origin response or a different service identity means the hostname still points at the wrong target. `contractFingerprint` is the SHA-256 digest of the public tool contract; it must equal `gateway/contract/public-tools.fingerprint` from the deployed source revision and the `server_contract_fingerprint` reported by the local/connected server's `session_info`. A mismatch means the deployed Worker carries a stale tool schema. Authenticated MCP reachability through Access is tracked separately from this local check.
+`/healthz` must return the Temote gateway identity and `readiness=ready` (currently `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`). The Worker does not require a client token for `/healthz`; Cloudflare Access still protects the hostname at the edge. A direct-origin response or a different service identity means the hostname still points at the wrong target. `contractFingerprint` is the SHA-256 digest of the public tool contract; it must equal `gateway/contract/public-tools.fingerprint` from the deployed source revision and the `server_contract_fingerprint` reported by the local/connected server's `session_info`.
+
+For MCP `tools/list` and other `/mcp` requests, use an MCP client authenticated through Access Managed OAuth as a user whose email is in `ACCESS_ALLOWED_EMAILS`. The Worker verifies the Access JWT's signature, audience, issuer, expiry, subject, and allowlisted email. An Access service token is for host-agent Service Auth and the `/healthz` smoke check; its JWT has no user email and an empty subject, so it does not satisfy `/mcp`'s user-identity check. Do not set the local/test `CLIENT_TOKEN` on the production Worker.
 
 ### Rollback
 

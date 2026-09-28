@@ -32,26 +32,56 @@ federated host mode では、Worker secret `HOST_TOKENS_JSON` に host ごとの
 
 ## Deploy
 
-1. `gateway/wrangler.toml` に non-secret の `ACCESS_TEAM_DOMAIN`、`ACCESS_AUDIENCE`、`ACCESS_ALLOWED_EMAILS` を設定します。
-2. host ごとの token map を保存します。
+Temote Fabric は現在 `gateway/` に実装されています。repository root にある `just` command は repository root で実行し、npm と Wrangler は pinned package、lockfile、`wrangler.toml` のある `gateway/` で実行します。別々の code block の間で working directory は引き継がれません。
+
+1. Node.js 22 以降を使い、deploy tooling を lockfile からインストールします。
 
 ```sh
-cd gateway
-npx wrangler secret put HOST_TOKENS_JSON
+(cd gateway && npm ci)
 ```
 
-3. migration 中に旧 per-session agent も稼働させる場合は、既存の `HOST_TOKEN` Worker secret も保持します。
-4. test と dry-run 後に deploy します。
+Rust の定義を変更した場合は repository root で生成・検証します。
 
 ```sh
-npm test
-npx wrangler deploy --dry-run --keep-vars
-npx wrangler deploy --keep-vars
+just generate-tools
+just check-generated
 ```
 
-5. deploy 前に公開 target を1つ選びます。`gateway/wrangler.toml` は `workers_dev = false` を維持するため、target を指定しない deploy は version を upload しても公開されません。[Deployment target](#deployment-target) を参照してください。
-6. 公開 hostname 全体を self-hosted Cloudflare Access application で保護し、利用する MCP client 向けに Managed OAuth を有効化します。
-7. host agent は Access service-token policy で許可します。Access service token と Temote host bearer token は独立した credential です。
+Worker は生成された `gateway/contract/routed-tool-metadata.json` を直接読みます。
+
+Observation 用に `OBSERVATION_OWNER_ID` と D1 `OBSERVATION_DB` を設定し、sentinel database ID を実際の ID に置き換えます。
+対象を確認してから、`gateway/` の pinned Wrangler で既存の追加型 migration を適用します。
+
+```sh
+(cd gateway && npx wrangler d1 migrations apply temote-observation --remote)
+```
+
+既存 Worker を更新するときは Durable Object の class 名と binding を維持します。
+dry-run の成功は remote secret、認証、公開 endpoint の成功を意味しません。
+
+2. 公開 target を1つ選び、既存の所有先を確認します。[Deployment target](#deployment-target) を参照してください。`workers_dev = false` を維持します。
+3. **公開する前に** hostname 全体を self-hosted Cloudflare Access application で保護します。人間の MCP client 向けに Managed OAuth、host agent 向けに Service Auth policy を設定します。
+4. deployment config に non-secret の `ACCESS_TEAM_DOMAIN`、`ACCESS_AUDIENCE`、`ACCESS_ALLOWED_EMAILS` と前述の Observation 設定を用意します。
+5. host ごとの token map を対話入力で保存します。旧 per-session agent が必要とする場合だけ、既存の `HOST_TOKEN` Worker secret も保持します。Access service token と Temote host bearer token は独立した credential です。
+
+```sh
+(cd gateway && npx wrangler secret put HOST_TOKENS_JSON)
+```
+
+6. metadata、test、dry-run を検証し、remote 設定と secret の存在を確認してから選択した target へ deploy します。
+
+```sh
+# repository root
+just generate-tools
+just check-generated
+
+# gateway/
+(cd gateway && npm test)
+(cd gateway && npm run deploy:dry-run -- --keep-vars)
+(cd gateway && npm run deploy -- --keep-vars)
+```
+
+7. 下記の health と認証済み MCP 疎通を確認します。target を指定しない deploy は version を upload しても公開されません。
 
 公開 MCP URL は `https://<gateway-host>/mcp` です。
 
@@ -59,7 +89,7 @@ npx wrangler deploy --keep-vars
 
 `workers_dev = false` では route または custom domain を指定しない deploy が Worker を公開せず、`No targets deployed` を表示することがあります。command が exit 0 でもこの出力は失敗として扱い、次のどちらか一方の target を明示します。
 
-Wrangler を実行する前に、意図した target を repository-local preflight で確認します。
+Wrangler を実行する前に、意図した target を `gateway/` から repository-local preflight で確認します。
 
 ```sh
 cd gateway
@@ -70,7 +100,7 @@ preflight は `target_missing`、`target_mismatch`、`remote_unknown` を区別�
 
 | Option | 使う条件 | target の設定 | Access | 確認 |
 | --- | --- | --- | --- | --- |
-| A. Custom domain | Worker に専用 hostname を割り当てる場合、または DNS record がまだ無い場合。 | hostname を Worker custom domain として宣言します。例: `gateway/wrangler.toml` の `routes = [{ pattern = "<gateway-host>", custom_domain = true }]`、または Cloudflare dashboard で作成します。 | hostname 全体を Cloudflare Access application で保護します。 | `npx wrangler deployments status --name temote-mcp-gateway` と `curl -sSf https://<gateway-host>/healthz`。 |
+| A. Custom domain | Worker に専用 hostname を割り当てる場合、または DNS record がまだ無い場合。 | hostname を Worker custom domain として宣言します。例: `gateway/wrangler.toml` の `routes = [{ pattern = "<gateway-host>", custom_domain = true }]`、または Cloudflare dashboard で作成します。 | hostname 全体を Cloudflare Access application で保護します。 | Wrangler status は `gateway/` から実行し、下記の Access 認証付き `/healthz` を確認します。 |
 | B. Existing DNS + Worker route | 既存 DNS record を削除できない場合。 | deploy 時に exact pattern を渡します。例: `npx wrangler deploy --keep-vars --routes '<gateway-host>/*'`。 | hostname 全体を Cloudflare Access application で保護します。 | A と同じ。さらに Cloudflare dashboard で route pattern が `temote-mcp-gateway` を指すことを確認します。 |
 
 どちらの方式でも次を守ります。
@@ -83,12 +113,19 @@ preflight は `target_missing`、`target_mismatch`、`remote_unknown` を区別�
 
 ### Deploy の確認（read-only）
 
+Wrangler command は `gateway/` から実行します。hostname 全体を Access で保護しているため、health check には Service Auth policy で許可された service-token credential を渡します。credential 値は保護された environment または secret store に置き、command や log に直接書かないでください。
+
 ```sh
-npx wrangler deployments status --name temote-mcp-gateway
-curl -sSf https://<gateway-host>/healthz
+(cd gateway && npx wrangler deployments status --name temote-mcp-gateway)
+curl --silent --show-error --fail \
+  --header "CF-Access-Client-Id: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_ID:?Access service-token client ID を設定してください}" \
+  --header "CF-Access-Client-Secret: ${TEMOTE_MCP_GATEWAY_ACCESS_CLIENT_SECRET:?Access service-token client secret を設定してください}" \
+  "https://<gateway-host>/healthz"
 ```
 
-`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`）。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。`contractFingerprint` は public tool contract の SHA-256 digest で、deploy した source revision の `gateway/contract/public-tools.fingerprint` と、local/connected server の `session_info` が返す `server_contract_fingerprint` に一致する必要があります。不一致は deployed Worker が古い tool schema を持つことを意味します。Access 経由の MCP 疎通は、この local check とは別に確認します。
+`/healthz` は Temote gateway の identity と `readiness=ready` を返す必要があります（現在の形式は `{"status":"ok","service":"temote-mcp-gateway","readiness":"ready","identity":"temote-mcp-gateway","contractFingerprint":"<sha256>"}`）。Worker 内の `/healthz` handler は client token を要求しませんが、Cloudflare Access は edge で hostname を保護します。direct origin の応答や別 service の identity が返る場合、hostname はまだ意図した target を指していません。`contractFingerprint` は public tool contract の SHA-256 digest で、deploy した source revision の `gateway/contract/public-tools.fingerprint` と、local/connected server の `session_info` が返す `server_contract_fingerprint` に一致する必要があります。
+
+MCP `tools/list` や他の `/mcp` request は、`ACCESS_ALLOWED_EMAILS` に含まれる user として Access Managed OAuth で認証した MCP client から確認します。Worker は Access JWT の signature、audience、issuer、expiry、subject、allowlist 内 email を検証します。Access service token は host agent の Service Auth と `/healthz` smoke 用です。service-token JWT には user email がなく `sub` も空のため、`/mcp` の user identity check は通りません。local/test 用の `CLIENT_TOKEN` を production Worker に設定しないでください。
 
 ### Rollback
 
