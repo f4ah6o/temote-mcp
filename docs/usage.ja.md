@@ -19,7 +19,7 @@ supervisor の bounded local activity stream は `temote-mcp activity [SESSION_I
 
 installed binary の更新後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` で compatible な same-PID supervisor handoff と coordinated session restart/restore を行えます。credential value は永続化せず、restart context 不足または in-flight operation があれば中止し、planned session を全て確認してから成功を返します。handoff protocol 導入前の supervisor からは最初に手動 restart が1回必要です。
 
-`session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` に加え、durable metadata は残っているが canonical な working directory または permitted workspace root が解決できなくなった session を `degraded` として確認できます。degraded entry は保存済みの ID、path、lifecycle timestamp を保持したまま返し、listing 全体を失敗させません。消失した path を stopped / crashed runtime と読み替えることはなく、`session info` も同じ bounded な degraded view を返します。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。working directory が対応する標準 Git worktree 配下にある場合は、configured な `src` named root から導出した非 secret の `workspace` identity(`canonical_checkout` / `managed_worktree` / `legacy_worktree` の `workspace_type` と、判明していれば `repository_root`、`workspace_root`、`repository`、`branch`、managed task 名)も返します。identity は read-only で、workspace が解決できなくなると表示されません。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。restart は old full session instance を fence し、replacement の開始前に登録済み Codex runtime を shutdown します。replacement の開始に失敗しても old child runtime は残しません。
+`session list` では durable な `starting` / `active` / `stopping` / `stopped` / `crashed` に加え、durable metadata は残っているが canonical な working directory または permitted workspace root が解決できなくなった session を `degraded` として確認できます。degraded entry は保存済みの ID、path、lifecycle timestamp を保持したまま返し、listing 全体を失敗させません。消失した path を stopped / crashed runtime と読み替えることはなく、`session info` も同じ bounded な degraded view を返します。`session info` では working directory、permitted root、permission mode、timestamp、exit reason、last error を確認できます。working directory が対応する標準 Git worktree 配下にある場合は、configured な `src` named root から導出した非 secret の `workspace` identity(`canonical_checkout` / `managed_worktree` / `legacy_worktree` の `workspace_type` と、判明していれば `repository_root`、`workspace_root`、`repository`、`branch`、managed task 名)も返します。identity は read-only で、workspace が解決できなくなると表示されません。bare repository または `.git` 以外の common directory を使う標準 linked worktree では、lifecycle admission とこの bounded view は検証済み canonical common directory を repository identity として使います。managed-worktree authority と Git mutation access の strict な primary-checkout 要件は緩和しません。死んでいる、または liveness が曖昧な socket を暗黙に active とは扱いません。manual restart は `temote-mcp session restart <id>` で行えます。自動 restart は現時点では有効化しません。restart は old full session instance を fence し、replacement の開始前に登録済み Codex runtime を shutdown します。replacement の開始に失敗しても old child runtime は残しません。
 
 session discovery は active-first です。running supervisor が所有する session を bounded な historical metadata より先に返すため、履歴が蓄積しても active session が `session list` / MCP `session_list` から押し出されません。historical な stopped / crashed entry は list budget 内で deterministic な recent-first 順に返しますが、workspace が解決できなくなった historical metadata は bounded history から除外します（metadata は保持し、`session info` は引き続き degraded view を返します）。supervisor startup と periodic maintenance では、安全に terminal と確認できた metadata pair のうち最近512件を保持し、それより古い confirmed stopped / crashed pair だけを prune します。live、曖昧、malformed / orphan、supervisor upgrade restore plan で保護されている metadata は retention で自動削除しません。read-only listing と MCP fallback は cleanup を行いません。
 
@@ -87,6 +87,47 @@ named root は Temote MCP 起動前に host 側の `TEMOTE_MCP_ROOTS` で設定�
 
 ## delegation と job
 
+### named root 直下への bare repository clone
+
+`repository_clone_bare` は、caller に absolute host path を要求せず、新しい bare Git repository を準備します。
+`session_id`、新しい UUID の `operation_id`、configured `root` 名、`source`、root-relative な `destination`、Codex の `model` と `effort` が必須です。
+選択した active managed session は non-yolo であり、その canonical cwd が supervisor の現在の `root` canonical path と一致する必要があります。
+root 配下の project-level session は拒否します。
+別の path alias から開始した normal local managed session でも、canonical cwd が root と一致すれば利用できます。
+
+`source` は `src/example` のような同じ root 配下の logical path、または `https://` Git URL です。
+local path では absolute path、`..`、symlink component を利用できません。
+HTTPS source では URL credential、query、fragment、control character、別 protocol を利用できません。
+request に credential を含められないため、task metadata、approval summary、delegated prompt に credential は入りません。
+
+`destination` は named root からの relative path です。
+parent はすべて root 配下の実 directory として既に存在する必要があります。
+absolute path、`.`、`..`、symlink parent、既存 leaf は拒否します。
+既存 leaf には empty directory と dangling symlink も含みます。
+Temote は retained Codex task receipt の永続化後、child 起動直前に filesystem admission を再検査します。
+delegated agent は canonical parent を再検査し、1回の atomic な `mkdir` で leaf を確保してから、新しく確保した empty directory に1回だけ `git clone --bare` を実行します。
+parent directory の作成と partial failure の cleanup は行いません。
+Temote は opened directory handle ではなく typed task を渡すため、別の same-user process が検査後の filesystem を変更する race までは排除できません。
+partial destination が残った場合は、caller が確認して明示的に削除してから新しい operation ID を使用します。
+
+tool は通常の retained Codex `task_id` を返します。
+既存の lifecycle には `codex_task_get`、`codex_task_control`、`task_list`、`evidence_read` を使用します。
+exact retry では同じ `operation_id` と request を再利用します。
+destination 作成後でも retained operation を返し、clone を再実行しません。
+clone 固有の request identity を記録する前に作成された receipt は、この tool 由来であることを authoritative に証明できないため、clone retry として拒否します。
+既存の `task_id` を `codex_task_get`、`task_list`、`evidence_read` で reconcile してください。
+effect が不明な間は、新しい `operation_id` を送信しないでください。
+Codex turn の `networkAccess: false` は維持され、HTTPS access と command/file mutation は既存の explicit child approval を通ります。
+古い lifecycle supervisor は repository-clone admission capability を advertise しないため、task 作成前に `REPOSITORY_CLONE_SUPERVISOR_UNAVAILABLE` で失敗します。
+supervisor の置換には explicit host approval が必要で、session が restore または restart される場合があります。
+Temote は supervisor を暗黙に置き換えません。
+
+evidence で clone の完了を確認した後、準備 session で `git worktree add` を委譲します。
+続いて `src/example.git/.wt/development` のような logical path を `session_start` に渡し、新しい通常 session で開発します。
+linked Git worktree で colocation を拒否する jj では、worktree 内に独立した backing repository を置きます。
+実測した手順と追加作業は [repository-setup dogfood](self-improvement-dogfood.md#bare-repository-setup) を参照してください。
+この方法では worktree session の書き込み範囲を維持できますが、jj の変更は元の bare repository に自動で export されません。
+
 Temote は file、command、Git、integration を直接実行しません。machine 上の作業は下記の task backendを通じて local 側の coding agent に委譲します。task の transcript や child output は bounded で期限付きの session/scope 限定 evidence としてだけ境界を越え、`evidence_read({session_id, evidence_id, offset_bytes?, max_bytes?})` で読みます。
 
 foreground timeout を超える sandbox 作業は session 所有の `job_id` を返す場合があります。完了が必要なら `poll_job` で確認し、不要になったら `stop_job` で停止します。delegated agent task は `task_id` を返し、対応する backend の `*_task_get` で追跡します。job は session に所属し、最大2時間で終了し、session 終了時にもキャンセルされます。
@@ -136,6 +177,11 @@ opt-in の `codex_status`、`codex_task_start`、`codex_task_get`、`codex_task_
 Temote の yolo は Temote 自身の local sandbox と approval behavior だけを変更し、Codex child の mutation を認可しません。Codex app-server の command/file-change approval request は child 側の approval boundary を維持し、user approval transport が利用できない場合は fail closed します。thread 作成前の initialization または model/list の失敗は `retryable_failed` として同じ start operation を再試行できます。一方、thread/start または turn/start の request 送信後に成否が不明になった場合は replay せず `reconciliation_required` を維持します。`codex_task_get` は `after_revision` / `not_modified` を判定する前に remote thread を reconcile します。別の Temote process が live app-server runtime を所有している場合は、競合する resume を起動せず、永続化済み revision と `reconciliation_deferred: true` を返します。typed control は operation receipt の永続化前に失敗します。その lease が live の間、session cleanup は task record を上書きせず、runtime owner が session 終了を検知して child を停止し task を finalize します。task record は task retention の全期間、unexpired の terminal record を含めて保持され、expired かつ live child runtime のない terminal record だけが prune 対象です。scope が retention limit に達した場合は、unexpired record を削除せず新しい start を拒否します。compact された operation receipt も retention 中の exact replay/conflict 検出を維持します。
 
 生成される turn には Codex の `workspaceWrite`、session の canonical directory を writable root、network disabled を指定します。これは Temote の session sandbox と同じ OS-level boundary ではなく、experimental な app-server adapter です。app-server process 自体は inference service と直接通信するため、Codex build と sandbox behavior を検証できない場合はこの surface を無効または opt-in のままにしてください。generic JSON-RPC、remote shell、automatic approval は公開しません。
+
+受理済み runtime の session 監視では、metadata または probe の unknown observation を既存の1秒間隔で再検査します。
+active を確認できれば連続回数をリセットし、unknown が3回連続すると fail-closed で runtime を停止します。
+inactive または full session instance の変更を確認した場合は即停止します。
+この有限の再検査で unknown を active と扱うことはなく、新しい task の受付と routing は引き続き liveness 情報が得られない場合に拒否します。
 
 ### Experimental OpenCode task
 

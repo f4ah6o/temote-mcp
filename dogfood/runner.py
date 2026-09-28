@@ -8,6 +8,10 @@ import select
 import subprocess
 import time
 import uuid
+import os
+import urllib.request
+import urllib.error
+import urllib.parse
 from pathlib import Path
 
 from .protocol import Recorder, TERMINAL, metrics, snapshot
@@ -57,10 +61,21 @@ class FakeAdapter:
 
 
 class LiveAdapter:
-    def __init__(self, binary: Path):
+    def __init__(self, binary: Path, *, lifecycle_url=None, lifecycle_token_env=None):
         if not binary.is_file():
             raise ValueError("Temote binary does not exist")
         self.binary = binary
+        self.lifecycle_url = lifecycle_url
+        self.lifecycle_token_env = lifecycle_token_env
+        if bool(lifecycle_url) != bool(lifecycle_token_env):
+            raise ValueError('HTTP lifecycle requires both URL and token environment variable')
+        if lifecycle_url:
+            parsed = urllib.parse.urlsplit(lifecycle_url)
+            if (parsed.username or parsed.password or parsed.query or parsed.fragment
+                    or parsed.path != '/mcp' or not parsed.hostname
+                    or not (parsed.scheme == 'https' or
+                            parsed.scheme == 'http' and parsed.hostname in {'127.0.0.1', '::1', 'localhost'})):
+                raise ValueError('lifecycle URL must be HTTPS or loopback HTTP /mcp without credentials')
         self.owners: list[subprocess.Popen] = []
         self._open()
 
@@ -123,7 +138,32 @@ class LiveAdapter:
         return result
 
     def call(self, tool: str, arguments: dict) -> dict:
-        result = self._rpc("tools/call", {"name": tool, "arguments": arguments})
+        if tool == 'session_start' and self.lifecycle_url:
+            token = os.environ.get(self.lifecycle_token_env, '')
+            if not token:
+                raise AdapterError('LIFECYCLE_AUTH_UNAVAILABLE')
+            body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                               'params': {'name': tool, 'arguments': arguments}}).encode()
+            request = urllib.request.Request(self.lifecycle_url, data=body,
+                      headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
+            try:
+                class NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        return None
+                with urllib.request.build_opener(NoRedirect).open(request, timeout=45) as response:
+                    payload = response.read(1048577)
+                if len(payload) > 1048576:
+                    raise AdapterError('LIFECYCLE_RESPONSE_TOO_LARGE')
+                answer = json.loads(payload)
+            except urllib.error.HTTPError as error:
+                raise AdapterError('LIFECYCLE_HTTP_ERROR') from error
+            except (OSError, ValueError) as error:
+                raise AdapterError('LIFECYCLE_TRANSPORT_UNAVAILABLE', retryable=True) from error
+            if not isinstance(answer, dict) or answer.get('id') != 1 or 'error' in answer:
+                raise AdapterError('LIFECYCLE_MCP_ERROR')
+            result = answer.get('result', {})
+        else:
+            result = self._rpc("tools/call", {"name": tool, "arguments": arguments})
         if isinstance(result, dict) and "content" in result:
             try:
                 return json.loads(result["content"][0]["text"])
@@ -139,7 +179,15 @@ def execute(scenario_data: dict, phase: str, adapter: FakeAdapter | LiveAdapter,
             backend: str = "codex", model: str | None = None, effort: str | None = None,
             max_polls: int = 20, poll_interval: float = 1.0,
             terminal_read_strategy: str = "reuse",
-            gates: dict[str, str] | None = None) -> dict:
+            gates: dict[str, str] | None = None,
+            root: str = "src", source: str = "src/temote-mcp-df", destination: str | None = None) -> dict:
+    if scenario_data["id"] == "repository-setup":
+        from .repository_setup import execute_setup
+        return execute_setup(scenario_data, phase, adapter, session_id=session_id,
+                             repository_head=repository_head, binary_identity=binary_identity,
+                             backend=backend, model=model, effort=effort, max_polls=max_polls,
+                             poll_interval=poll_interval, root=root, source=source,
+                             destination=destination, gates=gates)
     if backend not in {"codex", "opencode", "devin"}:
         raise ValueError("unsupported backend")
     if max_polls < 1 or max_polls > 200 or poll_interval < 0:

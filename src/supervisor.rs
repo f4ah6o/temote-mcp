@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -28,6 +28,87 @@ fn activity_now_ms() -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+fn validate_repository_clone_destination(root: &Path, destination: &str) -> Result<()> {
+    anyhow::ensure!(
+        !destination.is_empty()
+            && destination.len() <= 4096
+            && !destination.chars().any(char::is_control),
+        "repository clone destination must contain 1..=4096 bytes"
+    );
+    anyhow::ensure!(
+        !destination.contains('\\')
+            && destination
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != ".."),
+        "repository clone destination must contain only non-empty ordinary components"
+    );
+    let destination = Path::new(destination);
+    anyhow::ensure!(
+        !destination.is_absolute(),
+        "repository clone destination must be root-relative"
+    );
+    let components = destination.components().collect::<Vec<_>>();
+    anyhow::ensure!(
+        !components.is_empty(),
+        "repository clone destination must not be empty"
+    );
+    anyhow::ensure!(
+        components
+            .iter()
+            .all(|component| matches!(component, Component::Normal(_))),
+        "repository clone destination must not contain '.', '..', or absolute components"
+    );
+
+    let mut parent = root.to_path_buf();
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(component) = component else {
+            unreachable!("destination components were validated")
+        };
+        parent.push(component);
+        let metadata = std::fs::symlink_metadata(&parent).with_context(|| {
+            format!(
+                "repository clone destination parent must already exist: {}",
+                parent.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "repository clone destination parent must be a real directory: {}",
+            parent.display()
+        );
+    }
+    let canonical_parent = std::fs::canonicalize(&parent).with_context(|| {
+        format!(
+            "cannot resolve repository clone destination parent {}",
+            parent.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_parent == parent
+            && (canonical_parent == root || canonical_parent.starts_with(root)),
+        "repository clone destination escapes configured named root"
+    );
+    Ok(())
+}
+
+fn validate_repository_clone_session(
+    snapshot: &config::Session,
+    canonical_root: &Path,
+    root: &str,
+    destination: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        snapshot.cwd == canonical_root,
+        "repository clone session cwd does not match named root {root}"
+    );
+    validate_repository_clone_destination(canonical_root, destination)?;
+    anyhow::ensure!(
+        !snapshot.permission_mode.is_yolo(),
+        "repository_clone_bare is unavailable in yolo sessions"
+    );
+    Ok(())
 }
 
 struct SupervisorActivityEmitter {
@@ -345,6 +426,43 @@ impl SessionSupervisor {
             .collect::<Vec<_>>();
         ids.sort();
         ids
+    }
+
+    /// Authoritatively admit a repository clone at one configured named root.
+    ///
+    /// The transition lock keeps ownership/spec inspection coherent with
+    /// start, stop, restart, and upgrade handoff. The returned session is the
+    /// live runtime snapshot, not a caller claim or an environment-derived
+    /// reconstruction.
+    pub async fn repository_clone_admission(
+        &self,
+        session_id: &str,
+        root: &str,
+        destination: &str,
+    ) -> Result<config::Session> {
+        config::validate_session_id(session_id)?;
+        crate::named_roots::validate_root_name(root)?;
+        let _transition = self.transitions.lock().await;
+        self.ensure_mutations_allowed()?;
+        self.reap_finished().await;
+
+        let canonical_root = self
+            .roots
+            .canonical_root(root)
+            .with_context(|| format!("unknown named root: {root}"))?;
+        let snapshot = {
+            let sessions = self.sessions.lock().await;
+            let handle = sessions.get(session_id).with_context(|| {
+                format!("session {session_id} is not managed by this supervisor process")
+            })?;
+            handle.snapshot().await?
+        };
+        validate_repository_clone_session(&snapshot, canonical_root, root, destination)?;
+        anyhow::ensure!(
+            config::session_is_active(session_id).await?,
+            "repository clone requires an active managed session"
+        );
+        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -1715,6 +1833,36 @@ mod tests {
             NamedRoots::from_canonical_roots(BTreeMap::from([("src".to_owned(), canonical)]))
                 .unwrap();
         (temp, roots)
+    }
+
+    #[test]
+    fn repository_clone_admission_requires_root_cwd_safe_destination_and_normal_mode() {
+        let (temp, roots) = fixture();
+        let canonical_root = std::fs::canonicalize(temp.path().join("volume")).unwrap();
+        assert_eq!(roots.canonical_root("src"), Some(canonical_root.as_path()));
+        let mut session = config::Session {
+            id: "clone-root".to_owned(),
+            cwd: canonical_root.clone(),
+            permitted_directories: vec![canonical_root.clone()],
+            started_at: 1,
+            process_id: 2,
+            permission_mode: config::PermissionMode::Agent,
+            grants: config::SessionGrants::default(),
+        };
+        validate_repository_clone_session(&session, &canonical_root, "src", "new.git").unwrap();
+        assert!(
+            validate_repository_clone_session(&session, &canonical_root, "src", "../escape.git")
+                .is_err()
+        );
+        session.permission_mode = config::PermissionMode::Yolo;
+        let error = validate_repository_clone_session(&session, &canonical_root, "src", "new.git")
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable in yolo sessions"));
+        session.permission_mode = config::PermissionMode::Agent;
+        session.cwd = canonical_root.join("repo-a");
+        assert!(
+            validate_repository_clone_session(&session, &canonical_root, "src", "new.git").is_err()
+        );
     }
 
     #[tokio::test]

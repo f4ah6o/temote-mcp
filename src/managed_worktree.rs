@@ -616,6 +616,26 @@ fn worktree_root_for_admission(
     }
 }
 
+/// Repository reservation identity for lifecycle admission and bounded
+/// workspace inspection.
+///
+/// Standard repositories keep the existing primary-checkout identity so
+/// lifecycle reservations remain compatible with managed-worktree mutation
+/// brokers. A valid linked worktree backed by a non-`.git` common directory
+/// (for example, a bare repository) has no supported primary checkout; its
+/// already-canonical, fully validated common directory is the repository
+/// identity instead. This helper grants no filesystem authority and must not
+/// replace strict primary-checkout validation for managed targets or mutation
+/// brokers.
+fn lifecycle_repository_identity(cwd: &Path) -> Result<PathBuf> {
+    let common_dir = crate::sandbox::git_common_dir(cwd)?;
+    if common_dir.file_name() == Some(std::ffi::OsStr::new(".git")) {
+        crate::sandbox::git_primary_checkout(cwd)
+    } else {
+        Ok(common_dir)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdmissionDirectoryIdentity {
     #[cfg(unix)]
@@ -796,8 +816,8 @@ fn admission_identities(
         ));
     }
     if let Some(worktree_root) = worktree_root_for_admission(cwd, trusted_src_root)? {
-        let primary_checkout = crate::sandbox::git_primary_checkout(cwd)?;
-        return Ok((Some(worktree_root), Some(primary_checkout)));
+        let repository_identity = lifecycle_repository_identity(cwd)?;
+        return Ok((Some(worktree_root), Some(repository_identity)));
     }
     Ok((None, None))
 }
@@ -976,7 +996,7 @@ pub(crate) fn inspect_session_workspace(
     src_root: Option<&Path>,
 ) -> Option<SessionWorkspace> {
     let workspace_root = crate::sandbox::git_worktree_root(cwd).ok()?;
-    let repository_root = crate::sandbox::git_primary_checkout(&workspace_root).ok()?;
+    let repository_root = lifecycle_repository_identity(&workspace_root).ok()?;
     let branch = crate::sandbox::git_current_branch(&workspace_root)
         .ok()
         .flatten();
@@ -1740,6 +1760,142 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn bare_linked_worktree_admission_reserves_and_reports_common_directory_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let common_dir = fixture.path().join("unique.git");
+        let worktree = fixture.path().join("worktree");
+        fake_bare_linked_worktree(&common_dir, "task", &worktree, "feature/bare");
+        let common_dir = std::fs::canonicalize(common_dir).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+
+        assert_eq!(
+            lifecycle_repository_identity(&worktree).unwrap(),
+            common_dir
+        );
+        let primary_error = crate::sandbox::git_primary_checkout(&worktree).unwrap_err();
+        assert!(
+            primary_error
+                .to_string()
+                .contains("unsupported Git common directory layout"),
+            "{primary_error:#}"
+        );
+
+        let admission = acquire_worktree_admission(&worktree, None).await.unwrap();
+        assert_eq!(admission.worktree_root.as_deref(), Some(worktree.as_path()));
+        assert_eq!(
+            admission
+                .repository_reservation
+                .as_ref()
+                .unwrap()
+                .reservation
+                .identity(),
+            common_dir
+        );
+        assert_eq!(admission.reservation.as_ref().unwrap().identity(), worktree);
+        assert!(
+            try_acquire_repository_reservation_async(&common_dir)
+                .await
+                .is_err(),
+            "admission must hold the bare repository reservation"
+        );
+        assert!(
+            try_acquire_worktree_reservation(&worktree).is_err(),
+            "admission must hold the linked worktree reservation"
+        );
+
+        let workspace = inspect_session_workspace(&worktree, None).expect("bare workspace");
+        assert_eq!(
+            workspace.workspace_type,
+            SessionWorkspaceType::LegacyWorktree
+        );
+        assert_eq!(workspace.repository.as_deref(), Some("unique.git"));
+        assert_eq!(workspace.repository_root, common_dir);
+        assert_eq!(workspace.workspace_root, worktree);
+        assert_eq!(workspace.branch.as_deref(), Some("feature/bare"));
+        assert_eq!(workspace.task, None);
+
+        drop(admission);
+        let repository = try_acquire_repository_reservation_async(&common_dir)
+            .await
+            .unwrap();
+        let worktree = try_acquire_worktree_reservation(&worktree).unwrap();
+        drop(repository);
+        drop(worktree);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn bare_linked_worktree_admission_revalidates_reciprocal_pointer() {
+        let fixture = tempfile::tempdir().unwrap();
+        let common_dir = fixture.path().join("unique.git");
+        let worktree = fixture.path().join("worktree");
+        fake_bare_linked_worktree(&common_dir, "task", &worktree, "feature/bare");
+        let common_dir = std::fs::canonicalize(common_dir).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+
+        let held = acquire_worktree_reservation(&worktree).unwrap();
+        let mut admission = Box::pin(acquire_worktree_admission(&worktree, None));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut admission)
+                .await
+                .is_err(),
+            "admission must wait after its initial repository observation"
+        );
+
+        let unrelated = fixture.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let unrelated_dot_git = unrelated.join(".git");
+        std::fs::write(&unrelated_dot_git, "unrelated\n").unwrap();
+        std::fs::write(
+            common_dir.join("worktrees/task/gitdir"),
+            format!("{}\n", unrelated_dot_git.display()),
+        )
+        .unwrap();
+        drop(held);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), &mut admission)
+            .await
+            .expect("revalidation must finish")
+            .expect_err("mismatched reciprocal pointer must fail admission");
+        assert!(
+            format!("{error:#}").contains("does not point back"),
+            "{error:#}"
+        );
+
+        let repository = try_acquire_repository_reservation_async(&common_dir)
+            .await
+            .expect("failed revalidation must release the repository reservation");
+        let worktree = try_acquire_worktree_reservation(&worktree)
+            .expect("failed revalidation must release the worktree reservation");
+        drop(repository);
+        drop(worktree);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn lifecycle_repository_identity_rejects_symlinked_dot_git() {
+        let fixture = tempfile::tempdir().unwrap();
+        let worktree = fixture.path().join("worktree");
+        let metadata = fixture.path().join("metadata");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::create_dir(&metadata).unwrap();
+        std::os::unix::fs::symlink(&metadata, worktree.join(".git")).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+
+        let error = lifecycle_repository_identity(&worktree).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("symbolic-link .git metadata pointers are not supported"),
+            "{error:#}"
+        );
+        assert_eq!(inspect_session_workspace(&worktree, None), None);
+        assert!(
+            acquire_worktree_admission(&worktree, None).await.is_err(),
+            "symlinked .git metadata must not be admitted without reservations"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn repository_exclusive_gate_blocks_admission_even_without_prunable_targets() {
         let fixture = tempfile::tempdir().unwrap();
         let repository = fixture.path().join("repo");
@@ -2476,6 +2632,24 @@ mod tests {
 
     fn fake_linked_worktree(repository: &Path, name: &str, worktree: &Path, branch: &str) {
         let private = repository.join(".git").join("worktrees").join(name);
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            private.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(private.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+    }
+
+    fn fake_bare_linked_worktree(common_dir: &Path, name: &str, worktree: &Path, branch: &str) {
+        let private = common_dir.join("worktrees").join(name);
         std::fs::create_dir_all(&private).unwrap();
         std::fs::create_dir_all(worktree).unwrap();
         std::fs::write(
