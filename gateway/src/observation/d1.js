@@ -64,6 +64,21 @@ const UPDATE_SOURCE = [
   "WHERE owner_id = ? AND host_id = ? AND session_id = ?",
 ].join(" ");
 
+const UPSERT_MEMORY_OUTBOX = [
+  "INSERT INTO memory_outbox (owner_id, repository_key, through_cloud_seq, queued_at,",
+  "attempt_count, next_attempt_at, last_error_code, updated_at)",
+  "SELECT ?, ?, MAX(cloud_seq), NULL, 0, 0, NULL, ? FROM observations",
+  "WHERE owner_id = ? AND repository_key = ? HAVING COUNT(*) > 0",
+  "ON CONFLICT(owner_id, repository_key) DO UPDATE SET",
+  "through_cloud_seq = MAX(memory_outbox.through_cloud_seq, excluded.through_cloud_seq),",
+  "queued_at = CASE WHEN excluded.through_cloud_seq > memory_outbox.through_cloud_seq",
+  "THEN NULL ELSE memory_outbox.queued_at END,",
+  "next_attempt_at = CASE WHEN excluded.through_cloud_seq > memory_outbox.through_cloud_seq",
+  "THEN 0 ELSE memory_outbox.next_attempt_at END,",
+  "last_error_code = CASE WHEN excluded.through_cloud_seq > memory_outbox.through_cloud_seq",
+  "THEN NULL ELSE memory_outbox.last_error_code END, updated_at = excluded.updated_at",
+].join(" ");
+
 export async function ingestD1Batch(db, batch) {
   // A concurrent retry can race between the read snapshot and write batch.
   // Retry once after any batch failure: the second preflight classifies a
@@ -198,6 +213,16 @@ async function commit(db, batch, source, missing) {
     batch.sessionId,
   ));
 
+  if (repositoryKey) {
+    statements.push(db.prepare(UPSERT_MEMORY_OUTBOX).bind(
+      batch.ownerId,
+      repositoryKey,
+      now,
+      batch.ownerId,
+      repositoryKey,
+    ));
+  }
+
   await db.batch(statements);
 }
 
@@ -211,4 +236,5 @@ export const C1_D1_SQL = Object.freeze({
   insertSource: INSERT_SOURCE,
   insertObservation: INSERT_OBSERVATION,
   updateSource: UPDATE_SOURCE,
+  upsertMemoryOutbox: UPSERT_MEMORY_OUTBOX,
 });

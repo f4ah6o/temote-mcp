@@ -11,6 +11,30 @@ ACCESS_TEAM_DOMAIN = "replace-me.cloudflareaccess.com"
 ACCESS_AUDIENCE = "replace-with-access-application-aud"
 ACCESS_ALLOWED_EMAILS = "replace@example.com"
 OBSERVATION_OWNER_ID = "replace-with-owner-id"
+MEMORY_ENABLED = "false"
+MEMORY_EXTRACTOR = "openai_compatible"
+MEMORY_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+MEMORY_MODEL = "replace-with-available-model"
+MEMORY_TIMEOUT_MS = "30000"
+MEMORY_INPUT_BUDGET_BYTES = "32768"
+MEMORY_OUTPUT_BUDGET_BYTES = "8192"
+MEMORY_MAX_ATTEMPTS = "3"
+MEMORY_BATCH_SIZE = "32"
+MEMORY_PROJECTION_GENERATION = "1"
+
+# MEMORY_API_KEY is a Worker secret; never store it in this file.
+[[queues.producers]]
+binding = "MEMORY_QUEUE"
+queue = "temote-memory"
+
+[[queues.consumers]]
+queue = "temote-memory"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
+
+[triggers]
+crons = ["*/5 * * * *"]
 
 # Replace the sentinel database_id after provisioning `temote-observation`
 # (for example with `wrangler d1 create temote-observation`) before remote deploy.

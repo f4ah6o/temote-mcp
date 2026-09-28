@@ -1,8 +1,11 @@
 // Fabric context boundary.
 //
-// Context projection is intentionally separate from host/session routing.
-// FBR1 exposes only binding readiness; deterministic/cloud resolution is added
-// by the O3C resolver packets without moving execution authority into Fabric.
+// Context projection is intentionally separate from host/session routing and
+// never makes Fabric authoritative for live execution state.
+
+import { resolveCloudContext } from "./resolver.js";
+
+export { resolveCloudContext };
 
 export function contextPlaneBindings(env) {
   return {

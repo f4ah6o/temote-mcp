@@ -53,6 +53,8 @@ import {
   handleObservationSync,
   observationSyncHostId,
 } from "./observation/index.js";
+import { resolveCloudContext } from "./context/index.js";
+import { consumeMemoryBatch, sweepMemoryOutbox } from "./memory/index.js";
 
 export {
   accessEmailAllowed,
@@ -80,11 +82,19 @@ export {
 export { readBoundedBytes } from "./http.js";
 
 export default {
+  async queue(batch, env) {
+    await consumeMemoryBatch(batch, env);
+  },
+  async scheduled(_controller, env) {
+    await sweepMemoryOutbox(env);
+  },
   async fetch(request, env) {
     try {
       return await handleRequest(request, env);
     } catch (error) {
-      console.error("gateway request failed", error);
+      // Errors may contain provider/SQL payloads. Ordinary logs carry only a
+      // stable diagnostic code, never request or extractor content.
+      console.error("gateway request failed: internal_error");
       return withCors(jsonResponse({ error: "internal_error" }, 500));
     }
   },
@@ -299,6 +309,16 @@ async function handleToolCall(rpc, env) {
     return proxyToHost(rpc, env, hostId);
   }
 
+  if (name === "context_resolve" || name === "context_status") {
+    const cloud = await resolveCloudContext(name, args, env);
+    if (cloud.handled) {
+      if (cloud.error) {
+        return mcpJson(rpcError(id, cloud.code ?? -32001, cloud.error, cloud.data));
+      }
+      return toolTextResponse(rpc, env, cloud.value, true);
+    }
+  }
+
   const sessionId = sessionIdFromRpc(rpc);
   if (!sessionId) {
     return mcpJson(rpcError(id, -32602, "missing or invalid params.arguments.session_id"));
@@ -318,8 +338,10 @@ async function handleToolCall(rpc, env) {
   return proxyToLegacySession(rpc, env, sessionId);
 }
 
-function toolTextResponse(rpc, env, value) {
-  const result = textResult(JSON.stringify(value, null, 2));
+function toolTextResponse(rpc, env, value, compact = false) {
+  // Cloud context budgets apply to the serialized context text. Preserve that
+  // exact serialization rather than expanding it through pretty printing.
+  const result = textResult(compact ? JSON.stringify(value) : JSON.stringify(value, null, 2));
   return mcpJson(rpcResult(
     rpc.id ?? null,
     isModernRequest(rpc)

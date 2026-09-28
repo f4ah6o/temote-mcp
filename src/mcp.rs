@@ -827,6 +827,53 @@ fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
         if name == "session_start" {
             validate_gateway_session_start_source(tool)?;
         }
+        if name == "context_resolve" || name == "context_status" {
+            validate_gateway_context_source(tool)?;
+            // The host registry remains session-bound. Only Fabric's context
+            // projection can resolve an authenticated repository without a host.
+            anyhow::ensure!(
+                tool["inputSchema"]["required"] == json!(["session_id"]),
+                "context source schema must remain session-bound"
+            );
+            let properties = tool["inputSchema"]["properties"]
+                .as_object_mut()
+                .context("context source schema requires properties")?;
+            properties.insert("repository".to_owned(), json!({
+                "type": "string", "minLength": 1, "maxLength": 512,
+                "description": "Stable repository key, for example github:owner/repository. Resolves from the authenticated cloud replica even when execution hosts are offline."
+            }));
+            if name == "context_resolve" {
+                properties.insert(
+                    "workspace_id".to_owned(),
+                    json!({"type": "string", "minLength": 1, "maxLength": 256}),
+                );
+                properties.insert(
+                    "budget_bytes".to_owned(),
+                    json!({"type": "integer", "minimum": 1024, "maximum": 65536, "default": 16384}),
+                );
+                properties.insert(
+                    "at_least_cloud_seq".to_owned(),
+                    json!({"type": "integer", "minimum": 0}),
+                );
+            }
+            tool["inputSchema"]
+                .as_object_mut()
+                .unwrap()
+                .remove("required");
+            tool["inputSchema"]["anyOf"] = json!([
+                {"required": ["session_id"]}, {"required": ["repository"]}
+            ]);
+            tool["title"] = json!(if name == "context_resolve" {
+                "Resolve repository or session context"
+            } else {
+                "Inspect repository or session context freshness"
+            });
+            tool["description"] = json!(if name == "context_resolve" {
+                "Resolve bounded repository or session context from the authenticated cloud replica: observed tasks and instructions, derived knowledge, support references, and source/worker freshness. Repository requests work with offline execution hosts. Session requests without cloud mapping fall back to the owning host. Replicated observations and derived knowledge are distinct from authoritative live host state. Raw observation bodies are not returned."
+            } else {
+                "Inspect authenticated repository or session source cursors, gaps, synchronization freshness, and memory-worker readiness, errors and lag. Repository requests do not require an online host. Unmapped session requests retain the owning-host fallback."
+            });
+        }
         if let Some(properties) = tool
             .pointer_mut("/inputSchema/properties")
             .and_then(Value::as_object_mut)
@@ -869,6 +916,37 @@ fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
     }));
     validate_gateway_tool_metadata(&routed_tools)?;
     Ok(routed_tools)
+}
+
+/// Fabric deliberately adds a second, repository-scoped authorization path.
+/// Do not silently publish new host-only context arguments or relax a source
+/// constraint when the host registry evolves.
+fn validate_gateway_context_source(tool: &Value) -> Result<()> {
+    let expected = if tool["name"] == "context_resolve" {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "repository": {"type": "string", "minLength": 1, "maxLength": 256},
+                "query": {"type": "string", "minLength": 1, "maxLength": 512},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 64, "default": 16},
+                "at_least_revision": {"type": "integer", "minimum": 0}
+            },
+            "required": ["session_id"],
+            "additionalProperties": false
+        })
+    } else {
+        json!({
+            "type": "object", "properties": {"session_id": {"type": "string"}},
+            "required": ["session_id"], "additionalProperties": false
+        })
+    };
+    anyhow::ensure!(
+        tool["inputSchema"] == expected,
+        "context source schema changed; explicitly review the Fabric projection"
+    );
+    Ok(())
 }
 
 fn routed_gateway_tools() -> Vec<Value> {
@@ -2757,6 +2835,57 @@ mod tests {
                 "additionalProperties": false
             })
         );
+    }
+
+    #[test]
+    fn gateway_generated_context_is_cloud_scoped_while_host_stays_session_bound() {
+        let local = tools(true, true).as_array().unwrap().to_owned();
+        let routed = route_gateway_tools(local.clone()).unwrap();
+        for name in ["context_resolve", "context_status"] {
+            let source = local.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(source["inputSchema"]["required"], json!(["session_id"]));
+            let cloud = routed.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(
+                cloud["inputSchema"]["anyOf"],
+                json!([
+                    {"required": ["session_id"]}, {"required": ["repository"]}
+                ])
+            );
+            assert!(cloud["inputSchema"].get("required").is_none());
+            assert!(cloud["inputSchema"]["properties"].get("host_id").is_some());
+        }
+        let evidence = routed
+            .iter()
+            .find(|tool| tool["name"] == "evidence_read")
+            .unwrap();
+        assert!(
+            evidence["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_id"))
+        );
+    }
+
+    #[test]
+    fn gateway_generated_context_rejects_unreviewed_source_schema_changes() {
+        for name in ["context_resolve", "context_status"] {
+            let source = tools(true, true)
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+                .clone();
+            let mut extra = source.clone();
+            extra["inputSchema"]["properties"]["host_only"] = json!({"type": "string"});
+            assert!(route_gateway_tools(vec![extra]).is_err());
+            let mut constraint = source.clone();
+            constraint["inputSchema"]["minProperties"] = json!(2);
+            assert!(route_gateway_tools(vec![constraint]).is_err());
+            let mut widened = source;
+            widened["inputSchema"]["additionalProperties"] = json!(true);
+            assert!(route_gateway_tools(vec![widened]).is_err());
+        }
     }
 
     #[test]
