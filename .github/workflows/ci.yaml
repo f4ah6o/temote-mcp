@@ -22,7 +22,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Test gateway contract and runtime
         run: npm test --prefix gateway
@@ -58,6 +58,9 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+      - name: Check generated MCP metadata
+        run: TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote-mcp --locked gateway_generated
 
       - name: Check all targets
         run: cargo check --all-targets --locked

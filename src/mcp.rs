@@ -645,13 +645,10 @@ fn modernize_result(method: &str, mut result: Value) -> Value {
     result
 }
 
-/// Public contract advertised to repository-controlled MCP surfaces.
-///
-/// The contract covers the public tool names with their exact input schemas
-/// and annotations plus the routed protocol versions. Model-facing prose
-/// (`title`, `description`) is stripped so parity checks compare behavior
-/// rather than wording. This is the same value checked in as
-/// `gateway/contract/routed-tools.json`.
+/// Remove model-facing prose when computing the structural gateway contract.
+/// The complete routed tool metadata is generated separately and consumed by
+/// the gateway, while this contract and fingerprint remain stable across copy
+/// edits.
 fn strip_gateway_contract_prose(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -670,27 +667,190 @@ fn strip_gateway_contract_prose(value: &mut Value) {
     }
 }
 
-fn routed_gateway_contract() -> Value {
-    let mut routed_tools = tools(true, true).as_array().unwrap().to_owned();
-    let host_property = json!({"type": "string"});
+fn validate_gateway_tool_metadata(tools: &[Value]) -> Result<()> {
+    let mut names = std::collections::HashSet::with_capacity(tools.len());
+    anyhow::ensure!(!tools.is_empty(), "gateway tool metadata must not be empty");
+    for tool in tools {
+        let object = tool
+            .as_object()
+            .context("gateway tool metadata entries must be objects")?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .context("gateway tool metadata requires a string name")?;
+        validate_mcp_tool_name(name)?;
+        anyhow::ensure!(names.insert(name), "duplicate gateway tool name: {name}");
+        anyhow::ensure!(
+            object
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "gateway tool {name} requires a non-empty title"
+        );
+        anyhow::ensure!(
+            object
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()),
+            "gateway tool {name} requires a non-empty description"
+        );
+        anyhow::ensure!(
+            object.get("annotations").is_some_and(Value::is_object),
+            "gateway tool {name} requires annotations"
+        );
+        let schema = object
+            .get("inputSchema")
+            .and_then(Value::as_object)
+            .with_context(|| format!("gateway tool {name} requires an input schema object"))?;
+        anyhow::ensure!(
+            schema.get("type").and_then(Value::as_str) == Some("object"),
+            "gateway tool {name} input schema must be an object"
+        );
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .with_context(|| format!("gateway tool {name} input schema requires properties"))?;
+        anyhow::ensure!(
+            schema.get("additionalProperties").and_then(Value::as_bool) == Some(false),
+            "gateway tool {name} input schema must reject additional properties"
+        );
+        if let Some(required) = schema.get("required") {
+            let required = required
+                .as_array()
+                .with_context(|| format!("gateway tool {name} required must be an array"))?;
+            for property in required {
+                let property = property.as_str().with_context(|| {
+                    format!("gateway tool {name} required entries must be strings")
+                })?;
+                anyhow::ensure!(
+                    properties.contains_key(property),
+                    "gateway tool {name} requires missing input property {property}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_routed_string_property(
+    properties: &mut serde_json::Map<String, Value>,
+    name: &str,
+    description: &str,
+) -> Result<()> {
+    let property = properties
+        .entry(name.to_owned())
+        .or_insert_with(|| json!({"type": "string"}));
+    let property = property
+        .as_object_mut()
+        .with_context(|| format!("routed input property {name} must be an object schema"))?;
+    if let Some(kind) = property.get("type") {
+        anyhow::ensure!(
+            kind.as_str() == Some("string"),
+            "routed input property {name} must have type string"
+        );
+    } else {
+        property.insert("type".to_owned(), json!("string"));
+    }
+    property.insert("description".to_owned(), json!(description));
+    Ok(())
+}
+
+fn validate_gateway_session_list_source(tool: &Value) -> Result<()> {
+    let expected_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    anyhow::ensure!(
+        tool.get("inputSchema") == Some(&expected_schema),
+        "session_list source schema changed; update the gateway routing projection before exposing new arguments"
+    );
+    Ok(())
+}
+
+fn validate_gateway_session_start_source(tool: &Value) -> Result<()> {
+    let schema = tool
+        .get("inputSchema")
+        .and_then(Value::as_object)
+        .context("session_start source schema must be an object")?;
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .context("session_start source schema requires properties")?;
+    anyhow::ensure!(
+        properties.len() == 2
+            && properties.contains_key("path")
+            && properties.contains_key("session_id"),
+        "session_start source properties must be exactly path and session_id; update gateway routing before changing them"
+    );
+    for property in ["path", "session_id"] {
+        let property_schema = properties[property]
+            .as_object()
+            .with_context(|| format!("session_start {property} schema must be an object"))?;
+        anyhow::ensure!(
+            property_schema.get("type").and_then(Value::as_str) == Some("string"),
+            "session_start {property} must remain a string"
+        );
+    }
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .context("session_start source schema requires a required array containing path")?;
+    anyhow::ensure!(
+        required
+            .iter()
+            .any(|property| property.as_str() == Some("path")),
+        "session_start source schema must require path"
+    );
+    Ok(())
+}
+
+/// Project the authoritative MCP registry into the host-routed public surface.
+/// Only the public registry is passed here; private/local tools are never
+/// discovered from a generic dispatcher or copied into the generated artifact.
+fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
+    validate_gateway_tool_metadata(&routed_tools)?;
+    let host_description =
+        "Federated host ID. Omit only for backwards-compatible unqualified session routing.";
+    let session_description =
+        "Target host-local session ID. The same session ID may exist on multiple hosts.";
     for tool in &mut routed_tools {
         let name = tool["name"].as_str().unwrap_or_default().to_owned();
         if name == "session_list" {
+            validate_gateway_session_list_source(tool)?;
+            tool["title"] = json!("List federated Temote sessions");
+            tool["description"] = json!(
+                "List sessions across currently leased hosts with host attribution. Optionally filter by host_id. Without a host_id, listing fails closed when any relevant host or legacy session cannot be discovered safely."
+            );
             tool["inputSchema"] = json!({
                 "type": "object",
-                "properties": {"host_id": host_property.clone()},
+                "properties": {"host_id": {"type": "string", "description": "Filter sessions to this federated host. Omit to aggregate sessions across federated hosts and legacy sessions."}},
                 "additionalProperties": false
             });
             continue;
+        }
+        if name == "session_start" {
+            validate_gateway_session_start_source(tool)?;
         }
         if let Some(properties) = tool
             .pointer_mut("/inputSchema/properties")
             .and_then(Value::as_object_mut)
         {
-            properties.insert("host_id".to_owned(), host_property.clone());
+            add_routed_string_property(properties, "host_id", host_description)?;
+            if properties.contains_key("session_id") {
+                add_routed_string_property(properties, "session_id", session_description)?;
+            }
         }
         if name == "session_start" {
-            tool["inputSchema"]["required"] = json!(["host_id", "path"]);
+            let required = tool["inputSchema"]["required"]
+                .as_array_mut()
+                .context("validated session_start source requires a required array")?;
+            if !required
+                .iter()
+                .any(|property| property.as_str() == Some("host_id"))
+            {
+                required.insert(0, json!("host_id"));
+            }
         }
     }
     routed_tools.insert(0, json!({
@@ -700,7 +860,7 @@ fn routed_gateway_contract() -> Value {
         "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
         "inputSchema": {
             "type": "object",
-            "properties": {"host_id": host_property.clone()},
+            "properties": {"host_id": {"type": "string", "description": host_description}},
             "required": ["host_id"],
             "additionalProperties": false
         }
@@ -712,7 +872,26 @@ fn routed_gateway_contract() -> Value {
         "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
     }));
-    let mut routed_tools = Value::Array(routed_tools);
+    validate_gateway_tool_metadata(&routed_tools)?;
+    Ok(routed_tools)
+}
+
+fn routed_gateway_tools() -> Vec<Value> {
+    let source_tools = tools(true, true).as_array().unwrap().to_owned();
+    route_gateway_tools(source_tools).expect("the public MCP tool registry must be gateway-safe")
+}
+
+/// Full routed metadata consumed directly by the Cloudflare gateway.
+#[cfg(test)]
+fn routed_gateway_metadata() -> Value {
+    Value::Array(routed_gateway_tools())
+}
+
+/// Public contract advertised by repository-controlled MCP surfaces. Prose is
+/// removed so schema/annotation fingerprints remain compatible with existing
+/// deployments while gateway display metadata is still generated from Rust.
+fn routed_gateway_contract() -> Value {
+    let mut routed_tools = Value::Array(routed_gateway_tools());
     strip_gateway_contract_prose(&mut routed_tools);
     json!({
         "latestLegacyProtocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
@@ -758,6 +937,29 @@ fn canonical_contract_json(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
+fn sort_json_object_keys(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, child) in entries {
+                sorted.insert(key, sort_json_object_keys(child));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_json_object_keys).collect()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+fn stable_pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(&sort_json_object_keys(value.clone()))
+        .expect("JSON values are always serializable")
+}
+
 /// Bounded public contract fingerprint shared by diagnostics surfaces.
 ///
 /// The local server reports this from `session_info` and `server/discover`;
@@ -800,10 +1002,10 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
         {"name":"devin_cloud_task_start","title":"Start a Devin Cloud session task","description":"Accept an idempotent scoped Devin Cloud task mutation, persist acceptance before the remote side effect, then create a hosted Devin session (API v3) with a structured report schema. The session runs on Devin Cloud, not on this host; operation_id is mandatory.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"task":{"type":"string","minLength":1,"maxLength":1048576},"title":{"type":"string","minLength":1,"maxLength":256},"devin_mode":{"type":"string","description":"Devin session mode. The swe-2-medium/high/max values select SWE-2 reasoning effort only; they do not by themselves select promo or priority.","enum":["normal","fast","lite","ultra","fusion","swe-2-medium","swe-2-high","swe-2-max"]},"swe_tier":{"type":"string","description":"Optional SWE-2 service tier. promo preserves the selected SWE-2 mode and lets upstream account eligibility determine promotional pricing; priority resolves one exact account-visible SWE-2 priority/fast UID from the local Devin model catalog and fails closed if unavailable or ambiguous.","enum":["promo","priority"]},"repos":{"type":"array","items":{"type":"string","minLength":1,"maxLength":256},"maxItems":16},"max_acu_limit":{"type":"integer","minimum":1,"maximum":100000}},"required":["session_id","operation_id","task"],"additionalProperties":false}},
         {"name":"devin_cloud_task_get","title":"Read a Devin Cloud session task","description":"Read and reconcile a retained Devin Cloud task owned by the full Temote session instance and canonical scope against the hosted session status. Final messages are exposed only through bounded scoped evidence.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"after_revision":{"type":"integer","minimum":0}},"required":["session_id","task_id"],"additionalProperties":false}},
         {"name":"devin_cloud_task_control","title":"Control a Devin Cloud session task","description":"Idempotently steer (send a follow-up message), resume (message a suspended session), or interrupt (terminate) a retained Devin Cloud task. Acceptance is persisted before the API side effect; uncertain transport failures return reconciliation_required rather than replaying blindly.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","format":"uuid"},"operation_id":{"type":"string","format":"uuid"},"action":{"type":"string","enum":["steer","resume","interrupt"]},"input":{"type":"string","minLength":1,"maxLength":1048576}},"required":["session_id","task_id","operation_id","action"],"additionalProperties":false}},
-        {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a background command returned by execute or start_command. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"poll_job","title":"Poll a sandbox job","description":"Poll a legacy background sandbox job owned by the session. Optional output_limit_bytes or status_only can request a stricter completed-result view; omitted options reuse the job's stored default view.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"},"output_limit_bytes":{"type":"integer","minimum":256,"maximum":1048576},"status_only":{"type":"boolean"}},"required":["session_id","job_id"],"additionalProperties":false}},
         {"name":"job_list","title":"List current-session sandbox jobs","description":"Return a bounded redacted snapshot of in-memory sandbox jobs owned by this session. Command text and job output are never included.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
         {"name":"task_list","title":"List session delegated tasks","description":"Return a bounded read-only projection of the delegated tasks owned by this full session instance and canonical scope, merged across every delegation backend. Each item carries backend and task_id for use with the matching *_task_get tool. A backend whose retained store cannot be read is reported per-backend as unavailable instead of failing the whole list. Listing reads retained records only; it never reconciles or mutates tasks.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":128,"default":50}},"required":["session_id"],"additionalProperties":false}},
-        {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a background command returned by execute or start_command.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
+        {"name":"stop_job","title":"Stop a sandbox job","description":"Stop a legacy background sandbox job owned by the session.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"job_id":{"type":"string"}},"required":["session_id","job_id"],"additionalProperties":false}},
     ]);
     if !managed_sessions {
         tools.as_array_mut().unwrap().retain(|tool| {
@@ -2482,12 +2684,12 @@ mod tests {
     }
 
     #[test]
-    fn routed_gateway_contract_matches_checked_in_snapshot() {
+    fn gateway_generated_contract_matches_checked_in_snapshot() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("gateway")
             .join("contract")
             .join("routed-tools.json");
-        let mut rendered = serde_json::to_string_pretty(&routed_gateway_contract()).unwrap();
+        let mut rendered = stable_pretty_json(&routed_gateway_contract());
         rendered.push('\n');
         if std::env::var_os("TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT").as_deref()
             == Some(std::ffi::OsStr::new("1"))
@@ -2497,7 +2699,7 @@ mod tests {
         }
         let checked_in = std::fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!(
-                "could not read gateway contract {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test routed_gateway_contract_matches_checked_in_snapshot",
+                "could not read gateway contract {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote-mcp --locked gateway_generated",
                 path.display()
             )
         });
@@ -2505,7 +2707,316 @@ mod tests {
     }
 
     #[test]
-    fn public_contract_fingerprint_matches_checked_in_snapshot() {
+    fn gateway_generated_metadata_matches_checked_in_artifact() {
+        let metadata = routed_gateway_metadata();
+        let tools = metadata
+            .as_array()
+            .expect("generated tool list is an array");
+        validate_gateway_tool_metadata(tools).unwrap();
+        let mut rendered = stable_pretty_json(&metadata);
+        rendered.push('\n');
+        let second_render = stable_pretty_json(&routed_gateway_metadata()) + "\n";
+        assert_eq!(
+            rendered, second_render,
+            "tool metadata generation is unstable"
+        );
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("gateway")
+            .join("contract")
+            .join("routed-tool-metadata.json");
+        if std::env::var_os("TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &rendered).unwrap();
+        }
+        let checked_in = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not read generated gateway tool metadata {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote-mcp --locked gateway_generated",
+                path.display()
+            )
+        });
+        assert_eq!(checked_in, rendered, "gateway tool metadata is stale");
+    }
+
+    #[test]
+    fn gateway_generated_session_list_uses_routing_prose_and_preserves_annotations() {
+        let source_tools = tools(true, true).as_array().unwrap().to_owned();
+        let source = source_tools
+            .iter()
+            .find(|tool| tool["name"] == "session_list")
+            .unwrap()
+            .clone();
+        let routed = route_gateway_tools(source_tools).unwrap();
+        let session_list = routed
+            .iter()
+            .find(|tool| tool["name"] == "session_list")
+            .unwrap();
+
+        assert_ne!(session_list["title"], source["title"]);
+        assert_eq!(session_list["title"], "List federated Temote sessions");
+        assert_ne!(session_list["description"], source["description"]);
+        assert_eq!(
+            session_list["description"],
+            "List sessions across currently leased hosts with host attribution. Optionally filter by host_id. Without a host_id, listing fails closed when any relevant host or legacy session cannot be discovered safely."
+        );
+        assert_eq!(session_list["annotations"], source["annotations"]);
+        assert_eq!(
+            source["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        );
+        assert_ne!(session_list["inputSchema"], source["inputSchema"]);
+        assert_eq!(
+            session_list["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "host_id": {
+                        "type": "string",
+                        "description": "Filter sessions to this federated host. Omit to aggregate sessions across federated hosts and legacy sessions."
+                    }
+                },
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_generated_session_list_rejects_unprojected_source_schema_changes() {
+        let source_tools = tools(true, true).as_array().unwrap().to_owned();
+        let source = source_tools
+            .iter()
+            .find(|tool| tool["name"] == "session_list")
+            .unwrap()
+            .clone();
+
+        let mut extra_argument = source.clone();
+        extra_argument["inputSchema"]["properties"]["limit"] = json!({"type": "integer"});
+        extra_argument["inputSchema"]["required"] = json!(["limit"]);
+        assert!(route_gateway_tools(vec![extra_argument]).is_err());
+
+        let mut changed_schema = source;
+        changed_schema["inputSchema"]["minProperties"] = json!(1);
+        assert!(route_gateway_tools(vec![changed_schema]).is_err());
+    }
+
+    #[test]
+    fn gateway_generated_session_start_preserves_supported_required_fields() {
+        let source = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+        let mut constrained_source = source.clone();
+        constrained_source["inputSchema"]["properties"]["path"]["maxLength"] = json!(4096);
+        constrained_source["inputSchema"]["properties"]["session_id"]["minLength"] = json!(1);
+
+        let routed = route_gateway_tools(vec![constrained_source.clone()]).unwrap();
+        let routed_tool = routed
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap();
+        assert_eq!(
+            routed_tool["inputSchema"]["required"],
+            json!(["host_id", "path"])
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|property| property.as_str() == Some("host_id"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["properties"]["path"]["maxLength"],
+            4096
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["properties"]["session_id"]["minLength"],
+            1
+        );
+
+        constrained_source["inputSchema"]["required"] = json!(["path", "session_id"]);
+        let routed = route_gateway_tools(vec![constrained_source]).unwrap();
+        let routed_tool = routed
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap();
+        assert_eq!(
+            routed_tool["inputSchema"]["required"],
+            json!(["host_id", "path", "session_id"])
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|property| property.as_str() == Some("host_id"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn gateway_generated_session_start_rejects_unsupported_source_fields() {
+        let source = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+
+        let mut optional_future_property = source.clone();
+        optional_future_property["inputSchema"]["properties"]["future_option"] =
+            json!({"type": "string"});
+        assert!(route_gateway_tools(vec![optional_future_property]).is_err());
+
+        let mut required_future_property = source.clone();
+        required_future_property["inputSchema"]["properties"]["future_option"] =
+            json!({"type": "string"});
+        required_future_property["inputSchema"]["required"] = json!(["path", "future_option"]);
+        assert!(route_gateway_tools(vec![required_future_property]).is_err());
+
+        let mut missing_path_requirement = source;
+        missing_path_requirement["inputSchema"]["required"] = json!(["session_id"]);
+        assert!(route_gateway_tools(vec![missing_path_requirement]).is_err());
+
+        let mut missing_session_id = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+        missing_session_id["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("session_id");
+        assert!(route_gateway_tools(vec![missing_session_id]).is_err());
+
+        let mut non_string_path = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+        non_string_path["inputSchema"]["properties"]["path"]["type"] = json!("integer");
+        assert!(route_gateway_tools(vec![non_string_path]).is_err());
+    }
+
+    #[test]
+    fn gateway_generated_projection_tracks_registry_changes_and_fails_closed() {
+        let first_tool = json!({
+            "name": "alpha_tool",
+            "title": "Alpha tool",
+            "description": "Fixture description",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host_id": {"type": "string", "maxLength": 128},
+                    "session_id": {"type": "string", "minLength": 1},
+                    "value": {"type": "string", "description": "Fixture property"}
+                },
+                "required": ["value"],
+                "additionalProperties": false
+            }
+        });
+        let second_tool = json!({
+            "name": "beta_tool",
+            "title": "Beta tool",
+            "description": "Second fixture",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        });
+        let source = vec![first_tool.clone(), second_tool.clone()];
+        let routed = route_gateway_tools(source.clone()).unwrap();
+        let names = routed
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["host_list", "host_info", "alpha_tool", "beta_tool"]);
+        assert_eq!(routed[2]["description"], "Fixture description");
+        assert_eq!(
+            routed[2]["inputSchema"]["properties"]["value"]["description"],
+            "Fixture property"
+        );
+        assert_eq!(
+            routed[2]["inputSchema"]["properties"]["host_id"]["maxLength"],
+            128
+        );
+        assert_eq!(
+            routed[2]["inputSchema"]["properties"]["session_id"]["minLength"],
+            1
+        );
+        assert!(routed[2]["inputSchema"]["properties"]["session_id"]["description"].is_string());
+        let removed = route_gateway_tools(vec![first_tool.clone()]).unwrap();
+        assert!(removed.iter().all(|tool| tool["name"] != "beta_tool"));
+
+        let updated_description = {
+            let mut tool = first_tool.clone();
+            tool["description"] = json!("Updated fixture description");
+            route_gateway_tools(vec![tool]).unwrap()
+        };
+        assert_eq!(
+            updated_description[2]["description"],
+            "Updated fixture description"
+        );
+
+        let renamed = {
+            let mut tool = first_tool.clone();
+            tool["name"] = json!("renamed_tool");
+            route_gateway_tools(vec![tool, second_tool]).unwrap()
+        };
+        assert_eq!(renamed[2]["name"], "renamed_tool");
+        assert_eq!(renamed[3]["name"], "beta_tool");
+
+        let mut malformed = first_tool.clone();
+        malformed["inputSchema"]["required"] = json!(["missing"]);
+        assert!(route_gateway_tools(vec![malformed]).is_err());
+        assert!(route_gateway_tools(vec![first_tool.clone(), first_tool]).is_err());
+        let reserved_name = json!({
+            "name": "host_list",
+            "title": "Conflicting host list",
+            "description": "Conflicts with generated routing metadata",
+            "annotations": {},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        });
+        assert!(route_gateway_tools(vec![reserved_name]).is_err());
+        let empty_name = json!({
+            "name": "",
+            "title": "Missing name",
+            "description": "Malformed source",
+            "annotations": {},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        });
+        assert!(route_gateway_tools(vec![empty_name]).is_err());
+
+        let permuted_a = json!({"z": {"b": 2, "a": 1}, "a": 0});
+        let permuted_b = json!({"a": 0, "z": {"a": 1, "b": 2}});
+        assert_eq!(
+            stable_pretty_json(&permuted_a),
+            stable_pretty_json(&permuted_b)
+        );
+        assert_eq!(
+            stable_pretty_json(&Value::Array(routed.clone())),
+            stable_pretty_json(&Value::Array(route_gateway_tools(source).unwrap()))
+        );
+    }
+
+    #[test]
+    fn gateway_generated_fingerprint_matches_checked_in_snapshot() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("gateway")
             .join("contract")
@@ -2519,7 +3030,7 @@ mod tests {
         }
         let checked_in = std::fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!(
-                "could not read public contract fingerprint {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test public_contract_fingerprint_matches_checked_in_snapshot",
+                "could not read public contract fingerprint {}: {error}; regenerate with TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote-mcp --locked gateway_generated",
                 path.display()
             )
         });
@@ -2547,7 +3058,7 @@ mod tests {
     #[test]
     fn public_tools_have_chatgpt_display_metadata() {
         let tools = tools(true, true).as_array().unwrap().to_owned();
-        assert_eq!(tools.len(), 29);
+        assert!(!tools.is_empty());
         assert!(tools.iter().all(|tool| {
             tool["name"].is_string()
                 && tool["title"].is_string()

@@ -39,7 +39,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Set up Linux sandbox runtime
         shell: bash
@@ -110,8 +110,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --bin temote-mcp --locked routed_gateway_contract_matches_checked_in_snapshot
-          cargo test --bin temote-mcp --locked public_contract_fingerprint_matches_checked_in_snapshot
+          TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote-mcp --locked gateway_generated
           npm test --prefix gateway
 
       - name: Create release-only commit
