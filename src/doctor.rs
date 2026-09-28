@@ -297,8 +297,27 @@ pub async fn run(options: Options) -> Result<()> {
     }
 
     check_delegation_backends(&mut report);
+    report.add(check_jj_binary("jj").await);
 
     report.finish()
+}
+
+async fn check_jj_binary(program: &str) -> Check {
+    const NAME: &str = "development jj";
+    const HINT: &str = "Install Jujutsu (jj) and ensure `jj --version` succeeds on PATH; jj is optional for Temote MCP.";
+    match run_doctor_command(program, &["--version"]).await {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let version = stdout.trim();
+            if !output.truncated && version.starts_with("jj ") && !version.contains('\n') {
+                Check::pass(NAME, version)
+            } else {
+                Check::warn(NAME, "jj returned an unexpected version response", HINT)
+            }
+        }
+        Ok(_) => Check::warn(NAME, "jj --version exited unsuccessfully", HINT),
+        Err(_) => Check::warn(NAME, "jj is unavailable or its version probe failed", HINT),
+    }
 }
 
 fn delegation_binary_on_path(name: &str) -> Option<PathBuf> {
@@ -2202,6 +2221,43 @@ fn contains_loopback_permission_error_text(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::test_support;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jj_probe_checks_execution_and_warns_without_failing_doctor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let binary = fixture.path().join("jj");
+        let program = binary.to_str().unwrap();
+        let missing = check_jj_binary(program).await;
+        assert_eq!(missing.level, Level::Warn);
+        assert!(!missing.is_failure());
+
+        for (body, expected) in [
+            ("printf 'jj 0.37.0\\n'", Level::Pass),
+            ("printf 'jj 0.37.0\\n'; exit 1", Level::Warn),
+            ("exit 0", Level::Warn),
+            ("printf 'unexpected\\n'", Level::Warn),
+        ] {
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --version ] || exit 99\n{body}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let check = check_jj_binary(program).await;
+            assert_eq!(check.level, expected, "probe body={body}");
+            assert!(!check.is_failure());
+            if expected == Level::Pass {
+                assert_eq!(check.detail, "jj 0.37.0");
+            } else {
+                assert!(check.hint.unwrap().contains("optional"));
+            }
+        }
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(check_jj_binary(program).await.level, Level::Warn);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

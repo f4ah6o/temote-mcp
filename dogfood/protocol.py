@@ -201,13 +201,15 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
         raise ValueError("unknown target assertion")
     if any(key not in OPERATIONS for key in target_operations):
         raise ValueError("unknown target operation")
-    targets_met = bool(target_metrics or target_operations or target_assertions)
-    targets_met &= all(candidate["metrics"][key] < baseline["metrics"][key] for key in target_metrics)
-    targets_met &= all(candidate["metrics"]["tool_calls_per_operation"].get(key, 0)
-                       < baseline["metrics"]["tool_calls_per_operation"].get(key, 0)
-                       for key in target_operations)
-    targets_met &= all(baseline["assertions"][key] != "pass" and candidate["assertions"][key] == "pass"
-                       for key in target_assertions)
+    target_deltas = [candidate["metrics"][key] - baseline["metrics"][key]
+                     for key in target_metrics]
+    target_deltas += [candidate["metrics"]["tool_calls_per_operation"].get(key, 0)
+                      - baseline["metrics"]["tool_calls_per_operation"].get(key, 0)
+                      for key in target_operations]
+    target_improved = any(delta < 0 for delta in target_deltas) or any(
+        baseline["assertions"][key] != "pass" and candidate["assertions"][key] == "pass"
+        for key in target_assertions)
+    target_regressed = any(delta > 0 for delta in target_deltas)
     no_assertion_regression = all(value != "pass" or candidate["assertions"].get(key) == "pass"
                                   for key, value in baseline["assertions"].items())
     selectors = ("backend", "model", "effort")
@@ -215,10 +217,30 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
     candidate_profile = candidate["snapshot"]["environment_capabilities"]
     environment_comparable = all(baseline_profile.get(key) == candidate_profile.get(key)
                                  for key in selectors)
-    safe = (candidate["outcome"] == "pass" and no_assertion_regression and targets_met
+    safe = (candidate["outcome"] == "pass" and no_assertion_regression and not target_regressed
             and environment_comparable
             and bool(gate_results) and all(v == "pass" for v in gate_results.values())
             and all(v == "pass" for v in candidate["assertions"].values()))
+    if not environment_comparable:
+        improvement = "not_evaluated"
+    elif target_regressed or not no_assertion_regression:
+        improvement = "regressed"
+    elif candidate["outcome"] != "pass" or any(
+            value != "pass" for value in candidate["assertions"].values()):
+        improvement = "not_evaluated"
+    else:
+        improvement = "improved" if target_improved else "unchanged"
+    if not environment_comparable:
+        reason = "backend, model or effort differs"
+    elif target_regressed or not no_assertion_regression:
+        reason = "target metric or assertion regressed"
+    elif candidate["outcome"] != "pass" or any(
+            value != "pass" for value in candidate["assertions"].values()):
+        reason = "candidate run or assertions did not pass"
+    elif not gate_results or any(value != "pass" for value in gate_results.values()):
+        reason = "acceptance gates are missing or did not pass"
+    else:
+        reason = "assertions and gates passed; " + improvement
     measures = {}
     for key, value in baseline["metrics"].items():
         if key == "tool_calls_per_operation":
@@ -274,6 +296,7 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
         "target_metrics": target_metrics, "target_operations": target_operations,
         "target_assertions": target_assertions,
         "environment_comparable": environment_comparable,
+        "improvement": improvement,
         "regression_gates": gate_results, "qualification": "qualified" if safe else "blocked",
-        "reason": "assertions and gates passed" if safe else "missing, failed or incomparable acceptance evidence",
+        "reason": reason,
     }

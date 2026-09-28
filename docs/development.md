@@ -29,6 +29,12 @@ On Linux, `doctor` checks the installed sandbox helper, `bubblewrap`, user names
 
 `doctor` also reports delegation backend readiness as warnings: whether the `codex` and `opencode` binaries are resolvable (including `TEMOTE_OPENCODE_BIN`) and whether each backend has visible credentials (`$CODEX_HOME/auth.json` or `OPENAI_API_KEY` for Codex; `$XDG_DATA_HOME/opencode/auth.json` for OpenCode). These are warnings rather than failures because delegation is optional, and no turn is executed.
 
+For development with Jujutsu, `doctor` runs `jj --version` and reports the version
+as `development jj`. Missing or unusable jj produces a warning because jj is
+optional. This bounded probe does not initialize or snapshot a workspace, change
+bookmarks, or verify repository configuration. See the
+[dogfood harness](self-improvement-dogfood.md) for development with jj.
+
 ```sh
 temote-mcp doctor --profile cloudflare
 temote-mcp doctor --profile tailscale
