@@ -74,6 +74,21 @@ fn private_upgrade_binary() -> (TempDir, PathBuf) {
     (directory, binary)
 }
 
+/// An installed bundle missing its sandbox helper fails the helper-generation
+/// compatibility gate when pointed to by TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR.
+#[cfg(target_os = "linux")]
+fn helperless_upgrade_binary() -> (TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new().expect("failed to create private executable directory");
+    let binary = directory.path().join("temote-mcp");
+    fs::copy(env!("CARGO_BIN_EXE_temote-mcp"), &binary)
+        .expect("failed to copy upgrade test executable");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        .expect("failed to protect upgrade test executable");
+    (directory, binary)
+}
+
 struct ChildGuard {
     child: Child,
 }
@@ -645,6 +660,80 @@ fn supervisor_upgrade_force_stops_unrestorable_sessions() {
     assert_cli_success(&info, "session info after forced upgrade");
     let info: Value = serde_json::from_slice(&info.stdout).expect("invalid session info JSON");
     assert_eq!(info["status"], "degraded");
+
+    supervisor.interrupt();
+    let status = supervisor.wait_for_exit(SHUTDOWN_TIMEOUT);
+    assert!(status.success(), "supervisor exited with {status}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "process-boundary upgrade E2E; run explicitly on Linux"]
+fn supervisor_upgrade_force_leaves_blocked_sessions_when_gates_fail() {
+    let (_binary_directory, binary) = private_upgrade_binary();
+    let (_helperless_directory, helperless_binary) = helperless_upgrade_binary();
+    let project = TempDir::new().expect("failed to create E2E project directory");
+    let state = TempDir::new().expect("failed to create isolated state directory");
+    initialize_git_repository(project.path(), state.path());
+    let session_id = format!("upgrade-gate-{}", std::process::id());
+
+    let mut supervisor = spawn_supervisor(&binary, project.path(), state.path());
+    wait_for_supervisor(&binary, project.path(), state.path());
+    let victim = project.path().join("victim");
+    fs::create_dir_all(&victim).expect("failed to create session workspace");
+    let start = run_cli(
+        &binary,
+        &["session", "start", "--path", "src/victim", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&start, "session start before upgrade");
+    fs::remove_dir_all(&victim).expect("failed to remove session workspace");
+
+    // Pointing the installed locator at a bundle without its sandbox helper
+    // fails a non-session compatibility gate; `upgrade --force` must abort
+    // before stopping the blocked session.
+    let mut command = Command::new(&binary);
+    let upgrade = isolate_process(&mut command, state.path())
+        .args(["upgrade", "--force"])
+        .env(
+            "TEMOTE_MCP_SOCKET_NAMESPACE",
+            socket_namespace(state.path()),
+        )
+        .env("TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR", &helperless_binary)
+        .current_dir(state.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run temote-mcp upgrade --force");
+    assert!(
+        !upgrade.status.success(),
+        "upgrade --force succeeded despite the helper gate: stdout={} stderr={}",
+        String::from_utf8_lossy(&upgrade.stdout),
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&upgrade.stderr);
+    assert!(
+        stderr.contains("sandbox helper generation"),
+        "expected the helper-generation gate to reject the upgrade: stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("stopping unrestorable session"),
+        "upgrade stopped a session before a gate rejected it: stderr={stderr}"
+    );
+
+    let info = run_cli(
+        &binary,
+        &["session", "info", &session_id],
+        state.path(),
+        state.path(),
+    );
+    assert_cli_success(&info, "session info after rejected upgrade");
+    let info: Value = serde_json::from_slice(&info.stdout).expect("invalid session info JSON");
+    assert_eq!(info["status"], "degraded");
+    assert!(
+        info["pid"].is_u64(),
+        "blocked session lost its runtime although the upgrade was rejected: {info}"
+    );
 
     supervisor.interrupt();
     let status = supervisor.wait_for_exit(SHUTDOWN_TIMEOUT);

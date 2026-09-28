@@ -2738,6 +2738,11 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     }
     let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
     ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
+    // Every non-destructive gate must pass before --force may stop
+    // unrestorable sessions; a compatibility failure must leave the running
+    // session set untouched.
+    ensure_upgrade_compatibility_gates(&preflight)?;
+    revalidate_installed_upgrade_executable(&executable)?;
     let mut stopped_unrestorable = 0_usize;
     if preflight.blocked_session_count > 0 {
         anyhow::ensure!(
@@ -2746,6 +2751,23 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
             preflight.blocked_session_count
         );
         for blocked in &preflight.blocked_sessions {
+            match blocked_session_instance_current(&preflight, &blocked.id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "warning: session {} was replaced after upgrade preflight; not stopping it",
+                        blocked.id
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: could not re-check session {} before stop: {error:#}",
+                        blocked.id
+                    );
+                    continue;
+                }
+            }
             eprintln!(
                 "stopping unrestorable session {}: {}",
                 blocked.id, blocked.reason
@@ -2762,21 +2784,17 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
                 }
             }
         }
+        // Stopping sessions changed the runtime: re-run preflight and every
+        // compatibility gate against the fresh state before the handoff.
         preflight = upgrade_preflight_with_force(&executable, force).await?;
         anyhow::ensure!(
             preflight.blocked_session_count == 0,
             "upgrade is still blocked by {} session(s) after --force stopped unrestorable sessions",
             preflight.blocked_session_count
         );
+        ensure_upgrade_compatibility_gates(&preflight)?;
+        revalidate_installed_upgrade_executable(&executable)?;
     }
-    anyhow::ensure!(
-        !preflight.direct_ingress_blocked,
-        "direct ingress upgrade is blocked"
-    );
-    anyhow::ensure!(
-        preflight.helper_generation == HelperGeneration::Compatible,
-        "sandbox helper generation is not compatible with the running supervisor"
-    );
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
     let restored = apply_supervisor_upgrade(
         &executable_path,
@@ -2811,6 +2829,43 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
         preflight.source_version, executable.target_version
     );
     Ok(())
+}
+
+fn ensure_upgrade_compatibility_gates(preflight: &RemoteUpgradePreflight) -> Result<()> {
+    anyhow::ensure!(
+        !preflight.direct_ingress_blocked,
+        "direct ingress upgrade is blocked"
+    );
+    anyhow::ensure!(
+        preflight.helper_generation == HelperGeneration::Compatible,
+        "sandbox helper generation is not compatible with the running supervisor"
+    );
+    Ok(())
+}
+
+/// True while the supervisor still runs the session instance the upgrade
+/// preview declared unrestorable. A session restarted after the preview
+/// reuses the id but is a different instance and must not be stopped by
+/// `upgrade --force`.
+async fn blocked_session_instance_current(
+    preflight: &RemoteUpgradePreflight,
+    session_id: &str,
+) -> Result<bool> {
+    let expected = preflight
+        .planned_sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .with_context(|| {
+            format!("session {session_id} is missing from upgrade preview identities")
+        })?;
+    let result = upgrade_request(ControlRequest::Info {
+        session_id: session_id.to_owned(),
+    })
+    .await?;
+    let view: SessionView =
+        serde_json::from_value(result).context("invalid session view returned by upgrade probe")?;
+    Ok(view.process_id == expected.source_process_id
+        && view.started_at == expected.source_started_at)
 }
 
 fn ensure_no_remote_upgrade_owns_runtime(
