@@ -33,8 +33,10 @@ impl CloneSource {
 pub(crate) struct PreparedClone {
     session: config::Session,
     task_args: Value,
+    task_origin: codex_app_server::TaskStartOrigin,
     source: CloneSource,
     destination: PathBuf,
+    #[cfg(test)]
     retained_retry: bool,
 }
 
@@ -48,24 +50,13 @@ impl PreparedClone {
         actor: &observation::ActorRef,
         activity: Option<&ActivityScope>,
     ) -> Result<Value> {
-        if self.retained_retry {
-            return orchestration::invoke(
-                orchestration::Backend::Codex,
-                orchestration::Operation::TaskStart,
-                &self.task_args,
-                &self.session,
-                actor,
-                activity,
-            )
-            .await;
-        }
-
         let root = self.session.cwd.clone();
         let source = self.source.clone();
         let destination = self.destination.clone();
         orchestration::invoke_codex_task_start_with_admission(
             &self.task_args,
             &self.session,
+            &self.task_origin,
             actor,
             activity,
             move || validate_filesystem_admission(&root, &source, &destination),
@@ -127,6 +118,11 @@ pub(crate) async fn prepare(
     let source = parse_source(root_name, source_input)?;
     let destination = validate_relative_path(destination_input, "destination")?;
     let prompt = clone_prompt(&source, &destination)?;
+    let task_origin = codex_app_server::TaskStartOrigin::repository_clone_bare(
+        root_name,
+        source_input,
+        destination_input,
+    );
     let task_args = json!({
         "session_id": session_id,
         "operation_id": operation_id,
@@ -140,7 +136,8 @@ pub(crate) async fn prepare(
     // not treated as retained: no agent side effect could have occurred, so
     // normal filesystem admission is required again before retrying startup.
     let retained_retry =
-        codex_app_server::task_start_replay_if_retained(&task_args, &session)?.is_some();
+        codex_app_server::task_start_replay_if_retained(&task_args, &session, &task_origin)?
+            .is_some();
     if !retained_retry {
         validate_filesystem_admission(&session.cwd, &source, &destination)?;
     }
@@ -148,8 +145,10 @@ pub(crate) async fn prepare(
     Ok(PreparedClone {
         session,
         task_args,
+        task_origin,
         source,
         destination,
+        #[cfg(test)]
         retained_retry,
     })
 }
@@ -517,6 +516,28 @@ mod tests {
         assert!(prompt.contains("do not use `mkdir -p`"));
     }
 
+    #[test]
+    fn named_root_aliases_lower_to_the_same_prompt_but_keep_original_identity() {
+        let destination = Path::new("repo.git");
+        let src_source = parse_source("src", "src/source").unwrap();
+        let work_source = parse_source("work", "work/source").unwrap();
+        let src_prompt = clone_prompt(&src_source, destination).unwrap();
+        let work_prompt = clone_prompt(&work_source, destination).unwrap();
+        assert_eq!(src_prompt, work_prompt);
+
+        let src_origin = codex_app_server::TaskStartOrigin::repository_clone_bare(
+            "src",
+            "src/source",
+            "repo.git",
+        );
+        let work_origin = codex_app_server::TaskStartOrigin::repository_clone_bare(
+            "work",
+            "work/source",
+            "repo.git",
+        );
+        assert_ne!(src_origin, work_origin);
+    }
+
     #[tokio::test]
     async fn prepare_and_execute_replay_retained_clone_without_reapplying_filesystem_admission() {
         let fixture = tempfile::tempdir().unwrap();
@@ -556,9 +577,12 @@ mod tests {
             let fresh = prepare(&args, Some(&backend)).await.unwrap();
             assert!(!fresh.retained_retry);
             std::fs::create_dir(root.join(&destination)).unwrap();
-            let task_id =
-                codex_app_server::seed_completed_task_for_test(&fresh.task_args, &fresh.session)
-                    .unwrap();
+            let task_id = codex_app_server::seed_completed_task_for_test(
+                &fresh.task_args,
+                &fresh.session,
+                &fresh.task_origin,
+            )
+            .unwrap();
 
             let retained = prepare(&args, Some(&backend)).await.unwrap();
             assert!(retained.retained_retry);

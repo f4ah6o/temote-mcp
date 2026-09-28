@@ -272,6 +272,7 @@ pub(crate) async fn invoke(
 pub(crate) async fn invoke_codex_task_start_with_admission<F>(
     args: &Value,
     session: &config::Session,
+    origin: &codex_app_server::TaskStartOrigin,
     actor: &observation::ActorRef,
     activity: Option<&ActivityScope>,
     admission: F,
@@ -288,7 +289,8 @@ where
     };
     let (detail, metadata) = task_start_approval(start);
     authorize(backend, operation, session, detail, metadata, activity).await?;
-    let result = codex_app_server::task_start_with_admission(args, session, admission).await;
+    let result =
+        codex_app_server::task_start_with_admission(args, session, origin, admission).await;
     observation::record_outcome(session, actor, backend, operation, &request, &result);
     result
 }

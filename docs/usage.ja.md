@@ -114,6 +114,9 @@ tool は通常の retained Codex `task_id` を返します。
 既存の lifecycle には `codex_task_get`、`codex_task_control`、`task_list`、`evidence_read` を使用します。
 exact retry では同じ `operation_id` と request を再利用します。
 destination 作成後でも retained operation を返し、clone を再実行しません。
+clone 固有の request identity を記録する前に作成された receipt は、この tool 由来であることを authoritative に証明できないため、clone retry として拒否します。
+既存の `task_id` を `codex_task_get`、`task_list`、`evidence_read` で reconcile してください。
+effect が不明な間は、新しい `operation_id` を送信しないでください。
 Codex turn の `networkAccess: false` は維持され、HTTPS access と command/file mutation は既存の explicit child approval を通ります。
 古い lifecycle supervisor は repository-clone admission capability を advertise しないため、task 作成前に `REPOSITORY_CLONE_SUPERVISOR_UNAVAILABLE` で失敗します。
 supervisor の置換には explicit host approval が必要で、session が restore または restart される場合があります。
