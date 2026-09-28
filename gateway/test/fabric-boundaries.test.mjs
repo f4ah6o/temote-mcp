@@ -19,6 +19,14 @@ import {
   observationPlaneBindings,
 } from "../src/observation/index.js";
 import { contextPlaneBindings } from "../src/context/index.js";
+import * as workerEntrypoint from "../src/index.js";
+
+test("Worker named helper and Durable Object exports remain callable", () => {
+  const invalid = Object.entries(workerEntrypoint)
+    .filter(([name, value]) => name !== "default" && typeof value !== "function")
+    .map(([name]) => name);
+  assert.deepEqual(invalid, []);
+});
 
 test("Fabric access helpers are independently importable", () => {
   assert.equal(accessEmailAllowed("USER@example.com", "user@example.com"), true);

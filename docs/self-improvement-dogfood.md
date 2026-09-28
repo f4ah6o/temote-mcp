@@ -19,7 +19,8 @@ live run uses an **existing active local session** and a specified Temote binary
 python3 -m dogfood run baseline delegation-lifecycle \
   --adapter live --binary target/debug/temote-mcp \
   --session-id <existing-session-id> --backend codex \
-  --model <available-model> --effort <available-effort>
+  --model <available-model> --effort <available-effort> \
+  --max-polls 200 --poll-interval 1
 ```
 
 The live task asks the backend for a short read-only repository status report.
@@ -28,7 +29,9 @@ older client behavior; the default `reuse` consumes the terminal poll's
 evidence reference directly. Both strategies use the same scenario revision.
 The runner does not create or stop sessions. `--max-polls` (default 20) and
 `--poll-interval` (default 1 second) bound waiting. A run reaching the limit is
-`blocked`, never a pass. Runs go to ignored, owner-local `dogfood/runs/` unless
+`blocked`, never a pass. The live example uses a longer bounded wait because
+reasoning tasks can exceed the default 20 polls; choose the same waiting policy
+for baseline and candidate. Runs go to ignored, owner-local `dogfood/runs/` unless
 `--output` selects another path. Existing artifacts are never overwritten.
 The live adapter keeps the stdio MCP process alive while evidence is read. For
 rediscovery it opens a second MCP process while the runtime owner remains alive;
@@ -104,6 +107,53 @@ improvement cannot compensate for an incomplete issue or failing checks.
 An accepted unchanged comparison exits with status 0, just like an improvement.
 Blocked comparisons exit with status 1. Old comparison files are immutable;
 rerun `compare` into a new output file to use these semantics.
+
+## Fabric metadata and deployment loop
+
+The delegated task scenario observes execution behavior; it does not discover
+new tool definitions or deploy Fabric. Use the runtime observations to identify
+friction, then change the authoritative Rust registry when a tool needs a fix.
+Fabric (currently `gateway/`) consumes the generated public host-routing
+projection, including descriptions and input schemas:
+
+```text
+src/mcp.rs::tools() + public host-routing projection
+  -> just generate-tools
+  -> gateway/contract/routed-tool-metadata.json
+  -> gateway/src/protocol.js::PUBLIC_TOOLS
+  -> Worker MCP tools/list
+```
+
+After retaining a baseline binary and observation, run:
+
+```sh
+just generate-tools
+just check-generated
+npm ci --prefix gateway
+npm test --prefix gateway
+npm run deploy:dry-run --prefix gateway
+```
+
+Run generation twice and compare the artifact bytes. The generator’s fixture
+tests additionally cover add/remove/rename, prose changes, malformed metadata,
+and stale outputs. These checks need no live provider. Build the candidate and
+repeat the live scenario using the baseline backend/model/effort. Retain the
+candidate diff under the ignored run directory because HEAD alone does not
+identify uncommitted changes.
+
+Follow [Fabric deployment](gateway.md#deploy) to configure and inspect the
+existing public target, Access, D1 and secrets before deploying. Verify the
+Worker health fingerprint and authenticated `tools/list` against the generated
+metadata, including descriptions, schemas, count and representative tools.
+Record build, generated-state, runtime and deployment outcomes as independent
+gates. An unavailable credential, failed live task, or missing endpoint check
+is `blocked`/`not_run`; fixture success never substitutes for it. Local
+implementation qualification and Cloudflare deployment qualification may use
+separate gate maps so a local passing comparison does not claim remote success.
+
+The [2026-09-28 Fabric dogfood evaluation](evaluations/fabric-dogfood-20260928.md)
+records the local cycle, the initially blocked Cloudflare gates, subsequent
+authenticated deployment and plugin verification, and persistent host startup.
 
 ## Release qualification
 

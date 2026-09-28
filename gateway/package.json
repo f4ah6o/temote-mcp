@@ -6,12 +6,15 @@
   "scripts": {
     "test": "node --test",
     "test:sandbox": "node --test test/protocol.test.mjs",
-    "dev": "npx wrangler dev",
-    "deploy": "npx wrangler deploy",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "deploy:preflight": "node scripts/deployment-preflight.mjs",
-    "deploy:dry-run": "npx wrangler deploy --dry-run"
+    "deploy:dry-run": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "4.142.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

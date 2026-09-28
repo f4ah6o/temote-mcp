@@ -17,14 +17,14 @@ fmt:
     cargo fmt --all
 
 # Run the checks used before publishing changes.
-check: fmt-check test clippy gateway-test diff-check
+check: fmt-check check-generated test clippy gateway-test diff-check
 
 # Run the deterministic subset that is valid from inside an already-sandboxed
 # normal Temote developer session. This is intentionally not a replacement for
 # `just check` or CI: tests that need Unix-socket syscalls, a nested bubblewrap
 # namespace, nested process spawning, or a macOS Seatbelt host remain host/CI
 # gates and are reported as NOT RUN here.
-sandboxed-check: fmt-check sandboxed-test clippy sandboxed-no-default gateway-sandbox-test diff-check
+sandboxed-check: fmt-check check-generated sandboxed-test clippy sandboxed-no-default gateway-sandbox-test diff-check
 
 sandboxed-test:
     cargo test --lib --all-features --locked -- --skip sandbox::linux_tests
@@ -63,6 +63,14 @@ linux-sandbox-acceptance:
     cargo build --bin temote-linux-sandbox --locked
     cargo test --lib --all-features --locked linux_tests -- --nocapture
     cargo test --lib --all-features --locked sandbox::linux::helper::tests::pinned_workspace_descriptor_survives_a_path_swap_host_acceptance -- --exact --ignored --nocapture
+
+# Regenerate Fabric tool metadata, behavioral contract, and fingerprint from Rust.
+generate-tools:
+    TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=1 cargo test --bin temote-mcp --locked gateway_generated
+
+# Fail when checked-in Fabric metadata differs from the authoritative definitions.
+check-generated:
+    TEMOTE_MCP_UPDATE_GATEWAY_CONTRACT=0 cargo test --bin temote-mcp --locked gateway_generated
 
 fmt-check:
     cargo fmt --all -- --check

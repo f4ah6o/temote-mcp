@@ -62,10 +62,7 @@ export {
   normalizeAccessTeamDomain,
   validateAccessJwtShape,
 } from "./access.js";
-export {
-  OBSERVATION_SCHEMA_VERSION,
-  observationPlaneBindings,
-} from "./observation/index.js";
+export { observationPlaneBindings } from "./observation/index.js";
 export { contextPlaneBindings } from "./context/index.js";
 export { GatewayRegistry, GatewaySession } from "./routing-runtime.js";
 export {
