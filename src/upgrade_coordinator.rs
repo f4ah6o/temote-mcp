@@ -616,6 +616,7 @@ mod tests {
             planned_session_count: 1,
             blocked_session_count: 0,
             blocker_reasons: Vec::new(),
+            blocked_sessions: Vec::new(),
             direct_ingress_action: if supervisor_handoff_required {
                 "restart".to_owned()
             } else {

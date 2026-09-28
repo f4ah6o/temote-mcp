@@ -4,6 +4,7 @@
 
 ### Added
 
+- `temote-mcp upgrade --dry-run` now lists each unrestorable session's `session_id` and reason in `blocked_sessions`, and `temote-mcp upgrade --force` stops those sessions before the handoff (they are not restored) instead of aborting; protocol, ingress, and helper compatibility gates still apply. ([upgrade force and blocked session list](issues/open/20260928-upgrade-force-blocked-sessions.md))
 - Added `repository_clone_bare`, an idempotent public tool that admits an active non-yolo session at an exact supervisor-configured named root, accepts same-root local or credential-free HTTPS sources, rejects existing or escaping destinations, and delegates an atomically claimed bare Git clone through the retained Codex task lifecycle without exposing an absolute host path.
 - `temote-mcp doctor` checks Jujutsu (`jj --version`) for development readiness and warns when jj is missing or unusable without requiring it for normal operation.
 - Added a repository-owned dogfood harness for versioned logical scenarios, bounded call observations, deterministic fault fixtures, live MCP runs, and evidence-linked before/after comparison. ([self-improvement protocol](issues/done/20260928-self-improvement-dogfood-protocol.md))

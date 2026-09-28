@@ -255,7 +255,7 @@ where
             .take(&mut args)
             .is_present();
         let force = noargs::flag("force")
-            .doc("Perform a handoff even when the running and installed versions match")
+            .doc("Perform a handoff even when versions match, stopping sessions that cannot be restored")
             .take(&mut args)
             .is_present();
         return finish(args, Command::Upgrade { dry_run, force });

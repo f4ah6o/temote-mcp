@@ -2421,6 +2421,10 @@ pub struct RemoteUpgradePreflight {
     pub planned_session_count: usize,
     pub blocked_session_count: usize,
     pub blocker_reasons: Vec<&'static str>,
+    /// Sessions the upgrade cannot restore, with the reason each failed
+    /// preflight. `upgrade --force` stops these sessions instead of
+    /// restoring them.
+    pub blocked_sessions: Vec<crate::supervisor::UpgradeSessionBlocker>,
     pub direct_ingress_action: String,
     pub direct_ingress_blocked: bool,
     pub reconnect_expected: bool,
@@ -2519,6 +2523,7 @@ async fn upgrade_preflight_with_force(
             .iter()
             .map(|_| "session_not_restorable")
             .collect(),
+        blocked_sessions: preview.blocked_sessions,
         direct_ingress_action,
         direct_ingress_blocked,
         reconnect_expected,
@@ -2726,26 +2731,61 @@ fn codex_plugin_reconcile_command(
 
 pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     let executable = capture_installed_upgrade_executable()?;
-    let preflight = upgrade_preflight_with_force(&executable, force).await?;
+    let mut preflight = upgrade_preflight_with_force(&executable, force).await?;
     if dry_run {
         println!("{}", serde_json::to_string_pretty(&preflight)?);
         return Ok(());
     }
     let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
     ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
-    anyhow::ensure!(
-        preflight.blocked_session_count == 0,
-        "upgrade is blocked by {} session(s)",
-        preflight.blocked_session_count
-    );
-    anyhow::ensure!(
-        !preflight.direct_ingress_blocked,
-        "direct ingress upgrade is blocked"
-    );
-    anyhow::ensure!(
-        preflight.helper_generation == HelperGeneration::Compatible,
-        "sandbox helper generation is not compatible with the running supervisor"
-    );
+    // Every non-destructive gate must pass before --force may stop
+    // unrestorable sessions; a compatibility failure must leave the running
+    // session set untouched.
+    ensure_upgrade_compatibility_gates(&preflight)?;
+    revalidate_installed_upgrade_executable(&executable)?;
+    let stopped_unrestorable = if preflight.blocked_session_count > 0 {
+        anyhow::ensure!(
+            force,
+            "upgrade is blocked by {} session(s)",
+            preflight.blocked_session_count
+        );
+        let planned_sessions = preflight.planned_sessions.clone();
+        let stopped = stop_unrestorable_sessions(
+            &preflight.blocked_sessions,
+            move |session_id: String| {
+                let expected = planned_sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .cloned()
+                    .with_context(|| {
+                        format!("session {session_id} is missing from upgrade preview identities")
+                    });
+                async move { blocked_session_instance_current(expected?, session_id).await }
+            },
+            |session_id| async move {
+                upgrade_request(ControlRequest::Stop {
+                    session_id,
+                    public: false,
+                })
+                .await?;
+                Ok(())
+            },
+        )
+        .await?;
+        // Stopping sessions changed the runtime: re-run preflight and every
+        // compatibility gate against the fresh state before the handoff.
+        preflight = upgrade_preflight_with_force(&executable, force).await?;
+        anyhow::ensure!(
+            preflight.blocked_session_count == 0,
+            "upgrade is still blocked by {} session(s) after --force stopped unrestorable sessions",
+            preflight.blocked_session_count
+        );
+        ensure_upgrade_compatibility_gates(&preflight)?;
+        revalidate_installed_upgrade_executable(&executable)?;
+        stopped
+    } else {
+        0
+    };
     let executable_path = revalidate_installed_upgrade_executable(&executable)?;
     let restored = apply_supervisor_upgrade(
         &executable_path,
@@ -2771,11 +2811,94 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     if let Err(error) = reconcile_codex_plugin(&executable_path, executable.installed_locator()) {
         eprintln!("{error:#}; run `temote-mcp codex plugin install` manually");
     }
+    let stopped_note = match stopped_unrestorable {
+        0 => String::new(),
+        count => format!("; stopped {count} unrestorable session(s)"),
+    };
     println!(
-        "Temote upgrade complete: {} -> {}; restored {restored} session(s)",
+        "Temote upgrade complete: {} -> {}; restored {restored} session(s){stopped_note}",
         preflight.source_version, executable.target_version
     );
     Ok(())
+}
+
+fn ensure_upgrade_compatibility_gates(preflight: &RemoteUpgradePreflight) -> Result<()> {
+    anyhow::ensure!(
+        !preflight.direct_ingress_blocked,
+        "direct ingress upgrade is blocked"
+    );
+    anyhow::ensure!(
+        preflight.helper_generation == HelperGeneration::Compatible,
+        "sandbox helper generation is not compatible with the running supervisor"
+    );
+    Ok(())
+}
+
+/// True while the supervisor still runs the session instance the upgrade
+/// preview declared unrestorable. A session restarted after the preview
+/// reuses the id but is a different instance and must not be stopped by
+/// `upgrade --force`.
+async fn blocked_session_instance_current(
+    expected: crate::upgrade_transaction::UpgradePlannedSession,
+    session_id: String,
+) -> Result<bool> {
+    let result = upgrade_request(ControlRequest::Info { session_id }).await?;
+    let view: SessionView =
+        serde_json::from_value(result).context("invalid session view returned by upgrade probe")?;
+    Ok(view.process_id == expected.source_process_id
+        && view.started_at == expected.source_started_at)
+}
+
+/// Stops each session the preview declared unrestorable. A stop failure is
+/// fatal: the supervisor drops the handle before shutdown/cleanup completes,
+/// so a warn-and-continue could let the next preflight miss the blocker and
+/// hand off to a partially cleaned runtime. Sessions that no longer match the
+/// previewed instance (or cannot be verified) are skipped and left for the
+/// re-preflight to reclassify.
+async fn stop_unrestorable_sessions<V, VFut, S, SFut>(
+    blocked_sessions: &[crate::supervisor::UpgradeSessionBlocker],
+    mut verify: V,
+    mut stop: S,
+) -> Result<usize>
+where
+    V: FnMut(String) -> VFut,
+    VFut: std::future::Future<Output = Result<bool>>,
+    S: FnMut(String) -> SFut,
+    SFut: std::future::Future<Output = Result<()>>,
+{
+    let mut stopped = 0_usize;
+    for blocked in blocked_sessions {
+        match verify(blocked.id.clone()).await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "warning: session {} was replaced after upgrade preflight; not stopping it",
+                    blocked.id
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: could not re-check session {} before stop: {error:#}",
+                    blocked.id
+                );
+                continue;
+            }
+        }
+        eprintln!(
+            "stopping unrestorable session {}: {}",
+            blocked.id, blocked.reason
+        );
+        stop(blocked.id.clone()).await.with_context(|| {
+            format!(
+                "upgrade --force could not stop unrestorable session {}; aborting \
+                 before handoff because shutdown or cleanup may be incomplete",
+                blocked.id
+            )
+        })?;
+        stopped += 1;
+    }
+    Ok(stopped)
 }
 
 fn ensure_no_remote_upgrade_owns_runtime(
@@ -6890,6 +7013,88 @@ mod tests {
             validate_planned_upgrade_session_identities(&planned, &replacement, true).unwrap_err();
         assert!(error.to_string().contains("session instance changed"));
         validate_planned_upgrade_session_identities(&planned, &replacement, false).unwrap();
+    }
+
+    fn force_stop_preflight_fixture(ids: &[&str]) -> RemoteUpgradePreflight {
+        RemoteUpgradePreflight {
+            source_version: "2026.1.0".to_owned(),
+            target_version: "2026.2.0".to_owned(),
+            compatible: true,
+            supervisor_handoff_required: true,
+            planned_session_count: ids.len(),
+            blocked_session_count: ids.len(),
+            blocker_reasons: vec!["session_not_restorable"; ids.len()],
+            blocked_sessions: ids
+                .iter()
+                .map(|id| crate::supervisor::UpgradeSessionBlocker {
+                    id: (*id).to_owned(),
+                    reason: "workspace no longer resolves".to_owned(),
+                })
+                .collect(),
+            direct_ingress_action: "unchanged".to_owned(),
+            direct_ingress_blocked: false,
+            reconnect_expected: false,
+            plugin_reconciliation_required: false,
+            client_restart_required_if_plugin_replaced: false,
+            helper_generation: HelperGeneration::Compatible,
+            #[cfg(all(feature = "network", unix))]
+            direct_ingress: None,
+            planned_sessions: ids
+                .iter()
+                .map(|id| crate::upgrade_transaction::UpgradePlannedSession {
+                    session_id: (*id).to_owned(),
+                    source_process_id: 100,
+                    source_started_at: 10,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_stop_failure_aborts_before_handoff() {
+        let preflight = force_stop_preflight_fixture(&["blocked-a"]);
+        let attempts = std::cell::Cell::new(0_usize);
+        let error = stop_unrestorable_sessions(
+            &preflight.blocked_sessions,
+            |_| async { Ok(true) },
+            |_| {
+                attempts.set(attempts.get() + 1);
+                async { anyhow::bail!("injected shutdown cleanup failure") }
+            },
+        )
+        .await
+        .expect_err("a failed forced stop must abort the upgrade");
+        assert_eq!(attempts.get(), 1);
+        assert!(
+            format!("{error:#}").contains("could not stop unrestorable session blocked-a"),
+            "stop failure lost its session context: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_or_unverifiable_blocked_sessions_are_never_stopped() {
+        for verify_result in [Ok(false), Err(anyhow::anyhow!("injected probe failure"))] {
+            let preflight = force_stop_preflight_fixture(&["blocked-a"]);
+            let stopped = std::cell::Cell::new(false);
+            let stopped_count = stop_unrestorable_sessions(
+                &preflight.blocked_sessions,
+                |_| {
+                    let result = verify_result
+                        .as_ref()
+                        .map(|value| *value)
+                        .map_err(|_| anyhow::anyhow!("injected probe failure"));
+                    async move { result }
+                },
+                |_| {
+                    stopped.set(true);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .expect("skipped sessions defer to the re-preflight instead of failing");
+            assert_eq!(stopped_count, 0);
+            assert!(!stopped.get(), "a skipped session must never be stopped");
+        }
     }
 
     const GC_TEST_CWD: &str = "/tmp";

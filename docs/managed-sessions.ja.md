@@ -113,7 +113,7 @@ starting -> active -> stopping -> stopped
 
 Temote binary を更新した後は `temote-mcp upgrade --dry-run` → `temote-mcp upgrade` を使います。target executable が running supervisor と同じ local control protocol / lifecycle schema / restore-plan schema を申告する場合だけ続行し、非互換 generation は active runtime を停止する前に拒否します。
 
-`upgrade --dry-run` で `blocked_session_count` が正の場合は、存在しない workspace や失われた restart context を持つ session を `session info <id>` で確認します。復元不要な session は `session stop <id>` で終了してから再試行します。`helper_generation` は Linux sandbox helper の互換性を示します。古い supervisor がこの値を返さない場合、upgrade CLI は installed binary に同梱された helper を検査します。
+`upgrade --dry-run` で `blocked_session_count` が正の場合、dry-run の `blocked_sessions` に復元不能な session の `session_id` と理由が一覧されます。存在しない workspace や失われた restart context を `session info <id>` で確認します。復元不要な session は `session stop <id>` で終了してから再試行するか、`temote-mcp upgrade --force` で復元不能な session をまとめて停止して続行します(停止した session は復元されません)。`--force` は version が一致する場合の handoff も強制しますが、protocol / direct ingress / helper の互換性 gate は回避しません。`helper_generation` は Linux sandbox helper の互換性を示します。古い supervisor がこの値を返さない場合、upgrade CLI は installed binary に同梱された helper を検査します。
 
 実装は live な in-process task transfer ではなく coordinated restart/restore です。旧 supervisor は lifecycle mutation を fence し、named-root/cwd resolution と memory-only restart context を検証して全 active runtime を quiesce します。integration call または approval が in-flight なら fail closed で中止します。owner-only restore plan に含めるのは session identity、path/permission/restart metadata、restart-context のキー名だけで、credential value は保存しません。graceful drain 後、同じ PID のまま `temote-mcp supervisor --restore-plan ...` を `exec` し、replacement は planned active session だけを復元して metadata と全 session socket probe を確認してから plan を削除します。
 
