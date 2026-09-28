@@ -47,6 +47,18 @@ If a task ID is lost after reconnect, call `task_list({session_id, limit?})` on 
 
 Temote yolo does not authorize delegated child mutations: command/file-change approval requests still use the explicit user-approval path and fail closed if it is unavailable. Control is limited to typed actions; do not attempt to tunnel arbitrary backend JSON-RPC or a remote shell through these tools.
 
+## Prepare a bare repository under a named root
+
+Use `repository_clone_bare` when the requested repository does not yet have a local destination and the caller should not know the host's absolute root path. Select an active non-yolo managed session whose cwd is exactly the configured named root, not a project session below it. Pass a fresh UUID `operation_id`, the root name, either a same-root logical source such as `src/project` or a credential-free HTTPS Git URL, a root-relative destination, and the Codex model/effort.
+
+Preserve the same `operation_id` for an exact retry. The returned `task_id` belongs to the ordinary Codex retained-task lifecycle, so continue with `codex_task_get`, `codex_task_control`, `task_list`, and `evidence_read`. Never retry an uncertain clone with a new operation ID merely because the destination appeared; reconcile the retained task first.
+
+Once bounded evidence confirms completion, delegate worktree creation in that root preparation session and start a normal session using the worktree's logical named-root path. Develop in that new session. If jj refuses colocation in a linked Git worktree, create its independent backing repository inside the worktree rather than granting writes to the shared bare repository outside the session scope. Track only intended development files; independent backing does not automatically export changes to the original bare repository. See `docs/self-improvement-dogfood.md` in the Temote repository for the measured recipe.
+
+The measured jj 0.45.1 recipe passes `--config 'snapshot.auto-track="none()"'` to every jj command and explicitly tracks intended files. Avoid `jj config set/edit/path --repo` or `--workspace` in this recipe: secure configuration can require host config writes outside the session scope. Read-only verification uses `--ignore-working-copy` and the same CLI config without generating or migrating a config ID.
+
+Do not put credentials in the source URL, invent an absolute destination, create parent directories, weaken the child sandbox, or use a yolo session. The Codex turn keeps network disabled by default and uses the existing explicit approval path for commands, files, and any required HTTPS access. If the tool returns `REPOSITORY_CLONE_SUPERVISOR_UNAVAILABLE`, stop before delegation: the running supervisor lacks authoritative admission. Any supervisor replacement requires explicit host approval and may restore or restart sessions; never perform it silently.
+
 ## Jobs
 
 Sandbox work that exceeds the foreground timeout can return a session-owned `job_id`. Poll it with `poll_job` until it finishes when completion is needed for the user's current task; use `job_list` for the bounded snapshot of session jobs and `stop_job` when running work is no longer needed or must be cancelled. Delegated agent tasks use `task_id` and `*_task_get`, with `task_list` for rediscovery. Jobs are session-owned and cancelled when the session stops.

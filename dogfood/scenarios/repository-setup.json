@@ -1,0 +1,26 @@
+{
+  "id": "repository-setup",
+  "revision": 1,
+  "goal": "Admit a named-root bare clone, reconcile exact retries, create a worktree and develop with jj in a normal session",
+  "operations": [
+    "inspect_session",
+    "clone_bare",
+    "wait_until_terminal",
+    "read_terminal_result",
+    "retry_clone",
+    "create_worktree",
+    "start_worktree_session",
+    "develop_with_jj",
+    "verify_repository_setup"
+  ],
+  "assertions": [
+    "identity_is_separate",
+    "bounded_result",
+    "bare_clone_completed",
+    "worktree_created",
+    "normal_session_started",
+    "jj_development_completed",
+    "no_duplicate_clone",
+    "host_admission_enforced"
+  ]
+}

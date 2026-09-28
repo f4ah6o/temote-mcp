@@ -104,6 +104,7 @@ fn operation_name(operation: ActivityOperation) -> &'static str {
         ActivityOperation::DevToolRun => "dev_tool_run",
         ActivityOperation::GetImage => "get_image",
         ActivityOperation::EvidenceRead => "evidence_read",
+        ActivityOperation::RepositoryCloneBare => "repository_clone_bare",
         ActivityOperation::CodexStatus => "codex_status",
         ActivityOperation::CodexTaskStart => "codex_task_start",
         ActivityOperation::CodexTaskGet => "codex_task_get",

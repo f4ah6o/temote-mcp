@@ -118,6 +118,11 @@ const ACTIVITY_TOOL_COVERAGE: &[ActivityToolCoverage] = &[
         ActivityOperation::EvidenceRead,
         "evidence read",
     ),
+    activity_tool_accepted(
+        "repository_clone_bare",
+        ActivityOperation::RepositoryCloneBare,
+        "repository bare clone acceptance",
+    ),
     activity_tool(
         "codex_status",
         ActivityOperation::CodexStatus,
@@ -977,6 +982,7 @@ fn tools(_public: bool, managed_sessions: bool) -> Value {
         {"name":"session_stop","title":"Stop a managed Temote MCP session","description":"Gracefully stop a session created through the authenticated HTTP endpoint and owned by the local Temote session supervisor. Local CLI/yolo sessions cannot be stopped remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_restart","title":"Restart a managed Temote MCP session","description":"Restart an active normal sandboxed session created through the authenticated HTTP endpoint. Local CLI/yolo sessions cannot be restarted remotely.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"session_info","title":"Inspect a Temote MCP session","description":"Show durable lifecycle state, working directory, permission mode, exit reason, and last error for a temote-mcp session.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
+        {"name":"repository_clone_bare","title":"Clone a bare repository under a named root","description":"Idempotently delegate one bare Git clone into a non-existing root-relative destination. The lifecycle supervisor must admit an active non-yolo session whose cwd is exactly the configured named root. Source may be a path under that same logical root or an HTTPS Git URL without credentials, query, or fragment. The clone runs in Codex with networkAccess=false and existing command/network approvals.","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"operation_id":{"type":"string","format":"uuid"},"root":{"type":"string","minLength":1,"maxLength":256},"source":{"type":"string","minLength":1,"maxLength":4096},"destination":{"type":"string","minLength":1,"maxLength":4096},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id","operation_id","root","source","destination","model","effort"],"additionalProperties":false}},
         {"name":"context_resolve","title":"Resolve the session context bundle","description":"Project the session-owned observation journal into a deterministic bounded context bundle: current task/execution/workspace state, recent task-scoped instruction references, unresolved items, and provenance refs. Read-only; knowledge/memory synthesis is not implemented yet, so knowledge fields are explicitly empty. Observation bodies stay in the owner-only journal and are never inlined.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"task_id":{"type":"string","minLength":1,"maxLength":256},"repository":{"type":"string","minLength":1,"maxLength":256},"query":{"type":"string","minLength":1,"maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":64,"default":16},"at_least_revision":{"type":"integer","minimum":0}},"required":["session_id"],"additionalProperties":false}},
         {"name":"context_status","title":"Inspect the session context plane","description":"Report the session observation journal's revision, size, compaction, and degradation counters plus the memory-worker status. Read-only and bounded; raw observation records are never returned.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}},
         {"name":"evidence_read","title":"Read scoped Temote evidence","description":"Read a bounded UTF-8 chunk from an opaque expiring evidence record previously returned by Temote. Evidence is in-memory, session-owned, canonical-scope-bound, and cannot address arbitrary filesystem paths.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},"inputSchema":{"type":"object","properties":{"session_id":{"type":"string"},"evidence_id":{"type":"string","format":"uuid"},"offset_bytes":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384}},"required":["session_id","evidence_id"],"additionalProperties":false}},
@@ -1132,6 +1138,26 @@ async fn call_tool(
         let mut rendered = serde_json::to_value(&view)?;
         rendered["server_contract_fingerprint"] = json!(public_contract_fingerprint());
         return text_result(serde_json::to_string_pretty(&rendered)?);
+    }
+    if name == "repository_clone_bare" {
+        let prepared = crate::repository_clone::prepare(&args, sessions).await?;
+        let coverage = activity_tool_coverage(name);
+        let activity = if let Some(coverage) = coverage {
+            tool_activity_scope(
+                prepared.session(),
+                coverage.operation,
+                activity_tool_summary(&args, coverage.operation),
+            )
+            .await
+        } else {
+            None
+        };
+        let result = prepared
+            .execute(&observation::ActorRef::mcp(public), activity.as_ref())
+            .await
+            .and_then(|value| text_result(serde_json::to_string_pretty(&value)?));
+        finish_covered_tool_activity(coverage, activity.as_ref(), &result);
+        return result;
     }
     let session = config::load_session(&session_id).await?;
     anyhow::ensure!(
@@ -1959,6 +1985,7 @@ mod tests {
                 "devin_task_start",
                 "opencode_task_control",
                 "opencode_task_start",
+                "repository_clone_bare",
             ]
             .into_iter()
             .collect()
@@ -3050,6 +3077,7 @@ mod tests {
             "session_stop",
             "session_restart",
             "session_info",
+            "repository_clone_bare",
             "context_resolve",
             "context_status",
             "evidence_read",

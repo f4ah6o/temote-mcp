@@ -26,6 +26,121 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(run["outcome"], "pass")
                 self.assertTrue(all(value == "pass" for value in run["assertions"].values()))
 
+    def test_http_lifecycle_roundtrip_preserves_auth_and_refuses_redirect(self):
+        import json
+        import os
+        import sys
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from unittest.mock import patch
+        from .runner import LiveAdapter, AdapterError
+
+        calls = []
+        class Handler(BaseHTTPRequestHandler):
+            redirect = False
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                calls.append((self.headers.get('Authorization'),
+                              json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                if self.redirect:
+                    self.send_response(302)
+                    self.send_header('Location', '/redirect-target')
+                    self.end_headers()
+                else:
+                    payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {'content': [
+                        {'type': 'text', 'text': json.dumps({'session_id': 'new', 'status': 'active'})}
+                    ]}}).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.serve_forever)
+        worker.start()
+        try:
+            with patch.object(LiveAdapter, '_open'), patch.dict(os.environ, {'DOGFOOD_TEST_TOKEN': 'fixture-token'}):
+                adapter = LiveAdapter(Path(sys.executable),
+                    lifecycle_url=f'http://127.0.0.1:{server.server_port}/mcp',
+                    lifecycle_token_env='DOGFOOD_TEST_TOKEN')
+                self.assertEqual(adapter.call('session_start', {'path': 'root/worktree'})['status'], 'active')
+                self.assertEqual(calls[0][0], 'Bearer fixture-token')
+                self.assertEqual(calls[0][1]['params']['arguments'], {'path': 'root/worktree'})
+                Handler.redirect = True
+                with self.assertRaises(AdapterError):
+                    adapter.call('session_start', {'path': 'root/other'})
+                self.assertEqual(len(calls), 2)
+                with self.assertRaises(ValueError):
+                    LiveAdapter(Path(sys.executable), lifecycle_url='http://example.test/mcp',
+                                lifecycle_token_env='DOGFOOD_TEST_TOKEN')
+        finally:
+            server.shutdown()
+            worker.join()
+            server.server_close()
+
+    def test_repository_setup_records_replay_and_admission(self):
+        run = fixture("repository-setup", "candidate")
+        self.assertEqual(run["outcome"], "pass")
+        self.assertEqual(run["metrics"]["recovery_calls"], 1)
+        self.assertEqual(run["metrics"]["tool_calls_per_operation"]["verify_repository_setup"], 8)
+        self.assertEqual(run["assertions"]["no_duplicate_clone"], "pass")
+        self.assertNotIn("Temote MCP bare clone dogfood", str(run))
+
+    def test_repository_setup_recovers_uncertain_acceptance_with_same_id(self):
+        from .repository_setup import SetupFixture, execute_setup
+        from .runner import AdapterError
+        class LostResponse(SetupFixture):
+            def __init__(self):
+                super().__init__()
+                self.lost = False
+            def call(self, tool, arguments):
+                response = super().call(tool, arguments)
+                if tool == "repository_clone_bare" and not self.lost:
+                    self.lost = True
+                    raise AdapterError("MCP_TIMEOUT", retryable=True)
+                return response
+        adapter = LostResponse()
+        run = execute_setup(scenario(SCENARIOS / "repository-setup.json"), "candidate", adapter,
+                            session_id="fixture", repository_head="a" * 40, binary_identity="b" * 64,
+                            poll_interval=0)
+        self.assertEqual(run["outcome"], "pass")
+        self.assertEqual(run["metrics"]["recovery_calls"], 2)
+        self.assertEqual(len(adapter.destinations), 1)
+        self.assertEqual(run["assertions"]["no_duplicate_clone"], "pass")
+
+    def test_repository_setup_does_not_claim_missing_feature(self):
+        from .runner import AdapterError
+        from .repository_setup import execute_setup
+        class Unavailable:
+            def call(self, tool, arguments):
+                if tool == "session_info":
+                    return {"status": "active", "permission_mode": "agent", "yolo": False,
+                            "server_contract_fingerprint": "f" * 64}
+                raise AdapterError("MCP_TOOL_ERROR")
+        run = execute_setup(scenario(SCENARIOS / "repository-setup.json"), "baseline", Unavailable(),
+                            session_id="fixture", repository_head="a" * 40, binary_identity="b" * 64)
+        self.assertEqual(run["outcome"], "fail")
+        self.assertEqual(run["assertions"]["bare_clone_completed"], "fail")
+        self.assertEqual(run["assertions"]["jj_development_completed"], "not_run")
+        self.assertEqual(run["metrics"]["tool_calls"], 2)
+        validate_run(run)
+
+    def test_repository_setup_verification_ignores_prompt_sentinel(self):
+        import json
+        from .repository_setup import final_report
+        from .runner import AdapterError
+        transcript = {"thread": {"turns": [{"items": [
+            {"type": "userMessage", "text": "TEMOTE_SETUP_VERIFIED"},
+            {"type": "agentMessage", "phase": "commentary", "text": "TEMOTE_SETUP_VERIFIED"},
+            {"type": "agentMessage", "phase": "final", "text": "TEMOTE_SETUP_FAILED"},
+        ]}]}}
+        self.assertEqual(final_report(json.dumps(transcript)), "TEMOTE_SETUP_FAILED")
+        transcript['thread']['turns'][0]['items'][-1]['phase'] = 'final_answer'
+        self.assertEqual(final_report(json.dumps(transcript)), "TEMOTE_SETUP_FAILED")
+        transcript["thread"]["turns"][0]["items"].pop()
+        with self.assertRaises(AdapterError):
+            final_report(json.dumps(transcript))
+
     def test_uncertain_start_reuses_identity(self):
         run = fixture("duplicate-start")
         calls = [x for x in run["events"] if x["tool"] == "codex_task_start"]

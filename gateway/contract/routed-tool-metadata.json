@@ -178,6 +178,69 @@
   },
   {
     "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Idempotently delegate one bare Git clone into a non-existing root-relative destination. The lifecycle supervisor must admit an active non-yolo session whose cwd is exactly the configured named root. Source may be a path under that same logical root or an HTTPS Git URL without credentials, query, or fragment. The clone runs in Codex with networkAccess=false and existing command/network approvals.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "destination": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "effort": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "host_id": {
+          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "operation_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "root": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Target host-local session ID. The same session ID may exist on multiple hosts.",
+          "type": "string"
+        },
+        "source": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "operation_id",
+        "root",
+        "source",
+        "destination",
+        "model",
+        "effort"
+      ],
+      "type": "object"
+    },
+    "name": "repository_clone_bare",
+    "title": "Clone a bare repository under a named root"
+  },
+  {
+    "annotations": {
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false,

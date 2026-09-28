@@ -125,7 +125,7 @@ test("gateway routed tools and protocol versions match the Rust contract", () =>
   for (const required of ["host_list", "host_info", "session_list", "session_start", "session_stop", "session_restart", "session_info"]) {
     assert.equal(names.includes(required), true, required);
   }
-  for (const required of ["evidence_read", "context_resolve", "context_status", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "task_list", "stop_job"]) {
+  for (const required of ["evidence_read", "context_resolve", "context_status", "repository_clone_bare", "codex_status", "codex_task_start", "codex_task_get", "codex_task_control", "opencode_status", "opencode_task_start", "opencode_task_get", "opencode_task_control", "devin_status", "devin_task_start", "devin_task_get", "devin_task_control", "devin_cloud_status", "devin_cloud_task_start", "devin_cloud_task_get", "devin_cloud_task_control", "poll_job", "job_list", "task_list", "stop_job"]) {
     assert.equal(names.includes(required), true, required);
   }
   for (const removed of ["execute", "start_command", "read_file", "write_file", "git_push", "github_pr_list", "dev_tool_run", "session_permission_request", "onepassword_item_get", "kintone_mcp_status", "checkpoint_save", "work_handoff", "recall"]) {
@@ -133,6 +133,7 @@ test("gateway routed tools and protocol versions match the Rust contract", () =>
   }
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_status").annotations.openWorldHint, true);
   assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_start").inputSchema.required.includes("operation_id"), true);
+  assert.equal(PUBLIC_TOOLS.find((tool) => tool.name === "repository_clone_bare").inputSchema.required.includes("operation_id"), true);
   assert.deepEqual(PUBLIC_TOOLS.find((tool) => tool.name === "codex_task_control").inputSchema.properties.action.enum, ["steer", "resume", "interrupt"]);
   assert.equal(names.includes("without_sandbox"), false);
 });

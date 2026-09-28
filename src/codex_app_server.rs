@@ -41,6 +41,7 @@ const MAX_RPC_LINE_BYTES: usize = 4 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const SESSION_STOP_POLL: Duration = Duration::from_secs(1);
+const SESSION_STOP_UNKNOWN_LIMIT: u8 = 3;
 const SESSION_CODEX_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_USAGE_FIELDS: &[&str] = &[
     "input_tokens",
@@ -283,6 +284,72 @@ impl SessionInstance {
         self.id == session.id
             && self.started_at == session.started_at
             && self.process_id == session.process_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorUnknownKind {
+    MetadataRead,
+    ActivityProbe,
+}
+
+impl SessionMonitorUnknownKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataRead => "metadata_read",
+            Self::ActivityProbe => "activity_probe",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorObservation {
+    Active,
+    Inactive,
+    OwnerChanged,
+    Unknown(SessionMonitorUnknownKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorStopReason {
+    Inactive,
+    OwnerChanged,
+    PersistentUnknown(SessionMonitorUnknownKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorAction {
+    Continue,
+    Stop(SessionMonitorStopReason),
+}
+
+#[derive(Default)]
+struct SessionStopMonitor {
+    consecutive_unknown: u8,
+}
+
+impl SessionStopMonitor {
+    fn observe(&mut self, observation: SessionMonitorObservation) -> SessionMonitorAction {
+        match observation {
+            SessionMonitorObservation::Active => {
+                self.consecutive_unknown = 0;
+                SessionMonitorAction::Continue
+            }
+            SessionMonitorObservation::Inactive => {
+                SessionMonitorAction::Stop(SessionMonitorStopReason::Inactive)
+            }
+            SessionMonitorObservation::OwnerChanged => {
+                SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged)
+            }
+            SessionMonitorObservation::Unknown(kind) => {
+                self.consecutive_unknown = self.consecutive_unknown.saturating_add(1);
+                if self.consecutive_unknown >= SESSION_STOP_UNKNOWN_LIMIT {
+                    SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(kind))
+                } else {
+                    SessionMonitorAction::Continue
+                }
+            }
+        }
     }
 }
 
@@ -1370,6 +1437,69 @@ fn fingerprint(value: &Value) -> Result<Uuid> {
     Ok(Uuid::new_v5(&REQUEST_FINGERPRINT_NAMESPACE, &bytes))
 }
 
+/// Internal authority that selected a Codex task start.
+///
+/// Public `codex_task_start` input can only select `Generic`. Higher-level
+/// tools construct their origin inside Temote so prompt text cannot impersonate
+/// a typed operation. Clone request values are committed only through the
+/// durable fingerprint; the receipt does not persist the original strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TaskStartOrigin {
+    Generic,
+    RepositoryCloneBare {
+        root: String,
+        source: String,
+        destination: String,
+    },
+}
+
+impl TaskStartOrigin {
+    pub(crate) fn repository_clone_bare(root: &str, source: &str, destination: &str) -> Self {
+        Self::RepositoryCloneBare {
+            root: root.to_owned(),
+            source: source.to_owned(),
+            destination: destination.to_owned(),
+        }
+    }
+}
+
+fn task_start_fingerprint(
+    task_id: Uuid,
+    task: &str,
+    model: &str,
+    effort: &str,
+    origin: &TaskStartOrigin,
+) -> Result<Uuid> {
+    match origin {
+        // Preserve the exact legacy generic fingerprint so retained normal
+        // Codex tasks remain replayable across this change.
+        TaskStartOrigin::Generic => fingerprint(&json!({
+            "kind": "start",
+            "task_id": task_id,
+            "task": task,
+            "model": model,
+            "effort": effort,
+        })),
+        TaskStartOrigin::RepositoryCloneBare {
+            root,
+            source,
+            destination,
+        } => fingerprint(&json!({
+            "kind": "start",
+            "task_id": task_id,
+            "task": task,
+            "model": model,
+            "effort": effort,
+            "origin": {
+                "kind": "repository_clone_bare",
+                "root": root,
+                "source": source,
+                "destination": destination,
+            },
+        })),
+    }
+}
+
 fn task_view(record: &TaskRecord, evidence_ref: Option<&evidence::EvidenceRef>) -> Value {
     json!({
         "task_id": record.task_id,
@@ -1895,17 +2025,49 @@ fn insert_runtime_unchecked(
     Ok(())
 }
 
+async fn observe_session_instance(owner: &SessionInstance) -> SessionMonitorObservation {
+    match config::read_session_metadata(&owner.id).await {
+        Ok(session) if !owner.matches(&session) => SessionMonitorObservation::OwnerChanged,
+        Ok(_) => match config::session_is_active(&owner.id).await {
+            Ok(true) => SessionMonitorObservation::Active,
+            Ok(false) => SessionMonitorObservation::Inactive,
+            Err(_) => SessionMonitorObservation::Unknown(SessionMonitorUnknownKind::ActivityProbe),
+        },
+        Err(_) => SessionMonitorObservation::Unknown(SessionMonitorUnknownKind::MetadataRead),
+    }
+}
+
 async fn wait_for_session_stop(owner: SessionInstance) {
+    let mut monitor = SessionStopMonitor::default();
     loop {
-        let same_instance_active = match config::read_session_metadata(&owner.id).await {
-            Ok(session) if owner.matches(&session) => {
-                config::session_is_active(&owner.id).await.unwrap_or(false)
+        let observation = observe_session_instance(&owner).await;
+        match monitor.observe(observation) {
+            SessionMonitorAction::Continue => {
+                if let SessionMonitorObservation::Unknown(kind) = observation
+                    && monitor.consecutive_unknown == 1
+                {
+                    eprintln!(
+                        "Codex session monitor observation is unknown; retrying accepted runtime \
+                         (session {}, class {}, limit {})",
+                        owner.id,
+                        kind.as_str(),
+                        SESSION_STOP_UNKNOWN_LIMIT
+                    );
+                }
             }
-            Ok(_) | Err(_) => false,
-        };
-        if !same_instance_active {
-            begin_session_instance_shutdown(&owner);
-            return;
+            SessionMonitorAction::Stop(reason) => {
+                if let SessionMonitorStopReason::PersistentUnknown(kind) = reason {
+                    eprintln!(
+                        "Codex session monitor remained unknown; stopping accepted runtime \
+                         fail-closed (session {}, class {}, observations {})",
+                        owner.id,
+                        kind.as_str(),
+                        monitor.consecutive_unknown
+                    );
+                }
+                begin_session_instance_shutdown(&owner);
+                return;
+            }
         }
         tokio::time::sleep(SESSION_STOP_POLL).await;
     }
@@ -2890,7 +3052,140 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
 
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
-    task_start_with_store_and_binary_inner(args, session, &store, Path::new("codex"), true).await
+    task_start_with_store_and_binary_inner(
+        args,
+        session,
+        &store,
+        Path::new("codex"),
+        true,
+        &TaskStartOrigin::Generic,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Return the retained result for an exact task-start retry without applying
+/// any new filesystem precondition. A caller uses this before checking a
+/// destination that the already-accepted task may itself have created.
+pub(crate) fn task_start_replay_if_retained(
+    args: &Value,
+    session: &config::Session,
+    origin: &TaskStartOrigin,
+) -> Result<Option<Value>> {
+    let store = TaskStore::default_store()?;
+    task_start_replay_if_retained_with_store(args, session, origin, &store)
+}
+
+fn task_start_replay_if_retained_with_store(
+    args: &Value,
+    session: &config::Session,
+    origin: &TaskStartOrigin,
+    store: &TaskStore,
+) -> Result<Option<Value>> {
+    let operation_id = required_uuid(args, "operation_id")?;
+    let task = required_string(args, "task")?;
+    let model = required_string(args, "model")?;
+    let effort = required_string(args, "effort")?;
+    validate_task_input(task, "task")?;
+    validate_argument(model, "model")?;
+    validate_argument(effort, "effort")?;
+    let task_id = task_id_for_operation(session, operation_id)?;
+    let request_fingerprint = task_start_fingerprint(task_id, task, model, effort, origin)?;
+    match store.read_record(task_id) {
+        Ok(record) => {
+            ensure_task_owner(&record, session)?;
+            let retryable_before_thread = record
+                .operations
+                .iter()
+                .find(|receipt| receipt.operation_id == operation_id)
+                .is_some_and(|receipt| {
+                    receipt.request_fingerprint == request_fingerprint
+                        && receipt.action == "start"
+                        && receipt.phase == OperationPhase::RetryableFailed
+                        && record.status == TaskStatus::RetryableFailed
+                        && record.thread_id.is_none()
+                });
+            if retryable_before_thread {
+                return Ok(None);
+            }
+            replay_operation(&record, operation_id, request_fingerprint).map(Some)
+        }
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Seed an exact completed start receipt in the process-private default store.
+/// This exercises production fingerprinting and replay without starting a
+/// provider; it is intentionally unavailable outside unit tests.
+#[cfg(test)]
+pub(crate) fn seed_completed_task_for_test(
+    args: &Value,
+    session: &config::Session,
+    origin: &TaskStartOrigin,
+) -> Result<Uuid> {
+    let store = TaskStore::default_store()?;
+    let operation_id = required_uuid(args, "operation_id")?;
+    let task = required_string(args, "task")?;
+    let model = required_string(args, "model")?;
+    let effort = required_string(args, "effort")?;
+    validate_task_input(task, "task")?;
+    validate_argument(model, "model")?;
+    validate_argument(effort, "effort")?;
+    let task_id = task_id_for_operation(session, operation_id)?;
+    let request_fingerprint = task_start_fingerprint(task_id, task, model, effort, origin)?;
+    let now = config::unix_time();
+    let mut record = TaskRecord {
+        schema_version: TASK_SCHEMA_VERSION,
+        task_id,
+        owner: SessionInstance::from_session(session),
+        scope_cwd: config::canonical_directory(&session.cwd)?,
+        model: model.to_owned(),
+        effort: effort.to_owned(),
+        status: TaskStatus::Completed,
+        revision: 2,
+        generation: 1,
+        thread_id: Some("test-completed-thread".to_owned()),
+        turn_id: Some("test-completed-turn".to_owned()),
+        usage: None,
+        created_at: now,
+        updated_at: now,
+        operations: Vec::new(),
+        operation_tombstones: Vec::new(),
+    };
+    record.operations.push(OperationReceipt {
+        operation_id,
+        request_fingerprint,
+        action: "start".to_owned(),
+        phase: OperationPhase::Applied,
+        outcome: record.outcome(),
+    });
+    store.save(&record)?;
+    Ok(task_id)
+}
+
+/// Start a Codex task after its durable acceptance while rechecking a
+/// caller-supplied filesystem admission immediately before child startup.
+pub(crate) async fn task_start_with_admission<F>(
+    args: &Value,
+    session: &config::Session,
+    origin: &TaskStartOrigin,
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let store = TaskStore::default_store()?;
+    task_start_with_store_and_binary_inner(
+        args,
+        session,
+        &store,
+        Path::new("codex"),
+        true,
+        origin,
+        admission,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2900,7 +3195,16 @@ async fn task_start_with_store_and_binary(
     store: &TaskStore,
     binary: &Path,
 ) -> Result<Value> {
-    task_start_with_store_and_binary_inner(args, session, store, binary, false).await
+    task_start_with_store_and_binary_inner(
+        args,
+        session,
+        store,
+        binary,
+        false,
+        &TaskStartOrigin::Generic,
+        || Ok(()),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2910,16 +3214,46 @@ async fn task_start_with_store_and_binary_fenced(
     store: &TaskStore,
     binary: &Path,
 ) -> Result<Value> {
-    task_start_with_store_and_binary_inner(args, session, store, binary, true).await
+    task_start_with_store_and_binary_inner(
+        args,
+        session,
+        store,
+        binary,
+        true,
+        &TaskStartOrigin::Generic,
+        || Ok(()),
+    )
+    .await
 }
 
-async fn task_start_with_store_and_binary_inner(
+#[cfg(test)]
+async fn task_start_with_store_binary_and_admission<F>(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+    origin: &TaskStartOrigin,
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    task_start_with_store_and_binary_inner(args, session, store, binary, false, origin, admission)
+        .await
+}
+
+async fn task_start_with_store_and_binary_inner<F>(
     args: &Value,
     session: &config::Session,
     store: &TaskStore,
     binary: &Path,
     fence: bool,
-) -> Result<Value> {
+    origin: &TaskStartOrigin,
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
     let owner = SessionInstance::from_session(session);
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
@@ -2930,13 +3264,7 @@ async fn task_start_with_store_and_binary_inner(
     validate_argument(effort, "effort")?;
 
     let task_id = task_id_for_operation(session, operation_id)?;
-    let request_fingerprint = fingerprint(&json!({
-        "kind": "start",
-        "task_id": task_id,
-        "task": task,
-        "model": model,
-        "effort": effort,
-    }))?;
+    let request_fingerprint = task_start_fingerprint(task_id, task, model, effort, origin)?;
     let now = config::unix_time();
     let mut record = TaskRecord {
         schema_version: TASK_SCHEMA_VERSION,
@@ -2980,6 +3308,17 @@ async fn task_start_with_store_and_binary_inner(
         }
         StartAcceptance::Accepted(record, lease) => (record, lease),
     };
+    if let Err(error) = admission() {
+        drop(runtime_lease);
+        store.update(session, task_id, |record| {
+            record.status = TaskStatus::Failed;
+            record.revision = record.revision.saturating_add(1);
+            update_operation_receipt(record, operation_id, OperationPhase::Applied);
+            Ok(())
+        })?;
+        return Err(error)
+            .context("repository clone filesystem admission changed before delegated side effect");
+    }
     let runtime_lease = Arc::new(runtime_lease);
     let _operation_permit = if fence {
         Some(ensure_current_active_instance(&owner, session).await?)
@@ -3794,6 +4133,7 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier, mpsc};
 
@@ -3808,6 +4148,105 @@ mod tests {
             permission_mode: config::PermissionMode::from_legacy_yolo(yolo),
             grants: config::SessionGrants::default(),
         }
+    }
+
+    #[test]
+    fn session_stop_monitor_retries_only_consecutive_unknown_observations() {
+        let mut monitor = SessionStopMonitor::default();
+        assert_eq!(
+            monitor.observe(SessionMonitorObservation::Unknown(
+                SessionMonitorUnknownKind::ActivityProbe
+            )),
+            SessionMonitorAction::Continue
+        );
+        assert_eq!(monitor.consecutive_unknown, 1);
+        assert_eq!(
+            monitor.observe(SessionMonitorObservation::Active),
+            SessionMonitorAction::Continue
+        );
+        assert_eq!(monitor.consecutive_unknown, 0);
+
+        for expected in 1..SESSION_STOP_UNKNOWN_LIMIT {
+            assert_eq!(
+                monitor.observe(SessionMonitorObservation::Unknown(
+                    SessionMonitorUnknownKind::MetadataRead
+                )),
+                SessionMonitorAction::Continue
+            );
+            assert_eq!(monitor.consecutive_unknown, expected);
+        }
+        assert_eq!(
+            monitor.observe(SessionMonitorObservation::Unknown(
+                SessionMonitorUnknownKind::MetadataRead
+            )),
+            SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(
+                SessionMonitorUnknownKind::MetadataRead
+            ))
+        );
+
+        assert_eq!(
+            SessionStopMonitor::default().observe(SessionMonitorObservation::Inactive),
+            SessionMonitorAction::Stop(SessionMonitorStopReason::Inactive)
+        );
+        assert_eq!(
+            SessionStopMonitor::default().observe(SessionMonitorObservation::OwnerChanged),
+            SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged)
+        );
+    }
+
+    #[test]
+    fn generated_session_stop_monitor_matches_reference_model() -> noprop::TestResult {
+        crate::test_support::run(0x434f_4445_584d_4f4e, 1024, |ctx| {
+            let observations = (0..noprop::sample_usize_in(ctx, 0..=64))
+                .map(|_| noprop::sample_u8(ctx) % 5)
+                .collect::<Vec<_>>();
+            let mut monitor = SessionStopMonitor::default();
+            let mut reference_unknown = 0_u8;
+
+            for sample in observations {
+                let (observation, expected) = match sample {
+                    0 => {
+                        reference_unknown = 0;
+                        (
+                            SessionMonitorObservation::Active,
+                            SessionMonitorAction::Continue,
+                        )
+                    }
+                    1 => (
+                        SessionMonitorObservation::Inactive,
+                        SessionMonitorAction::Stop(SessionMonitorStopReason::Inactive),
+                    ),
+                    2 => (
+                        SessionMonitorObservation::OwnerChanged,
+                        SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged),
+                    ),
+                    kind => {
+                        let kind = if kind == 3 {
+                            SessionMonitorUnknownKind::MetadataRead
+                        } else {
+                            SessionMonitorUnknownKind::ActivityProbe
+                        };
+                        reference_unknown = reference_unknown.saturating_add(1);
+                        let expected = if reference_unknown >= SESSION_STOP_UNKNOWN_LIMIT {
+                            SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(
+                                kind,
+                            ))
+                        } else {
+                            SessionMonitorAction::Continue
+                        };
+                        (SessionMonitorObservation::Unknown(kind), expected)
+                    }
+                };
+
+                let actual = monitor.observe(observation);
+                assert_eq!(actual, expected);
+                assert_eq!(monitor.consecutive_unknown, reference_unknown);
+                if matches!(actual, SessionMonitorAction::Stop(_)) {
+                    break;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn fake_app_server(root: &Path, mode: &str) -> PathBuf {
@@ -4276,6 +4715,428 @@ for raw in sys.stdin:
         let other_root = tempfile::tempdir().unwrap();
         let other = session(other_root.path(), "owner", true);
         assert!(store.load(&other, task_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn post_acceptance_admission_failure_is_terminal_and_exact_retry_does_not_reapply() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(root.path(), "clone-admission", false);
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "clone one admitted repository",
+            "model": "gpt-5.6-luna",
+            "effort": "high"
+        });
+        let missing_binary = root.path().join("must-not-run");
+
+        let error = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &missing_binary,
+            &TaskStartOrigin::Generic,
+            || anyhow::bail!("destination raced"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("before delegated side effect"));
+
+        let replay = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &missing_binary,
+            &TaskStartOrigin::Generic,
+            || panic!("exact retained retry must bypass filesystem admission"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "failed");
+        assert!(replay["task_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn task_start_origin_conflicts_before_admission_in_both_cross_tool_directions() {
+        let cases = [
+            (
+                "generic-to-clone",
+                TaskStartOrigin::Generic,
+                TaskStartOrigin::repository_clone_bare("src", "src/source", "repo.git"),
+            ),
+            (
+                "clone-to-generic",
+                TaskStartOrigin::repository_clone_bare("src", "src/source", "repo.git"),
+                TaskStartOrigin::Generic,
+            ),
+            (
+                "named-root-alias",
+                TaskStartOrigin::repository_clone_bare("src", "src/source", "repo.git"),
+                TaskStartOrigin::repository_clone_bare("work", "work/source", "repo.git"),
+            ),
+        ];
+
+        for (label, first_origin, conflicting_origin) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let store_root = tempfile::tempdir().unwrap();
+            let store = TaskStore::new(store_root.path().join("tasks"));
+            let owner = session(root.path(), label, false);
+            let operation_id = Uuid::new_v4();
+            let args = json!({
+                "operation_id": operation_id,
+                // `src/source` and `work/source` both lower to this exact task
+                // when the named roots alias the same canonical directory.
+                "task": "clone ./source into ./repo.git",
+                "model": "gpt-5.6-luna",
+                "effort": "high"
+            });
+            let missing_binary = root.path().join("must-not-run");
+
+            let first = match &first_origin {
+                TaskStartOrigin::Generic => {
+                    task_start_with_store_and_binary(&args, &owner, &store, &missing_binary).await
+                }
+                TaskStartOrigin::RepositoryCloneBare { .. } => {
+                    task_start_with_store_binary_and_admission(
+                        &args,
+                        &owner,
+                        &store,
+                        &missing_binary,
+                        &first_origin,
+                        || Ok(()),
+                    )
+                    .await
+                }
+            }
+            .unwrap();
+            assert_eq!(first["status"], "retryable_failed", "{label}");
+
+            let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+            let before = store.load(&owner, task_id).unwrap();
+            let admissions = Cell::new(0usize);
+            let conflict = match &conflicting_origin {
+                TaskStartOrigin::Generic => {
+                    task_start_with_store_and_binary(&args, &owner, &store, &missing_binary).await
+                }
+                TaskStartOrigin::RepositoryCloneBare { .. } => {
+                    task_start_with_store_binary_and_admission(
+                        &args,
+                        &owner,
+                        &store,
+                        &missing_binary,
+                        &conflicting_origin,
+                        || {
+                            admissions.set(admissions.get() + 1);
+                            Ok(())
+                        },
+                    )
+                    .await
+                }
+            };
+            let error = conflict.unwrap_err();
+
+            assert!(
+                error.to_string().contains("OPERATION_CONFLICT"),
+                "{label}: {error:#}"
+            );
+            assert_eq!(admissions.get(), 0, "{label}");
+            assert_eq!(store.load(&owner, task_id).unwrap(), before, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_clone_origin_retries_pre_thread_then_replays_without_readmission() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(root.path(), "clone-origin-retry", false);
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "clone ./source into ./repo.git",
+            "model": "gpt-5.6-luna",
+            "effort": "high"
+        });
+        let origin = TaskStartOrigin::repository_clone_bare("src", "src/source", "repo.git");
+
+        let first = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &root.path().join("missing-codex"),
+            &origin,
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["status"], "retryable_failed");
+        assert!(
+            task_start_replay_if_retained_with_store(&args, &owner, &origin, &store)
+                .unwrap()
+                .is_none(),
+            "pre-thread failures must repeat admission before retry"
+        );
+
+        let second = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &fake_app_server(root.path(), "ok"),
+            &origin,
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["status"], "running");
+        let preflight = task_start_replay_if_retained_with_store(&args, &owner, &origin, &store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preflight["task_id"], second["task_id"]);
+        assert_eq!(preflight["status"], "running");
+
+        let replay = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &root.path().join("must-not-run"),
+            &origin,
+            || panic!("an exact retained clone retry must not reapply admission"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["task_id"], second["task_id"]);
+        assert_eq!(replay["status"], "running");
+
+        remove_session_with_store(&owner, &store).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_generic_receipt_reloads_but_cannot_be_promoted_to_clone_origin() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store_path = store_root.path().join("tasks");
+        let store = TaskStore::new(store_path.clone());
+        let owner = session(root.path(), "legacy-generic-origin", false);
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "clone ./source into ./repo.git",
+            "model": "gpt-5.6-luna",
+            "effort": "high"
+        });
+        let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+        let legacy_fingerprint = fingerprint(&json!({
+            "kind": "start",
+            "task_id": task_id,
+            "task": args["task"],
+            "model": args["model"],
+            "effort": args["effort"],
+        }))
+        .unwrap();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Completed,
+            2,
+            Some("legacy-thread"),
+            Some("legacy-turn"),
+        );
+        record.effort = "high".to_owned();
+        record.operations.push(start_receipt(
+            operation_id,
+            legacy_fingerprint,
+            OperationPhase::Applied,
+            record.outcome(),
+        ));
+        store.save(&record).unwrap();
+        drop(store);
+
+        let reloaded = TaskStore::new(store_path);
+        let generic = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &reloaded,
+            &root.path().join("must-not-run"),
+            &TaskStartOrigin::Generic,
+            || panic!("a retained generic retry must not reapply admission"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(generic["status"], "completed");
+
+        let before = reloaded.load(&owner, task_id).unwrap();
+        let clone_origin = TaskStartOrigin::repository_clone_bare("src", "src/source", "repo.git");
+        let error = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &reloaded,
+            &root.path().join("must-not-run"),
+            &clone_origin,
+            || panic!("an ambiguous legacy receipt must not become a clone receipt"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("OPERATION_CONFLICT"));
+        assert_eq!(reloaded.load(&owner, task_id).unwrap(), before);
+
+        let persisted = std::fs::read(reloaded.path(task_id)).unwrap();
+        let persisted = String::from_utf8_lossy(&persisted);
+        assert!(!persisted.contains("repository_clone_bare"));
+        assert!(!persisted.contains("src/source"));
+        assert!(!persisted.contains("repo.git"));
+    }
+
+    #[test]
+    fn generated_clone_origin_preflight_matches_reference_and_is_read_only() -> noprop::TestResult {
+        const STATUSES: [TaskStatus; 4] = [
+            TaskStatus::Accepted,
+            TaskStatus::Running,
+            TaskStatus::RetryableFailed,
+            TaskStatus::Completed,
+        ];
+        const PHASES: [OperationPhase; 3] = [
+            OperationPhase::Accepted,
+            OperationPhase::Applied,
+            OperationPhase::RetryableFailed,
+        ];
+
+        crate::test_support::run(0x434c_4f4e_4f52_4947, 8, |ctx| {
+            let root = tempfile::tempdir().unwrap();
+            let store_root = tempfile::tempdir().unwrap();
+            let store = TaskStore::new(store_root.path().join("tasks"));
+            let nonce = noprop::sample_u64(ctx);
+            let component = crate::test_support::safe_component(ctx);
+            let owner = session(root.path(), &format!("origin-model-{nonce:016x}"), false);
+            let origin = TaskStartOrigin::repository_clone_bare(
+                "src",
+                &format!("src/{component}"),
+                &format!("{component}.git"),
+            );
+
+            let missing_operation = Uuid::from_u128((u128::from(nonce) << 64) | 1);
+            let missing_args = json!({
+                "operation_id": missing_operation,
+                "task": format!("clone ./{component} into ./{component}.git"),
+                "model": "gpt-5.6-luna",
+                "effort": "high"
+            });
+            assert!(
+                task_start_replay_if_retained_with_store(&missing_args, &owner, &origin, &store,)
+                    .unwrap()
+                    .is_none(),
+                "an absent receipt is not retained"
+            );
+
+            let mut case_index = 2u128;
+            for status in STATUSES {
+                for phase in PHASES {
+                    for has_thread in [false, true] {
+                        for identity_matches in [false, true] {
+                            for action_is_start in [false, true] {
+                                let operation_id =
+                                    Uuid::from_u128((u128::from(nonce) << 64) | case_index);
+                                case_index += 1;
+                                let args = json!({
+                                    "operation_id": operation_id,
+                                    "task": missing_args["task"],
+                                    "model": "gpt-5.6-luna",
+                                    "effort": "high"
+                                });
+                                let task_id = task_id_for_operation(&owner, operation_id).unwrap();
+                                let expected_fingerprint = task_start_fingerprint(
+                                    task_id,
+                                    args["task"].as_str().unwrap(),
+                                    args["model"].as_str().unwrap(),
+                                    args["effort"].as_str().unwrap(),
+                                    &origin,
+                                )
+                                .unwrap();
+                                let stored_fingerprint = if identity_matches {
+                                    expected_fingerprint
+                                } else {
+                                    Uuid::from_u128(expected_fingerprint.as_u128() ^ 1)
+                                };
+                                let thread_id = has_thread.then_some("thread");
+                                let mut record = task_record(
+                                    &owner,
+                                    task_id,
+                                    status,
+                                    2,
+                                    thread_id,
+                                    thread_id.map(|_| "turn"),
+                                );
+                                record.effort = "high".to_owned();
+                                let mut receipt = start_receipt(
+                                    operation_id,
+                                    stored_fingerprint,
+                                    phase,
+                                    record.outcome(),
+                                );
+                                if !action_is_start {
+                                    receipt.action = "resume".to_owned();
+                                }
+                                record.operations.push(receipt);
+                                store.save(&record).unwrap();
+                                let before_bytes = std::fs::read(store.path(task_id)).unwrap();
+
+                                let actual = task_start_replay_if_retained_with_store(
+                                    &args, &owner, &origin, &store,
+                                );
+                                let actual_category = match &actual {
+                                    Ok(Some(_)) => "retained",
+                                    Ok(None) => "absent",
+                                    Err(_) => "error",
+                                };
+                                let retryable_before_thread = identity_matches
+                                    && action_is_start
+                                    && phase == OperationPhase::RetryableFailed
+                                    && status == TaskStatus::RetryableFailed
+                                    && !has_thread;
+                                match (identity_matches, retryable_before_thread, actual) {
+                                    (false, _, Err(error)) => assert!(
+                                        error.to_string().contains("OPERATION_CONFLICT"),
+                                        "unexpected identity error category"
+                                    ),
+                                    (true, true, Ok(None)) => {}
+                                    (true, false, Ok(Some(_))) => {}
+                                    (_, _, _) => panic!(
+                                        "preflight diverged from reference: status={status:?} phase={phase:?} thread={has_thread} identity={identity_matches} action_start={action_is_start} actual={actual_category}"
+                                    ),
+                                }
+                                assert_eq!(store.load(&owner, task_id).unwrap(), record);
+                                assert_eq!(
+                                    std::fs::read(store.path(task_id)).unwrap(),
+                                    before_bytes
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let corrupt_operation = Uuid::from_u128((u128::from(nonce) << 64) | case_index);
+            let corrupt_args = json!({
+                "operation_id": corrupt_operation,
+                "task": missing_args["task"],
+                "model": "gpt-5.6-luna",
+                "effort": "high"
+            });
+            let corrupt_task = task_id_for_operation(&owner, corrupt_operation).unwrap();
+            std::fs::write(store.path(corrupt_task), b"not-json").unwrap();
+            let before_corrupt = std::fs::read(store.path(corrupt_task)).unwrap();
+            assert!(
+                task_start_replay_if_retained_with_store(&corrupt_args, &owner, &origin, &store,)
+                    .is_err(),
+                "a corrupt record must fail closed"
+            );
+            assert_eq!(
+                std::fs::read(store.path(corrupt_task)).unwrap(),
+                before_corrupt
+            );
+            Ok(())
+        })
     }
 
     #[tokio::test]
