@@ -91,9 +91,11 @@ never point it at the shared repo binary or real state. Mirror
   the supervisor socket lives at `/tmp/tmcp-<uid>-<ns>/supervisor.sock`).
 - Spawn `temote-mcp supervisor` with `TEMOTE_MCP_ROOTS="src=$project"` (or
   the JSON-object form `TEMOTE_MCP_ROOTS='{"src":"/absolute/project"}'` —
-  each value must be a quoted string), setsid + detached; wait for
-  `session list` to exit 0, then `session start --path src/<subdir> <id>`
-  (logical root+relative path).
+  each value must be a quoted string) in the background with null stdio,
+  and SIGINT/kill the child when done — a plain foreground child like the
+  e2e helper's is enough; do not require `setsid` (absent on macOS). Wait
+  for `session list` to exit 0, then `session start --path src/<subdir>
+  <id>` (logical root+relative path).
 - "Installed" binary = `current_exe` unless
   `TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR=<path>` overrides it — use a private
   copy so `upgrade` never re-execs the repo build. Set this variable only on
