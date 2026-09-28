@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -32,11 +32,322 @@ const MEMORY_TIMEOUT_MS = 60_000;
 const MEMORY_INPUT_BUDGET_BYTES = 32_768;
 const MEMORY_OUTPUT_BUDGET_BYTES = 8_192;
 const MAX_ARTIFACT_BYTES = 1_048_576;
+const MEMORY_ERROR_CODES = new Set([
+  "db_unavailable", "extractor_not_configured", "provider_not_configured", "provider_timeout",
+  "provider_unavailable", "provider_rejected",
+  "provider_invalid_response", "provider_output_too_large", "invalid_output", "invalid_support",
+  "invalid_scope", "invalid_verification_support", "invalid_supersession", "input_too_large",
+  "producer_generation_conflict", "producer_generation_stale", "run_retry_exhausted",
+  "projection_too_large", "commit_rejected", "worker_internal", "queue_not_configured", "queue_send_failed",
+]);
 
 class HarnessError extends Error {
   constructor(code) {
     super(code);
     this.code = code;
+  }
+}
+
+function safeCount(value) {
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+function safeErrorCode(value) {
+  return value == null ? null : MEMORY_ERROR_CODES.has(value) ? value : "other";
+}
+
+function safeTimestamp(value) {
+  return typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value)
+    ? value
+    : null;
+}
+
+function safeState(value) {
+  return new Set(["disabled", "not_configured", "failed", "lagging", "ready", "ready_empty"]).has(value)
+    ? value
+    : "unknown";
+}
+
+export function projectSafeContextStatus(rpcResponse) {
+  if (!rpcResponse || rpcResponse.status !== 200) {
+    return { state: "unavailable", error_code: "context_status_unavailable" };
+  }
+  const encoded = rpcResponse.body?.result?.content?.find((item) => item?.type === "text")?.text;
+  if (typeof encoded !== "string" || Buffer.byteLength(encoded) > 32_768) {
+    return { state: "unavailable", error_code: "context_status_invalid_response" };
+  }
+  let context;
+  try {
+    context = JSON.parse(encoded);
+  } catch {
+    return { state: "unavailable", error_code: "context_status_invalid_response" };
+  }
+  const memory = context?.memory && typeof context.memory === "object" ? context.memory : {};
+  const freshness = context?.freshness && typeof context.freshness === "object" ? context.freshness : {};
+  const boolOrNull = (value) => typeof value === "boolean" ? value : null;
+  return {
+    state: safeState(memory.state),
+    enabled: boolOrNull(memory.enabled),
+    active_producer_version: typeof memory.active_producer_version === "string"
+      && memory.active_producer_version.length <= 128 ? memory.active_producer_version : null,
+    requested_producer_version: typeof memory.requested_producer_version === "string"
+      && memory.requested_producer_version.length <= 128 ? memory.requested_producer_version : null,
+    worker_last_cloud_seq: safeCount(memory.worker_last_cloud_seq),
+    latest_cloud_seq: safeCount(memory.latest_cloud_seq),
+    worker_lag: safeCount(memory.worker_lag),
+    last_success_at: safeTimestamp(memory.last_success_at),
+    last_error_at: safeTimestamp(memory.last_error_at),
+    last_error_code: safeErrorCode(memory.last_error_code),
+    stale: boolOrNull(memory.stale),
+    freshness: {
+      source_count: safeCount(freshness.source_count),
+      source_head_revision: safeCount(freshness.source_head_revision),
+      source_acked_revision: safeCount(freshness.source_acked_revision),
+      source_gap_count: safeCount(freshness.source_gap_count),
+      observation_count: safeCount(freshness.observation_count),
+      cloud_observation_stale: boolOrNull(freshness.cloud_observation_stale),
+      worker_state: safeState(freshness.worker_state),
+      worker_last_cloud_seq: safeCount(freshness.worker_last_cloud_seq),
+      worker_lag: safeCount(freshness.worker_lag),
+      knowledge_stale: boolOrNull(freshness.knowledge_stale),
+    },
+  };
+}
+
+function safeStatusRow(row, fields) {
+  return Object.fromEntries(fields.map((field) => {
+    if (field === "last_error_code" || field === "error_code") return [field, safeErrorCode(row?.[field])];
+    if (field === "last_success_at" || field === "last_error_at" || field === "queued_at") {
+      return [field, safeTimestamp(row?.[field])];
+    }
+    if (field === "status" && row?.status != null) {
+      return [field, new Set(["pending", "running", "completed", "failed", "candidate", "supported", "current", "superseded", "retracted"]).has(row.status) ? row.status : "unknown"];
+    }
+    if (field === "state" && row?.state != null) {
+      return [field, new Set(["running", "completed", "failed"]).has(row.state) ? row.state : "unknown"];
+    }
+    if (field === "kind" && row?.kind != null) {
+      return [field, new Set(["fact", "decision", "constraint", "observation", "failure_pattern", "unresolved", "summary"]).has(row.kind) ? row.kind : "unknown"];
+    }
+    if (field === "outcome" && row?.outcome != null) {
+      return [field, new Set(["projected", "empty"]).has(row.outcome) ? row.outcome : "unknown"];
+    }
+    if (field === "producer_version" || field.endsWith("_producer_version")) {
+      const value = row?.[field];
+      return [field, typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : null];
+    }
+    if (field === "stale" || field === "journal_degraded") {
+      return [field, row?.[field] == null ? null : Number(row[field]) === 1];
+    }
+    return [field, safeCount(row?.[field])];
+  }));
+}
+
+async function diagnosticQuery(runtime, sql, params, fields, { aggregate = false, limit = 16 } = {}) {
+  try {
+    const rows = await runtime.querySql(sql, params);
+    if (aggregate) return safeStatusRow(rows[0] ?? {}, fields);
+    return rows.slice(0, limit).map((row) => safeStatusRow(row, fields));
+  } catch {
+    return { error_code: "diagnostic_query_failed" };
+  }
+}
+
+async function collectProjectionDiagnostics(runtime, clientToken, host) {
+  let workerContextStatus;
+  try {
+    const response = await runtime.callMcp(
+      clientToken,
+      "context_status",
+      { repository: REPOSITORY_KEY },
+      991,
+    );
+    workerContextStatus = projectSafeContextStatus(response);
+  } catch {
+    workerContextStatus = { state: "unavailable", error_code: "context_status_unavailable" };
+  }
+  const [sourceRows, sourceTerminal, observations, runs, checkpoints, projectionHead, outbox, queueDispatches, knowledgeCounts] = await Promise.all([
+    diagnosticQuery(runtime,
+      "SELECT source_head_revision, acked_through_revision, cloud_head_seq, journal_degraded, gap_count FROM observation_sources WHERE owner_id = ? AND host_id = ? AND session_id = ? AND repository_key = ?",
+      [OWNER_ID, host.hostId, host.sessionId, REPOSITORY_KEY],
+      ["source_head_revision", "acked_through_revision", "cloud_head_seq", "journal_degraded", "gap_count"],
+      { limit: 1 },
+    ),
+    diagnosticQuery(runtime,
+      "SELECT COUNT(*) AS terminal_observation_count FROM observations WHERE owner_id = ? AND host_id = ? AND session_id = ? AND repository_key = ? AND kind = 'execution_state' AND state_status IN ('completed', 'failed', 'interrupted')",
+      [OWNER_ID, host.hostId, host.sessionId, REPOSITORY_KEY], ["terminal_observation_count"], { aggregate: true },
+    ),
+    diagnosticQuery(runtime,
+      "SELECT COUNT(*) AS observation_count, COALESCE(MAX(cloud_seq), 0) AS latest_cloud_seq FROM observations WHERE owner_id = ? AND repository_key = ?",
+      [OWNER_ID, REPOSITORY_KEY], ["observation_count", "latest_cloud_seq"], { aggregate: true },
+    ),
+    diagnosticQuery(runtime,
+      "SELECT status, outcome, attempt_count, from_seq, to_seq, error_code FROM memory_runs WHERE owner_id = ? AND repository_key = ? ORDER BY started_at DESC LIMIT 16",
+      [OWNER_ID, REPOSITORY_KEY],
+      ["status", "outcome", "attempt_count", "from_seq", "to_seq", "error_code"],
+    ),
+    diagnosticQuery(runtime,
+      "SELECT producer_version, last_cloud_seq, last_success_at, last_error_at, last_error_code, stale, fence, projection_epoch FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ? ORDER BY last_cloud_seq DESC LIMIT 8",
+      [OWNER_ID, REPOSITORY_KEY],
+      ["producer_version", "last_cloud_seq", "last_success_at", "last_error_at", "last_error_code", "stale", "fence", "projection_epoch"],
+    ),
+    diagnosticQuery(runtime,
+      "SELECT requested_generation, requested_producer_version, active_generation, active_producer_version, epoch FROM memory_projection_heads WHERE owner_id = ? AND repository_key = ? LIMIT 1",
+      [OWNER_ID, REPOSITORY_KEY],
+      ["requested_generation", "requested_producer_version", "active_generation", "active_producer_version", "epoch"],
+      { limit: 1 },
+    ),
+    diagnosticQuery(runtime,
+      "SELECT through_cloud_seq, queued_at, attempt_count, next_attempt_at, last_error_code FROM memory_outbox WHERE owner_id = ? AND repository_key = ? LIMIT 1",
+      [OWNER_ID, REPOSITORY_KEY],
+      ["through_cloud_seq", "queued_at", "attempt_count", "next_attempt_at", "last_error_code"],
+      { limit: 1 },
+    ),
+    diagnosticQuery(runtime,
+      "SELECT state, COUNT(*) AS dispatch_count, SUM(message_count) AS message_count, SUM(CASE WHEN completed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed_count FROM __memory_test_queue_dispatches GROUP BY state",
+      [], ["state", "dispatch_count", "message_count", "completed_count"],
+    ),
+    diagnosticQuery(runtime,
+      "SELECT kind, status, COUNT(*) AS item_count FROM knowledge_items WHERE owner_id = ? AND repository_key = ? GROUP BY kind, status ORDER BY kind, status LIMIT 32",
+      [OWNER_ID, REPOSITORY_KEY], ["kind", "status", "item_count"],
+    ),
+  ]);
+  const source = Array.isArray(sourceRows) ? sourceRows[0] ?? null : null;
+  return {
+    schema_version: 1,
+    diagnostic_type: "automatic_memory_projection_timeout",
+    host_label: host.label,
+    worker_context_status: workerContextStatus,
+    source: source ? {
+      ...source,
+      terminal_observation_count: sourceTerminal?.terminal_observation_count ?? null,
+      complete: source.acked_through_revision >= source.source_head_revision
+        && source.journal_degraded === false && source.gap_count === 0,
+    } : { present: false },
+    observations,
+    memory_runs: runs,
+    checkpoints,
+    projection_head: Array.isArray(projectionHead) ? projectionHead[0] ?? null : projectionHead,
+    outbox: Array.isArray(outbox) ? outbox[0] ?? null : outbox,
+    queue_dispatches: queueDispatches,
+    knowledge_counts: knowledgeCounts,
+  };
+}
+
+async function writeProjectionDiagnostics(runtime, clientToken, host, runDir) {
+  try {
+    const result = await Promise.race([
+      collectProjectionDiagnostics(runtime, clientToken, host),
+      delay(5_000).then(() => null),
+    ]);
+    const snapshot = result ?? {
+      schema_version: 1,
+      diagnostic_type: "automatic_memory_projection_timeout",
+      host_label: host.label,
+      diagnostic_capture: "timed_out",
+    };
+    await fs.writeFile(
+      path.join(runDir, `projection-${host.label}-diagnostics.json`),
+      JSON.stringify(snapshot, null, 2) + "\n",
+      { mode: 0o600, flag: "wx" },
+    );
+    return snapshot;
+  } catch {
+    // Diagnostics are best-effort and must never replace the pipeline failure.
+    return null;
+  }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function collectRunProvenance(binary, scenario) {
+  const sourceHead = runCommand("git", ["rev-parse", "HEAD"], { cwd: ROOT }).trim();
+  const workingDiff = runCommand("git", ["diff", "--binary", "HEAD"], { cwd: ROOT });
+  const inputs = {
+    repository_key: scenario.repository_key,
+    task_a: scenario.task_a.instruction,
+    task_b: scenario.task_b.instruction,
+    limits: scenario.limits,
+  };
+  const [binaryBytes, runnerBytes, helperBytes, scenarioBytes] = await Promise.all([
+    fs.readFile(binary),
+    fs.readFile(fileURLToPath(import.meta.url)),
+    fs.readFile(path.join(ROOT, "target/debug/temote-linux-sandbox")).catch(() => Buffer.alloc(0)),
+    fs.readFile(path.join(ROOT, "dogfood/scenarios/memory-continuity.json")),
+  ]);
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const canonicalInputs = Buffer.from(canonicalJson(inputs));
+  const canonicalScenario = Buffer.from(canonicalJson(scenario));
+  return {
+    source_head: sourceHead,
+    working_diff_sha256: sha256(Buffer.from(workingDiff)),
+    binary_sha256: sha256(binaryBytes),
+    input_sha256: sha256(canonicalInputs),
+    scenario_fingerprint: sha256(canonicalScenario),
+    runner_sha256: sha256(runnerBytes),
+    sandbox_helper_sha256: helperBytes.length > 0 ? sha256(helperBytes) : null,
+    scenario_file_sha256: sha256(scenarioBytes),
+  };
+}
+
+async function writeProjectionFailureManifest(runDir, metadata, host, diagnostics) {
+  try {
+    const markerPath = path.join(runDir, "task-a-complete.proof");
+    let taskATerminal = false;
+    try {
+      taskATerminal = (await fs.readFile(markerPath, "utf8")) === TASK_A_MARKER;
+    } catch {
+      // A missing marker is represented as false, without reading task output.
+    }
+    const sourceComplete = diagnostics?.source?.complete === true;
+    const manifest = {
+      schema_version: 1,
+      scenario_id: "memory-continuity",
+      scenario_revision: 1,
+      scenario_fingerprint: metadata.provenance.scenario_fingerprint,
+      phase: metadata.phase,
+      mode: "live",
+      synthesis_mode: metadata.extractor === "live" ? "live" : "fixture",
+      outcome: "blocked",
+      live_synthesis: "NOT QUALIFIED",
+      selectors: metadata.selectors,
+      provenance: metadata.provenance,
+      gates: {
+        task_a_terminal: taskATerminal ? "pass" : "not_run",
+        source_sync_complete: sourceComplete ? "pass" : "blocked",
+        task_a_knowledge_projection: host.label === "a" ? "blocked" : "not_run",
+        head_switch: "not_run",
+        offline_host: "not_run",
+        task_b_supersession: "not_run",
+        queue_replay: "not_run",
+        tenancy: "not_run",
+      },
+      events: {
+        projection_host: host.label,
+        stable_error_code: `PROJECTION_${host.label.toUpperCase()}_TIMEOUT`,
+        task_a_terminal_marker_verified: taskATerminal,
+        source_acked_revision: diagnostics?.source?.acked_through_revision ?? null,
+        source_head_revision: diagnostics?.source?.source_head_revision ?? null,
+        source_cloud_head: diagnostics?.source?.cloud_head_seq ?? null,
+        source_gap_count: diagnostics?.source?.gap_count ?? null,
+        worker_status: diagnostics?.worker_context_status?.state ?? "unavailable",
+        live_qualification: "not_qualified",
+      },
+    };
+    await fs.writeFile(
+      path.join(runDir, `${metadata.phase}-failure.json`),
+      JSON.stringify(manifest, null, 2) + "\n",
+      { mode: 0o600, flag: "wx" },
+    );
+  } catch {
+    // Failure manifests must not mask the underlying projection gate failure.
   }
 }
 
@@ -610,12 +921,21 @@ async function waitForDriver(driver, timeoutMs) {
   return result.code;
 }
 
-async function waitForProjectionWhileDriverRuns(runtime, host, constraint, timeoutMs, driver) {
-  const result = await Promise.race([
-    waitForTaskProjection(runtime, host, constraint, timeoutMs).then(() => "projected"),
-    driver.exit.then(({ code }) => `driver_exit_${code}`),
-  ]);
-  if (result !== "projected") throw new HarnessError("DOGFOOD_DRIVER_EXITED_BEFORE_PROJECTION");
+async function waitForProjectionWhileDriverRuns(runtime, clientToken, host, constraint, timeoutMs, driver, runDir, metadata) {
+  try {
+    const result = await Promise.race([
+      waitForTaskProjection(runtime, host, constraint, timeoutMs).then(() => "projected"),
+      driver.exit.then(({ code }) => `driver_exit_${code}`),
+    ]);
+    if (result !== "projected") throw new HarnessError("DOGFOOD_DRIVER_EXITED_BEFORE_PROJECTION");
+  } catch (error) {
+    if (error instanceof HarnessError
+        && (error.code.startsWith("PROJECTION_") || error.code === "DOGFOOD_DRIVER_EXITED_BEFORE_PROJECTION")) {
+      const diagnostics = await writeProjectionDiagnostics(runtime, clientToken, host, runDir);
+      await writeProjectionFailureManifest(runDir, metadata, host, diagnostics);
+    }
+    throw error;
+  }
 }
 
 async function runFixture(phase, runDir) {
@@ -663,6 +983,8 @@ async function runLive(flags, phase, extractor, runDir) {
   const extractorModel = flags["extractor-model"] ?? process.env.TEMOTE_MCP_MEMORY_MODEL ?? DEFAULT_EXTRACTOR_MODEL;
   const extractorProfile = flags["extractor-profile"] ?? `opencode-go/${extractorModel}`;
   if (backend !== "codex" || !model || !effort) throw new HarnessError("CODING_BACKEND_SELECTOR_UNSUPPORTED");
+  const selectors = { backend, model, effort, extractor_profile: extractorProfile };
+  const metadata = { phase, extractor, selectors, provenance: await collectRunProvenance(binary, scenario) };
 
   const hostAId = `memory-dogfood-a-${randomBytes(6).toString("hex")}`;
   const hostBId = `memory-dogfood-b-${randomBytes(6).toString("hex")}`;
@@ -730,7 +1052,7 @@ async function runLive(flags, phase, extractor, runDir) {
     if (phase === "candidate") {
       const pipelineWait = handshakeTimeout;
       const taskAConstraint = scenario.task_a.constraint;
-      await waitForProjectionWhileDriverRuns(runtime, hostA, taskAConstraint, pipelineWait, driver);
+      await waitForProjectionWhileDriverRuns(runtime, clientToken, hostA, taskAConstraint, pipelineWait, driver, runDir, metadata);
 
       await stopOwnedProcess(hostA.hostAgent);
       await waitForHost(runtime, clientToken, hostA.hostId, false, 15_000);
@@ -740,7 +1062,7 @@ async function runLive(flags, phase, extractor, runDir) {
     await fs.writeFile(path.join(runDir, "task-b-ready.proof"), TASK_B_READY_MARKER, { mode: 0o600, flag: "wx" });
     if (phase === "candidate") {
       const pipelineWait = handshakeTimeout;
-      await waitForProjectionWhileDriverRuns(runtime, hostB, scenario.task_b.constraint, pipelineWait, driver);
+      await waitForProjectionWhileDriverRuns(runtime, clientToken, hostB, scenario.task_b.constraint, pipelineWait, driver, runDir, metadata);
       await replayQueueAndWriteManifest(runtime, runDir);
     }
 
@@ -828,10 +1150,12 @@ async function main() {
   if (mode === "live" && !result.successful) process.exitCode = 1;
 }
 
-main()
-  .catch((error) => {
-    const code = error instanceof HarnessError ? error.code : "MEMORY_DOGFOOD_FAILED";
-    process.stderr.write(JSON.stringify({ outcome: "blocked", error_code: code }) + "\n");
-    process.exitCode = 1;
-  })
-  .finally(() => stopEsbuild());
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main()
+    .catch((error) => {
+      const code = error instanceof HarnessError ? error.code : "MEMORY_DOGFOOD_FAILED";
+      process.stderr.write(JSON.stringify({ outcome: "blocked", error_code: code }) + "\n");
+      process.exitCode = 1;
+    })
+    .finally(() => stopEsbuild());
+}

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 
+import { projectSafeContextStatus } from "../scripts/memory-dogfood.mjs";
 import {
   MEMORY_TEST_CLIENT_TOKEN,
   MEMORY_TEST_HOST_ID,
@@ -23,6 +24,50 @@ const CONTENT = [
 const SESSION = "automatic-memory-session";
 const TASK = "automatic-memory-task";
 const OPERATION = "550e8400-e29b-41d4-a716-446655440000";
+
+test("failure diagnostics keep only bounded context status fields and stable error codes", () => {
+  const projected = projectSafeContextStatus({
+    status: 200,
+    body: { result: { content: [{
+      type: "text",
+      text: JSON.stringify({
+        memory: {
+          state: "failed",
+          enabled: true,
+          worker_last_cloud_seq: 4,
+          latest_cloud_seq: 9,
+          worker_lag: 5,
+          last_error_code: "provider_timeout; sensitive output omitted",
+          stale: true,
+          provider_response: "should never be retained",
+        },
+        freshness: {
+          source_count: 2,
+          source_head_revision: 8,
+          source_acked_revision: 8,
+          source_gap_count: 0,
+          observation_count: 9,
+          worker_state: "failed",
+          worker_last_cloud_seq: 4,
+          worker_lag: 5,
+          knowledge_stale: true,
+          source_cursors: [{ session_id: "not copied into diagnostics" }],
+        },
+        task_body: "not copied into diagnostics",
+      }),
+    }] } },
+  });
+  assert.equal(projected.state, "failed");
+  assert.equal(projected.last_error_code, "other");
+  assert.equal(projected.worker_last_cloud_seq, 4);
+  assert.equal(projected.latest_cloud_seq, 9);
+  assert.equal(projected.worker_lag, 5);
+  assert.equal(projected.freshness.source_acked_revision, 8);
+  assert.equal(projected.freshness.observation_count, 9);
+  assert.equal(JSON.stringify(projected).includes("sensitive output omitted"), false);
+  assert.equal(JSON.stringify(projected).includes("provider_response"), false);
+  assert.equal(JSON.stringify(projected).includes("task_body"), false);
+});
 
 function observation() {
   const sha256 = createHash("sha256").update(CONTENT).digest("hex");
