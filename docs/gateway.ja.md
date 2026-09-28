@@ -102,8 +102,8 @@ OpenAI-compatible extractor を有効にする場合は `MEMORY_ENABLED = "true"
 
 必要な場合は `MEMORY_REASONING_EFFORT` に `low`、`medium`、`high`、`minimal`、`none`、`max`、`xhigh` のいずれかを指定できます。
 未設定なら adapter は request に `reasoning_effort` を含めず、provider の既定値を使います。
-provider がこの値をすべてサポートするとは限りません。
-未対応値は `provider_configuration_invalid` として報告されます。
+ローカルの許可リスト外の値は、requestを送信せず `provider_configuration_invalid` として報告されます。
+許可リスト内でも選択したproviderが対応しない値は、HTTP 400 と `provider_rejected` として報告されます。
 OpenCode Go は `glm-5.3-flash` を提供しており、GLM API の仕様では GLM-5.3-Flash の thinking は無効化できず、既定 effort は `max`、`low` は指定可能です。
 このモデルで bounded live extraction を行う場合は `low` を明示します（[OpenCode Go の model と endpoint](https://opencode.ai/docs/go/)、[GLM Chat Completion の parameter](https://docs.z.ai/api-reference/llm/chat-completion)）。
 producer version は adapter version、指定された effort、envelope 上限を追跡します。
