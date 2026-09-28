@@ -78,9 +78,11 @@ binding was configured. This packet has not changed those remote resources.
 
 ## Candidate evidence
 
-Implementation packets are committed locally. Live synthesis, final continuity,
-independent integrated review and remote qualification are pending. Results below must be updated from terminal runs;
-fixture success must not stand in for a live model or remote deployment.
+Implementation packets are committed locally. Local code and workerd/D1
+qualification is separate from live-model synthesis and Cloudflare remote
+qualification. The live scenario has run, but it is **not qualified**; the final
+candidate HEAD and Cloudflare remote gates remain pending. Fixture and local
+integration success do not substitute for either gate.
 
 ### Completed packet checks before upstream integration
 
@@ -122,3 +124,78 @@ the immutable batch is acknowledged can produce `conflicting_replay`;
 acknowledged previews cannot be undisclosed. The documented recovery preserves
 the durable source and requires an explicitly authorized policy choice. Source
 gaps remain partial after later records synchronize.
+
+### Later local qualification and independent review
+
+- The final authority review approved the 47-file integrated patch at head
+  0f43abee9cbfcca1cd30796acb646cc97bee542c, based on
+  48596907b92b09d706181c3e6b886052e6bf8c16. Its manifest matched the reviewed
+  head and working tree after independent tests.
+- The provider/envelope review returned **approve-with-nits** for the 48-file
+  manifest at target dae7a1c6bfb6fc45092bf7b602ed31f726f7c8ef. This is not a
+  final review of the ending candidate HEAD.
+- cargo fmt --all -- --check, cargo clippy --all-targets -- -D warnings,
+  cargo check --no-default-features --all-targets, and
+  cargo test --locked -- --test-threads=1 completed successfully in the
+  recorded Rust runs. The final stored Rust test log reports 835 unit tests
+  passed and 1 ignored, with no failures; integration test binaries also report
+  no failures.
+- The stored complete Gateway run reports 166/166 tests passing. The root later
+  reported a 185/185 full Gateway run; its terminal result is not yet included
+  in the retained log set, so the final consolidated test count remains pending.
+- The real workerd/D1 integration suite covers migration preservation,
+  transaction rollback and fencing, concurrent claims, Queue ACK loss,
+  DB-commit retry, restart recovery, scheduled outbox repair, poison-attempt
+  bounds, and projection rebuild. The D1 migration runner applied migrations
+  0001–0003 to an isolated **local** D1 database (22, 5, and 37 SQL commands
+  respectively). No remote D1 migration was run.
+- python3 -m dogfood validate validates eight checked-in scenario IDs.
+  This validates scenario schemas; it does not run all scenarios.
+- Two just generate-tools runs produced identical bytes for the three public
+  artifacts and just check-generated passed. The gateway deploy dry-run built
+  the Worker with its declared bindings; this did not deploy it or verify a
+  remote target. The worker statement bound is at most 602 D1 statements per
+  repository invocation, suitable for the Paid 1,000-statement limit; Free's
+  50-statement worst-case limit is not qualified.
+
+### Baseline and live memory-continuity scenario
+
+Baseline run 348f3eae-9525-4c5e-a718-a02fcdb1cc7a used scenario
+memory-continuity revision 1 and the same scenario fingerprint as the
+candidate runs. Its outcome is not_implemented; live synthesis is NOT RUN,
+and knowledge-dependent assertions are not_implemented (Queue replay and
+offline proof are not_run). The baseline's absent knowledge is not a passing
+empty result.
+
+Candidate runs ae1e618f-ba5b-4645-8fe1-e75ff638dd70,
+d29a9fe6-287d-41c4-b25e-9bdc6421be05, and
+dced0085-3c46-4b57-b7ae-102dc2feeb3a all ended blocked with live synthesis
+NOT QUALIFIED. They used scenario revision 1, the same fingerprint as the
+baseline, and coding selectors codex / gpt-5.6-luna / max. The final attempt
+used glm-5.3-flash with reasoning effort low, a 60,000 ms timeout, 32,768-byte
+input budget, 8,192-byte content output budget, batch size 16, and three
+extraction attempts. Its bounded projection run failed with invalid_support
+at the retry limit. The task-A terminal observation and source sync gates
+passed, but task-A projection remained blocked. Partial D1 knowledge rows
+existed; they do not qualify the failed batch or its assertions. The head-switch,
+Task-B supersession, offline-host, Queue-replay, and tenancy live gates were
+not_run; no offline proof file was produced.
+
+| Qualification gate | Interim result | Evidence |
+| --- | --- | --- |
+| issue_completion | Partial | C2–C5 implementation and local tests exist; the live scenario and final child-issue progress update remain incomplete. |
+| memory_pipeline | Local integration passes; live blocked | Workerd/D1/Queue recovery tests pass; live candidate stopped on invalid_support. |
+| knowledge_quality | Not qualified | The live support-validation assertion did not pass. |
+| head_switch | Not run live | The candidate did not reach Task B or alternate-head resolution. |
+| offline_host | Not run live | The dedicated host-offline proof was not reached; local resolver tests do cover repository reads without an online host. |
+| tenancy | Not run live | Local owner/repository isolation tests pass; live unrelated-repository assertion was not reached. |
+| retry_recovery | Local D1 recovery tests pass; live gate not run | Commit failure, ACK loss, restart, outbox sweep, poison cap, and generation rebuild have workerd tests. |
+| tests | Local checks pass; final aggregate pending | Recorded Rust/generation/local D1 checks pass; the later 185/185 Gateway result still needs its retained terminal summary. |
+| final_diff | Pending | The reviewed patches precede the ending candidate HEAD; no final diff review has been recorded. |
+| cloudflare_remote | Not run | No remote migration, Queue provisioning, binding change, deploy, or remote E2E was performed. |
+
+No live model qualification or Cloudflare remote qualification is claimed.
+The next candidate trial must pass support validation before attempting the
+Task-B, alternate-head, offline-host, Queue-replay, and tenancy gates. The final
+ending HEAD and its full test/review/diff evidence will be recorded after that
+trial terminates.
