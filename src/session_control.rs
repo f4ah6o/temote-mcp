@@ -2746,9 +2746,9 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
             preflight.blocked_session_count
         );
         for blocked in &preflight.blocked_sessions {
-            // codeql[rust/cleartext-logging] session ids are non-secret routing
-            // identifiers and blocker reasons are built secret-free.
             eprintln!(
+                // codeql[rust/cleartext-logging] session ids are non-secret routing
+                // identifiers and blocker reasons are built secret-free.
                 "stopping unrestorable session {}: {}",
                 blocked.session_id, blocked.reason
             );
@@ -2759,9 +2759,9 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
             .await
             {
                 Ok(_) => stopped_unrestorable += 1,
-                // codeql[rust/cleartext-logging] session ids are non-secret
-                // routing identifiers; the error is already environment-redacted.
                 Err(error) => eprintln!(
+                    // codeql[rust/cleartext-logging] session ids are non-secret
+                    // routing identifiers; the error is already environment-redacted.
                     "warning: could not stop session {}: {error:#}",
                     blocked.session_id
                 ),
