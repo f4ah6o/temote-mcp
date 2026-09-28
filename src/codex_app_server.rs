@@ -5084,6 +5084,11 @@ for raw in sys.stdin:
                                 let actual = task_start_replay_if_retained_with_store(
                                     &args, &owner, &origin, &store,
                                 );
+                                let actual_category = match &actual {
+                                    Ok(Some(_)) => "retained",
+                                    Ok(None) => "absent",
+                                    Err(_) => "error",
+                                };
                                 let retryable_before_thread = identity_matches
                                     && action_is_start
                                     && phase == OperationPhase::RetryableFailed
@@ -5092,12 +5097,12 @@ for raw in sys.stdin:
                                 match (identity_matches, retryable_before_thread, actual) {
                                     (false, _, Err(error)) => assert!(
                                         error.to_string().contains("OPERATION_CONFLICT"),
-                                        "unexpected identity error: {error:#}"
+                                        "unexpected identity error category"
                                     ),
                                     (true, true, Ok(None)) => {}
                                     (true, false, Ok(Some(_))) => {}
-                                    (_, _, other) => panic!(
-                                        "preflight diverged from reference: status={status:?} phase={phase:?} thread={has_thread} identity={identity_matches} action_start={action_is_start} actual={other:?}"
+                                    (_, _, _) => panic!(
+                                        "preflight diverged from reference: status={status:?} phase={phase:?} thread={has_thread} identity={identity_matches} action_start={action_is_start} actual={actual_category}"
                                     ),
                                 }
                                 assert_eq!(store.load(&owner, task_id).unwrap(), record);
