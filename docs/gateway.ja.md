@@ -100,6 +100,23 @@ OpenAI-compatible extractor を有効にする場合は `MEMORY_ENABLED = "true"
 `MEMORY_API_KEY` は Worker secret として保存し、値を `wrangler.toml`、`.dev.vars.example`、評価 artifact に書きません。
 抽出方式を変えるときは `MEMORY_PROJECTION_GENERATION` を単調増加させ、旧 worker が有効な projection を置き換えないようにします。
 
+必要な場合は `MEMORY_REASONING_EFFORT` に `low`、`medium`、`high`、`minimal`、`none`、`max`、`xhigh` のいずれかを指定できます。
+未設定なら adapter は request に `reasoning_effort` を含めず、provider の既定値を使います。
+provider がこの値をすべてサポートするとは限りません。
+未対応値は `provider_configuration_invalid` として報告されます。
+OpenCode Go は `glm-5.3-flash` を提供しており、GLM API の仕様では GLM-5.3-Flash の thinking は無効化できず、既定 effort は `max`、`low` は指定可能です。
+このモデルで bounded live extraction を行う場合は `low` を明示します（[OpenCode Go の model と endpoint](https://opencode.ai/docs/go/)、[GLM Chat Completion の parameter](https://docs.z.ai/api-reference/llm/chat-completion)）。
+producer version は adapter version、指定された effort、envelope 上限を追跡します。
+adapter の意味や reasoning effort を変える場合は `MEMORY_PROJECTION_GENERATION` を単調増加させ、derived projection を再構築します。
+
+`MEMORY_OUTPUT_BUDGET_BYTES` は抽出する JSON content の上限です。
+これとは別に、HTTP response の JSON envelope は `min(80 KiB, 2 × MEMORY_OUTPUT_BUDGET_BYTES + 16 KiB)` 以内に制限します。
+既定の content budget 8 KiB では envelope は最大32 KiB、最大の content budget 32 KiB では最大80 KiBです。
+adapter は response の `content` だけを読み取ります。
+provider の `reasoning_content` と `usage` は無視し、記録、保存、再利用しません。
+envelope 超過は `provider_envelope_too_large`、provider が `finish_reason: "length"` を返した completion は `provider_incomplete_response` として `context_status` に報告され、どちらも checkpoint を進めません。
+provider または response budget を修正した後、`MEMORY_PROJECTION_GENERATION` を増加させると retained observation を新しい projection として再処理します。
+
 ```sh
 (cd gateway && npx wrangler secret put MEMORY_API_KEY)
 ```

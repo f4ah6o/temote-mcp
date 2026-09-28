@@ -31,11 +31,19 @@ const DEFAULT_BACKEND = "codex";
 const MEMORY_TIMEOUT_MS = 60_000;
 const MEMORY_INPUT_BUDGET_BYTES = 32_768;
 const MEMORY_OUTPUT_BUDGET_BYTES = 8_192;
+const MEMORY_PROVIDER_ENVELOPE_BUDGET_BYTES = Math.min(
+  80 * 1_024,
+  2 * MEMORY_OUTPUT_BUDGET_BYTES + 16_384,
+);
+const MEMORY_MAX_ATTEMPTS = 3;
+const MEMORY_BATCH_SIZE = 16;
+const MEMORY_REASONING_EFFORTS = new Set(["low", "medium", "high", "minimal", "none", "max", "xhigh"]);
 const MAX_ARTIFACT_BYTES = 1_048_576;
 const MEMORY_ERROR_CODES = new Set([
   "db_unavailable", "extractor_not_configured", "provider_not_configured", "provider_timeout",
   "provider_unavailable", "provider_rejected",
-  "provider_invalid_response", "provider_output_too_large", "invalid_output", "invalid_support",
+  "provider_invalid_response", "provider_incomplete_response", "provider_envelope_too_large",
+  "provider_output_too_large", "provider_configuration_invalid", "invalid_output", "invalid_support",
   "invalid_scope", "invalid_verification_support", "invalid_supersession", "input_too_large",
   "producer_generation_conflict", "producer_generation_stale", "run_retry_exhausted",
   "projection_too_large", "commit_rejected", "worker_internal", "queue_not_configured", "queue_send_failed",
@@ -49,8 +57,37 @@ class HarnessError extends Error {
 }
 
 function safeCount(value) {
+  if (value == null || typeof value === "boolean") return null;
   const count = Number(value);
   return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+export function resolveExtractorReasoningEffort({ explicitValue, environmentValue, extractor }) {
+  if (explicitValue !== undefined && extractor !== "live") {
+    throw new HarnessError("EXTRACTOR_REASONING_EFFORT_REQUIRES_LIVE_EXTRACTOR");
+  }
+  const requested = explicitValue ?? (extractor === "live" ? environmentValue : undefined);
+  if (requested === undefined) return null;
+  if (typeof requested !== "string") throw new HarnessError("INVALID_EXTRACTOR_REASONING_EFFORT");
+  const normalized = requested.trim().toLowerCase();
+  if (normalized === "") return null;
+  if (!MEMORY_REASONING_EFFORTS.has(normalized)) {
+    throw new HarnessError("INVALID_EXTRACTOR_REASONING_EFFORT");
+  }
+  return normalized;
+}
+
+export function memoryExtractorSettings(model, reasoningEffort) {
+  return {
+    model,
+    reasoning_effort: reasoningEffort,
+    timeout_ms: MEMORY_TIMEOUT_MS,
+    input_budget_bytes: MEMORY_INPUT_BUDGET_BYTES,
+    output_budget_bytes: MEMORY_OUTPUT_BUDGET_BYTES,
+    response_envelope_budget_bytes: MEMORY_PROVIDER_ENVELOPE_BUDGET_BYTES,
+    max_attempts: MEMORY_MAX_ATTEMPTS,
+    batch_size: MEMORY_BATCH_SIZE,
+  };
 }
 
 function safeErrorCode(value) {
@@ -222,7 +259,9 @@ async function collectProjectionDiagnostics(runtime, clientToken, host) {
     source: source ? {
       ...source,
       terminal_observation_count: sourceTerminal?.terminal_observation_count ?? null,
-      complete: source.acked_through_revision >= source.source_head_revision
+      complete: Number.isSafeInteger(source.acked_through_revision)
+        && Number.isSafeInteger(source.source_head_revision)
+        && source.acked_through_revision >= source.source_head_revision
         && source.journal_degraded === false && source.gap_count === 0,
     } : { present: false },
     observations,
@@ -318,6 +357,7 @@ async function writeProjectionFailureManifest(runDir, metadata, host, diagnostic
       outcome: "blocked",
       live_synthesis: "NOT QUALIFIED",
       selectors: metadata.selectors,
+      extractor_config: metadata.extractorConfig,
       provenance: metadata.provenance,
       gates: {
         task_a_terminal: taskATerminal ? "pass" : "not_run",
@@ -357,7 +397,7 @@ function parseArgs(argv) {
   const valued = new Set([
     "phase", "mode", "extractor", "binary", "baseline-binary", "candidate-binary", "baseline-gateway-root",
     "output", "backend", "model", "effort", "extractor-profile", "extractor-endpoint",
-    "extractor-model", "auth-file", "python", "task-polls", "poll-interval",
+    "extractor-model", "extractor-reasoning-effort", "auth-file", "python", "task-polls", "poll-interval",
     "host-wait-seconds", "pipeline-wait-seconds",
   ]);
   for (let i = 0; i < argv.length; i += 1) {
@@ -388,9 +428,11 @@ function printHelp() {
     "    [--extractor disabled|fixture|live] [--baseline-binary PATH] [--candidate-binary PATH]",
     "    [--output RUN_DIR] [--backend codex] [--model MODEL] [--effort EFFORT]",
     "    [--extractor-profile PROFILE] [--extractor-endpoint URL] [--extractor-model MODEL]",
+    "    [--extractor-reasoning-effort low|medium|high|minimal|none|max|xhigh]",
     "",
     "Fixture mode runs the deterministic real-D1/Queue integration test and is never live qualification.",
     "Live mode starts dedicated Temote supervisors and host agents in isolated XDG_STATE_HOME roots.",
+    "Reasoning effort is sent only when explicitly set by this flag or TEMOTE_MCP_MEMORY_REASONING_EFFORT.",
   ].join("\n") + "\n");
 }
 
@@ -982,9 +1024,21 @@ async function runLive(flags, phase, extractor, runDir) {
   const extractorEndpoint = flags["extractor-endpoint"] ?? process.env.TEMOTE_MCP_MEMORY_ENDPOINT ?? DEFAULT_ENDPOINT;
   const extractorModel = flags["extractor-model"] ?? process.env.TEMOTE_MCP_MEMORY_MODEL ?? DEFAULT_EXTRACTOR_MODEL;
   const extractorProfile = flags["extractor-profile"] ?? `opencode-go/${extractorModel}`;
+  const reasoningEffort = resolveExtractorReasoningEffort({
+    explicitValue: flags["extractor-reasoning-effort"],
+    environmentValue: process.env.TEMOTE_MCP_MEMORY_REASONING_EFFORT,
+    extractor,
+  });
   if (backend !== "codex" || !model || !effort) throw new HarnessError("CODING_BACKEND_SELECTOR_UNSUPPORTED");
   const selectors = { backend, model, effort, extractor_profile: extractorProfile };
-  const metadata = { phase, extractor, selectors, provenance: await collectRunProvenance(binary, scenario) };
+  const extractorConfig = memoryExtractorSettings(
+    extractor === "live" ? extractorModel : null,
+    extractor === "live" ? reasoningEffort : null,
+  );
+  const metadata = {
+    phase, extractor, selectors, extractorConfig,
+    provenance: await collectRunProvenance(binary, scenario),
+  };
 
   const hostAId = `memory-dogfood-a-${randomBytes(6).toString("hex")}`;
   const hostBId = `memory-dogfood-b-${randomBytes(6).toString("hex")}`;
@@ -1018,8 +1072,11 @@ async function runLive(flags, phase, extractor, runDir) {
       MEMORY_TIMEOUT_MS: String(MEMORY_TIMEOUT_MS),
       MEMORY_INPUT_BUDGET_BYTES: String(MEMORY_INPUT_BUDGET_BYTES),
       MEMORY_OUTPUT_BUDGET_BYTES: String(MEMORY_OUTPUT_BUDGET_BYTES),
-      MEMORY_MAX_ATTEMPTS: "3",
-      MEMORY_BATCH_SIZE: "16",
+      MEMORY_MAX_ATTEMPTS: String(MEMORY_MAX_ATTEMPTS),
+      MEMORY_BATCH_SIZE: String(MEMORY_BATCH_SIZE),
+      ...(extractor === "live" && reasoningEffort
+        ? { MEMORY_REASONING_EFFORT: reasoningEffort }
+        : {}),
     },
   });
 
@@ -1090,6 +1147,7 @@ async function runLive(flags, phase, extractor, runDir) {
       mode: "live",
       synthesis_mode: artifact.synthesis_mode,
       extractor,
+      extractor_config: extractorConfig,
       runtime: { miniflare_version: miniflarePackage.version, d1: "workerd", gateway_source: phase === "baseline" ? "archived_baseline" : "candidate" },
       live_synthesis: extractor === "live" && phase === "candidate"
         ? (artifact.outcome === "pass" ? "PASS" : artifact.outcome.toUpperCase())
@@ -1133,6 +1191,9 @@ async function main() {
     throw new HarnessError("INVALID_PHASE_MODE_OR_EXTRACTOR");
   }
   if (mode === "fixture" && extractor === "live") throw new HarnessError("FIXTURE_MODE_CANNOT_USE_LIVE_EXTRACTOR");
+  if (flags["extractor-reasoning-effort"] !== undefined && extractor !== "live") {
+    throw new HarnessError("EXTRACTOR_REASONING_EFFORT_REQUIRES_LIVE_EXTRACTOR");
+  }
   const runId = randomUUID();
   const runDir = flags.output
     ? checkSafeRelativeArtifactPath(flags.output)

@@ -12,7 +12,7 @@ python3 -m unittest dogfood.test_protocol
 python3 -m dogfood run baseline delegation-lifecycle --poll-interval 0
 ```
 
-Fixture runs cover all seven checked-in logical scenarios without a provider. A
+`python3 -m dogfood validate` validates every checked-in logical scenario without a provider. A
 live run uses an **existing active local session** and a specified Temote binary:
 
 ```sh
@@ -142,22 +142,29 @@ resolves repository context while it is offline, runs task B on host B, and
 checks Queue replay and repository isolation. It never stops a production host
 or deploys to Cloudflare. `npm ci` in `gateway/` is required first. Preserve
 the exact baseline binary and use the candidate binary built from the tested
-checkout. For example, use the same task backend, model, effort, and extractor
-profile for both phases:
+checkout. The task model and `--effort` select the delegated coding run; the
+extractor model and `--extractor-reasoning-effort` independently configure
+knowledge synthesis. Use the same task backend, model, effort, and extractor
+profile for both phases. The extractor reasoning option is candidate-only,
+requires `--extractor live`, accepts `low`, `medium`, `high`, `minimal`, `none`,
+`max`, or `xhigh`, and is omitted from the provider request when unset or blank.
+The environment fallback is `TEMOTE_MCP_MEMORY_REASONING_EFFORT`.
 
 ```sh
 node gateway/scripts/memory-dogfood.mjs --phase baseline --mode live \
   --extractor disabled \
   --baseline-binary dogfood/runs/memory-20260928/baseline-bin/temote-mcp \
   --backend codex --model <available-model> --effort <available-effort> \
-  --extractor-profile opencode-go/<extractor-model>
+  --extractor-profile opencode-go/glm-5.3-flash
 
 node gateway/scripts/memory-dogfood.mjs --phase candidate --mode live \
   --extractor live --candidate-binary target/debug/temote-mcp \
   --backend codex --model <same-model> --effort <same-effort> \
-  --extractor-profile opencode-go/<same-extractor-model> \
-  --extractor-endpoint https://<provider>/v1/chat/completions \
-  --extractor-model <same-extractor-model>
+  --extractor-profile opencode-go/glm-5.3-flash \
+  --extractor-endpoint https://opencode.ai/zen/go/v1/chat/completions \
+  --extractor-model glm-5.3-flash \
+  --extractor-reasoning-effort low \
+  --host-wait-seconds 60 --pipeline-wait-seconds 240 --task-polls 200
 ```
 
 The live extractor key is read from the local OpenCode auth profile (default

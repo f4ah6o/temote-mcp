@@ -192,6 +192,9 @@ function fixtureExtract(observations) {
 }
 
 async function openAiCompatibleExtract(observations, config, runId) {
+  if (config.reasoningEffortInvalid || config.errorCode === "provider_configuration_invalid") {
+    throw new MemoryError("provider_configuration_invalid");
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
   const prompt = [
@@ -231,6 +234,7 @@ async function openAiCompatibleExtract(observations, config, runId) {
         response_format: { type: "json_object" },
         max_tokens: Math.max(128, Math.min(8192, Math.floor(config.outputBudgetBytes / 4))),
         stream: false,
+        ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
       }),
       signal: controller.signal,
     });
@@ -239,16 +243,23 @@ async function openAiCompatibleExtract(observations, config, runId) {
         ? "provider_unavailable"
         : "provider_rejected");
     }
-    const responseText = await readBoundedText(response, config.outputBudgetBytes);
+    const responseText = await readBoundedText(response, config.envelopeBudgetBytes, controller);
     let envelope;
     try {
       envelope = JSON.parse(responseText);
     } catch {
       throw new MemoryError("provider_invalid_response");
     }
-    const content = envelope?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || utf8Size(content) > config.outputBudgetBytes) {
+    const choice = envelope?.choices?.[0];
+    if (choice?.finish_reason === "length") {
+      throw new MemoryError("provider_incomplete_response");
+    }
+    const content = choice?.message?.content;
+    if (typeof content !== "string") {
       throw new MemoryError("provider_invalid_response");
+    }
+    if (utf8Size(content) > config.outputBudgetBytes) {
+      throw new MemoryError("provider_output_too_large");
     }
     try {
       return JSON.parse(content);
@@ -263,10 +274,18 @@ async function openAiCompatibleExtract(observations, config, runId) {
   }
 }
 
-async function readBoundedText(response, budgetBytes) {
+async function readBoundedText(response, budgetBytes, controller) {
   if (!response.body?.getReader) {
+    const contentLength = Number(response.headers?.get?.("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > budgetBytes) {
+      controller.abort();
+      throw new MemoryError("provider_envelope_too_large");
+    }
     const text = await response.text();
-    if (utf8Size(text) > budgetBytes) throw new MemoryError("provider_output_too_large");
+    if (utf8Size(text) > budgetBytes) {
+      controller.abort();
+      throw new MemoryError("provider_envelope_too_large");
+    }
     return text;
   }
   const reader = response.body.getReader();
@@ -277,8 +296,9 @@ async function readBoundedText(response, budgetBytes) {
     if (done) break;
     size += value.byteLength;
     if (size > budgetBytes) {
+      controller.abort();
       await reader.cancel().catch(() => {});
-      throw new MemoryError("provider_output_too_large");
+      throw new MemoryError("provider_envelope_too_large");
     }
     chunks.push(value);
   }

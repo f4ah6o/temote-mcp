@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 
-import { projectSafeContextStatus } from "../scripts/memory-dogfood.mjs";
+import {
+  memoryExtractorSettings,
+  projectSafeContextStatus,
+  resolveExtractorReasoningEffort,
+} from "../scripts/memory-dogfood.mjs";
 import {
   MEMORY_TEST_CLIENT_TOKEN,
   MEMORY_TEST_HOST_ID,
@@ -67,6 +71,52 @@ test("failure diagnostics keep only bounded context status fields and stable err
   assert.equal(JSON.stringify(projected).includes("sensitive output omitted"), false);
   assert.equal(JSON.stringify(projected).includes("provider_response"), false);
   assert.equal(JSON.stringify(projected).includes("task_body"), false);
+
+  const missingCursor = projectSafeContextStatus({
+    status: 200,
+    body: { result: { content: [{
+      type: "text",
+      text: JSON.stringify({ memory: { state: "ready_empty", worker_last_cloud_seq: null }, freshness: {
+        source_head_revision: null,
+        source_acked_revision: null,
+      } }),
+    }] } },
+  });
+  assert.equal(missingCursor.worker_last_cloud_seq, null);
+  assert.equal(missingCursor.freshness.source_head_revision, null);
+  assert.equal(missingCursor.freshness.source_acked_revision, null);
+});
+
+test("extractor reasoning effort is optional, normalized, and bounded to provider-supported values", () => {
+  assert.equal(resolveExtractorReasoningEffort({ extractor: "live" }), null);
+  assert.equal(resolveExtractorReasoningEffort({
+    extractor: "live",
+    environmentValue: "  LOW  ",
+  }), "low");
+  assert.equal(resolveExtractorReasoningEffort({
+    extractor: "live",
+    explicitValue: "xhigh",
+    environmentValue: "low",
+  }), "xhigh");
+  assert.throws(
+    () => resolveExtractorReasoningEffort({ extractor: "live", explicitValue: "budget-100" }),
+    (error) => error.code === "INVALID_EXTRACTOR_REASONING_EFFORT",
+  );
+  assert.throws(
+    () => resolveExtractorReasoningEffort({ extractor: "fixture", explicitValue: "low" }),
+    (error) => error.code === "EXTRACTOR_REASONING_EFFORT_REQUIRES_LIVE_EXTRACTOR",
+  );
+  assert.deepEqual(memoryExtractorSettings("glm-5.3-flash", "low"), {
+    model: "glm-5.3-flash",
+    reasoning_effort: "low",
+    timeout_ms: 60_000,
+    input_budget_bytes: 32_768,
+    output_budget_bytes: 8_192,
+    response_envelope_budget_bytes: 32_768,
+    max_attempts: 3,
+    batch_size: 16,
+  });
+  assert.equal(memoryExtractorSettings(null, null).reasoning_effort, null);
 });
 
 function observation() {

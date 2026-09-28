@@ -1,6 +1,9 @@
 const PRODUCER_SCHEMA_VERSION = 1;
 const EXTRACTION_POLICY_VERSION = 3;
 const PROMPT_VERSION = 2;
+const EXTRACTOR_ADAPTER_VERSION = 2;
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "minimal", "none", "max", "xhigh"]);
+const MAX_PROVIDER_ENVELOPE_BYTES = 80 * 1024;
 
 export const MEMORY_OUTPUT_SCHEMA = Object.freeze({
   version: PRODUCER_SCHEMA_VERSION,
@@ -32,18 +35,28 @@ export async function loadMemoryConfiguration(env) {
   const timeoutMs = positiveInteger(env?.MEMORY_TIMEOUT_MS, 30_000, 120_000);
   const inputBudgetBytes = positiveInteger(env?.MEMORY_INPUT_BUDGET_BYTES, 16_384, 65_536);
   const outputBudgetBytes = positiveInteger(env?.MEMORY_OUTPUT_BUDGET_BYTES, 8_192, 32_768);
+  const envelopeBudgetBytes = Math.min(MAX_PROVIDER_ENVELOPE_BYTES, 2 * outputBudgetBytes + 16_384);
   const maxAttempts = positiveInteger(env?.MEMORY_MAX_ATTEMPTS, 3, 5);
   const batchSize = positiveInteger(env?.MEMORY_BATCH_SIZE, 32, 64);
+  const requestedReasoningEffort = normalized(env?.MEMORY_REASONING_EFFORT);
+  const reasoningEffortInvalid = requestedExtractor === "openai_compatible"
+    && requestedReasoningEffort !== ""
+    && !REASONING_EFFORTS.has(requestedReasoningEffort);
+  const reasoningEffort = requestedReasoningEffort !== "" && !reasoningEffortInvalid
+    ? requestedReasoningEffort
+    : null;
   const model = boundedString(env?.MEMORY_MODEL, 256);
   const apiKey = boundedString(env?.MEMORY_API_KEY, 8192);
   const endpoint = normalizedEndpoint(env?.MEMORY_ENDPOINT);
   const credentialsConfigured = Boolean(model && apiKey && endpoint);
-  const configured = enabled && (
+  const configured = enabled && !reasoningEffortInvalid && (
     extractor === "fixture"
     || (extractor === "openai_compatible" && credentialsConfigured)
   );
   const errorCode = !enabled
     ? null
+    : reasoningEffortInvalid
+      ? "provider_configuration_invalid"
     : extractor === "disabled"
       ? "extractor_not_configured"
       : extractor === "openai_compatible" && !credentialsConfigured
@@ -55,11 +68,14 @@ export async function loadMemoryConfiguration(env) {
       adapter: extractor,
       endpoint: extractor === "openai_compatible" ? endpoint : null,
       model: extractor === "openai_compatible" ? model : "fixture-v1",
+      adapterVersion: EXTRACTOR_ADAPTER_VERSION,
+      reasoningEffort: extractor === "openai_compatible" ? reasoningEffort : null,
       prompt: PROMPT_VERSION,
       schema: PRODUCER_SCHEMA_VERSION,
       policy: EXTRACTION_POLICY_VERSION,
       inputBudgetBytes,
       outputBudgetBytes,
+      envelopeBudgetBytes,
       batchSize,
       generation,
     }))
@@ -75,6 +91,9 @@ export async function loadMemoryConfiguration(env) {
     timeoutMs,
     inputBudgetBytes,
     outputBudgetBytes,
+    envelopeBudgetBytes,
+    reasoningEffort,
+    reasoningEffortInvalid,
     maxAttempts,
     batchSize,
     model: extractor === "openai_compatible" ? model : null,
