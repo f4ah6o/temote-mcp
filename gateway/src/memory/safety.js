@@ -9,10 +9,9 @@ const SECRET_PATTERNS = [
   /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret)\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{8,}["']?/gi,
 ];
 
-const REPOSITORY_POLICY_MARKER = /(?:^|[\n.!?。！？]\s*)For this repository,\s+the\s+repository-level policy\s+(is|has changed):\s*/gim;
-const REPOSITORY_POLICY_MARKER_SHORT = /(?:^|[\n.!?。！？]\s*)For this repository,\s+repository-level policy\s+(is|has changed):\s*/gim;
-const REPOSITORY_WIDE_MARKER = /(?:^|[\n.!?。！？]\s*)Repository-wide\s+(?:policy|constraint|rule):\s*/gim;
-const OPEN_QUESTION_MARKER = /^Open question:\s*/i;
+const REPOSITORY_HEADER = /^(?:For this repository,[ \t]+the[ \t]+repository-level policy[ \t]+(is|has changed):|For this repository,[ \t]+repository-level policy[ \t]+(is|has changed):|Repository-wide[ \t]+(?:policy|constraint|rule):)[ \t]*/i;
+const OPEN_QUESTION_MARKER = /^Open question:[ \t]*/i;
+const REPOSITORY_PREDECESSOR_MARKER = /^Previous repository-level policy to replace:[ \t]*/i;
 const SENTENCE_END = /[.!?。！？](?=\s|$)/g;
 const CONSTRAINT_DIRECTIVE = /\b(?:must|should|never|always|do not|don't|keep|changed from|replace|instead of|no longer|from now on)\b|(?:必ず|禁止|してはなら|しないこと|維持する|制約|変更|置き換え|今後は)/i;
 const DECISION_DIRECTIVE = /\bdecision:\s*|\b(?:decided to|we chose|the decision is|selected because)\b|(?:決定事項|決定した|選択した)/i;
@@ -32,64 +31,12 @@ export function redactUntrustedText(value) {
 
 export function permittedRepositoryClauses(source) {
   if (source?.kind !== "instruction" || typeof source.content_preview !== "string") return [];
-  const text = source.content_preview;
-  const clauses = [];
-  for (const { marker, changedFromCapture } of repositoryMarkers()) {
-    marker.lastIndex = 0;
-    let match;
-    while ((match = marker.exec(text)) !== null) {
-      const claimStart = marker.lastIndex;
-      const claimEnd = sentenceEnd(text, claimStart);
-      if (claimEnd < 0) continue;
-      const quote = text.slice(claimStart, claimEnd + 1).trim();
-      if (!CONSTRAINT_DIRECTIVE.test(quote)) continue;
-      clauses.push({
-        kind: "constraint",
-        quote,
-        changed: changedFromCapture && match[1]?.toLowerCase() === "has changed",
-        subject: semanticSubject("constraint", quote),
-      });
-
-      let questionStart = claimEnd + 1;
-      while (/\s/.test(text[questionStart] ?? "")) questionStart += 1;
-      const questionMarker = OPEN_QUESTION_MARKER.exec(text.slice(questionStart));
-      if (!questionMarker) continue;
-      const questionTextStart = questionStart + questionMarker[0].length;
-      const questionEnd = sentenceEnd(text, questionTextStart);
-      if (questionEnd < 0) continue;
-      const question = text.slice(questionTextStart, questionEnd + 1).trim();
-      clauses.push({
-        kind: "unresolved",
-        quote: question,
-        changed: false,
-        subject: semanticSubject("unresolved", question),
-      });
-    }
-  }
-  const deduped = new Map();
-  for (const clause of clauses) deduped.set(clause.kind + "\u0000" + clause.quote, clause);
-  return [...deduped.values()];
+  return parseRepositoryDeclarationBlock(source.content_preview).clauses;
 }
 
 export function explicitRepositoryPredecessors(source) {
-  if (source?.kind !== "instruction") return [];
-  const inherited = Array.isArray(source.repository_change_predecessors)
-    ? source.repository_change_predecessors.map((value) => redactUntrustedText(value))
-      .filter((value) => typeof value === "string" && value.length > 0 && !value.includes("[REDACTED]"))
-    : [];
-  const text = typeof source.content_preview === "string" ? source.content_preview : "";
-  const marker = /(?:^|[\n.!?。！？]\s*)Previous repository-level policy to replace:\s*/gim;
-  const predecessors = [];
-  let match;
-  while ((match = marker.exec(text)) !== null) {
-    const start = marker.lastIndex;
-    const end = sentenceEnd(text, start);
-    if (end >= 0) {
-      const quote = text.slice(start, end + 1).trim();
-      if (quote) predecessors.push(quote);
-    }
-  }
-  return [...new Set([...inherited, ...predecessors])];
+  if (source?.kind !== "instruction" || typeof source.content_preview !== "string") return [];
+  return parseRepositoryDeclarationBlock(source.content_preview).predecessors;
 }
 
 export function isExplicitRepositoryPredecessor(source, quote) {
@@ -156,12 +103,97 @@ export function semanticKeyFor(kind, text) {
   return kind + ":" + boundedSemanticSubject(value || "unresolved");
 }
 
-function repositoryMarkers() {
-  return [
-    { marker: REPOSITORY_POLICY_MARKER, changedFromCapture: true },
-    { marker: REPOSITORY_POLICY_MARKER_SHORT, changedFromCapture: true },
-    { marker: REPOSITORY_WIDE_MARKER, changedFromCapture: false },
-  ];
+function parseRepositoryDeclarationBlock(text) {
+  const clauses = [];
+  const predecessors = [];
+  if (typeof text !== "string") return { clauses, predecessors };
+  let cursor = skipWhitespace(text, 0);
+  let parsedHeader = false;
+  while (cursor < text.length) {
+    const header = REPOSITORY_HEADER.exec(text.slice(cursor));
+    if (!header) break;
+    parsedHeader = true;
+    const isRepositoryPrefixed = /^For this repository,/i.test(header[0]);
+    const changeWord = header[1] ?? header[2] ?? null;
+    cursor = skipOneLineSeparator(text, cursor + header[0].length);
+    if (startsQuotedOrFenced(text, cursor)) break;
+    const claimEnd = sentenceEndOnLine(text, cursor);
+    if (claimEnd < 0) break;
+    const quote = text.slice(cursor, claimEnd + 1).trim();
+    if (!quote || startsQuotedOrFenced(quote, 0) || !CONSTRAINT_DIRECTIVE.test(quote)) break;
+    clauses.push({
+      kind: "constraint",
+      quote,
+      changed: isRepositoryPrefixed && changeWord?.toLowerCase() === "has changed",
+      subject: semanticSubject("constraint", quote),
+    });
+    cursor = skipOneLineSeparator(text, claimEnd + 1);
+    const questionMarker = OPEN_QUESTION_MARKER.exec(text.slice(cursor));
+    if (questionMarker) {
+      cursor += questionMarker[0].length;
+      if (startsQuotedOrFenced(text, cursor)) break;
+      const questionEnd = sentenceEndOnLine(text, cursor);
+      if (questionEnd < 0) break;
+      const question = text.slice(cursor, questionEnd + 1).trim();
+      if (!question || startsQuotedOrFenced(question, 0)) break;
+      clauses.push({
+        kind: "unresolved",
+        quote: question,
+        changed: false,
+        subject: semanticSubject("unresolved", question),
+      });
+      cursor = skipOneLineSeparator(text, questionEnd + 1);
+    }
+    const predecessorMarker = REPOSITORY_PREDECESSOR_MARKER.exec(text.slice(cursor));
+    if (predecessorMarker) {
+      cursor += predecessorMarker[0].length;
+      if (startsQuotedOrFenced(text, cursor)) break;
+      const predecessorEnd = sentenceEndOnLine(text, cursor);
+      if (predecessorEnd < 0) break;
+      const predecessor = text.slice(cursor, predecessorEnd + 1).trim();
+      if (!predecessor || startsQuotedOrFenced(predecessor, 0)) break;
+      predecessors.push(predecessor);
+      cursor = skipOneLineSeparator(text, predecessorEnd + 1);
+    }
+    const nextDeclaration = skipWhitespace(text, cursor);
+    if (!REPOSITORY_HEADER.test(text.slice(nextDeclaration))) break;
+    cursor = nextDeclaration;
+  }
+  if (!parsedHeader) return { clauses: [], predecessors: [] };
+  const deduped = new Map();
+  for (const clause of clauses) deduped.set(JSON.stringify([clause.kind, clause.quote]), clause);
+  return { clauses: [...deduped.values()], predecessors: [...new Set(predecessors)] };
+}
+
+function skipWhitespace(text, start) {
+  while (/\s/.test(text[start] ?? "")) start += 1;
+  return start;
+}
+
+function skipOneLineSeparator(text, start) {
+  let cursor = start;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  if (text[cursor] === "\r" && text[cursor + 1] === "\n") cursor += 2;
+  else if (text[cursor] === "\r" || text[cursor] === "\n") cursor += 1;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  return cursor;
+}
+
+function sentenceEndOnLine(text, start) {
+  const end = sentenceEnd(text, start);
+  const newline = text.indexOf("\n", start);
+  return end >= 0 && (newline < 0 || end < newline) ? end : -1;
+}
+
+function startsQuotedOrFenced(text, start) {
+  const first = text.slice(start);
+  const backtick = String.fromCharCode(96);
+  return first.startsWith(">")
+    || first.startsWith(backtick.repeat(3))
+    || first.startsWith("~~~")
+    || first.startsWith("\"")
+    || first.startsWith(String.fromCharCode(39))
+    || first.startsWith(backtick);
 }
 
 function semanticSubject(kind, text) {
