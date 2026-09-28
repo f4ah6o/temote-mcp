@@ -137,6 +137,67 @@ class MemoryContinuityTests(unittest.TestCase):
         context["constraints"][0]["scope_id"] = "github:other/repo"
         self.assertIsNone(_supported_item(context, "JSON", repo, "constraint", "task-a"))
 
+    def test_supported_unresolved_is_surfaced_without_relaxing_constraint_status(self):
+        repo = "github:temote-tests/memory-continuity"
+        question = "The required report field set remains undecided."
+        support = {
+            "observation_id": "task-a-instruction",
+            "cloud_seq": 17,
+            "observation_kind": "instruction",
+            "task_id": "task-a",
+        }
+        unresolved = {
+            "knowledge_id": "knowledge-question",
+            "text": question,
+            "kind": "unresolved",
+            "status": "supported",
+            "scope_type": "repository",
+            "scope_id": repo,
+            "authority": "derived",
+            "support_refs": [support],
+        }
+
+        for status in ("supported", "current"):
+            with self.subTest(status=status):
+                item = {**unresolved, "status": status}
+                self.assertIsNotNone(
+                    _supported_item({"unresolved": [item]}, question, repo,
+                                    "unresolved", "task-a")
+                )
+
+        for status in ("candidate", "superseded", "retracted"):
+            with self.subTest(status=status):
+                item = {**unresolved, "status": status}
+                self.assertIsNone(
+                    _supported_item({"unresolved": [item]}, question, repo,
+                                    "unresolved", "task-a")
+                )
+
+        negative_cases = (
+            ({**unresolved, "scope_id": "github:other/repo"}, [support]),
+            (unresolved, [{**support, "task_id": "task-b"}]),
+            ({**unresolved, "authority": "replicated_observed"}, [support]),
+            (unresolved, []),
+            (unresolved, [{**support, "observation_kind": "execution_state"}]),
+        )
+        for item, refs in negative_cases:
+            with self.subTest(item=item, refs=refs):
+                self.assertIsNone(
+                    _supported_item({"unresolved": [{**item, "support_refs": refs}]},
+                                    question, repo, "unresolved", "task-a")
+                )
+
+        supported_constraint = {
+            **unresolved,
+            "text": "Report output format must be JSON.",
+            "kind": "constraint",
+            "status": "supported",
+        }
+        self.assertIsNone(_supported_item(
+            {"constraints": [supported_constraint]},
+            "Report output format must be JSON.", repo, "constraint", "task-a",
+        ))
+
     def test_current_summary_must_match_policy_and_instruction_support(self):
         reference = {
             "observation_id": "task-a-instruction",

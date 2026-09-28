@@ -107,7 +107,8 @@ function parseRepositoryDeclarationBlock(text) {
   const clauses = [];
   const predecessors = [];
   if (typeof text !== "string") return { clauses, predecessors };
-  let cursor = skipWhitespace(text, 0);
+  let cursor = skipBlankLinesAndCheckIndent(text, 0);
+  if (cursor < 0) return { clauses, predecessors };
   let parsedHeader = false;
   while (cursor < text.length) {
     const header = REPOSITORY_HEADER.exec(text.slice(cursor));
@@ -116,6 +117,7 @@ function parseRepositoryDeclarationBlock(text) {
     const isRepositoryPrefixed = /^For this repository,/i.test(header[0]);
     const changeWord = header[1] ?? header[2] ?? null;
     cursor = skipOneLineSeparator(text, cursor + header[0].length);
+    if (cursor < 0) break;
     if (startsQuotedOrFenced(text, cursor)) break;
     const claimEnd = sentenceEndOnLine(text, cursor);
     if (claimEnd < 0) break;
@@ -128,6 +130,7 @@ function parseRepositoryDeclarationBlock(text) {
       subject: semanticSubject("constraint", quote),
     });
     cursor = skipOneLineSeparator(text, claimEnd + 1);
+    if (cursor < 0) break;
     const questionMarker = OPEN_QUESTION_MARKER.exec(text.slice(cursor));
     if (questionMarker) {
       cursor += questionMarker[0].length;
@@ -143,6 +146,7 @@ function parseRepositoryDeclarationBlock(text) {
         subject: semanticSubject("unresolved", question),
       });
       cursor = skipOneLineSeparator(text, questionEnd + 1);
+      if (cursor < 0) break;
     }
     const predecessorMarker = REPOSITORY_PREDECESSOR_MARKER.exec(text.slice(cursor));
     if (predecessorMarker) {
@@ -154,9 +158,10 @@ function parseRepositoryDeclarationBlock(text) {
       if (!predecessor || startsQuotedOrFenced(predecessor, 0)) break;
       predecessors.push(predecessor);
       cursor = skipOneLineSeparator(text, predecessorEnd + 1);
+      if (cursor < 0) break;
     }
-    const nextDeclaration = skipWhitespace(text, cursor);
-    if (!REPOSITORY_HEADER.test(text.slice(nextDeclaration))) break;
+    const nextDeclaration = skipBlankLinesAndCheckIndent(text, cursor);
+    if (nextDeclaration < 0 || !REPOSITORY_HEADER.test(text.slice(nextDeclaration))) break;
     cursor = nextDeclaration;
   }
   if (!parsedHeader) return { clauses: [], predecessors: [] };
@@ -165,9 +170,23 @@ function parseRepositoryDeclarationBlock(text) {
   return { clauses: [...deduped.values()], predecessors: [...new Set(predecessors)] };
 }
 
-function skipWhitespace(text, start) {
-  while (/\s/.test(text[start] ?? "")) start += 1;
-  return start;
+function skipBlankLinesAndCheckIndent(text, start) {
+  let cursor = start;
+  while (cursor < text.length) {
+    const newline = text.indexOf("\n", cursor);
+    const lineEnd = newline < 0 ? text.length : newline;
+    const line = text.slice(cursor, lineEnd).replace(/\r$/, "");
+    if (/^[ \t]*$/.test(line)) {
+      if (newline < 0) return text.length;
+      cursor = newline + 1;
+      continue;
+    }
+    let indent = 0;
+    while (line[indent] === " ") indent += 1;
+    if (line[indent] === "\t" || indent >= 4) return -1;
+    return cursor + indent;
+  }
+  return cursor;
 }
 
 function skipOneLineSeparator(text, start) {
@@ -175,7 +194,13 @@ function skipOneLineSeparator(text, start) {
   while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
   if (text[cursor] === "\r" && text[cursor + 1] === "\n") cursor += 2;
   else if (text[cursor] === "\r" || text[cursor] === "\n") cursor += 1;
-  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  else return cursor;
+  let indent = 0;
+  while (text[cursor] === " ") {
+    cursor += 1;
+    indent += 1;
+  }
+  if (text[cursor] === "\t" || indent >= 4) return -1;
   return cursor;
 }
 

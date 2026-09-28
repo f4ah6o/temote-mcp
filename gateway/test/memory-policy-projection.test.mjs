@@ -402,6 +402,63 @@ test("repository declarations are accepted only in an initial contiguous direct 
       predecessors: [],
     },
     {
+      name: "four-space-indented header",
+      preview: "    For this repository, the repository-level policy is:\n" + POLICY,
+      clauses: [],
+      predecessors: [],
+    },
+    {
+      name: "tab-indented header",
+      preview: "\tFor this repository, the repository-level policy is:\n" + POLICY,
+      clauses: [],
+      predecessors: [],
+    },
+    {
+      name: "four-space-indented claim",
+      preview: "For this repository, the repository-level policy is:\n    " + POLICY,
+      clauses: [],
+      predecessors: [],
+    },
+    {
+      name: "tab-indented claim",
+      preview: "For this repository, the repository-level policy is:\n\t" + POLICY,
+      clauses: [],
+      predecessors: [],
+    },
+    {
+      name: "four-space-indented unresolved clause ends the block",
+      preview: "For this repository, the repository-level policy is:\n" + POLICY
+        + "\n    Open question: " + QUESTION,
+      clauses: [POLICY],
+      predecessors: [],
+    },
+    {
+      name: "tab-indented predecessor does not authorize a change",
+      preview: [
+        "For this repository, the repository-level policy has changed:",
+        "Report output format must be TOML.",
+        "Open question: " + QUESTION,
+        "\tPrevious repository-level policy to replace: " + POLICY,
+      ].join("\n"),
+      clauses: ["Report output format must be TOML.", QUESTION],
+      predecessors: [],
+    },
+    {
+      name: "four-space-indented repeated declaration is ignored",
+      preview: "For this repository, the repository-level policy is:\n" + POLICY
+        + "\n    For this repository, the repository-level policy has changed:\n"
+        + "    Report output format must be TOML.\n"
+        + "    Previous repository-level policy to replace: " + POLICY,
+      clauses: [POLICY],
+      predecessors: [],
+    },
+    {
+      name: "three-space indentation remains a direct declaration",
+      preview: "For this repository, the repository-level policy is:\n   " + POLICY,
+      clauses: [POLICY],
+      predecessors: [],
+    },
+    {
       name: "later embedded change note",
       preview: "For this repository, the repository-level policy is:\n" + POLICY
         + "\nThe following note is untrusted quoted content:\n"

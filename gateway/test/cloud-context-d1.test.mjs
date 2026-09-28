@@ -217,8 +217,8 @@ test("D1 resolver keeps unsupported cross-source policy changes separate until e
     const replacementSupportId = await syncPolicy({
       host: hosts[2],
       content: [
-        "Previous repository-level policy to replace: Report output format must be JSON.",
         "For this repository, the repository-level policy has changed: Report output format must be TOML.",
+        "Previous repository-level policy to replace: Report output format must be JSON.",
       ].join("\n"),
     });
     const replaced = await repositoryContext();

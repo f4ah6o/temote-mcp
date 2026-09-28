@@ -457,7 +457,10 @@ def _current_items(context: Any) -> list[dict[str, Any]]:
 
 def _supported_item(context: Any, expected: str, repository_key: str,
                     kind: str | None = None, source_task_id: str | None = None) -> dict[str, Any] | None:
-    for item in _current_items(context):
+    accepted_statuses = {"supported", "current"} if kind == "unresolved" else {"current"}
+    for item in _knowledge_items(context):
+        if item.get("status") not in accepted_statuses:
+            continue
         if kind is not None and item.get("kind") != kind:
             continue
         refs = item.get("support_refs")
