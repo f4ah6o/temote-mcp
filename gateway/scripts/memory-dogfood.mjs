@@ -38,6 +38,9 @@ const MEMORY_PROVIDER_ENVELOPE_BUDGET_BYTES = Math.min(
 const MEMORY_MAX_ATTEMPTS = 3;
 const MEMORY_BATCH_SIZE = 16;
 const MEMORY_REASONING_EFFORTS = new Set(["low", "medium", "high", "minimal", "none", "max", "xhigh"]);
+const HOST_LEASE_MS = 90_000;
+const HOST_LEASE_MARGIN_MS = 5_000;
+const HOST_GRACEFUL_OFFLINE_WAIT_MS = 15_000;
 const MAX_ARTIFACT_BYTES = 1_048_576;
 const MEMORY_ERROR_CODES = new Set([
   "db_unavailable", "extractor_not_configured", "provider_not_configured", "provider_timeout",
@@ -47,6 +50,21 @@ const MEMORY_ERROR_CODES = new Set([
   "invalid_scope", "invalid_verification_support", "invalid_supersession", "input_too_large",
   "producer_generation_conflict", "producer_generation_stale", "run_retry_exhausted",
   "projection_too_large", "commit_rejected", "worker_internal", "queue_not_configured", "queue_send_failed",
+]);
+const SAFE_HARNESS_ERROR_CODES = new Set([
+  "ARTIFACT_PATH_MUST_BE_IGNORED_RUNS", "AUTOMATIC_MEMORY_FIXTURE_TEST_FAILED",
+  "CHILD_COMMAND_FAILED", "CODING_BACKEND_SELECTOR_UNSUPPORTED", "CONTEXT_STATUS_FAILED",
+  "CONTEXT_STATUS_RESULT_INVALID", "DEDICATED_HOST_CONNECT_TIMEOUT", "DEDICATED_HOST_OFFLINE_TIMEOUT",
+  "DOGFOOD_ARTIFACT_IDENTITY_INVALID", "DOGFOOD_DRIVER_EXITED_BEFORE_HANDSHAKE",
+  "DOGFOOD_DRIVER_EXITED_BEFORE_PROJECTION", "DOGFOOD_DRIVER_TIMEOUT", "DOGFOOD_FIXTURE_DRIVER_FAILED",
+  "DOGFOOD_HANDSHAKE_TIMEOUT", "DOGFOOD_SCENARIO_FAILED", "DRIVER_START_FAILED", "DUPLICATE_ARGUMENT",
+  "EXTRACTOR_CREDENTIAL_UNAVAILABLE", "EXTRACTOR_REASONING_EFFORT_REQUIRES_LIVE_EXTRACTOR",
+  "FIXTURE_MODE_CANNOT_USE_LIVE_EXTRACTOR", "HOST_AGENT_STOP_TIMEOUT", "HOST_LIST_FAILED",
+  "HOST_LIST_RESULT_INVALID", "HOST_LIST_UNAVAILABLE", "HOST_OFFLINE_BUDGET_EXCEEDED",
+  "INVALID_ARGUMENT", "INVALID_EXTRACTOR_REASONING_EFFORT", "INVALID_PHASE_MODE_OR_EXTRACTOR",
+  "INVALID_PROJECTION_TABLE", "MEMORY_DOGFOOD_FAILED", "MEMORY_OUTBOX_MISSING", "MISSING_ARGUMENT_VALUE",
+  "QUEUE_HAS_UNSETTLED_DISPATCH", "QUEUE_REPLAY_CHANGED_PROJECTION", "QUEUE_REPLAY_NOT_CONSUMED",
+  "SCENARIO_CONTRACT_INVALID", "SCENARIO_UNAVAILABLE", "TEMOTE_BINARY_NOT_FOUND", "UNKNOWN_ARGUMENT",
 ]);
 
 class HarnessError extends Error {
@@ -298,6 +316,31 @@ async function writeProjectionDiagnostics(runtime, clientToken, host, runDir) {
   }
 }
 
+async function writeLiveFailureDiagnostics(runtime, clientToken, host, phase, runDir) {
+  try {
+    const result = await Promise.race([
+      collectProjectionDiagnostics(runtime, clientToken, host),
+      delay(5_000).then(() => null),
+    ]);
+    const snapshot = result ?? {
+      schema_version: 1,
+      diagnostic_type: "automatic_memory_run_failure",
+      host_label: host?.label ?? "unknown",
+      diagnostic_capture: "timed_out",
+    };
+    snapshot.diagnostic_type = "automatic_memory_run_failure";
+    await fs.writeFile(
+      path.join(runDir, `${phase}-run-diagnostics.json`),
+      JSON.stringify(snapshot, null, 2) + "\n",
+      { mode: 0o600, flag: "wx" },
+    );
+    return snapshot;
+  } catch {
+    // Diagnostics are best-effort and must never replace the pipeline failure.
+    return null;
+  }
+}
+
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -388,6 +431,80 @@ async function writeProjectionFailureManifest(runDir, metadata, host, diagnostic
     );
   } catch {
     // Failure manifests must not mask the underlying projection gate failure.
+  }
+}
+
+export function safeHarnessErrorCode(error) {
+  if (!(error instanceof HarnessError)) return "MEMORY_DOGFOOD_FAILED";
+  const code = error.code;
+  const stableDynamicCode = /^PROJECTION_[AB]_TIMEOUT$/.test(code)
+    || /^(HOST_AGENT|SUPERVISOR)_[AB]_(SOCKET_NAMESPACE_INVALID|GATEWAY_AUTH_FAILED|GATEWAY_CONNECT_FAILED|GATEWAY_URL_INVALID|CHILD_SIGNALED|CHILD_EXIT_\d{1,3}|CHILD_START_FAILED|START_FAILED)$/.test(code);
+  return SAFE_HARNESS_ERROR_CODES.has(code) || stableDynamicCode ? code : "MEMORY_DOGFOOD_FAILED";
+}
+
+async function markerMatches(filePath, expected) {
+  try {
+    return (await fs.readFile(filePath, "utf8")) === expected;
+  } catch {
+    return false;
+  }
+}
+
+export async function writeLiveFailureManifest(runDir, metadata, failureCode, progress, diagnostics) {
+  try {
+    const taskATerminal = await markerMatches(path.join(runDir, "task-a-complete.proof"), TASK_A_MARKER);
+    const offlineProof = await markerMatches(path.join(runDir, "host-a-offline.proof"), OFFLINE_MARKER);
+    const taskBReady = await markerMatches(path.join(runDir, "task-b-ready.proof"), TASK_B_READY_MARKER);
+    const manifest = {
+      schema_version: 1,
+      scenario_id: "memory-continuity",
+      scenario_revision: 1,
+      scenario_fingerprint: metadata.provenance.scenario_fingerprint,
+      phase: metadata.phase,
+      mode: "live",
+      synthesis_mode: metadata.extractor === "live" ? "live" : "fixture",
+      outcome: "blocked",
+      live_synthesis: "NOT QUALIFIED",
+      selectors: metadata.selectors,
+      extractor_config: metadata.extractorConfig,
+      provenance: metadata.provenance,
+      gates: {
+        task_a_terminal: taskATerminal ? "pass" : "not_run",
+        source_sync_complete: diagnostics?.source?.complete === true ? "pass" : "blocked",
+        task_a_projection_predicate: progress.taskAProjectionPredicatePassed ? "pass" : "not_run",
+        task_a_public_context_assertions: "not_run",
+        offline_host: offlineProof ? "pass" : progress.offlineCheckAttempted ? "blocked" : "not_run",
+        task_b_ready: taskBReady ? "pass" : "not_run",
+        task_b_projection_predicate: progress.taskBProjectionPredicatePassed ? "pass" : "not_run",
+        queue_replay: progress.queueReplayPassed ? "pass" : "not_run",
+        scenario_assertions: "not_run",
+      },
+      progress: {
+        last_completed_stage: progress.stage,
+        diagnostic_host: progress.diagnosticHostLabel ?? null,
+      },
+      events: {
+        stable_error_code: failureCode,
+        task_a_terminal_marker_verified: taskATerminal,
+        host_a_offline_marker_verified: offlineProof,
+        task_b_ready_marker_verified: taskBReady,
+        source_acked_revision: diagnostics?.source?.acked_through_revision ?? null,
+        source_head_revision: diagnostics?.source?.source_head_revision ?? null,
+        source_cloud_head: diagnostics?.source?.cloud_head_seq ?? null,
+        source_gap_count: diagnostics?.source?.gap_count ?? null,
+        worker_status: diagnostics?.worker_context_status?.state ?? "unavailable",
+        worker_last_cloud_seq: diagnostics?.worker_context_status?.worker_last_cloud_seq ?? null,
+        worker_lag: diagnostics?.worker_context_status?.worker_lag ?? null,
+        live_qualification: "not_qualified",
+      },
+    };
+    await fs.writeFile(
+      path.join(runDir, `${metadata.phase}-run-failure.json`),
+      JSON.stringify(manifest, null, 2) + "\n",
+      { mode: 0o600, flag: "wx" },
+    );
+  } catch {
+    // Failure manifests must not mask the original pipeline failure.
   }
 }
 
@@ -519,14 +636,20 @@ async function waitUntil(predicate, timeoutMs, intervalMs = 100) {
   return false;
 }
 
-async function stopOwnedProcess(child, timeoutMs = 5_000) {
-  if (!child || childExited(child)) return;
-  child.kill("SIGTERM");
+async function stopOwnedProcess(child, timeoutMs = 5_000, initialSignal = "SIGTERM") {
+  if (!child || childExited(child)) return "already_exited";
+  child.kill(initialSignal);
   const exited = await waitUntil(() => childExited(child), timeoutMs, 50);
-  if (!exited && !childExited(child)) {
-    child.kill("SIGKILL");
-    await waitUntil(() => childExited(child), 2_000, 50);
+  if (exited || childExited(child)) {
+    if (initialSignal !== "SIGINT") return "signaled";
+    return child.exitCode === 0 ? "graceful" : "unexpected_exit";
   }
+  if (!childExited(child)) {
+    child.kill("SIGKILL");
+    const killed = await waitUntil(() => childExited(child), 2_000, 50);
+    return killed || childExited(child) ? "forced" : "still_running";
+  }
+  return "forced";
 }
 
 function parseMcpText(response, name) {
@@ -540,34 +663,84 @@ function parseMcpText(response, name) {
   }
 }
 
-function hostIdsFrom(value, found = new Set(), depth = 0) {
-  if (depth > 16) return found;
-  if (Array.isArray(value)) {
-    for (const child of value) hostIdsFrom(child, found, depth + 1);
-  } else if (value && typeof value === "object") {
-    if (typeof value.host_id === "string") found.add(value.host_id);
-    for (const child of Object.values(value)) hostIdsFrom(child, found, depth + 1);
-  }
-  return found;
-}
-
-async function hostIsPresent(runtime, token, hostId) {
+export async function hostIsPresent(runtime, token, hostId) {
   const result = parseMcpText(
     await runtime.callMcp(token, "host_list", {}, Math.floor(Math.random() * 1_000_000_000)),
     "host_list",
   );
-  return hostIdsFrom(result).has(hostId);
+  if (!Array.isArray(result)) throw new HarnessError("HOST_LIST_RESULT_INVALID");
+  if (result.some((host) => !host || typeof host !== "object" || Array.isArray(host)
+      || typeof host.host_id !== "string" || host.host_id.length === 0)) {
+    throw new HarnessError("HOST_LIST_RESULT_INVALID");
+  }
+  return result.some((host) => host.host_id === hostId);
 }
 
-async function waitForHost(runtime, token, hostId, present, timeoutMs) {
+export async function waitForHost(runtime, token, hostId, present, timeoutMs, pollIntervalMs = 250) {
+  let lastDiscoveryError = null;
   const ok = await waitUntil(async () => {
     try {
-      return (await hostIsPresent(runtime, token, hostId)) === present;
-    } catch {
+      const actual = await hostIsPresent(runtime, token, hostId);
+      lastDiscoveryError = null;
+      return actual === present;
+    } catch (error) {
+      lastDiscoveryError = error;
       return false;
     }
-  }, timeoutMs, 250);
-  if (!ok) throw new HarnessError(present ? "DEDICATED_HOST_CONNECT_TIMEOUT" : "DEDICATED_HOST_OFFLINE_TIMEOUT");
+  }, timeoutMs, pollIntervalMs);
+  if (!ok) {
+    if (lastDiscoveryError) throw new HarnessError("HOST_LIST_UNAVAILABLE");
+    throw new HarnessError(present ? "DEDICATED_HOST_CONNECT_TIMEOUT" : "DEDICATED_HOST_OFFLINE_TIMEOUT");
+  }
+}
+
+export async function stopDedicatedHostAndConfirmOffline({
+  host,
+  runtime,
+  token,
+  proofPath,
+  budgetMs,
+  signalTimeoutMs = 5_000,
+  gracefulAbsenceTimeoutMs = HOST_GRACEFUL_OFFLINE_WAIT_MS,
+  leaseMs = HOST_LEASE_MS,
+  leaseMarginMs = HOST_LEASE_MARGIN_MS,
+  stopProcess = stopOwnedProcess,
+  waitHost = waitForHost,
+  writeProof = (filePath) => fs.writeFile(filePath, OFFLINE_MARKER, { mode: 0o600, flag: "wx" }),
+}) {
+  if (!Number.isSafeInteger(budgetMs) || budgetMs <= 0) {
+    throw new HarnessError("HOST_OFFLINE_BUDGET_EXCEEDED");
+  }
+  const startedAt = Date.now();
+  const termination = await stopProcess(host.hostAgent, signalTimeoutMs, "SIGINT");
+  if (termination === "still_running") throw new HarnessError("HOST_AGENT_STOP_TIMEOUT");
+  const remainingBudget = () => Number.isSafeInteger(budgetMs) ? Math.max(0, budgetMs - (Date.now() - startedAt)) : 0;
+  let leaseFallback = termination !== "graceful";
+  if (!leaseFallback) {
+    const gracefulWait = Math.min(gracefulAbsenceTimeoutMs, remainingBudget());
+    if (gracefulWait <= 0) throw new HarnessError("HOST_OFFLINE_BUDGET_EXCEEDED");
+    try {
+      await waitHost(runtime, token, host.hostId, false, gracefulWait);
+    } catch (error) {
+      if (!(error instanceof HarnessError) || error.code !== "DEDICATED_HOST_OFFLINE_TIMEOUT") throw error;
+      leaseFallback = true;
+    }
+  }
+  if (leaseFallback) {
+    const fallbackWait = Math.min(leaseMs + leaseMarginMs, remainingBudget());
+    if (fallbackWait <= 0) throw new HarnessError("HOST_OFFLINE_BUDGET_EXCEEDED");
+    try {
+      await waitHost(runtime, token, host.hostId, false, fallbackWait);
+    } catch (error) {
+      if (error instanceof HarnessError && error.code === "DEDICATED_HOST_OFFLINE_TIMEOUT"
+          && fallbackWait < leaseMs + leaseMarginMs) {
+        throw new HarnessError("HOST_OFFLINE_BUDGET_EXCEEDED");
+      }
+      throw error;
+    }
+  }
+  await writeProof(proofPath);
+  return { termination, lease_fallback: leaseFallback, offline_confirmed: true };
 }
 
 async function loadExtractorKey(authFile) {
@@ -1084,6 +1257,14 @@ async function runLive(flags, phase, extractor, runDir) {
   let driver;
   let hosts = [];
   let successful = false;
+  const progress = {
+    stage: "runtime_started",
+    diagnosticHostLabel: null,
+    taskAProjectionPredicatePassed: false,
+    taskBProjectionPredicatePassed: false,
+    queueReplayPassed: false,
+    offlineCheckAttempted: false,
+  };
   try {
     const { repoA, repoB } = await createRunWorkspace(runDir);
     const hostA = await createDedicatedHost({
@@ -1097,33 +1278,55 @@ async function runLive(flags, phase, extractor, runDir) {
     });
     hosts.push(hostB);
     await startMcpReady(runtime, clientToken, hosts, Number(flags["host-wait-seconds"] ?? 60) * 1000);
+    progress.stage = "hosts_ready";
 
     driver = await startDriver({
       phase, mode: "live", extractor, binary, flags, runtime, clientToken, hostA, hostB, runDir,
       extractorProfile, python: flags.python ?? process.env.PYTHON ?? "python3",
     });
+    progress.stage = "driver_started";
 
     const handshakeTimeout = Number(flags["pipeline-wait-seconds"] ?? 240) * 1000;
     await waitForMarker(path.join(runDir, "task-a-complete.proof"), TASK_A_MARKER, handshakeTimeout, driver);
+    progress.stage = "task_a_terminal";
     await copyTaskAHeadToHostB(repoA, repoB);
     if (phase === "candidate") {
       const pipelineWait = handshakeTimeout;
       const taskAConstraint = scenario.task_a.constraint;
+      progress.stage = "task_a_projection";
+      progress.diagnosticHostLabel = hostA.label;
       await waitForProjectionWhileDriverRuns(runtime, clientToken, hostA, taskAConstraint, pipelineWait, driver, runDir, metadata);
+      progress.taskAProjectionPredicatePassed = true;
+      progress.stage = "task_a_projection_predicate_passed";
 
-      await stopOwnedProcess(hostA.hostAgent);
-      await waitForHost(runtime, clientToken, hostA.hostId, false, 15_000);
-      const proofPath = path.join(runDir, "host-a-offline.proof");
-      await fs.writeFile(proofPath, OFFLINE_MARKER, { mode: 0o600, flag: "wx" });
+      progress.stage = "stopping_host_a";
+      progress.offlineCheckAttempted = true;
+      await stopDedicatedHostAndConfirmOffline({
+        host: hostA,
+        runtime,
+        token: clientToken,
+        proofPath: path.join(runDir, "host-a-offline.proof"),
+        budgetMs: handshakeTimeout,
+      });
+      progress.stage = "host_a_offline";
     }
     await fs.writeFile(path.join(runDir, "task-b-ready.proof"), TASK_B_READY_MARKER, { mode: 0o600, flag: "wx" });
+    progress.stage = "task_b_ready";
     if (phase === "candidate") {
       const pipelineWait = handshakeTimeout;
+      progress.stage = "task_b_projection";
+      progress.diagnosticHostLabel = hostB.label;
       await waitForProjectionWhileDriverRuns(runtime, clientToken, hostB, scenario.task_b.constraint, pipelineWait, driver, runDir, metadata);
+      progress.taskBProjectionPredicatePassed = true;
+      progress.stage = "task_b_projection_predicate_passed";
+      progress.stage = "queue_replay";
       await replayQueueAndWriteManifest(runtime, runDir);
+      progress.queueReplayPassed = true;
+      progress.stage = "queue_replay_complete";
     }
 
     const driverExitCode = await waitForDriver(driver, 30 * 60 * 1000);
+    progress.stage = "driver_terminal";
     const artifact = JSON.parse(await fs.readFile(driver.artifactPath, "utf8"));
     if (artifact.scenario_fingerprint === undefined || artifact.phase !== phase
         || artifact.scenario_revision !== scenario.revision) {
@@ -1161,6 +1364,14 @@ async function runLive(flags, phase, extractor, runDir) {
       offline_host_proof: phase === "candidate" ? "verified" : "not_run",
     };
     return { summary, successful };
+  } catch (error) {
+    const diagnosticHost = hosts.find((host) => host.label === progress.diagnosticHostLabel)
+      ?? hosts.find((host) => host.label === "a")
+      ?? hosts[0]
+      ?? { label: "unknown", hostId: "", sessionId: "" };
+    const diagnostics = await writeLiveFailureDiagnostics(runtime, clientToken, diagnosticHost, phase, runDir);
+    await writeLiveFailureManifest(runDir, metadata, safeHarnessErrorCode(error), progress, diagnostics);
+    throw error;
   } finally {
     if (driver && !childExited(driver.child)) await stopOwnedProcess(driver.child, 3_000);
     // Only these child processes were launched by this runner with isolated state.
