@@ -58,7 +58,8 @@ def main() -> None:
                 raise FileExistsError(args.output)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
-        print(json.dumps({"qualification": result["qualification"], "report": str(args.output) if args.output else result}))
+        print(json.dumps({"qualification": result["qualification"], "improvement": result["improvement"],
+                          "report": str(args.output) if args.output else result}))
         if result["qualification"] != "qualified":
             sys.exit(1)
         return
