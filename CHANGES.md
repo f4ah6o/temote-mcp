@@ -4,6 +4,7 @@
 
 ### Added
 
+- Fabric now synchronizes eligible host observations automatically and resolves bounded repository context with provenance; a configured Memory Worker can derive supported knowledge from the D1 replica. Instruction and error previews remain opt-in, and their policy must stay unchanged until pending batches are acknowledged. ([cloud observation and knowledge plane](issues/open/20260926-cloud-observation-knowledge-plane.md))
 - `temote-mcp doctor` checks Jujutsu (`jj --version`) for development readiness and warns when jj is missing or unusable without requiring it for normal operation.
 - Added a repository-owned dogfood harness for versioned logical scenarios, bounded call observations, deterministic fault fixtures, live MCP runs, and evidence-linked before/after comparison. ([self-improvement protocol](issues/done/20260928-self-improvement-dogfood-protocol.md))
 - `task_list` rediscovers session-owned delegated tasks across backends through the existing bounded task projection, with per-backend availability and no transcript or output. ([development harness](issues/open/20260924-temote-development-harness-restructure.md))
@@ -42,3 +43,5 @@
 - Kept activity summaries and durable upgrade/task state bounded and free of command output, prompts, session paths, credentials, and raw errors.
 
 ### Migration
+
+- Existing Fabric D1 deployments must inspect and apply pending observation and memory migrations before deploying this Worker update. Migration `0003_memory_worker.sql` rebuilds knowledge tables while copying their existing rows and provenance. Memory extraction remains disabled by default; enable it through Worker variables and the `MEMORY_API_KEY` secret when ready. ([Fabric operations](docs/gateway.md#deploy))

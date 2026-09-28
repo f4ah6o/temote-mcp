@@ -28,7 +28,7 @@ On a direct single-host Temote endpoint without `host_list`, keep using the exis
 
 Do not ask the user to repeat a session ID or logical path that Temote MCP can discover or that the current task already supplies.
 
-When resuming work on a session you did not start (head-switching), call `context_resolve` before delegating: it returns a bounded bundle with current workspace state, recent task rollups, unresolved items needing attention, and provenance `refs`. Use `at_least_revision` to check whether a bundle you already hold is still fresh, and `context_status` for journal health. Neither returns raw observation bodies; knowledge fields are explicitly empty until memory synthesis lands.
+When resuming work on a session you did not start (head-switching), call `context_resolve` before delegating. On Fabric, pass the stable repository key to retrieve replicated task observations and supported/current knowledge without requiring an execution host to be online; use `context_status` to inspect source gaps, synchronization freshness, and memory-worker lag. In a local session-only context, pass `session_id` and use its observation journal. Treat observations as `replicated_observed`, knowledge as `derived`, and host execution state as live only when Temote has actually queried the host. Follow the returned provenance references, and do not treat task completion or an agent assertion as proof that a requirement or test passed. Context responses are bounded and do not include raw observation bodies. Never ask a coding agent to save or summarize memory; Fabric synchronizes observations and synthesizes knowledge when its memory worker is enabled.
 
 ## Delegate machine work to the local agent
 

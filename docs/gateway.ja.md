@@ -13,6 +13,9 @@ native Windows 実行は後続 milestone です。現時点の Windows 11 federa
 - Worker `/mcp` は MCP client を認証し、host-aware tool を公開して routing します。
 - `/v1/hosts/*` は `temote-mcp gateway-agent` が outbound long poll で使う protocol です。
 - session lifecycle、named-root 解決、sandbox、approval の最終 authority は各 host の local supervisor です。gateway には named root の absolute path を送信しません。
+- delegation observation は owner 専用の local journal に先に記録します。host agent は認証済み host channel から送信対象の record を D1 へ複製します。D1 の内容は sanitized replica であり、execution の authority にはなりません。
+- D1 への ingest が commit されると Queue が Memory Worker を起動します。D1 は未処理 work を保持し、定期 sweep が Queue 送信漏れと projection の遅れを回復します。
+- knowledge は根拠を持つ derived projection です。execution を認可したり起動したりしません。
 
 host reconnect ごとに generation を進めます。古い generation または古い process `instance_id` からの request/response は拒否します。routed operation には非 idempotent なものがあるため、timeout や disconnect 後の自動 replay は行いません。
 
@@ -50,9 +53,12 @@ just check-generated
 Worker は生成された `gateway/contract/routed-tool-metadata.json` を直接読みます。
 
 Observation 用に `OBSERVATION_OWNER_ID` と D1 `OBSERVATION_DB` を設定し、sentinel database ID を実際の ID に置き換えます。
-対象を確認してから、`gateway/` の pinned Wrangler で既存の追加型 migration を適用します。
+未適用 migration を確認してから、`gateway/` の pinned Wrangler で適用します。
+`0003_memory_worker.sql` は既存の knowledge table を再構築し、item、support、supersession の行をコピーします。
+対象 database の内容に照らして、この migration を事前に確認してください。
 
 ```sh
+(cd gateway && npx wrangler d1 migrations list temote-observation --remote)
 (cd gateway && npx wrangler d1 migrations apply temote-observation --remote)
 ```
 
@@ -84,6 +90,53 @@ just check-generated
 7. 下記の health と認証済み MCP 疎通を確認します。target を指定しない deploy は version を upload しても公開されません。
 
 公開 MCP URL は `https://<gateway-host>/mcp` です。
+
+D1 schema は observation、memory run、checkpoint、outbox、knowledge の table を使います。
+適用前に未適用 migration を確認してください。
+`0003_memory_worker.sql` は既存の knowledge table を再構築し、既存の row と provenance をコピーします。
+対象 database に適用する前に内容を確認してください。
+memory extraction は既定で無効です（`MEMORY_ENABLED = "false"`）。
+OpenAI-compatible extractor を有効にする場合は `MEMORY_ENABLED = "true"`、`MEMORY_EXTRACTOR = "openai_compatible"`、full URL の `MEMORY_ENDPOINT`、`MEMORY_MODEL`、`MEMORY_TIMEOUT_MS`、`MEMORY_INPUT_BUDGET_BYTES`、`MEMORY_OUTPUT_BUDGET_BYTES`、`MEMORY_MAX_ATTEMPTS`、`MEMORY_BATCH_SIZE`、`MEMORY_PROJECTION_GENERATION` を Worker config に設定します。
+`MEMORY_API_KEY` は Worker secret として保存し、値を `wrangler.toml`、`.dev.vars.example`、評価 artifact に書きません。
+抽出方式を変えるときは `MEMORY_PROJECTION_GENERATION` を単調増加させ、旧 worker が有効な projection を置き換えないようにします。
+
+```sh
+(cd gateway && npx wrangler secret put MEMORY_API_KEY)
+```
+
+`wrangler secret put` は直ちに Worker deployment を作成します。
+target と Access policy を確認し、意図した Worker の設定作業として実行してください。
+[Wrangler の secret 管理](https://developers.cloudflare.com/workers/configuration/secrets/) を参照してください。
+抽出を止めるときは `MEMORY_ENABLED` を `false` にします。
+有効にするときは `true` にして、確認済みの Worker config を deploy します。
+`temote-memory` Queue と5分ごとの scheduled sweep は `gateway/wrangler.toml` に定義されています。
+deploy 時も両方の binding を維持してください。
+Queue は at-least-once の起動通知です。
+D1 outbox は未送信または古くなった work を60秒後に再送対象にし、次の5分ごとの scheduled sweep が Queue に再投入します。
+provider run は `MEMORY_MAX_ATTEMPTS` で再試行を打ち切り、上限後は `context_status` に bounded error code と `failed` を報告します。
+sweep はこの上限を迂回しません。
+provider または入力の失敗原因を修正した後、retry するには `MEMORY_PROJECTION_GENERATION` を単調増加させ、確認済みの config を deploy します。
+新しい producer version は retained observation を先頭から再処理します。
+再構築が追いつくまで、以前の active projection は読み取り可能です。
+provider cost を伴う明示的な rebuild として扱ってください。
+同期と Worker の freshness は `context_status` で確認します。
+live deployment では `fixture` extractor を有効にしないでください。
+
+Memory Worker は1 invocation につき repository group を最大1つ処理します。
+保守的に見積もった worst-case は602 D1 statement です。
+内訳は setup、claim、outbox、error の処理が最大14、active item、support count、provenance の read が各24、commit batch が最大512、commit 後の処理が最大4です。
+[Cloudflare D1 の公式上限](https://developers.cloudflare.com/d1/platform/limits/) では Workers Paid の1 invocation あたり上限は1,000 query なので、この実装上の statement 数はその範囲に収まります。
+Free の上限は50 query で worst-case batch を処理できないため、Free の worst-case qualification はしていません。
+この statement 数の qualification は、特定の account、plan、remote Worker の確認を示すものではありません。
+
+projection の準備に512 statement を超える場合、Worker は `projection_too_large` を返し、knowledge を commit せず checkpoint も進めません。
+再試行は `MEMORY_MAX_ATTEMPTS` で打ち切ります。
+復旧するには `MEMORY_BATCH_SIZE` を下げて入力を commit 上限内に収め、`MEMORY_PROJECTION_GENERATION` を増加させて確認済み config を deploy し、retained observation から rebuild します。
+新しい projection の publish までは、以前の active projection を読み取れます。
+
+repository-scoped context は、観測済みの D1 record から取得できます。
+live Worker が offline でも利用できます。
+Cloudflare 上でこの経路が動くことは、ローカルの dry-run だけでは確認できません。
 
 ## Deployment target
 
@@ -163,6 +216,50 @@ temote-mcp supervisor
 temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
+既存の host-level `gateway-agent --host-id` は、認証済み channel から observation batch を自動送信します。
+1 batch は最大32件または512 KiBで、5秒ごとに確認し、同期 request の timeout は8秒です。
+local journal への記録が先行するため、Fabric の timeout や認証失敗で delegated task が失敗したり、backend operation が再実行されたりしません。
+agent は通常の `task_get` polling が完了を観測して作成した terminal observation を含む retained journal を確認し、host、Fabric endpoint、session ごとの cursor を owner 専用領域に保存します。
+呼び出し側の polling が止まった後に backend を独自に確認するわけではありません。
+`committed_through_revision` は D1 への commit が確認された最大 source revision です。
+`acked_through_revision` は D1 が連続して受領したと確認できる source revision です。
+既知の gap を越えて後続の retained record を同期できますが、gap は保持され、source は `complete=false` になります。
+source revision cursor と cloud sequence は別の番号体系です。
+
+同期診断は stable error code と timestamp を含む owner 専用 status file に保存されます。
+retry 間隔は2秒から最大5分まで段階的に延び、agent 再起動後も再開します。
+同期 cursor、gap、source の partial 状態は `context_status({repository: ...})` で確認できます。
+手動同期 command はありません。
+cursor を reset する CLI もありません。
+operator が承認した復旧で古い journal record を戻した場合は、対象 host の `gateway-agent` だけを停止し、`cursor` に `gateway-observation-sync/<host-id>/<sha256-normalized-gateway-url>/` 内の対象 session の `ack-<session-id>.json` のみを設定して、owner 専用の一意な backup 名へ移動します。
+
+```sh
+mv -- "$cursor" "${cursor}.backup-${unique_timestamp}"
+```
+
+その後、同じ agent を再起動すると retained record を再走査します。
+observation journal、`status.json`、他の cursor は変更しません。
+D1 の完全一致する再送は重複しませんが、再走査だけで既報の source gap は消えず、complete の証明にもなりません。
+結果は `context_status` で確認します。
+
+repository-wide context を利用できるのは、対応する Git forge の unambiguous な `remote.origin.url` を解決できる workspace です。
+GitHub、GitLab.com、Bitbucket.org の remote を `github:owner/repository` のような path-free key に正規化します。
+checkout path や directory 名は使いません。
+remote を安全に解決できない場合、その observation は session scope にとどまり、repository-wide current knowledge には使いません。
+
+instruction と error の preview は既定で cloud sync から除外します。
+`TEMOTE_MCP_OBSERVATION_SYNC_PREVIEW=1` は bounded text preview の送信を opt-in します。
+preview に秘密が含まれない保証はありません。
+長さを制限しても secret は除去されないため、既存の content-sharing policy が許す場合だけ設定します。
+対象 host / Fabric endpoint の未 ACK batch がなくなるまで、この設定を変更しないでください。
+D1 commit 後に応答を失うと、再起動後に host は durable cursor から同じ observation を再送します。
+preview 設定が変わってpayloadが異なる場合、D1 は既存 observation を上書きせず `409 conflicting_replay` を返します。
+preview opt-out の再送には preview は含まれません。
+再送を成功扱いにするために payload digest の検証を弱めないでください。
+conflict が起きた場合、当初の preview policy に従う送信が引き続き認可されているときだけ、その policy に戻して ACK が進むまで同期します。
+認可されていない場合は対象 host agent を停止し、source を診断状態のままにしてください。
+設定を off にしても、すでに D1 へ commit された preview は取り消せません。
+
 `--platform auto` は macOS、Linux、WSL2 を判別します。`TEMOTE_MCP_GATEWAY_HOST_ID` が設定されている場合、`temote-mcp doctor` は gateway readiness を stage 別に表示します。`local_config` の各項目（host ID、gateway URL origin、host token の存在、Access service-token の組）と `local_supervisor` の control protocol が個別の結果になります。network-enabled build では read-only の `/healthz` identity check と認証付き `/v1/hosts/status` probe も実行し、remote endpoint、Access 認証、この host の active lease を分類します。doctor は `session_availability` も local supervisor の read-only な session inventory から `listed_sessions`/`active_sessions` の件数として報告します。これは supervisor control protocol を再利用し、MCP tool を dispatch せず、session や lease を変更しません。live（`active`/`starting`）な session が 1 件もないと確定した inventory は `ready` ではなく `failed` とし、inventory を列挙できない場合は `unavailable` とします。local の host-level `gateway-agent` generation が記録されている場合、doctor は認証済み gateway の `generation` と比較し、remote の generation が新しいときは `generation_replaced` として報告するため、置き換えられた古い local agent を healthy と誤認しません。host-level `gateway-agent` は bounded で non-secret な `session_availability`（`ready`、`session_unavailable`、`unavailable`）を poll ごとに報告し、認証付き `/v1/hosts/status` は最新の報告値を返します。未報告の値は `ready` として扱わず `not_checked` のままにします。この remote 値は supervisor inventory から read-only で導出され、session ID、path、credential を含みません。root path や token 値は表示しません。
 
 ## MCP workflow
@@ -189,6 +286,60 @@ linux-main / srmj
 routing を確定させる場合は `host_id` を明示します。backward compatibility のため、`host_id` を省略した既存 `session_id` は、現在 discover 可能な owner がちょうど1つの場合だけ解決します。2 host が同じ ID を持つ場合や、leased host の問い合わせに失敗して ownership を安全に確定できない場合は、勝手に host を選ばず fail closed します。
 
 `session_stop` と `session_restart` は、その host の public supervisor が所有する active managed session だけに作用します。別途 local CLI で起動した yolo session は local-only のままで、public session-bound tool は yolo target の unrestricted semantics を引き継がず拒否します。
+
+### Repository context と memory
+
+Fabric は既存の `context_resolve` と `context_status` を拡張します。
+repository を指定すれば `session_id` を省略でき、すべての execution host が offline でも認証済み D1 replica から取得できます。
+
+```text
+context_resolve({repository: "github:owner/repository", query: "report", budget_bytes: 16384})
+context_status({repository: "github:owner/repository"})
+```
+
+owner scope は認証済み Worker config から決まり、caller は別 owner を指定できません。
+repository key は安定した forge identity から作り、local directory 名は使いません。
+session request は記録済みの owner、host、repository の対応を検証します。
+session の cloud mapping がない場合は既存の host fallback を使います。
+認可または所有権の検証に失敗した request は別 host へ fallback しません。
+
+`context_resolve` は replicated task observation、support reference 付きの derived knowledge、関連 task、bounded freshness metadata を返します。
+observation は `replicated_observed`、knowledge は `derived` と示し、replica を live state として報告しません。
+`context_status` は source cursor と gap、observation freshness、Memory Worker の readiness と lag を報告します。
+partial または stale な結果は明示されます。
+response は deterministic で上限があり、raw observation body を含みません。
+`MEMORY_ENABLED = "false"` のままでも observation に基づく repository context は利用でき、memory は disabled と報告されます。
+その他の host-routed tool と local session-bound tool は既存の `session_id` 要件を維持します。
+
+#### Knowledge の昇格と競合
+
+Worker は各 support reference が cloud sync 対象の observation に存在することを確認し、引用文が元の本文にそのまま含まれることを検証します。
+extractor は status や scope を決められず、`verification_path` は `null` でなければなりません。
+confidence や observation の kind だけでは検証済みになりません。
+直接引用で根拠を持つ主張は通常 `supported` になり、確認済み user instruction の一部だけが `current` に昇格します。
+
+- 制約を repository-wide の `current` にするには、user instruction に明示的な repository policy marker と直接の制約文があり、その文自体が根拠として引用されている必要があります。
+  たとえば `For this repository, the repository-level policy is:` に続く制約文が対象です。
+  task 固有の制約は task scope に残ります。
+  その他の通常の制約も導出された task、workspace、execution の scope にとどまり、`supported` として保存されます。
+  operation に結び付く場合も execution scope の識別子として扱います。
+- user の決定を直接引用した場合、その決定は導出された task、workspace、execution の scope で `current` になります。
+- fact、observation、failure pattern、agent の主張は `supported` にとどまります。
+  task の完了や agent の「tests passed」という報告は、実行状態または報告内容の根拠であり、要求された変更の正しさを検証した証拠ではありません。
+
+変更された repository policy が以前の current policy を supersede できるのは、新しい instruction が `Previous repository-level policy to replace: ...` に置き換える旧文を正確に指定した場合、または旧 policy の直接根拠がすべて同じ host と session の instruction であり、新しい変更指示がその source revision より後の場合です。
+どちらの条件も満たさなければ、旧 item は `current` のまま残り、競合する新 item は `supported` として保存されます。
+Worker は最終書き込み優先で旧 policy を置き換えません。
+生成 summary は元の引用を繰り返し、summary provenance として記録するため、独立した根拠には数えません。
+
+既定の sync policy は instruction と error の preview を送らないため、設定済みで処理が追いついた Worker でも、active な `supported` または `current` knowledge item がなければ `ready_empty` になります。
+これは知識が空の projection を正常に作成した状態であり、`disabled`、`not_configured`、`failed`、`lagging` とは異なります。
+`context_resolve` は引き続き observation を返せます。
+bounded preview を opt-in すると抽出可能な本文が増えますが、preview に秘密が含まれる可能性は前述のとおりです。
+
+`source_head_revision` と `source_acked_revision` は source ごとの journal cursor です。
+`latest_cloud_seq` は別の D1 cursor なので、同じ番号体系として比較しないでください。
+gap または未 ACK の source revision がある場合、observation context は partial として返ります。
 
 ## Lease と failure behavior
 

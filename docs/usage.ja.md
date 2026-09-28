@@ -101,7 +101,29 @@ stdout/stderr の保持量は合計 1 MiB までで、超過時は truncated と
 
 session 限定の delegation call はすべて単一の orchestration 境界を通過し、observation(instruction、acceptance、delivery、execution state、evidence 参照、verification、reconciliation マーク)を session 状態ディレクトリ以下の owner 専用 journal に記録します。observation の追記は best-effort で、underlying の tool call を失敗させません。
 
-`context_resolve({session_id, task_id?, repository?, query?, limit?, at_least_revision?})` はその journal を deterministic な bounded context bundle に射影します: workspace/current state、最近の related task rollup、対応が必要な unresolved item、provenance `refs`、そして `freshness` の revision カウンタです。`at_least_revision` で、呼び出し側がすでに新しい projection を保持しているかを判定できます。`context_status({session_id})` は journal の revision、size、compaction、degradation カウンタを返します。どちらの tool も raw な observation body は返さず、read-only です。memory/knowledge synthesis は未実装のため、bundle の knowledge field は明示的に空で、`memory.worker` は `not_implemented` を報告します。
+`context_resolve({session_id, task_id?, repository?, query?, limit?, at_least_revision?})` は local journal を deterministic な bounded context bundle に射影します。
+workspace/current state、最近の task rollup、対応が必要な unresolved item、provenance `refs`、`freshness` の revision counter を返します。
+`at_least_revision` で、呼び出し側がすでに新しい projection を保持しているかを判定できます。
+`context_status({session_id})` は journal の revision、size、compaction、degradation counter を返します。
+local session の call は read-only で、memory synthesis は実行しません。
+cloud で合成された knowledge は Fabric の repository context から取得してください。
+local `memory.worker` の status は Fabric worker の readiness を示しません。
+
+Fabric 経由では、同じ `context_resolve` と `context_status` が認証済み cloud replica を使えます。安定した repository key を指定すると `session_id` を省略でき、execution host が offline でも context を取得できます。
+
+```text
+context_resolve({repository: "github:owner/repository", query: "report", budget_bytes: 16384})
+context_status({repository: "github:owner/repository"})
+```
+
+Fabric は対応する Git forge metadata から repository key を解決します。
+local path や directory 名は identity に使いません。
+tenant scope は認証済み Fabric owner が決めます。
+repository context は replicated task observation と、Worker が有効で追いついている場合は根拠付きの supported/current knowledge を含みます。
+replicated observation、derived knowledge、live host state は区別して報告されます。
+`context_status` は source cursor、gap、同期 freshness、worker state（`disabled`、`not_configured`、`lagging`、`failed`、`ready`、`ready_empty`）を返します。
+session request は所有権を検証してから cloud mapping を使い、mapping がない場合は既存の host fallback を維持します。
+repository-only request は、他の host-routed tool に必要な `session_id` を省略可能にはしません。
 
 operator は owner 専用の `temote-mcp observation list|get|status <session_id>` debug command で session の journal を直接確認できます。`--include-content` は opt-in で、raw record が local surface の外に出ることはありません。
 

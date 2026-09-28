@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "id": "memory-continuity",
+  "revision": 1,
+  "goal": "Verify that ordinary task observations become supported repository knowledge that another head can retrieve, then that an explicit policy change supersedes the old constraint.",
+  "repository_key": "github:temote-tests/memory-continuity",
+  "task_a": {
+    "instruction": "For this repository, the repository-level policy is:\nReport output format must be JSON.\nOpen question: The required report field set remains undecided.\nImplement a small report.py module with render_report(fields), preserve the passed field mapping as-is, add one focused test for the JSON output, and do not change other files.",
+    "constraint": "Report output format must be JSON.",
+    "unresolved": "The required report field set remains undecided."
+  },
+  "task_b": {
+    "instruction": "For this repository, the repository-level policy has changed:\nReport output format must be TOML.\nOpen question: The required report field set remains undecided.\nPrevious repository-level policy to replace: Report output format must be JSON.\nUpdate report.py and its focused test so render_report(fields) produces TOML, preserve the passed field mapping as-is, and do not change other files.",
+    "old_constraint": "Report output format must be JSON.",
+    "constraint": "Report output format must be TOML.",
+    "unresolved": "The required report field set remains undecided."
+  },
+  "limits": {
+    "context_bytes": 16384,
+    "knowledge_items": 32,
+    "task_polls": 120,
+    "context_wait_seconds": 180
+  },
+  "assertions": [
+    "task_a_constraint_supported",
+    "task_a_unresolved_surfaced",
+    "cross_head_repository_context",
+    "bounded_context_response",
+    "offline_host_context",
+    "task_b_constraint_current",
+    "task_a_constraint_superseded",
+    "queue_replay_no_growth",
+    "unrelated_repository_isolated"
+  ]
+}

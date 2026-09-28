@@ -830,6 +830,21 @@ remote deployment must replace it with the provisioned `temote-observation` data
 
 ### C2 — host replicator
 
+2026-09-28 implementation packet: the host cursor is namespaced by authenticated
+host and Fabric endpoint, with separate contiguous ACK and delivered cursors.
+The compatible sync response adds optional `committed_through_revision`: the
+highest source revision among records validated and committed/replayed in that
+specific successful batch (an empty batch returns the contiguous ACK). The host
+checks the response session and bounds this value by that batch's last record.
+It persists both cursors atomically and never rolls either back.
+
+`acked_through_revision` retains its contiguous meaning. Pagination after the
+delivered cursor allows later records, including terminal updates, to pass an
+internal journal hole. Recorded gaps and degradation remain sticky and the
+source is never reported complete. Restoring an older missing journal record
+requires an explicit cursor rescan; it is not invented by replication.
+The independent authority review approved this distinction before implementation.
+
 - [ ] gateway-agent reads local O1 journal
 - [ ] durable per-session ack cursor
 - [ ] bounded batches

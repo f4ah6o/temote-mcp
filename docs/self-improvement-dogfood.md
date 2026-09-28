@@ -108,6 +108,82 @@ An accepted unchanged comparison exits with status 0, just like an improvement.
 Blocked comparisons exit with status 1. Old comparison files are immutable;
 rerun `compare` into a new output file to use these semantics.
 
+## Memory continuity qualification
+
+The `memory-continuity` scenario (revision 1) checks the Fabric observation and
+knowledge path with two ordinary implementation tasks. Task A requires JSON
+output and leaves a field-set question unresolved. A second head resolves the
+repository context, then task B explicitly changes the output policy to TOML.
+Neither task asks the coding agent to save or summarize memory. Its independent
+assertions cover supported knowledge and support references, unresolved
+context, cross-head repository lookup, explicit supersession of the JSON
+constraint, Queue replay deduplication, and isolation from an unrelated
+repository.
+
+The Node harness has two fixture modes. `--mode fixture` runs the deterministic
+Miniflare/D1/Queue integration test with synthetic observations. In live mode,
+`--extractor fixture` exercises dedicated Temote hosts without calling a real
+model. Neither mode is live synthesis qualification. From the repository root,
+run:
+
+```sh
+node gateway/scripts/memory-dogfood.mjs --phase baseline --mode fixture --extractor disabled
+node gateway/scripts/memory-dogfood.mjs --phase candidate --mode fixture --extractor fixture
+```
+
+A fixture run reports `live_synthesis: NOT RUN` and `qualification:
+not_qualified`. It verifies the local D1/Queue worker integration only; it is
+not evidence that a real model produced knowledge.
+
+Live mode starts two dedicated local supervisors and host agents with isolated
+`XDG_STATE_HOME` directories and temporary credentials. The candidate run
+waits for host A's observation to sync, stops only that harness-owned host,
+resolves repository context while it is offline, runs task B on host B, and
+checks Queue replay and repository isolation. It never stops a production host
+or deploys to Cloudflare. `npm ci` in `gateway/` is required first. Preserve
+the exact baseline binary and use the candidate binary built from the tested
+checkout. For example, use the same task backend, model, effort, and extractor
+profile for both phases:
+
+```sh
+node gateway/scripts/memory-dogfood.mjs --phase baseline --mode live \
+  --extractor disabled \
+  --baseline-binary dogfood/runs/memory-20260928/baseline-bin/temote-mcp \
+  --backend codex --model <available-model> --effort <available-effort> \
+  --extractor-profile opencode-go/<extractor-model>
+
+node gateway/scripts/memory-dogfood.mjs --phase candidate --mode live \
+  --extractor live --candidate-binary target/debug/temote-mcp \
+  --backend codex --model <same-model> --effort <same-effort> \
+  --extractor-profile opencode-go/<same-extractor-model> \
+  --extractor-endpoint https://<provider>/v1/chat/completions \
+  --extractor-model <same-extractor-model>
+```
+
+The live extractor key is read from the local OpenCode auth profile (default
+`~/.local/share/opencode/auth.json`; use `--auth-file` for another path). Never
+put the key in command arguments, environment dumps, or shared artifacts. A
+candidate run with `--extractor fixture` covers host synchronization and
+context continuity but reports live synthesis as `NOT RUN`. The harness prints
+the scenario artifact path and gate states; keep its run directory under
+ignored `dogfood/runs/`.
+
+Compare the baseline and candidate scenario artifacts with the independent
+qualification gates. The report remains blocked until every required gate is
+present and passing:
+
+```sh
+python3 -m dogfood compare <baseline-scenario.json> <candidate-scenario.json> \
+  --gates <owner-local-independent-gates.json> \
+  --output dogfood/runs/memory-continuity-comparison.json
+```
+
+Missing credentials, an unavailable model, failed assertions, or unperformed
+gates remain `blocked` or `not_run`; a successful fixture run cannot substitute
+for them. Run artifacts contain bounded event metadata and gate results, not
+task text, model input/output, credentials, or evidence bodies. Cloudflare
+deployment and remote E2E remain separate qualification gates.
+
 ## Fabric metadata and deployment loop
 
 The delegated task scenario observes execution behavior; it does not discover

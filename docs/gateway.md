@@ -13,6 +13,9 @@ Native Windows execution remains a later milestone. Windows 11 federation curren
 - Worker `/mcp` authenticates MCP clients, exposes host-aware tools, resolves routing, and forwards calls to the selected host.
 - `/v1/hosts/*` is the outbound long-poll protocol used by `temote-mcp gateway-agent`.
 - The local supervisor remains authoritative for session lifecycle, named-root resolution, sandboxing, and approval. The gateway never receives absolute named-root paths.
+- Delegation observations first enter an owner-only local journal. The host agent replicates eligible records to D1 through its authenticated host channel; D1 is a sanitized replica, not execution authority.
+- Queue messages wake the Memory Worker after committed D1 ingest. D1 retains pending work so the scheduled sweep can recover missed queue sends and lagging projections.
+- Knowledge is a derived, provenance-bearing projection. It does not authorize or start execution.
 
 A host reconnect increments its generation. Requests and responses from an older generation or process `instance_id` are rejected. Timed-out or disconnected tool calls are not automatically replayed, because routed operations may be non-idempotent.
 
@@ -41,9 +44,10 @@ Run repository `just` commands from the repository root. Run npm and Wrangler co
 ```
 
 2. Select a public target, inspect its existing ownership, and configure Cloudflare Access for the whole hostname **before publishing**. Enable Managed OAuth for human MCP clients and a Service Auth policy for host agents. See [Deployment target](#deployment-target). Keep `workers_dev = false`.
-3. Set the non-secret `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, `ACCESS_ALLOWED_EMAILS` and `OBSERVATION_OWNER_ID` in the deployment config. Provision `OBSERVATION_DB`, replace its sentinel D1 database ID, and review/apply the additive migrations using the pinned Wrangler from `gateway/`. Keep existing Durable Object class names and bindings when updating a deployed Worker.
+3. Set the non-secret `ACCESS_TEAM_DOMAIN`, `ACCESS_AUDIENCE`, `ACCESS_ALLOWED_EMAILS` and `OBSERVATION_OWNER_ID` in the deployment config. Provision `OBSERVATION_DB`, replace its sentinel D1 database ID, inspect pending migrations, and apply them using the pinned Wrangler from `gateway/`. Migration `0003_memory_worker.sql` rebuilds the knowledge tables while copying existing knowledge, support, and supersession rows; review it against the target database before applying. Keep existing Durable Object class names and bindings when updating a deployed Worker.
 
 ```sh
+(cd gateway && npx wrangler d1 migrations list temote-observation --remote)
 (cd gateway && npx wrangler d1 migrations apply temote-observation --remote)
 ```
 
@@ -69,6 +73,18 @@ just check-generated
 6. Verify health and authenticated MCP reachability using the checks below. A deploy without a target can upload a version without publishing it.
 
 The public MCP URL is `https://<gateway-host>/mcp`. The Worker imports `gateway/contract/routed-tool-metadata.json` generated from Rust; see [generation and stale checks](development.md#connected-runtime-contract-parity). A bundle dry-run proves configuration/build validity, not remote authentication, secret presence or endpoint readiness.
+
+The D1 schema includes observation, memory-run, checkpoint, outbox, and knowledge tables. Inspect all pending migrations before applying them. Migration `0003_memory_worker.sql` rebuilds the knowledge tables while copying existing rows and provenance, so review it against the target database before applying. Memory extraction is disabled by default (`MEMORY_ENABLED = "false"`). To enable the OpenAI-compatible extractor, set `MEMORY_ENABLED = "true"`, `MEMORY_EXTRACTOR = "openai_compatible"`, a full `MEMORY_ENDPOINT` URL, `MEMORY_MODEL`, `MEMORY_TIMEOUT_MS`, `MEMORY_INPUT_BUDGET_BYTES`, `MEMORY_OUTPUT_BUDGET_BYTES`, `MEMORY_MAX_ATTEMPTS`, `MEMORY_BATCH_SIZE`, and `MEMORY_PROJECTION_GENERATION` in the existing Worker config. Store `MEMORY_API_KEY` as a Worker secret; never put its value in `wrangler.toml`, `.dev.vars.example`, or an evaluation artifact. Increase `MEMORY_PROJECTION_GENERATION` monotonically when changing extraction semantics so an older worker cannot replace the active projection.
+
+```sh
+(cd gateway && npx wrangler secret put MEMORY_API_KEY)
+```
+
+`wrangler secret put` creates a Worker deployment immediately. Run it only as part of configuring the intended target, after checking the target and Access policy. See [Wrangler secret management](https://developers.cloudflare.com/workers/configuration/secrets/). Set `MEMORY_ENABLED` to `false` to pause extraction or `true` to enable it, then deploy the reviewed Worker config. The `temote-memory` Queue and five-minute scheduled sweep are declared in `gateway/wrangler.toml`; preserve both bindings when deploying. Queue messages are at-least-once wake-ups; the D1 outbox marks unsent or stale work due after 60 seconds, and the next five-minute sweep requeues it, including recovery when a Queue send response was lost. A provider run stops retrying after `MEMORY_MAX_ATTEMPTS` and reports `failed` with a bounded error code through `context_status`; the sweep does not override that limit. To retry after fixing a provider or input failure, monotonically increase `MEMORY_PROJECTION_GENERATION` and deploy the reviewed config. This requests a new producer version that reprocesses retained observations from the start while the prior active projection remains readable until the rebuild catches up. Treat this as an explicit rebuild with provider cost. Use `context_status` to inspect synchronization and worker freshness after configuration. Do not enable the `fixture` extractor in a live deployment.
+
+The Memory Worker processes at most one repository group per invocation. Its conservative worst-case budget is 602 D1 statements: up to 14 setup, claim, outbox, and error statements; 24 each for active-item, support-count, and provenance reads; a commit batch capped at 512 statements; and up to four post-commit statements. The 602-statement bound is below the current 1,000-query-per-invocation limit for Workers Paid in [Cloudflare D1 limits](https://developers.cloudflare.com/d1/platform/limits/). The same worst-case batch exceeds the Free limit of 50, so Free worst-case qualification is not claimed. This local statement-count qualification does not verify a deployed account, plan, or remote Worker.
+
+If projection preparation would exceed the 512-statement commit cap, the Worker returns `projection_too_large` without committing knowledge or advancing the checkpoint; retries stop at `MEMORY_MAX_ATTEMPTS`. Reduce `MEMORY_BATCH_SIZE` to keep the input within the cap, then increase `MEMORY_PROJECTION_GENERATION` and deploy the reviewed config to rebuild from retained observations. The previous active projection remains readable until the new projection is published.
 
 ## Deployment target
 
@@ -148,6 +164,22 @@ temote-mcp supervisor
 temote-mcp gateway-agent --host-id win-main --platform wsl2
 ```
 
+The existing host-level `gateway-agent --host-id` automatically sends bounded observation batches over its authenticated channel: at most 32 records or 512 KiB per batch, on a five-second loop with an eight-second sync request timeout. It writes locally first, so a Fabric timeout or authorization failure does not fail a delegated task or replay its backend operation. The agent scans retained session journals, including terminal observations created when the ordinary `task_get` polling observes completion, and persists an owner-only per-host, per-Fabric-endpoint, per-session cursor. It does not independently poll a backend after its caller stops polling. `committed_through_revision` records the highest source revision confirmed committed to D1; `acked_through_revision` is the contiguous source revision D1 can confirm. The delivered cursor can advance across a known gap so later retained records still sync, while the gap remains visible and `complete=false`. The source revision cursors are not cloud sequence numbers.
+
+Sync diagnostics persist as owner-only status data with stable error codes and timestamps. Retry delay grows from two seconds to a five-minute maximum and resumes after agent restart. `context_status({repository: ...})` reports cloud cursors, gaps, and whether a source is partial. No manual sync command is needed. There is no cursor-reset CLI. If an operator-approved repair restores an older missing journal record, stop only the matching host's `gateway-agent`, set `cursor` to that host/endpoint/session's `ack-<session-id>.json` under `gateway-observation-sync/<host-id>/<sha256-normalized-gateway-url>/`, then move that one file to a unique owner-only backup name:
+
+```sh
+mv -- "$cursor" "${cursor}.backup-${unique_timestamp}"
+```
+
+Restart the same agent to rescan retained records. Keep the observation journal, `status.json`, and every other cursor. Exact D1 replays are idempotent; rescan does not by itself erase a previously reported source gap or establish completeness. Verify the result with `context_status`.
+
+Repository-wide context is enabled only when the workspace has one unambiguous, supported Git `remote.origin.url`. Fabric normalizes GitHub, GitLab.com, and Bitbucket.org remotes to a path-free key such as `github:owner/repository`; it never uses the checkout path or directory name. If the remote cannot be safely resolved, records remain session-scoped and do not contribute to repository-wide current knowledge.
+
+Instruction and error previews are excluded from cloud sync by default. `TEMOTE_MCP_OBSERVATION_SYNC_PREVIEW=1` opts into sending bounded text previews. These previews may contain sensitive free text; the size bound does not scrub secrets. Enable this setting only when the existing content-sharing policy permits those previews.
+
+Keep this setting unchanged until every pending batch for that host and Fabric endpoint is ACKed. D1 may commit a batch while its response is lost; after restart, the host retries from its durable cursor. If the preview setting changed, the retried payload differs and D1 rejects it with `409 conflicting_replay` rather than overwriting the committed observation. An opt-out retry omits previews. Do not weaken payload digest checks to make the retry appear successful. If a conflict occurs, restore the originally authorized preview policy and sync until ACK only when that upload remains authorized; otherwise stop that host agent and leave the source diagnosed. Turning previews off cannot undisclose preview text already committed to D1.
+
 `--platform auto` detects macOS, Linux, and WSL2. When `TEMOTE_MCP_GATEWAY_HOST_ID` is configured, `temote-mcp doctor` reports staged gateway readiness: each `local_config` item (host ID, gateway URL origin, host token presence, Access service-token pair) and the `local_supervisor` control protocol are separate results. With the network-enabled build it also performs a read-only `/healthz` identity check and authenticated `/v1/hosts/status` probe. These classify the remote endpoint, Access authorization, and this host's active lease. Doctor also reports `session_availability` from the local supervisor's read-only session inventory as `listed_sessions`/`active_sessions` counts; this reuses the supervisor control protocol, never dispatches an MCP tool, and never mutates a session or lease. A confirmed inventory whose live (`active`/`starting`) session count is zero is reported as `failed`, not `ready`; an inventory that cannot be enumerated is `unavailable`. When a local host-level `gateway-agent` generation is recorded, doctor compares the authenticated gateway `generation` against it and reports `generation_replaced` when the remote generation is newer, so a superseded local agent is not mistaken for a healthy one. The host-level `gateway-agent` separately reports a bounded, non-secret `session_availability` value (`ready`, `session_unavailable`, or `unavailable`) on each poll; the authenticated `/v1/hosts/status` response returns the latest reported value, and an unreported value stays `not_checked` instead of being treated as `ready`. That remote value is derived read-only from the supervisor inventory and carries no session ID, path, or credential. Doctor never prints root paths or token values.
 
 ## MCP workflow
@@ -174,6 +206,33 @@ linux-main / srmj
 Use explicit `host_id` for deterministic routing. For backwards compatibility, an omitted `host_id` may resolve an existing `session_id` only when exactly one currently discoverable owner exists. If two hosts own the same ID, or ownership cannot be determined safely because a leased host cannot be queried, the gateway fails closed instead of choosing a host.
 
 `session_stop` and `session_restart` apply only to active sessions owned by the host's public supervisor. Separately started local CLI/yolo sessions remain local-only: public session-bound tools reject yolo targets rather than inheriting their unrestricted semantics.
+
+### Repository context and memory
+
+Fabric also exposes the existing `context_resolve` and `context_status` tools. A repository request can omit `session_id` and works from the authenticated D1 replica while every execution host is offline:
+
+```text
+context_resolve({repository: "github:owner/repository", query: "report", budget_bytes: 16384})
+context_status({repository: "github:owner/repository"})
+```
+
+The authenticated Worker configuration supplies the owner scope; callers cannot select another owner. Repository keys come from a stable forge identity, not a local directory name. A session request is checked against its recorded owner, host, and repository mapping. If a session has no cloud mapping, the existing host fallback remains available; an authorization or ownership error never falls through to another host.
+
+`context_resolve` returns replicated task observations, derived current knowledge with support references, recent related tasks, and bounded freshness metadata. It labels observations `replicated_observed` and knowledge `derived`; it does not claim that replicated state is live. `context_status` reports source cursors and gaps, observation freshness, and Memory Worker readiness and lag. A partial or stale result is marked explicitly. Responses are bounded, deterministic, and do not include raw observation bodies. The `MEMORY_ENABLED = "false"` default still permits repository context from observations, with memory reported as disabled. Other host-routed and local session-bound tools continue to require their existing `session_id` contracts.
+
+#### Knowledge promotion and conflicts
+
+The Worker validates each support reference against an eligible observation and requires the quoted text to occur verbatim in that source. Extractor output cannot choose its own status or scope, and it must leave `verification_path` null. Confidence or an observation kind does not establish verification. A directly supported assertion is normally `supported`; only checked user instructions can promote selected items to `current`:
+
+- A constraint becomes repository-wide `current` only when a user instruction uses an explicit repository-policy marker, includes a direct constraint clause, and the quoted clause is supported by that instruction. Task-specific constraints stay task-scoped; other ordinary constraints stay at their narrower task, workspace, or execution scope (including an operation-scoped execution) and remain `supported`.
+- A directly quoted user decision can be `current` at its derived task, workspace, or execution scope.
+- Facts, observations, failure patterns, and agent statements remain `supported`. A completed task or an agent statement such as “tests passed” describes what was reported or observed; it does not verify that the requested change is correct.
+
+A changed repository policy supersedes an older current policy only when the new instruction either quotes the exact predecessor with `Previous repository-level policy to replace: ...`, or comes from the same host and session at a newer source revision than every direct instruction supporting the old policy. Otherwise the Worker keeps the old item `current` and stores the conflicting item as `supported`; it does not use last-write-wins. A generated summary repeats its source quote and is marked as summary provenance, not as independent evidence.
+
+The default sync policy omits instruction and error previews, so a configured and caught-up Worker can report `ready_empty` when it has no active supported or current knowledge items. This is a successful empty projection, distinct from `disabled`, `not_configured`, `failed`, or `lagging`; observations can still be returned by `context_resolve`. Bounded preview opt-in can provide more extraction input, but previews may contain secrets as described above.
+
+Per-source `source_head_revision` and `source_acked_revision` are journal cursors. `latest_cloud_seq` is a separate D1 cursor; do not compare them as if they shared one counter. A gap or unacknowledged source revision makes the observation context partial.
 
 ## Lease and failure behavior
 

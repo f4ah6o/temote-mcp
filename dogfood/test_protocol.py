@@ -21,6 +21,13 @@ class ProtocolTests(unittest.TestCase):
     def test_all_scenarios_execute(self):
         for path in SCENARIOS.glob("*.json"):
             with self.subTest(path=path.name):
+                if path.stem == "memory-continuity":
+                    from .memory_continuity import fixture_run, load_scenario, validate_artifact
+                    run = fixture_run("candidate", load_scenario(path))
+                    validate_artifact(run)
+                    self.assertEqual(run["outcome"], "not_run")
+                    self.assertTrue(all(value == "not_run" for value in run["gates"].values()))
+                    continue
                 run = fixture(path.stem)
                 validate_run(run)
                 self.assertEqual(run["outcome"], "pass")
