@@ -801,6 +801,253 @@ test("Queue ACK loss after commit redelivers as a projection no-op", async () =>
   }
 });
 
+test("execution_state-only batch with an empty provider extraction completes without fabricated knowledge", {
+  timeout: 30_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "openai_compatible",
+    memoryEnabled: true,
+    memoryEndpoint: "https://memory-provider.invalid/v1/chat/completions",
+    memoryModel: "empty-target-contract-test",
+    memoryApiKey: "test-only-provider-key",
+    // The bounded mock provider returns exactly {items: []} when no allowed
+    // repository clause exists. This exercises the production HTTP adapter,
+    // Queue consumer, and D1 commit path without using a live model.
+    memoryTestProviderMode: "echo_allowed_repository_clauses",
+  });
+  try {
+    const observedAt = Math.floor(Date.now() / 1000);
+    const sessionId = "execution-state-empty-session";
+    const taskId = "execution-state-empty-task";
+    const observation = {
+      id: randomUUID(),
+      schema_version: 1,
+      observed_at: observedAt,
+      session_id: sessionId,
+      session_instance: { started_at: observedAt, process_id: 1 },
+      actor: { transport: "mcp-stdio" },
+      target: { backend: "codex" },
+      action: "task_get",
+      kind: "execution_state",
+      task_id: taskId,
+      execution_id: "execution-state-empty-execution",
+      operation_id: randomUUID(),
+      content: { kind: "none" },
+      state_ref: {
+        task_id: taskId,
+        status: "running",
+        revision: 1,
+        generation: 1,
+      },
+      evidence_refs: [],
+      provenance: { tool: "codex_task_get", source: "orchestration" },
+      revision: 1,
+      dedupe_key: "execution-state-empty:revision:1",
+    };
+    const response = await runtime.fetch(
+      `https://memory-test.local/v1/hosts/${MEMORY_TEST_HOST_ID}/observations/sync`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${MEMORY_TEST_HOST_TOKEN}`,
+          "content-type": "application/json",
+          "x-temote-host-id": MEMORY_TEST_HOST_ID,
+        },
+        body: JSON.stringify({
+          schema_version: 1,
+          session_id: sessionId,
+          repository_key: MEMORY_TEST_REPOSITORY,
+          source_base_revision: 0,
+          source_head_revision: 1,
+          journal_degraded: false,
+          gap_count: 0,
+          records: [{ source_revision: 1, observation }],
+        }),
+      },
+    );
+    assert.equal(response.status, 200, "the execution state must be replicated before extraction");
+    const sync = await response.json();
+    assert.equal(sync.acked_through_revision, 1);
+
+    await runtime.waitFor(async () => {
+      const dispatches = await runtime.queueDispatches();
+      return dispatches.length === 1 && dispatches[0].state === "completed";
+    }, { timeoutMs: 10_000, intervalMs: 25 });
+
+    const [runRows, checkpointRows, headRows, itemRows, supportRows, supersessionRows] = await Promise.all([
+      runtime.querySql(
+        "SELECT status, outcome, attempt_count, from_seq, to_seq, input_count, error_code FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      ),
+      runtime.querySql(
+        "SELECT last_cloud_seq, stale, last_error_code FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      ),
+      runtime.querySql(
+        "SELECT requested_producer_version, active_producer_version, requested_generation, active_generation FROM memory_projection_heads WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      ),
+      runtime.querySql(
+        "SELECT knowledge_id, kind, text FROM knowledge_items WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      ),
+      runtime.querySql(
+        "SELECT knowledge_id, observation_id FROM knowledge_support WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      ),
+      runtime.querySql(
+        "SELECT new_knowledge_id, old_knowledge_id FROM knowledge_supersession WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      ),
+    ]);
+
+    assert.deepEqual(runRows, [{
+      status: "completed",
+      outcome: "empty",
+      attempt_count: 1,
+      from_seq: 0,
+      to_seq: sync.cloud_head_seq,
+      input_count: 1,
+      error_code: null,
+    }]);
+    assert.deepEqual(checkpointRows, [{ last_cloud_seq: sync.cloud_head_seq, stale: 0, last_error_code: null }]);
+    assert.equal(headRows.length, 1);
+    assert.equal(headRows[0].active_producer_version, headRows[0].requested_producer_version);
+    assert.equal(headRows[0].active_generation, headRows[0].requested_generation);
+    assert.deepEqual(itemRows, [], "an execution status alone is not reusable knowledge");
+    assert.deepEqual(supportRows, [], "empty extraction must not fabricate support rows");
+    assert.deepEqual(supersessionRows, [], "empty extraction must not fabricate history");
+
+    const context = await repositoryContext(runtime);
+    assert.equal(context.memory.state, "ready_empty");
+    assert.equal(context.current_summary.knowledge_summary, null);
+    assert.deepEqual(context.constraints, []);
+    assert.equal(context.recent_related_tasks[0].state.status, "running",
+      "the structured host observation remains available separately from derived knowledge");
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("invalid_support provider output exhausts a fixed batch without advancing the projection", {
+  timeout: 30_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "openai_compatible",
+    memoryEnabled: true,
+    memoryEndpoint: "https://memory-provider.invalid/v1/chat/completions",
+    memoryModel: "invalid-support-contract-test",
+    memoryApiKey: "test-only-provider-key",
+    // Test-only adapter response: the quote/ref are valid, but the assertion
+    // text is paraphrased and must fail exact-support validation.
+    memoryTestProviderMode: "paraphrase_allowed_repository_clauses",
+    maxQueueRetries: 0,
+    bindings: { MEMORY_MAX_ATTEMPTS: "2" },
+  });
+  try {
+    const sync = await ingestInstruction(runtime, {
+      content: "For this repository, the repository-level policy is:\nReport output format must be JSON.",
+      sessionId: "invalid-support-session",
+      taskId: "invalid-support-task",
+    });
+    await runtime.waitFor(async () => {
+      const dispatches = await runtime.queueDispatches();
+      const runs = await runtime.querySql(
+        "SELECT status, attempt_count, error_code FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      );
+      return dispatches.length > 0 && dispatches.at(-1).state === "completed"
+        && runs.length === 1 && runs[0].status === "pending"
+        && runs[0].attempt_count === 1 && runs[0].error_code === "invalid_support";
+    }, { timeoutMs: 10_000, intervalMs: 25 });
+
+    const firstAttemptCheckpoint = (await runtime.querySql(
+      "SELECT last_cloud_seq, stale, last_error_code FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0];
+    assert.equal(firstAttemptCheckpoint.last_cloud_seq, 0);
+    assert.equal(firstAttemptCheckpoint.stale, 1);
+    assert.equal(firstAttemptCheckpoint.last_error_code, "invalid_support");
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM knowledge_items WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].n, 0);
+
+    await exec(runtime, `UPDATE memory_outbox SET queued_at = NULL, next_attempt_at = 0
+      WHERE owner_id = ? AND repository_key = ?`, [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY]);
+    await runtime.runScheduled();
+    await runtime.waitFor(async () => {
+      const dispatches = await runtime.queueDispatches();
+      const runs = await runtime.querySql(
+        "SELECT status, attempt_count, error_code, from_seq, to_seq FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      );
+      return dispatches.length >= 2 && dispatches.at(-1).state === "completed"
+        && runs.length === 1 && runs[0].status === "failed"
+        && runs[0].attempt_count === 2 && runs[0].error_code === "invalid_support";
+    }, { timeoutMs: 10_000, intervalMs: 25 });
+
+    const cappedRun = (await runtime.querySql(
+      "SELECT status, outcome, attempt_count, error_code, from_seq, to_seq FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0];
+    assert.deepEqual(cappedRun, {
+      status: "failed",
+      outcome: null,
+      attempt_count: 2,
+      error_code: "invalid_support",
+      from_seq: 0,
+      to_seq: sync.cloud_head_seq,
+    });
+    assert.equal((await runtime.querySql(
+      "SELECT last_cloud_seq FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].last_cloud_seq, 0);
+    assert.deepEqual(await runtime.querySql(
+      "SELECT active_generation, active_producer_version FROM memory_projection_heads WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ), [{ active_generation: null, active_producer_version: null }]);
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM knowledge_support WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].n, 0);
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM knowledge_supersession WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].n, 0);
+
+    const dispatchCountBeforeReplay = await runtime.queueDispatchCount();
+    const replay = await runtime.enqueue({
+      owner_id: MEMORY_TEST_OWNER,
+      repository_key: MEMORY_TEST_REPOSITORY,
+      through_cloud_seq: sync.cloud_head_seq,
+    });
+    assert.equal(replay.success, true);
+    await runtime.waitFor(async () => {
+      const dispatches = await runtime.queueDispatches();
+      return dispatches.length > dispatchCountBeforeReplay
+        && dispatches.at(-1).state === "completed";
+    }, { timeoutMs: 10_000, intervalMs: 25 });
+
+    assert.deepEqual((await runtime.querySql(
+      "SELECT status, attempt_count, error_code, from_seq, to_seq FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0], {
+      status: "failed",
+      attempt_count: 2,
+      error_code: "invalid_support",
+      from_seq: 0,
+      to_seq: sync.cloud_head_seq,
+    }, "a capped invalid-support batch must not get a fresh retry budget on redelivery");
+    assert.equal((await runtime.querySql(
+      "SELECT last_cloud_seq FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].last_cloud_seq, 0);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("provider poison batches stop at configured attempts and later ingest does not reset the cap", async () => {
   const runtime = await startMemoryRuntime({
     memoryExtractor: "openai_compatible",

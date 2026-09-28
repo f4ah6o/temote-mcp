@@ -110,6 +110,40 @@ test("provider envelope has a larger bounded budget than validated message conte
   assert.equal(JSON.stringify(result).includes(sentinel), false);
 });
 
+test("provider prompt specifies the strict validator contract within its reserved byte budget", async () => {
+  const config = await loadMemoryConfiguration(PROVIDER_ENV);
+  let prompt;
+  const { calls } = await extractWithFetch(
+    config,
+    () => new Response(JSON.stringify(envelope('{"items":[]}'))),
+    ({ body }) => { prompt = body.messages[1].content; },
+  );
+  assert.equal(calls, 1);
+  const payloadStart = prompt.lastIndexOf("\n\n{");
+  assert.ok(payloadStart >= 0);
+  const payload = JSON.parse(prompt.slice(payloadStart + 2));
+  const promptOverheadBytes = Buffer.byteLength(prompt)
+    - Buffer.byteLength(JSON.stringify(payload.observations));
+  assert.ok(promptOverheadBytes <= 4096, "static instructions and JSON wrapper fit the reserved prompt budget");
+  assert.ok(Buffer.byteLength(prompt) <= config.inputBudgetBytes);
+  for (const contractText of [
+    'return {"items":[]}',
+    "exactly one top-level key, items",
+    "at most 12 items",
+    "exactly these keys: kind, semantic_key, text, scope_type, scope_id, support, verification_path",
+    "at most 128 UTF-8 bytes matching ^[a-z0-9][a-z0-9._:/-]*$",
+    "1 to 16 support entries",
+    "exactly cloud_seq, observation_id, quote",
+    "byte-for-byte identical to item.text",
+    "content_kind text or error",
+    "content_kind view",
+    "only quote source is the exact state_status value",
+    "verification_path must be exactly null",
+  ]) {
+    assert.ok(prompt.includes(contractText), `prompt is missing the output rule: ${contractText}`);
+  }
+});
+
 test("provider envelope overflow aborts and cancels the streamed response", async () => {
   const config = await loadMemoryConfiguration({
     ...PROVIDER_ENV,

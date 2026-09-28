@@ -61,7 +61,11 @@ function testQueueAckFailureBatch(batch, env) {
 }
 
 async function withTestProvider(env, callback) {
-  if (!new Set(["echo_allowed_repository_clauses", "reject"]).has(env.MEMORY_TEST_PROVIDER_MODE)) {
+  if (!new Set([
+    "echo_allowed_repository_clauses",
+    "paraphrase_allowed_repository_clauses",
+    "reject",
+  ]).has(env.MEMORY_TEST_PROVIDER_MODE)) {
     return callback();
   }
   const endpoint = env.MEMORY_ENDPOINT;
@@ -81,10 +85,13 @@ async function withTestProvider(env, callback) {
       const items = [];
       for (const observation of payload.observations ?? []) {
         for (const clause of observation.allowed_repository_clauses ?? []) {
+          const text = env.MEMORY_TEST_PROVIDER_MODE === "paraphrase_allowed_repository_clauses"
+            ? clause.quote + " (paraphrased)"
+            : clause.quote;
           items.push({
             kind: clause.kind,
             semantic_key: clause.subject,
-            text: clause.quote,
+            text,
             scope_type: clause.scope_type,
             scope_id: clause.scope_id,
             support: [{
