@@ -69,6 +69,40 @@ Put `codex`/`opencode` on PATH first (`export PATH="$HOME/.nvm/versions/node/*/b
 - Corrupt lines: hand-append a garbage line to the .jsonl; `list` prints a
   `{"warning","corrupt_lines"}` JSON line and `status` reports degraded=true.
 
+## Supervisor upgrade / handoff testing
+
+The `upgrade` flow applies the *installed* binary to a *running* supervisor —
+never point it at the shared repo binary or real state. Mirror
+`tests/cli_session_e2e.rs`:
+
+- Private binary dir: copy `target/debug/temote-mcp` AND
+  `target/debug/temote-linux-sandbox` side by side (helper generation is
+  classified next to the installed locator), chmod 700.
+- Isolate state exactly like `isolate_process()`: HOME=XDG_STATE_HOME=<state>,
+  plus XDG_CACHE_HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR/TMPDIR/CODEX_HOME/
+  TEMOTE_MCP_RUNTIME_DIR under it (all 0700), and a shared
+  `TEMOTE_MCP_SOCKET_NAMESPACE` (1-12 ASCII alnum/`-`/`_`) on supervisor AND
+  every CLI call — the supervisor socket lives at
+  `/tmp/tmcp-<uid>-<ns>/supervisor.sock`.
+- Spawn `temote-mcp supervisor` with `TEMOTE_MCP_ROOTS='{"src": <project>}'`
+  (setsid + detached), wait for `session list` to exit 0, then
+  `session start --path src/<subdir> <id>` (logical root+relative path).
+- "Installed" binary = `current_exe` unless
+  `TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR=<path>` overrides it — use a private
+  copy so `upgrade` never re-execs the repo build.
+- `handoff_required = --force || source_version != target_version`: to
+  exercise non-force version-diff paths, patch the version bytes in a binary
+  copy (`python3 -c` replace b"X.Y.Z" with a same-length version — verify via
+  `<copy> supervisor --capabilities`).
+- Supervisor PID / boot_generation: unix-socket ping — connect to
+  `/tmp/tmcp-<uid>-<ns>/supervisor.sock`, send `{"command":"ping"}`, read
+  `result.pid` / `result.boot_generation` (same PID + new boot_generation =
+  same-PID handoff).
+- Unrestorable-session fixture: `session start --path src/victim <id>` then
+  `rm -rf <project>/victim` → the workspace-resolve check blocks it.
+- Keep EVERY CLI invocation's env identical — session restart contexts are
+  captured from the start env and mismatches turn healthy sessions blocked.
+
 ## Devin Secrets Needed
 
 - `TEMOTE_MCP_DEVIN_API_KEY` — only for `devin_cloud_*` live calls; not needed for
