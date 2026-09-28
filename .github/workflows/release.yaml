@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - latest
+    branches:
+      - release
 
 permissions:
   actions: write
