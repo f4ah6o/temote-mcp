@@ -265,6 +265,34 @@ pub(crate) async fn invoke(
     result
 }
 
+/// Start the Codex task used by a higher-level typed operation while keeping
+/// the shared parse, observation, and approval boundary. The admission closure
+/// runs only after the task receipt is durable and immediately before Codex
+/// child startup; exact retained retries bypass it in the backend.
+pub(crate) async fn invoke_codex_task_start_with_admission<F>(
+    args: &Value,
+    session: &config::Session,
+    actor: &observation::ActorRef,
+    activity: Option<&ActivityScope>,
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let backend = Backend::Codex;
+    let operation = Operation::TaskStart;
+    let request = TaskRequest::parse(backend, operation, args)?;
+    observation::record_instruction(session, actor, backend, operation, &request, args);
+    let TaskRequest::Start(start) = &request else {
+        unreachable!("Codex task-start parser returned a different operation")
+    };
+    let (detail, metadata) = task_start_approval(start);
+    authorize(backend, operation, session, detail, metadata, activity).await?;
+    let result = codex_app_server::task_start_with_admission(args, session, admission).await;
+    observation::record_outcome(session, actor, backend, operation, &request, &result);
+    result
+}
+
 async fn authorize(
     backend: Backend,
     operation: Operation,

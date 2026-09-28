@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `repository_clone_bare`, an idempotent public tool that admits an active non-yolo session at an exact supervisor-configured named root, accepts same-root local or credential-free HTTPS sources, rejects existing or escaping destinations, and delegates an atomically claimed bare Git clone through the retained Codex task lifecycle without exposing an absolute host path.
 - `temote-mcp doctor` checks Jujutsu (`jj --version`) for development readiness and warns when jj is missing or unusable without requiring it for normal operation.
 - Added a repository-owned dogfood harness for versioned logical scenarios, bounded call observations, deterministic fault fixtures, live MCP runs, and evidence-linked before/after comparison. ([self-improvement protocol](issues/done/20260928-self-improvement-dogfood-protocol.md))
 - `task_list` rediscovers session-owned delegated tasks across backends through the existing bounded task projection, with per-backend availability and no transcript or output. ([development harness](issues/open/20260924-temote-development-harness-restructure.md))
@@ -23,6 +24,8 @@
 
 ### Fixed
 
+- Accepted Codex task runtimes now tolerate one-off session metadata or liveness probe failures while monitoring their already-authorized owner. Verified inactive or replaced sessions still stop immediately, and three consecutive unknown observations stop fail-closed.
+- Session lifecycle admission now accepts standard linked worktrees backed by bare repositories, using the validated canonical common Git directory as the repository reservation identity. Managed-worktree authority and Git mutation brokers still require the supported primary-checkout layout, and malformed reciprocal pointers or symlinked `.git` metadata remain rejected.
 - Completed OpenCode and Devin ACP tasks keep malformed final replies recoverable through scoped evidence. Task responses show report decode status and truncation without changing execution status. ([completed task result recovery](issues/open/20260927-completed-task-malformed-final-report-json.md))
 - Local supervisor control requests no longer fail when macOS reports `ENOTCONN` while half-closing an already-written request; the client still requires the supervisor response and never replays the mutation. Session metadata E2E fixtures also wait for active-session and retention quiescence before parity/determinism assertions. ([CLI/MCP parity flake](issues/open/20260922-cli-mcp-parity-enotconn-flake.md), [retention macOS flakes](issues/open/20260923-retention-e2e-macos-race-flakes.md))
 - Upgrading from an older, protocol-compatible supervisor now checks the installed Linux sandbox helper locally when that supervisor does not report its helper generation, so a compatible bundle is not incorrectly blocked as `unavailable`. ([legacy upgrade helper preflight](issues/open/20260924-upgrade-legacy-helper-preflight.md))

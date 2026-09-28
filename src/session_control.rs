@@ -118,6 +118,11 @@ enum ControlRequest {
     Info {
         session_id: String,
     },
+    RepositoryCloneAdmission {
+        session_id: String,
+        root: String,
+        destination: String,
+    },
     Stop {
         session_id: String,
         #[serde(default)]
@@ -352,6 +357,7 @@ impl SessionBackend {
                 "control_protocol": CONTROL_PROTOCOL_VERSION,
                 "roots_configured": supervisor.roots_configured(),
                 "named_roots": supervisor.named_root_names(),
+                "repository_clone_admission_supported": true,
             })),
             Self::LocalControl => request(ControlRequest::Ping).await,
         }
@@ -364,6 +370,39 @@ impl SessionBackend {
             .get("roots_configured")
             .and_then(Value::as_bool)
             .unwrap_or(false))
+    }
+
+    /// Ask the lifecycle supervisor to bind a repository clone to one exact
+    /// managed root session. This deliberately goes through the supervisor:
+    /// neither MCP process environment nor durable lifecycle metadata is an
+    /// authority for the current named-root mapping.
+    pub async fn repository_clone_admission(
+        &self,
+        session_id: &str,
+        root: &str,
+        destination: &str,
+    ) -> Result<config::Session> {
+        let status = self.status().await?;
+        require_repository_clone_admission_capability(&status)?;
+        match self {
+            #[cfg(test)]
+            Self::InProcess(supervisor) => {
+                supervisor
+                    .repository_clone_admission(session_id, root, destination)
+                    .await
+            }
+            Self::LocalControl => {
+                let result = request(ControlRequest::RepositoryCloneAdmission {
+                    session_id: session_id.to_owned(),
+                    root: root.to_owned(),
+                    destination: destination.to_owned(),
+                })
+                .await
+                .context("lifecycle supervisor repository clone admission failed")?;
+                serde_json::from_value(result)
+                    .context("lifecycle supervisor returned invalid repository clone admission")
+            }
+        }
     }
 
     pub async fn start(&self, path: &str, session_id: Option<&str>) -> Result<Value> {
@@ -465,6 +504,17 @@ impl SessionBackend {
             }
         }
     }
+}
+
+fn require_repository_clone_admission_capability(status: &Value) -> Result<()> {
+    anyhow::ensure!(
+        status
+            .get("repository_clone_admission_supported")
+            .and_then(Value::as_bool)
+            == Some(true),
+        "REPOSITORY_CLONE_SUPERVISOR_UNAVAILABLE: the running lifecycle supervisor does not support authoritative repository clone admission. Replacing it requires explicit host approval and may restore or restart sessions; the selected session must not be restarted silently"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1171,6 +1221,7 @@ async fn dispatch_request(
             "upgrade_plan_schema": UPGRADE_PLAN_SCHEMA_VERSION,
             "roots_configured": supervisor.roots_configured(),
             "named_roots": supervisor.named_root_names(),
+            "repository_clone_admission_supported": true,
         })),
         ControlRequest::Approval {
             session_id,
@@ -1217,6 +1268,15 @@ async fn dispatch_request(
         ControlRequest::Info { session_id } => {
             Ok(serde_json::to_value(inspect_session(&session_id).await?)?)
         }
+        ControlRequest::RepositoryCloneAdmission {
+            session_id,
+            root,
+            destination,
+        } => Ok(serde_json::to_value(
+            supervisor
+                .repository_clone_admission(&session_id, &root, &destination)
+                .await?,
+        )?),
         ControlRequest::Stop { session_id, public } => {
             if public {
                 supervisor.stop_public(&session_id).await?;
@@ -4776,7 +4836,29 @@ mod tests {
         assert_eq!(result["lifecycle_schema"], LIFECYCLE_SCHEMA_VERSION);
         assert_eq!(result["upgrade_plan_schema"], UPGRADE_PLAN_SCHEMA_VERSION);
         assert_eq!(result["roots_configured"], true);
+        assert_eq!(result["repository_clone_admission_supported"], true);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn repository_clone_capability_gate_has_stable_unavailable_prefix() {
+        for status in [
+            json!({}),
+            json!({"repository_clone_admission_supported": false}),
+        ] {
+            let error = require_repository_clone_admission_capability(&status).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("REPOSITORY_CLONE_SUPERVISOR_UNAVAILABLE:")
+            );
+        }
+        assert!(
+            require_repository_clone_admission_capability(
+                &json!({"repository_clone_admission_supported": true})
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

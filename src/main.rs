@@ -40,6 +40,7 @@ mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
+mod repository_clone;
 mod session_control;
 mod supervisor;
 #[cfg(test)]

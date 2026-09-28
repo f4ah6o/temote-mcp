@@ -32,6 +32,11 @@ def main() -> None:
     run.add_argument("--max-polls", type=int, default=20)
     run.add_argument("--poll-interval", type=float, default=1.0)
     run.add_argument("--terminal-read-strategy", choices=("reuse", "reread"), default="reuse")
+    run.add_argument("--root", default="src", help="named root for repository-setup")
+    run.add_argument("--source", default="src/temote-mcp-df", help="clone source for repository-setup")
+    run.add_argument("--destination", help="unique root-relative bare repository destination")
+    run.add_argument("--lifecycle-url", help="authenticated HTTP MCP endpoint for session_start")
+    run.add_argument("--lifecycle-token-env", help="environment variable holding the lifecycle OAuth bearer token")
     run.add_argument("--gates", type=Path, help="JSON map of independently observed gate outcomes")
     run.add_argument("--output", type=Path)
     comparison = commands.add_parser("compare", help="compare immutable baseline and candidate runs")
@@ -71,7 +76,8 @@ def main() -> None:
             parser.error("live runs require --binary and an existing --session-id")
         binary = args.binary.resolve()
         binary_identity = hashlib.sha256(binary.read_bytes()).hexdigest()
-        adapter = LiveAdapter(binary)
+        adapter = LiveAdapter(binary, lifecycle_url=args.lifecycle_url,
+                              lifecycle_token_env=args.lifecycle_token_env)
     else:
         binary_identity = "b" * 64
         adapter = FakeAdapter()
@@ -83,7 +89,7 @@ def main() -> None:
                          backend=args.backend, model=args.model, effort=args.effort,
                          max_polls=args.max_polls, poll_interval=args.poll_interval,
                          terminal_read_strategy=args.terminal_read_strategy,
-                         gates=gates)
+                         gates=gates, root=args.root, source=args.source, destination=args.destination)
     finally:
         if isinstance(adapter, LiveAdapter):
             adapter.close()

@@ -12,7 +12,7 @@ python3 -m unittest dogfood.test_protocol
 python3 -m dogfood run baseline delegation-lifecycle --poll-interval 0
 ```
 
-Fixture runs cover all six checked-in logical scenarios without a provider. A
+Fixture runs cover all seven checked-in logical scenarios without a provider. A
 live run uses an **existing active local session** and a specified Temote binary:
 
 ```sh
@@ -26,7 +26,7 @@ The live task asks the backend for a short read-only repository status report.
 `--terminal-read-strategy reread` provides a reproducible baseline for the
 older client behavior; the default `reuse` consumes the terminal poll's
 evidence reference directly. Both strategies use the same scenario revision.
-The runner does not create or stop sessions. `--max-polls` (default 20) and
+The delegation-lifecycle runner does not create or stop sessions; the repository-setup scenario creates its development session as described below. `--max-polls` (default 20) and
 `--poll-interval` (default 1 second) bound waiting. A run reaching the limit is
 `blocked`, never a pass. Runs go to ignored, owner-local `dogfood/runs/` unless
 `--output` selects another path. Existing artifacts are never overwritten.
@@ -151,3 +151,94 @@ A passing self-host scenario alone does not prove an issue is complete. With
 independent passing issue-completion and verification gates, `compare` can
 report `qualified` and `unchanged`; the new diagnostic's benefit remains
 supported by its own before/after evidence.
+
+## Bare repository setup
+
+`repository-setup` revision 1 measures root preparation → bare clone → exact
+operation replay after reconnect → linked worktree → normal session → a jj
+change. Add a new logical scenario before implementing a flow that the existing
+scenarios cannot measure. The fixture proves the harness contract only.
+
+```sh
+python3 -m dogfood run baseline repository-setup --adapter live \
+  --binary <preserved-baseline-binary> --session-id <existing-root-session> \
+  --root <named-root> --source <named-root>/<repository> \
+  --model <available-model> --effort <available-effort> \
+  --lifecycle-url https://<host>/mcp --lifecycle-token-env <token-variable> \
+  --max-polls 200 --poll-interval 1 --output <baseline.json>
+```
+
+Use the same options with `candidate` and the rebuilt candidate binary. A
+unique destination is generated unless `--destination` supplies one. Clone
+sources can also be HTTPS URLs admitted by the product; compare equivalent
+source kinds and network/auth conditions. Clone, worktree, verification, and jj
+filesystem operations run in delegated agents. The harness supplies logical
+paths and retains only argument names and bounded observations. The final
+verification reads only the generated bare repository and worktree; success
+must appear in the final assistant report, never merely in its input prompt.
+
+Delegation uses stdio MCP; worktree `session_start` uses the existing authenticated
+HTTP MCP endpoint because lifecycle creation is intentionally unavailable on
+stdio. Supply an existing OAuth bearer token through the named environment
+variable, never an argument or artifact. The HTTP adapter refuses redirects,
+credential-bearing URLs, and unencrypted endpoints except loopback fixtures.
+The endpoint must use Temote local OAuth; Cloudflare Access clients need their
+own assertion-header adapter. Keep lifecycle transport equivalent in the comparison.
+
+After creating the normal worktree session, the runner selects it through a
+fresh stdio MCP transport and observes `session_info` again. Count this extra
+selection step and call; keep the preparation owner alive until its tasks are
+terminal. Earlier mixed-session transport observations remain separate failures,
+and transport separation does not establish their underlying cause.
+
+The existing root session is never stopped or restarted. A successful run
+leaves its new worktree session active and the repository intact for inspection.
+A failed or blocked run may leave an accepted task or partial repository: use
+`task_list`, `codex_task_get`, and scoped evidence to reconcile it before another
+attempt. Never replace an uncertain clone's `operation_id` merely to retry.
+Exact-replay recovery and admission probes are measured calls. Initialization,
+building the binaries, `doctor`, and human setup/approval steps are separate
+prerequisites and must be reported alongside the run. A missing baseline tool
+is a failure with downstream steps `not_run`, never a zero-call success.
+
+Compare `--target-assertion bare_clone_completed` with independently observed
+admission, repository-completion, verification, and normal development gates.
+A candidate blocked by an older supervisor or unavailable child approval is
+recorded as blocked and cannot qualify. Preserve an exact `jj diff --git`, jj
+change/commit and operation identities, and both binary/helper SHA-256 identities
+next to the runs. `doctor` jj diagnostics are a prerequisite, evaluated
+separately from the repository-setup feature.
+
+On the measured jj 0.45.1, `jj git init --colocate` refuses a linked Git
+worktree. A backing repository outside the worktree would require writes
+outside the normal worktree session's scope. The scenario therefore imports
+`HEAD` into a separate jj backing repository **inside** that worktree:
+
+```sh
+git init --bare .jj-backing.git
+git --git-dir .jj-backing.git fetch ../.. HEAD:refs/heads/seed
+git --git-dir .jj-backing.git symbolic-ref HEAD refs/heads/seed
+jj --config 'snapshot.auto-track="none()"' git init --git-repo .jj-backing.git
+# Create the development file, then explicitly track it:
+jj --config 'snapshot.auto-track="none()"' file track DOGFOOD_JJ.txt
+jj --config 'snapshot.auto-track="none()"' describe -m 'test: prove repository setup through jj'
+jj --config 'snapshot.auto-track="none()"' status
+jj --config 'snapshot.auto-track="none()"' diff --git
+```
+
+`../..` assumes the scenario's `<bare>/.wt/development` layout. Local fetching
+reads the source bare repository; all new jj metadata stays in the worktree.
+The backing directory remains untracked. These are four preparation commands
+plus explicit file tracking and the repeated CLI config argument, and must be
+reported as additional steps. Do not persist this setting with `jj config set
+--repo`: jj 0.45.1's secure repo configuration needs a writable host config
+directory outside the worktree. The CLI-only form was measured with every
+other host path read-only and avoids generating a repo `config-id`. Verification
+uses `--ignore-working-copy` with the same CLI config and does not repair or
+migrate configuration. See [jj secure config](https://docs.jj-vcs.dev/latest/design/secure-config/).
+Changes in this independent jj backing repository are not automatically
+exported to the original bare repository. The main development checkout can
+continue to use its existing colocated jj workspace.
+
+The [2026-09-28 bare-clone report](dogfood-bare-clone-20260928.md) preserves
+measured failures, recovery calls, independent gates and blocked comparisons.

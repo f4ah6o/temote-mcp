@@ -164,6 +164,24 @@ export const PUBLIC_TOOLS = [
     schema(sessionProperty, ["session_id"]),
   ),
   tool(
+    "repository_clone_bare",
+    "Clone a bare repository under a named root",
+    "Idempotently delegate one bare Git clone into a supervisor-admitted named root.",
+    idempotentNetworkMutation,
+    schema(
+      {
+        ...sessionProperty,
+        operation_id: { type: "string", format: "uuid" },
+        root: { type: "string", minLength: 1, maxLength: 256 },
+        source: { type: "string", minLength: 1, maxLength: 4096 },
+        destination: { type: "string", minLength: 1, maxLength: 4096 },
+        model: { type: "string", minLength: 1, maxLength: 256 },
+        effort: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      ["session_id", "operation_id", "root", "source", "destination", "model", "effort"],
+    ),
+  ),
+  tool(
     "context_resolve",
     "Resolve the session context bundle",
     "Project the session-owned observation journal into a deterministic bounded context bundle: current task/execution/workspace state, recent task-scoped instruction references, unresolved items, and provenance refs. Read-only; knowledge/memory synthesis is not implemented yet, so knowledge fields are explicitly empty. Observation bodies stay in the owner-only journal and are never inlined.",

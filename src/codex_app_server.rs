@@ -41,6 +41,7 @@ const MAX_RPC_LINE_BYTES: usize = 4 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 const SESSION_STOP_POLL: Duration = Duration::from_secs(1);
+const SESSION_STOP_UNKNOWN_LIMIT: u8 = 3;
 const SESSION_CODEX_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_USAGE_FIELDS: &[&str] = &[
     "input_tokens",
@@ -283,6 +284,72 @@ impl SessionInstance {
         self.id == session.id
             && self.started_at == session.started_at
             && self.process_id == session.process_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorUnknownKind {
+    MetadataRead,
+    ActivityProbe,
+}
+
+impl SessionMonitorUnknownKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataRead => "metadata_read",
+            Self::ActivityProbe => "activity_probe",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorObservation {
+    Active,
+    Inactive,
+    OwnerChanged,
+    Unknown(SessionMonitorUnknownKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorStopReason {
+    Inactive,
+    OwnerChanged,
+    PersistentUnknown(SessionMonitorUnknownKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionMonitorAction {
+    Continue,
+    Stop(SessionMonitorStopReason),
+}
+
+#[derive(Default)]
+struct SessionStopMonitor {
+    consecutive_unknown: u8,
+}
+
+impl SessionStopMonitor {
+    fn observe(&mut self, observation: SessionMonitorObservation) -> SessionMonitorAction {
+        match observation {
+            SessionMonitorObservation::Active => {
+                self.consecutive_unknown = 0;
+                SessionMonitorAction::Continue
+            }
+            SessionMonitorObservation::Inactive => {
+                SessionMonitorAction::Stop(SessionMonitorStopReason::Inactive)
+            }
+            SessionMonitorObservation::OwnerChanged => {
+                SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged)
+            }
+            SessionMonitorObservation::Unknown(kind) => {
+                self.consecutive_unknown = self.consecutive_unknown.saturating_add(1);
+                if self.consecutive_unknown >= SESSION_STOP_UNKNOWN_LIMIT {
+                    SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(kind))
+                } else {
+                    SessionMonitorAction::Continue
+                }
+            }
+        }
     }
 }
 
@@ -1895,17 +1962,49 @@ fn insert_runtime_unchecked(
     Ok(())
 }
 
+async fn observe_session_instance(owner: &SessionInstance) -> SessionMonitorObservation {
+    match config::read_session_metadata(&owner.id).await {
+        Ok(session) if !owner.matches(&session) => SessionMonitorObservation::OwnerChanged,
+        Ok(_) => match config::session_is_active(&owner.id).await {
+            Ok(true) => SessionMonitorObservation::Active,
+            Ok(false) => SessionMonitorObservation::Inactive,
+            Err(_) => SessionMonitorObservation::Unknown(SessionMonitorUnknownKind::ActivityProbe),
+        },
+        Err(_) => SessionMonitorObservation::Unknown(SessionMonitorUnknownKind::MetadataRead),
+    }
+}
+
 async fn wait_for_session_stop(owner: SessionInstance) {
+    let mut monitor = SessionStopMonitor::default();
     loop {
-        let same_instance_active = match config::read_session_metadata(&owner.id).await {
-            Ok(session) if owner.matches(&session) => {
-                config::session_is_active(&owner.id).await.unwrap_or(false)
+        let observation = observe_session_instance(&owner).await;
+        match monitor.observe(observation) {
+            SessionMonitorAction::Continue => {
+                if let SessionMonitorObservation::Unknown(kind) = observation
+                    && monitor.consecutive_unknown == 1
+                {
+                    eprintln!(
+                        "Codex session monitor observation is unknown; retrying accepted runtime \
+                         (session {}, class {}, limit {})",
+                        owner.id,
+                        kind.as_str(),
+                        SESSION_STOP_UNKNOWN_LIMIT
+                    );
+                }
             }
-            Ok(_) | Err(_) => false,
-        };
-        if !same_instance_active {
-            begin_session_instance_shutdown(&owner);
-            return;
+            SessionMonitorAction::Stop(reason) => {
+                if let SessionMonitorStopReason::PersistentUnknown(kind) = reason {
+                    eprintln!(
+                        "Codex session monitor remained unknown; stopping accepted runtime \
+                         fail-closed (session {}, class {}, observations {})",
+                        owner.id,
+                        kind.as_str(),
+                        monitor.consecutive_unknown
+                    );
+                }
+                begin_session_instance_shutdown(&owner);
+                return;
+            }
         }
         tokio::time::sleep(SESSION_STOP_POLL).await;
     }
@@ -2890,7 +2989,133 @@ pub(crate) async fn status(session: &config::Session) -> Result<Value> {
 
 pub(crate) async fn task_start(args: &Value, session: &config::Session) -> Result<Value> {
     let store = TaskStore::default_store()?;
-    task_start_with_store_and_binary_inner(args, session, &store, Path::new("codex"), true).await
+    task_start_with_store_and_binary_inner(args, session, &store, Path::new("codex"), true, || {
+        Ok(())
+    })
+    .await
+}
+
+/// Return the retained result for an exact task-start retry without applying
+/// any new filesystem precondition. A caller uses this before checking a
+/// destination that the already-accepted task may itself have created.
+pub(crate) fn task_start_replay_if_retained(
+    args: &Value,
+    session: &config::Session,
+) -> Result<Option<Value>> {
+    let store = TaskStore::default_store()?;
+    let operation_id = required_uuid(args, "operation_id")?;
+    let task = required_string(args, "task")?;
+    let model = required_string(args, "model")?;
+    let effort = required_string(args, "effort")?;
+    validate_task_input(task, "task")?;
+    validate_argument(model, "model")?;
+    validate_argument(effort, "effort")?;
+    let task_id = task_id_for_operation(session, operation_id)?;
+    let request_fingerprint = fingerprint(&json!({
+        "kind": "start",
+        "task_id": task_id,
+        "task": task,
+        "model": model,
+        "effort": effort,
+    }))?;
+    match store.read_record(task_id) {
+        Ok(record) => {
+            ensure_task_owner(&record, session)?;
+            let retryable_before_thread = record
+                .operations
+                .iter()
+                .find(|receipt| receipt.operation_id == operation_id)
+                .is_some_and(|receipt| {
+                    receipt.request_fingerprint == request_fingerprint
+                        && receipt.action == "start"
+                        && receipt.phase == OperationPhase::RetryableFailed
+                        && record.status == TaskStatus::RetryableFailed
+                        && record.thread_id.is_none()
+                });
+            if retryable_before_thread {
+                return Ok(None);
+            }
+            replay_operation(&record, operation_id, request_fingerprint).map(Some)
+        }
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Seed an exact completed start receipt in the process-private default store.
+/// This exercises production fingerprinting and replay without starting a
+/// provider; it is intentionally unavailable outside unit tests.
+#[cfg(test)]
+pub(crate) fn seed_completed_task_for_test(
+    args: &Value,
+    session: &config::Session,
+) -> Result<Uuid> {
+    let store = TaskStore::default_store()?;
+    let operation_id = required_uuid(args, "operation_id")?;
+    let task = required_string(args, "task")?;
+    let model = required_string(args, "model")?;
+    let effort = required_string(args, "effort")?;
+    validate_task_input(task, "task")?;
+    validate_argument(model, "model")?;
+    validate_argument(effort, "effort")?;
+    let task_id = task_id_for_operation(session, operation_id)?;
+    let request_fingerprint = fingerprint(&json!({
+        "kind": "start",
+        "task_id": task_id,
+        "task": task,
+        "model": model,
+        "effort": effort,
+    }))?;
+    let now = config::unix_time();
+    let mut record = TaskRecord {
+        schema_version: TASK_SCHEMA_VERSION,
+        task_id,
+        owner: SessionInstance::from_session(session),
+        scope_cwd: config::canonical_directory(&session.cwd)?,
+        model: model.to_owned(),
+        effort: effort.to_owned(),
+        status: TaskStatus::Completed,
+        revision: 2,
+        generation: 1,
+        thread_id: Some("test-completed-thread".to_owned()),
+        turn_id: Some("test-completed-turn".to_owned()),
+        usage: None,
+        created_at: now,
+        updated_at: now,
+        operations: Vec::new(),
+        operation_tombstones: Vec::new(),
+    };
+    record.operations.push(OperationReceipt {
+        operation_id,
+        request_fingerprint,
+        action: "start".to_owned(),
+        phase: OperationPhase::Applied,
+        outcome: record.outcome(),
+    });
+    store.save(&record)?;
+    Ok(task_id)
+}
+
+/// Start a Codex task after its durable acceptance while rechecking a
+/// caller-supplied filesystem admission immediately before child startup.
+pub(crate) async fn task_start_with_admission<F>(
+    args: &Value,
+    session: &config::Session,
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let store = TaskStore::default_store()?;
+    task_start_with_store_and_binary_inner(
+        args,
+        session,
+        &store,
+        Path::new("codex"),
+        true,
+        admission,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2900,7 +3125,7 @@ async fn task_start_with_store_and_binary(
     store: &TaskStore,
     binary: &Path,
 ) -> Result<Value> {
-    task_start_with_store_and_binary_inner(args, session, store, binary, false).await
+    task_start_with_store_and_binary_inner(args, session, store, binary, false, || Ok(())).await
 }
 
 #[cfg(test)]
@@ -2910,16 +3135,34 @@ async fn task_start_with_store_and_binary_fenced(
     store: &TaskStore,
     binary: &Path,
 ) -> Result<Value> {
-    task_start_with_store_and_binary_inner(args, session, store, binary, true).await
+    task_start_with_store_and_binary_inner(args, session, store, binary, true, || Ok(())).await
 }
 
-async fn task_start_with_store_and_binary_inner(
+#[cfg(test)]
+async fn task_start_with_store_binary_and_admission<F>(
+    args: &Value,
+    session: &config::Session,
+    store: &TaskStore,
+    binary: &Path,
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
+    task_start_with_store_and_binary_inner(args, session, store, binary, false, admission).await
+}
+
+async fn task_start_with_store_and_binary_inner<F>(
     args: &Value,
     session: &config::Session,
     store: &TaskStore,
     binary: &Path,
     fence: bool,
-) -> Result<Value> {
+    admission: F,
+) -> Result<Value>
+where
+    F: FnOnce() -> Result<()>,
+{
     let owner = SessionInstance::from_session(session);
     let operation_id = required_uuid(args, "operation_id")?;
     let task = required_string(args, "task")?;
@@ -2980,6 +3223,17 @@ async fn task_start_with_store_and_binary_inner(
         }
         StartAcceptance::Accepted(record, lease) => (record, lease),
     };
+    if let Err(error) = admission() {
+        drop(runtime_lease);
+        store.update(session, task_id, |record| {
+            record.status = TaskStatus::Failed;
+            record.revision = record.revision.saturating_add(1);
+            update_operation_receipt(record, operation_id, OperationPhase::Applied);
+            Ok(())
+        })?;
+        return Err(error)
+            .context("repository clone filesystem admission changed before delegated side effect");
+    }
     let runtime_lease = Arc::new(runtime_lease);
     let _operation_permit = if fence {
         Some(ensure_current_active_instance(&owner, session).await?)
@@ -3810,6 +4064,105 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_stop_monitor_retries_only_consecutive_unknown_observations() {
+        let mut monitor = SessionStopMonitor::default();
+        assert_eq!(
+            monitor.observe(SessionMonitorObservation::Unknown(
+                SessionMonitorUnknownKind::ActivityProbe
+            )),
+            SessionMonitorAction::Continue
+        );
+        assert_eq!(monitor.consecutive_unknown, 1);
+        assert_eq!(
+            monitor.observe(SessionMonitorObservation::Active),
+            SessionMonitorAction::Continue
+        );
+        assert_eq!(monitor.consecutive_unknown, 0);
+
+        for expected in 1..SESSION_STOP_UNKNOWN_LIMIT {
+            assert_eq!(
+                monitor.observe(SessionMonitorObservation::Unknown(
+                    SessionMonitorUnknownKind::MetadataRead
+                )),
+                SessionMonitorAction::Continue
+            );
+            assert_eq!(monitor.consecutive_unknown, expected);
+        }
+        assert_eq!(
+            monitor.observe(SessionMonitorObservation::Unknown(
+                SessionMonitorUnknownKind::MetadataRead
+            )),
+            SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(
+                SessionMonitorUnknownKind::MetadataRead
+            ))
+        );
+
+        assert_eq!(
+            SessionStopMonitor::default().observe(SessionMonitorObservation::Inactive),
+            SessionMonitorAction::Stop(SessionMonitorStopReason::Inactive)
+        );
+        assert_eq!(
+            SessionStopMonitor::default().observe(SessionMonitorObservation::OwnerChanged),
+            SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged)
+        );
+    }
+
+    #[test]
+    fn generated_session_stop_monitor_matches_reference_model() -> noprop::TestResult {
+        crate::test_support::run(0x434f_4445_584d_4f4e, 1024, |ctx| {
+            let observations = (0..noprop::sample_usize_in(ctx, 0..=64))
+                .map(|_| noprop::sample_u8(ctx) % 5)
+                .collect::<Vec<_>>();
+            let mut monitor = SessionStopMonitor::default();
+            let mut reference_unknown = 0_u8;
+
+            for sample in observations {
+                let (observation, expected) = match sample {
+                    0 => {
+                        reference_unknown = 0;
+                        (
+                            SessionMonitorObservation::Active,
+                            SessionMonitorAction::Continue,
+                        )
+                    }
+                    1 => (
+                        SessionMonitorObservation::Inactive,
+                        SessionMonitorAction::Stop(SessionMonitorStopReason::Inactive),
+                    ),
+                    2 => (
+                        SessionMonitorObservation::OwnerChanged,
+                        SessionMonitorAction::Stop(SessionMonitorStopReason::OwnerChanged),
+                    ),
+                    kind => {
+                        let kind = if kind == 3 {
+                            SessionMonitorUnknownKind::MetadataRead
+                        } else {
+                            SessionMonitorUnknownKind::ActivityProbe
+                        };
+                        reference_unknown = reference_unknown.saturating_add(1);
+                        let expected = if reference_unknown >= SESSION_STOP_UNKNOWN_LIMIT {
+                            SessionMonitorAction::Stop(SessionMonitorStopReason::PersistentUnknown(
+                                kind,
+                            ))
+                        } else {
+                            SessionMonitorAction::Continue
+                        };
+                        (SessionMonitorObservation::Unknown(kind), expected)
+                    }
+                };
+
+                let actual = monitor.observe(observation);
+                assert_eq!(actual, expected);
+                assert_eq!(monitor.consecutive_unknown, reference_unknown);
+                if matches!(actual, SessionMonitorAction::Stop(_)) {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn fake_app_server(root: &Path, mode: &str) -> PathBuf {
         let path = root.join(format!("fake-app-server-{mode}"));
         let script = r##"#!/usr/bin/env python3
@@ -4276,6 +4629,45 @@ for raw in sys.stdin:
         let other_root = tempfile::tempdir().unwrap();
         let other = session(other_root.path(), "owner", true);
         assert!(store.load(&other, task_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn post_acceptance_admission_failure_is_terminal_and_exact_retry_does_not_reapply() {
+        let root = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(root.path(), "clone-admission", false);
+        let operation_id = Uuid::new_v4();
+        let args = json!({
+            "operation_id": operation_id,
+            "task": "clone one admitted repository",
+            "model": "gpt-5.6-luna",
+            "effort": "high"
+        });
+        let missing_binary = root.path().join("must-not-run");
+
+        let error = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &missing_binary,
+            || anyhow::bail!("destination raced"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("before delegated side effect"));
+
+        let replay = task_start_with_store_binary_and_admission(
+            &args,
+            &owner,
+            &store,
+            &missing_binary,
+            || panic!("exact retained retry must bypass filesystem admission"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["status"], "failed");
+        assert!(replay["task_id"].is_string());
     }
 
     #[tokio::test]

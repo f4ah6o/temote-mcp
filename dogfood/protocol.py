@@ -12,11 +12,13 @@ OPERATIONS = frozenset({
     "inspect_session", "start_agent", "lose_task_id", "rediscover_task",
     "inject_poll_failure", "start_agent_uncertain", "retry_same_start",
     "wait_until_terminal", "read_terminal_result",
+    "clone_bare", "retry_clone", "create_worktree", "start_worktree_session", "develop_with_jj", "verify_repository_setup",
 })
 ASSERTIONS = frozenset({
     "terminal_state_is_unambiguous", "no_duplicate_task", "bounded_result",
     "tasks_can_be_rediscovered", "retry_is_machine_decidable", "exact_retry",
     "identity_is_separate", "repository_gates_recorded",
+    "bare_clone_completed", "worktree_created", "normal_session_started", "jj_development_completed", "no_duplicate_clone", "host_admission_enforced",
 })
 PHASES = frozenset({"baseline", "candidate"})
 OUTCOMES = frozenset({"pass", "fail", "blocked", "not_run"})
@@ -50,7 +52,7 @@ def scenario(path: Path) -> dict:
         raise ValueError("unknown logical operation")
     if not isinstance(data["assertions"], list) or any(a not in ASSERTIONS for a in data["assertions"]):
         raise ValueError("unknown assertion")
-    if "start_agent" not in data["operations"] and "start_agent_uncertain" not in data["operations"]:
+    if not {"start_agent", "start_agent_uncertain", "clone_bare"} & set(data["operations"]):
         raise ValueError("scenario must exercise a delegated task")
     data["fingerprint"] = digest(data)
     return data
@@ -212,7 +214,7 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
     target_regressed = any(delta > 0 for delta in target_deltas)
     no_assertion_regression = all(value != "pass" or candidate["assertions"].get(key) == "pass"
                                   for key, value in baseline["assertions"].items())
-    selectors = ("backend", "model", "effort")
+    selectors = ("backend", "model", "effort", "source_kind", "permission_mode", "max_polls", "poll_interval", "lifecycle_transport")
     baseline_profile = baseline["snapshot"]["environment_capabilities"]
     candidate_profile = candidate["snapshot"]["environment_capabilities"]
     environment_comparable = all(baseline_profile.get(key) == candidate_profile.get(key)
@@ -231,7 +233,7 @@ def compare(baseline: dict, candidate: dict, *, gates: dict[str, str] | None = N
     else:
         improvement = "improved" if target_improved else "unchanged"
     if not environment_comparable:
-        reason = "backend, model or effort differs"
+        reason = "backend, model, effort or scenario execution conditions differ"
     elif target_regressed or not no_assertion_regression:
         reason = "target metric or assertion regressed"
     elif candidate["outcome"] != "pass" or any(
