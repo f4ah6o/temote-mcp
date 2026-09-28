@@ -793,11 +793,11 @@ async fn run_host_observation_sync(gateway: &GatewayClient, host_id: &str) {
             .await
         {
             Ok(crate::observation::replicator::SyncOutcome::Acked {
-                session_id,
                 records,
                 through_revision,
+                ..
             }) if records > 0 => eprintln!(
-                "observation sync acked: session={session_id} records={records} through_revision={through_revision}"
+                "observation sync acked: records={records} through_revision={through_revision}"
             ),
             Ok(crate::observation::replicator::SyncOutcome::NoWork)
             | Ok(crate::observation::replicator::SyncOutcome::Busy)
