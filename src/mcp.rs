@@ -750,6 +750,56 @@ fn add_routed_string_property(
     Ok(())
 }
 
+fn validate_gateway_session_list_source(tool: &Value) -> Result<()> {
+    let expected_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    anyhow::ensure!(
+        tool.get("inputSchema") == Some(&expected_schema),
+        "session_list source schema changed; update the gateway routing projection before exposing new arguments"
+    );
+    Ok(())
+}
+
+fn validate_gateway_session_start_source(tool: &Value) -> Result<()> {
+    let schema = tool
+        .get("inputSchema")
+        .and_then(Value::as_object)
+        .context("session_start source schema must be an object")?;
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .context("session_start source schema requires properties")?;
+    anyhow::ensure!(
+        properties.len() == 2
+            && properties.contains_key("path")
+            && properties.contains_key("session_id"),
+        "session_start source properties must be exactly path and session_id; update gateway routing before changing them"
+    );
+    for property in ["path", "session_id"] {
+        let property_schema = properties[property]
+            .as_object()
+            .with_context(|| format!("session_start {property} schema must be an object"))?;
+        anyhow::ensure!(
+            property_schema.get("type").and_then(Value::as_str) == Some("string"),
+            "session_start {property} must remain a string"
+        );
+    }
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .context("session_start source schema requires a required array containing path")?;
+    anyhow::ensure!(
+        required
+            .iter()
+            .any(|property| property.as_str() == Some("path")),
+        "session_start source schema must require path"
+    );
+    Ok(())
+}
+
 /// Project the authoritative MCP registry into the host-routed public surface.
 /// Only the public registry is passed here; private/local tools are never
 /// discovered from a generic dispatcher or copied into the generated artifact.
@@ -762,12 +812,20 @@ fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
     for tool in &mut routed_tools {
         let name = tool["name"].as_str().unwrap_or_default().to_owned();
         if name == "session_list" {
+            validate_gateway_session_list_source(tool)?;
+            tool["title"] = json!("List federated Temote sessions");
+            tool["description"] = json!(
+                "List sessions across currently leased hosts with host attribution. Optionally filter by host_id. Without a host_id, listing fails closed when any relevant host or legacy session cannot be discovered safely."
+            );
             tool["inputSchema"] = json!({
                 "type": "object",
-                "properties": {"host_id": {"type": "string", "description": host_description}},
+                "properties": {"host_id": {"type": "string", "description": "Filter sessions to this federated host. Omit to aggregate sessions across federated hosts and legacy sessions."}},
                 "additionalProperties": false
             });
             continue;
+        }
+        if name == "session_start" {
+            validate_gateway_session_start_source(tool)?;
         }
         if let Some(properties) = tool
             .pointer_mut("/inputSchema/properties")
@@ -779,7 +837,15 @@ fn route_gateway_tools(mut routed_tools: Vec<Value>) -> Result<Vec<Value>> {
             }
         }
         if name == "session_start" {
-            tool["inputSchema"]["required"] = json!(["host_id", "path"]);
+            let required = tool["inputSchema"]["required"]
+                .as_array_mut()
+                .context("validated session_start source requires a required array")?;
+            if !required
+                .iter()
+                .any(|property| property.as_str() == Some("host_id"))
+            {
+                required.insert(0, json!("host_id"));
+            }
         }
     }
     routed_tools.insert(0, json!({
@@ -2645,6 +2711,181 @@ mod tests {
             )
         });
         assert_eq!(checked_in, rendered, "gateway tool metadata is stale");
+    }
+
+    #[test]
+    fn gateway_generated_session_list_uses_routing_prose_and_preserves_annotations() {
+        let source_tools = tools(true, true).as_array().unwrap().to_owned();
+        let source = source_tools
+            .iter()
+            .find(|tool| tool["name"] == "session_list")
+            .unwrap()
+            .clone();
+        let routed = route_gateway_tools(source_tools).unwrap();
+        let session_list = routed
+            .iter()
+            .find(|tool| tool["name"] == "session_list")
+            .unwrap();
+
+        assert_ne!(session_list["title"], source["title"]);
+        assert_eq!(session_list["title"], "List federated Temote sessions");
+        assert_ne!(session_list["description"], source["description"]);
+        assert_eq!(
+            session_list["description"],
+            "List sessions across currently leased hosts with host attribution. Optionally filter by host_id. Without a host_id, listing fails closed when any relevant host or legacy session cannot be discovered safely."
+        );
+        assert_eq!(session_list["annotations"], source["annotations"]);
+        assert_eq!(
+            source["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        );
+        assert_ne!(session_list["inputSchema"], source["inputSchema"]);
+        assert_eq!(
+            session_list["inputSchema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "host_id": {
+                        "type": "string",
+                        "description": "Filter sessions to this federated host. Omit to aggregate sessions across federated hosts and legacy sessions."
+                    }
+                },
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_generated_session_list_rejects_unprojected_source_schema_changes() {
+        let source_tools = tools(true, true).as_array().unwrap().to_owned();
+        let source = source_tools
+            .iter()
+            .find(|tool| tool["name"] == "session_list")
+            .unwrap()
+            .clone();
+
+        let mut extra_argument = source.clone();
+        extra_argument["inputSchema"]["properties"]["limit"] = json!({"type": "integer"});
+        extra_argument["inputSchema"]["required"] = json!(["limit"]);
+        assert!(route_gateway_tools(vec![extra_argument]).is_err());
+
+        let mut changed_schema = source;
+        changed_schema["inputSchema"]["minProperties"] = json!(1);
+        assert!(route_gateway_tools(vec![changed_schema]).is_err());
+    }
+
+    #[test]
+    fn gateway_generated_session_start_preserves_supported_required_fields() {
+        let source = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+        let mut constrained_source = source.clone();
+        constrained_source["inputSchema"]["properties"]["path"]["maxLength"] = json!(4096);
+        constrained_source["inputSchema"]["properties"]["session_id"]["minLength"] = json!(1);
+
+        let routed = route_gateway_tools(vec![constrained_source.clone()]).unwrap();
+        let routed_tool = routed
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap();
+        assert_eq!(
+            routed_tool["inputSchema"]["required"],
+            json!(["host_id", "path"])
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|property| property.as_str() == Some("host_id"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["properties"]["path"]["maxLength"],
+            4096
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["properties"]["session_id"]["minLength"],
+            1
+        );
+
+        constrained_source["inputSchema"]["required"] = json!(["path", "session_id"]);
+        let routed = route_gateway_tools(vec![constrained_source]).unwrap();
+        let routed_tool = routed
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap();
+        assert_eq!(
+            routed_tool["inputSchema"]["required"],
+            json!(["host_id", "path", "session_id"])
+        );
+        assert_eq!(
+            routed_tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|property| property.as_str() == Some("host_id"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn gateway_generated_session_start_rejects_unsupported_source_fields() {
+        let source = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+
+        let mut optional_future_property = source.clone();
+        optional_future_property["inputSchema"]["properties"]["future_option"] =
+            json!({"type": "string"});
+        assert!(route_gateway_tools(vec![optional_future_property]).is_err());
+
+        let mut required_future_property = source.clone();
+        required_future_property["inputSchema"]["properties"]["future_option"] =
+            json!({"type": "string"});
+        required_future_property["inputSchema"]["required"] = json!(["path", "future_option"]);
+        assert!(route_gateway_tools(vec![required_future_property]).is_err());
+
+        let mut missing_path_requirement = source;
+        missing_path_requirement["inputSchema"]["required"] = json!(["session_id"]);
+        assert!(route_gateway_tools(vec![missing_path_requirement]).is_err());
+
+        let mut missing_session_id = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+        missing_session_id["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("session_id");
+        assert!(route_gateway_tools(vec![missing_session_id]).is_err());
+
+        let mut non_string_path = tools(true, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "session_start")
+            .unwrap()
+            .clone();
+        non_string_path["inputSchema"]["properties"]["path"]["type"] = json!("integer");
+        assert!(route_gateway_tools(vec![non_string_path]).is_err());
     }
 
     #[test]

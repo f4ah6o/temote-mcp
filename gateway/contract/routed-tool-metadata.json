@@ -46,19 +46,19 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List active temote-mcp sessions and surface sessions whose liveness or workspace cannot be safely determined (status degraded). Returns session IDs, working directories, start times, status, and permission mode (ask/agent/yolo).",
+    "description": "List sessions across currently leased hosts with host attribution. Optionally filter by host_id. Without a host_id, listing fails closed when any relevant host or legacy session cannot be discovered safely.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "host_id": {
-          "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "description": "Filter sessions to this federated host. Omit to aggregate sessions across federated hosts and legacy sessions.",
           "type": "string"
         }
       },
       "type": "object"
     },
     "name": "session_list",
-    "title": "List Temote MCP sessions"
+    "title": "List federated Temote sessions"
   },
   {
     "annotations": {

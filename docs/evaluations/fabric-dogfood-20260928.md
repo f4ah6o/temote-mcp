@@ -282,3 +282,35 @@ restore the previous in-memory sessions after a machine reboot; a new session
 must be started through the normal lifecycle tools. The current supervisor's
 transient status is expected until the next user-manager start, when the
 persistent definition is selected. No commit or push was performed.
+
+
+## PR review follow-up
+
+PR #79 review identified two routed-projection problems and a related schema
+follow-up. `session_list` now describes Fabric's host-attributed aggregation,
+optional host filter, and fail-closed discovery, while preserving source
+annotations. Its exact supported local schema is checked before projection so
+future source arguments or schema constraints cannot silently disappear.
+`session_start` retains source required fields and adds `host_id`; unsupported
+properties, missing lifecycle fields, changed string types, or a missing path
+requirement fail generation before publication.
+
+Four new regression tests join the four existing generated-state tests.
+All eight passed. The old metadata artifact was rejected after the prose
+change; two regeneration runs produced identical bytes. The only metadata
+changes were the `session_list` title, description, and host-filter argument
+description. All 30 tools remain,
+and the structural contract and fingerprint are unchanged. The new full
+metadata SHA-256 is
+`369c3b5799c05441fea1eb52c11373f3cc27898f38dc62e83b40c1b6832fc660`.
+The gateway suite passed all 102 tests, including Worker metadata equality
+and host-scoped versus incomplete global discovery behavior.
+The final `cargo test --locked -- --test-threads=1`, format check,
+`cargo clippy --all-targets -- -D warnings`, no-default-features all-targets
+check, and diff whitespace check passed. Existing ignored host/provider gates
+were not run; the no-default-features check retained its non-fatal warnings.
+
+This follow-up updates the PR source and its local verification. It was not
+redeployed to Cloudflare; the earlier deployment and plugin evidence describe
+the original candidate, and their immutable observations remain unchanged.
+No supervisor or host-agent process was replaced for the review correction.
