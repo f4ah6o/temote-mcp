@@ -568,6 +568,91 @@ fn supervisor_upgrade_handoff_preserves_active_session_and_pid() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "process-boundary upgrade E2E; run explicitly on Linux and macOS"]
+fn supervisor_upgrade_force_stops_unrestorable_sessions() {
+    let (_binary_directory, binary) = private_upgrade_binary();
+    let project = TempDir::new().expect("failed to create E2E project directory");
+    let state = TempDir::new().expect("failed to create isolated state directory");
+    initialize_git_repository(project.path(), state.path());
+    let session_id = format!("upgrade-force-{}", std::process::id());
+
+    let mut supervisor = spawn_supervisor(&binary, project.path(), state.path());
+    wait_for_supervisor(&binary, project.path(), state.path());
+    let victim = project.path().join("victim");
+    fs::create_dir_all(&victim).expect("failed to create session workspace");
+    let start = run_cli(
+        &binary,
+        &["session", "start", "--path", "src/victim", &session_id],
+        project.path(),
+        state.path(),
+    );
+    assert_cli_success(&start, "session start before upgrade");
+
+    // Removing the session workspace makes it unrestorable for the handoff.
+    fs::remove_dir_all(&victim).expect("failed to remove session workspace");
+
+    let dry_run = run_cli(
+        &binary,
+        &["upgrade", "--dry-run", "--force"],
+        state.path(),
+        state.path(),
+    );
+    assert_cli_success(&dry_run, "upgrade dry-run with an unrestorable session");
+    let preview: Value =
+        serde_json::from_slice(&dry_run.stdout).expect("invalid upgrade dry-run JSON");
+    assert_eq!(
+        preview["blocked_session_count"], 1,
+        "dry-run did not report the unrestorable session: {preview}"
+    );
+    let blocked = preview["blocked_sessions"]
+        .as_array()
+        .expect("dry-run did not list blocked sessions");
+    assert_eq!(blocked.len(), 1, "dry-run blocked session list: {preview}");
+    assert_eq!(blocked[0]["session_id"], session_id.as_str());
+    assert!(
+        blocked[0]["reason"].is_string(),
+        "blocked session reason missing: {preview}"
+    );
+
+    let upgrade = run_cli(&binary, &["upgrade", "--force"], state.path(), state.path());
+    assert_cli_success(
+        &upgrade,
+        "forced supervisor upgrade past unrestorable session",
+    );
+    assert!(
+        String::from_utf8_lossy(&upgrade.stdout).contains("Temote upgrade complete:"),
+        "upgrade did not report handoff completion: stdout={} stderr={}",
+        String::from_utf8_lossy(&upgrade.stdout),
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&upgrade.stderr).contains(session_id.as_str()),
+        "upgrade did not report the stopped session: stderr={}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&upgrade.stdout).contains("stopped 1 unrestorable session(s)"),
+        "upgrade did not report the stopped session count: stdout={}",
+        String::from_utf8_lossy(&upgrade.stdout)
+    );
+
+    let info = run_cli(
+        &binary,
+        &["session", "info", &session_id],
+        state.path(),
+        state.path(),
+    );
+    assert_cli_success(&info, "session info after forced upgrade");
+    let info: Value = serde_json::from_slice(&info.stdout).expect("invalid session info JSON");
+    assert_eq!(info["status"], "degraded");
+
+    supervisor.interrupt();
+    let status = supervisor.wait_for_exit(SHUTDOWN_TIMEOUT);
+    assert!(status.success(), "supervisor exited with {status}");
+}
+
+#[cfg(unix)]
+#[test]
 #[ignore = "process-boundary E2E; run explicitly on Linux and macOS"]
 fn legacy_start_bootstraps_agent_supervisor_without_manual_socket_setup() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_temote-mcp"));

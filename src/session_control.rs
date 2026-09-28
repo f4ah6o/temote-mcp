@@ -2421,6 +2421,10 @@ pub struct RemoteUpgradePreflight {
     pub planned_session_count: usize,
     pub blocked_session_count: usize,
     pub blocker_reasons: Vec<&'static str>,
+    /// Sessions the upgrade cannot restore, with the reason each failed
+    /// preflight. `upgrade --force` stops these sessions instead of
+    /// restoring them.
+    pub blocked_sessions: Vec<crate::supervisor::UpgradeSessionBlocker>,
     pub direct_ingress_action: String,
     pub direct_ingress_blocked: bool,
     pub reconnect_expected: bool,
@@ -2519,6 +2523,7 @@ async fn upgrade_preflight_with_force(
             .iter()
             .map(|_| "session_not_restorable")
             .collect(),
+        blocked_sessions: preview.blocked_sessions,
         direct_ingress_action,
         direct_ingress_blocked,
         reconnect_expected,
@@ -2726,18 +2731,45 @@ fn codex_plugin_reconcile_command(
 
 pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     let executable = capture_installed_upgrade_executable()?;
-    let preflight = upgrade_preflight_with_force(&executable, force).await?;
+    let mut preflight = upgrade_preflight_with_force(&executable, force).await?;
     if dry_run {
         println!("{}", serde_json::to_string_pretty(&preflight)?);
         return Ok(());
     }
     let _admission = crate::upgrade_transaction::acquire_admission_lock()?;
     ensure_no_remote_upgrade_owns_runtime(&crate::upgrade_transaction::load_transactions()?)?;
-    anyhow::ensure!(
-        preflight.blocked_session_count == 0,
-        "upgrade is blocked by {} session(s)",
-        preflight.blocked_session_count
-    );
+    let mut stopped_unrestorable = 0_usize;
+    if preflight.blocked_session_count > 0 {
+        anyhow::ensure!(
+            force,
+            "upgrade is blocked by {} session(s)",
+            preflight.blocked_session_count
+        );
+        for blocked in &preflight.blocked_sessions {
+            eprintln!(
+                "stopping unrestorable session {}: {}",
+                blocked.session_id, blocked.reason
+            );
+            match upgrade_request(ControlRequest::Stop {
+                session_id: blocked.session_id.clone(),
+                public: false,
+            })
+            .await
+            {
+                Ok(_) => stopped_unrestorable += 1,
+                Err(error) => eprintln!(
+                    "warning: could not stop session {}: {error:#}",
+                    blocked.session_id
+                ),
+            }
+        }
+        preflight = upgrade_preflight_with_force(&executable, force).await?;
+        anyhow::ensure!(
+            preflight.blocked_session_count == 0,
+            "upgrade is still blocked by {} session(s) after --force stopped unrestorable sessions",
+            preflight.blocked_session_count
+        );
+    }
     anyhow::ensure!(
         !preflight.direct_ingress_blocked,
         "direct ingress upgrade is blocked"
@@ -2771,8 +2803,12 @@ pub async fn upgrade(dry_run: bool, force: bool) -> Result<()> {
     if let Err(error) = reconcile_codex_plugin(&executable_path, executable.installed_locator()) {
         eprintln!("{error:#}; run `temote-mcp codex plugin install` manually");
     }
+    let stopped_note = match stopped_unrestorable {
+        0 => String::new(),
+        count => format!("; stopped {count} unrestorable session(s)"),
+    };
     println!(
-        "Temote upgrade complete: {} -> {}; restored {restored} session(s)",
+        "Temote upgrade complete: {} -> {}; restored {restored} session(s){stopped_note}",
         preflight.source_version, executable.target_version
     );
     Ok(())
