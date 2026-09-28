@@ -24,6 +24,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install gateway dependencies
+        run: npm ci --prefix gateway
+
       - name: Test gateway contract and runtime
         run: npm test --prefix gateway
 

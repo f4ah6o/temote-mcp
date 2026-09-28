@@ -63,6 +63,7 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo check --no-default-features --all-targets
+npm ci --prefix gateway
 npm test --prefix gateway
 git diff --check
 ```
