@@ -78,18 +78,29 @@ never point it at the shared repo binary or real state. Mirror
 - Private binary dir: copy `target/debug/temote-mcp` AND
   `target/debug/temote-linux-sandbox` side by side (helper generation is
   classified next to the installed locator), chmod 700.
-- Isolate state exactly like `isolate_process()`: HOME=XDG_STATE_HOME=<state>,
-  plus XDG_CACHE_HOME/XDG_CONFIG_HOME/XDG_RUNTIME_DIR/TMPDIR/CODEX_HOME/
-  TEMOTE_MCP_RUNTIME_DIR under it (all 0700), and a shared
-  `TEMOTE_MCP_SOCKET_NAMESPACE` (1-12 ASCII alnum/`-`/`_`) on supervisor AND
-  every CLI call — the supervisor socket lives at
-  `/tmp/tmcp-<uid>-<ns>/supervisor.sock`.
-- Spawn `temote-mcp supervisor` with `TEMOTE_MCP_ROOTS='{"src": <project>}'`
-  (setsid + detached), wait for `session list` to exit 0, then
-  `session start --path src/<subdir> <id>` (logical root+relative path).
+- Run every spawn under a *clean* environment like `isolate_process()`'s
+  `.env_clear()` — inherited variables defeat the isolation, most notably an
+  ambient `TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR`, which would make `upgrade`
+  re-exec a shared/real binary instead of the private copy. Wrap each
+  invocation as `env -i PATH="$PATH" HOME=<state> XDG_STATE_HOME=<state>
+  XDG_CACHE_HOME=<state>/cache XDG_CONFIG_HOME=<state>/config
+  XDG_RUNTIME_DIR=<state>/xdg-runtime TMPDIR=<state>/tmp
+  CODEX_HOME=<state>/codex TEMOTE_MCP_RUNTIME_DIR=<state>/runtime
+  TEMOTE_MCP_SOCKET_NAMESPACE=<ns> <command>` (all state dirs 0700; `<ns>` is
+  1-12 ASCII alnum/`-`/`_`, identical on supervisor AND every CLI call —
+  the supervisor socket lives at `/tmp/tmcp-<uid>-<ns>/supervisor.sock`).
+- Spawn `temote-mcp supervisor` with `TEMOTE_MCP_ROOTS="src=$project"` (or
+  the JSON-object form `TEMOTE_MCP_ROOTS='{"src":"/absolute/project"}'` —
+  each value must be a quoted string), setsid + detached; wait for
+  `session list` to exit 0, then `session start --path src/<subdir> <id>`
+  (logical root+relative path).
 - "Installed" binary = `current_exe` unless
   `TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR=<path>` overrides it — use a private
-  copy so `upgrade` never re-execs the repo build.
+  copy so `upgrade` never re-execs the repo build. Set this variable only on
+  the single `upgrade` invocation when a test deliberately redirects the
+  locator (e.g. to a helperless bundle, which exercises the
+  helper-generation gate rejecting `upgrade --force`); the
+  supervisor/session env must never carry it.
 - `handoff_required = --force || source_version != target_version`: to
   exercise non-force version-diff paths, patch the version bytes in a binary
   copy (`python3 -c` replace b"X.Y.Z" with a same-length version — verify via
@@ -100,8 +111,10 @@ never point it at the shared repo binary or real state. Mirror
   same-PID handoff).
 - Unrestorable-session fixture: `session start --path src/victim <id>` then
   `rm -rf <project>/victim` → the workspace-resolve check blocks it.
-- Keep EVERY CLI invocation's env identical — session restart contexts are
-  captured from the start env and mismatches turn healthy sessions blocked.
+- Keep EVERY other CLI invocation's env identical — session restart contexts
+  are captured from the start env and mismatches turn healthy sessions
+  blocked (the deliberate per-invocation locator override above is the only
+  exception).
 
 ## Devin Secrets Needed
 
