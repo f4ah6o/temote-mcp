@@ -83,13 +83,13 @@ binding was configured. This packet has not changed those remote resources.
 
 ## Candidate evidence
 
-Candidate source head `83a533aa75d9001fa95aa9fcfbef78951123d642` is locally
-qualified, including a live-model memory-continuity run. Local code/workerd/D1
-checks, live-model synthesis, final tracked-diff review, and Cloudflare remote
-qualification are separate gates. The live scenario passed all nine assertions
-and the final documentation/issue diff received independent approval. The
-remote gate remains **NOT RUN**. Fixture success does not substitute for
-live-model qualification.
+The C2–C5 feature behavior and live-model memory-continuity run were qualified
+at source head `83a533aa75d9001fa95aa9fcfbef78951123d642`. Follow-up commit
+`efea482ec6dda2e547bdec9bfa12a3e55f7f5752` makes a narrow logging-privacy
+correction described below; the model scenario was not rerun on its binary.
+The live scenario passed all nine assertions and the final documentation/issue
+diff received independent approval. Cloudflare remote qualification remains
+**NOT RUN**. Fixture success does not substitute for live-model qualification.
 
 ### Completed packet checks before upstream integration
 
@@ -377,13 +377,50 @@ client/host credentials were not established. No remote resource was changed.
 The separate gate result is retained in
 `dogfood/runs/memory-20260928/memory-continuity-policy5-cloudflare-remote-gate.json`.
 
+### PR81 CodeQL snapshot and logging correction
+
+At PR head `0fed`, nine check results were terminal: eight succeeded and the
+aggregate CodeQL check failed on high finding #197,
+`rust/cleartext-logging`, at `src/gateway.rs:800`, where ordinary ACK
+diagnostics wrote `session_id`. All individual CodeQL analyses, Gateway, Linux
+and macOS Rust, and release-plan checks succeeded; the aggregate CodeQL check
+was the only failure. This observed failure remains part of the history.
+
+Commit `efea482ec6dda2e547bdec9bfa12a3e55f7f5752` removes `session_id` only
+from ordinary ACK stderr diagnostics. It retains records, revisions, cursors,
+and status reporting, with no suppression; authorization, ACK cursors, sync,
+model calls, D1 writes, and knowledge selection are unchanged. An independent
+review approved the exact fix in three passes across seven aspects; artifact
+SHA-256 `785d0241c1deb754425c6ddb7b0fdfaa717a3fb3c95a1c23841f2a78a8d1f5ed`.
+
+Post-fix local Rust checks completed: the main suite passed 835 tests, the
+library suite passed 151, and integration binaries passed. Formatting, clippy,
+no-default-features checks, diff check, and 14 scoped Gateway tests passed.
+Owner-local summaries and logs are retained with mode `0600` under
+`dogfood/runs/memory-20260928/codeql-privacy-checks/`.
+
+The qualified live run remains run
+`6f691adf-811c-46e1-9b1d-0a3e8ef90802` at source head `83a533aa75d9001fa95aa9fcfbef78951123d642`.
+Its preserved Policy5 binary and Linux helper are retained under
+`dogfood/runs/memory-20260928/policy5-live-bin/`. The binary and helper built
+after the logging correction are separate files under
+`dogfood/runs/memory-20260928/codeql-privacy-bin/`, identified by
+`codeql-privacy-binary-identity.json`; no live model run used them. The
+previously qualified comparison therefore remains evidence for the 83a533aa
+source behavior and does not claim a model rerun on efea482.
+
+The owner artifact for the historical 0fed check snapshot is
+`dogfood/runs/memory-20260928/github-pr81-checks-0fed9b8.json` (SHA-256
+`e9c74d393f06251fa946e864b90c2af5d34fe9265f80b37048b6e05f339b1330`).
+Current-tip CI results are represented by PR81's check statuses; this
+historical evaluation does not treat the 0fed artifact as the final-tip result.
+
 ## Ending state
 
-The candidate source code was tested at HEAD
-`83a533aa75d9001fa95aa9fcfbef78951123d642` on branch
-`codex/20260928-memory-plane`. At report-packet preparation, the branch had no
-upstream tracking branch and `origin/main` was at
-`48596907b92b09d706181c3e6b886052e6bf8c16`. The only worktree changes then were
-the six documentation and issue files listed in the implementation review
-request; no commit was made by the documentation packet. The original checkout
-and its pre-existing change boundary were left intact.
+The live-qualified feature source was HEAD
+`83a533aa75d9001fa95aa9fcfbef78951123d642`; the follow-up logging fix is commit
+`efea482ec6dda2e547bdec9bfa12a3e55f7f5752`. At this report-update snapshot,
+branch `codex/20260928-memory-plane` tracked
+`origin/codex/20260928-memory-plane` and was one commit ahead before this
+evaluation edit. The original checkout and its pre-existing change boundary
+were left intact.
