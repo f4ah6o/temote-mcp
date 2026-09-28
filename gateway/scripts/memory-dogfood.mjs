@@ -20,6 +20,7 @@ const OWNER_ID = "memory-dogfood-owner";
 const OFFLINE_MARKER = "temote-memory-host-offline-v1\n";
 const TASK_A_MARKER = "temote-memory-task-a-complete-v1\n";
 const TASK_B_READY_MARKER = "temote-memory-task-b-ready-v1\n";
+const TASK_B_COMPLETE_MARKER = "temote-memory-task-b-complete-v1\n";
 const DEFAULT_BASELINE = path.join(ROOT, "dogfood/runs/memory-20260928/baseline-bin/temote-mcp");
 const DEFAULT_BASELINE_GATEWAY = path.join(ROOT, "dogfood/runs/memory-20260928/baseline-full-source/gateway");
 const DEFAULT_CANDIDATE = path.join(ROOT, "target/debug/temote-mcp");
@@ -41,6 +42,9 @@ const MEMORY_REASONING_EFFORTS = new Set(["low", "medium", "high", "minimal", "n
 const HOST_LEASE_MS = 90_000;
 const HOST_LEASE_MARGIN_MS = 5_000;
 const HOST_GRACEFUL_OFFLINE_WAIT_MS = 15_000;
+const MCP_RPC_TIMEOUT_MS = 45_000;
+const TASK_TERMINAL_WAIT_MARGIN_MS = 5_000;
+const MAX_TASK_TERMINAL_WAIT_MS = 10_000_000;
 const MAX_ARTIFACT_BYTES = 1_048_576;
 const MEMORY_ERROR_CODES = new Set([
   "db_unavailable", "extractor_not_configured", "provider_not_configured", "provider_timeout",
@@ -61,10 +65,12 @@ const SAFE_HARNESS_ERROR_CODES = new Set([
   "EXTRACTOR_CREDENTIAL_UNAVAILABLE", "EXTRACTOR_REASONING_EFFORT_REQUIRES_LIVE_EXTRACTOR",
   "FIXTURE_MODE_CANNOT_USE_LIVE_EXTRACTOR", "HOST_AGENT_STOP_TIMEOUT", "HOST_LIST_FAILED",
   "HOST_LIST_RESULT_INVALID", "HOST_LIST_UNAVAILABLE", "HOST_OFFLINE_BUDGET_EXCEEDED",
-  "INVALID_ARGUMENT", "INVALID_EXTRACTOR_REASONING_EFFORT", "INVALID_PHASE_MODE_OR_EXTRACTOR",
+  "INVALID_ARGUMENT", "INVALID_EXTRACTOR_REASONING_EFFORT", "INVALID_PHASE_MODE_OR_EXTRACTOR", "INVALID_PIPELINE_WAIT",
   "INVALID_PROJECTION_TABLE", "MEMORY_DOGFOOD_FAILED", "MEMORY_OUTBOX_MISSING", "MISSING_ARGUMENT_VALUE",
   "QUEUE_HAS_UNSETTLED_DISPATCH", "QUEUE_REPLAY_CHANGED_PROJECTION", "QUEUE_REPLAY_NOT_CONSUMED",
   "SCENARIO_CONTRACT_INVALID", "SCENARIO_UNAVAILABLE", "TEMOTE_BINARY_NOT_FOUND", "UNKNOWN_ARGUMENT",
+  "TASK_A_TERMINAL_TIMEOUT", "TASK_B_TERMINAL_TIMEOUT", "TASK_TERMINAL_BUDGET_INVALID",
+  "DOGFOOD_DRIVER_EXITED_BEFORE_TASK_A_TERMINAL", "DOGFOOD_DRIVER_EXITED_BEFORE_TASK_B_TERMINAL",
 ]);
 
 class HarnessError extends Error {
@@ -106,6 +112,45 @@ export function memoryExtractorSettings(model, reasoningEffort) {
     max_attempts: MEMORY_MAX_ATTEMPTS,
     batch_size: MEMORY_BATCH_SIZE,
   };
+}
+
+export function taskTerminalWaitBudgetMs(maxPolls, pollIntervalSeconds) {
+  if (!Number.isSafeInteger(maxPolls) || maxPolls < 1 || maxPolls > 200
+      || typeof pollIntervalSeconds !== "number" || !Number.isFinite(pollIntervalSeconds)
+      || pollIntervalSeconds < 0) {
+    throw new HarnessError("TASK_TERMINAL_BUDGET_INVALID");
+  }
+  const budgetMs = Math.ceil((maxPolls + 1) * MCP_RPC_TIMEOUT_MS
+    + Math.max(0, maxPolls - 1) * pollIntervalSeconds * 1_000
+    + TASK_TERMINAL_WAIT_MARGIN_MS);
+  if (!Number.isSafeInteger(budgetMs) || budgetMs > MAX_TASK_TERMINAL_WAIT_MS) {
+    throw new HarnessError("TASK_TERMINAL_BUDGET_INVALID");
+  }
+  return budgetMs;
+}
+
+function taskTerminalWaitBudgetFromFlags(flags) {
+  const maxPollsRaw = flags["task-polls"] ?? "120";
+  const pollIntervalRaw = flags["poll-interval"] ?? "1";
+  if (!/^\d+$/.test(maxPollsRaw)
+      || !/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(pollIntervalRaw)) {
+    throw new HarnessError("TASK_TERMINAL_BUDGET_INVALID");
+  }
+  const maxPolls = Number(maxPollsRaw);
+  const pollIntervalSeconds = Number(pollIntervalRaw);
+  return {
+    maxPolls,
+    pollIntervalSeconds,
+    waitMs: taskTerminalWaitBudgetMs(maxPolls, pollIntervalSeconds),
+  };
+}
+
+function projectionWaitMsFromFlags(flags) {
+  const seconds = Number(flags["pipeline-wait-seconds"] ?? "240");
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 600) {
+    throw new HarnessError("INVALID_PIPELINE_WAIT");
+  }
+  return seconds * 1_000;
 }
 
 function safeErrorCode(value) {
@@ -469,12 +514,14 @@ export async function writeLiveFailureManifest(runDir, metadata, failureCode, pr
       extractor_config: metadata.extractorConfig,
       provenance: metadata.provenance,
       gates: {
-        task_a_terminal: taskATerminal ? "pass" : "not_run",
+        task_a_terminal: taskATerminal ? "pass" : progress.taskATerminalWaitStarted ? "blocked" : "not_run",
         source_sync_complete: diagnostics?.source?.complete === true ? "pass" : "blocked",
         task_a_projection_predicate: progress.taskAProjectionPredicatePassed ? "pass" : "not_run",
         task_a_public_context_assertions: "not_run",
         offline_host: offlineProof ? "pass" : progress.offlineCheckAttempted ? "blocked" : "not_run",
         task_b_ready: taskBReady ? "pass" : "not_run",
+        task_b_terminal: await markerMatches(path.join(runDir, "task-b-complete.proof"), TASK_B_COMPLETE_MARKER)
+          ? "pass" : progress.taskBTerminalWaitStarted ? "blocked" : "not_run",
         task_b_projection_predicate: progress.taskBProjectionPredicatePassed ? "pass" : "not_run",
         queue_replay: progress.queueReplayPassed ? "pass" : "not_run",
         scenario_assertions: "not_run",
@@ -482,12 +529,19 @@ export async function writeLiveFailureManifest(runDir, metadata, failureCode, pr
       progress: {
         last_completed_stage: progress.stage,
         diagnostic_host: progress.diagnosticHostLabel ?? null,
+        task_terminal_wait_ms: progress.taskTerminalWaitMs ?? null,
+        projection_wait_ms: progress.projectionWaitMs ?? null,
+        task_polls: progress.taskPolls ?? null,
+        poll_interval_seconds: progress.pollIntervalSeconds ?? null,
       },
       events: {
         stable_error_code: failureCode,
         task_a_terminal_marker_verified: taskATerminal,
+        task_a_terminal_wait_started: progress.taskATerminalWaitStarted === true,
         host_a_offline_marker_verified: offlineProof,
         task_b_ready_marker_verified: taskBReady,
+        task_b_terminal_marker_verified: await markerMatches(path.join(runDir, "task-b-complete.proof"), TASK_B_COMPLETE_MARKER),
+        task_b_terminal_wait_started: progress.taskBTerminalWaitStarted === true,
         source_acked_revision: diagnostics?.source?.acked_through_revision ?? null,
         source_head_revision: diagnostics?.source?.source_head_revision ?? null,
         source_cloud_head: diagnostics?.source?.cloud_head_seq ?? null,
@@ -627,11 +681,16 @@ function childExited(child) {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
-async function waitUntil(predicate, timeoutMs, intervalMs = 100) {
+async function waitUntil(predicate, timeoutMs, intervalMs = 100, signal = undefined) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
+  while (!signal?.aborted && Date.now() <= deadline) {
     if (await predicate()) return true;
-    await delay(intervalMs);
+    try {
+      await delay(intervalMs, undefined, signal ? { signal } : undefined);
+    } catch (error) {
+      if (signal?.aborted && error?.name === "AbortError") return false;
+      throw error;
+    }
   }
   return false;
 }
@@ -910,6 +969,7 @@ async function startDriver({
     "--output", artifactPath,
     "--task-a-complete-file", path.join(runDir, "task-a-complete.proof"),
     "--task-b-ready-file", path.join(runDir, "task-b-ready.proof"),
+    "--task-b-complete-file", path.join(runDir, "task-b-complete.proof"),
     "--fabric-url", runtime.endpoint,
     "--session-a", hostA.sessionId,
     "--session-b", hostB.sessionId,
@@ -957,18 +1017,55 @@ async function startDriver({
   return { child, artifactPath, exit };
 }
 
-async function waitForMarker(filePath, expected, timeoutMs, driver) {
-  const result = await Promise.race([
-    waitUntil(async () => {
-      try {
-        return (await fs.readFile(filePath, "utf8")) === expected;
-      } catch {
-        return false;
-      }
-    }, timeoutMs, 50).then((ok) => ok ? "marker" : "timeout"),
-    driver.exit.then(() => "driver_exit"),
-  ]);
-  if (result !== "marker") throw new HarnessError(result === "timeout" ? "DOGFOOD_HANDSHAKE_TIMEOUT" : "DOGFOOD_DRIVER_EXITED_BEFORE_HANDSHAKE");
+export async function waitForMarker(
+  filePath,
+  expected,
+  timeoutMs,
+  driver,
+  {
+    timeoutCode = "DOGFOOD_HANDSHAKE_TIMEOUT",
+    driverExitCode = "DOGFOOD_DRIVER_EXITED_BEFORE_HANDSHAKE",
+    intervalMs = 50,
+    markerReader = async (file, marker) => (await fs.readFile(file, "utf8")) === marker,
+  } = {},
+) {
+  const abort = new AbortController();
+  let result;
+  try {
+    result = await Promise.race([
+      waitUntil(async () => {
+        try {
+          return await markerReader(filePath, expected);
+        } catch {
+          return false;
+        }
+      }, timeoutMs, intervalMs, abort.signal).then((ok) => ok ? "marker" : "timeout"),
+      driver.exit.then(async () => {
+        // The driver writes the terminal marker immediately before exit. A final
+        // read preserves that proof if process exit wins the polling interval.
+        try {
+          return await markerReader(filePath, expected) ? "marker" : "driver_exit";
+        } catch {
+          return "driver_exit";
+        }
+      }),
+    ]);
+  } finally {
+    // A long task-terminal budget must not leave its polling timer alive after
+    // the driver has already terminated or the exact marker has arrived.
+    abort.abort();
+  }
+  if (result !== "marker") throw new HarnessError(result === "timeout" ? timeoutCode : driverExitCode);
+}
+
+export async function waitForTaskBTerminalBeforeProjection({ markerPath, timeoutMs, driver, project, intervalMs = 50, markerReader }) {
+  await waitForMarker(markerPath, TASK_B_COMPLETE_MARKER, timeoutMs, driver, {
+    timeoutCode: "TASK_B_TERMINAL_TIMEOUT",
+    driverExitCode: "DOGFOOD_DRIVER_EXITED_BEFORE_TASK_B_TERMINAL",
+    intervalMs,
+    ...(markerReader ? { markerReader } : {}),
+  });
+  return project();
 }
 
 async function sourceStatus(runtime, hostId, sessionId) {
@@ -1027,17 +1124,31 @@ async function repositoryCheckpointReady(runtime) {
   return rows.length > 0 && Number(rows[0].last_cloud_seq) >= Number(rows[0].latest_cloud_seq);
 }
 
-async function waitForTaskProjection(runtime, host, constraint, timeoutMs) {
+async function waitForTaskProjection(runtime, host, constraint, timeoutMs, signal = undefined) {
   const end = Date.now() + timeoutMs;
-  while (Date.now() <= end) {
+  while (!signal?.aborted && Date.now() <= end) {
     const source = await sourceStatus(runtime, host.hostId, host.sessionId);
-    if (source?.complete && source.terminalCount > 0
-        && await repositoryCheckpointReady(runtime)
-        && await knowledgeStatus(runtime, constraint)) {
-      return source;
+    if (signal?.aborted) throw new HarnessError("PROJECTION_WAIT_ABORTED");
+    if (source?.complete && source.terminalCount > 0) {
+      const checkpointReady = await repositoryCheckpointReady(runtime);
+      if (signal?.aborted) throw new HarnessError("PROJECTION_WAIT_ABORTED");
+      if (checkpointReady) {
+        const hasKnowledge = await knowledgeStatus(runtime, constraint);
+        if (signal?.aborted) throw new HarnessError("PROJECTION_WAIT_ABORTED");
+        if (hasKnowledge) return source;
+      }
     }
-    await delay(250);
+    if (signal?.aborted) throw new HarnessError("PROJECTION_WAIT_ABORTED");
+    try {
+      await delay(250, undefined, signal ? { signal } : undefined);
+    } catch (error) {
+      if (signal?.aborted && error?.name === "AbortError") {
+        throw new HarnessError("PROJECTION_WAIT_ABORTED");
+      }
+      throw error;
+    }
   }
+  if (signal?.aborted) throw new HarnessError("PROJECTION_WAIT_ABORTED");
   throw new HarnessError(`PROJECTION_${host.label.toUpperCase()}_TIMEOUT`);
 }
 
@@ -1126,7 +1237,20 @@ async function replayQueueAndWriteManifest(runtime, runDir) {
 }
 
 async function waitForDriver(driver, timeoutMs) {
-  const result = await Promise.race([driver.exit, delay(timeoutMs).then(() => null)]);
+  const abort = new AbortController();
+  let result;
+  try {
+    result = await Promise.race([
+      driver.exit,
+      delay(timeoutMs, null, { signal: abort.signal }).catch((error) => {
+        if (error?.name === "AbortError") return "aborted";
+        throw error;
+      }),
+    ]);
+  } finally {
+    abort.abort();
+  }
+  if (result === "aborted") result = null;
   if (result === null) {
     driver.child.kill("SIGTERM");
     await waitUntil(() => childExited(driver.child), 3_000, 50);
@@ -1137,10 +1261,14 @@ async function waitForDriver(driver, timeoutMs) {
 }
 
 async function waitForProjectionWhileDriverRuns(runtime, clientToken, host, constraint, timeoutMs, driver, runDir, metadata) {
+  const abort = new AbortController();
   try {
     const result = await Promise.race([
-      waitForTaskProjection(runtime, host, constraint, timeoutMs).then(() => "projected"),
-      driver.exit.then(({ code }) => `driver_exit_${code}`),
+      waitForTaskProjection(runtime, host, constraint, timeoutMs, abort.signal).then(() => "projected"),
+      driver.exit.then(({ code }) => {
+        abort.abort();
+        return `driver_exit_${code}`;
+      }),
     ]);
     if (result !== "projected") throw new HarnessError("DOGFOOD_DRIVER_EXITED_BEFORE_PROJECTION");
   } catch (error) {
@@ -1150,6 +1278,8 @@ async function waitForProjectionWhileDriverRuns(runtime, clientToken, host, cons
       await writeProjectionFailureManifest(runDir, metadata, host, diagnostics);
     }
     throw error;
+  } finally {
+    abort.abort();
   }
 }
 
@@ -1191,6 +1321,8 @@ async function runFixture(phase, runDir) {
 async function runLive(flags, phase, extractor, runDir) {
   const scenario = await readScenario();
   const binary = await resolveBinary(flags, phase);
+  const taskPollSettings = taskTerminalWaitBudgetFromFlags(flags);
+  const projectionWaitMs = projectionWaitMsFromFlags(flags);
   const backend = flags.backend ?? DEFAULT_BACKEND;
   const model = flags.model ?? DEFAULT_TASK_MODEL;
   const effort = flags.effort ?? DEFAULT_TASK_EFFORT;
@@ -1210,6 +1342,13 @@ async function runLive(flags, phase, extractor, runDir) {
   );
   const metadata = {
     phase, extractor, selectors, extractorConfig,
+    timing: {
+      task_terminal_wait_ms: taskPollSettings.waitMs,
+      projection_wait_ms: projectionWaitMs,
+      task_polls: taskPollSettings.maxPolls,
+      poll_interval_seconds: taskPollSettings.pollIntervalSeconds,
+      mcp_rpc_timeout_ms: MCP_RPC_TIMEOUT_MS,
+    },
     provenance: await collectRunProvenance(binary, scenario),
   };
 
@@ -1264,6 +1403,12 @@ async function runLive(flags, phase, extractor, runDir) {
     taskBProjectionPredicatePassed: false,
     queueReplayPassed: false,
     offlineCheckAttempted: false,
+    taskATerminalWaitStarted: false,
+    taskBTerminalWaitStarted: false,
+    taskTerminalWaitMs: taskPollSettings.waitMs,
+    projectionWaitMs,
+    taskPolls: taskPollSettings.maxPolls,
+    pollIntervalSeconds: taskPollSettings.pollIntervalSeconds,
   };
   try {
     const { repoA, repoB } = await createRunWorkspace(runDir);
@@ -1286,16 +1431,19 @@ async function runLive(flags, phase, extractor, runDir) {
     });
     progress.stage = "driver_started";
 
-    const handshakeTimeout = Number(flags["pipeline-wait-seconds"] ?? 240) * 1000;
-    await waitForMarker(path.join(runDir, "task-a-complete.proof"), TASK_A_MARKER, handshakeTimeout, driver);
+    progress.taskATerminalWaitStarted = true;
+    progress.stage = "task_a_terminal_wait";
+    await waitForMarker(
+      path.join(runDir, "task-a-complete.proof"), TASK_A_MARKER, taskPollSettings.waitMs, driver,
+      { timeoutCode: "TASK_A_TERMINAL_TIMEOUT", driverExitCode: "DOGFOOD_DRIVER_EXITED_BEFORE_TASK_A_TERMINAL" },
+    );
     progress.stage = "task_a_terminal";
     await copyTaskAHeadToHostB(repoA, repoB);
     if (phase === "candidate") {
-      const pipelineWait = handshakeTimeout;
       const taskAConstraint = scenario.task_a.constraint;
       progress.stage = "task_a_projection";
       progress.diagnosticHostLabel = hostA.label;
-      await waitForProjectionWhileDriverRuns(runtime, clientToken, hostA, taskAConstraint, pipelineWait, driver, runDir, metadata);
+      await waitForProjectionWhileDriverRuns(runtime, clientToken, hostA, taskAConstraint, projectionWaitMs, driver, runDir, metadata);
       progress.taskAProjectionPredicatePassed = true;
       progress.stage = "task_a_projection_predicate_passed";
 
@@ -1306,24 +1454,35 @@ async function runLive(flags, phase, extractor, runDir) {
         runtime,
         token: clientToken,
         proofPath: path.join(runDir, "host-a-offline.proof"),
-        budgetMs: handshakeTimeout,
+        budgetMs: projectionWaitMs,
       });
       progress.stage = "host_a_offline";
     }
     await fs.writeFile(path.join(runDir, "task-b-ready.proof"), TASK_B_READY_MARKER, { mode: 0o600, flag: "wx" });
     progress.stage = "task_b_ready";
-    if (phase === "candidate") {
-      const pipelineWait = handshakeTimeout;
-      progress.stage = "task_b_projection";
-      progress.diagnosticHostLabel = hostB.label;
-      await waitForProjectionWhileDriverRuns(runtime, clientToken, hostB, scenario.task_b.constraint, pipelineWait, driver, runDir, metadata);
-      progress.taskBProjectionPredicatePassed = true;
-      progress.stage = "task_b_projection_predicate_passed";
-      progress.stage = "queue_replay";
-      await replayQueueAndWriteManifest(runtime, runDir);
-      progress.queueReplayPassed = true;
-      progress.stage = "queue_replay_complete";
-    }
+    progress.taskBTerminalWaitStarted = true;
+    progress.stage = "task_b_terminal_wait";
+    await waitForTaskBTerminalBeforeProjection({
+      markerPath: path.join(runDir, "task-b-complete.proof"),
+      timeoutMs: taskPollSettings.waitMs,
+      driver,
+      project: async () => {
+        progress.taskBTerminalMarkerVerified = true;
+        progress.stage = "task_b_terminal";
+        if (phase !== "candidate") return;
+        progress.stage = "task_b_projection";
+        progress.diagnosticHostLabel = hostB.label;
+        await waitForProjectionWhileDriverRuns(
+          runtime, clientToken, hostB, scenario.task_b.constraint, projectionWaitMs, driver, runDir, metadata,
+        );
+        progress.taskBProjectionPredicatePassed = true;
+        progress.stage = "task_b_projection_predicate_passed";
+        progress.stage = "queue_replay";
+        await replayQueueAndWriteManifest(runtime, runDir);
+        progress.queueReplayPassed = true;
+        progress.stage = "queue_replay_complete";
+      },
+    });
 
     const driverExitCode = await waitForDriver(driver, 30 * 60 * 1000);
     progress.stage = "driver_terminal";
@@ -1351,6 +1510,7 @@ async function runLive(flags, phase, extractor, runDir) {
       synthesis_mode: artifact.synthesis_mode,
       extractor,
       extractor_config: extractorConfig,
+      timing: metadata.timing,
       runtime: { miniflare_version: miniflarePackage.version, d1: "workerd", gateway_source: phase === "baseline" ? "archived_baseline" : "candidate" },
       live_synthesis: extractor === "live" && phase === "candidate"
         ? (artifact.outcome === "pass" ? "PASS" : artifact.outcome.toUpperCase())

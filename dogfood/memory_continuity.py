@@ -30,6 +30,7 @@ UNRELATED_REPOSITORY = "github:temote-tests/memory-continuity-unrelated"
 OFFLINE_PROOF_MARKER = b"temote-memory-host-offline-v1\n"
 TASK_A_COMPLETE_MARKER = b"temote-memory-task-a-complete-v1\n"
 TASK_B_READY_MARKER = b"temote-memory-task-b-ready-v1\n"
+TASK_B_COMPLETE_MARKER = b"temote-memory-task-b-complete-v1\n"
 REPLAY_MANIFEST_FIELDS = {
     "schema_version", "repository_key",
     "dispatch_count_before", "dispatch_count_after",
@@ -217,6 +218,25 @@ def write_task_a_complete_marker(path: Path | None) -> None:
                          | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(TASK_A_COMPLETE_MARKER)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def write_task_b_complete_marker(path: Path | None) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    resolved_parent = path.parent.resolve(strict=True)
+    try:
+        resolved_parent.relative_to((ROOT / "dogfood" / "runs").resolve())
+    except ValueError as error:
+        raise ValueError("task completion marker must be under ignored dogfood/runs") from error
+    if path.is_symlink():
+        raise ValueError("task completion marker must not be a symlink")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(TASK_B_COMPLETE_MARKER)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -576,6 +596,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
              offline_proof_wait_seconds: int = 180,
              task_a_complete_file: Path | None = None,
              task_b_ready_file: Path | None = None,
+             task_b_complete_file: Path | None = None,
              task_b_ready_wait_seconds: int = 180,
              queue_replay_manifest: Path | None = None,
              queue_replay_wait_seconds: int = 180,
@@ -655,6 +676,16 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
                None if ready else "TASK_B_READY_NOT_OBSERVED")
         return ready
 
+    def run_task_b() -> dict[str, Any]:
+        result = _run_task(client, run_id, events, scenario_data=data, task_key="task_b",
+                           session_id=session_b, host_id=host_b, backend=backend, model=model,
+                           effort=effort, max_polls=max_polls, poll_interval=poll_interval)
+        # _run_task returns only after it observes a completed terminal state.
+        # The Node harness may now wait for this host's terminal observation
+        # and projection; acceptance/running never produce this marker.
+        write_task_b_complete_marker(task_b_complete_file)
+        return result
+
     try:
         first = _run_task(client, run_id, events, scenario_data=data, task_key="task_a",
                           session_id=session_a, host_id=host_a, backend=backend, model=model,
@@ -685,9 +716,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
                     run["outcome"] = "blocked"
                     validate_artifact(run)
                     return run
-                _run_task(client, run_id, events, scenario_data=data, task_key="task_b",
-                          session_id=session_b, host_id=host_b, backend=backend, model=model,
-                          effort=effort, max_polls=max_polls, poll_interval=poll_interval)
+                run_task_b()
                 run["outcome"] = "not_implemented"
                 validate_artifact(run)
                 return run
@@ -713,9 +742,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
                     run["outcome"] = "blocked"
                     validate_artifact(run)
                     return run
-                _run_task(client, run_id, events, scenario_data=data, task_key="task_b",
-                          session_id=session_b, host_id=host_b, backend=backend, model=model,
-                          effort=effort, max_polls=max_polls, poll_interval=poll_interval)
+                run_task_b()
                 run["outcome"] = "not_implemented"
                 validate_artifact(run)
                 return run
@@ -732,9 +759,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
                     run["outcome"] = "blocked"
                     validate_artifact(run)
                     return run
-                _run_task(client, run_id, events, scenario_data=data, task_key="task_b",
-                          session_id=session_b, host_id=host_b, backend=backend, model=model,
-                          effort=effort, max_polls=max_polls, poll_interval=poll_interval)
+                run_task_b()
                 run["outcome"] = "blocked"
                 validate_artifact(run)
                 return run
@@ -751,9 +776,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
                     run["outcome"] = "blocked"
                     validate_artifact(run)
                     return run
-                _run_task(client, run_id, events, scenario_data=data, task_key="task_b",
-                          session_id=session_b, host_id=host_b, backend=backend, model=model,
-                          effort=effort, max_polls=max_polls, poll_interval=poll_interval)
+                run_task_b()
                 run["outcome"] = "blocked"
                 validate_artifact(run)
                 return run
@@ -839,9 +862,7 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
             run["outcome"] = "blocked"
             validate_artifact(run)
             return run
-        second = _run_task(client, run_id, events, scenario_data=data, task_key="task_b",
-                           session_id=session_b, host_id=host_b, backend=backend, model=model,
-                           effort=effort, max_polls=max_polls, poll_interval=poll_interval)
+        second = run_task_b()
         new_context = None
         deadline = time.monotonic() + data["limits"]["context_wait_seconds"]
         while time.monotonic() <= deadline:
@@ -1001,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--offline-proof-wait-seconds", type=int, default=180)
     parser.add_argument("--task-a-complete-file", type=Path)
     parser.add_argument("--task-b-ready-file", type=Path)
+    parser.add_argument("--task-b-complete-file", type=Path)
     parser.add_argument("--task-b-ready-wait-seconds", type=int, default=180)
     parser.add_argument("--source-head", help="verified full source Git object id, for archived baselines")
     parser.add_argument("--working-diff-sha256", help="verified source diff SHA-256, for archived baselines")
@@ -1045,6 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
                            offline_proof_wait_seconds=args.offline_proof_wait_seconds,
                            task_a_complete_file=args.task_a_complete_file,
                            task_b_ready_file=args.task_b_ready_file,
+                           task_b_complete_file=args.task_b_complete_file,
                            task_b_ready_wait_seconds=args.task_b_ready_wait_seconds,
                            queue_replay_manifest=args.queue_replay_manifest,
                            queue_replay_wait_seconds=args.queue_replay_wait_seconds,

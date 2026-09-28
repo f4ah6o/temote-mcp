@@ -18,6 +18,7 @@ from .memory_continuity import (
     _summary_matches_supported_policy,
     McpHttpClient,
     TASK_A_COMPLETE_MARKER,
+    TASK_B_COMPLETE_MARKER,
     compare_runs,
     fixture_run,
     live_run,
@@ -26,6 +27,7 @@ from .memory_continuity import (
     validate_offline_proof,
     validate_queue_replay_manifest,
     write_task_a_complete_marker,
+    write_task_b_complete_marker,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -223,6 +225,20 @@ class MemoryContinuityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 write_task_a_complete_marker(Path(directory) / "task-a-complete")
 
+    def test_task_b_handshake_marker_is_bounded_private_and_confined(self):
+        RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNS) as directory:
+            marker = Path(directory) / "task-b-complete"
+            write_task_b_complete_marker(marker)
+            self.assertEqual(marker.read_bytes(), TASK_B_COMPLETE_MARKER)
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                write_task_b_complete_marker(marker)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                write_task_b_complete_marker(Path(directory) / "task-b-complete")
+
     def test_archived_source_identity_requires_both_verified_overrides(self):
         scenario = load_scenario()
         empty_diff = hashlib.sha256(b"").hexdigest()
@@ -272,6 +288,7 @@ class MemoryContinuityTests(unittest.TestCase):
     def test_archived_baseline_runs_both_tasks_but_does_not_wait_for_memory(self):
         class FakeClient:
             starts = 0
+            marker = None
 
             def __init__(self, *_args, **_kwargs):
                 pass
@@ -285,18 +302,31 @@ class MemoryContinuityTests(unittest.TestCase):
                     self.starts += 1
                     return {"task_id": f"baseline-task-{self.starts}"}
                 if name == "opencode_task_get":
+                    if _arguments["task_id"] == "baseline-task-2":
+                        self.assert_no_early_marker()
                     return {"status": "completed"}
                 raise AssertionError(f"unexpected baseline tool: {name}")
 
-        with patch("dogfood.memory_continuity.McpHttpClient", FakeClient):
-            result = live_run(
-                phase="baseline", endpoint="https://fabric.example/mcp", token="test-token",
-                session_a="baseline-session-a", session_b="baseline-session-b",
-                backend="opencode", model="gpt-5.6-luna", effort="max",
-                extractor_profile="openai_compatible:glm-5.3-flash",
-                synthesis_mode="not_run", binary=Path(__file__), max_polls=2,
-                poll_interval=0,
-            )
+            @classmethod
+            def assert_no_early_marker(cls):
+                if cls.marker is not None:
+                    assert not cls.marker.exists(), "Task B marker appeared before terminal completion"
+
+        RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNS) as directory:
+            marker = Path(directory) / "task-b-complete"
+            FakeClient.marker = marker
+            with patch("dogfood.memory_continuity.McpHttpClient", FakeClient):
+                result = live_run(
+                    phase="baseline", endpoint="https://fabric.example/mcp", token="test-token",
+                    session_a="baseline-session-a", session_b="baseline-session-b",
+                    backend="opencode", model="gpt-5.6-luna", effort="max",
+                    extractor_profile="openai_compatible:glm-5.3-flash",
+                    synthesis_mode="not_run", binary=Path(__file__), max_polls=2,
+                    poll_interval=0, task_b_complete_file=marker,
+                )
+            self.assertEqual(marker.read_bytes(), TASK_B_COMPLETE_MARKER)
+            self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
         self.assertEqual(result["outcome"], "not_implemented")
         self.assertEqual(result["synthesis_mode"], "not_run")
         self.assertEqual(sum(event["action"] == "opencode_task_start" for event in result["events"]), 2)
@@ -304,6 +334,85 @@ class MemoryContinuityTests(unittest.TestCase):
         self.assertEqual(result["gates"]["task_a_constraint_supported"], "not_implemented")
         self.assertEqual(result["gates"]["task_b_constraint_current"], "not_implemented")
         self.assertEqual(result["gates"]["queue_replay_no_growth"], "not_run")
+
+    def test_task_b_poll_limit_does_not_emit_terminal_handshake_marker(self):
+        class FakeClient:
+            starts = 0
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def call(self, name, arguments):
+                if name == "context_status":
+                    raise RuntimeError("SESSION_REQUIRED")
+                if name == "opencode_task_start":
+                    type(self).starts += 1
+                    return {"task_id": f"baseline-task-{type(self).starts}"}
+                if name == "opencode_task_get":
+                    if arguments["task_id"] == "baseline-task-2":
+                        self.assert_no_marker()
+                        return {"status": "running"}
+                    return {"status": "completed"}
+                raise AssertionError(f"unexpected baseline tool: {name}")
+
+            @staticmethod
+            def assert_no_marker():
+                assert not marker.exists(), "Task B marker appeared while task was running"
+
+        RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNS) as directory:
+            marker = Path(directory) / "task-b-complete"
+            with patch("dogfood.memory_continuity.McpHttpClient", FakeClient):
+                result = live_run(
+                    phase="baseline", endpoint="https://fabric.example/mcp", token="test-token",
+                    session_a="baseline-session-a", session_b="baseline-session-b",
+                    backend="opencode", model="gpt-5.6-luna", effort="max",
+                    extractor_profile="openai_compatible:glm-5.3-flash",
+                    synthesis_mode="not_run", binary=Path(__file__), max_polls=1,
+                    poll_interval=0, task_b_complete_file=marker,
+                )
+            self.assertEqual(result["outcome"], "blocked")
+            self.assertFalse(marker.exists())
+
+    def test_task_b_failed_terminal_does_not_emit_completion_marker(self):
+        class FakeClient:
+            starts = 0
+            marker = None
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def call(self, name, arguments):
+                if name == "context_status":
+                    raise RuntimeError("SESSION_REQUIRED")
+                if name == "opencode_task_start":
+                    type(self).starts += 1
+                    return {"task_id": f"baseline-task-{type(self).starts}"}
+                if name == "opencode_task_get":
+                    if arguments["task_id"] == "baseline-task-2":
+                        assert not type(self).marker.exists(), (
+                            "Task B marker appeared before successful completion"
+                        )
+                        return {"status": "failed"}
+                    return {"status": "completed"}
+                raise AssertionError(f"unexpected baseline tool: {name}")
+
+        RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNS) as directory:
+            marker = Path(directory) / "task-b-complete"
+            FakeClient.marker = marker
+            with patch("dogfood.memory_continuity.McpHttpClient", FakeClient):
+                result = live_run(
+                    phase="baseline", endpoint="https://fabric.example/mcp", token="test-token",
+                    session_a="baseline-session-a", session_b="baseline-session-b",
+                    backend="opencode", model="gpt-5.6-luna", effort="max",
+                    extractor_profile="openai_compatible:glm-5.3-flash",
+                    synthesis_mode="not_run", binary=Path(__file__), max_polls=2,
+                    poll_interval=0, task_b_complete_file=marker,
+                )
+            self.assertEqual(result["outcome"], "fail")
+            self.assertIn("failed", [event["state"] for event in result["events"]])
+            self.assertFalse(marker.exists())
 
     def test_replay_manifest_requires_real_dispatch_and_unchanged_projection(self):
         RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)

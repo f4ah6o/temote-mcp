@@ -13,7 +13,9 @@ import {
   resolveExtractorReasoningEffort,
   safeHarnessErrorCode,
   stopDedicatedHostAndConfirmOffline,
+  taskTerminalWaitBudgetMs,
   waitForHost,
+  waitForTaskBTerminalBeforeProjection,
   writeLiveFailureManifest,
 } from "../scripts/memory-dogfood.mjs";
 import {
@@ -104,6 +106,98 @@ test("host_list discovery errors and malformed replies never prove a host offlin
     waitForHost(hostListRuntime([{ host_id: "host-a" }]), "token", "host-a", false, 5, 1),
     (error) => error.code === "DEDICATED_HOST_OFFLINE_TIMEOUT",
   );
+});
+
+test("task terminal budget covers bounded MCP RPCs and rejects unsafe polling settings", () => {
+  assert.equal(taskTerminalWaitBudgetMs(200, 1), 9_249_000);
+  assert.throws(() => taskTerminalWaitBudgetMs(0, 1), (error) => error.code === "TASK_TERMINAL_BUDGET_INVALID");
+  assert.throws(() => taskTerminalWaitBudgetMs(201, 1), (error) => error.code === "TASK_TERMINAL_BUDGET_INVALID");
+  assert.throws(() => taskTerminalWaitBudgetMs(200, Infinity), (error) => error.code === "TASK_TERMINAL_BUDGET_INVALID");
+  assert.throws(() => taskTerminalWaitBudgetMs(200, 1_000), (error) => error.code === "TASK_TERMINAL_BUDGET_INVALID");
+});
+
+test("Task B projection cannot start before the exact terminal marker", { timeout: 5_000 }, async () => {
+  const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "temote-memory-task-b-terminal-"));
+  const markerPath = path.join(runDir, "task-b-complete.proof");
+  let projectionStarted = false;
+  const driver = { exit: new Promise(() => {}) };
+  try {
+    const projected = waitForTaskBTerminalBeforeProjection({
+      markerPath,
+      timeoutMs: 2_000,
+      intervalMs: 5,
+      driver,
+      project: async () => {
+        assert.equal(await fs.readFile(markerPath, "utf8"), "temote-memory-task-b-complete-v1\n");
+        projectionStarted = true;
+        return "projection_started";
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(projectionStarted, false);
+    await fs.writeFile(markerPath, "temote-memory-task-b-complete-v1\n", { mode: 0o600, flag: "wx" });
+    assert.equal(await projected, "projection_started");
+    assert.equal(projectionStarted, true);
+  } finally {
+    await fs.rm(runDir, { recursive: true, force: true });
+  }
+});
+
+test("Task B marker timeout and driver exit are distinct and never begin projection", async () => {
+  let projectionStarted = false;
+  const project = async () => { projectionStarted = true; };
+  await assert.rejects(
+    waitForTaskBTerminalBeforeProjection({
+      markerPath: "/path/which/does/not/exist/task-b-complete.proof",
+      timeoutMs: 5,
+      intervalMs: 1,
+      driver: { exit: new Promise(() => {}) },
+      project,
+    }),
+    (error) => error.code === "TASK_B_TERMINAL_TIMEOUT",
+  );
+  await assert.rejects(
+    waitForTaskBTerminalBeforeProjection({
+      markerPath: "/path/which/does/not/exist/task-b-complete.proof",
+      timeoutMs: 5_000,
+      intervalMs: 1,
+      driver: { exit: Promise.resolve({ code: 1 }) },
+      project,
+    }),
+    (error) => error.code === "DOGFOOD_DRIVER_EXITED_BEFORE_TASK_B_TERMINAL",
+  );
+  assert.equal(projectionStarted, false);
+});
+
+test("driver exit cancels the long Task B marker poll, while a marker written at exit wins", { timeout: 5_000 }, async () => {
+  let markerReads = 0;
+  let projectionStarted = false;
+  await assert.rejects(
+    waitForTaskBTerminalBeforeProjection({
+      markerPath: "/path/which/does/not/exist/task-b-complete.proof",
+      timeoutMs: taskTerminalWaitBudgetMs(200, 1),
+      intervalMs: 10,
+      markerReader: async () => { markerReads += 1; return false; },
+      driver: { exit: Promise.resolve({ code: 1 }) },
+      project: async () => { projectionStarted = true; },
+    }),
+    (error) => error.code === "DOGFOOD_DRIVER_EXITED_BEFORE_TASK_B_TERMINAL",
+  );
+  const readsAtExit = markerReads;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(markerReads, readsAtExit, "the long polling timer must be aborted when the driver exits");
+  assert.equal(projectionStarted, false);
+
+  let racedReads = 0;
+  const result = await waitForTaskBTerminalBeforeProjection({
+    markerPath: "written-by-driver-before-exit",
+    timeoutMs: taskTerminalWaitBudgetMs(200, 1),
+    markerReader: async () => { racedReads += 1; return racedReads >= 2; },
+    driver: { exit: Promise.resolve({ code: 0 }) },
+    project: async () => { projectionStarted = true; return "projected"; },
+  });
+  assert.equal(result, "projected");
+  assert.equal(projectionStarted, true);
 });
 
 test("offline proof follows SIGINT exit and a successful absence check", { timeout: 5_000 }, async () => {
