@@ -1,6 +1,8 @@
 # Named-root bare clone: implementation and live dogfood
 
-Date: 2026-09-28 (Asia/Tokyo). This change is implemented and the individual
+Initial assessment before the authorized supervisor replacement, 2026-09-28
+(Asia/Tokyo). The subsequent successful local host run is recorded in the final
+section below; earlier observations remain unchanged. This change is implemented and the individual
 clone → worktree → normal session → jj steps were verified live. **Neither
 production nor the isolated end-to-end comparison qualifies:** production has
 an missing required admission capability and the isolated run has an interrupted
@@ -254,3 +256,85 @@ same-user filesystem races between validation and a delegated agent action;
 this API cannot pass a pinned directory descriptor through its typed task.
 Ignored owner-local artifacts retain hashes and bounded non-secret observations;
 child transcripts remain bounded, expiring session evidence.
+
+
+## Authorized supervisor replacement and successful host run
+
+The user subsequently authorized supervisor replacement and explicitly approved
+restarting the six blocked sessions. Detailed read-only preflight identified
+`PATH` restart-context mismatches, not missing directories or unsupported session
+layouts. The affected sessions were `bp`, `dagu-cf`,
+`eea64ad0-abf8-4b35-b64e-9936bb94cfbb`, `repo-setup`, `tansomiru`, and `temote`.
+Fresh complete task/job inventories were empty. Each was restarted under the
+upgrade environment, with its cwd, permission, grants, permitted directories and
+restart policy verified unchanged. Preflight then reported 60 sessions and zero
+blockers. These are explicit later authorizations; the original observations of
+an untouched `repo-setup` above still describe the earlier runs correctly.
+
+The official CLI upgrade completed a same-PID supervisor handoff and restored
+all 60 active sessions. Independent verification compared their scopes,
+permissions, grants and policies against the snapshot immediately before
+handoff. `/proc/3259657/exe` SHA-256 matches candidate
+`27d81dd14fc9e927c1058778c57fda185ce42a8279c5a4edef0c4f0d78dc59cd`.
+The supervisor advertises bare-clone admission and the rebuilt direct HTTP
+`/healthz` reports healthy with a new boot generation. Version `2026.8.0` remains
+the development package baseline; no release/version metadata was edited.
+
+Automatic plugin reconciliation left a pin to a deleted temporary upgrade
+staging executable. This was detected rather than treated as a successful pin.
+The official `codex plugin install` command recovered the plugin onto the
+preserved `candidate-monitored-bin` bundle with its sibling Linux helper.
+`codex status --json` then reports matching binary/MCP command, enabled and
+installed, and no problems. This is an operational recovery, not a product fix
+for the staging-pin defect. Already-running Codex sessions require restart to
+refresh loaded plugin inventory; this task's CLI MCP harness does not require
+that reload. Do not delete the preserved bundle while the plugin uses it.
+
+Evidence: `upgrade-approved-restarts.json`, `upgrade-ready-preflight.json`,
+`upgrade-before-all-sessions.json`, `upgrade-after-all-sessions.json`,
+`upgrade-verification-gate.json`, and `upgrade-plugin-recovery-gate.json`.
+
+After replacement, `repo-setup` was used with logical root `src`, source
+`src/temote-mcp-df`, and a generated root-relative bare destination. The real
+repository source HEAD was `94a72e7772e15a94026ae483eec0e68046017099`. Baseline
+and candidate used equivalent Codex/medium/agent/local-source conditions, the
+same scenario revision 1, and a temporary loopback Local OAuth lifecycle
+endpoint connected to the production supervisor. OAuth used PKCE S256 and one
+explicit test-console approval, with no token persistence. This exercises the
+actual host's named root and preparation session, but does not measure the
+configured Cloudflare Access client's authenticated reconnection.
+
+| Later paired artifact | Calls | Result |
+| --- | ---: | --- |
+| `baseline-production-http-post-upgrade.json` | 2 | FAIL: baseline binary lacks the tool |
+| `candidate-production-http-post-upgrade.json` | 246 | PASS: all eight scenario assertions |
+
+Run UUID `a934d35d-94e1-4b06-8e70-10392fba1516` completed bare clone, exact
+accepted-ID replay after reconnect, one linked worktree, normal session, jj
+change, pre-delegation boundary refusals and final delegated read-only
+verification. It needed no interruption recovery; its one counted recovery call
+is the scenario's intentional exact clone replay. No duplicate start or clone
+destination was observed. The new normal worktree session remains active.
+
+Per-operation calls were inspect 1, clone 1, clone terminal polling 20, bounded
+evidence reads 4, exact replay 1, worktree creation/polling 29, session start/info
+2, jj selection/development/polling 85, and admission/final verification 103.
+`repository-post-upgrade-independent-gate.json` adds two MCP inspection calls and
+passes all 12 independent checks, including source HEAD, common-directory
+identity, intended jj description/diff, normal scope, no config-id and no
+duplicate destination. The compiled Rust diff and binary identities are
+unchanged from the previous tested candidate.
+
+`comparison-production-post-upgrade.json` now reports **qualified / improved**
+for the measured local named-root repository-setup flow, targeting the repaired
+`bare_clone_completed` assertion. The declared independent functional,
+supervisor restore, plugin-recovery and previously passing test/review gates
+pass. This does not claim a call-count reduction, that the earlier immediate
+interruptions are cured, general reliability, private HTTPS/ask coverage, or
+Cloudflare Access client reconnection. Earlier failed and blocked observations
+and comparisons are retained unchanged. The earlier NOT RUN ignored
+upgrade/reconnect E2E was not rerun; this separate real handoff gate records the
+actual authorized transition and health verification.
+
+The additional tracked change is documentation-only and follows the published
+implementation commit; product code and package versions remain unchanged.
