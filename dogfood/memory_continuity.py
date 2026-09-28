@@ -455,6 +455,35 @@ def _supported_item(context: Any, expected: str, repository_key: str,
     return None
 
 
+def _summary_matches_supported_policy(context: Any, expected: str,
+                                      source_task_id: str) -> bool:
+    """Require the current-summary projection to match an instruction-backed policy.
+
+    The summary is a separate public field from the typed constraint list. Keep
+    its provenance check independent so a correct constraint cannot mask a
+    stale or missing summary, and do not infer a status from the summary row.
+    """
+    for node in _walk(context):
+        summary = node.get("current_summary")
+        if not isinstance(summary, dict) or summary.get("knowledge_summary") != expected:
+            continue
+        refs = summary.get("knowledge_summary_refs")
+        if not isinstance(refs, list):
+            continue
+        if any(
+            isinstance(ref, dict)
+            and ref.get("role") in {"direct_quote", "summary_quote"}
+            and ref.get("observation_kind") == "instruction"
+            and ref.get("task_id") == source_task_id
+            and isinstance(ref.get("observation_id"), str)
+            and ref["observation_id"]
+            and type(ref.get("cloud_seq")) is int
+            for ref in refs
+        ):
+            return True
+    return False
+
+
 def _memory_status(context: Any) -> dict[str, Any] | None:
     for node in _walk(context):
         value = node.get("memory")
@@ -789,9 +818,18 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
                 gates[gate] = "blocked"
         else:
             gates["task_a_constraint_supported"] = "pass" if offline_item else "fail"
-            gates["cross_head_repository_context"] = "pass" if cross_head_item and queried_policy else "fail"
+            task_a_summary = _summary_matches_supported_policy(
+                cross_head_context, data["task_a"]["constraint"], first["task_id"],
+            )
+            offline_summary = _summary_matches_supported_policy(
+                offline_context, data["task_a"]["constraint"], first["task_id"],
+            )
+            gates["cross_head_repository_context"] = (
+                "pass" if cross_head_item and queried_policy and task_a_summary else "fail"
+            )
             gates["offline_host_context"] = (
-                "pass" if offline_proven and offline_item else "not_run" if not offline_proven else "fail"
+                "pass" if offline_proven and offline_item and offline_summary
+                else "not_run" if not offline_proven else "fail"
             )
             gates["task_a_unresolved_surfaced"] = "pass" if unresolved else "fail"
             if not cross_head_item or not offline_item or not unresolved:
@@ -831,6 +869,11 @@ def live_run(*, phase: str, endpoint: str, token: str, session_a: str,
         gates["task_b_constraint_current"] = "pass" if _supported_item(
             new_context, data["task_b"]["constraint"], data["repository_key"],
             "constraint", second["task_id"]) else "fail"
+        task_b_summary = _summary_matches_supported_policy(
+            new_context, data["task_b"]["constraint"], second["task_id"],
+        )
+        if not task_b_summary:
+            gates["task_b_constraint_current"] = "fail"
         supersession_recorded = any(item.get("status") == "superseded" for item in historical_items)
         gates["task_a_constraint_superseded"] = (
             "pass" if old_text not in current_text and supersession_recorded

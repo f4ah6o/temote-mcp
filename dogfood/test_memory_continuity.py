@@ -15,6 +15,7 @@ from .memory_continuity import (
     _baseline_not_implemented,
     _source_identity,
     _supported_item,
+    _summary_matches_supported_policy,
     McpHttpClient,
     TASK_A_COMPLETE_MARKER,
     compare_runs,
@@ -133,6 +134,65 @@ class MemoryContinuityTests(unittest.TestCase):
         self.assertIsNone(_supported_item(context, "JSON", repo, "constraint", "task-b"))
         context["constraints"][0]["scope_id"] = "github:other/repo"
         self.assertIsNone(_supported_item(context, "JSON", repo, "constraint", "task-a"))
+
+    def test_current_summary_must_match_policy_and_instruction_support(self):
+        reference = {
+            "observation_id": "task-a-instruction",
+            "cloud_seq": 17,
+            "task_id": "task-a",
+            "observation_kind": "instruction",
+            "role": "summary_quote",
+        }
+        context = {"current_summary": {
+            "knowledge_summary": "Report output format must be JSON.",
+            "knowledge_summary_refs": [reference],
+        }}
+
+        self.assertTrue(_summary_matches_supported_policy(
+            context, "Report output format must be JSON.", "task-a",
+        ))
+        self.assertTrue(_summary_matches_supported_policy(
+            {"current_summary": {
+                "knowledge_summary": "Report output format must be JSON.",
+                "knowledge_summary_refs": [{**reference, "role": "direct_quote"}],
+            }},
+            "Report output format must be JSON.", "task-a",
+        ))
+        self.assertFalse(_summary_matches_supported_policy(
+            {"current_summary": {
+                "knowledge_summary": "Report output format must be JSON.",
+                "knowledge_summary_refs": [{**reference, "task_id": "task-b"}],
+            }},
+            "Report output format must be JSON.", "task-a",
+        ))
+        self.assertFalse(_summary_matches_supported_policy(
+            {"current_summary": {
+                "knowledge_summary": "Report output format must be JSON.",
+                "knowledge_summary_refs": [{**reference, "observation_kind": "execution_state"}],
+            }},
+            "Report output format must be JSON.", "task-a",
+        ))
+        self.assertFalse(_summary_matches_supported_policy(
+            {"current_summary": {
+                "knowledge_summary": "Report output format must be JSON.",
+                "knowledge_summary_refs": [{**reference, "role": "verification"}],
+            }},
+            "Report output format must be JSON.", "task-a",
+        ))
+        self.assertFalse(_summary_matches_supported_policy(
+            {"current_summary": {
+                "knowledge_summary": "Report output format must be JSON.",
+                "knowledge_summary_refs": [],
+            }},
+            "Report output format must be JSON.", "task-a",
+        ))
+        self.assertFalse(_summary_matches_supported_policy(
+            {"current_summary": {
+                "knowledge_summary": "Report output format must be JSON.",
+                "knowledge_summary_refs": [reference],
+            }},
+            "Report output format must be TOML.", "task-a",
+        ))
 
     def test_offline_marker_is_exact_and_confined_to_ignored_artifacts(self):
         RUNS.mkdir(mode=0o700, parents=True, exist_ok=True)
