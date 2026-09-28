@@ -116,10 +116,12 @@ export async function handleObservationSync(request, env, hostId) {
     const complete = Number(source.journal_degraded) === 0
       && Number(source.gap_count) === 0
       && Number(source.acked_through_revision) >= Number(source.source_head_revision);
-    const committedThroughRevision = checked.value.records.reduce(
-      (highest, record) => Math.max(highest, record.sourceRevision),
-      Number(source.acked_through_revision),
-    );
+    const committedThroughRevision = checked.value.records.length > 0
+      ? checked.value.records.reduce(
+        (highest, record) => Math.max(highest, record.sourceRevision),
+        0,
+      )
+      : Number(source.acked_through_revision);
     return reply({
       session_id: checked.value.sessionId,
       acked_through_revision: Number(source.acked_through_revision),

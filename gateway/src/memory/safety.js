@@ -172,11 +172,17 @@ function semanticSubject(kind, text) {
 }
 
 function normalizedSubject(value) {
-  const words = value.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const normalized = value.normalize("NFKC").toLowerCase();
+  const words = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
   const subject = words.filter((word) => !SUBJECT_STOPWORDS.has(word)).join("-");
-  if (subject) return subject;
-  if (words.length) return words.join("-");
-  return unicodeSubjectHash(value);
+  if (!subject && !words.length) return unicodeSubjectHash(normalized);
+  // Preserve the complete subject when Japanese or another non-ASCII script
+  // is mixed with Latin identifiers. ASCII-only tokenization used to collapse
+  // unrelated subjects such as "出力 API" and "内部 API" to the same "api" key.
+  if ([...normalized].some((character) => character.codePointAt(0) > 0x7f)) {
+    return unicodeSubjectHash(subject || words.join("-"));
+  }
+  return subject || words.join("-");
 }
 
 function boundedSemanticSubject(subject) {

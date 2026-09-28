@@ -71,7 +71,7 @@ const READ_SESSION_TOTALS = [
 const READ_KNOWLEDGE = [
   "SELECT knowledge_id, owner_id, repository_key, scope_type, scope_id, kind,",
   "semantic_key, text, status, confidence, valid_from, valid_until, producer,",
-  "producer_version, produced_at, source_through_cloud_seq FROM knowledge_items",
+  "producer_version, produced_at, source_through_cloud_seq, support_incomplete FROM knowledge_items",
   "WHERE owner_id = ? AND repository_key = ? AND producer_version = ?",
   "AND status IN ('supported', 'current')",
   "AND ((scope_type = 'repository' AND scope_id = ?)",
@@ -108,7 +108,7 @@ const READ_SUPERSESSION_HISTORY = [
   "old_item.owner_id, old_item.repository_key, old_item.scope_type, old_item.scope_id,",
   "old_item.kind, old_item.text, old_item.status, old_item.confidence, old_item.valid_from,",
   "old_item.valid_until, old_item.producer, old_item.producer_version, old_item.produced_at,",
-  "old_item.source_through_cloud_seq FROM knowledge_supersession AS edge",
+  "old_item.source_through_cloud_seq, old_item.support_incomplete FROM knowledge_supersession AS edge",
   "JOIN knowledge_items AS current_item ON current_item.owner_id = edge.owner_id",
   "AND current_item.repository_key = edge.repository_key",
   "AND current_item.knowledge_id = edge.new_knowledge_id",
@@ -738,6 +738,7 @@ async function readKnowledgeProjection(db, ownerId, repositoryKey, filters, prod
       scope_id: oldItem?.scope_id ?? null,
       text: oldItem?.text ?? null,
       text_omitted: Boolean(oldItem?.textOmitted),
+      ...(oldItem ? { support_incomplete: oldItem.supportIncomplete } : {}),
       support_state: oldSupport.length > 0 ? "available" : "missing",
       support_refs: oldSupport,
       authority: "derived",
@@ -830,6 +831,7 @@ function normalizeHistoricalKnowledge(row, current, ownerId, repositoryKey) {
     status: row.status,
     text: textBytes <= 4096 ? row.text : null,
     textOmitted: textBytes > 4096,
+    supportIncomplete: incompleteFlag(row.support_incomplete),
   };
 }
 
@@ -881,7 +883,13 @@ function normalizeKnowledge(row, ownerId, repositoryKey, filters, now, operation
     producer_version: row.producer_version,
     produced_at: row.produced_at,
     source_through_cloud_seq: nonNegativeNumber(row.source_through_cloud_seq),
+    support_incomplete: incompleteFlag(row.support_incomplete),
   };
+}
+
+function incompleteFlag(value) {
+  if (value === true || Number(value ?? 0) !== 0) return true;
+  return false;
 }
 
 function normalizeSupport(row) {
@@ -941,6 +949,7 @@ function assembleContext({ repositoryKey, filters, freshness, worker, observatio
     last_observed_at: tasks.map((task) => task.last_observed_at).filter(Boolean).sort().at(-1) ?? null,
     knowledge_summary: summaries[0]?.text ?? null,
     knowledge_summary_refs: summaries[0]?.support_refs ?? [],
+    knowledge_summary_support_incomplete: summaries[0]?.support_incomplete ?? null,
   };
   if (summaries[0]) {
     currentSummary.knowledge_summary = summaries[0].text;
@@ -954,7 +963,9 @@ function assembleContext({ repositoryKey, filters, freshness, worker, observatio
     scope_type: item.scope_type,
     scope_id: item.scope_id,
     support_refs: item.support_refs,
+    support_incomplete: item.support_incomplete,
     supersedes: item.supersedes,
+    supersession_history: item.supersession_history,
     authority: "derived",
   }));
   const refs = [];
@@ -971,6 +982,10 @@ function assembleContext({ repositoryKey, filters, freshness, worker, observatio
   if (knowledgeResult.missingSupport) partialReasons.push("unsupported_knowledge_omitted");
   if (knowledgeResult.historicalSupportMissing) partialReasons.push("historical_support_missing");
   if (knowledgeResult.supportTruncated) partialReasons.push("support_truncated");
+  if (knowledgeResult.items.some((item) => item.support_incomplete
+      || item.supersession_history.some((history) => history.support_incomplete === true))) {
+    partialReasons.push("knowledge_support_incomplete");
+  }
   const context = {
     context_schema_version: 1,
     scope: scopeProjection(repositoryKey, filters),
@@ -1022,6 +1037,7 @@ function projectKnowledge(item) {
     produced_at: item.produced_at,
     source_through_cloud_seq: item.source_through_cloud_seq,
     support_refs: item.support_refs,
+    support_incomplete: item.support_incomplete,
     supersedes: item.supersedes,
     supersession_history: item.supersession_history,
     authority: "derived",

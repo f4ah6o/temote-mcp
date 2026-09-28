@@ -76,6 +76,18 @@ test("D1 resolver safely joins earlier execution support after task acceptance",
     assert.equal(otherTask.constraints.length, 0);
     const repositoryContext = await contextValue(runtime, { repository: MEMORY_TEST_REPOSITORY });
     assert.equal(repositoryContext.constraints.length, 0, "execution scope is not promoted to repository scope");
+
+    await runtime.executeSql(
+      "UPDATE knowledge_items SET support_incomplete = 1 WHERE owner_id = ? AND repository_key = ? AND knowledge_id = 'operation-knowledge'",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    const incompleteTaskContext = await contextValue(runtime, {
+      repository: MEMORY_TEST_REPOSITORY,
+      task_id: TASK,
+    });
+    assert.equal(incompleteTaskContext.constraints[0].support_incomplete, true);
+    assert.equal(incompleteTaskContext.partial.value, true);
+    assert.equal(incompleteTaskContext.partial.reasons.includes("knowledge_support_incomplete"), true);
   } finally {
     await runtime.dispose();
   }

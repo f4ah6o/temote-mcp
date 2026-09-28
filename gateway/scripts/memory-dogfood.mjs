@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { stop as stopEsbuild } from "esbuild";
 
 import { startMemoryRuntime } from "../test/helpers/memory-runtime.mjs";
 
@@ -623,7 +624,14 @@ async function runFixture(phase, runDir) {
   const result = await execFile(python, [
     path.join(ROOT, "dogfood/memory_continuity.py"), phase, "--mode", "fixture", "--output", driverArtifact,
   ], { cwd: ROOT, failureCode: "DOGFOOD_FIXTURE_DRIVER_FAILED" });
-  if (result.code !== 0) throw new HarnessError("DOGFOOD_FIXTURE_DRIVER_FAILED");
+  const fixtureArtifact = JSON.parse(await fs.readFile(driverArtifact, "utf8"));
+  const expectedFixtureNotRun = result.code === 1
+    && fixtureArtifact.phase === phase
+    && fixtureArtifact.mode === "fixture"
+    && fixtureArtifact.synthesis_mode === "not_run"
+    && fixtureArtifact.outcome === "not_run"
+    && Object.values(fixtureArtifact.gates ?? {}).every((state) => state === "not_run");
+  if (!expectedFixtureNotRun) throw new HarnessError("DOGFOOD_FIXTURE_DRIVER_FAILED");
   const test = spawnSync(process.execPath, ["--test", "gateway/test/automatic-memory-pipeline.test.mjs"], {
     cwd: ROOT,
     encoding: "utf8",
@@ -636,6 +644,7 @@ async function runFixture(phase, runDir) {
     phase,
     mode: "fixture",
     live_synthesis: "NOT RUN",
+    fixture_status: fixtureArtifact.outcome,
     integration_test: test.status === 0 ? "pass" : "fail",
     qualification: "not_qualified",
     status_artifact: path.relative(ROOT, driverArtifact),
@@ -819,8 +828,10 @@ async function main() {
   if (mode === "live" && !result.successful) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  const code = error instanceof HarnessError ? error.code : "MEMORY_DOGFOOD_FAILED";
-  process.stderr.write(JSON.stringify({ outcome: "blocked", error_code: code }) + "\n");
-  process.exitCode = 1;
-});
+main()
+  .catch((error) => {
+    const code = error instanceof HarnessError ? error.code : "MEMORY_DOGFOOD_FAILED";
+    process.stderr.write(JSON.stringify({ outcome: "blocked", error_code: code }) + "\n");
+    process.exitCode = 1;
+  })
+  .finally(() => stopEsbuild());

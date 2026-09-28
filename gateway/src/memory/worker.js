@@ -189,9 +189,14 @@ const READ_KNOWLEDGE_COUNT = [
   "WHERE owner_id = ? AND repository_key = ? AND producer_version = ?",
   "AND status IN ('supported', 'current')",
 ].join(" ");
-const READ_SUPPORT_COUNT = [
-  "SELECT COUNT(*) AS support_count FROM knowledge_support",
-  "WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ?",
+const READ_SUPPORT_DETAILS = [
+  "SELECT support.observation_cloud_seq, support.observation_id, support.support_role,",
+  "observation.host_id, observation.session_id, observation.source_revision, observation.kind",
+  "FROM knowledge_support AS support JOIN observations AS observation",
+  "ON observation.owner_id = support.owner_id AND observation.repository_key = support.repository_key",
+  "AND observation.cloud_seq = support.observation_cloud_seq AND observation.observation_id = support.observation_id",
+  "WHERE support.owner_id = ? AND support.repository_key = ? AND support.knowledge_id = ?",
+  "ORDER BY support.observation_cloud_seq, support.support_role LIMIT ?",
 ].join(" ");
 const MAX_SUPPORTS_PER_KNOWLEDGE = 16;
 const MAX_SUPERSESSION_SUPPORT_ROWS = 1024;
@@ -641,8 +646,8 @@ async function commitProjection(db, data) {
       statements.push(db.prepare([
         "INSERT INTO knowledge_items (knowledge_id, owner_id, repository_key, scope_type, scope_id,",
         "kind, semantic_key, text, status, confidence, valid_from, producer, producer_version,",
-        "produced_at, source_through_cloud_seq)",
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'temote-memory', ?, ?, ?)",
+        "produced_at, source_through_cloud_seq, support_incomplete)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'temote-memory', ?, ?, ?, ?)",
       ].join(" ")).bind(
         item.knowledgeId,
         ownerId,
@@ -657,15 +662,18 @@ async function commitProjection(db, data) {
         config.producerVersion,
         now,
         toSeq,
+        item.supportIncomplete ? 1 : 0,
       ));
     } else {
       statements.push(db.prepare([
         "UPDATE knowledge_items SET status = CASE WHEN status = 'current' THEN 'current' ELSE ? END,",
-        "valid_from = COALESCE(valid_from, ?) WHERE owner_id = ? AND repository_key = ?",
+        "valid_from = COALESCE(valid_from, ?), support_incomplete = MAX(support_incomplete, ?)",
+        "WHERE owner_id = ? AND repository_key = ?",
         "AND producer_version = ? AND knowledge_id = ? AND status IN ('candidate', 'supported', 'current')",
       ].join(" ")).bind(
         item.status,
         item.validFrom,
+        item.supportIncomplete ? 1 : 0,
         ownerId,
         repositoryKey,
         config.producerVersion,
@@ -785,11 +793,19 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       const additions = extracted.support.map(supportToStored).filter((support) =>
         !prior.support.some((existing) => existing.cloudSeq === support.cloudSeq
           && existing.role === support.role));
-      prior.support.push(...additions.slice(0, Math.max(0, MAX_SUPPORTS_PER_KNOWLEDGE - prior.support.length)));
+      const supportAvailable = Math.max(0, MAX_SUPPORTS_PER_KNOWLEDGE - prior.support.length);
+      if (additions.length > supportAvailable) prior.supportIncomplete = true;
+      prior.support.push(...additions.slice(0, supportAvailable));
       const persisted = extracted.support.map(supportToStored).filter((support) =>
         !prior.persistSupport.some((existing) => existing.cloudSeq === support.cloudSeq
+          && existing.role === support.role)
+        && !prior.persistedSupport.some((existing) => existing.cloudSeq === support.cloudSeq
           && existing.role === support.role));
-      prior.persistSupport.push(...persisted.slice(0, Math.max(0, prior.supportCapacity - prior.persistSupport.length)));
+      const persistAvailable = Math.max(0, prior.supportCapacity - prior.persistSupport.length);
+      if (persisted.length > persistAvailable) prior.supportIncomplete = true;
+      const persistedAccepted = persisted.slice(0, persistAvailable);
+      prior.persistSupport.push(...persistedAccepted);
+      prior.persistedSupport.push(...persistedAccepted);
       continue;
     }
 
@@ -803,7 +819,7 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       extracted.semanticKey,
     ];
     const activeRows = await all(db, [
-      "SELECT knowledge_id, text, status FROM knowledge_items",
+      "SELECT knowledge_id, text, status, support_incomplete FROM knowledge_items",
       "WHERE owner_id = ? AND repository_key = ? AND producer_version = ?",
       "AND scope_type = ? AND scope_id = ? AND kind = ? AND semantic_key = ?",
       "AND status IN ('supported', 'current') ORDER BY status DESC, produced_at DESC LIMIT ?",
@@ -861,11 +877,36 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
     }
 
     const existingMatchingId = matching?.knowledge_id ?? stagedMatching?.knowledgeId ?? null;
-    const existingSupportCount = matching
-      ? Number((await first(db, READ_SUPPORT_COUNT, [ownerId, repositoryKey, matching.knowledge_id]))?.support_count ?? 0)
-      : stagedMatching?.support.length ?? 0;
-    const supportCapacity = Math.max(0, MAX_SUPPORTS_PER_KNOWLEDGE - existingSupportCount);
-    const storedSupports = extracted.support.map(supportToStored).slice(0, MAX_SUPPORTS_PER_KNOWLEDGE);
+    const existingSupportRows = matching
+      ? await all(db, READ_SUPPORT_DETAILS, [ownerId, repositoryKey, matching.knowledge_id, MAX_SUPPORTS_PER_KNOWLEDGE + 1])
+      : [];
+    const existingSupports = existingSupportRows.slice(0, MAX_SUPPORTS_PER_KNOWLEDGE).map((row) => ({
+      cloudSeq: Number(row.observation_cloud_seq),
+      observationId: row.observation_id,
+      role: row.support_role,
+      hostId: row.host_id,
+      sessionId: row.session_id,
+      sourceRevision: row.source_revision == null ? null : Number(row.source_revision),
+      sourceKind: row.kind,
+    }));
+    const stagedSupports = matching ? [] : stagedMatching?.support ?? [];
+    const priorSupports = matching ? existingSupports : stagedSupports;
+    const priorSupportKeys = new Set(priorSupports.map((support) => `${support.cloudSeq}\u0000${support.role}`));
+    const incomingSupports = extracted.support.map(supportToStored);
+    const incomingUnique = incomingSupports.filter((support, supportIndex) => {
+      const key = `${support.cloudSeq}\u0000${support.role}`;
+      return !priorSupportKeys.has(key)
+        && incomingSupports.findIndex((candidate) => candidate.cloudSeq === support.cloudSeq
+          && candidate.role === support.role) === supportIndex;
+    });
+    const existingSupportCount = matching ? existingSupportRows.length : priorSupports.length;
+    const supportCapacity = Math.max(0, MAX_SUPPORTS_PER_KNOWLEDGE - Math.min(MAX_SUPPORTS_PER_KNOWLEDGE, existingSupportCount));
+    const persistSupport = incomingUnique.slice(0, supportCapacity);
+    const support = [...priorSupports, ...incomingUnique].slice(0, MAX_SUPPORTS_PER_KNOWLEDGE);
+    const supportIncomplete = Boolean(matching?.support_incomplete ?? stagedMatching?.supportIncomplete)
+      || existingSupportRows.length > MAX_SUPPORTS_PER_KNOWLEDGE
+      || priorSupports.length + incomingUnique.length > MAX_SUPPORTS_PER_KNOWLEDGE
+      || persistSupport.length < incomingUnique.length;
     const knowledgeId = existingMatchingId ?? await deterministicId([
       ownerId,
       repositoryKey,
@@ -887,9 +928,11 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       text: extracted.text,
       status,
       validFrom: extracted.support[0].source.observed_at,
-      support: storedSupports,
-      persistSupport: storedSupports.slice(0, supportCapacity),
+      support,
+      persistedSupport: [...priorSupports, ...persistSupport],
+      persistSupport,
       supportCapacity,
+      supportIncomplete,
       supersedes,
     };
     unique.set(semanticIdentity, item);
@@ -946,6 +989,7 @@ async function authorizeSupersession(db, ownerId, repositoryKey, conflicts, chan
   for (const prior of conflicts) {
     const oldId = prior.knowledge_id ?? prior.knowledgeId;
     if (explicitIds.has(oldId)) continue;
+    if (prior.support_incomplete === 1 || prior.support_incomplete === true || prior.supportIncomplete) return false;
     const oldSupports = prior.knowledge_id
       ? supportByKnowledge.get(oldId) ?? []
       : prior.support.map((support) => ({

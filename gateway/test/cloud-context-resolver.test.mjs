@@ -81,6 +81,7 @@ function knowledge({
   text,
   version = PRODUCER,
   validUntil = null,
+  supportIncomplete = false,
 }) {
   return {
     knowledge_id: id,
@@ -99,6 +100,7 @@ function knowledge({
     producer_version: version,
     produced_at: STAMP,
     source_through_cloud_seq: 4,
+    support_incomplete: supportIncomplete ? 1 : 0,
   };
 }
 
@@ -428,6 +430,36 @@ test("repository resolution works without an online host and returns active supp
   assert.equal(result.value.freshness.source_head_revision, null, "repository-wide freshness must not compare different source revision sequences");
   assert.equal(result.value.freshness.source_gap_count, 1);
   assert.equal(result.value.partial.value, true);
+});
+
+test("selected knowledge reports incomplete active and historical support provenance", async () => {
+  const db = fixtureDb();
+  db.rows.knowledge = db.rows.knowledge.map((item) =>
+    ["summary-a", "constraint-a", "old-a"].includes(item.knowledge_id)
+      ? { ...item, support_incomplete: 1 }
+      : item);
+  const result = await resolveCloudContext("context_resolve", { repository: REPOSITORY_A }, env(db));
+
+  assert.equal(result.value.current_summary.knowledge_summary, "A compact repository summary.");
+  assert.equal(result.value.current_summary.knowledge_summary_support_incomplete, true);
+  assert.equal(result.value.relevant_facts[0].support_incomplete, false);
+  assert.equal(result.value.constraints[0].support_incomplete, true);
+  assert.equal(result.value.constraints[0].supersession_history[0].support_incomplete, true);
+  assert.equal(result.value.partial.value, true);
+  assert.equal(result.value.partial.reasons.includes("knowledge_support_incomplete"), true);
+
+  const historicalOnlyDb = fixtureDb();
+  historicalOnlyDb.rows.knowledge = historicalOnlyDb.rows.knowledge.map((item) => item.knowledge_id === "old-a"
+    ? { ...item, support_incomplete: 1 }
+    : item);
+  const historicalOnly = await resolveCloudContext(
+    "context_resolve",
+    { repository: REPOSITORY_A },
+    env(historicalOnlyDb),
+  );
+  assert.equal(historicalOnly.value.constraints[0].support_incomplete, false);
+  assert.equal(historicalOnly.value.constraints[0].supersession_history[0].support_incomplete, true);
+  assert.equal(historicalOnly.value.partial.reasons.includes("knowledge_support_incomplete"), true);
 });
 
 test("repository and owner boundaries are applied before observation, support, and knowledge projection", async () => {

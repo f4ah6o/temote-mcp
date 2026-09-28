@@ -13,6 +13,82 @@ import {
   MEMORY_TEST_REPOSITORY,
   startMemoryRuntime,
 } from "./helpers/memory-runtime.mjs";
+import { semanticKeyFor } from "../src/memory/safety.js";
+
+async function syncInstructionBatch(runtime, { hostId, token, sessionId, entries }) {
+  const now = Math.floor(Date.now() / 1000);
+  const operationId = `operation-${sessionId}`;
+  const taskId = `task-${sessionId}`;
+  const records = entries.map(({ revision, content }) => ({
+    source_revision: revision,
+    observation: {
+      id: randomUUID(),
+      schema_version: 1,
+      observed_at: now + revision,
+      session_id: sessionId,
+      session_instance: { started_at: now, process_id: 17 },
+      actor: { transport: "mcp-stdio" },
+      target: { backend: "codex" },
+      action: "task_start",
+      kind: "instruction",
+      task_id: taskId,
+      operation_id: operationId,
+      content: {
+        kind: "text",
+        preview: content,
+        total_bytes: Buffer.byteLength(content),
+        sha256: createHash("sha256").update(content).digest("hex"),
+        truncated: false,
+      },
+      evidence_refs: [],
+      provenance: { tool: "codex_task_start", source: "orchestration" },
+      revision,
+      dedupe_key: `${sessionId}:${revision}`,
+    },
+  }));
+  const response = await runtime.fetch(
+    `https://memory-test.local/v1/hosts/${encodeURIComponent(hostId)}/observations/sync`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "x-temote-host-id": hostId,
+      },
+      body: JSON.stringify({
+        schema_version: 1,
+        session_id: sessionId,
+        repository_key: MEMORY_TEST_REPOSITORY,
+        source_base_revision: 0,
+        source_head_revision: Math.max(...entries.map((entry) => entry.revision)),
+        journal_degraded: false,
+        gap_count: 0,
+        records,
+      }),
+    },
+  );
+  assert.equal(response.status, 200, "instruction batch should be accepted by the host sync boundary");
+  return response.json();
+}
+
+async function waitForMemoryHead(runtime, cloudHeadSeq) {
+  await runtime.waitFor(async () => {
+    const checkpoints = await runtime.querySql(
+      "SELECT last_cloud_seq FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    return checkpoints.length > 0
+      && Number(checkpoints[0].last_cloud_seq) >= Number(cloudHeadSeq);
+  }, { timeoutMs: 10_000, intervalMs: 25 });
+}
+
+function repositoryPolicy(quote, { changed = false, predecessor = null } = {}) {
+  return [
+    `For this repository, the repository-level policy ${changed ? "has changed" : "is"}:`,
+    quote,
+    ...(predecessor ? [`Previous repository-level policy to replace: ${predecessor}`] : []),
+  ].join("\n");
+}
 
 test("failed generation keeps the previous active projection and leaves raw observations unchanged", {
   timeout: 30_000,
@@ -283,6 +359,361 @@ test("one projection transaction applies all seven explicitly named policy chang
     );
     assert.deepEqual(runs.map((run) => run.status), ["completed", "completed"]);
     assert.equal(runs.some((run) => run.error_code != null), false);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("truncated support cannot authorize delayed same-source supersession, but exact predecessor can", {
+  timeout: 45_000,
+}, async () => {
+  const hosts = {
+    "support-source-a": "support-token-a",
+    "support-source-b": "support-token-b",
+  };
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "fixture",
+    memoryEnabled: true,
+    maxQueueRetries: 0,
+    bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+  });
+  try {
+    const oldPolicy = "Report output format must be JSON.";
+    const sourceA = { hostId: "support-source-a", token: hosts["support-source-a"], sessionId: "support-session-a" };
+    const sourceB = { hostId: "support-source-b", token: hosts["support-source-b"], sessionId: "support-session-b" };
+    const first = await syncInstructionBatch(runtime, {
+      ...sourceA,
+      entries: Array.from({ length: 12 }, (_, index) => ({
+        revision: index + 1,
+        content: repositoryPolicy(oldPolicy),
+      })),
+    });
+    await waitForMemoryHead(runtime, first.cloud_head_seq);
+
+    const second = await syncInstructionBatch(runtime, {
+      ...sourceA,
+      entries: Array.from({ length: 4 }, (_, index) => ({
+        revision: index + 13,
+        content: repositoryPolicy(oldPolicy),
+      })),
+    });
+    await waitForMemoryHead(runtime, second.cloud_head_seq);
+
+    let knowledge = await runtime.querySql(
+      "SELECT knowledge_id, text, status, support_incomplete FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint'",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.deepEqual(knowledge.map(({ text, status, support_incomplete }) => ({ text, status, support_incomplete })), [
+      { text: oldPolicy, status: "current", support_incomplete: 0 },
+    ]);
+    const oldId = knowledge[0].knowledge_id;
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_support WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, oldId],
+    ))[0].count, 16);
+
+    const reaffirmed = await syncInstructionBatch(runtime, {
+      ...sourceB,
+      entries: [1, 2].map((revision) => ({
+        revision,
+        content: repositoryPolicy(oldPolicy),
+      })),
+    });
+    await waitForMemoryHead(runtime, reaffirmed.cloud_head_seq);
+    knowledge = await runtime.querySql(
+      "SELECT knowledge_id, text, status, support_incomplete FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint'",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.equal(knowledge.length, 1);
+    assert.equal(knowledge[0].knowledge_id, oldId);
+    assert.equal(knowledge[0].support_incomplete, 1,
+      "new independent raw support omitted at the 16-reference limit must be recorded as incomplete");
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_support WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, oldId],
+    ))[0].count, 16, "support rows stay bounded even after additional independent support arrives");
+
+    const unbound = await syncInstructionBatch(runtime, {
+      ...sourceA,
+      entries: [{
+        revision: 17,
+        content: repositoryPolicy("Report output format must be TOML.", { changed: true }),
+      }],
+    });
+    await waitForMemoryHead(runtime, unbound.cloud_head_seq);
+    knowledge = await runtime.querySql(
+      "SELECT text, status, support_incomplete FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint' ORDER BY text",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.ok(knowledge.some((item) => item.text === oldPolicy && item.status === "current"
+      && item.support_incomplete === 1),
+    "a source-order inference over a truncated support set must not supersede current knowledge");
+    assert.ok(knowledge.some((item) => item.text === "Report output format must be TOML." && item.status === "supported"));
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_supersession WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].count, 0);
+
+    const context = await runtime.callMcp(MEMORY_TEST_CLIENT_TOKEN, "context_resolve", {
+      repository: MEMORY_TEST_REPOSITORY,
+      query: "Report output format",
+      limit: 10,
+    }, 82);
+    assert.equal(context.status, 200);
+    const contextJson = JSON.parse(context.body.result.content.find((item) => item.type === "text").text);
+    const selected = contextJson.constraints.find((item) => item.text === oldPolicy);
+    assert.equal(selected.support_incomplete, true,
+      "cloud context must disclose that some support references were omitted");
+    assert.ok(contextJson.partial.reasons.includes("knowledge_support_incomplete"));
+
+    const bound = await syncInstructionBatch(runtime, {
+      ...sourceA,
+      entries: [{
+        revision: 18,
+        content: repositoryPolicy("Report output format must be CSV.", {
+          changed: true,
+          predecessor: oldPolicy,
+        }),
+      }],
+    });
+    await waitForMemoryHead(runtime, bound.cloud_head_seq);
+    knowledge = await runtime.querySql(
+      "SELECT text, status, support_incomplete FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint' ORDER BY text",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.ok(knowledge.some((item) => item.text === oldPolicy && item.status === "superseded"));
+    assert.ok(knowledge.some((item) => item.text === "Report output format must be CSV." && item.status === "current"));
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("two hosts supporting the same quote in one worker batch block an unbound host change", {
+  timeout: 45_000,
+}, async () => {
+  const persistencePath = await fs.mkdtemp(path.join(os.tmpdir(), "temote-memory-cross-host-support-"));
+  const hosts = {
+    "cross-host-a": "cross-token-a",
+    "cross-host-b": "cross-token-b",
+  };
+  let disabled;
+  let runtime;
+  try {
+    disabled = await startMemoryRuntime({
+      resourcePersistencePath: persistencePath,
+      memoryEnabled: false,
+      bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+    });
+    const oldPolicy = "Report output format must be JSON.";
+    const first = await syncInstructionBatch(disabled, {
+      hostId: "cross-host-a", token: hosts["cross-host-a"], sessionId: "cross-session-a",
+      entries: [{ revision: 1, content: repositoryPolicy(oldPolicy) }],
+    });
+    const second = await syncInstructionBatch(disabled, {
+      hostId: "cross-host-b", token: hosts["cross-host-b"], sessionId: "cross-session-b",
+      entries: [{ revision: 1, content: repositoryPolicy(oldPolicy) }],
+    });
+    assert.equal(second.cloud_head_seq, first.cloud_head_seq + 1);
+    await disabled.dispose();
+    disabled = null;
+
+    runtime = await startMemoryRuntime({
+      resourcePersistencePath: persistencePath,
+      applyMigrations: false,
+      memoryEnabled: true,
+      memoryExtractor: "fixture",
+      bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+      maxQueueRetries: 0,
+    });
+    await runtime.enqueue({
+      owner_id: MEMORY_TEST_OWNER,
+      repository_key: MEMORY_TEST_REPOSITORY,
+      through_cloud_seq: second.cloud_head_seq,
+    });
+    await waitForMemoryHead(runtime, second.cloud_head_seq);
+
+    const old = (await runtime.querySql(
+      "SELECT knowledge_id, status, support_incomplete FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint' AND text = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, oldPolicy],
+    ))[0];
+    assert.equal(old.status, "current");
+    assert.equal(old.support_incomplete, 0);
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_support WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, old.knowledge_id],
+    ))[0].count, 2, "same-batch duplicate merge must persist both independent host supports");
+
+    const changed = await syncInstructionBatch(runtime, {
+      hostId: "cross-host-a", token: hosts["cross-host-a"], sessionId: "cross-session-a",
+      entries: [{
+        revision: 2,
+        content: repositoryPolicy("Report output format must be TOML.", { changed: true }),
+      }],
+    });
+    await waitForMemoryHead(runtime, changed.cloud_head_seq);
+    const constraints = await runtime.querySql(
+      "SELECT text, status FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint'",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.ok(constraints.some((item) => item.text === oldPolicy && item.status === "current"));
+    assert.ok(constraints.some((item) => item.text === "Report output format must be TOML." && item.status === "supported"));
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_supersession WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].count, 0);
+  } finally {
+    if (disabled) await disabled.dispose();
+    if (runtime) await runtime.dispose();
+    await fs.rm(persistencePath, { recursive: true, force: true });
+  }
+});
+
+test("same-batch reaffirmation retains earlier database provenance before evaluating a change", {
+  timeout: 45_000,
+}, async () => {
+  const persistencePath = await fs.mkdtemp(path.join(os.tmpdir(), "temote-memory-overlay-provenance-"));
+  const hosts = {
+    "overlay-source-a": "overlay-token-a",
+    "overlay-source-b": "overlay-token-b",
+  };
+  const oldPolicy = "Report output format must be JSON.";
+  let disabled;
+  let enabled;
+  try {
+    disabled = await startMemoryRuntime({
+      resourcePersistencePath: persistencePath,
+      memoryEnabled: false,
+      bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+    });
+    const first = await syncInstructionBatch(disabled, {
+      hostId: "overlay-source-a", token: hosts["overlay-source-a"], sessionId: "overlay-session-a",
+      entries: [{ revision: 1, content: repositoryPolicy(oldPolicy) }],
+    });
+    await disabled.dispose();
+    disabled = null;
+
+    enabled = await startMemoryRuntime({
+      resourcePersistencePath: persistencePath,
+      applyMigrations: false,
+      memoryEnabled: true,
+      memoryExtractor: "fixture",
+      bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+      maxQueueRetries: 0,
+    });
+    await enabled.enqueue({
+      owner_id: MEMORY_TEST_OWNER,
+      repository_key: MEMORY_TEST_REPOSITORY,
+      through_cloud_seq: first.cloud_head_seq,
+    });
+    await waitForMemoryHead(enabled, first.cloud_head_seq);
+    await enabled.dispose();
+    enabled = null;
+
+    disabled = await startMemoryRuntime({
+      resourcePersistencePath: persistencePath,
+      applyMigrations: false,
+      memoryEnabled: false,
+      bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+    });
+    await syncInstructionBatch(disabled, {
+      hostId: "overlay-source-b", token: hosts["overlay-source-b"], sessionId: "overlay-session-b",
+      entries: [{ revision: 1, content: repositoryPolicy(oldPolicy) }],
+    });
+    const queuedChange = await syncInstructionBatch(disabled, {
+      hostId: "overlay-source-a", token: hosts["overlay-source-a"], sessionId: "overlay-session-a",
+      entries: [{
+        revision: 2,
+        content: repositoryPolicy("Report output format must be TOML.", { changed: true }),
+      }],
+    });
+    await disabled.dispose();
+    disabled = null;
+
+    enabled = await startMemoryRuntime({
+      resourcePersistencePath: persistencePath,
+      applyMigrations: false,
+      memoryEnabled: true,
+      memoryExtractor: "fixture",
+      bindings: { HOST_TOKENS_JSON: JSON.stringify(hosts) },
+      maxQueueRetries: 0,
+    });
+    await enabled.enqueue({
+      owner_id: MEMORY_TEST_OWNER,
+      repository_key: MEMORY_TEST_REPOSITORY,
+      through_cloud_seq: queuedChange.cloud_head_seq,
+    });
+    await waitForMemoryHead(enabled, queuedChange.cloud_head_seq);
+
+    const constraints = await enabled.querySql(
+      "SELECT knowledge_id, text, status, support_incomplete FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint'",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.ok(constraints.some((item) => item.text === oldPolicy && item.status === "current"));
+    assert.ok(constraints.some((item) => item.text === "Report output format must be TOML." && item.status === "supported"));
+    assert.equal((await enabled.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_support WHERE owner_id = ? AND repository_key = ? AND knowledge_id = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY, constraints.find((item) => item.text === oldPolicy).knowledge_id],
+    ))[0].count, 2, "the overlay should persist the independent reaffirmation support");
+    assert.equal((await enabled.querySql(
+      "SELECT COUNT(*) AS count FROM knowledge_supersession WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].count, 0,
+    "a same-source order claim cannot ignore the earlier cross-host support retained from D1");
+  } finally {
+    if (disabled) await disabled.dispose();
+    if (enabled) await enabled.dispose();
+    await fs.rm(persistencePath, { recursive: true, force: true });
+  }
+});
+
+test("mixed Japanese and Latin policy subjects do not collide or supersede an unrelated policy", {
+  timeout: 45_000,
+}, async () => {
+  const outputPolicy = "出力APIの形式は必ずJSONにする。";
+  const internalPolicy = "内部APIの形式は必ずTOMLにする。";
+  const changedOutputPolicy = "出力APIの形式は必ずYAMLにする。";
+  assert.notEqual(
+    semanticKeyFor("constraint", outputPolicy),
+    semanticKeyFor("constraint", internalPolicy),
+    "Japanese subject words must remain part of the semantic identity when ASCII tokens are present",
+  );
+  assert.equal(
+    semanticKeyFor("constraint", outputPolicy),
+    semanticKeyFor("constraint", changedOutputPolicy),
+    "format value changes must keep the same subject key",
+  );
+
+  const runtime = await startMemoryRuntime({ memoryExtractor: "fixture", memoryEnabled: true, maxQueueRetries: 0 });
+  try {
+    const source = { hostId: MEMORY_TEST_HOST_ID, token: MEMORY_TEST_HOST_TOKEN, sessionId: "mixed-subject-session" };
+    const first = await syncInstructionBatch(runtime, {
+      ...source,
+      entries: [{ revision: 1, content: repositoryPolicy(outputPolicy) }],
+    });
+    await waitForMemoryHead(runtime, first.cloud_head_seq);
+    const second = await syncInstructionBatch(runtime, {
+      ...source,
+      entries: [{ revision: 2, content: repositoryPolicy(internalPolicy) }],
+    });
+    await waitForMemoryHead(runtime, second.cloud_head_seq);
+    const changed = await syncInstructionBatch(runtime, {
+      ...source,
+      entries: [{
+        revision: 3,
+        content: repositoryPolicy(changedOutputPolicy, { changed: true, predecessor: outputPolicy }),
+      }],
+    });
+    await waitForMemoryHead(runtime, changed.cloud_head_seq);
+
+    const constraints = await runtime.querySql(
+      "SELECT semantic_key, text, status FROM knowledge_items WHERE owner_id = ? AND repository_key = ? AND kind = 'constraint' ORDER BY text",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.ok(constraints.some((item) => item.text === outputPolicy && item.status === "superseded"));
+    assert.ok(constraints.some((item) => item.text === changedOutputPolicy && item.status === "current"));
+    assert.ok(constraints.some((item) => item.text === internalPolicy && item.status === "current"),
+      "an exact predecessor for output API policy must not supersede the unrelated internal API policy");
+    assert.equal(new Set(constraints.map((item) => item.semantic_key)).size, 2);
   } finally {
     await runtime.dispose();
   }

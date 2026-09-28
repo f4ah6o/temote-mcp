@@ -210,6 +210,55 @@ test("exact replay is idempotent while conflicting revision or observation id is
   assert.equal(database.observations.length, 1);
 });
 
+test("committed cursor stays within the replayed page when contiguous ACK exceeds compacted source range", async () => {
+  const database = new FakeD1();
+  database.state.sources.set("owner-a\n" + HOST + "\n" + SESSION, {
+    owner_id: "owner-a",
+    host_id: HOST,
+    session_id: SESSION,
+    repository_key: REPOSITORY,
+    source_base_revision: 0,
+    source_head_revision: 100,
+    acked_through_revision: 100,
+    cloud_head_seq: 100,
+    journal_degraded: 1,
+    gap_count: 68,
+    last_synced_at: "2026-09-28T00:00:00.000Z",
+  });
+  const replayedPage = body(Array.from({ length: 32 }, (_, index) => record(index + 1)), {
+    source_base_revision: 0,
+    source_head_revision: 100,
+    journal_degraded: true,
+    gap_count: 68,
+  });
+
+  let result = await sync(replayedPage, { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.json.acked_through_revision, 100,
+    "the durable contiguous ACK remains unchanged for the host");
+  assert.equal(result.json.committed_through_revision, 32,
+    "the per-request committed cursor must never claim records absent from this page");
+  assert.equal(result.json.complete, false);
+  assert.equal(database.observations.length, 32);
+
+  result = await sync(replayedPage, { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.json.acked_through_revision, 100);
+  assert.equal(result.json.committed_through_revision, 32);
+  assert.equal(database.observations.length, 32, "replaying the same bounded page is idempotent");
+
+  const empty = await sync(body([], {
+    source_base_revision: 0,
+    source_head_revision: 100,
+    journal_degraded: true,
+    gap_count: 68,
+  }), { db: database });
+  assert.equal(empty.response.status, 200);
+  assert.equal(empty.json.acked_through_revision, 100);
+  assert.equal(empty.json.committed_through_revision, 100,
+    "empty sync confirms only the source's existing contiguous ACK");
+});
+
 test("ack advances only through the committed contiguous prefix and never regresses", async () => {
   const database = new FakeD1();
   let result = await sync(body([record(1), record(3)], { source_head_revision: 3 }), { db: database });

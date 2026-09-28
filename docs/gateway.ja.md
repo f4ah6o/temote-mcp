@@ -124,7 +124,8 @@ live deployment では `fixture` extractor を有効にしないでください�
 
 Memory Worker は1 invocation につき repository group を最大1つ処理します。
 保守的に見積もった worst-case は602 D1 statement です。
-内訳は setup、claim、outbox、error の処理が最大14、active item、support count、provenance の read が各24、commit batch が最大512、commit 後の処理が最大4です。
+内訳は setup と claim が最大14、projection lookup が最大48（生成 summary を含むknowledge item最大24件について、active-row と support-detail を各1回）、supersession provenance read が最大24、commit batch が最大512、commit 後と pending outbox 回復の処理が計4（commit 後のreadが1、outbox回復が3）です。
+support-detail の read は以前の count read を置き換えるもので、合計 statement 数は増やしません。
 [Cloudflare D1 の公式上限](https://developers.cloudflare.com/d1/platform/limits/) では Workers Paid の1 invocation あたり上限は1,000 query なので、この実装上の statement 数はその範囲に収まります。
 Free の上限は50 query で worst-case batch を処理できないため、Free の worst-case qualification はしていません。
 この statement 数の qualification は、特定の account、plan、remote Worker の確認を示すものではありません。
@@ -331,6 +332,15 @@ confidence や observation の kind だけでは検証済みになりません�
 どちらの条件も満たさなければ、旧 item は `current` のまま残り、競合する新 item は `supported` として保存されます。
 Worker は最終書き込み優先で旧 policy を置き換えません。
 生成 summary は元の引用を繰り返し、summary provenance として記録するため、独立した根拠には数えません。
+
+knowledge item ごとの direct または summary support provenance は異なる参照を最大16件保存します。
+有効な support reference が上限を超えた場合、Worker は上限内の参照を保存し、sticky な `support_incomplete` flag を設定します。
+migration も、既存の support row が上限を超える item にこの flag を設定します。
+保存した参照を完全な根拠履歴として扱いません。
+`context_resolve` は該当 item に `support_incomplete` を含め、summary では `knowledge_summary_support_incomplete` を返します。
+選択された knowledge または supersession history の根拠が不完全なら `context.partial.value` を `true` にし、reason に `knowledge_support_incomplete` を加えます。
+根拠が不完全な旧 policy は、source revision の順序だけでは supersede できません。
+認証済みの同じ scope の変更指示が旧文を正確に指定すれば、その指示による supersession は可能です。
 
 既定の sync policy は instruction と error の preview を送らないため、設定済みで処理が追いついた Worker でも、active な `supported` または `current` knowledge item がなければ `ready_empty` になります。
 これは知識が空の projection を正常に作成した状態であり、`disabled`、`not_configured`、`failed`、`lagging` とは異なります。

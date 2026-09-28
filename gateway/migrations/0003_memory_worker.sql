@@ -275,6 +275,7 @@ CREATE TABLE knowledge_items (
   producer_version TEXT NOT NULL,
   produced_at TEXT NOT NULL,
   source_through_cloud_seq INTEGER NOT NULL DEFAULT 0 CHECK (source_through_cloud_seq >= 0),
+  support_incomplete INTEGER NOT NULL DEFAULT 0 CHECK (support_incomplete IN (0, 1)),
   CHECK (
     (scope_type = 'user' AND scope_id = owner_id)
     OR (scope_type = 'repository' AND scope_id = repository_key)
@@ -286,11 +287,16 @@ CREATE TABLE knowledge_items (
 INSERT INTO knowledge_items (
   knowledge_id, owner_id, repository_key, scope_type, scope_id, kind,
   semantic_key, text, status, confidence, valid_from, valid_until,
-  producer, producer_version, produced_at, source_through_cloud_seq
+  producer, producer_version, produced_at, source_through_cloud_seq, support_incomplete
 )
 SELECT knowledge_id, owner_id, repository_key, scope_type, scope_id, kind,
        semantic_key, text, status, confidence, valid_from, valid_until,
-       producer, producer_version, produced_at, source_through_cloud_seq
+       producer, producer_version, produced_at, source_through_cloud_seq,
+       CASE WHEN (SELECT COUNT(*) FROM knowledge_support_legacy AS support
+         WHERE support.owner_id = knowledge_items_legacy.owner_id
+           AND support.repository_key = knowledge_items_legacy.repository_key
+           AND support.knowledge_id = knowledge_items_legacy.knowledge_id) > 16
+         THEN 1 ELSE 0 END
 FROM knowledge_items_legacy;
 
 CREATE TABLE knowledge_support (
