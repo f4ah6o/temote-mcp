@@ -345,7 +345,40 @@ confidence や observation の kind だけでは検証済みになりません�
 - fact、observation、failure pattern、agent の主張は `supported` にとどまります。
   task の完了や agent の「tests passed」という報告は、実行状態または報告内容の根拠であり、要求された変更の正しさを検証した証拠ではありません。
 
-変更された repository policy が以前の current policy を supersede できるのは、新しい instruction が `Previous repository-level policy to replace: ...` に置き換える旧文を正確に指定した場合、または旧 policy の直接根拠がすべて同じ host と session の instruction であり、新しい変更指示がその source revision より後の場合です。
+実 model の呼び出しが成功し、response 全体の検証が終わった後、Worker は repository declaration block から正確な clause を決定的に投影します。
+最初の非空行は parser が認識する header で始まり、同じ行または次の行に直接の制約文が続く必要があります。
+たとえば `For this repository, the repository-level policy is:` と `For this repository, the repository-level policy has changed:` を認識します。
+直後に続く `Open question:` の行は任意で、その次に直結する `Previous repository-level policy to replace:` の行も任意です。
+これらは同じ block の一部です。
+引用または code fence 内の clause、4つの space または tab で始まる行、未対応の header は受理しません。
+説明文が現れると block はそこで終了し、後続の header や predecessor は無視します。
+predecessor は supersession のための入力専用 authority hint であり、knowledge claim にはなりません。
+
+たとえば Task A の declaration prefix は次のとおりです。
+
+```text
+For this repository, the repository-level policy is:
+Report output format must be JSON.
+Open question: The required report field set remains undecided.
+```
+
+Task B で制約を変更する declaration prefix は次のとおりです。
+
+```text
+For this repository, the repository-level policy has changed:
+Report output format must be TOML.
+Open question: The required report field set remains undecided.
+Previous repository-level policy to replace: Report output format must be JSON.
+```
+
+Task B に Task A の制約文を正確に指定すると supersession が可能です。
+predecessor text 自体は claim として保存しません。
+repository-level と明示された制約は `current` になり、unresolved clause は `supported` として保存され、resolver は `supported` または `current` のものを返せます。
+task 固有の記述を repository-wide policy にはしません。
+provider failure または不正な model output を決定的な投影で補うことはできず、どちらの場合も projection を commit せず checkpoint を進めません。
+追加の extractor 提案は model-derived として区別し、同じ support、scope、output の検証を通します。
+
+変更された repository policy が以前の current policy を supersede できるのは、新しい instruction が `Previous repository-level policy to replace: ...` に旧文を正確に指定した場合、または旧 policy の直接根拠がすべて同じ host と session の instruction であり、新しい変更指示がその source revision より後の場合です。
 どちらの条件も満たさなければ、旧 item は `current` のまま残り、競合する新 item は `supported` として保存されます。
 Worker は最終書き込み優先で旧 policy を置き換えません。
 生成 summary は元の引用を繰り返し、summary provenance として記録するため、独立した根拠には数えません。

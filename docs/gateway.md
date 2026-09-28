@@ -232,6 +232,27 @@ The Worker validates each support reference against an eligible observation and 
 - A directly quoted user decision can be `current` at its derived task, workspace, or execution scope.
 - Facts, observations, failure patterns, and agent statements remain `supported`. A completed task or an agent statement such as “tests passed” describes what was reported or observed; it does not verify that the requested change is correct.
 
+After a successful real extractor call and validation of its complete response, the Worker also deterministically projects exact clauses from a repository declaration block. The first nonblank line must start with a supported header, such as `For this repository, the repository-level policy is:` or `For this repository, the repository-level policy has changed:`; a direct constraint clause must follow on the same or next line. An immediately following `Open question:` line is optional, as is an immediately following `Previous repository-level policy to replace:` line. These lines belong to the same block. Quoted or fenced clauses, lines indented by four spaces or a tab, and unsupported header forms are not accepted. Any narrative line ends the block permanently; later headers or predecessor text are ignored. The predecessor is an input-only authority hint for supersession, never a knowledge claim.
+
+For example, the declaration prefix in Task A can be:
+
+```text
+For this repository, the repository-level policy is:
+Report output format must be JSON.
+Open question: The required report field set remains undecided.
+```
+
+The changed declaration prefix in Task B can be:
+
+```text
+For this repository, the repository-level policy has changed:
+Report output format must be TOML.
+Open question: The required report field set remains undecided.
+Previous repository-level policy to replace: Report output format must be JSON.
+```
+
+The exact quoted Task A policy in Task B authorizes supersession; the predecessor text itself is not stored as a claim. A repository-level constraint from this block can become `current`, while its unresolved clause is stored as `supported` and can be retrieved as `supported` or `current`. Task-specific statements do not become repository-wide policies. Provider failure or invalid model output cannot be rescued by this deterministic projection; neither case commits a projection or advances its checkpoint. Additional extractor proposals remain model-derived and go through the same support, scope, and output validation.
+
 A changed repository policy supersedes an older current policy only when the new instruction either quotes the exact predecessor with `Previous repository-level policy to replace: ...`, or comes from the same host and session at a newer source revision than every direct instruction supporting the old policy. Otherwise the Worker keeps the old item `current` and stores the conflicting item as `supported`; it does not use last-write-wins. A generated summary repeats its source quote and is marked as summary provenance, not as independent evidence.
 
 Support provenance is bounded to 16 distinct direct or summary references per knowledge item. If additional valid references cannot be persisted, the Worker retains the bounded set and sets the sticky `support_incomplete` flag; migration also marks existing items whose support rows exceed the cap. It does not present the saved references as complete. `context_resolve` includes that flag on the affected item (`knowledge_summary_support_incomplete` for its summary) and sets `partial.value` with the `knowledge_support_incomplete` reason when selected knowledge or its supersession history has incomplete support. An incomplete old policy cannot be superseded through source-revision ordering alone. An authenticated same-scope change instruction can still supersede it by naming the exact predecessor text.

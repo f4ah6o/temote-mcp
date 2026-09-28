@@ -83,11 +83,13 @@ binding was configured. This packet has not changed those remote resources.
 
 ## Candidate evidence
 
-Implementation packets are committed locally. Local code and workerd/D1
-qualification is separate from live-model synthesis and Cloudflare remote
-qualification. The live scenario has run, but it is **not qualified**; the final
-candidate HEAD and Cloudflare remote gates remain pending. Fixture and local
-integration success do not substitute for either gate.
+Candidate source head `83a533aa75d9001fa95aa9fcfbef78951123d642` is locally
+qualified, including a live-model memory-continuity run. Local code/workerd/D1
+checks, live-model synthesis, final tracked-diff review, and Cloudflare remote
+qualification are separate gates. The live scenario passed all nine assertions
+and the final documentation/issue diff received independent approval. The
+remote gate remains **NOT RUN**. Fixture success does not substitute for
+live-model qualification.
 
 ### Completed packet checks before upstream integration
 
@@ -146,8 +148,9 @@ gaps remain partial after later records synchronize.
   passed and 1 ignored, with no failures; integration test binaries also report
   no failures.
 - The earlier offline Gateway log reported 197/197. At frozen head
-  `57a75293660853b4ed88e62ed93ca903162a3b38`, the retained Node 22.23.3 CI
-  run reports 201/201 tests passing, 0 failed/skipped, exit 0 (log SHA-256
+  `57a75293660853b4ed88e62ed93ca903162a3b38`, the retained Node 22.23.3 local
+  CI-compatible run (not GitHub CI) reports 201/201 tests passing, 0
+  failed/skipped, exit 0 (log SHA-256
   `289c284893e73ee158de6224aeec28cb15ed00bbab236a6f2877b342d53c6423`). The
   da449 offline-harness review subset reported 11/11 passing. The terminal
   handshake suite at 57a7529 reports 15/15 passing, exit 0 (SHA-256
@@ -175,14 +178,35 @@ gaps remain partial after later records synchronize.
   live-scenario assertions.
 - The local D1 migration, generator, Rust, dry-run, and test evidence above
   does not establish a Cloudflare remote deployment or remote qualification.
+- At final source head `83a533aa75d9001fa95aa9fcfbef78951123d642`, the full
+  Gateway suite passed 238/238 with no failures or skips on Node 24.21.0 and
+  again on Node 22.23.3. The Node 22 run is a local CI-compatible runtime
+  check, not GitHub CI (summary SHA-256
+  `6a519bd432fc5ed8e2250e412c324bd41d8bcc0505be9405c3df6f98897079a6`, log
+  SHA-256 `8d3646023209c0c59ace898ed5a2fcc4c939e7b0803400922105516b94bc596f`).
+  The Node 24 log SHA-256 is
+  `beb3d1a786d4e36bb1e3d10c52c57e3faa9b8821f41fbea74fbe50afb4aaf9e1`.
+  Python dogfood/protocol tests passed 37/37 (log SHA-256
+  `48199581b9a4cfae1882b79f923885ce8704fda63ad490afc7a1db2fe837da54`).
+  Formatting, scenario validation (eight schemas), diff check, and deploy
+  dry-run passed; Rust code has not changed since the recorded 835-test run.
+- An independent high-effort authority review approved the Policy5 source at
+  `83a533aa75d9001fa95aa9fcfbef78951123d642`; review artifact SHA-256 is
+  `bd8dcce0b6c57c2fda8bca067cd354741a7f2a3ad01a2200ea42c570902eb21a`. It
+  matched the reviewed patch, confirmed the earlier 46 reviewed files were
+  unchanged, and passed 87 Gateway checks including actual D1 coverage plus
+  37 Python tests. This is an independent code review, not the final review of
+  the documentation diff recorded below.
 
 ### Baseline and live memory-continuity scenario
 
-Baseline run `348f3eae-9525-4c5e-a718-a02fcdb1cc7a` used scenario
-`memory-continuity` revision 1 and the fingerprint recorded above. Its outcome
-is `not_implemented`; its manifest has no extractor configuration and live
-synthesis is NOT RUN. The baseline's absent knowledge is not a passing empty
-result.
+The baseline scenario artifact has run ID
+`4b2bffbc-72e8-4c30-a50a-648a3d1defe6` and is retained under
+`dogfood/runs/memory-continuity-baseline-348f3eae-9525-4c5e-a718-a02fcdb1cc7a/`.
+It used scenario `memory-continuity` revision 1 and the fingerprint recorded
+above. Its outcome is `not_implemented`; its manifest has no extractor
+configuration and live synthesis is NOT RUN. The baseline's absent knowledge
+is not a passing empty result.
 
 Candidate runs `ae1e618f-ba5b-4645-8fe1-e75ff638dd70`,
 `d29a9fe6-287d-41c4-b25e-9bdc6421be05`, and
@@ -213,7 +237,18 @@ the 15-second absence wait. It produced no final D1 artifact, Task B, or
 offline proof; it is NOT QUALIFIED. The subsequent SIGINT/offline-proof
 harness correction passed its independent review and scoped tests.
 
-The latest live attempt is
+The live attempt `021a8200-789d-4419-b55a-bf2c5ad58f15` passed 7/9 scenario
+assertions; unresolved-context and cross-head context assertions failed. The
+subsequent sessionless-reader change fixed the cross-head path. Policy4 run
+`85e294a0-817d-4d6d-a238-e2ad06262250` passed 8/9, with only
+`task_a_unresolved_surfaced` failing. Its raw provider response was not
+retained, so this failure does not establish that the model omitted the item.
+Review found a scenario acceptance-helper bug: the helper accepted only
+`current` items, while the contract permits supported unresolved items.
+Policy5 fixed that acceptance path and tightened declaration parsing; prior
+outcomes remain historical and are not reclassified.
+
+An earlier live attempt was
 `memory-continuity-candidate-live-final-da4496b-20260928`. Its safe failure
 manifest records scenario revision 1, the same fingerprint as baseline, source
 head `da4496bcb6455d04d8ce4dbd2accebe211c57695`, and an empty working diff at
@@ -242,25 +277,113 @@ review matched all nine patch files to HEAD, retained the prior 44 reviewed
 files unchanged, and independently passed 15 Gateway tests, 35 Python tests,
 offline `npm ci` (40 packages) and fresh Miniflare/esbuild imports. A separate
 child-process probe exited in 206 ms after the driver completed despite a long
-task budget. No live trial has been run on this head; the next live run is
-pending. No raw task text, provider request/response, or secret is included here.
+task budget. At that review point no live trial had run on the head; the later
+Policy5 run below supersedes that interim status. No raw task text, provider
+request/response, or secret is included here.
 
-| Qualification gate | Interim result | Evidence |
+### Final Policy5 live candidate
+
+Candidate run `6f691adf-811c-46e1-9b1d-0a3e8ef90802` used source head
+`83a533aa75d9001fa95aa9fcfbef78951123d642`, scenario
+`memory-continuity` revision 1, fingerprint
+`d927d6f6fd369423a7516afcd7eb82662e60f28963f76b0c46c0d43139400d54`, and
+input SHA-256
+`4958baa4922c80a8165ebafcaaa6b9b3d5e2fe07ce2621ea1bc45ba489a837d7`, matching
+the baseline scenario and input. The candidate scenario artifact SHA-256 is
+`607850dfb551d3a4a087ef8da1d6b267fb72e0693c961cf28bc3bd683623b780`, the
+safe summary SHA-256 is
+`cb8da12486031f79f7092e8757eaf8495e6efa9c8f6a452071d5643195fbbcd5`, and the
+Queue replay artifact SHA-256 is
+`7dc86fefbb64147883a37ba55a768d63dffd6968d6c6e994de22b30bb0417840`.
+
+The live task used backend `codex`, model `gpt-5.6-luna`, effort `max`. The
+extractor made a real OpenCode Go `glm-5.3-flash` request at reasoning effort
+`low`, with 60,000 ms timeout, 32,768-byte input budget, 8,192-byte knowledge
+content budget, 32,768-byte response-envelope budget, three attempts, and batch
+size 16. The baseline used the same scenario/input and task selectors, but its
+extractor configuration and timing were not recorded; it had no extractor
+configuration and synthesis was NOT RUN. No comparison of extractor settings,
+runtime, or task friction is claimed.
+
+All nine live assertions passed: Task A's current repository constraint and
+supported unresolved item were surfaced with support; another head retrieved
+repository context; the context stayed within budget; the same context was available with source host A
+offline; Task B's explicit constraint change became current and superseded the
+old constraint; Queue replay added no knowledge/support/supersession/run or
+checkpoint growth; and an unrelated repository remained isolated. The harness
+used two dedicated local Temote hosts; local O1 journals ended at 114/114 and
+173/173 with `degraded=false`. The ordinary tasks contained no memory-saving
+or summarization instruction. The terminal update was recorded when ordinary
+task polling observed completion, then synchronized automatically. This does
+not add backend-autonomous polling when no client requests task state.
+
+Replay counts were dispatch 34→35, knowledge 10→10, support 31→31,
+supersession 2→2, memory runs 34→34, and checkpoint 287→287. These counts are
+from the local harness D1 replay proof. Its ephemeral D1 was disposed after
+the run, so it did not preserve cloud Worker last-success/lag or per-kind
+counts; no such values are inferred here. The Cloudflare read-only inventory
+found the existing Worker and observation D1 readable (HTTP 200), but no
+`MEMORY_ENABLED` binding, observed `MEMORY_API_KEY`, or `temote-memory` Queue.
+Read-only Cloudflare access was available and no remote mutation was made.
+Remote qualification remains **NOT RUN** because an approved rollout scope and
+dedicated remote test client/host credentials were not established.
+
+Policy5 performs the real extractor call and validates the complete response
+before deterministically projecting exact constraint and unresolved clauses
+from the initial contiguous, unquoted, unfenced owner-declaration block.
+Repository-level constraints can become `current`; owner-declared unresolved
+items are stored as `supported` and are returned by the resolver. This direct
+declaration projection does not rescue provider failure or invalid output.
+Additional model-derived proposals remain subject to support, scope, and
+schema validation. The live result qualifies the tested scenario; it does not
+claim a general model accuracy rate.
+
+| Required comparison gate | Result | Evidence |
 | --- | --- | --- |
-| issue_completion | Partial | C2–C5 implementation and local tests exist; full live scenario and final issue progress remain incomplete. |
-| memory_pipeline | Local integration passes; live blocked | Workerd/D1/Queue recovery tests pass; the latest candidate timed out waiting for Task B projection. |
-| knowledge_quality | Not qualified | Task A projection predicate passed, but public context assertions and full scenario assertions were not run. |
-| head_switch | Not qualified | Task B became ready, but Task B projection and alternate-head context assertions were not run. |
-| offline_host | Process proof passed; retrieval not run | The dedicated host absence proof passed; context retrieval/assertions while offline were not run. |
-| tenancy | Not run live | Local owner/repository isolation tests pass; the live unrelated-repository assertion was not reached. |
-| retry_recovery | Local D1 recovery tests pass; live replay not run | Commit failure, ACK loss, restart, outbox sweep, poison cap, and generation rebuild have workerd tests; Queue replay is NOT RUN in this live candidate. |
-| tests | Local checks pass; final diff-bound aggregate pending | Rust checks, Node 22.23.3 Gateway 201/201, terminal harness 15/15, Python 35/35, SQLite 10/10, D1 recovery tests, generator checks, and deploy dry-run are recorded. |
-| final_diff | Code review approved; report commit pending | The frozen-head nine-file code delta is independently approved; this evaluation update remains uncommitted and needs final-diff inclusion. |
-| cloudflare_remote | Not run | No remote migration, Queue provisioning, binding change, deployment, or remote E2E was performed. |
+| issue_completion | Pass (local C2–C5 scope) | Child issue C2–C5 and parent O3–O4 progress are updated with evidence; optional C6/R2 remains open. |
+| memory_pipeline | Pass | Workerd/D1/Queue recovery tests and live model synthesis completed; the live Queue replay was idempotent. |
+| knowledge_quality | Pass | Live assertions checked supported/current constraints, unresolved context, supersession, support, and bounded output. |
+| head_switch | Pass | A separate head resolved repository context and saw Task B's changed policy. |
+| offline_host | Pass | Repository context assertions passed after the dedicated source host was stopped. |
+| tenancy | Pass | The live unrelated-repository isolation assertion passed. |
+| retry_recovery | Pass | D1 recovery tests and live Queue replay/no-growth assertion passed. |
+| tests | Pass (local) | Rust 835 passed/1 ignored; Gateway 238/238 on Node 24 and 22; Python 37/37; scenario validation, format, diff check, dry-run, and independent review passed. |
+| final_diff | Pass | Independent final-docs review approved the frozen diff in three passes across seven aspects; artifact SHA-256 `f71fd61b989a584d931f4d2845ed6149e760aff2cfb008cba42fd610d1b21618`. |
 
-No live model qualification or Cloudflare remote qualification is claimed.
-The next candidate trial must complete Task B projection before the public
-context, supersession, Queue-replay, and tenancy assertions can be evaluated.
-Cloudflare remote qualification remains a separate NOT RUN gate. The final
-ending HEAD and complete test/review/diff evidence will be recorded after the
-next trial and final review terminate.
+The comparison gate map is the nine-key owner-local file
+`dogfood/runs/memory-20260928/memory-continuity-policy5-independent-gates.json`;
+its nine values are all `pass`. It deliberately excludes
+Cloudflare remote qualification, which has its own owner-local gate artifact.
+
+Local implementation qualification and live-model scenario qualification
+pass. After the final-diff gate passed, the dogfood comparison exited 0 with
+`qualification: qualified`. The comparison report is
+`dogfood/runs/memory-continuity-comparison-6f691adf-811c-46e1-9b1d-0a3e8ef90802.json`,
+SHA-256 `a242b51ddb93cba514b9fbf7ce579ca64606e9ec2f6f691b1d983fd7201f1e78`;
+all 18 scenario and external gate entries passed, with the same input,
+selectors, identified binaries, and an honest `not_implemented` baseline.
+Cloudflare remote qualification remains NOT RUN. No claim of reduced task
+friction or improved task success is made; the baseline had no knowledge
+implementation and did not record extractor configuration or comparable
+timing.
+
+### Cloudflare remote gate
+
+**NOT RUN.** The read-only inventory confirmed that the existing Worker and
+observation D1 were reachable, but did not show a memory enablement binding, a
+configured `MEMORY_API_KEY`, or the `temote-memory` Queue. Read-only Cloudflare
+access was available; an approved rollout scope and dedicated remote test
+client/host credentials were not established. No remote resource was changed.
+The separate gate result is retained in
+`dogfood/runs/memory-20260928/memory-continuity-policy5-cloudflare-remote-gate.json`.
+
+## Ending state
+
+The candidate source code was tested at HEAD
+`83a533aa75d9001fa95aa9fcfbef78951123d642` on branch
+`codex/20260928-memory-plane`. At report-packet preparation, the branch had no
+upstream tracking branch and `origin/main` was at
+`48596907b92b09d706181c3e6b886052e6bf8c16`. The only worktree changes then were
+the six documentation and issue files listed in the implementation review
+request; no commit was made by the documentation packet. The original checkout
+and its pre-existing change boundary were left intact.

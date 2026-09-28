@@ -191,6 +191,17 @@ for them. Run artifacts contain bounded event metadata and gate results, not
 task text, model input/output, credentials, or evidence bodies. Cloudflare
 deployment and remote E2E remain separate qualification gates.
 
+The 2026-09-28 live candidate run `6f691adf-811c-46e1-9b1d-0a3e8ef90802`
+passed all nine `memory-continuity` assertions with the real OpenCode Go
+`glm-5.3-flash` extractor at reasoning effort `low`. The worker requires the
+successful, fully validated model response before it adds deterministic
+projections of direct owner-declared constraints and unresolved items; a failed
+or invalid response cannot use that path to advance the projection. This is
+local live-model qualification, not Cloudflare deployment qualification. See
+[the dated evaluation](evaluations/memory-continuity-20260928.md) for the
+baseline, test and review evidence, prior failed trials, and the separate
+Cloudflare remote gate.
+
 ## Fabric metadata and deployment loop
 
 The delegated task scenario observes execution behavior; it does not discover

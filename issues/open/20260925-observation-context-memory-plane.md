@@ -1,6 +1,7 @@
 # O0: head-independent observation / context / memory plane
 
-Status: high-priority / O1 + O2 implemented; O3 + O4 implementation not started  
+Status: high-priority / O1–O4 locally implemented and qualified; Cloudflare remote NOT RUN
+
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260924-temote-development-harness-restructure.md`  
 Cloud extension: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
@@ -581,26 +582,36 @@ Memory Worker が未実装でも、過去の instruction と verified state を�
 Prerequisite: O1 + O2。
 Cloud shared implementation / replication / D1 / Queue contract は `issues/open/20260926-cloud-observation-knowledge-plane.md` を canonical child packet とする。
 
-- [ ] worker checkpoint
-- [ ] batch read
-- [ ] knowledge extraction schema
-- [ ] support refs required
-- [ ] dedupe / supersession
-- [ ] stale worker reporting
-- [ ] retry idempotency
-- [ ] worker failure が task state を変更しない
+- [x] worker checkpoint
+- [x] batch read
+- [x] knowledge extraction schema
+- [x] support refs required
+- [x] dedupe / supersession
+- [x] stale worker reporting
+- [x] retry idempotency
+- [x] worker failure が task state を変更しない
 
 ### O4 — Knowledge-aware resolver
 
 Prerequisite: O3。
 Temote Fabric 経由では cloud D1 projection を利用し、host offline でも last synced revision まで repository context を解決できること。
 
-- [ ] current knowledge selection
-- [ ] task-specific vs repository-wide scope policy
-- [ ] unresolved / failure pattern retrieval
-- [ ] budgeted context bundle
-- [ ] provenance included
-- [ ] stale / superseded knowledge exclusion by default
+- [x] current knowledge selection
+- [x] task-specific vs repository-wide scope policy
+- [x] unresolved / failure pattern retrieval
+- [x] budgeted context bundle
+- [x] provenance included
+- [x] stale / superseded knowledge exclusion by default
+
+2026-09-28 local qualification: the canonical child packet's Policy5 live
+`memory-continuity` run passed all nine assertions, including a different-head
+repository lookup with the source host offline, evidence-backed knowledge,
+explicit constraint supersession, Queue replay idempotency, and repository
+isolation. The real extractor ran without asking either coding task to save or
+summarize memory. Details and test/review evidence are in
+`docs/evaluations/memory-continuity-20260928.md`. Cloudflare remote
+qualification remains NOT RUN; this status does not mark the larger parent
+issue or its unrelated work complete.
 
 ## 19. Priority and dependency
 
@@ -634,13 +645,13 @@ O1/O2 を D (environment) / E (delivery) より優先する。
 - [x] 「誰/何が、どの backend に、どの instruction を出したか」を authorized scope 内で追跡できる
 - [x] caller/agent claim と Temote verified execution state を区別する
 - [x] raw observation は worker output から独立して保持される
-- [ ] derived knowledge は support refs を持ち、再生成可能
-- [ ] superseded/stale knowledge を current fact として返さない
+- [x] derived knowledge は support refs を持ち、再生成可能
+- [x] superseded/stale knowledge を current fact として返さない
 - [x] observation/worker failure が accepted backend operation の盲目的 replay を起こさない
 - [x] MCP/local/HTTP/Fabric remote frontend で semantic observation contract が変わらない
 - [x] secrets を observation metadata / ordinary output に複製しない
 - [x] raw transcript dump を通常の public surface にしない
-- [ ] worker failure 時も task execution は独立して継続できる
+- [x] worker failure 時も task execution は独立して継続できる
 
 ## 21. Principle
 
