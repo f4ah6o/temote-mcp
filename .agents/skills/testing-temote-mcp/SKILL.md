@@ -106,7 +106,10 @@ never point it at the shared repo binary or real state. Mirror
 - `handoff_required = --force || source_version != target_version`: to
   exercise non-force version-diff paths, patch the version bytes in a binary
   copy (`python3 -c` replace b"X.Y.Z" with a same-length version — verify via
-  `<copy> supervisor --capabilities`).
+  `<copy> supervisor --capabilities`). macOS only: the byte patch invalidates
+  the Mach-O code signature and the kernel SIGKILLs the patched copy — re-sign
+  it ad-hoc and verify before executing:
+  `codesign --force --sign - <copy> && codesign --verify <copy>`.
 - Supervisor PID / boot_generation: unix-socket ping — connect to
   `/tmp/tmcp-<uid>-<ns>/supervisor.sock`, send `{"command":"ping"}`, read
   `result.pid` / `result.boot_generation` (same PID + new boot_generation =
