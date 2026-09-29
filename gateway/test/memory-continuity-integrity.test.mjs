@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -926,6 +927,102 @@ test("execution_state-only batch with an empty provider extraction completes wit
       "the structured host observation remains available separately from derived knowledge");
   } finally {
     await runtime.dispose();
+  }
+});
+
+test("workerd D1 rejects parseable provider output when finish_reason is content_filter", {
+  timeout: 30_000,
+}, async () => {
+  const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const providerWorkerPath = path.join(testDirectory, `memory-filtered-provider-${randomUUID()}.mjs`);
+  let runtime;
+  try {
+    await fs.writeFile(providerWorkerPath, `
+      import production from "../src/index.js";
+      export { GatewayRegistry, GatewaySession } from "../src/routing-runtime.js";
+
+      export default {
+        ...production,
+        async queue(batch, env, ctx) {
+          const originalFetch = globalThis.fetch;
+          globalThis.fetch = async (input, init) => {
+            if (String(input) === env.MEMORY_ENDPOINT) {
+              return Response.json({ choices: [{
+                message: { role: "assistant", content: "{\\\"items\\\":[]}" },
+                finish_reason: "content_filter",
+              }] });
+            }
+            return originalFetch(input, init);
+          };
+          try {
+            return await production.queue(batch, env, ctx);
+          } finally {
+            globalThis.fetch = originalFetch;
+          }
+        },
+      };
+    `, { mode: 0o600 });
+
+    runtime = await startMemoryRuntime({
+      memoryExtractor: "openai_compatible",
+      memoryEnabled: true,
+      memoryEndpoint: "https://memory-provider.invalid/v1/chat/completions",
+      memoryModel: "filtered-response-contract-test",
+      memoryApiKey: "test-only-provider-key",
+      productionEntryPath: providerWorkerPath,
+      maxQueueRetries: 0,
+      bindings: { MEMORY_MAX_ATTEMPTS: "1" },
+    });
+    const sync = await ingestInstruction(runtime, {
+      content: [
+        "For this repository, the repository-level policy is:",
+        "Report output format must be JSON.",
+        "Open question: The required report field set remains undecided.",
+      ].join("\n"),
+      sessionId: "filtered-provider-session",
+      taskId: "filtered-provider-task",
+    });
+
+    await runtime.waitFor(async () => {
+      const runs = await runtime.querySql(
+        "SELECT status, error_code FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+        [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+      );
+      return runs.length === 1 && runs[0].status === "failed"
+        && runs[0].error_code === "provider_incomplete_response";
+    }, { timeoutMs: 10_000, intervalMs: 25 });
+
+    assert.deepEqual(await runtime.querySql(
+      "SELECT last_cloud_seq, stale, last_error_code FROM memory_checkpoints WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ), [{ last_cloud_seq: 0, stale: 1, last_error_code: "provider_incomplete_response" }]);
+    assert.deepEqual(await runtime.querySql(
+      "SELECT status, outcome, attempt_count, error_code FROM memory_runs WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ), [{ status: "failed", outcome: null, attempt_count: 1, error_code: "provider_incomplete_response" }]);
+    assert.deepEqual(await runtime.querySql(
+      "SELECT active_generation, active_producer_version FROM memory_projection_heads WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ), [{ active_generation: null, active_producer_version: null }]);
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM knowledge_items WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].n, 0, "canonical source clauses must not rescue filtered model output");
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM knowledge_support WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].n, 0);
+    assert.equal((await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM observations WHERE owner_id = ? AND repository_key = ?",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    ))[0].n, 1, "ingested source remains durable while failed extraction leaves no projection");
+    assert.equal(sync.cloud_head_seq, 1);
+  } finally {
+    try {
+      if (runtime) await runtime.dispose();
+    } finally {
+      await fs.rm(providerWorkerPath, { force: true });
+    }
   }
 });
 

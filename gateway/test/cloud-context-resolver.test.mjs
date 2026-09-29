@@ -432,6 +432,60 @@ test("repository resolution works without an online host and returns active supp
   assert.equal(result.value.partial.value, true);
 });
 
+test("repository context with no owner-scoped sources is partial and stale", async () => {
+  const db = fixtureDb({
+    sources: [
+      source({ owner: "owner-b", host: "foreign-owner-host", session: "foreign-owner-session" }),
+      source({ host: "host-b", session: "session-b", repository: REPOSITORY_B }),
+    ],
+    observations: [],
+    knowledge: [],
+    supports: [],
+    supersessions: [],
+  });
+
+  for (const repository of [REPOSITORY_A, "forge:example/repo-typo"]) {
+    for (const name of ["context_resolve", "context_status"]) {
+      const result = await resolveCloudContext(name, { repository }, env(db));
+      assert.equal(result.handled, true);
+      assert.equal(result.value.scope.repository, repository);
+      assert.equal(result.value.freshness.source_count, 0);
+      assert.equal(result.value.freshness.source_cursors.length, 0);
+      assert.equal(result.value.freshness.cloud_observation_stale, true);
+      assert.equal(result.value.freshness.partial, true);
+      if (name === "context_resolve") {
+        assert.equal(result.value.partial.value, true);
+        assert.equal(result.value.partial.reasons.includes("source_incomplete"), true);
+      } else {
+        assert.equal(result.value.partial, true);
+      }
+      assert.doesNotMatch(JSON.stringify(result.value), /foreign-owner-host|session-b/);
+    }
+  }
+});
+
+test("repository context with a healthy owner-scoped source remains fresh", async () => {
+  const base = fixtureDb().rows;
+  const db = fixtureDb({
+    sources: [source({ host: "healthy-host", session: "healthy-session", head: 0, acked: 0, cloud: 0 })],
+    observations: [],
+    knowledge: [],
+    supports: [],
+    supersessions: [],
+    checkpoints: [{ ...base.checkpoints[0], last_cloud_seq: 0, stale: 0 }],
+  });
+
+  for (const name of ["context_resolve", "context_status"]) {
+    const result = await resolveCloudContext(name, { repository: REPOSITORY_A }, env(db));
+    assert.equal(result.handled, true);
+    assert.equal(result.value.freshness.source_count, 1);
+    assert.equal(result.value.freshness.cloud_observation_stale, false);
+    assert.equal(result.value.freshness.partial, false);
+    if (name === "context_resolve") assert.equal(result.value.partial.value, false);
+    else assert.equal(result.value.partial, false);
+  }
+});
+
 test("selected knowledge reports incomplete active and historical support provenance", async () => {
   const db = fixtureDb();
   db.rows.knowledge = db.rows.knowledge.map((item) =>

@@ -415,12 +415,55 @@ The owner artifact for the historical 0fed check snapshot is
 Current-tip CI results are represented by PR81's check statuses; this
 historical evaluation does not treat the 0fed artifact as the final-tip result.
 
+### Adapter v3 validation follow-up
+
+The subsequent extractor change advances the adapter version from 2 to 3;
+prompt version 4 and policy version 5 are unchanged. A present provider
+`finish_reason` is accepted only when it is `stop`; any other present value
+fails without advancing the checkpoint. A genuinely absent field remains
+allowed. A repository with no owner-scoped replication source records is
+reported partial and stale. A recorded source with zero observation rows is
+evaluated from its cursor and gap state; a healthy zero high-water mark can be
+fresh. Worker `ready_empty` describes extraction state separately from source
+freshness.
+
+Producer-version isolation prevents completed runs under the prior adapter
+from being reused as v3 work. Deploying v3 requires a monotonic
+`MEMORY_PROJECTION_GENERATION` increase to rebuild from retained observations.
+The rebuild does not alter raw observations; the previous valid projection
+remains readable and is marked stale until the new projection is published.
+This follow-up has not had a new real-model scenario run or Cloudflare remote
+deployment. The qualified live run and comparison above remain tied to source
+head `83a533aa75d9001fa95aa9fcfbef78951123d642` and adapter v2.
+
+Local verification for the adapter-v3 follow-up working tree, based on source
+HEAD `b8173594666a1c4002126a75cde1dfd015bb5b73`, completed as follows:
+
+- `npm test` in `gateway/` passed 251/251, including new context coverage and
+  the content-filter test against workerd/D1. The focused cloud-context
+  resolver run passed 23/23, including actual workerd/D1 coverage.
+- `cargo test` passed 835 main tests, 151
+  library tests, and integration test binaries. `cargo fmt --all -- --check`,
+  `cargo clippy --all-targets -- -D warnings`, and
+  `cargo check --no-default-features --all-targets` passed.
+- `python3 -m unittest discover -t . -s dogfood -p 'test_*.py' -q`
+  passed 37/37; `python3 -m dogfood validate` validated eight scenarios;
+  `just check-generated`, `npm run deploy:dry-run` in `gateway/`, and
+  `git diff --check` passed.
+- An earlier full Gateway attempt failed on a syntax error in a new test; its
+  log was retained. The later full run completed successfully.
+
+These are local implementation checks, not an adapter-v3 live-model or
+Cloudflare remote qualification. Independent review of this follow-up diff
+was still pending at this report snapshot.
+
 ## Ending state
 
 The live-qualified feature source was HEAD
 `83a533aa75d9001fa95aa9fcfbef78951123d642`; the follow-up logging fix is commit
-`efea482ec6dda2e547bdec9bfa12a3e55f7f5752`. At this report-update snapshot,
-branch `codex/20260928-memory-plane` tracked
-`origin/codex/20260928-memory-plane` and was one commit ahead before this
-evaluation edit. The original checkout and its pre-existing change boundary
-were left intact.
+`efea482ec6dda2e547bdec9bfa12a3e55f7f5752`. At the start of this adapter-v3
+follow-up, branch `codex/20260928-memory-plane` was at HEAD
+`b8173594666a1c4002126a75cde1dfd015bb5b73` and tracked
+`origin/codex/20260928-memory-plane`. The v3 source and documentation updates
+were in the working tree for review at this report snapshot. The original
+checkout and its pre-existing change boundary were left intact.

@@ -353,7 +353,7 @@ function sourceFreshness(sourceRows, totals, filters, selectedSource, sourcesTru
     .map(normalizeSource)
     .sort((a, b) => a.host_id.localeCompare(b.host_id) || a.session_id.localeCompare(b.session_id));
   const gaps = sources.reduce((sum, source) => sum + source.gap_count, 0);
-  const incomplete = sources.some((source) => source.journal_degraded
+  const incomplete = sources.length === 0 || sources.some((source) => source.journal_degraded
     || source.gap_count > 0
     || source.source_acked_revision < source.source_head_revision);
   const latestCloudSeq = nonNegativeNumber(totals?.latest_cloud_seq);

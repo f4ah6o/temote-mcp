@@ -380,7 +380,7 @@ async function openAiCompatibleExtract(observations, config, runId) {
       throw new MemoryError("provider_invalid_response");
     }
     const choice = envelope?.choices?.[0];
-    if (choice?.finish_reason === "length") {
+    if (choice && Object.hasOwn(choice, "finish_reason") && choice.finish_reason !== "stop") {
       throw new MemoryError("provider_incomplete_response");
     }
     const content = choice?.message?.content;

@@ -17,7 +17,11 @@ const OPERATION = "550e8400-e29b-41d4-a716-446655440000";
 const STAMP = "2026-09-20T00:00:00.000Z";
 
 async function contextValue(runtime, args) {
-  const response = await runtime.callMcp(MEMORY_TEST_CLIENT_TOKEN, "context_resolve", args, 21);
+  return contextToolValue(runtime, "context_resolve", args, 21);
+}
+
+async function contextToolValue(runtime, name, args, id = 21) {
+  const response = await runtime.callMcp(MEMORY_TEST_CLIENT_TOKEN, name, args, id);
   assert.equal(response.status, 200);
   assert.equal(response.body.error, undefined);
   const text = response.body.result?.content?.find((item) => item.type === "text")?.text;
@@ -88,6 +92,43 @@ test("D1 resolver safely joins earlier execution support after task acceptance",
     assert.equal(incompleteTaskContext.constraints[0].support_incomplete, true);
     assert.equal(incompleteTaskContext.partial.value, true);
     assert.equal(incompleteTaskContext.partial.reasons.includes("knowledge_support_incomplete"), true);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("real D1 repository context marks absent owner-scoped sources partial and stale", {
+  timeout: 30_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({ memoryExtractor: "fixture", memoryEnabled: true });
+  try {
+    await runtime.executeSql(
+      "INSERT INTO observation_sources (owner_id, host_id, session_id, repository_key, source_base_revision, source_head_revision, acked_through_revision, cloud_head_seq, journal_degraded, gap_count, last_synced_at) VALUES ('other-owner', 'foreign-owner-host', 'foreign-owner-session', ?, 0, 1, 1, 1, 0, 0, ?)",
+      [MEMORY_TEST_REPOSITORY, STAMP],
+    );
+    await runtime.executeSql(
+      "INSERT INTO observation_sources (owner_id, host_id, session_id, repository_key, source_base_revision, source_head_revision, acked_through_revision, cloud_head_seq, journal_degraded, gap_count, last_synced_at) VALUES (?, 'other-repository-host', 'other-repository-session', ?, 0, 1, 1, 1, 0, 0, ?)",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY + "/other", STAMP],
+    );
+
+    for (const repository of [MEMORY_TEST_REPOSITORY, MEMORY_TEST_REPOSITORY + "-mistyped"]) {
+      for (const name of ["context_resolve", "context_status"]) {
+        const context = await contextToolValue(runtime, name, { repository }, 31);
+        assert.equal(context.scope.repository, repository);
+        assert.equal(context.freshness.source_count, 0);
+        assert.deepEqual(context.freshness.source_cursors, []);
+        assert.equal(context.freshness.latest_cloud_seq, 0);
+        assert.equal(context.freshness.cloud_observation_stale, true);
+        assert.equal(context.freshness.partial, true);
+        if (name === "context_resolve") {
+          assert.equal(context.partial.value, true);
+          assert.equal(context.partial.reasons.includes("source_incomplete"), true);
+        } else {
+          assert.equal(context.partial, true);
+        }
+        assert.doesNotMatch(JSON.stringify(context), /foreign-owner-host|other-repository-host|foreign-owner-session/);
+      }
+    }
   } finally {
     await runtime.dispose();
   }

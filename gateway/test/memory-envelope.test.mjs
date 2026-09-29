@@ -196,19 +196,48 @@ test("no-stream response fallback remains bounded and compatible", async () => {
   assert.deepEqual(result.items, []);
 });
 
-test("finish_reason length is an incomplete response, while an absent reason remains compatible", async (t) => {
+test("every present non-stop finish_reason is incomplete while stop and absent remain compatible", async (t) => {
   const config = await loadMemoryConfiguration(PROVIDER_ENV);
-  await t.test("truncated generation is rejected", async () => {
-    await errorWithFetch(config, () => new Response(JSON.stringify({
-      choices: [{ message: { content: '{"items":[]}' }, finish_reason: "length" }],
-    })), "provider_incomplete_response");
+  for (const [name, finishReason] of [
+    ["null", null],
+    ["empty string", ""],
+    ["length", "length"],
+    ["content_filter", "content_filter"],
+    ["tool_calls", "tool_calls"],
+    ["function_call", "function_call"],
+    ["unknown string", "unknown"],
+    ["number", 0],
+  ]) {
+    await t.test(`${name} finish reason is rejected despite parseable empty JSON`, async () => {
+      await errorWithFetch(config, () => new Response(JSON.stringify({
+        choices: [{ message: { content: '{"items":[]}' }, finish_reason: finishReason }],
+      })), "provider_incomplete_response");
+    });
+  }
+
+  await t.test("the successful stop finish reason is accepted", async () => {
+    const { result } = await extractWithFetch(config, () => new Response(JSON.stringify({
+      choices: [{ message: { content: '{"items":[]}' }, finish_reason: "stop" }],
+    })));
+    assert.deepEqual(result.items, []);
   });
-  await t.test("older adapters without finish_reason remain accepted", async () => {
+
+  await t.test("older adapters without a finish_reason property remain accepted", async () => {
     const { result } = await extractWithFetch(config, () => new Response(JSON.stringify({
       choices: [{ message: { content: '{"items":[]}' } }],
     })));
     assert.deepEqual(result.items, []);
   });
+});
+
+test("extractor adapter contract changes producer identity", async () => {
+  const config = await loadMemoryConfiguration(PROVIDER_ENV);
+  assert.equal(config.generation, 1);
+  assert.notEqual(
+    config.producerVersion,
+    "memory-v1-24cc4ae8f4c3126fbdb69d960f82ac7cb4bbaa00984743556200bf2f5d740795",
+    "adapter-v3 must not reuse the producer identity created by adapter-v2",
+  );
 });
 
 test("reasoning effort is optional, validated, sent only when configured, and versioned", async (t) => {
