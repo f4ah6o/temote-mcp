@@ -84,28 +84,13 @@ export function boundedInput(observations, budgetBytes) {
   const selected = [];
   const encoder = new TextEncoder();
   for (const observation of observations) {
-    const safe = toExtractorObservation(observation);
-    const base = { ...safe, content_preview: null };
-    if (encodedSize([...selected, base], encoder) > budgetBytes) break;
-
-    let preview = safe.content_preview;
-    if (typeof preview === "string") {
-      const remaining = budgetBytes - encodedSize([...selected, base], encoder);
-      preview = truncateUtf8(preview, Math.max(0, remaining - 128));
-    }
-    const item = { ...safe, content_preview: preview };
-    item.allowed_repository_clauses = permittedRepositoryClauses(item).map((clause) => ({
-      kind: clause.kind,
-      quote: clause.quote,
-      changed: clause.changed,
-      subject: clause.subject,
-      scope_type: "repository",
-      scope_id: observation.repository_key,
-    }));
-    item.repository_change_predecessors = explicitRepositoryPredecessors(item);
-    if (encodedSize([...selected, item], encoder) > budgetBytes) {
-      item.content_preview = null;
-    }
+    const item = toExtractorObservation(observation);
+    // An observation enters the batch only with its complete sanitized
+    // extraction input — preview, canonical clauses, and change predecessors.
+    // One that does not fit is deferred so the next batch (or the bounded
+    // failure contract when it never fits) sees the same full content the
+    // observation retains in storage.
+    if (encodedSize({ observations: [...selected, item] }, encoder) > budgetBytes) break;
     selected.push(item);
   }
   return { observations: selected };
@@ -171,19 +156,6 @@ function boundedEvidenceRefs(value) {
 
 function encodedSize(value, encoder) {
   return encoder.encode(JSON.stringify(value)).byteLength;
-}
-
-function truncateUtf8(value, maxBytes) {
-  if (maxBytes <= 0) return "";
-  let output = "";
-  let used = 0;
-  for (const character of value) {
-    const length = new TextEncoder().encode(character).byteLength;
-    if (used + length > maxBytes) break;
-    output += character;
-    used += length;
-  }
-  return output;
 }
 
 function fixtureExtract(observations) {
