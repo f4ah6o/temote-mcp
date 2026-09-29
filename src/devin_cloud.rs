@@ -2117,9 +2117,7 @@ async fn observe_one_cloud_task(
                 }
             }
             Some(previous) => {
-                if let Err(error) = store.release_cloud_observation_lease(&previous) {
-                    return Err(error);
-                }
+                store.release_cloud_observation_lease(&previous)?;
                 let mut leases = observer.leases.lock().await;
                 if leases.get(&record.task_id) == Some(&previous) {
                     leases.remove(&record.task_id);

@@ -732,9 +732,7 @@ mod tests {
             let mut previous: Option<Summary> = None;
             let mut model: Option<(SummaryState, Option<u8>, Vec<InteractionType>, bool)> = None;
             let mut expected_revision = 0u64;
-            let mut now = 1u64;
-
-            for _ in 0..steps {
+            for now in (1u64..).take(steps) {
                 let state = match noprop::sample_usize_in(ctx, 0..=3) {
                     0 => SummaryState::None,
                     1 => SummaryState::Pending,
@@ -794,7 +792,6 @@ mod tests {
                     "unavailable"
                 );
                 previous = Some(next);
-                now += 1;
             }
             Ok(())
         })

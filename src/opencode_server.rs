@@ -7826,7 +7826,7 @@ mod tests {
         assert_eq!(cyclic_observation.state, SummaryState::Unknown);
 
         let sessions = vec![json!({"id": "root"})];
-        let permissions = (0..=usize::from(MAX_PENDING_INTERACTIONS))
+        let permissions = (0..=MAX_PENDING_INTERACTIONS)
             .map(|index| {
                 json!({
                     "id": format!("permission-{index}"),
