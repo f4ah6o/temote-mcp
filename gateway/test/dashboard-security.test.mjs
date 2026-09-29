@@ -306,7 +306,14 @@ test("dashboard gates assets, redirects, API paths, errors, and methods before g
       assertDashboardHeaders(post);
     }
 
-    for (const path of ["/dash/api/v1/bootstrap", "/dash/unknown/path"]) {
+    const bootstrapWithoutDeployment = await worker.fetch(dashboardRequest("/dash/api/v1/bootstrap", {
+      assertion: fixture.assertion,
+    }), env);
+    assert.equal(bootstrapWithoutDeployment.status, 503);
+    assert.equal((await bootstrapWithoutDeployment.json()).error_code, "bootstrap_unavailable");
+    assertDashboardHeaders(bootstrapWithoutDeployment);
+
+    for (const path of ["/dash/unknown/path"]) {
       const notFound = await worker.fetch(dashboardRequest(path, {
         assertion: fixture.assertion,
       }), env);

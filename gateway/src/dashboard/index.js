@@ -1,4 +1,5 @@
 import { authorizeDashboard } from "../access.js";
+import { handleDashboardApi } from "./api.js";
 
 export const DASHBOARD_SECURITY_HEADERS = Object.freeze({
   "cache-control": "no-store",
@@ -80,6 +81,10 @@ export async function handleDashboardRequest(request, env) {
         status: 308,
         headers: { location: "/dash/" },
       }));
+    }
+
+    if (url.pathname === "/dash/api" || url.pathname.startsWith("/dash/api/")) {
+      return dashboardResponse(await handleDashboardApi(request, env));
     }
 
     const assetPath = STATIC_ASSETS.get(url.pathname);
