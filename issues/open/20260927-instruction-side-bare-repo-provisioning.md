@@ -110,6 +110,7 @@ The normal caller surface is the session-first composition defined by `20260929-
 
 ```text
 session_start(
+  operation_id = "<caller-generated-uuid>",   # required retry key (parent §5.3)
   source = {
     kind = "repository",
     repository = "github.com/f4ah6o/example",
@@ -118,6 +119,8 @@ session_start(
   vcs = "auto"
 )
 ```
+
+The composed operation follows the parent document's retry/idempotency contract (§5.3): the caller generates `operation_id` before the first send and reuses the same value on timeout / lost response / transport retry; a durable Accepted receipt is established before the first session-owned provisioning side effect; same key + same normalized request fingerprint replays or reconciles; same key + a different request fails closed as `operation_conflict`. The internal `ensure_repository` step participates in that operation's receipt rather than defining a separate idempotency scope.
 
 No branch or physical workspace path is required from the caller for the Jujutsu normal path. The store adapter returns repository/freshness/base evidence to the session provisioning flow; workspace allocation is a later step owned by Temote.
 
@@ -186,7 +189,7 @@ It should not duplicate or replace the existing F1/V2 contracts.
 ### P1 — session provisioning integration
 
 - [ ] call repository preparation from the session-first provisioning operation
-- [ ] make the operation idempotent
+- [ ] make the operation idempotent under the parent contract: caller-supplied `operation_id`, durable Accepted receipt before the first session-owned side effect, fingerprint replay / `operation_conflict` / `reconciliation_required` semantics
 - [ ] provide actionable errors for missing root/config/auth/repository conflicts
 - [ ] ensure callers do not need host-local absolute paths
 
