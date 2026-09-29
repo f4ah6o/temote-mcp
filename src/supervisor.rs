@@ -1,17 +1,41 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "network")]
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+#[cfg(feature = "network")]
+use tokio::sync::watch;
+#[cfg(feature = "network")]
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
+#[cfg(feature = "network")]
+type CloudPendingObserver = crate::devin_cloud::CloudPendingObserver;
+
+#[cfg(not(feature = "network"))]
+struct CloudPendingObserver;
+
+impl CloudPendingObserver {
+    #[cfg(not(feature = "network"))]
+    fn new() -> Self {
+        Self
+    }
+
+    #[cfg(not(feature = "network"))]
+    async fn release_session(&self, _session: &config::Session) -> Result<()> {
+        Ok(())
+    }
+}
+
 use temote_mcp::activity::broker::{ActivityBroker, BrokerError};
 use temote_mcp::activity::contract::{
     ActivityErrorKind, ActivityOperation, ActivitySummary, ActivityUpdate,
@@ -322,9 +346,69 @@ pub struct SessionSupervisor {
     upgrade_fenced: AtomicBool,
     max_sessions: usize,
     activity_broker: Arc<ActivityBroker>,
+    cloud_pending_observer: CloudPendingObserver,
+    #[cfg(feature = "network")]
+    cloud_observer_shutdown: watch::Sender<bool>,
+    #[cfg(feature = "network")]
+    cloud_observer_task: StdMutex<Option<JoinHandle<()>>>,
+}
+
+#[cfg(feature = "network")]
+async fn run_cloud_pending_observer(
+    supervisor: std::sync::Weak<SessionSupervisor>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(
+        crate::pending_interaction::REFRESH_INTERVAL_SECS,
+    ));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+        let Some(supervisor) = supervisor.upgrade() else {
+            return;
+        };
+        if supervisor.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let sessions = {
+            let handles = supervisor.sessions.lock().await;
+            handles
+                .values()
+                .map(RuntimeHandle::session_metadata)
+                .collect::<Vec<_>>()
+        };
+        let observer = supervisor.cloud_pending_observer.clone();
+        drop(supervisor);
+
+        let mut jobs = JoinSet::new();
+        for session in sessions {
+            let observer = observer.clone();
+            jobs.spawn(async move {
+                let _ = observer.observe_session_tasks(&session).await;
+            });
+        }
+        while jobs.join_next().await.is_some() {}
+    }
 }
 
 impl SessionSupervisor {
+    #[cfg(feature = "network")]
+    async fn stop_cloud_pending_observer(&self) {
+        let _ = self.cloud_observer_shutdown.send(true);
+        let task = self.cloud_observer_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     pub fn new(roots: NamedRoots) -> (Arc<Self>, ApprovalReceiver) {
         Self::with_limit(roots, MAX_MANAGED_SESSIONS)
     }
@@ -332,21 +416,32 @@ impl SessionSupervisor {
     fn with_limit(roots: NamedRoots, max_sessions: usize) -> (Arc<Self>, ApprovalReceiver) {
         let (approval_sender, approval_receiver) = approvals::approval_channel();
         let activity_broker = Arc::new(ActivityBroker::new(activity_now_ms, Uuid::new_v4()));
-        (
-            Arc::new(Self {
-                roots,
-                approval_sender,
-                sessions: Mutex::new(HashMap::new()),
-                restart_specs: Mutex::new(HashMap::new()),
-                public_sessions: Mutex::new(HashSet::new()),
-                transitions: Mutex::new(()),
-                closed: AtomicBool::new(false),
-                upgrade_fenced: AtomicBool::new(false),
-                max_sessions,
-                activity_broker,
-            }),
-            approval_receiver,
-        )
+        #[cfg(feature = "network")]
+        let (cloud_observer_shutdown, shutdown_receiver) = watch::channel(false);
+        let supervisor = Arc::new(Self {
+            roots,
+            approval_sender,
+            sessions: Mutex::new(HashMap::new()),
+            restart_specs: Mutex::new(HashMap::new()),
+            public_sessions: Mutex::new(HashSet::new()),
+            transitions: Mutex::new(()),
+            closed: AtomicBool::new(false),
+            upgrade_fenced: AtomicBool::new(false),
+            max_sessions,
+            activity_broker,
+            cloud_pending_observer: CloudPendingObserver::new(),
+            #[cfg(feature = "network")]
+            cloud_observer_shutdown,
+            #[cfg(feature = "network")]
+            cloud_observer_task: StdMutex::new(None),
+        });
+        #[cfg(feature = "network")]
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&supervisor);
+            let task = runtime.spawn(run_cloud_pending_observer(weak, shutdown_receiver));
+            *supervisor.cloud_observer_task.lock().unwrap() = Some(task);
+        }
+        (supervisor, approval_receiver)
     }
 
     pub fn roots_configured(&self) -> bool {
@@ -1156,6 +1251,9 @@ impl SessionSupervisor {
             if self.restart_specs.lock().await.remove(session_id).is_some() {
                 self.public_sessions.lock().await.remove(session_id);
                 let session = config::read_session_metadata(session_id).await?;
+                self.cloud_pending_observer
+                    .release_session(&session)
+                    .await?;
                 let cleanup_result = remove_agent_sessions(&session).await;
                 if let Some(mut lifecycle) = config::read_session_lifecycle(session_id).await? {
                     lifecycle.status = config::LifecycleStatus::Stopped;
@@ -1173,9 +1271,15 @@ impl SessionSupervisor {
         self.restart_specs.lock().await.remove(session_id);
         self.public_sessions.lock().await.remove(session_id);
         let session = handle.session_metadata();
+        let observer_release_before = self.cloud_pending_observer.release_session(&session).await;
         let shutdown_result = handle.shutdown().await;
+        let observer_release_after = self.cloud_pending_observer.release_session(&session).await;
         let cleanup_result = remove_agent_sessions(&session).await;
         shutdown_result.with_context(|| format!("failed to stop session {session_id}"))?;
+        observer_release_before
+            .with_context(|| format!("failed to release pending observer for {session_id}"))?;
+        observer_release_after
+            .with_context(|| format!("failed to release pending observer for {session_id}"))?;
         cleanup_result
     }
 
@@ -1454,10 +1558,26 @@ impl SessionSupervisor {
                     .expect("session handle disappeared after it was inspected")
             };
             let session = handle.session_metadata();
+            let observer_release_before =
+                self.cloud_pending_observer.release_session(&session).await;
             let shutdown_result = handle.shutdown().await;
+            let observer_release_after =
+                self.cloud_pending_observer.release_session(&session).await;
             let cleanup_result = remove_agent_sessions(&session).await;
             shutdown_result
                 .with_context(|| format!("failed to drain session {}", planned.session_id))?;
+            observer_release_before.with_context(|| {
+                format!(
+                    "failed to release pending observer for {}",
+                    planned.session_id
+                )
+            })?;
+            observer_release_after.with_context(|| {
+                format!(
+                    "failed to release pending observer for {}",
+                    planned.session_id
+                )
+            })?;
             cleanup_result
                 .with_context(|| format!("failed to clean up session {}", planned.session_id))?;
         }
@@ -1535,15 +1655,39 @@ impl SessionSupervisor {
                 sessions.remove(&id)
             };
             let session = handle.as_ref().map(RuntimeHandle::session_metadata);
+            let observer_release_before = if let Some(session) = session.as_ref() {
+                self.cloud_pending_observer.release_session(session).await
+            } else {
+                Ok(())
+            };
             let shutdown_result = match handle {
                 Some(handle) => handle.shutdown().await,
                 None => Ok(()),
+            };
+            let observer_release = if let Some(session) = session.as_ref() {
+                self.cloud_pending_observer.release_session(session).await
+            } else {
+                Ok(())
             };
             if let Err(error) = shutdown_result
                 && first_error.is_none()
             {
                 first_error =
                     Some(error.context(format!("failed to stop partially restored session {id}")));
+            }
+            if let Err(error) = observer_release
+                && first_error.is_none()
+            {
+                first_error = Some(error.context(format!(
+                    "failed to release pending observer for session {id}"
+                )));
+            }
+            if let Err(error) = observer_release_before
+                && first_error.is_none()
+            {
+                first_error = Some(error.context(format!(
+                    "failed to release pending observer for session {id}"
+                )));
             }
             let cleanup_result = match session {
                 Some(session) => remove_agent_sessions(&session).await,
@@ -1722,6 +1866,7 @@ impl SessionSupervisor {
                 let session = handle.session_metadata();
                 let session_instance = handle.activity_session_instance();
                 let wait_result = handle.wait().await;
+                let _ = self.cloud_pending_observer.release_session(&session).await;
                 if wait_result.is_err() {
                     let crash = self.crash_activity_scope(id.clone(), session_instance);
                     let _ = crash.fail_with_summary(ActivitySummary::failure(
@@ -1777,6 +1922,8 @@ impl SessionSupervisor {
     pub async fn shutdown(&self) -> Result<()> {
         let _transition = self.transitions.lock().await;
         self.closed.store(true, Ordering::Release);
+        #[cfg(feature = "network")]
+        self.stop_cloud_pending_observer().await;
         let handles = {
             let mut sessions = self.sessions.lock().await;
             for handle in sessions.values() {
@@ -1792,7 +1939,21 @@ impl SessionSupervisor {
         let mut first_error = None;
         for (_, handle) in handles {
             let session = handle.session_metadata();
+            let observer_release_before =
+                self.cloud_pending_observer.release_session(&session).await;
             if let Err(error) = handle.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            let observer_release_after =
+                self.cloud_pending_observer.release_session(&session).await;
+            if let Err(error) = observer_release_before
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if let Err(error) = observer_release_after
                 && first_error.is_none()
             {
                 first_error = Some(error);

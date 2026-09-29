@@ -26,7 +26,10 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::{config, evidence};
+use crate::{
+    config, evidence,
+    pending_interaction::{self, InteractionType, ProducerKind, Summary, SummaryState},
+};
 
 const TASK_SCHEMA_VERSION: u64 = 1;
 const TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
@@ -39,6 +42,8 @@ const MAX_TASK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_INTERACTION_ANSWER_BYTES: usize = 16 * 1024;
 const MAX_INTERACTION_VIEW_BYTES: usize = 16 * 1024;
 const MAX_PENDING_INTERACTIONS: usize = 64;
+const MAX_PENDING_INTERACTION_SOURCE_ITEMS: usize = 4096;
+const MAX_OPENCODE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024;
 const MAX_RAW_RESULT_BYTES: usize = 16 * 1024;
@@ -464,6 +469,8 @@ struct TaskRecord {
     raw_result: Option<String>,
     #[serde(default)]
     raw_result_truncated: bool,
+    #[serde(default)]
+    pending_interaction_summary: Option<pending_interaction::PendingInteractionSummary>,
     created_at: u64,
     updated_at: u64,
     operations: Vec<OperationReceipt>,
@@ -713,6 +720,74 @@ impl TaskStore {
         Ok(record)
     }
 
+    fn pending_interaction_observation_context(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        runtime_instance_id: Uuid,
+    ) -> Result<Option<(String, u64)>> {
+        let _guard = self.lock()?;
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(None);
+        }
+        let record = self.load_locked(session, task_id)?;
+        if record.status.is_terminal()
+            || config::unix_time().saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+        {
+            return Ok(None);
+        }
+        let Some(opencode_session_id) = record.opencode_session_id else {
+            return Ok(None);
+        };
+        Ok(Some((opencode_session_id, record.generation)))
+    }
+
+    fn update_pending_interaction_summary(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        runtime_instance_id: Uuid,
+        opencode_session_id: &str,
+        producer_epoch: u64,
+        observation: &PendingInteractionObservation,
+    ) -> Result<bool> {
+        let _guard = self.lock()?;
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(false);
+        }
+        let mut record = self.load_locked(session, task_id)?;
+        if record.status.is_terminal()
+            || config::unix_time().saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+            || record.generation != producer_epoch
+            || record.opencode_session_id.as_deref() != Some(opencode_session_id)
+        {
+            return Ok(false);
+        }
+        let summary = if observation.preserve_observed_at {
+            Summary::unavailable(
+                record.pending_interaction_summary.as_ref(),
+                ProducerKind::RuntimeOwner,
+                producer_epoch,
+            )?
+        } else {
+            Summary::observe(
+                record.pending_interaction_summary.as_ref(),
+                observation.state,
+                observation.count,
+                &observation.types,
+                observation.truncated,
+                ProducerKind::RuntimeOwner,
+                producer_epoch,
+                config::unix_time(),
+            )?
+        };
+        record.pending_interaction_summary = Some(summary);
+        // This locked read-modify-write changes only the summary field. It
+        // leaves task retention, status, revision, binding, and receipts intact.
+        self.save_metadata_locked(&record)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     fn save(&self, record: &TaskRecord) -> Result<()> {
         let _guard = self.lock()?;
@@ -723,6 +798,16 @@ impl TaskStore {
         self.ensure_directory()?;
         validate_record(record)?;
         self.prune_locked(record)?;
+        self.write_record_locked(record)
+    }
+
+    fn save_metadata_locked(&self, record: &TaskRecord) -> Result<()> {
+        self.ensure_directory()?;
+        validate_record(record)?;
+        self.write_record_locked(record)
+    }
+
+    fn write_record_locked(&self, record: &TaskRecord) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(record)?;
         anyhow::ensure!(
             bytes.len() <= MAX_TASK_RECORD_BYTES,
@@ -1412,6 +1497,9 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             "OpenCode task raw result exceeds {MAX_RAW_RESULT_BYTES} bytes"
         );
     }
+    if let Some(summary) = &record.pending_interaction_summary {
+        summary.validate()?;
+    }
     anyhow::ensure!(
         record.revision > 0,
         "OpenCode task revision must be positive"
@@ -1684,6 +1772,399 @@ fn pending_interaction_views(interactions: &[PendingInteraction]) -> Vec<Value> 
         .collect()
 }
 
+#[derive(Clone, Debug)]
+struct PendingInteractionObservation {
+    state: SummaryState,
+    count: Option<u8>,
+    types: Vec<InteractionType>,
+    truncated: bool,
+    preserve_observed_at: bool,
+}
+
+impl PendingInteractionObservation {
+    fn unavailable() -> Self {
+        Self {
+            state: SummaryState::Unavailable,
+            count: None,
+            types: Vec::new(),
+            truncated: false,
+            preserve_observed_at: true,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            state: SummaryState::Unknown,
+            count: None,
+            types: Vec::new(),
+            truncated: false,
+            preserve_observed_at: false,
+        }
+    }
+}
+
+fn complete_descendant_session_ids(
+    root_session_id: &str,
+    sessions: &[Value],
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    anyhow::ensure!(
+        sessions.len() <= MAX_PENDING_INTERACTION_SOURCE_ITEMS,
+        "OpenCode session listing exceeds the scoped-read item limit"
+    );
+    let mut parents = BTreeMap::new();
+    for session in sessions {
+        let id = session_id(session)
+            .filter(|id| !id.is_empty())
+            .context("OpenCode session listing contains a session without an ID")?;
+        let parent = ["parentID", "parent_id", "parentId"]
+            .iter()
+            .find_map(|key| session.get(*key))
+            .map(|parent| match parent {
+                Value::Null => Ok(None),
+                Value::String(parent) if !parent.is_empty() => Ok(Some(parent.as_str())),
+                _ => anyhow::bail!("OpenCode session listing contains an invalid parent ID"),
+            })
+            .transpose()?
+            .flatten()
+            .map(str::to_owned);
+        anyhow::ensure!(
+            parents.insert(id.to_owned(), parent).is_none(),
+            "OpenCode session listing contains a duplicate session ID"
+        );
+    }
+
+    anyhow::ensure!(
+        parents.contains_key(root_session_id),
+        "OpenCode session listing does not contain the task session"
+    );
+    for parent in parents.values().flatten() {
+        anyhow::ensure!(
+            parents.contains_key(parent),
+            "OpenCode session listing has an incomplete descendant chain"
+        );
+    }
+
+    let mut acyclic = BTreeSet::new();
+    for session_id in parents.keys() {
+        let mut path = BTreeSet::new();
+        let mut chain = Vec::new();
+        let mut current = Some(session_id.as_str());
+        while let Some(session_id) = current {
+            if acyclic.contains(session_id) {
+                break;
+            }
+            anyhow::ensure!(
+                path.insert(session_id.to_owned()),
+                "OpenCode session listing contains a parent cycle"
+            );
+            chain.push(session_id.to_owned());
+            current = parents.get(session_id).and_then(|parent| parent.as_deref());
+        }
+        acyclic.extend(chain);
+    }
+
+    let all_session_ids = parents.keys().cloned().collect::<BTreeSet<_>>();
+    let mut descendants = BTreeSet::from([root_session_id.to_owned()]);
+    loop {
+        let before = descendants.len();
+        for (id, parent) in &parents {
+            if parent
+                .as_ref()
+                .is_some_and(|parent| descendants.contains(parent))
+            {
+                descendants.insert(id.clone());
+            }
+        }
+        if descendants.len() == before {
+            break;
+        }
+    }
+    Ok((all_session_ids, descendants))
+}
+
+fn pending_interaction_observation_from(
+    root_session_id: &str,
+    sessions: &[Value],
+    permissions: &[Value],
+    questions: &[Value],
+) -> Result<PendingInteractionObservation> {
+    anyhow::ensure!(
+        permissions.len() <= MAX_PENDING_INTERACTION_SOURCE_ITEMS
+            && questions.len() <= MAX_PENDING_INTERACTION_SOURCE_ITEMS,
+        "OpenCode interaction listing exceeds the scoped-read item limit"
+    );
+    let (all_session_ids, descendants) =
+        complete_descendant_session_ids(root_session_id, sessions)?;
+    let mut count = 0usize;
+    let mut types = BTreeSet::new();
+    for (kind, requests) in [
+        (InteractionType::Permission, permissions),
+        (InteractionType::Question, questions),
+    ] {
+        for request in requests {
+            let request_session_id = interaction_session_id(request)
+                .filter(|id| !id.is_empty())
+                .context("OpenCode interaction listing contains a request without a session ID")?;
+            interaction_request_id(request)
+                .filter(|id| !id.is_empty())
+                .context("OpenCode interaction listing contains a request without an ID")?;
+            anyhow::ensure!(
+                all_session_ids.contains(request_session_id),
+                "OpenCode interaction listing references an unknown session"
+            );
+            if descendants.contains(request_session_id) {
+                count = count.saturating_add(1);
+                types.insert(kind);
+            }
+        }
+    }
+
+    let truncated = count > usize::from(pending_interaction::MAX_COUNT);
+    let bounded_count = count.min(usize::from(pending_interaction::MAX_COUNT)) as u8;
+    Ok(PendingInteractionObservation {
+        state: if truncated {
+            SummaryState::Unavailable
+        } else if count == 0 {
+            SummaryState::None
+        } else {
+            SummaryState::Pending
+        },
+        count: Some(bounded_count),
+        types: types.into_iter().collect(),
+        truncated,
+        preserve_observed_at: false,
+    })
+}
+
+fn complete_bounded_list_items<'a>(data: &'a Value, endpoint: &str) -> Result<&'a [Value]> {
+    let items = data
+        .as_array()
+        .or_else(|| data.get("items").and_then(Value::as_array))
+        .or_else(|| data.get("data").and_then(Value::as_array))
+        .with_context(|| format!("opencode {endpoint} list response is not an array"))?;
+    anyhow::ensure!(
+        items.len() <= MAX_PENDING_INTERACTION_SOURCE_ITEMS,
+        "opencode {endpoint} list response exceeds the scoped-read item limit"
+    );
+    let Some(object) = data.as_object() else {
+        return Ok(items);
+    };
+    let containers = [
+        Some(data),
+        object.get("pagination"),
+        object.get("cursor"),
+        object.get("pageInfo"),
+        object.get("page_info"),
+        object.get("meta"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let has_more = containers.iter().any(|value| {
+        ["hasMore", "has_more", "more", "truncated", "isTruncated"]
+            .iter()
+            .any(|key| value.get(*key).and_then(Value::as_bool) == Some(true))
+    });
+    let next_page_keys = [
+        "next",
+        "nextCursor",
+        "next_cursor",
+        "nextPage",
+        "next_page",
+        "nextPageToken",
+        "next_page_token",
+    ];
+    let has_next_page = containers.iter().any(|value| {
+        next_page_keys.iter().any(|key| match value.get(*key) {
+            None | Some(Value::Null) => false,
+            Some(Value::String(value)) => !value.is_empty(),
+            Some(Value::Bool(value)) => *value,
+            Some(_) => true,
+        })
+    });
+    let total_exceeds_page = containers.iter().any(|value| {
+        ["total", "totalCount", "total_count"]
+            .iter()
+            .filter_map(|key| value.get(*key).and_then(Value::as_u64))
+            .any(|total| total > items.len() as u64)
+    });
+    anyhow::ensure!(
+        !has_more && !has_next_page && !total_exceeds_page,
+        "opencode {endpoint} list response is incomplete"
+    );
+    Ok(items)
+}
+
+fn session_list_items(data: &Value) -> Result<Vec<Value>> {
+    Ok(complete_bounded_list_items(data, "session")?.to_vec())
+}
+
+fn pending_interaction_items(data: &Value, endpoint: &str) -> Result<Vec<Value>> {
+    Ok(complete_bounded_list_items(data, endpoint)?.to_vec())
+}
+
+async fn pending_interaction_endpoint<T>(
+    name: &str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(
+        Duration::from_secs(pending_interaction::SCOPED_READ_TIMEOUT_SECS),
+        future,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("OpenCode {name} timed out"),
+    }
+}
+
+async fn read_opencode_pending_interaction_summary(
+    client: &ServeClient,
+    root_session_id: &str,
+    session: &config::Session,
+    task_id: Uuid,
+    runtime_instance_id: Uuid,
+) -> Option<PendingInteractionObservation> {
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return None;
+    }
+    let sessions = match pending_interaction_endpoint("session_list", client.session_list()).await {
+        Ok(sessions) => sessions,
+        Err(_) => return Some(PendingInteractionObservation::unavailable()),
+    };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return None;
+    }
+    if complete_descendant_session_ids(root_session_id, &sessions).is_err() {
+        return Some(PendingInteractionObservation::unknown());
+    }
+
+    let permissions =
+        match pending_interaction_endpoint("permission_list", client.permission_list()).await {
+            Ok(permissions) => permissions,
+            Err(_) => return Some(PendingInteractionObservation::unavailable()),
+        };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return None;
+    }
+    let questions =
+        match pending_interaction_endpoint("question_list", client.question_list()).await {
+            Ok(questions) => questions,
+            Err(_) => return Some(PendingInteractionObservation::unavailable()),
+        };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return None;
+    }
+    Some(
+        pending_interaction_observation_from(root_session_id, &sessions, &permissions, &questions)
+            .unwrap_or_else(|_| PendingInteractionObservation::unknown()),
+    )
+}
+
+async fn observe_opencode_pending_interaction_once(
+    session: &config::Session,
+    task_id: Uuid,
+    store: &TaskStore,
+    client: &ServeClient,
+    runtime_instance_id: Uuid,
+) -> bool {
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return false;
+    }
+    let (opencode_session_id, producer_epoch) = match store.pending_interaction_observation_context(
+        session,
+        task_id,
+        runtime_instance_id,
+    ) {
+        Ok(Some(context)) => context,
+        Ok(None) => return false,
+        Err(_) => return runtime_registration_matches(session, task_id, runtime_instance_id),
+    };
+    // generation zero means the task runtime is connected before its first
+    // admitted turn has established a producer epoch. Keep the observer
+    // registered, but do not read or persist against an invalid epoch.
+    if producer_epoch == 0 {
+        return true;
+    }
+    let acquire_permit = pending_interaction::acquire_host_semaphore_permit();
+    tokio::pin!(acquire_permit);
+    let wait_started = Instant::now();
+    let permit = loop {
+        tokio::select! {
+            result = &mut acquire_permit => match result {
+                Ok(permit) => break permit,
+                Err(_) => return runtime_registration_matches(session, task_id, runtime_instance_id),
+            },
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+                    return false;
+                }
+                if wait_started.elapsed()
+                    >= Duration::from_secs(pending_interaction::REFRESH_INTERVAL_SECS)
+                {
+                    // Drop the queued acquisition future and retry on the next
+                    // observer interval. A lost runtime cannot leave a waiter
+                    // parked indefinitely behind the host-wide gate.
+                    return true;
+                }
+            }
+        }
+    };
+    let observation = read_opencode_pending_interaction_summary(
+        client,
+        &opencode_session_id,
+        session,
+        task_id,
+        runtime_instance_id,
+    )
+    .await;
+    drop(permit);
+    let Some(observation) = observation else {
+        return false;
+    };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return false;
+    }
+    match store.update_pending_interaction_summary(
+        session,
+        task_id,
+        runtime_instance_id,
+        &opencode_session_id,
+        producer_epoch,
+        &observation,
+    ) {
+        Ok(_) => true,
+        Err(_) => runtime_registration_matches(session, task_id, runtime_instance_id),
+    }
+}
+
+async fn observe_opencode_pending_interactions(
+    session: config::Session,
+    task_id: Uuid,
+    store: TaskStore,
+    client: ServeClient,
+    runtime_instance_id: Uuid,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(
+        pending_interaction::REFRESH_INTERVAL_SECS,
+    ));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !observe_opencode_pending_interaction_once(
+            &session,
+            task_id,
+            &store,
+            &client,
+            runtime_instance_id,
+        )
+        .await
+        {
+            break;
+        }
+    }
+}
+
 fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
     json!({
         "task_id": task_id,
@@ -1816,6 +2297,10 @@ impl Clone for ServeClient {
 
 struct SdkServe {
     client: unofficial_opencode_sdk::Client,
+    bounded_http: reqwest::Client,
+    base_url: String,
+    password: String,
+    directory: String,
     child: tokio::sync::Mutex<tokio::process::Child>,
     tail: Arc<Mutex<String>>,
 }
@@ -1863,10 +2348,24 @@ fn v2_request(
         .basic_auth("opencode", Some(password))
 }
 
+fn build_opencode_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        // Runtime-scoped reads must stay on the owned local serve endpoint.
+        // A redirect could otherwise send credentials or scoped reads to an
+        // unrelated destination.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("cannot build OpenCode HTTP client")
+}
+
 /// Send one bounded V2 request and decode the body as JSON. A bare 200 is not
 /// proof an `api/*` route exists: OpenCode 1.x answers unmatched paths with an
 /// HTML shell page, so the body must parse as JSON to count.
 async fn v2_send(request: reqwest::RequestBuilder, path: &str) -> Result<Value> {
+    bounded_json_request(request, path).await
+}
+
+async fn bounded_json_request(request: reqwest::RequestBuilder, path: &str) -> Result<Value> {
     let response = match tokio::time::timeout(SERVE_REQUEST_TIMEOUT, request.send()).await {
         Ok(result) => result.context("opencode serve request failed")?,
         Err(_) => anyhow::bail!(
@@ -1875,17 +2374,49 @@ async fn v2_send(request: reqwest::RequestBuilder, path: &str) -> Result<Value> 
         ),
     };
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    if status.is_redirection() {
+        // Do not read or include a redirect response body: it may contain
+        // server-controlled content, and redirects are never followed by the
+        // runtime-scoped client.
+        anyhow::bail!("OpenCode API returned HTTP {status}");
+    }
+    let declared_length = response.content_length();
+    anyhow::ensure!(
+        declared_length.is_none_or(|length| length <= MAX_OPENCODE_RESPONSE_BYTES as u64),
+        "OpenCode {path} response exceeds {MAX_OPENCODE_RESPONSE_BYTES} bytes"
+    );
+    let body = tokio::time::timeout(SERVE_REQUEST_TIMEOUT, async move {
+        let mut response = response;
+        let capacity = declared_length
+            .unwrap_or_default()
+            .min(MAX_OPENCODE_RESPONSE_BYTES as u64) as usize;
+        let mut body = Vec::with_capacity(capacity);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("cannot read opencode serve response body")?
+        {
+            anyhow::ensure!(
+                chunk.len() <= MAX_OPENCODE_RESPONSE_BYTES.saturating_sub(body.len()),
+                "OpenCode {path} response exceeds {MAX_OPENCODE_RESPONSE_BYTES} bytes"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok::<_, anyhow::Error>(body)
+    })
+    .await
+    .context("opencode serve response body timed out")??;
     if !status.is_success() {
+        let body = String::from_utf8_lossy(&body);
         anyhow::bail!(
             "OpenCode API returned HTTP {status}: {}",
             truncate_tail(&body)
         );
     }
-    if body.trim().is_empty() {
+    if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(json!({}));
     }
-    serde_json::from_str(&body)
+    serde_json::from_slice(&body)
         .with_context(|| format!("opencode serve {path} returned a non-JSON response"))
 }
 
@@ -1897,6 +2428,41 @@ async fn v2_get_json(
 ) -> Result<Value> {
     v2_send(
         v2_request(client, base_url, password, reqwest::Method::GET, path),
+        path,
+    )
+    .await
+}
+
+async fn v2_get_json_with_query(
+    client: &reqwest::Client,
+    base_url: &str,
+    password: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<Value> {
+    v2_send(
+        v2_request(client, base_url, password, reqwest::Method::GET, path).query(query),
+        path,
+    )
+    .await
+}
+
+async fn v1_scoped_get_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    password: &str,
+    directory: &str,
+    path: &str,
+) -> Result<Value> {
+    // unofficial-opencode-sdk 0.1.0 decodes these V1 list routes with
+    // Response::json and has no body limit. Keep the exact SDK base URL,
+    // basic-auth identity, directory query, and routes while bounding the
+    // producer's response before JSON parsing.
+    bounded_json_request(
+        client
+            .get(format!("{base_url}{path}"))
+            .basic_auth("opencode", Some(password))
+            .query(&[("directory", directory)]),
         path,
     )
     .await
@@ -2166,31 +2732,28 @@ impl ServeClient {
     async fn session_list(&self) -> Result<Vec<Value>> {
         match self {
             Self::Sdk(inner) => {
-                let sessions = sdk_call(inner.client.session().list())
-                    .await
-                    .context("opencode session list failed")?;
-                sessions
-                    .into_iter()
-                    .map(|session| serde_json::to_value(session).map_err(Into::into))
-                    .collect()
+                let body = v1_scoped_get_json(
+                    &inner.bounded_http,
+                    &inner.base_url,
+                    &inner.password,
+                    &inner.directory,
+                    "session",
+                )
+                .await
+                .context("opencode session list failed")?;
+                session_list_items(&body)
             }
             Self::SdkV2(inner) => {
-                let body = v2_get_json(
+                let body = v2_get_json_with_query(
                     &inner.client,
                     &inner.base_url,
                     &inner.password,
                     "api/session",
+                    &[("directory", &inner.directory)],
                 )
                 .await
                 .context("opencode session list failed")?;
-                let data = body.get("data").unwrap_or(&body);
-                if let Some(items) = data.as_array() {
-                    return Ok(items.clone());
-                }
-                if let Some(items) = data.get("items").and_then(Value::as_array) {
-                    return Ok(items.clone());
-                }
-                Ok(Vec::new())
+                session_list_items(&body)
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().session_list(),
@@ -2264,20 +2827,29 @@ impl ServeClient {
 
     async fn permission_list(&self) -> Result<Vec<Value>> {
         match self {
-            Self::Sdk(inner) => sdk_call(inner.client.permission().list())
+            Self::Sdk(inner) => {
+                let body = v1_scoped_get_json(
+                    &inner.bounded_http,
+                    &inner.base_url,
+                    &inner.password,
+                    &inner.directory,
+                    "permission",
+                )
                 .await
-                .context("opencode permission list failed"),
+                .context("opencode permission list failed")?;
+                pending_interaction_items(&body, "permission")
+            }
             Self::SdkV2(inner) => {
-                let body = v2_get_json(
+                let body = v2_get_json_with_query(
                     &inner.client,
                     &inner.base_url,
                     &inner.password,
                     "api/permission/request",
+                    &[("location[directory]", &inner.directory)],
                 )
                 .await
                 .context("opencode permission list failed")?;
-                let pending = body.get("data").unwrap_or(&body).clone();
-                Ok(pending.as_array().cloned().unwrap_or_default())
+                pending_interaction_items(&body, "permission")
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().permission_list(),
@@ -2286,31 +2858,45 @@ impl ServeClient {
 
     async fn question_list(&self) -> Result<Vec<Value>> {
         match self {
-            Self::Sdk(inner) => sdk_call(inner.client.question().list())
+            Self::Sdk(inner) => {
+                let body = v1_scoped_get_json(
+                    &inner.bounded_http,
+                    &inner.base_url,
+                    &inner.password,
+                    &inner.directory,
+                    "question",
+                )
                 .await
-                .context("opencode question list failed"),
+                .context("opencode question list failed")?;
+                pending_interaction_items(&body, "question")
+            }
             Self::SdkV2(inner) => {
                 // 1.x exposes pending prompts as `api/question/request`; 2.x
                 // renamed that surface to `api/form`. The route that answers
                 // JSON wins; the 1.x fallback route returns the HTML shell,
                 // which `v2_send` rejects as non-JSON.
-                let body = match v2_get_json(
+                let query = [("location[directory]", inner.directory.as_str())];
+                let body = match v2_get_json_with_query(
                     &inner.client,
                     &inner.base_url,
                     &inner.password,
                     "api/question/request",
+                    &query,
                 )
                 .await
                 {
                     Ok(body) => body,
-                    Err(_) => {
-                        v2_get_json(&inner.client, &inner.base_url, &inner.password, "api/form")
-                            .await
-                            .context("opencode question list failed")?
-                    }
+                    Err(_) => v2_get_json_with_query(
+                        &inner.client,
+                        &inner.base_url,
+                        &inner.password,
+                        "api/form",
+                        &query,
+                    )
+                    .await
+                    .context("opencode question list failed")?,
                 };
-                let pending = body.get("data").unwrap_or(&body).clone();
-                Ok(pending.as_array().cloned().unwrap_or_default())
+                pending_interaction_items(&body, "question")
             }
             #[cfg(test)]
             Self::Fake(inner) => inner.lock().unwrap().question_list(),
@@ -2829,9 +3415,7 @@ async fn spawn_serve_once(
         .directory(directory.clone())
         .build()
         .context("cannot build OpenCode SDK client")?;
-    let client_v2 = reqwest::Client::builder()
-        .build()
-        .context("cannot build OpenCode v2 HTTP client")?;
+    let client_v2 = build_opencode_http_client()?;
     let password_v2 = password.to_owned();
 
     let child = tokio::sync::Mutex::new(child);
@@ -2855,6 +3439,10 @@ async fn spawn_serve_once(
                 Ok(Ok(_)) => {
                     return Ok(ServeClient::Sdk(Arc::new(SdkServe {
                         client: client_v1,
+                        bounded_http: client_v2.clone(),
+                        base_url: base_url.clone(),
+                        password: password_v2.clone(),
+                        directory: directory.clone(),
                         child,
                         tail: Arc::clone(&tail),
                     })));
@@ -2954,6 +3542,7 @@ struct RuntimeHandle {
     client: ServeClient,
     owner: SessionInstance,
     scope: PathBuf,
+    instance_id: Uuid,
     started_at: Instant,
     _lease: Arc<TaskRuntimeLease>,
 }
@@ -2991,6 +3580,36 @@ fn runtime_matches_record(record: &TaskRecord) -> bool {
         .is_some_and(|runtime| runtime.owner == record.owner && runtime.scope == record.scope_cwd)
 }
 
+fn runtime_registration_matches(
+    session: &config::Session,
+    task_id: Uuid,
+    runtime_instance_id: Uuid,
+) -> bool {
+    let owner = SessionInstance::from_session(session);
+    if lifecycle_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .get(&owner)
+        .is_some_and(|entry| entry.closing)
+    {
+        return false;
+    }
+    let Ok(scope) = config::canonical_directory(&session.cwd) else {
+        return false;
+    };
+    runtimes()
+        .lock()
+        .unwrap()
+        .get(&task_id)
+        .is_some_and(|runtime| {
+            runtime.instance_id == runtime_instance_id
+                && runtime.owner == owner
+                && runtime.scope == scope
+                && Instant::now().saturating_duration_since(runtime.started_at) < CHILD_LIFETIME
+        })
+}
+
 async fn insert_runtime(
     session: &config::Session,
     task_id: Uuid,
@@ -3014,10 +3633,12 @@ fn insert_runtime_unchecked(
     let owner = owner.clone();
     let store = store.clone();
     let scope = config::canonical_directory(&session.cwd)?;
+    let runtime_instance_id = Uuid::new_v4();
     let runtime = RuntimeHandle {
         client: client.clone(),
         owner: owner.clone(),
         scope,
+        instance_id: runtime_instance_id,
         started_at: Instant::now(),
         _lease: lease,
     };
@@ -3038,32 +3659,38 @@ fn insert_runtime_unchecked(
         );
         state.insert(task_id, runtime);
     }
+    let observer_session = session.clone();
+    let observer_store = store.clone();
+    let observer_client = client.clone();
+    tokio::spawn(async move {
+        observe_opencode_pending_interactions(
+            observer_session,
+            task_id,
+            observer_store,
+            observer_client,
+            runtime_instance_id,
+        )
+        .await;
+    });
     tokio::spawn(async move {
         let session_stopped = tokio::select! {
             _ = tokio::time::sleep(CHILD_LIFETIME) => false,
             _ = wait_for_session_stop(owner.clone()) => true,
         };
-        let client = {
-            let _guard = store_lock().lock().unwrap();
-            runtimes()
-                .lock()
-                .unwrap()
-                .get(&task_id)
-                .filter(|runtime| runtime.owner == owner)
-                .map(|runtime| runtime.client.clone())
-        };
-        if let Some(client) = client {
-            client.shutdown().await;
-        }
-        {
+        let runtime = {
             let _guard = store_lock().lock().unwrap();
             let mut state = runtimes().lock().unwrap();
             if state
                 .get(&task_id)
-                .is_some_and(|runtime| runtime.owner == owner)
+                .is_some_and(|runtime| runtime.instance_id == runtime_instance_id)
             {
-                state.remove(&task_id);
+                state.remove(&task_id)
+            } else {
+                None
             }
+        };
+        if let Some(runtime) = runtime {
+            runtime.client.shutdown().await;
         }
         if session_stopped {
             let result = async {
@@ -3839,6 +4466,7 @@ async fn task_start_with_store_and_binary(
         report_status: None,
         raw_result: None,
         raw_result_truncated: false,
+        pending_interaction_summary: None,
         created_at: now,
         updated_at: now,
         operations: Vec::new(),
@@ -4166,6 +4794,10 @@ fn task_list_item(record: &TaskRecord) -> Value {
     let mut item = task_view(record, None);
     item["backend"] = json!("opencode");
     item["last_updated_at"] = json!(record.updated_at);
+    item["pending_interaction"] = Summary::projection(
+        record.pending_interaction_summary.as_ref(),
+        config::unix_time(),
+    );
     item
 }
 
@@ -4867,8 +5499,14 @@ struct FakeServe {
     dead: bool,
     next_session: u64,
     sessions: HashMap<String, FakeSession>,
+    session_list_calls: usize,
+    permission_list_calls: usize,
+    question_list_calls: usize,
     pending_permissions: Vec<Value>,
     pending_questions: Vec<Value>,
+    session_list_error: Option<String>,
+    permission_list_error: Option<String>,
+    question_list_error: Option<String>,
     permission_reply_calls: Vec<(String, String, String, Option<String>)>,
     question_reply_calls: Vec<(String, String, Vec<Vec<String>>)>,
     prompt_calls: Vec<(String, Value)>,
@@ -4967,6 +5605,10 @@ impl FakeServe {
 
     fn session_list(&mut self) -> Result<Vec<Value>> {
         self.require_live()?;
+        self.session_list_calls += 1;
+        if let Some(error) = &self.session_list_error {
+            anyhow::bail!("{error}");
+        }
         Ok(self
             .sessions
             .iter()
@@ -5006,11 +5648,19 @@ impl FakeServe {
 
     fn permission_list(&mut self) -> Result<Vec<Value>> {
         self.require_live()?;
+        self.permission_list_calls += 1;
+        if let Some(error) = &self.permission_list_error {
+            anyhow::bail!("{error}");
+        }
         Ok(self.pending_permissions.clone())
     }
 
     fn question_list(&mut self) -> Result<Vec<Value>> {
         self.require_live()?;
+        self.question_list_calls += 1;
+        if let Some(error) = &self.question_list_error {
+            anyhow::bail!("{error}");
+        }
         Ok(self.pending_questions.clone())
     }
 
@@ -6767,10 +7417,21 @@ mod tests {
                         .next()
                         .unwrap_or_default();
                     let (status, body) = mock_v2_response(method, path);
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
+                    let location_header = if path == "/api/redirect" {
+                        "Location: /api/session\r\n"
+                    } else {
+                        ""
+                    };
+                    let response = if path == "/api/chunked_too_large" {
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 {status}\r\n{location_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
                     let _ = socket.write_all(response.as_bytes()).await;
                     let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
                 });
@@ -6781,6 +7442,12 @@ mod tests {
 
     #[cfg(unix)]
     fn mock_v2_response(method: &str, path: &str) -> (&'static str, String) {
+        if method == "GET" && path == "/api/redirect" {
+            return (
+                "302 Found",
+                "secret-redirect-body-do-not-surface".to_owned(),
+            );
+        }
         if matches!(
             (method, path),
             ("GET", "/api/info") | ("GET", "/api/health")
@@ -6814,6 +7481,12 @@ mod tests {
         if method == "GET" && path == "/api/permission/request" {
             return ("200 OK", r#"{"data":[]}"#.to_owned());
         }
+        if method == "GET" && path == "/api/session" {
+            return (
+                "200 OK",
+                r#"{"data":[{"id":"ses_mock","parentID":null}],"cursor":{"previous":null,"next":null}}"#.to_owned(),
+            );
+        }
         if method == "GET" && path == "/api/question/request" {
             return ("200 OK", r#"{"data":[]}"#.to_owned());
         }
@@ -6822,6 +7495,12 @@ mod tests {
         }
         if method == "GET" && path == "/api/boom" {
             return ("500 Internal Server Error", "{}".to_owned());
+        }
+        if method == "GET" && path == "/api/too_large" {
+            return ("200 OK", " ".repeat(MAX_OPENCODE_RESPONSE_BYTES + 1));
+        }
+        if method == "GET" && path == "/api/chunked_too_large" {
+            return ("200 OK", " ".repeat(MAX_OPENCODE_RESPONSE_BYTES + 1));
         }
         ("404 Not Found", "{}".to_owned())
     }
@@ -6842,7 +7521,7 @@ mod tests {
             .spawn()
             .expect("placeholder child for the V2 client");
         let client = ServeClient::SdkV2(Arc::new(SdkV2Serve {
-            client: reqwest::Client::builder().build().unwrap(),
+            client: build_opencode_http_client().unwrap(),
             base_url: base_url.clone(),
             password: password.clone(),
             directory: "/tmp".to_owned(),
@@ -6867,6 +7546,8 @@ mod tests {
             .unwrap();
         let session_id = created["id"].as_str().unwrap().to_owned();
         assert_eq!(session_id, "ses_mock");
+        let sessions = client.session_list().await.unwrap();
+        assert_eq!(sessions[0]["id"], "ses_mock");
 
         // The provider-dependent half of the old live test is replaced by a
         // mock that echoes this deterministic prompt id in its message list.
@@ -6930,7 +7611,7 @@ mod tests {
         // The V2 JSON contract rejects a non-JSON body even on HTTP 200 and
         // surfaces non-success statuses, so an HTML shell page cannot be
         // mistaken for an `api/*` route that answered.
-        let http = reqwest::Client::builder().build().unwrap();
+        let http = build_opencode_http_client().unwrap();
         assert!(
             v2_get_json(&http, &base_url, &password, "api/non_json")
                 .await
@@ -6941,6 +7622,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("HTTP 500"), "{error}");
+        let error = v2_get_json(&http, &base_url, &password, "api/redirect")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 302"), "{error}");
+        assert!(
+            !error.contains("secret-redirect-body-do-not-surface"),
+            "redirect body must not be surfaced: {error}"
+        );
+        let error = v2_get_json(&http, &base_url, &password, "api/too_large")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds"), "{error}");
+        let error = v2_get_json(&http, &base_url, &password, "api/chunked_too_large")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds"), "{error}");
         server.abort();
     }
 
@@ -6970,6 +7670,7 @@ mod tests {
             report_status: None,
             raw_result: None,
             raw_result_truncated: false,
+            pending_interaction_summary: None,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
@@ -6989,6 +7690,44 @@ mod tests {
             process_id: 5678,
             permission_mode: config::PermissionMode::Agent,
             grants: config::SessionGrants::default(),
+        }
+    }
+
+    fn install_observer_runtime(
+        owner_session: &config::Session,
+        store: &TaskStore,
+        task_id: Uuid,
+        client: ServeClient,
+    ) -> Uuid {
+        let lease = Arc::new(store.try_acquire_runtime_lease(task_id).unwrap().unwrap());
+        let runtime_instance_id = Uuid::new_v4();
+        let runtime = RuntimeHandle {
+            client,
+            owner: SessionInstance::from_session(owner_session),
+            scope: config::canonical_directory(&owner_session.cwd).unwrap(),
+            instance_id: runtime_instance_id,
+            started_at: Instant::now(),
+            _lease: lease,
+        };
+        let _guard = store_lock().lock().unwrap();
+        assert!(
+            runtimes()
+                .lock()
+                .unwrap()
+                .insert(task_id, runtime)
+                .is_none()
+        );
+        runtime_instance_id
+    }
+
+    fn uninstall_observer_runtime(task_id: Uuid, runtime_instance_id: Uuid) {
+        let _guard = store_lock().lock().unwrap();
+        let mut state = runtimes().lock().unwrap();
+        if state
+            .get(&task_id)
+            .is_some_and(|runtime| runtime.instance_id == runtime_instance_id)
+        {
+            state.remove(&task_id);
         }
     }
 
@@ -7032,6 +7771,533 @@ mod tests {
         assert_eq!(tasks[0]["task_id"], json!(owner_task));
         assert_eq!(tasks[0]["backend"], "opencode");
         assert!(tasks[0]["last_updated_at"].is_u64());
+    }
+
+    #[test]
+    fn pending_interaction_observation_requires_complete_scope_and_marks_overflow() {
+        assert!(
+            session_list_items(&json!({
+                "items": [{"id": "root"}],
+                "nextCursor": "more-sessions"
+            }))
+            .is_err()
+        );
+        assert!(
+            session_list_items(&json!({
+                "data": [{"id": "root"}],
+                "cursor": {"next": "more-sessions"}
+            }))
+            .is_err()
+        );
+        let too_many_sessions = Value::Array(
+            (0..=MAX_PENDING_INTERACTION_SOURCE_ITEMS)
+                .map(|index| json!({"id": format!("session-{index}")}))
+                .collect(),
+        );
+        assert!(session_list_items(&too_many_sessions).is_err());
+        assert!(
+            pending_interaction_items(
+                &Value::Array(vec![Value::Null; MAX_PENDING_INTERACTION_SOURCE_ITEMS + 1]),
+                "permission"
+            )
+            .is_err()
+        );
+        assert!(
+            pending_interaction_items(
+                &json!({"data": [], "pagination": {"hasMore": true}}),
+                "question"
+            )
+            .is_err()
+        );
+
+        let incomplete_sessions = vec![
+            json!({"id": "root"}),
+            json!({"id": "descendant", "parentID": "missing-parent"}),
+        ];
+        assert!(complete_descendant_session_ids("root", &incomplete_sessions).is_err());
+        let cyclic_sessions = vec![
+            json!({"id": "root"}),
+            json!({"id": "first", "parentID": "second"}),
+            json!({"id": "second", "parentID": "first"}),
+        ];
+        let cyclic_observation =
+            pending_interaction_observation_from("root", &cyclic_sessions, &[], &[])
+                .unwrap_or_else(|_| PendingInteractionObservation::unknown());
+        assert_eq!(cyclic_observation.state, SummaryState::Unknown);
+
+        let sessions = vec![json!({"id": "root"})];
+        let permissions = (0..=MAX_PENDING_INTERACTIONS)
+            .map(|index| {
+                json!({
+                    "id": format!("permission-{index}"),
+                    "sessionID": "root",
+                    "action": "do-not-store-this-detail"
+                })
+            })
+            .collect::<Vec<_>>();
+        let observation =
+            pending_interaction_observation_from("root", &sessions, &permissions, &[]).unwrap();
+        assert_eq!(observation.state, SummaryState::Unavailable);
+        assert_eq!(observation.count, Some(MAX_PENDING_INTERACTIONS as u8));
+        assert_eq!(observation.types, vec![InteractionType::Permission]);
+        assert!(observation.truncated);
+    }
+
+    #[test]
+    fn legacy_task_record_defaults_pending_interaction_summary_to_none() {
+        let workspace = tempfile::tempdir().unwrap();
+        let owner = session(workspace.path(), &test_id());
+        let record = record_for(&owner, Uuid::new_v4(), TaskStatus::Running, None);
+        let mut serialized = serde_json::to_value(record).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("pending_interaction_summary");
+
+        let restored: TaskRecord = serde_json::from_value(serialized).unwrap();
+        assert!(restored.pending_interaction_summary.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_observer_updates_task_list_without_task_get_or_detail_storage() {
+        let _serial = serial().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), &test_id());
+        let task_id = Uuid::new_v4();
+        let record = record_for(&owner, task_id, TaskStatus::Running, Some("root"));
+        let original_updated_at = record.updated_at;
+        store.save(&record).unwrap();
+
+        let (client, fake) = fake_client();
+        fake.lock().unwrap().sessions.insert(
+            "root".to_owned(),
+            FakeSession {
+                busy: true,
+                ..FakeSession::default()
+            },
+        );
+        fake.lock().unwrap().sessions.insert(
+            "child".to_owned(),
+            FakeSession {
+                parent_id: Some("root".to_owned()),
+                ..FakeSession::default()
+            },
+        );
+        let runtime_instance_id = install_observer_runtime(&owner, &store, task_id, client.clone());
+        assert!(runtime_registration_matches(
+            &owner,
+            task_id,
+            runtime_instance_id
+        ));
+        assert_eq!(
+            store
+                .pending_interaction_observation_context(&owner, task_id, runtime_instance_id)
+                .unwrap(),
+            Some(("root".to_owned(), 1))
+        );
+        pending_interaction::acquire_host_semaphore_permit()
+            .await
+            .map(drop)
+            .unwrap_or_else(|error| panic!("host observation slot acquisition failed: {error:#}"));
+
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        {
+            let fake = fake.lock().unwrap();
+            assert_eq!(fake.session_list_calls, 1);
+            assert_eq!(fake.permission_list_calls, 1);
+            assert_eq!(fake.question_list_calls, 1);
+        }
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(listed["tasks"][0]["pending_interaction"]["state"], "none");
+        assert_eq!(listed["tasks"][0]["pending_interaction"]["count"], 0);
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["summary_revision"],
+            1
+        );
+
+        fake.lock().unwrap().pending_permissions = vec![json!({
+            "id": "permission-1",
+            "sessionID": "root",
+            "action": "permission-detail-sentinel",
+            "resources": ["resource-sentinel"]
+        })];
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let counts_before_list = {
+            let fake = fake.lock().unwrap();
+            (
+                fake.session_list_calls,
+                fake.permission_list_calls,
+                fake.question_list_calls,
+            )
+        };
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["state"],
+            "pending"
+        );
+        assert_eq!(listed["tasks"][0]["pending_interaction"]["count"], 1);
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["types"][0],
+            "permission"
+        );
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["summary_revision"],
+            2
+        );
+        let counts_after_list = {
+            let fake = fake.lock().unwrap();
+            (
+                fake.session_list_calls,
+                fake.permission_list_calls,
+                fake.question_list_calls,
+            )
+        };
+        assert_eq!(counts_before_list, counts_after_list);
+
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.pending_permissions.clear();
+            fake.pending_questions = vec![json!({
+                "id": "question-1",
+                "sessionID": "child",
+                "questions": [{"question": "question-detail-sentinel", "options": ["choice-sentinel"]}]
+            })];
+        }
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["types"][0],
+            "question"
+        );
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["summary_revision"],
+            3
+        );
+
+        fake.lock().unwrap().pending_questions.clear();
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(listed["tasks"][0]["pending_interaction"]["state"], "none");
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["summary_revision"],
+            4
+        );
+
+        let stored = store.read_record(task_id).unwrap();
+        assert_eq!(stored.updated_at, original_updated_at);
+        assert_eq!(stored.status, TaskStatus::Running);
+        assert_eq!(stored.revision, record.revision);
+        let mut expected = record.clone();
+        expected.pending_interaction_summary = stored.pending_interaction_summary.clone();
+        assert_eq!(stored, expected);
+        let bytes = std::fs::read(store.path(task_id)).unwrap();
+        let serialized = String::from_utf8(bytes).unwrap();
+        for detail in [
+            "permission-detail-sentinel",
+            "resource-sentinel",
+            "question-detail-sentinel",
+            "choice-sentinel",
+        ] {
+            assert!(!serialized.contains(detail));
+        }
+        uninstall_observer_runtime(task_id, runtime_instance_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_scoped_endpoint_is_unavailable_without_freshening_observed_at() {
+        let _serial = serial().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), &test_id());
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                Some("root"),
+            ))
+            .unwrap();
+        let (client, fake) = fake_client();
+        fake.lock()
+            .unwrap()
+            .sessions
+            .insert("root".to_owned(), FakeSession::default());
+        let runtime_instance_id = install_observer_runtime(&owner, &store, task_id, client.clone());
+
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let observed_at = store
+            .read_record(task_id)
+            .unwrap()
+            .pending_interaction_summary
+            .unwrap()
+            .observed_at;
+        fake.lock().unwrap().question_list_error = Some("test endpoint failure".to_owned());
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let summary = store
+            .read_record(task_id)
+            .unwrap()
+            .pending_interaction_summary
+            .unwrap();
+        assert_eq!(summary.state, SummaryState::Unavailable);
+        assert_eq!(summary.observed_at, observed_at);
+        uninstall_observer_runtime(task_id, runtime_instance_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cyclic_descendant_scope_stays_unknown_and_skips_unscoped_reads() {
+        let _serial = serial().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), &test_id());
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                Some("root"),
+            ))
+            .unwrap();
+        let (client, fake) = fake_client();
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.sessions
+                .insert("root".to_owned(), FakeSession::default());
+            fake.sessions.insert(
+                "first".to_owned(),
+                FakeSession {
+                    parent_id: Some("second".to_owned()),
+                    ..FakeSession::default()
+                },
+            );
+            fake.sessions.insert(
+                "second".to_owned(),
+                FakeSession {
+                    parent_id: Some("first".to_owned()),
+                    ..FakeSession::default()
+                },
+            );
+        }
+        let runtime_instance_id = install_observer_runtime(&owner, &store, task_id, client.clone());
+
+        assert!(
+            observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["state"],
+            "unknown"
+        );
+        assert!(
+            listed["tasks"][0]["pending_interaction"]
+                .get("count")
+                .is_none()
+        );
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.session_list_calls, 1);
+        assert_eq!(fake.permission_list_calls, 0);
+        assert_eq!(fake.question_list_calls, 0);
+        drop(fake);
+        uninstall_observer_runtime(task_id, runtime_instance_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_does_not_read_after_runtime_owner_is_lost() {
+        let _serial = serial().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), &test_id());
+        let task_id = Uuid::new_v4();
+        store
+            .save(&record_for(
+                &owner,
+                task_id,
+                TaskStatus::Running,
+                Some("root"),
+            ))
+            .unwrap();
+        let (client, fake) = fake_client();
+        let runtime_instance_id = install_observer_runtime(&owner, &store, task_id, client.clone());
+        uninstall_observer_runtime(task_id, runtime_instance_id);
+
+        assert!(
+            !observe_opencode_pending_interaction_once(
+                &owner,
+                task_id,
+                &store,
+                &client,
+                runtime_instance_id,
+            )
+            .await
+        );
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.session_list_calls, 0);
+        assert_eq!(fake.permission_list_calls, 0);
+        assert_eq!(fake.question_list_calls, 0);
+        drop(fake);
+        assert!(
+            store
+                .read_record(task_id)
+                .unwrap()
+                .pending_interaction_summary
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn summary_update_is_generation_fenced_and_preserves_task_retention() {
+        let _serial = serial().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), &test_id());
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(&owner, task_id, TaskStatus::Running, Some("root"));
+        let now = config::unix_time();
+        record.generation = 2;
+        record.updated_at = now - TASK_RETENTION_SECONDS + 5;
+        record.created_at = record.updated_at;
+        let operation_id = Uuid::new_v4();
+        record.operations.push(OperationReceipt {
+            operation_id,
+            request_fingerprint: Uuid::new_v4(),
+            action: "start".to_owned(),
+            phase: OperationPhase::Applied,
+            outcome: record.outcome(),
+            interaction_result: None,
+        });
+        store.save(&record).unwrap();
+        let expired_task_id = Uuid::new_v4();
+        let mut expired_record = record_for(
+            &owner,
+            expired_task_id,
+            TaskStatus::Failed,
+            Some("expired-session"),
+        );
+        expired_record.updated_at = now - TASK_RETENTION_SECONDS - 1;
+        expired_record.created_at = expired_record.updated_at;
+        store.save(&expired_record).unwrap();
+        let (client, _) = fake_client();
+        let runtime_instance_id = install_observer_runtime(&owner, &store, task_id, client);
+        let observation = PendingInteractionObservation {
+            state: SummaryState::None,
+            count: Some(0),
+            types: Vec::new(),
+            truncated: false,
+            preserve_observed_at: false,
+        };
+
+        assert!(
+            store
+                .update_pending_interaction_summary(
+                    &owner,
+                    task_id,
+                    runtime_instance_id,
+                    "root",
+                    1,
+                    &observation,
+                )
+                .is_ok_and(|updated| !updated)
+        );
+        let before = store.read_record(task_id).unwrap();
+        assert!(before.pending_interaction_summary.is_none());
+
+        assert!(
+            store
+                .update_pending_interaction_summary(
+                    &owner,
+                    task_id,
+                    runtime_instance_id,
+                    "root",
+                    2,
+                    &observation,
+                )
+                .unwrap()
+        );
+        let after = store.read_record(task_id).unwrap();
+        assert_eq!(after.updated_at, record.updated_at);
+        assert_eq!(after.status, record.status);
+        assert_eq!(after.revision, record.revision);
+        assert_eq!(after.generation, record.generation);
+        assert_eq!(after.opencode_session_id, record.opencode_session_id);
+        assert_eq!(after.operations, record.operations);
+        assert!(store.path(expired_task_id).exists());
+        assert_eq!(
+            after.pending_interaction_summary.unwrap().state,
+            SummaryState::None
+        );
+        assert_eq!(
+            task_list_with_store(&json!({}), &owner, &store).unwrap()["total"],
+            2
+        );
+        uninstall_observer_runtime(task_id, runtime_instance_id);
     }
 
     #[test]

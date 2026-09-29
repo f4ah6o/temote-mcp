@@ -36,12 +36,15 @@ mod openai_tunnel;
 #[cfg(feature = "network")]
 mod opencode_server;
 mod orchestration;
+mod pending_interaction;
 mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
 mod provider;
 mod repository_clone;
 mod session_control;
+#[allow(dead_code)]
+mod session_source;
 mod supervisor;
 #[cfg(test)]
 mod test_support;

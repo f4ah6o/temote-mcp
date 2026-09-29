@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::pending_interaction::{
+    InteractionType, PendingInteractionSummary, ProducerKind, REFRESH_INTERVAL_SECS, Summary,
+    SummaryState,
+};
 use crate::{approvals, config, evidence};
 
 const APP_SERVER_CLIENT_NAME: &str = "temote-mcp";
@@ -434,6 +439,8 @@ struct TaskRecord {
     turn_id: Option<String>,
     #[serde(default)]
     usage: Option<BTreeMap<String, u64>>,
+    #[serde(default)]
+    pending_interaction: Option<PendingInteractionSummary>,
     created_at: u64,
     updated_at: u64,
     operations: Vec<OperationReceipt>,
@@ -692,6 +699,18 @@ impl TaskStore {
         self.ensure_directory()?;
         validate_record(record)?;
         self.prune_locked(record)?;
+        self.write_record_locked(record)
+    }
+
+    /// Persist runtime-owned summary metadata without pruning other records or
+    /// extending task retention.
+    fn save_metadata_locked(&self, record: &TaskRecord) -> Result<()> {
+        self.ensure_directory()?;
+        validate_record(record)?;
+        self.write_record_locked(record)
+    }
+
+    fn write_record_locked(&self, record: &TaskRecord) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(record)?;
         anyhow::ensure!(
             bytes.len() <= MAX_TASK_RECORD_BYTES,
@@ -756,6 +775,107 @@ impl TaskStore {
         record.updated_at = config::unix_time();
         self.save_locked(&record)?;
         Ok(record)
+    }
+
+    /// Persist the bounded projection of approvals known by the currently
+    /// connected runtime. This deliberately avoids `update`: summary
+    /// heartbeats must not extend task retention or change task revisions.
+    fn observe_pending_interaction(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        runtime_instance_id: Uuid,
+        expected_generation: Option<u64>,
+    ) -> Result<bool> {
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(false);
+        }
+        let client = {
+            let registered = runtimes().lock().unwrap();
+            let Some(runtime) = registered.get(&task_id) else {
+                return Ok(false);
+            };
+            if runtime.instance_id != runtime_instance_id {
+                return Ok(false);
+            }
+            runtime.client.clone()
+        };
+        if !client.is_connected() {
+            return Ok(false);
+        }
+        let pending_binding = client.pending_summary_binding();
+
+        let _guard = self.lock()?;
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(false);
+        }
+        if !client.is_connected() {
+            return Ok(false);
+        }
+
+        let mut record = self.load_locked(session, task_id)?;
+        let now = config::unix_time();
+        if record.status.is_terminal()
+            || now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+            || expected_generation.is_some_and(|generation| generation != record.generation)
+        {
+            return Ok(false);
+        }
+        let pending_count = client.pending_approvals.load(Ordering::Acquire);
+        let observed_at = config::unix_time();
+        let pending_state_ready = pending_binding.as_ref().is_some_and(|binding| {
+            record.generation > 0
+                && record.thread_id.as_deref() == Some(binding.thread_id.as_str())
+                && record.turn_id.as_deref() == Some(binding.turn_id.as_str())
+                && record.generation == binding.generation
+        });
+        if record.generation == 0 {
+            return Ok(true);
+        }
+
+        if pending_count == 0
+            && (!pending_state_ready || record.status == TaskStatus::WaitingApproval)
+        {
+            record.pending_interaction = Some(Summary::unavailable(
+                record.pending_interaction.as_ref(),
+                ProducerKind::RuntimeOwner,
+                record.generation,
+            )?);
+            if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+                return Ok(false);
+            }
+            self.save_metadata_locked(&record)?;
+            return Ok(true);
+        }
+
+        let count = pending_count.min(crate::pending_interaction::MAX_COUNT as u64) as u8;
+        let state = if pending_count == 0 {
+            SummaryState::None
+        } else if pending_count > crate::pending_interaction::MAX_COUNT as u64 {
+            SummaryState::Unavailable
+        } else {
+            SummaryState::Pending
+        };
+        let types = if pending_count == 0 {
+            Vec::new()
+        } else {
+            vec![InteractionType::Approval]
+        };
+        record.pending_interaction = Some(Summary::observe(
+            record.pending_interaction.as_ref(),
+            state,
+            Some(count),
+            &types,
+            pending_count > crate::pending_interaction::MAX_COUNT as u64,
+            ProducerKind::RuntimeOwner,
+            record.generation,
+            observed_at,
+        )?);
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(false);
+        }
+        self.save_metadata_locked(&record)?;
+        Ok(true)
     }
 
     fn accept_start(
@@ -1390,6 +1510,9 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             "Codex task usage has unsupported fields"
         );
     }
+    if let Some(summary) = &record.pending_interaction {
+        summary.validate()?;
+    }
     Ok(())
 }
 
@@ -1707,6 +1830,57 @@ fn operation_view(task_id: Uuid, outcome: &OperationOutcome) -> Value {
 struct RpcClient {
     tx: mpsc::Sender<ClientCommand>,
     actor: Arc<Mutex<Option<JoinHandle<()>>>>,
+    connected: Arc<AtomicBool>,
+    pending_approvals: Arc<AtomicU64>,
+    pending_summary_binding: Arc<Mutex<Option<PendingSummaryBinding>>>,
+    runtime_instance_id: Arc<Mutex<Option<Uuid>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSummaryBinding {
+    thread_id: String,
+    turn_id: String,
+    generation: u64,
+}
+
+impl RpcClient {
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    fn pending_summary_binding(&self) -> Option<PendingSummaryBinding> {
+        self.pending_summary_binding.lock().unwrap().clone()
+    }
+
+    fn mark_pending_summary_ready(&self, record: &TaskRecord) {
+        let binding = record
+            .thread_id
+            .as_ref()
+            .zip(record.turn_id.as_ref())
+            .filter(|_| record.generation > 0)
+            .map(|(thread_id, turn_id)| PendingSummaryBinding {
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                generation: record.generation,
+            });
+        *self.pending_summary_binding.lock().unwrap() = binding;
+    }
+
+    fn pending_summary_ready_for(&self, record: &TaskRecord) -> bool {
+        let Some(thread_id) = record.thread_id.as_deref() else {
+            return false;
+        };
+        let Some(turn_id) = record.turn_id.as_deref() else {
+            return false;
+        };
+        record.generation > 0
+            && self.pending_summary_binding().as_ref()
+                == Some(&PendingSummaryBinding {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    generation: record.generation,
+                })
+    }
 }
 
 enum ClientCommand {
@@ -1780,6 +1954,7 @@ impl RpcClient {
     }
 
     async fn shutdown(&self) {
+        self.connected.store(false, Ordering::Release);
         let _ = self.tx.send(ClientCommand::Shutdown).await;
         let actor = self.actor.lock().unwrap().take();
         if let Some(actor) = actor {
@@ -1897,6 +2072,7 @@ struct RuntimeHandle {
     client: RpcClient,
     owner: SessionInstance,
     scope: PathBuf,
+    instance_id: Uuid,
     started_at: Instant,
     _lease: Arc<TaskRuntimeLease>,
 }
@@ -1934,6 +2110,50 @@ fn runtime_matches_record(record: &TaskRecord) -> bool {
         .is_some_and(|runtime| runtime.owner == record.owner && runtime.scope == record.scope_cwd)
 }
 
+fn runtime_registration_matches(
+    session: &config::Session,
+    task_id: Uuid,
+    runtime_instance_id: Uuid,
+) -> bool {
+    let owner = SessionInstance::from_session(session);
+    if codex_lifecycle_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .get(&owner)
+        .is_some_and(|entry| entry.closing)
+    {
+        return false;
+    }
+    let Ok(scope) = config::canonical_directory(&session.cwd) else {
+        return false;
+    };
+    runtimes()
+        .lock()
+        .unwrap()
+        .get(&task_id)
+        .is_some_and(|runtime| {
+            runtime.instance_id == runtime_instance_id
+                && runtime.owner == owner
+                && runtime.scope == scope
+                && Instant::now().saturating_duration_since(runtime.started_at) < CHILD_LIFETIME
+                && runtime.client.is_connected()
+        })
+}
+
+fn take_runtime_if_instance(task_id: Uuid, runtime_instance_id: Uuid) -> Option<RuntimeHandle> {
+    let _guard = store_lock().lock().unwrap();
+    let mut state = runtimes().lock().unwrap();
+    if state
+        .get(&task_id)
+        .is_some_and(|runtime| runtime.instance_id == runtime_instance_id)
+    {
+        state.remove(&task_id)
+    } else {
+        None
+    }
+}
+
 async fn insert_runtime(
     session: &config::Session,
     task_id: Uuid,
@@ -1946,6 +2166,78 @@ async fn insert_runtime(
     insert_runtime_unchecked(session, task_id, store, client, &owner, lease)
 }
 
+async fn observe_pending_interactions(
+    session: config::Session,
+    task_id: Uuid,
+    store: TaskStore,
+    runtime_instance_id: Uuid,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(REFRESH_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !observe_pending_interaction_step(
+            &session,
+            task_id,
+            &store,
+            runtime_instance_id,
+            Duration::from_secs(REFRESH_INTERVAL_SECS),
+        )
+        .await
+        {
+            break;
+        }
+    }
+}
+
+async fn observe_pending_interaction_step(
+    session: &config::Session,
+    task_id: Uuid,
+    store: &TaskStore,
+    runtime_instance_id: Uuid,
+    permit_timeout: Duration,
+) -> bool {
+    observe_pending_interaction_step_with(
+        session,
+        task_id,
+        store,
+        runtime_instance_id,
+        permit_timeout,
+        crate::pending_interaction::acquire_host_semaphore_permit(),
+    )
+    .await
+}
+
+async fn observe_pending_interaction_step_with<F>(
+    session: &config::Session,
+    task_id: Uuid,
+    store: &TaskStore,
+    runtime_instance_id: Uuid,
+    permit_timeout: Duration,
+    acquire_permit: F,
+) -> bool
+where
+    F: std::future::Future<Output = Result<crate::pending_interaction::HostObservationPermit>>,
+{
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return false;
+    }
+    let permit = match tokio::time::timeout(permit_timeout, acquire_permit).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return true,
+    };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        drop(permit);
+        return false;
+    }
+    let observed = store.observe_pending_interaction(session, task_id, runtime_instance_id, None);
+    drop(permit);
+    match observed {
+        Ok(true) | Err(_) => true,
+        Ok(false) => false,
+    }
+}
+
 fn insert_runtime_unchecked(
     session: &config::Session,
     task_id: Uuid,
@@ -1956,11 +2248,14 @@ fn insert_runtime_unchecked(
 ) -> Result<()> {
     let owner = owner.clone();
     let store = store.clone();
+    let session = session.clone();
     let scope = config::canonical_directory(&session.cwd)?;
+    let runtime_instance_id = Uuid::new_v4();
     let runtime = RuntimeHandle {
         client: client.clone(),
         owner: owner.clone(),
         scope,
+        instance_id: runtime_instance_id,
         started_at: Instant::now(),
         _lease: lease,
     };
@@ -1980,33 +2275,27 @@ fn insert_runtime_unchecked(
             "Codex task runtime is already registered"
         );
         state.insert(task_id, runtime);
+        *client.runtime_instance_id.lock().unwrap() = Some(runtime_instance_id);
     }
+    let observer_session = session.clone();
+    let observer_store = store.clone();
+    tokio::spawn(async move {
+        observe_pending_interactions(
+            observer_session,
+            task_id,
+            observer_store,
+            runtime_instance_id,
+        )
+        .await;
+    });
     tokio::spawn(async move {
         let session_stopped = tokio::select! {
             _ = tokio::time::sleep(CHILD_LIFETIME) => false,
             _ = wait_for_session_stop(owner.clone()) => true,
         };
-        let client = {
-            let _guard = store_lock().lock().unwrap();
-            runtimes()
-                .lock()
-                .unwrap()
-                .get(&task_id)
-                .filter(|runtime| runtime.owner == owner)
-                .map(|runtime| runtime.client.clone())
-        };
-        if let Some(client) = client {
-            client.shutdown().await;
-        }
-        {
-            let _guard = store_lock().lock().unwrap();
-            let mut state = runtimes().lock().unwrap();
-            if state
-                .get(&task_id)
-                .is_some_and(|runtime| runtime.owner == owner)
-            {
-                state.remove(&task_id);
-            }
+        let runtime = take_runtime_if_instance(task_id, runtime_instance_id);
+        if let Some(runtime) = runtime {
+            runtime.client.shutdown().await;
         }
         if session_stopped {
             let result = async {
@@ -2362,18 +2651,30 @@ fn spawn_client_with_binary_unchecked(
         .take()
         .context("Codex app-server stdout unavailable")?;
     let (tx, rx) = mpsc::channel(64);
+    let connected = Arc::new(AtomicBool::new(true));
+    let pending_approvals = Arc::new(AtomicU64::new(0));
+    let runtime_instance_id = Arc::new(Mutex::new(None));
     let actor = tokio::spawn(run_actor(
         child,
         stdin,
         stdout,
-        session,
-        task_id,
         rx,
-        runtime_lease,
+        RpcActorContext {
+            session,
+            task_id,
+            runtime_lease_guard: runtime_lease,
+            connected: Arc::clone(&connected),
+            pending_approvals: Arc::clone(&pending_approvals),
+            runtime_instance_id: Arc::clone(&runtime_instance_id),
+        },
     ));
     Ok(RpcClient {
         tx,
         actor: Arc::new(Mutex::new(Some(actor))),
+        connected,
+        pending_approvals,
+        pending_summary_binding: Arc::new(Mutex::new(None)),
+        runtime_instance_id,
     })
 }
 
@@ -2394,16 +2695,45 @@ fn codex_environment_key_allowed(key: &OsStr) -> bool {
     key.starts_with("LC_") || CODEX_CHILD_ENV_ALLOWLIST.contains(&key)
 }
 
+struct RpcActorContext {
+    session: config::Session,
+    task_id: Option<Uuid>,
+    runtime_lease_guard: Option<Arc<TaskRuntimeLease>>,
+    connected: Arc<AtomicBool>,
+    pending_approvals: Arc<AtomicU64>,
+    runtime_instance_id: Arc<Mutex<Option<Uuid>>>,
+}
+
+struct ActorConnectionGuard(Arc<AtomicBool>);
+
+impl Drop for ActorConnectionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 async fn run_actor(
     mut child: tokio::process::Child,
     mut stdin: ChildStdin,
     stdout: ChildStdout,
-    session: config::Session,
-    task_id: Option<Uuid>,
     mut commands: mpsc::Receiver<ClientCommand>,
-    runtime_lease_guard: Option<Arc<TaskRuntimeLease>>,
+    context: RpcActorContext,
 ) {
+    let RpcActorContext {
+        session,
+        task_id,
+        runtime_lease_guard,
+        connected,
+        pending_approvals,
+        runtime_instance_id,
+    } = context;
+    let _connection_guard = ActorConnectionGuard(Arc::clone(&connected));
     let mut reader = BufReader::new(stdout);
+    // Keep partial JSONL data outside the cancellable select future. If a
+    // command arrives while fill_buf is waiting for the rest of a line, Tokio
+    // drops only the read future; this buffer retains the bytes already
+    // consumed from the child pipe for the next iteration.
+    let mut partial_line = Vec::new();
     let (server_tx, mut server_rx) = mpsc::channel::<ServerResponse>(16);
     let mut next_id = 1u64;
     let mut pending = HashMap::<u64, oneshot::Sender<std::result::Result<Value, String>>>::new();
@@ -2447,7 +2777,7 @@ async fn run_actor(
                     }
                 }
             }
-            line = read_bounded_json_line(&mut reader) => {
+            line = read_bounded_json_line(&mut reader, &mut partial_line) => {
                 match line {
                     Ok(Some(value)) => {
                         if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -2456,8 +2786,17 @@ async fn run_actor(
                                 let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
                                 let tx = server_tx.clone();
                                 let session = session.clone();
+                                let pending_approvals = Arc::clone(&pending_approvals);
+                                let runtime_instance_id = Arc::clone(&runtime_instance_id);
                                 tokio::spawn(async move {
-                                    let payload = handle_server_request(&session, task_id, &method, params).await;
+                                    let payload = handle_server_request(
+                                        &session,
+                                        task_id,
+                                        &method,
+                                        params,
+                                        pending_approvals,
+                                        runtime_instance_id,
+                                    ).await;
                                     let _ = tx.send(ServerResponse { id, payload }).await;
                                 });
                             } else {
@@ -2491,6 +2830,7 @@ async fn run_actor(
     for (_, reply) in pending {
         let _ = reply.send(Err(terminal_error.clone()));
     }
+    pending_approvals.store(0, Ordering::Release);
     let _ = child.kill().await;
     drop(runtime_lease_guard);
 }
@@ -2507,11 +2847,10 @@ async fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn read_bounded_json_line<R>(reader: &mut R) -> Result<Option<Value>>
+async fn read_bounded_json_line<R>(reader: &mut R, line: &mut Vec<u8>) -> Result<Option<Value>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = Vec::new();
     loop {
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
@@ -2537,7 +2876,8 @@ where
         let len = chunk.len();
         reader.consume(len);
     }
-    let value = serde_json::from_slice(&line).context("invalid Codex app-server JSON line")?;
+    let value = serde_json::from_slice(line).context("invalid Codex app-server JSON line")?;
+    line.clear();
     Ok(Some(value))
 }
 
@@ -2675,24 +3015,38 @@ async fn handle_server_request(
     task_id: Option<Uuid>,
     method: &str,
     params: Value,
+    pending_approvals: Arc<AtomicU64>,
+    runtime_instance_id: Arc<Mutex<Option<Uuid>>>,
 ) -> std::result::Result<Value, (i64, String)> {
     match method {
         "item/commandExecution/requestApproval" => {
-            let task_id = task_id.ok_or_else(|| {
-                (
+            increment_pending_approvals(&pending_approvals);
+            let Some(task_id) = task_id else {
+                decrement_pending_approvals(&pending_approvals);
+                return Err((
                     -32601,
                     "approval request is unavailable outside a Codex task".to_owned(),
-                )
-            })?;
+                ));
+            };
             let owner = SessionInstance::from_session(session);
             if ensure_current_active_instance(&owner, session)
                 .await
                 .is_err()
             {
+                decrement_pending_approvals(&pending_approvals);
                 return Ok(json!({"decision": "decline"}));
             }
-            validate_approval_task(session, task_id, &params)?;
+            let generation = match validate_approval_task(session, task_id, &params) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    decrement_pending_approvals(&pending_approvals);
+                    publish_pending_interaction(session, task_id, None, &runtime_instance_id).await;
+                    return Err(error);
+                }
+            };
             mark_waiting_approval(session, task_id, true);
+            publish_pending_interaction(session, task_id, Some(generation), &runtime_instance_id)
+                .await;
             let (detail, metadata) = child_approval(
                 "command execution",
                 "commandExecution",
@@ -2703,30 +3057,48 @@ async fn handle_server_request(
             let allowed =
                 request_child_approval(session, "Codex command approval", detail, metadata).await;
             mark_waiting_approval(session, task_id, false);
+            decrement_pending_approvals(&pending_approvals);
+            publish_pending_interaction(session, task_id, Some(generation), &runtime_instance_id)
+                .await;
             Ok(json!({"decision": if allowed { "accept" } else { "decline" }}))
         }
         "item/fileChange/requestApproval" => {
-            let task_id = task_id.ok_or_else(|| {
-                (
+            increment_pending_approvals(&pending_approvals);
+            let Some(task_id) = task_id else {
+                decrement_pending_approvals(&pending_approvals);
+                return Err((
                     -32601,
                     "approval request is unavailable outside a Codex task".to_owned(),
-                )
-            })?;
+                ));
+            };
             let owner = SessionInstance::from_session(session);
             if ensure_current_active_instance(&owner, session)
                 .await
                 .is_err()
             {
+                decrement_pending_approvals(&pending_approvals);
                 return Ok(json!({"decision": "decline"}));
             }
-            validate_approval_task(session, task_id, &params)?;
+            let generation = match validate_approval_task(session, task_id, &params) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    decrement_pending_approvals(&pending_approvals);
+                    publish_pending_interaction(session, task_id, None, &runtime_instance_id).await;
+                    return Err(error);
+                }
+            };
             mark_waiting_approval(session, task_id, true);
+            publish_pending_interaction(session, task_id, Some(generation), &runtime_instance_id)
+                .await;
             let (detail, metadata) =
                 child_approval("file change", "fileChange", "file_change", task_id, &params);
             let allowed =
                 request_child_approval(session, "Codex file-change approval", detail, metadata)
                     .await;
             mark_waiting_approval(session, task_id, false);
+            decrement_pending_approvals(&pending_approvals);
+            publish_pending_interaction(session, task_id, Some(generation), &runtime_instance_id)
+                .await;
             Ok(json!({"decision": if allowed { "accept" } else { "decline" }}))
         }
         _ => Err((
@@ -2900,7 +3272,7 @@ fn validate_approval_task(
     session: &config::Session,
     task_id: Uuid,
     params: &Value,
-) -> std::result::Result<(), (i64, String)> {
+) -> std::result::Result<u64, (i64, String)> {
     let store = TaskStore::default_store().map_err(internal_server_error)?;
     bind_approval_turn(&store, session, task_id, params)
         .map_err(|error| (-32602, error.to_string()))
@@ -2911,7 +3283,7 @@ fn bind_approval_turn(
     session: &config::Session,
     task_id: Uuid,
     params: &Value,
-) -> Result<()> {
+) -> Result<u64> {
     let thread_id = params
         .get("threadId")
         .and_then(Value::as_str)
@@ -2920,7 +3292,7 @@ fn bind_approval_turn(
         .get("turnId")
         .and_then(Value::as_str)
         .context("approval request is missing turnId")?;
-    store.update(session, task_id, |record| {
+    let record = store.update(session, task_id, |record| {
         anyhow::ensure!(
             !record.status.is_terminal(),
             "approval request arrived after the Codex task was finalized"
@@ -2941,7 +3313,7 @@ fn bind_approval_turn(
         }
         Ok(())
     })?;
-    Ok(())
+    Ok(record.generation)
 }
 
 fn internal_server_error(error: anyhow::Error) -> (i64, String) {
@@ -2965,6 +3337,49 @@ fn mark_waiting_approval(session: &config::Session, task_id: Uuid, waiting: bool
             Ok(())
         });
     }
+}
+
+fn increment_pending_approvals(pending_approvals: &AtomicU64) {
+    let _ = pending_approvals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+        Some(pending.saturating_add(1))
+    });
+}
+
+fn decrement_pending_approvals(pending_approvals: &AtomicU64) {
+    let _ = pending_approvals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+        Some(pending.saturating_sub(1))
+    });
+}
+
+async fn publish_pending_interaction(
+    session: &config::Session,
+    task_id: Uuid,
+    expected_generation: Option<u64>,
+    runtime_instance_id: &Mutex<Option<Uuid>>,
+) {
+    let Some(runtime_instance_id) = *runtime_instance_id.lock().unwrap() else {
+        return;
+    };
+    let Ok(Ok(_permit)) = tokio::time::timeout(
+        Duration::from_secs(REFRESH_INTERVAL_SECS),
+        crate::pending_interaction::acquire_host_semaphore_permit(),
+    )
+    .await
+    else {
+        return;
+    };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return;
+    }
+    let Ok(store) = TaskStore::default_store() else {
+        return;
+    };
+    let _ = store.observe_pending_interaction(
+        session,
+        task_id,
+        runtime_instance_id,
+        expected_generation,
+    );
 }
 
 fn advertised_effort_name(entry: &Value) -> Option<&str> {
@@ -3148,6 +3563,7 @@ pub(crate) fn seed_completed_task_for_test(
         thread_id: Some("test-completed-thread".to_owned()),
         turn_id: Some("test-completed-turn".to_owned()),
         usage: None,
+        pending_interaction: None,
         created_at: now,
         updated_at: now,
         operations: Vec::new(),
@@ -3279,6 +3695,7 @@ where
         thread_id: None,
         turn_id: None,
         usage: None,
+        pending_interaction: None,
         created_at: now,
         updated_at: now,
         operations: Vec::new(),
@@ -3529,6 +3946,11 @@ where
         })?;
         return Ok(task_view(&record, None));
     }
+
+    // A completed, admitted `turn/start` binds the new in-process runtime to
+    // this exact thread, turn, and task generation. Reconnected clients remain
+    // unready until a scoped `thread/read` validates the retained state.
+    client.mark_pending_summary_ready(&record);
 
     let insert_result = if fence {
         insert_runtime(session, task_id, store, client.clone(), runtime_lease).await
@@ -3921,6 +4343,8 @@ fn task_list_item(record: &TaskRecord) -> Value {
     let mut item = task_view(record, None);
     item["backend"] = json!("codex");
     item["last_updated_at"] = json!(record.updated_at);
+    item["pending_interaction"] =
+        Summary::projection(record.pending_interaction.as_ref(), config::unix_time());
     item
 }
 
@@ -4008,6 +4432,7 @@ async fn task_control_with_store_and_binary(
                 return Ok(task_view(&record, None));
             }
         };
+    let pending_summary_was_ready = client.pending_summary_ready_for(&record);
     let result = match action {
         "steer" => {
             request_for_instance(
@@ -4106,6 +4531,9 @@ async fn task_control_with_store_and_binary(
         Ok(())
     })?;
     drop(apply_permit);
+    if action == "steer" && pending_summary_was_ready {
+        client.mark_pending_summary_ready(&record);
+    }
     Ok(task_view(&record, None))
 }
 
@@ -4134,8 +4562,122 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
+    use std::pin::Pin;
     use std::sync::{Arc, Barrier, mpsc};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct NotifyOnReadPending<R> {
+        inner: R,
+        read_data: bool,
+        pending_notice: Option<oneshot::Sender<()>>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for NotifyOnReadPending<R> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let filled_before = buffer.filled().len();
+            let result = Pin::new(&mut this.inner).poll_read(cx, buffer);
+            match &result {
+                Poll::Ready(Ok(())) if buffer.filled().len() > filled_before => {
+                    this.read_data = true;
+                }
+                Poll::Pending if this.read_data => {
+                    if let Some(notice) = this.pending_notice.take() {
+                        let _ = notice.send(());
+                    }
+                }
+                _ => {}
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_json_line_read_keeps_prefix_when_cancelled_waiting_for_newline() {
+        let (mut writer, raw_reader) = tokio::io::duplex(128);
+        let (pending_notice, pending_notice_rx) = oneshot::channel();
+        let reader = NotifyOnReadPending {
+            inner: raw_reader,
+            read_data: false,
+            pending_notice: Some(pending_notice),
+        };
+        let mut reader = BufReader::new(reader);
+        let mut partial_line = Vec::new();
+        writer.write_all(b"{\"id\":").await.unwrap();
+
+        {
+            let read = read_bounded_json_line(&mut reader, &mut partial_line);
+            tokio::pin!(read);
+            tokio::select! {
+                result = &mut read => panic!("read completed before the line suffix: {result:?}"),
+                result = pending_notice_rx => result.expect("read did not consume the prefix"),
+            }
+        }
+
+        assert_eq!(partial_line, b"{\"id\":");
+        writer
+            .write_all(b"7,\"result\":{\"ok\":true}}\n")
+            .await
+            .unwrap();
+        let value = read_bounded_json_line(&mut reader, &mut partial_line)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, json!({"id": 7, "result": {"ok": true}}));
+        assert!(partial_line.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_json_line_read_rejects_overflowing_retained_prefix() {
+        let (mut writer, raw_reader) = tokio::io::duplex(16);
+        let mut reader = BufReader::new(raw_reader);
+        let mut partial_line = vec![b' '; MAX_RPC_LINE_BYTES];
+        writer.write_all(b"x\n").await.unwrap();
+        let error = read_bounded_json_line(&mut reader, &mut partial_line)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exceeds {MAX_RPC_LINE_BYTES} bytes"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_json_line_read_handles_multiple_lines_and_complete_eof() {
+        let (mut writer, raw_reader) = tokio::io::duplex(128);
+        let mut reader = BufReader::new(raw_reader);
+        let mut partial_line = Vec::new();
+        writer.write_all(b"{\"id\":1}\n{\"id\":2}").await.unwrap();
+        drop(writer);
+
+        assert_eq!(
+            read_bounded_json_line(&mut reader, &mut partial_line)
+                .await
+                .unwrap(),
+            Some(json!({"id": 1}))
+        );
+        assert_eq!(
+            read_bounded_json_line(&mut reader, &mut partial_line)
+                .await
+                .unwrap(),
+            Some(json!({"id": 2}))
+        );
+        assert_eq!(
+            read_bounded_json_line(&mut reader, &mut partial_line)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(partial_line.is_empty());
+    }
 
     fn session(root: &Path, id: &str, yolo: bool) -> config::Session {
         let cwd = config::canonical_directory(root).unwrap();
@@ -4481,6 +5023,10 @@ for raw in sys.stdin:
         RpcClient {
             tx: commands,
             actor: Arc::new(Mutex::new(Some(actor))),
+            connected: Arc::new(AtomicBool::new(true)),
+            pending_approvals: Arc::new(AtomicU64::new(0)),
+            pending_summary_binding: Arc::new(Mutex::new(None)),
+            runtime_instance_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4529,6 +5075,10 @@ for raw in sys.stdin:
         RpcClient {
             tx: commands,
             actor: Arc::new(Mutex::new(Some(actor))),
+            connected: Arc::new(AtomicBool::new(true)),
+            pending_approvals: Arc::new(AtomicU64::new(0)),
+            pending_summary_binding: Arc::new(Mutex::new(None)),
+            runtime_instance_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4554,6 +5104,7 @@ for raw in sys.stdin:
             thread_id: thread_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
@@ -4687,6 +5238,7 @@ for raw in sys.stdin:
             thread_id: None,
             turn_id: None,
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: vec![OperationReceipt {
@@ -5171,6 +5723,7 @@ for raw in sys.stdin:
             thread_id: Some("0199aaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa".to_owned()),
             turn_id: Some("0199bbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb".to_owned()),
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
@@ -5226,6 +5779,7 @@ for raw in sys.stdin:
             thread_id: None,
             turn_id: None,
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: vec![OperationReceipt {
@@ -5268,6 +5822,11 @@ for raw in sys.stdin:
         let old_client = RpcClient {
             tx: old_commands,
             actor: Arc::new(Mutex::new(Some(old_actor))),
+
+            connected: Arc::new(AtomicBool::new(true)),
+            pending_approvals: Arc::new(AtomicU64::new(0)),
+            pending_summary_binding: Arc::new(Mutex::new(None)),
+            runtime_instance_id: Arc::new(Mutex::new(None)),
         };
 
         let (replacement_commands, mut replacement_receiver) = tokio::sync::mpsc::channel(1);
@@ -5277,6 +5836,11 @@ for raw in sys.stdin:
         let replacement_client = RpcClient {
             tx: replacement_commands,
             actor: Arc::new(Mutex::new(Some(replacement_actor))),
+
+            connected: Arc::new(AtomicBool::new(true)),
+            pending_approvals: Arc::new(AtomicU64::new(0)),
+            pending_summary_binding: Arc::new(Mutex::new(None)),
+            runtime_instance_id: Arc::new(Mutex::new(None)),
         };
         let old_lease = test_runtime_lease(root.path(), old_task);
         let replacement_lease = test_runtime_lease(root.path(), replacement_task);
@@ -5287,6 +5851,7 @@ for raw in sys.stdin:
                 client: old_client,
                 owner: SessionInstance::from_session(&old),
                 scope: old.cwd.clone(),
+                instance_id: Uuid::new_v4(),
                 started_at: Instant::now(),
                 _lease: old_lease,
             },
@@ -5297,6 +5862,7 @@ for raw in sys.stdin:
                 client: replacement_client,
                 owner: SessionInstance::from_session(&replacement),
                 scope: replacement.cwd.clone(),
+                instance_id: Uuid::new_v4(),
                 started_at: Instant::now(),
                 _lease: replacement_lease,
             },
@@ -5594,6 +6160,7 @@ for raw in sys.stdin:
                 client: client.clone(),
                 owner: owner_instance.clone(),
                 scope: owner.cwd.clone(),
+                instance_id: Uuid::new_v4(),
                 started_at: Instant::now(),
                 _lease: Arc::new(runtime_lease),
             },
@@ -6022,9 +6589,15 @@ for raw in sys.stdin:
                 client: RpcClient {
                     tx: commands,
                     actor: Arc::new(Mutex::new(Some(actor))),
+
+                    connected: Arc::new(AtomicBool::new(true)),
+                    pending_approvals: Arc::new(AtomicU64::new(0)),
+                    pending_summary_binding: Arc::new(Mutex::new(None)),
+                    runtime_instance_id: Arc::new(Mutex::new(None)),
                 },
                 owner: SessionInstance::from_session(&owner),
                 scope: owner.cwd.clone(),
+                instance_id: Uuid::new_v4(),
                 started_at: Instant::now(),
                 _lease: runtime_lease,
             },
@@ -6261,9 +6834,15 @@ for raw in sys.stdin:
                 client: RpcClient {
                     tx: commands,
                     actor: Arc::new(Mutex::new(Some(actor))),
+
+                    connected: Arc::new(AtomicBool::new(true)),
+                    pending_approvals: Arc::new(AtomicU64::new(0)),
+                    pending_summary_binding: Arc::new(Mutex::new(None)),
+                    runtime_instance_id: Arc::new(Mutex::new(None)),
                 },
                 owner: SessionInstance::from_session(&old_session),
                 scope: old_session.cwd.clone(),
+                instance_id: Uuid::new_v4(),
                 started_at: Instant::now(),
                 _lease: runtime_lease,
             },
@@ -6332,6 +6911,7 @@ for raw in sys.stdin:
             thread_id: None,
             turn_id: None,
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: vec![OperationReceipt {
@@ -6465,6 +7045,11 @@ for raw in sys.stdin:
                     let client = RpcClient {
                         tx: commands,
                         actor: Arc::new(Mutex::new(Some(actor))),
+
+                        connected: Arc::new(AtomicBool::new(true)),
+                        pending_approvals: Arc::new(AtomicU64::new(0)),
+                        pending_summary_binding: Arc::new(Mutex::new(None)),
+                        runtime_instance_id: Arc::new(Mutex::new(None)),
                     };
                     insert_runtime(&owner, task_id, &store, client.clone(), lease)
                         .await
@@ -6753,6 +7338,7 @@ for raw in sys.stdin:
             thread_id: Some("thread-1".to_owned()),
             turn_id: Some("turn-1".to_owned()),
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
@@ -6820,6 +7406,7 @@ for raw in sys.stdin:
             thread_id: Some("thread-1".to_owned()),
             turn_id: Some("turn-1".to_owned()),
             usage: None,
+            pending_interaction: None,
             created_at: now,
             updated_at: now,
             operations: Vec::new(),
@@ -6905,6 +7492,7 @@ for raw in sys.stdin:
             thread_id: Some("thread-1".to_owned()),
             turn_id: Some("turn-1".to_owned()),
             usage: None,
+            pending_interaction: None,
             created_at: config::unix_time(),
             updated_at: config::unix_time(),
             operations: Vec::new(),
@@ -7149,9 +7737,15 @@ for raw in sys.stdin:
                 client: RpcClient {
                     tx: commands,
                     actor: Arc::new(Mutex::new(Some(actor))),
+
+                    connected: Arc::new(AtomicBool::new(true)),
+                    pending_approvals: Arc::new(AtomicU64::new(0)),
+                    pending_summary_binding: Arc::new(Mutex::new(None)),
+                    runtime_instance_id: Arc::new(Mutex::new(None)),
                 },
                 owner: SessionInstance::from_session(&owner),
                 scope: owner.cwd.clone(),
+                instance_id: Uuid::new_v4(),
                 started_at: Instant::now(),
                 _lease: runtime_lease,
             },
@@ -7875,6 +8469,399 @@ for raw in sys.stdin:
     }
 
     // ---------- session-owned task listing ----------
+
+    #[tokio::test]
+    async fn pending_interaction_owner_projection_is_bounded_and_instance_fenced() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "pending-owner", false);
+        let task_id = Uuid::new_v4();
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            7,
+            Some("thread"),
+            Some("turn"),
+        );
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let client = recording_client(Arc::clone(&methods));
+        client.mark_pending_summary_ready(&record);
+        record.operations.push(start_receipt(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            OperationPhase::Applied,
+            record.outcome(),
+        ));
+        store.save(&record).unwrap();
+
+        client.pending_approvals.store(2, Ordering::Release);
+        let old_instance_id = Uuid::new_v4();
+        *client.runtime_instance_id.lock().unwrap() = Some(old_instance_id);
+        let old_runtime_lease = test_runtime_lease(store_root.path(), task_id);
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: client.clone(),
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                instance_id: old_instance_id,
+                started_at: Instant::now(),
+                _lease: old_runtime_lease,
+            },
+        );
+
+        let expired_task_id = Uuid::new_v4();
+        let mut expired = task_record(
+            &owner,
+            expired_task_id,
+            TaskStatus::Completed,
+            1,
+            None,
+            None,
+        );
+        expired.updated_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS);
+        store.save(&expired).unwrap();
+
+        let original = store.read_record(task_id).unwrap();
+        let failed_permit: std::future::Ready<
+            Result<crate::pending_interaction::HostObservationPermit>,
+        > = std::future::ready(Err(anyhow::anyhow!("slot unavailable")));
+        assert!(
+            observe_pending_interaction_step_with(
+                &owner,
+                task_id,
+                &store,
+                old_instance_id,
+                Duration::from_millis(10),
+                failed_permit,
+            )
+            .await
+        );
+        assert!(runtime_registration_matches(
+            &owner,
+            task_id,
+            old_instance_id
+        ));
+        assert!(client.is_connected());
+
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        let pending = store.read_record(task_id).unwrap();
+        let summary = pending.pending_interaction.as_ref().unwrap();
+        assert_eq!(summary.state, SummaryState::Pending);
+        assert_eq!(summary.count, Some(2));
+        assert_eq!(summary.types, vec![InteractionType::Approval]);
+        assert_eq!(summary.summary_revision, 1);
+        assert_eq!(pending.created_at, original.created_at);
+        assert_eq!(pending.updated_at, original.updated_at);
+        assert_eq!(pending.status, original.status);
+        assert_eq!(pending.revision, original.revision);
+        assert_eq!(pending.generation, original.generation);
+        assert_eq!(pending.operations, original.operations);
+
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["state"],
+            "pending"
+        );
+        assert_eq!(listed["tasks"][0]["pending_interaction"]["count"], 2);
+        assert!(methods.lock().unwrap().is_empty());
+
+        client.pending_approvals.store(65, Ordering::Release);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        let bounded = store.read_record(task_id).unwrap();
+        let bounded_summary = bounded.pending_interaction.as_ref().unwrap();
+        assert_eq!(bounded_summary.state, SummaryState::Unavailable);
+        assert_eq!(bounded_summary.count, Some(64));
+        assert!(bounded_summary.truncated);
+        assert_eq!(bounded_summary.summary_revision, 2);
+
+        client.pending_approvals.store(0, Ordering::Release);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        let resolved = store.read_record(task_id).unwrap();
+        let resolved_summary = resolved.pending_interaction.as_ref().unwrap();
+        assert_eq!(resolved_summary.state, SummaryState::None);
+        assert_eq!(resolved_summary.count, Some(0));
+        assert_eq!(resolved_summary.summary_revision, 3);
+        assert_eq!(resolved.revision, original.revision);
+        assert_eq!(resolved.updated_at, original.updated_at);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        assert!(store.read_record(expired_task_id).is_ok());
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        let projected = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["task_id"] == json!(task_id))
+            .unwrap();
+        assert_eq!(projected["pending_interaction"]["state"], "none");
+        assert!(methods.lock().unwrap().is_empty());
+
+        let stale_summary = Summary::observe(
+            None,
+            SummaryState::Pending,
+            Some(1),
+            &[InteractionType::Approval],
+            false,
+            ProducerKind::RuntimeOwner,
+            1,
+            config::unix_time().saturating_sub(crate::pending_interaction::SUMMARY_TTL_SECS + 1),
+        )
+        .unwrap();
+        let mut expired_projection = store.read_record(task_id).unwrap();
+        expired_projection.pending_interaction = Some(stale_summary);
+        store.save(&expired_projection).unwrap();
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        let projected = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["task_id"] == json!(task_id))
+            .unwrap();
+        assert_eq!(projected["pending_interaction"]["state"], "unavailable");
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            expired_projection.pending_interaction
+        );
+        let mut out_of_retention = store.read_record(task_id).unwrap();
+        out_of_retention.updated_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS);
+        store.save(&out_of_retention).unwrap();
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .is_ok_and(|observed| !observed)
+        );
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            out_of_retention.pending_interaction
+        );
+
+        let replacement_methods = Arc::new(Mutex::new(Vec::new()));
+        let replacement_client = recording_client(replacement_methods);
+        let replacement_instance_id = Uuid::new_v4();
+        *replacement_client.runtime_instance_id.lock().unwrap() = Some(replacement_instance_id);
+        let mut replacement_record = store.read_record(task_id).unwrap();
+        replacement_record.generation = 2;
+        store.save(&replacement_record).unwrap();
+        let old_runtime = take_runtime_if_instance(task_id, old_instance_id).unwrap();
+        drop(old_runtime);
+        let replacement_runtime_lease = test_runtime_lease(store_root.path(), task_id);
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: replacement_client.clone(),
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                instance_id: replacement_instance_id,
+                started_at: Instant::now(),
+                _lease: replacement_runtime_lease,
+            },
+        );
+
+        assert!(
+            !store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, None)
+                .unwrap()
+        );
+        assert!(take_runtime_if_instance(task_id, old_instance_id).is_none());
+        assert!(runtime_registration_matches(
+            &owner,
+            task_id,
+            replacement_instance_id
+        ));
+        assert_eq!(
+            runtimes()
+                .lock()
+                .unwrap()
+                .get(&task_id)
+                .unwrap()
+                .instance_id,
+            replacement_instance_id
+        );
+
+        let stale_epoch_record = store.read_record(task_id).unwrap();
+        let mut retired = stale_epoch_record.clone();
+        retired.generation = 0;
+        retired.updated_at = config::unix_time();
+        store.save(&retired).unwrap();
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, replacement_instance_id, Some(0))
+                .unwrap()
+        );
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            stale_epoch_record.pending_interaction
+        );
+
+        let _ = take_runtime_if_instance(task_id, replacement_instance_id);
+        client.shutdown().await;
+        replacement_client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_interaction_reconnect_read_cannot_restore_none_without_in_process_proof() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(store_root.path().join("tasks"));
+        let owner = session(workspace.path(), "pending-reconnect-owner", false);
+        let task_id = Uuid::new_v4();
+        let old_observed_at =
+            config::unix_time().saturating_sub(crate::pending_interaction::SUMMARY_TTL_SECS + 5);
+        let mut record = task_record(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            3,
+            Some("stored-thread"),
+            Some("stored-turn"),
+        );
+        record.pending_interaction = Some(
+            Summary::observe(
+                None,
+                SummaryState::None,
+                Some(0),
+                &[],
+                false,
+                ProducerKind::RuntimeOwner,
+                record.generation,
+                old_observed_at,
+            )
+            .unwrap(),
+        );
+        store.save(&record).unwrap();
+
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let client = recording_client(methods);
+        client.pending_approvals.store(0, Ordering::Release);
+        let runtime_instance_id = Uuid::new_v4();
+        *client.runtime_instance_id.lock().unwrap() = Some(runtime_instance_id);
+        let runtime_lease = test_runtime_lease(store_root.path(), task_id);
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: client.clone(),
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                instance_id: runtime_instance_id,
+                started_at: Instant::now(),
+                _lease: runtime_lease,
+            },
+        );
+
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let unloaded = store.read_record(task_id).unwrap();
+        let unavailable = unloaded.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, old_observed_at);
+        assert_eq!(
+            unavailable.expires_at,
+            old_observed_at + crate::pending_interaction::SUMMARY_TTL_SECS
+        );
+        assert!(client.is_connected());
+
+        let mut wrong_binding_record = record.clone();
+        wrong_binding_record.turn_id = Some("different-turn".to_owned());
+        client.mark_pending_summary_ready(&wrong_binding_record);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let mismatched = store.read_record(task_id).unwrap();
+        let unavailable = mismatched.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, old_observed_at);
+        assert!(client.is_connected());
+
+        let matching_read = json!({
+            "thread": {
+                "id": "stored-thread",
+                "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+                "turns": [{"id": "stored-turn", "status": "inProgress"}]
+            }
+        });
+        let derived = derive_thread_state(&matching_read, Some("stored-turn")).unwrap();
+        assert_eq!(derived.status, TaskStatus::Running);
+        assert_eq!(derived.turn_id.as_deref(), Some("stored-turn"));
+        *client.pending_summary_binding.lock().unwrap() = None;
+        assert!(!client.pending_summary_ready_for(&record));
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let after_read = store.read_record(task_id).unwrap();
+        let unavailable = after_read.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, old_observed_at);
+        assert_eq!(unavailable.summary_revision, 2);
+
+        client.pending_approvals.store(1, Ordering::Release);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let pending = store.read_record(task_id).unwrap();
+        let summary = pending.pending_interaction.as_ref().unwrap();
+        assert_eq!(summary.state, SummaryState::Pending);
+        assert_eq!(summary.count, Some(1));
+        assert_eq!(summary.summary_revision, 3);
+
+        client.pending_approvals.store(0, Ordering::Release);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let after_resolution = store.read_record(task_id).unwrap();
+        let unavailable = after_resolution.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, summary.observed_at);
+        assert_eq!(unavailable.summary_revision, 4);
+
+        store
+            .update(&owner, task_id, |record| {
+                record.status = TaskStatus::WaitingApproval;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let waiting = store.read_record(task_id).unwrap();
+        let unavailable = waiting.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, summary.observed_at);
+        assert!(client.is_connected());
+
+        let _ = take_runtime_if_instance(task_id, runtime_instance_id);
+        client.shutdown().await;
+    }
 
     #[test]
     fn task_list_projects_only_the_calling_sessions_tasks() {

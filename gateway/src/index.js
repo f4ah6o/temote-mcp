@@ -54,6 +54,10 @@ import {
   observationSyncHostId,
 } from "./observation/index.js";
 import { resolveCloudContext } from "./context/index.js";
+import {
+  handleDashboardRequest,
+  isDashboardPathname,
+} from "./dashboard/index.js";
 import { consumeMemoryBatch, sweepMemoryOutbox } from "./memory/index.js";
 
 export {
@@ -89,6 +93,9 @@ export default {
     await sweepMemoryOutbox(env);
   },
   async fetch(request, env) {
+    if (isDashboardPathname(new URL(request.url).pathname)) {
+      return handleDashboardRequest(request, env);
+    }
     try {
       return await handleRequest(request, env);
     } catch (error) {

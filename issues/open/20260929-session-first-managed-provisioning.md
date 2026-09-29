@@ -1,8 +1,11 @@
 # S1: session-first managed repository provisioning
 
-Status: design ready / S0a polished and ready for implementation  
+Status: design ready / S0a initial implementation merged (PR #86); strengthened-contract conformance pending (`issues/polished/20260929-s0a-contract-conformance.md`)
+
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-29 (Asia/Tokyo)
+
+Revision note (2026-09-29, PR #85 review follow-up): added the §5.3 provisioning retry contract — required caller-supplied `operation_id`, durable Accepted receipt before the first session-owned side effect, replay / `operation_conflict` / `reconciliation_required` semantics. The inherited F1 `RepositoryId` component grammar lives on the S0a packet side.
 
 Related:
 - `issues/open/20260924-temote-development-harness-restructure.md`
@@ -114,6 +117,7 @@ SessionId
 != TaskId
 != ChangeId
 != ExecutionId
+!= OperationId
 != jj workspace name
 != jj change_id
 != jj commit_id
@@ -200,6 +204,7 @@ named root が答えないもの:
 
 ```text
 session_start(
+  operation_id = "<caller-generated-uuid>",   # required retry key (§5.3)
   source = {
     kind = "repository",
     repository = "github.com/f4ah6o/temote-mcp",
@@ -212,10 +217,14 @@ session_start(
 CLI direction:
 
 ```sh
-temote session start f4ah6o/temote-mcp
-temote session start f4ah6o/temote-mcp --base main
-temote session start f4ah6o/temote-mcp --vcs jujutsu
+temote session start f4ah6o/temote-mcp --operation-id <uuid>
+temote session start f4ah6o/temote-mcp --operation-id <uuid> --base main
+temote session start f4ah6o/temote-mcp --operation-id <uuid> --vcs jujutsu
 ```
+
+これらの MCP/CLI 形式は将来 contract の例であり、現行の公開 `session_start(path=...)` 機能ではない。
+
+`operation_id` は caller-supplied の必須 retry key (§5.3)。timeout / 応答喪失 / transport retry では同じ値を再送し、意図的に別 Session を作る場合だけ新しい値を使う。
 
 caller は bare store path / workspace path / Git branch を指定しない。
 
@@ -236,6 +245,66 @@ migration 中の public `session_start` は mutually-exclusive input として�
 最終的には path-based start を `--existing-workspace` / attach 系の explicit compatibility semantics に寄せ、managed default と混同しない。
 
 absolute path を remote caller の authority input として追加しない。
+
+### 5.3 Provisioning operation の retry contract
+
+managed `session_start` は repository preparation と workspace allocation を伴う副作用操作である。
+応答喪失や transport retry の時点で caller は server 発行の SessionId をまだ受け取っていないため、server 発行 ID だけでは「同じ要求の再送」と「同じ repository の新規 Session」を区別できない。
+そこで caller-supplied `operation_id` を必須 retry key とする (task_start の `operation_id` 必須規約、F1 の request fingerprint、V2 の receipt / `reconciliation_required` と同じ契約系)。
+
+#### operation_id の発行と scope
+
+- caller は初回送信前に `operation_id` を生成する (UUID を推奨)。
+- timeout / 応答喪失 / transport retry では同じ値を再送する。
+- 意図的に別 Session を作る場合だけ新しい値を使う。
+- provisioning 前は Session が存在しないため、receipt lookup は `operation_id` を一次参照 key とし、既存 SessionId を必須前提にしない。
+- key は (authenticated caller namespace, target host, operation kind) に bind する。`operation_id` 単体を権限や identity として扱わず、request 認可は従来どおり caller の permission で行う。
+- local CLI と remote/MCP で同じ契約とし、transport の違いだけで同じ operation が別扱いにならないようにする。
+
+#### request fingerprint
+
+receipt は normalized request fingerprint を保持する。fingerprint の対象:
+
+- operation kind (managed repository session start)
+- normalized `RepositoryId` (host / owner / name)
+- requested base (caller が指定した ref 名。省略時は省略の事実)
+- VCS preference
+- managed start のその他の caller 入力 (workspace policy 等の選択)
+
+fingerprint に含めないもの:
+
+- remote HEAD / remote-tracking ref の観測値
+- 解決済み・pinned commit (pinned execution state であり request ではない)
+- server 発行の SessionId / WorkspaceId
+- timestamp など再送で変動する値
+
+同じ (caller namespace, host, operation kind, `operation_id`) に対して:
+
+- 同じ fingerprint の再送 → 同一 operation として replay / reconcile
+- 異なる fingerprint (`repository` / `base` / `vcs` 等が違う) → `operation_conflict` で fail closed。追加副作用を起こさない
+
+初回に pin した base revision は receipt に保持する。remote が進んでも、同じ operation の再送で base を再選択しない。
+
+#### durable acceptance ordering
+
+- session-owned provisioning の最初の副作用 (SessionId 採番、WorkspaceId 採番、workspace 作成) より先に、operation ownership と Accepted receipt を durable に確立する。
+- SessionId / WorkspaceId の採番は receipt に結び付け、同時再送でも別の割当を作らない。
+- Accepted receipt が存在する途中状態は「同じ operation の再開・照合対象」とし、新規 provisioning の根拠にしない。
+- RepositoryStore ensure/fetch は共有 substrate であり F1 の idempotent ensure/fetch 契約に従う。session としての provisioning 副作用はすべて receipt 確立の後に置く。
+
+#### 応答喪失 / crash 後の規則
+
+- Completed receipt を持つ再送は、記録済みの identity (SessionId / WorkspaceId / pinned base / result) をそのまま返す。
+- Accepted receipt のみ存在する再送は、安全に照合できる範囲で同じ operation として再開する。照合できない場合は `reconciliation_required` を返して fail closed し、根拠なく新規 provisioning を開始しない。
+- 対象 Session が既に停止・終了していても、同じ key の再送で別 Session を暗黙作成しない。
+- receipt は対応 Session record の retained lifetime 以上保持する。期限切れ / prune 済みの key の再送は無条件に新規要求として受理せず、明示的な conflict / expired 応答で fail closed する。
+
+#### caller surface と責務配置
+
+- CLI / MCP / local / remote は同一 contract とし、CLI の retry は同じ `--operation-id` を明示して行う。
+- receipt の確立は最初の managed provisioning 副作用より前の責務であり、S3a (caller surface) まで durability を後回しにしない。
+- S0a の `SessionStartSpec` は "source の記述" (`RepositoryId` / `base` / `vcs`) であり、`operation_id` は別の request envelope に置く。source identity と invocation identity を分離する。
+- この責務境界は文書化のみとし、本 issue では runtime を実装しない。
 
 ## 6. Provisioning state
 
@@ -265,6 +334,7 @@ Session
 最初の implementation slice では provisioning receipt / record を別 record として持ち、runtime は workspace_ready 後だけ生成してよい。
 
 重要なのは、workspace が先に存在して偶然 session が紐づくのではなく、**session request / operation が provisioning ownership を持つ**こと。
+provisioning ownership は caller-supplied `operation_id` の Accepted receipt で、最初の session-owned 副作用より前に確立する (§5.3)。receipt の無い workspace allocation を発生させない。
 
 ## 7. RepositoryStore contract
 
@@ -383,7 +453,7 @@ WorkspaceBinding
 7. jj managed flow で mutating Git と mutating jj を unrestricted に混在させない。
 8. Git branch/bookmark は Session / Workspace identity にしない。
 9. agent completion != verification success != delivery success。
-10. provisioning retry は operation receipt で idempotent にする。
+10. provisioning retry は caller-supplied `operation_id` + durable operation receipt で idempotent にする (§5.3)。receipt は最初の session-owned 副作用より前に確立し、応答喪失・crash・同時再送で Session / Workspace を二重作成しない。同じ key + 異なる request は `operation_conflict`、照合不能は `reconciliation_required` で fail closed。
 
 ## 12. Compatibility migration
 
@@ -398,10 +468,11 @@ behavior-preserving:
 
 ### Phase S1 — provisioning planner
 
-- session request owns provisioning operation id
+- session request (caller-supplied `operation_id`) owns the provisioning operation
+- establish Accepted receipt / operation ownership before the first session-owned side effect (§5.3)
 - resolve configured repository-store root / workspace pool
 - ensure store
-- fetch / pin base
+- fetch / pin base (pinned revision は receipt に記録し、同じ operation の再送で再選択しない)
 - produce a machine-readable plan
 - no agent start until plan is complete
 
@@ -459,6 +530,8 @@ Acceptance:
 
 This packet creates the seam required before repository provisioning is wired into session start.
 
+S0a landed via PR #86; conformance to the strengthened §3 contract is tracked by `issues/polished/20260929-s0a-contract-conformance.md` and must land before S1+ packets wire `SessionStartSpec` / `RepositoryId` into managed `session_start`.
+
 ## 14. Follow-on implementation packets
 
 ### S1a — RepositoryStore adapter
@@ -485,8 +558,8 @@ This packet creates the seam required before repository provisioning is wired in
 
 ### S3a — repository-first session start
 
-- public MCP/CLI composition
-- provisioning receipt / retry
+- public MCP/CLI composition (required caller-supplied `operation_id`, §5.3)
+- expose replay / `operation_conflict` / `reconciliation_required` retry semantics on the caller surface (receipt durability は S1 で確立済み。S3a へ先送りしない)
 - session_info projection
 - compatibility path explicitly marked ExistingWorkspace
 
@@ -508,6 +581,20 @@ This packet creates the seam required before repository provisioning is wired in
 - [ ] caller does not need host-local physical paths for managed repository start.
 - [ ] named roots remain enforced as host filesystem admission, not durable workspace identity.
 - [ ] Existing dirty/unmanaged checkout is never silently migrated or modified.
+- [ ] managed `session_start` requires a caller-supplied `operation_id` and never double-creates Session / Workspace across lost responses, retries, crashes, or concurrent resends (§5.3).
+
+### Provisioning retry scenarios (受入 test 仕様)
+
+以下は S1〜S3a 実装 packet が automated test として実装する受入仕様であり、実行済み test の報告ではない。
+
+- 初回成功後に応答だけ喪失 → 同じ key の再送は同じ SessionId / WorkspaceId / result を返す
+- 同じ key の同時到着 → provisioning は二重化しない
+- 同じ key + 異なる request → `operation_conflict`、追加副作用なし
+- Accepted receipt 確立後の crash → 同じ operation として再開・照合
+- workspace 作成後・Completed receipt 保存前の crash → 根拠なく再作成せず、安全に照合または `reconciliation_required` で fail closed
+- remote base 更新後の retry → 初回に pin した revision を維持する
+- 異なる authenticated caller から同じ key → 他者の receipt / Session を取得できない
+- 明示的に新しい key → policy の範囲内で別 Session を作成可能
 
 ## 16. Principle
 
