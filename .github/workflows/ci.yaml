@@ -24,6 +24,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install pinned gateway tooling
+        run: npm ci --prefix gateway
+
       - name: Test gateway contract and runtime
         run: npm test --prefix gateway
 

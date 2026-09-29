@@ -12,6 +12,7 @@
     "deploy:dry-run": "wrangler deploy --dry-run"
   },
   "devDependencies": {
+    "@mizchi/vlmkit": "^0.22.0",
     "wrangler": "4.142.0"
   },
   "engines": {
