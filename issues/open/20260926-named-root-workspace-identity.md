@@ -53,35 +53,37 @@ temote-mcp start temote
 
 where cwd is passed to the supervisor as the workspace.
 
-That leaves two workspace identity models:
+That leaves two filesystem admission/location models:
 
-1. logical named-root-relative identity
-2. ambient cwd / absolute-path identity
+1. configured named-root-relative location
+2. ambient cwd / absolute-path location
 
-The second model should be removed as an authority model.
+The second model should be removed as an authority model. Neither location form is the durable identity of a new session-first managed workspace; that identity is owned by Temote records.
 
 ## 3. Why named roots should be mandatory
 
-### 3.1 One workspace identity model
+### 3.1 One filesystem admission model
 
-Temote should identify a workspace logically:
+Temote should admit host-local workspaces through configured roots rather than treating an arbitrary host-specific physical path as authority.
+
+For existing-workspace compatibility, a logical location such as:
 
 ```text
 src/temote-mcp
 ```
 
-rather than by a host-specific physical path:
+is preferable to:
 
 ```text
 /Volumes/devstorage/Developer/temote-mcp
 /home/fu2hito/src/temote-mcp
 ```
 
-Physical paths remain necessary locally, but they should be implementation details resolved from the root registry.
+For new managed-repository sessions, Temote allocates a WorkspaceId and generates the location under an admitted workspace pool. Physical/root-relative paths remain host-local placement data, not the durable workspace identity.
 
 ### 3.2 Local and remote become equivalent
 
-The caller should not change the workspace contract.
+The caller should not change the admission/provisioning contract.
 
 These should resolve through the same code path:
 
@@ -93,7 +95,7 @@ Fabric-routed caller
 Codex/OpenCode/Devin backend
 ```
 
-The difference is transport and authority, not workspace identity.
+The difference is transport and authority, not how workspace admission is enforced or how durable IDs are assigned.
 
 ### 3.3 Fail closed
 
@@ -115,19 +117,13 @@ linux-main:
   src -> /home/fu2hito/src
 ```
 
-Both can still refer to:
-
-```text
-src/temote-mcp
-```
-
-without requiring the physical path to match.
+Both can expose the same logical root label and can host equivalent Temote workspace pools without requiring the physical path to match. Existing-workspace compatibility paths may still use coordinates such as `src/temote-mcp`; generated managed workspaces use WorkspaceId as durable identity.
 
 ### 3.5 Durable metadata
 
 Observation, context, memory, VCS state, checkpoints, delegation continuation, and Fabric replication should not primarily key durable state by machine-specific absolute cwd.
 
-A named-root-relative identity is a better stable coordinate.
+For new managed-repository sessions, key durable state by SessionId / RepositoryId / WorkspaceId / ChangeId. Named-root-relative coordinates remain useful host-local provenance/admission metadata and compatibility location references.
 
 ## 4. Important distinction: root registry vs environment variable
 
@@ -232,7 +228,7 @@ Temote must reverse-resolve cwd into a configured named root:
 src/temote-mcp
 ```
 
-The resulting managed session is identical to an explicit named-root-relative start.
+The resulting existing-workspace compatibility session is identical to an explicit named-root-relative start.
 
 ### 6.3 Unregistered cwd
 
@@ -295,7 +291,7 @@ Repository identity answers:
 
 Workspace identity answers:
 
-> which concrete working copy / branch / worktree state is this?
+> which Temote-managed writable workspace is this, independent of its generated host-local path and VCS backend?
 
 Do not collapse these into one identifier.
 
