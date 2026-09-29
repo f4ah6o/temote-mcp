@@ -3,7 +3,9 @@ import test, { after, before } from "node:test";
 
 import {
   DASHBOARD_RUNTIME_CLIENT_TOKEN,
+  DASHBOARD_RUNTIME_FEDERATED_TOKEN,
   DASHBOARD_RUNTIME_HOST_TOKEN,
+  createDashboardAccessFixture,
   startDashboardRuntime,
 } from "./dashboard-runtime-harness.mjs";
 
@@ -57,7 +59,11 @@ after(async () => {
 });
 
 async function request(path, init) {
-  const response = await runtime.fetch(path, init);
+  return requestWith(runtime, path, init);
+}
+
+async function requestWith(targetRuntime, path, init) {
+  const response = await targetRuntime.fetch(path, init);
   return {
     response,
     body: await response.text(),
@@ -103,6 +109,7 @@ test("actual Workers Static Assets routing keeps canonical dashboard files behin
       /Temote Fabric dashboard|REFRESH_FOREGROUND_MS|color-scheme:\s*light/,
       `${route}: no dashboard shell or asset content before auth`,
     );
+    assert.equal(unauthenticated.response.headers.has("location"), false, `${route}: no redirect before auth`);
 
     const clientTokenOnly = await request(route, {
       headers: { authorization: `Bearer ${DASHBOARD_RUNTIME_CLIENT_TOKEN}` },
@@ -120,6 +127,13 @@ test("actual Workers Static Assets routing keeps canonical dashboard files behin
     });
     assert.equal(hostTokenOnly.response.status, 401, `${route}: HOST_TOKEN must not authorize dashboard`);
     assertDashboardResponseIsPrivate(hostTokenOnly.response, route);
+
+    const federatedHostTokenOnly = await request(route, {
+      headers: { authorization: `Bearer ${DASHBOARD_RUNTIME_FEDERATED_TOKEN}` },
+    });
+    assert.equal(federatedHostTokenOnly.response.status, 401, `${route}: federated host token must not authorize dashboard`);
+    assertDashboardResponseIsPrivate(federatedHostTokenOnly.response, route);
+
   }
 });
 
@@ -129,6 +143,7 @@ test("dashboard aliases cannot expose Static Assets or escape dashboard response
       ["without token", undefined],
       ["CLIENT_TOKEN only", { authorization: `Bearer ${DASHBOARD_RUNTIME_CLIENT_TOKEN}` }],
       ["HOST_TOKEN only", { authorization: `Bearer ${DASHBOARD_RUNTIME_HOST_TOKEN}` }],
+      ["federated host token only", { authorization: `Bearer ${DASHBOARD_RUNTIME_FEDERATED_TOKEN}` }],
     ]) {
       await context.test(`${alias} ${label}`, async () => {
         const result = await request(alias, { headers });
@@ -187,4 +202,72 @@ test("existing /mcp CLIENT_TOKEN and /healthz behavior still works in the real W
   assert.equal(healthPayload.readiness, "ready");
   assert.equal(healthPayload.identity, "temote-mcp-gateway");
   assert.match(healthPayload.contractFingerprint, /^[0-9a-f]{64}$/);
+});
+
+test("a verified Access JWT reaches the real configured Static Assets binding", async () => {
+  const fixture = await createDashboardAccessFixture();
+  const assertion = await fixture.sign();
+  const validHeaders = { "cf-access-jwt-assertion": assertion };
+  const accessRuntime = await startDashboardRuntime({ accessFixture: fixture });
+
+  try {
+    const redirect = await requestWith(accessRuntime, "/dash", { headers: validHeaders });
+    assert.equal(redirect.response.status, 308);
+    assert.equal(redirect.response.headers.get("location"), "/dash/");
+    assertDashboardResponseIsPrivate(redirect.response, "/dash");
+
+    const shell = await requestWith(accessRuntime, "/dash/", { headers: validHeaders });
+    assert.equal(shell.response.status, 200);
+    assert.match(shell.response.headers.get("content-type") ?? "", /text\/html/i);
+    assert.match(shell.body, /<title>Temote Fabric dashboard<\/title>/);
+    assert.match(shell.body, /<script type="module" src="\/dash\/app\.js"><\/script>/);
+    assertDashboardResponseIsPrivate(shell.response, "/dash/");
+
+    const app = await requestWith(accessRuntime, "/dash/app.js", { headers: validHeaders });
+    assert.equal(app.response.status, 200);
+    assert.match(app.response.headers.get("content-type") ?? "", /javascript/i);
+    assert.match(app.body, /REFRESH_FOREGROUND_MS/);
+    assertDashboardResponseIsPrivate(app.response, "/dash/app.js");
+
+    const styles = await requestWith(accessRuntime, "/dash/styles.css", { headers: validHeaders });
+    assert.equal(styles.response.status, 200);
+    assert.match(styles.response.headers.get("content-type") ?? "", /text\/css/i);
+    assert.match(styles.body, /--ink:/);
+    assertDashboardResponseIsPrivate(styles.response, "/dash/styles.css");
+
+    for (const alias of [
+      "/%64ash/",
+      "/%64ash/app.js",
+      "/dash%2fapp.js",
+      "/DASH/app.js",
+      "/dash//app.js",
+      "/dash/app.js/",
+      "/dash/index.html",
+      "/dash/unknown/index.html",
+    ]) {
+      const result = await requestWith(accessRuntime, alias, { headers: validHeaders });
+      assert.equal(result.response.status, 404, `${alias}: aliases and direct index paths must not fall through to an asset`);
+      assert.doesNotMatch(result.body, /Temote Fabric dashboard|REFRESH_FOREGROUND_MS|color-scheme:\s*light/);
+      assertDashboardResponseIsPrivate(result.response, alias);
+    }
+
+    const authorizedOptions = await requestWith(accessRuntime, "/dash/api/v1/bootstrap", {
+      method: "OPTIONS",
+      headers: validHeaders,
+    });
+    assert.equal(authorizedOptions.response.status, 405);
+    assertDashboardResponseIsPrivate(authorizedOptions.response, "authorized dashboard OPTIONS");
+
+    const assertionParts = assertion.split(".");
+    const changedSignature = assertionParts[2][0] === "A" ? "B" : "A";
+    assertionParts[2] = `${changedSignature}${assertionParts[2].slice(1)}`;
+    const invalidJwt = await requestWith(accessRuntime, "/dash/app.js", {
+      headers: { "cf-access-jwt-assertion": assertionParts.join(".") },
+    });
+    assert.equal(invalidJwt.response.status, 401);
+    assertRejectedWithoutDashboardContent(invalidJwt, "/dash/app.js with invalid signature");
+    assertDashboardResponseIsPrivate(invalidJwt.response, "/dash/app.js with invalid signature");
+  } finally {
+    await accessRuntime.close();
+  }
 });
