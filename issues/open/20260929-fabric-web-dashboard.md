@@ -436,7 +436,9 @@ summary が表現する内容:
 state              = none | pending | unknown | unsupported | unavailable
 count?             bounded integer (source が件数を確定できる場合のみ)
 types?             allow-listed 種別の bounded 配列
-summary_revision   observer 書込みごとに増加する独立 revision
+summary_revision   summary 内容 (state / count / types) が変化した
+                   書込みで増加する独立 revision
+                   (`observed_at` のみの更新では増やさない)
 observed_at        backend を実際に観測した時刻
 runtime_generation summary を生成した runtime owner の generation
 expires_at         observed_at + TTL
@@ -458,6 +460,12 @@ freshness / generation:
 
 - `summary_revision` は task `revision` / task status とは独立に増加し、
   summary だけが変化した場合にも UI が更新を検出できる。
+- event-driven producer (Codex / Devin ACP) は observer interval ごとに
+  `observed_at` を再記述し、owner が生存し最後に確認した pending 状態が
+  継続していることを再確認する(backend への再取得ではなく、
+  所有中 runtime の in-process 状態による heartbeat)。
+  heartbeat が止まった summary は `expires_at` で `unavailable` になるため、
+  長時間 pending の request で marker が消えない。
 - `observed_at` は backend 観測時刻であり、HTTP response 生成時刻や
   host 接続確認時刻で古い summary を fresh にしない。
 - summary は `runtime_generation` を持ち、runtime generation 変更後に
@@ -481,8 +489,8 @@ backend ごとの support 判定と取得元(実ファイル確認済み):
 | backend | v1 support | safe metadata の実際の取得元 | 更新主体・保存先 | freshness / generation | 取得不能・未対応時 | 追加する prerequisite |
 |---|---|---|---|---|---|---|
 | OpenCode | supported | 既存 `pending_interactions()` の scoped read: `session_list` + `permission_list` + `question_list` を対象 OpenCode session と descendant session に絞り込む (`MAX_PENDING_INTERACTIONS` = 64) | 所有中 runtime に対する runtime owner の定期 scoped read → task metadata | `observed_at` + `runtime_generation` | `unavailable` | `task_list` read から分離された observer と summary 保存 field |
-| Codex (app-server) | supported | runtime JSON-RPC channel の approval request event(現行 `mark_waiting_approval` が `waiting_approval` を record に記録する経路) | 既存 approval event path が bounded summary を task metadata に永続化 | `observed_at` + `runtime_generation` | `unavailable` | status 記録と同じ owner が summary を永続化する field |
-| Devin ACP | supported | `session/request_permission` event と task binding に永続される `pending_permissions` (`mark_task_waiting_approval` 経路) | 既存 permission event path が bounded summary を task metadata に永続化 | `observed_at` + `runtime_generation` | `unavailable` | binding 永続化と同じ owner が summary を永続化する field |
+| Codex (app-server) | supported | runtime JSON-RPC channel の approval request event(現行 `mark_waiting_approval` が `waiting_approval` を record に記録する経路) | 既存 approval event path が bounded summary を task metadata に永続化 + interval heartbeat で `observed_at` を更新 | `observed_at` + `runtime_generation` | `unavailable` | status 記録と同じ owner が summary を永続化する field |
+| Devin ACP | supported | `session/request_permission` event と task binding に永続される `pending_permissions` (`mark_task_waiting_approval` 経路) | 既存 permission event path が bounded summary を task metadata に永続化 + interval heartbeat で `observed_at` を更新 | `observed_at` + `runtime_generation` | `unavailable` | binding 永続化と同じ owner が summary を永続化する field |
 | Devin Cloud | supported | remote session の `status_detail` の bounded read(既存 reconcile が `waiting_for_approval` → `WaitingApproval` に導出する値) | runtime owner の定期 remote status read → task metadata | `observed_at` + `runtime_generation` | `unavailable` | `task_get` 外で status のみを読む observer と summary 保存 field |
 
 - `types` は `permission` / `question` (OpenCode) と `approval`
