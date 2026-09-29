@@ -1,7 +1,7 @@
 const PRODUCER_SCHEMA_VERSION = 1;
-const EXTRACTION_POLICY_VERSION = 5;
+const EXTRACTION_POLICY_VERSION = 6;
 const PROMPT_VERSION = 4;
-const EXTRACTOR_ADAPTER_VERSION = 3;
+const EXTRACTOR_ADAPTER_VERSION = 4;
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "minimal", "none", "max", "xhigh"]);
 const MAX_PROVIDER_ENVELOPE_BYTES = 80 * 1024;
 

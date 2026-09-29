@@ -875,6 +875,8 @@ This stage gives multi-host deterministic continuity before O3 model extraction.
 - [x] supersession
 - [x] stable-run retry idempotency
 - [x] worker failure does not alter Task / Execution
+- [x] policy reinstatement is a state transition, not deduplicated support (policy v6 / adapter v4)
+- [x] tail observations that exceed the remaining input budget defer to the next batch (policy v6 / adapter v4)
 
 ### C5 — O4 knowledge-aware cloud resolver
 

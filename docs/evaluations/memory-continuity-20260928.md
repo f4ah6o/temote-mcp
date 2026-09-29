@@ -457,6 +457,63 @@ These are local implementation checks, not an adapter-v3 live-model or
 Cloudflare remote qualification. Independent review of this follow-up diff
 was still pending at this report snapshot.
 
+### Policy v6 / adapter v4 validation follow-up
+
+Independent review of the memory plane found two projection defects on the
+reviewed head `bc6fcc6b2bff1cde6fb8e7783ad5f2631122cf64`. The fix advances
+the extraction policy version from 5 to 6 and the adapter version from 3
+to 4; prompt version 4 and producer schema version 1 are unchanged.
+
+- Policy reinstatement (A→B→A): re-stating policy text that an in-batch
+  change already superseded was folded into the dead staged item as extra
+  support, so the reinstatement never received its own state transition
+  and the intermediate policy stayed current. `prepareProjection` now
+  merges support only into a live staged item, excludes rows superseded
+  earlier in the same batch from live-row matching and conflict
+  targeting, and `canonicalFirstUnion` opens a new canonical item for
+  every `changed` clause instead of merging it into the earlier
+  same-text group. Same-batch `[A,B,A]` and the `[A]→[B]→[A]`,
+  `[A]→[B,A]`, and `[A,B]→[A]` splits all converge on the last-adopted
+  policy through the fixture adapter and the real `openai_compatible`
+  adapter path, verified on workerd/D1 with the public `context_resolve`
+  surface.
+- Input budget deferral: `boundedInput` truncated or emptied an
+  observation's sanitized preview to fit the remaining batch window and
+  still consumed its `cloud_seq`, so a policy whose metadata fit but
+  whose content did not was lost while the checkpoint advanced past it.
+  An observation is now selected only when its complete sanitized
+  extraction input — preview, canonical clauses, change predecessors,
+  and JSON escaping inside the serialized `{observations:...}` payload —
+  fits the remaining window; otherwise it defers to the next batch. An
+  observation that can never fit follows the existing bounded
+  failure/retry/diagnostic contract without advancing the checkpoint.
+
+Producer-version isolation prevents completed runs under the prior
+adapter/policy pair from being reused as v6/v4 work. Deploying these
+changes requires a monotonic `MEMORY_PROJECTION_GENERATION` increase so
+the projection is rebuilt from retained observations; queue redelivery
+alone does not repair gaps behind an already-advanced checkpoint. The
+rebuild does not alter raw observations; the previous valid projection
+remains readable and is marked stale until the new projection is
+published.
+
+Local verification for this follow-up, based on source HEAD `bc6fcc6`
+plus the fix commits `008bc3d` (reinstatement) and `62b98b2` (input
+budget):
+
+- Pre-fix reproduction captured the findings: the new reinstatement
+  suite failed 4/7 cases and the new input-budget suite failed 7/11
+  cases on the reviewed head; the same suites pass 7/7 and 11/11 after
+  the fix.
+- `npm test` in `gateway/` passed 269/269 including real workerd/D1
+  coverage; `cargo fmt --all -- --check`, `cargo clippy --all-targets --
+  -D warnings`, `cargo check --no-default-features --all-targets`, the
+  generated-contract check (`just check-generated`), `npm run
+  deploy:dry-run`, and `git diff --check` passed.
+- These are local implementation checks, not a v6/v4 live-model or
+  Cloudflare remote qualification. Independent review of this follow-up
+  diff was still pending at this report snapshot.
+
 ## Ending state
 
 The live-qualified feature source was HEAD
