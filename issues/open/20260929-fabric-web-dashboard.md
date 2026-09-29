@@ -1,9 +1,12 @@
 # Fabric Dashboard: Zero Trust 配下の `/dash` Web dashboard
 
-Status: open / design ready  
+Status: open / implementation in progress  
 Repository: `f4ah6o/temote-mcp`  
 Priority: P1 operator visibility  
 Created: 2026-09-29 (Asia/Tokyo)  
+Updated: 2026-09-29  
+Model: gpt-6-sol  
+Branch: feat/fabric-web-dashboard  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
 Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
 Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
@@ -1107,3 +1110,7 @@ Design baseline checked 2026-09-29:
   https://developers.cloudflare.com/workers/static-assets/routing/worker-script/
 
 Platform-specific behavior must be rechecked when implementation starts; repo security/authority invariants remain the source of truth.
+
+## 17. Implementation tracking
+
+D0–D4 implementation and gates are tracked in [the acceptance matrix](../../docs/evaluations/fabric-dashboard-20260929.md). The design-stage statement in §6 does not restrict the authorized runtime implementation. This issue remains open until all acceptance gates are evidenced. Deployed acceptance and independent PR review are separate from local tests.
