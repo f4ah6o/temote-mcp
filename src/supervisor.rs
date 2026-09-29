@@ -1,18 +1,41 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+#[cfg(feature = "network")]
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
+#[cfg(feature = "network")]
+use tokio::sync::watch;
+#[cfg(feature = "network")]
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use crate::approvals::{self, ApprovalReceiver, ApprovalSender, RuntimeHandle};
 use crate::config;
 use crate::named_roots::NamedRoots;
+#[cfg(feature = "network")]
+type CloudPendingObserver = crate::devin_cloud::CloudPendingObserver;
+
+#[cfg(not(feature = "network"))]
+struct CloudPendingObserver;
+
+impl CloudPendingObserver {
+    #[cfg(not(feature = "network"))]
+    fn new() -> Self {
+        Self
+    }
+
+    #[cfg(not(feature = "network"))]
+    async fn release_session(&self, _session: &config::Session) -> Result<()> {
+        Ok(())
+    }
+}
+
 use temote_mcp::activity::broker::{ActivityBroker, BrokerError};
 use temote_mcp::activity::contract::{
     ActivityErrorKind, ActivityOperation, ActivitySummary, ActivityUpdate,
@@ -323,11 +346,14 @@ pub struct SessionSupervisor {
     upgrade_fenced: AtomicBool,
     max_sessions: usize,
     activity_broker: Arc<ActivityBroker>,
-    cloud_pending_observer: crate::devin_cloud::CloudPendingObserver,
+    cloud_pending_observer: CloudPendingObserver,
+    #[cfg(feature = "network")]
     cloud_observer_shutdown: watch::Sender<bool>,
+    #[cfg(feature = "network")]
     cloud_observer_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
+#[cfg(feature = "network")]
 async fn run_cloud_pending_observer(
     supervisor: std::sync::Weak<SessionSupervisor>,
     mut shutdown: watch::Receiver<bool>,
@@ -373,6 +399,7 @@ async fn run_cloud_pending_observer(
 }
 
 impl SessionSupervisor {
+    #[cfg(feature = "network")]
     async fn stop_cloud_pending_observer(&self) {
         let _ = self.cloud_observer_shutdown.send(true);
         let task = self.cloud_observer_task.lock().unwrap().take();
@@ -389,6 +416,7 @@ impl SessionSupervisor {
     fn with_limit(roots: NamedRoots, max_sessions: usize) -> (Arc<Self>, ApprovalReceiver) {
         let (approval_sender, approval_receiver) = approvals::approval_channel();
         let activity_broker = Arc::new(ActivityBroker::new(activity_now_ms, Uuid::new_v4()));
+        #[cfg(feature = "network")]
         let (cloud_observer_shutdown, shutdown_receiver) = watch::channel(false);
         let supervisor = Arc::new(Self {
             roots,
@@ -401,10 +429,13 @@ impl SessionSupervisor {
             upgrade_fenced: AtomicBool::new(false),
             max_sessions,
             activity_broker,
-            cloud_pending_observer: crate::devin_cloud::CloudPendingObserver::new(),
+            cloud_pending_observer: CloudPendingObserver::new(),
+            #[cfg(feature = "network")]
             cloud_observer_shutdown,
+            #[cfg(feature = "network")]
             cloud_observer_task: StdMutex::new(None),
         });
+        #[cfg(feature = "network")]
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let weak = Arc::downgrade(&supervisor);
             let task = runtime.spawn(run_cloud_pending_observer(weak, shutdown_receiver));
@@ -1891,6 +1922,7 @@ impl SessionSupervisor {
     pub async fn shutdown(&self) -> Result<()> {
         let _transition = self.transitions.lock().await;
         self.closed.store(true, Ordering::Release);
+        #[cfg(feature = "network")]
         self.stop_cloud_pending_observer().await;
         let handles = {
             let mut sessions = self.sessions.lock().await;

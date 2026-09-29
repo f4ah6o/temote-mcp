@@ -11,6 +11,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::pending_interaction::{
+    InteractionType, PendingInteractionSummary, ProducerKind, REFRESH_INTERVAL_SECS, Summary,
+    SummaryState,
+};
 use crate::{approvals, config, evidence};
 
 const TASK_SCHEMA_VERSION: u64 = 1;
@@ -423,6 +428,8 @@ struct TaskRecord {
     #[serde(default)]
     usage: Option<BTreeMap<String, u64>>,
     #[serde(default)]
+    pending_interaction: Option<PendingInteractionSummary>,
+    #[serde(default)]
     observed_model: Option<String>,
     #[serde(default)]
     report: Option<Value>,
@@ -693,6 +700,18 @@ impl TaskStore {
         self.ensure_directory()?;
         validate_record(record)?;
         self.prune_locked(record)?;
+        self.write_record_locked(record)
+    }
+
+    /// Persist runtime-owned summary metadata without pruning other records or
+    /// extending task retention.
+    fn save_metadata_locked(&self, record: &TaskRecord) -> Result<()> {
+        self.ensure_directory()?;
+        validate_record(record)?;
+        self.write_record_locked(record)
+    }
+
+    fn write_record_locked(&self, record: &TaskRecord) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(record)?;
         anyhow::ensure!(
             bytes.len() <= MAX_TASK_RECORD_BYTES,
@@ -757,6 +776,154 @@ impl TaskStore {
         record.updated_at = config::unix_time();
         self.save_locked(&record)?;
         Ok(record)
+    }
+
+    /// Persist the bounded approval summary from the current connected ACP
+    /// runtime without changing task timestamps, status, revision, or receipts.
+    fn observe_pending_interaction(
+        &self,
+        session: &config::Session,
+        task_id: Uuid,
+        runtime_instance_id: Uuid,
+        expected_generation: Option<u64>,
+    ) -> Result<bool> {
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(false);
+        }
+
+        let (client, connection_signal) = {
+            let registered = runtimes().lock().unwrap();
+            let Some(runtime) = registered.get(&task_id) else {
+                return Ok(false);
+            };
+            if runtime.instance_id != runtime_instance_id {
+                return Ok(false);
+            }
+            (runtime.client.clone(), runtime.client.connection_signal())
+        };
+        if !client.is_connected() {
+            return Ok(false);
+        }
+
+        let (snapshot_generation, snapshot_session_id) = {
+            let _guard = self.lock()?;
+            if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+                return Ok(false);
+            }
+            let record = self.load_locked(session, task_id)?;
+            let now = config::unix_time();
+            if record.status.is_terminal()
+                || now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+                || expected_generation.is_some_and(|generation| generation != record.generation)
+            {
+                return Ok(false);
+            }
+            if record.generation == 0 {
+                return Ok(true);
+            }
+            (record.generation, record.acp_session_id.clone())
+        };
+
+        let pending_snapshot = client.pending_permission_snapshot();
+        let observed_at = config::unix_time();
+
+        let _guard = self.lock()?;
+        if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+            return Ok(false);
+        }
+
+        let mut record = self.load_locked(session, task_id)?;
+        let now = config::unix_time();
+        if record.status.is_terminal()
+            || now.saturating_sub(record.updated_at) >= TASK_RETENTION_SECONDS
+            || expected_generation.is_some_and(|generation| generation != record.generation)
+            || record.generation != snapshot_generation
+            || record.acp_session_id != snapshot_session_id
+        {
+            return Ok(false);
+        }
+        if connection_signal
+            .as_ref()
+            .is_some_and(|connected| !connected.load(Ordering::Acquire))
+        {
+            return Ok(false);
+        }
+        if record.generation == 0 {
+            return Ok(true);
+        }
+
+        let pending_count = (pending_snapshot.session_loaded
+            && pending_snapshot.session_id.as_deref() == record.acp_session_id.as_deref())
+        .then_some(pending_snapshot.pending_count);
+        let Some(pending_count) = pending_count else {
+            record.pending_interaction = Some(Summary::unavailable(
+                record.pending_interaction.as_ref(),
+                ProducerKind::RuntimeOwner,
+                record.generation,
+            )?);
+            if !runtime_registration_matches(session, task_id, runtime_instance_id)
+                || connection_signal
+                    .as_ref()
+                    .is_some_and(|connected| !connected.load(Ordering::Acquire))
+            {
+                return Ok(false);
+            }
+            self.save_metadata_locked(&record)?;
+            return Ok(true);
+        };
+
+        if pending_count == 0
+            && (!pending_snapshot.pending_state_ready
+                || record.status == TaskStatus::WaitingApproval)
+        {
+            record.pending_interaction = Some(Summary::unavailable(
+                record.pending_interaction.as_ref(),
+                ProducerKind::RuntimeOwner,
+                record.generation,
+            )?);
+            if !runtime_registration_matches(session, task_id, runtime_instance_id)
+                || connection_signal
+                    .as_ref()
+                    .is_some_and(|connected| !connected.load(Ordering::Acquire))
+            {
+                return Ok(false);
+            }
+            self.save_metadata_locked(&record)?;
+            return Ok(true);
+        }
+
+        let count = pending_count.min(crate::pending_interaction::MAX_COUNT as u64) as u8;
+        let state = if pending_count == 0 {
+            SummaryState::None
+        } else if pending_count > crate::pending_interaction::MAX_COUNT as u64 {
+            SummaryState::Unavailable
+        } else {
+            SummaryState::Pending
+        };
+        let types = if pending_count == 0 {
+            Vec::new()
+        } else {
+            vec![InteractionType::Approval]
+        };
+        record.pending_interaction = Some(Summary::observe(
+            record.pending_interaction.as_ref(),
+            state,
+            Some(count),
+            &types,
+            pending_count > crate::pending_interaction::MAX_COUNT as u64,
+            ProducerKind::RuntimeOwner,
+            record.generation,
+            observed_at,
+        )?);
+        if !runtime_registration_matches(session, task_id, runtime_instance_id)
+            || connection_signal
+                .as_ref()
+                .is_some_and(|connected| !connected.load(Ordering::Acquire))
+        {
+            return Ok(false);
+        }
+        self.save_metadata_locked(&record)?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1397,6 +1564,9 @@ fn validate_record(record: &TaskRecord) -> Result<()> {
             "Devin task usage has unsupported fields"
         );
     }
+    if let Some(summary) = &record.pending_interaction {
+        summary.validate()?;
+    }
     Ok(())
 }
 
@@ -1556,6 +1726,13 @@ enum AcpClient {
     Fake(Arc<Mutex<FakeAcp>>),
 }
 
+struct AcpPendingPermissionSnapshot {
+    session_id: Option<String>,
+    session_loaded: bool,
+    pending_count: u64,
+    pending_state_ready: bool,
+}
+
 /// Accumulated per-session turn state kept in sync by the stdio actor (or the
 /// test fake). `session/prompt` is a long-running JSON-RPC request: its
 /// response carries the turn's `stopReason`.
@@ -1563,6 +1740,7 @@ enum AcpClient {
 struct AcpShared {
     session_id: Option<String>,
     session_loaded: bool,
+    pending_state_ready: bool,
     prompts_in_flight: u32,
     last_stop_reason: Option<String>,
     last_prompt_error: Option<String>,
@@ -1577,9 +1755,11 @@ struct AcpShared {
 struct StdioAcp {
     tx: mpsc::Sender<ClientCommand>,
     actor: Arc<Mutex<Option<JoinHandle<()>>>>,
+    connected: Arc<AtomicBool>,
     state: Arc<Mutex<AcpShared>>,
     capabilities: Arc<Mutex<AcpCapabilities>>,
     tail: Arc<Mutex<String>>,
+    runtime_instance_id: Arc<Mutex<Option<Uuid>>>,
 }
 
 #[derive(Clone, Default)]
@@ -1623,9 +1803,78 @@ struct TaskBinding {
     task_id: Uuid,
     owner: SessionInstance,
     store: TaskStore,
+    runtime_instance_id: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl AcpClient {
+    fn is_connected(&self) -> bool {
+        match self {
+            Self::Stdio(inner) => inner.connected.load(Ordering::Acquire),
+            #[cfg(test)]
+            Self::Fake(fake) => !fake.lock().unwrap().dead,
+        }
+    }
+
+    fn connection_signal(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Stdio(inner) => Some(Arc::clone(&inner.connected)),
+            #[cfg(test)]
+            Self::Fake(_) => None,
+        }
+    }
+
+    fn bind_runtime_instance_id(&self, runtime_instance_id: Uuid) {
+        match self {
+            Self::Stdio(inner) => {
+                *inner.runtime_instance_id.lock().unwrap() = Some(runtime_instance_id);
+            }
+            #[cfg(test)]
+            Self::Fake(_) => {}
+        }
+    }
+
+    fn pending_permission_snapshot(&self) -> AcpPendingPermissionSnapshot {
+        let shared = match self {
+            Self::Stdio(inner) => inner.state.lock().unwrap(),
+            #[cfg(test)]
+            Self::Fake(fake) => {
+                let fake = fake.lock().unwrap();
+                let snapshot = {
+                    let state = fake.state.lock().unwrap();
+                    AcpPendingPermissionSnapshot {
+                        session_id: state.session_id.clone(),
+                        session_loaded: state.session_loaded,
+                        pending_count: state.pending_permissions as u64,
+                        pending_state_ready: state.pending_state_ready,
+                    }
+                };
+                return snapshot;
+            }
+        };
+        AcpPendingPermissionSnapshot {
+            session_id: shared.session_id.clone(),
+            session_loaded: shared.session_loaded,
+            pending_count: shared.pending_permissions as u64,
+            pending_state_ready: shared.pending_state_ready,
+        }
+    }
+
+    fn mark_pending_state_ready(&self, session_id: &str) {
+        let mark_ready = |state: &mut AcpShared| {
+            if state.session_loaded && state.session_id.as_deref() == Some(session_id) {
+                state.pending_state_ready = true;
+            }
+        };
+        match self {
+            Self::Stdio(inner) => mark_ready(&mut inner.state.lock().unwrap()),
+            #[cfg(test)]
+            Self::Fake(fake) => {
+                let fake = fake.lock().unwrap();
+                mark_ready(&mut fake.state.lock().unwrap());
+            }
+        }
+    }
+
     async fn request(&self, method: &'static str, params: Value) -> Result<Value> {
         match self {
             Self::Stdio(inner) => {
@@ -1693,7 +1942,10 @@ impl AcpClient {
                         Err(anyhow::Error::new(error).context("Devin ACP actor stopped"))
                     }
                     Ok(()) => match tokio::time::timeout(RPC_TIMEOUT, admitted_rx).await {
-                        Ok(Ok(Ok(()))) => Ok(reply_rx),
+                        Ok(Ok(Ok(()))) => {
+                            self.mark_pending_state_ready(session_id);
+                            Ok(reply_rx)
+                        }
                         Ok(Ok(Err(error))) => {
                             inner.state.lock().unwrap().prompts_in_flight -= 1;
                             Err(anyhow::anyhow!("Devin ACP prompt write failed: {error}"))
@@ -1710,7 +1962,13 @@ impl AcpClient {
                 }
             }
             #[cfg(test)]
-            Self::Fake(fake) => fake.lock().unwrap().prompt(session_id, text),
+            Self::Fake(fake) => {
+                let result = fake.lock().unwrap().prompt(session_id, text);
+                if result.is_ok() {
+                    self.mark_pending_state_ready(session_id);
+                }
+                result
+            }
         }
     }
 
@@ -1727,7 +1985,12 @@ impl AcpClient {
         });
         self.request("session/load", params).await?;
         match self {
-            Self::Stdio(inner) => inner.state.lock().unwrap().session_loaded = true,
+            Self::Stdio(inner) => {
+                let mut state = inner.state.lock().unwrap();
+                state.session_id = Some(session_id.to_owned());
+                state.session_loaded = true;
+                state.pending_state_ready = false;
+            }
             #[cfg(test)]
             Self::Fake(_) => {}
         }
@@ -1737,6 +2000,7 @@ impl AcpClient {
     async fn shutdown(&self) {
         match self {
             Self::Stdio(inner) => {
+                inner.connected.store(false, Ordering::Release);
                 let _ = inner.tx.send(ClientCommand::Shutdown).await;
                 let actor = inner.actor.lock().unwrap().take();
                 if let Some(actor) = actor {
@@ -1755,6 +2019,7 @@ impl AcpClient {
                 AcpShared {
                     session_id: state.session_id.clone(),
                     session_loaded: state.session_loaded,
+                    pending_state_ready: state.pending_state_ready,
                     prompts_in_flight: state.prompts_in_flight,
                     last_stop_reason: state.last_stop_reason.clone(),
                     last_prompt_error: state.last_prompt_error.clone(),
@@ -1773,6 +2038,7 @@ impl AcpClient {
                 AcpShared {
                     session_id: state.session_id.clone(),
                     session_loaded: state.session_loaded,
+                    pending_state_ready: state.pending_state_ready,
                     prompts_in_flight: state.prompts_in_flight,
                     last_stop_reason: state.last_stop_reason.clone(),
                     last_prompt_error: state.last_prompt_error.clone(),
@@ -1931,28 +2197,36 @@ async fn spawn_acp_once(
 
     let state = Arc::new(Mutex::new(AcpShared::default()));
     let capabilities = Arc::new(Mutex::new(AcpCapabilities::default()));
+    let runtime_instance_id = Arc::new(Mutex::new(None));
+    let connected = Arc::new(AtomicBool::new(true));
     let binding = task_id.map(|task_id| TaskBinding {
         session: session.clone(),
         task_id,
         owner: owner.clone(),
         store: store.clone(),
+        runtime_instance_id: Arc::clone(&runtime_instance_id),
     });
     let (tx, rx) = mpsc::channel(64);
     let actor = tokio::spawn(run_actor(
         child,
         stdin,
         stdout,
-        binding,
-        Arc::clone(&state),
         rx,
-        lease,
+        AcpActorContext {
+            binding,
+            state: Arc::clone(&state),
+            runtime_lease_guard: lease,
+            connected: Arc::clone(&connected),
+        },
     ));
     Ok(AcpClient::Stdio(Arc::new(StdioAcp {
         tx,
         actor: Arc::new(Mutex::new(Some(actor))),
+        connected,
         state,
         capabilities,
         tail,
+        runtime_instance_id,
     })))
 }
 
@@ -1986,15 +2260,35 @@ fn acp_environment_key_allowed(key: &OsStr) -> bool {
     key.starts_with("LC_") || ACP_CHILD_ENV_ALLOWLIST.contains(&key)
 }
 
+struct AcpActorContext {
+    binding: Option<TaskBinding>,
+    state: Arc<Mutex<AcpShared>>,
+    runtime_lease_guard: Option<Arc<TaskRuntimeLease>>,
+    connected: Arc<AtomicBool>,
+}
+
+struct AcpActorConnectionGuard(Arc<AtomicBool>);
+
+impl Drop for AcpActorConnectionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 async fn run_actor(
     mut child: tokio::process::Child,
     mut stdin: ChildStdin,
     stdout: ChildStdout,
-    binding: Option<TaskBinding>,
-    state: Arc<Mutex<AcpShared>>,
     mut commands: mpsc::Receiver<ClientCommand>,
-    runtime_lease_guard: Option<Arc<TaskRuntimeLease>>,
+    context: AcpActorContext,
 ) {
+    let AcpActorContext {
+        binding,
+        state,
+        runtime_lease_guard,
+        connected,
+    } = context;
+    let _connection_guard = AcpActorConnectionGuard(Arc::clone(&connected));
     let mut reader = BufReader::new(stdout);
     let (server_tx, mut server_rx) = mpsc::channel::<ServerResponse>(16);
     let mut next_id = 1u64;
@@ -2073,6 +2367,7 @@ async fn run_actor(
                                     task_id: binding.task_id,
                                     owner: binding.owner.clone(),
                                     store: binding.store.clone(),
+                                    runtime_instance_id: Arc::clone(&binding.runtime_instance_id),
                                 });
                                 let state = Arc::clone(&state);
                                 tokio::spawn(async move {
@@ -2268,7 +2563,9 @@ async fn handle_server_request(
                 }
                 shared.pending_permissions = shared.pending_permissions.saturating_add(1);
             }
-            mark_task_waiting_approval(binding, true);
+            if let Some(generation) = mark_task_waiting_approval(binding, true) {
+                publish_pending_interaction(binding, Some(generation)).await;
+            }
             let (detail, metadata) = permission_approval(binding.task_id, &params);
             let allowed = request_child_approval(
                 &binding.session,
@@ -2278,9 +2575,14 @@ async fn handle_server_request(
                 metadata,
             )
             .await;
-            mark_task_waiting_approval(binding, false);
-            let mut state = state.lock().unwrap();
-            state.pending_permissions = state.pending_permissions.saturating_sub(1);
+            let generation = mark_task_waiting_approval(binding, false);
+            {
+                let mut shared = state.lock().unwrap();
+                shared.pending_permissions = shared.pending_permissions.saturating_sub(1);
+            }
+            if let Some(generation) = generation {
+                publish_pending_interaction(binding, Some(generation)).await;
+            }
             if !allowed {
                 return Ok(json!({"outcome": {"outcome": "cancelled"}}));
             }
@@ -2320,8 +2622,8 @@ fn select_permission_option(params: &Value) -> Option<String> {
         })
 }
 
-fn mark_task_waiting_approval(binding: &TaskBinding, waiting: bool) {
-    let _ = binding
+fn mark_task_waiting_approval(binding: &TaskBinding, waiting: bool) -> Option<u64> {
+    binding
         .store
         .update(&binding.session, binding.task_id, |record| {
             if record.status.is_terminal() {
@@ -2336,7 +2638,32 @@ fn mark_task_waiting_approval(binding: &TaskBinding, waiting: bool) {
             };
             record.revision = record.revision.saturating_add(1);
             Ok(())
-        });
+        })
+        .ok()
+        .map(|record| record.generation)
+}
+
+async fn publish_pending_interaction(binding: &TaskBinding, expected_generation: Option<u64>) {
+    let permit = tokio::time::timeout(
+        Duration::from_secs(REFRESH_INTERVAL_SECS),
+        crate::pending_interaction::acquire_host_semaphore_permit(),
+    )
+    .await;
+    let Ok(Ok(_permit)) = permit else {
+        return;
+    };
+    let Some(runtime_instance_id) = *binding.runtime_instance_id.lock().unwrap() else {
+        return;
+    };
+    if !runtime_registration_matches(&binding.session, binding.task_id, runtime_instance_id) {
+        return;
+    }
+    let _ = binding.store.observe_pending_interaction(
+        &binding.session,
+        binding.task_id,
+        runtime_instance_id,
+        expected_generation,
+    );
 }
 
 fn permission_approval(task_id: Uuid, params: &Value) -> (String, BTreeMap<String, String>) {
@@ -2452,6 +2779,7 @@ struct RuntimeHandle {
     client: AcpClient,
     owner: SessionInstance,
     scope: PathBuf,
+    instance_id: Uuid,
     started_at: Instant,
     _lease: Arc<TaskRuntimeLease>,
 }
@@ -2479,6 +2807,50 @@ fn runtime_for(session: &config::Session, task_id: Uuid) -> Option<RuntimeHandle
     let runtime = runtime.clone();
     let scope = config::canonical_directory(&session.cwd).ok()?;
     (runtime.owner.matches(session) && runtime.scope == scope).then_some(runtime)
+}
+
+fn runtime_registration_matches(
+    session: &config::Session,
+    task_id: Uuid,
+    runtime_instance_id: Uuid,
+) -> bool {
+    let owner = SessionInstance::from_session(session);
+    if lifecycle_registry()
+        .lock()
+        .unwrap()
+        .entries
+        .get(&owner)
+        .is_some_and(|entry| entry.closing)
+    {
+        return false;
+    }
+    let Ok(scope) = config::canonical_directory(&session.cwd) else {
+        return false;
+    };
+    runtimes()
+        .lock()
+        .unwrap()
+        .get(&task_id)
+        .is_some_and(|runtime| {
+            runtime.instance_id == runtime_instance_id
+                && runtime.owner == owner
+                && runtime.scope == scope
+                && Instant::now().saturating_duration_since(runtime.started_at) < CHILD_LIFETIME
+                && runtime.client.is_connected()
+        })
+}
+
+fn take_runtime_if_instance(task_id: Uuid, runtime_instance_id: Uuid) -> Option<RuntimeHandle> {
+    let _guard = store_lock().lock().unwrap();
+    let mut state = runtimes().lock().unwrap();
+    if state
+        .get(&task_id)
+        .is_some_and(|runtime| runtime.instance_id == runtime_instance_id)
+    {
+        state.remove(&task_id)
+    } else {
+        None
+    }
 }
 
 fn runtime_matches_record(record: &TaskRecord) -> bool {
@@ -2511,11 +2883,14 @@ fn insert_runtime_unchecked(
 ) -> Result<()> {
     let owner = owner.clone();
     let store = store.clone();
+    let session = session.clone();
     let scope = config::canonical_directory(&session.cwd)?;
+    let runtime_instance_id = Uuid::new_v4();
     let runtime = RuntimeHandle {
         client: client.clone(),
         owner: owner.clone(),
         scope,
+        instance_id: runtime_instance_id,
         started_at: Instant::now(),
         _lease: lease,
     };
@@ -2535,11 +2910,27 @@ fn insert_runtime_unchecked(
             "Devin task runtime is already registered"
         );
         state.insert(task_id, runtime);
+        client.bind_runtime_instance_id(runtime_instance_id);
     }
+    let producer_session = session.clone();
+    let producer_store = store.clone();
     tokio::spawn(async move {
+        observe_pending_interactions(
+            producer_session,
+            task_id,
+            producer_store,
+            runtime_instance_id,
+        )
+        .await;
+    });
+    tokio::spawn(async move {
+        let lifetime = tokio::time::sleep(CHILD_LIFETIME);
+        tokio::pin!(lifetime);
+        let session_stop = wait_for_session_stop(owner.clone());
+        tokio::pin!(session_stop);
         let session_stopped = tokio::select! {
-            _ = tokio::time::sleep(CHILD_LIFETIME) => false,
-            _ = wait_for_session_stop(owner.clone()) => true,
+            _ = &mut lifetime => false,
+            _ = &mut session_stop => true,
         };
         let client = {
             let _guard = store_lock().lock().unwrap();
@@ -2547,22 +2938,13 @@ fn insert_runtime_unchecked(
                 .lock()
                 .unwrap()
                 .get(&task_id)
-                .filter(|runtime| runtime.owner == owner)
+                .filter(|runtime| runtime.instance_id == runtime_instance_id)
                 .map(|runtime| runtime.client.clone())
         };
         if let Some(client) = client {
             client.shutdown().await;
         }
-        {
-            let _guard = store_lock().lock().unwrap();
-            let mut state = runtimes().lock().unwrap();
-            if state
-                .get(&task_id)
-                .is_some_and(|runtime| runtime.owner == owner)
-            {
-                state.remove(&task_id);
-            }
-        }
+        let _ = take_runtime_if_instance(task_id, runtime_instance_id);
         if session_stopped {
             let result = async {
                 wait_for_session_inflight_drain(&owner, SESSION_TASK_DRAIN_TIMEOUT).await?;
@@ -2578,6 +2960,78 @@ fn insert_runtime_unchecked(
         }
     });
     Ok(())
+}
+
+async fn observe_pending_interactions(
+    session: config::Session,
+    task_id: Uuid,
+    store: TaskStore,
+    runtime_instance_id: Uuid,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(REFRESH_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !observe_pending_interaction_step(
+            &session,
+            task_id,
+            &store,
+            runtime_instance_id,
+            Duration::from_secs(REFRESH_INTERVAL_SECS),
+        )
+        .await
+        {
+            break;
+        }
+    }
+}
+
+async fn observe_pending_interaction_step(
+    session: &config::Session,
+    task_id: Uuid,
+    store: &TaskStore,
+    runtime_instance_id: Uuid,
+    permit_timeout: Duration,
+) -> bool {
+    observe_pending_interaction_step_with(
+        session,
+        task_id,
+        store,
+        runtime_instance_id,
+        permit_timeout,
+        crate::pending_interaction::acquire_host_semaphore_permit(),
+    )
+    .await
+}
+
+async fn observe_pending_interaction_step_with<F>(
+    session: &config::Session,
+    task_id: Uuid,
+    store: &TaskStore,
+    runtime_instance_id: Uuid,
+    permit_timeout: Duration,
+    acquire_permit: F,
+) -> bool
+where
+    F: std::future::Future<Output = Result<crate::pending_interaction::HostObservationPermit>>,
+{
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        return false;
+    }
+    let permit = match tokio::time::timeout(permit_timeout, acquire_permit).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return true,
+    };
+    if !runtime_registration_matches(session, task_id, runtime_instance_id) {
+        drop(permit);
+        return false;
+    }
+    let observed = store.observe_pending_interaction(session, task_id, runtime_instance_id, None);
+    drop(permit);
+    match observed {
+        Ok(true) | Err(_) => true,
+        Ok(false) => false,
+    }
 }
 
 async fn wait_for_session_stop(owner: SessionInstance) {
@@ -3316,6 +3770,7 @@ async fn task_start_with_store_and_binary(
         generation: 0,
         acp_session_id: None,
         usage: None,
+        pending_interaction: None,
         observed_model: None,
         report: None,
         last_error: None,
@@ -3414,6 +3869,7 @@ async fn task_start_with_store_and_binary(
                 let mut state = inner.state.lock().unwrap();
                 state.session_id = Some(acp_session_id.clone());
                 state.session_loaded = true;
+                state.pending_state_ready = true;
                 state.observed_model = observed_model.clone();
             }
             #[cfg(test)]
@@ -3422,6 +3878,7 @@ async fn task_start_with_store_and_binary(
                 let mut state = fake.state.lock().unwrap();
                 state.session_id = Some(acp_session_id.clone());
                 state.session_loaded = true;
+                state.pending_state_ready = true;
                 state.observed_model = observed_model.clone();
             }
         }
@@ -3665,6 +4122,8 @@ fn task_list_item(record: &TaskRecord) -> Value {
     let mut item = task_view(record, None);
     item["backend"] = json!("devin_acp");
     item["last_updated_at"] = json!(record.updated_at);
+    item["pending_interaction"] =
+        Summary::projection(record.pending_interaction.as_ref(), config::unix_time());
     item
 }
 
@@ -4021,8 +4480,10 @@ impl FakeAcp {
                     self.sessions.contains_key(session_id),
                     "unknown acp session {session_id}"
                 );
-                self.state.lock().unwrap().session_id = Some(session_id.to_owned());
-                self.state.lock().unwrap().session_loaded = true;
+                let mut state = self.state.lock().unwrap();
+                state.session_id = Some(session_id.to_owned());
+                state.session_loaded = true;
+                state.pending_state_ready = false;
                 Ok(json!({}))
             }
             _ => anyhow::bail!("unsupported fake method {method}"),
@@ -4751,6 +5212,7 @@ mod tests {
             generation: 0,
             acp_session_id: acp_session_id.map(str::to_owned),
             usage: None,
+            pending_interaction: None,
             observed_model: None,
             report: None,
             last_error: None,
@@ -4854,6 +5316,388 @@ mod tests {
             permission_mode: config::PermissionMode::Agent,
             grants: config::SessionGrants::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_interaction_owner_projection_is_instance_fenced() {
+        let workspace = tempdir();
+        let store = test_store(&workspace);
+        let owner = session(&workspace, "pending-owner");
+        let task_id = Uuid::new_v4();
+        let mut record = record_for(&owner, task_id, TaskStatus::Running, Some("acp-session"));
+        record.generation = 1;
+        record.revision = 7;
+        record.operations.push(OperationReceipt {
+            operation_id: Uuid::new_v4(),
+            request_fingerprint: Uuid::new_v4(),
+            action: "start".to_owned(),
+            phase: OperationPhase::Applied,
+            outcome: record.outcome(),
+        });
+        store.save(&record).unwrap();
+
+        let (client, fake) = fake_client(true);
+        let shared = fake.lock().unwrap().state.clone();
+        {
+            let mut state = shared.lock().unwrap();
+            state.session_id = Some("acp-session".to_owned());
+            state.session_loaded = true;
+            state.pending_state_ready = true;
+            state.pending_permissions = 2;
+        }
+        let old_instance_id = Uuid::new_v4();
+        let old_runtime_lease = Arc::new(
+            store
+                .try_acquire_runtime_lease(task_id)
+                .unwrap()
+                .expect("test runtime lease is unavailable"),
+        );
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: client.clone(),
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                instance_id: old_instance_id,
+                started_at: Instant::now(),
+                _lease: old_runtime_lease,
+            },
+        );
+
+        let expired_task_id = Uuid::new_v4();
+        let mut expired = record_for(&owner, expired_task_id, TaskStatus::Completed, None);
+        expired.updated_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS);
+        store.save(&expired).unwrap();
+
+        let original = store.read_record(task_id).unwrap();
+        let failed_permit: std::future::Ready<
+            Result<crate::pending_interaction::HostObservationPermit>,
+        > = std::future::ready(Err(anyhow::anyhow!("slot unavailable")));
+        assert!(
+            observe_pending_interaction_step_with(
+                &owner,
+                task_id,
+                &store,
+                old_instance_id,
+                Duration::from_millis(10),
+                failed_permit,
+            )
+            .await
+        );
+        assert!(runtime_registration_matches(
+            &owner,
+            task_id,
+            old_instance_id
+        ));
+        assert!(client.is_connected());
+
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        let pending = store.read_record(task_id).unwrap();
+        let summary = pending.pending_interaction.as_ref().unwrap();
+        assert_eq!(summary.state, SummaryState::Pending);
+        assert_eq!(summary.count, Some(2));
+        assert_eq!(summary.types, vec![InteractionType::Approval]);
+        assert_eq!(summary.summary_revision, 1);
+        assert_eq!(pending.created_at, original.created_at);
+        assert_eq!(pending.updated_at, original.updated_at);
+        assert_eq!(pending.status, original.status);
+        assert_eq!(pending.revision, original.revision);
+        assert_eq!(pending.generation, original.generation);
+        assert_eq!(pending.operations, original.operations);
+
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["state"],
+            "pending"
+        );
+        assert_eq!(listed["tasks"][0]["pending_interaction"]["count"], 2);
+        assert!(client.is_connected());
+        let permission_snapshot = client.pending_permission_snapshot();
+        assert!(permission_snapshot.session_loaded);
+        assert_eq!(
+            permission_snapshot.session_id.as_deref(),
+            Some("acp-session")
+        );
+        assert_eq!(permission_snapshot.pending_count, 2);
+        assert!(permission_snapshot.pending_state_ready);
+
+        shared.lock().unwrap().pending_permissions = 65;
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        let bounded = store.read_record(task_id).unwrap();
+        let bounded_summary = bounded.pending_interaction.as_ref().unwrap();
+        assert_eq!(bounded_summary.state, SummaryState::Unavailable);
+        assert_eq!(bounded_summary.count, Some(64));
+        assert!(bounded_summary.truncated);
+        assert_eq!(bounded_summary.summary_revision, 2);
+
+        shared.lock().unwrap().pending_permissions = 0;
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        let resolved = store.read_record(task_id).unwrap();
+        let resolved_summary = resolved.pending_interaction.as_ref().unwrap();
+        assert_eq!(resolved_summary.state, SummaryState::None);
+        assert_eq!(resolved_summary.count, Some(0));
+        assert_eq!(resolved_summary.summary_revision, 3);
+        assert_eq!(resolved.revision, original.revision);
+        assert_eq!(resolved.updated_at, original.updated_at);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        assert!(store.read_record(expired_task_id).is_ok());
+
+        let stale_summary = Summary::observe(
+            None,
+            SummaryState::Pending,
+            Some(1),
+            &[InteractionType::Approval],
+            false,
+            ProducerKind::RuntimeOwner,
+            1,
+            config::unix_time().saturating_sub(crate::pending_interaction::SUMMARY_TTL_SECS + 1),
+        )
+        .unwrap();
+        let mut expired_projection = store.read_record(task_id).unwrap();
+        expired_projection.pending_interaction = Some(stale_summary);
+        store.save(&expired_projection).unwrap();
+        let listed = task_list_with_store(&json!({}), &owner, &store).unwrap();
+        assert_eq!(
+            listed["tasks"][0]["pending_interaction"]["state"],
+            "unavailable"
+        );
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            expired_projection.pending_interaction
+        );
+        let mut out_of_retention = store.read_record(task_id).unwrap();
+        out_of_retention.updated_at = config::unix_time().saturating_sub(TASK_RETENTION_SECONDS);
+        store.save(&out_of_retention).unwrap();
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .is_ok_and(|observed| !observed)
+        );
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            out_of_retention.pending_interaction
+        );
+
+        let replacement_instance_id = Uuid::new_v4();
+        let old_runtime = take_runtime_if_instance(task_id, old_instance_id).unwrap();
+        drop(old_runtime);
+        let (replacement_client, _replacement_fake) = fake_client(true);
+        let mut replacement_record = store.read_record(task_id).unwrap();
+        replacement_record.generation = 2;
+        store.save(&replacement_record).unwrap();
+        let replacement_runtime_lease = Arc::new(
+            store
+                .try_acquire_runtime_lease(task_id)
+                .unwrap()
+                .expect("replacement test runtime lease is unavailable"),
+        );
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: replacement_client.clone(),
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                instance_id: replacement_instance_id,
+                started_at: Instant::now(),
+                _lease: replacement_runtime_lease,
+            },
+        );
+        let before_late_result = store.read_record(task_id).unwrap();
+        assert!(
+            !store
+                .observe_pending_interaction(&owner, task_id, old_instance_id, Some(1))
+                .unwrap()
+        );
+        assert!(take_runtime_if_instance(task_id, old_instance_id).is_none());
+        assert!(runtime_registration_matches(
+            &owner,
+            task_id,
+            replacement_instance_id
+        ));
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            before_late_result.pending_interaction
+        );
+
+        let mut generation_zero = store.read_record(task_id).unwrap();
+        generation_zero.generation = 0;
+        generation_zero.updated_at = config::unix_time();
+        store.save(&generation_zero).unwrap();
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, replacement_instance_id, Some(0))
+                .is_ok_and(|observed| observed)
+        );
+        assert_eq!(
+            store.read_record(task_id).unwrap().pending_interaction,
+            generation_zero.pending_interaction
+        );
+
+        let _ = take_runtime_if_instance(task_id, replacement_instance_id);
+        client.shutdown().await;
+        replacement_client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_interaction_restore_requires_matching_loaded_acp_session() {
+        let workspace = tempdir();
+        let store = test_store(&workspace);
+        let owner = session(&workspace, "pending-restore-owner");
+        let task_id = Uuid::new_v4();
+        let expected_session_id = "stored-acp-session";
+        let old_observed_at =
+            config::unix_time().saturating_sub(crate::pending_interaction::SUMMARY_TTL_SECS + 5);
+        let mut record = record_for(
+            &owner,
+            task_id,
+            TaskStatus::Running,
+            Some(expected_session_id),
+        );
+        record.generation = 1;
+        record.pending_interaction = Some(
+            Summary::observe(
+                None,
+                SummaryState::None,
+                Some(0),
+                &[],
+                false,
+                ProducerKind::RuntimeOwner,
+                1,
+                old_observed_at,
+            )
+            .unwrap(),
+        );
+        store.save(&record).unwrap();
+
+        let (client, fake) = fake_client(true);
+        let shared = fake.lock().unwrap().state.clone();
+        {
+            let mut state = shared.lock().unwrap();
+            state.session_loaded = false;
+            state.session_id = None;
+            state.pending_permissions = 0;
+        }
+        let runtime_instance_id = Uuid::new_v4();
+        let runtime_lease = Arc::new(
+            store
+                .try_acquire_runtime_lease(task_id)
+                .unwrap()
+                .expect("test runtime lease is unavailable"),
+        );
+        runtimes().lock().unwrap().insert(
+            task_id,
+            RuntimeHandle {
+                client: client.clone(),
+                owner: SessionInstance::from_session(&owner),
+                scope: owner.cwd.clone(),
+                instance_id: runtime_instance_id,
+                started_at: Instant::now(),
+                _lease: runtime_lease,
+            },
+        );
+
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let unloaded = store.read_record(task_id).unwrap();
+        let unavailable = unloaded.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, old_observed_at);
+        assert_eq!(
+            unavailable.expires_at,
+            old_observed_at + crate::pending_interaction::SUMMARY_TTL_SECS
+        );
+        assert_eq!(
+            Summary::projection(Some(unavailable), config::unix_time())["state"],
+            "unavailable"
+        );
+        assert!(client.is_connected());
+        assert!(runtime_registration_matches(
+            &owner,
+            task_id,
+            runtime_instance_id
+        ));
+
+        {
+            let mut state = shared.lock().unwrap();
+            state.session_loaded = true;
+            state.session_id = Some("different-remote-session".to_owned());
+        }
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let mismatched = store.read_record(task_id).unwrap();
+        let unavailable = mismatched.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, old_observed_at);
+        assert_eq!(
+            unavailable.expires_at,
+            old_observed_at + crate::pending_interaction::SUMMARY_TTL_SECS
+        );
+        assert!(client.is_connected());
+
+        {
+            fake.lock()
+                .unwrap()
+                .sessions
+                .insert(expected_session_id.to_owned(), false);
+        }
+        client
+            .session_load(expected_session_id, &owner.cwd)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let loaded = store.read_record(task_id).unwrap();
+        let unavailable = loaded.pending_interaction.as_ref().unwrap();
+        assert_eq!(unavailable.state, SummaryState::Unavailable);
+        assert_eq!(unavailable.observed_at, old_observed_at);
+        assert!(!client.pending_permission_snapshot().pending_state_ready);
+
+        let _prompt = client
+            .session_prompt(expected_session_id, "resume task".to_owned())
+            .await
+            .unwrap();
+        assert!(client.pending_permission_snapshot().pending_state_ready);
+        assert!(
+            store
+                .observe_pending_interaction(&owner, task_id, runtime_instance_id, Some(1))
+                .unwrap()
+        );
+        let restored = store.read_record(task_id).unwrap();
+        let summary = restored.pending_interaction.as_ref().unwrap();
+        assert_eq!(summary.state, SummaryState::None);
+        assert_eq!(summary.count, Some(0));
+        assert!(summary.observed_at > old_observed_at);
+        assert!(summary.expires_at > config::unix_time());
+        assert_eq!(summary.summary_revision, 3);
+        assert!(client.is_connected());
+
+        let _ = take_runtime_if_instance(task_id, runtime_instance_id);
+        client.shutdown().await;
     }
 
     #[test]
