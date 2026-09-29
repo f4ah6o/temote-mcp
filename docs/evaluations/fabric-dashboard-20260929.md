@@ -28,11 +28,11 @@ Results start as NOT RUN and must be updated from direct evidence. Scope and req
 
 | ID / packet | Requirement | Implementation | Verification | Result | Evidence | Blocker |
 | --- | --- | --- | --- | --- | --- | --- |
-| AC01 / D0 | Dashboard は existing Fabric Worker と同じ deployment に含まれる。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC02 / D0 | canonical entry is `/dash/`; `/dash` は authenticated redirect。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
+| AC01 / D0 | Dashboard は existing Fabric Worker と同じ deployment に含まれる。 | `gateway/wrangler.toml`; `src/dashboard/index.js` | Pinned Wrangler deploy dry-run; real workerd assets | LOCAL PASS | D0 commit `9c221c6`; local asset tests `d3d4768` | D4 deployed identity NOT RUN |
+| AC02 / D0 | canonical entry is `/dash/`; `/dash` は authenticated redirect。 | `handleDashboard`; exact canonical asset allow-list | Signed JWT redirect; unauthenticated/alias rejection | PASS | 80 real workerd tests/subtests; security tests | — |
 | AC03 / D4 | Cloudflare Access を通らない public dashboard route が存在しない。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC04 / D0 | Worker 側で検証済み Access JWT(signature / issuer / audience / expiry / subject / `ACCESS_ALLOWED_EMAILS`)を必須とする。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC05 / D0 | `CLIENT_TOKEN` / `HOST_TOKEN` / federated host token は dashboard 認証の代替にならない。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
+| AC04 / D0 | Worker 側で検証済み Access JWT(signature / issuer / audience / expiry / subject / `ACCESS_ALLOWED_EMAILS`)を必須とする。 | `authorizeDashboard`; shared JWT verifier | RSA fixture signature/issuer/aud/exp/nbf/sub/email failures | PASS | `dashboard-security.test.mjs`; real signed JWT asset test | Deployed JWT gate remains D4 |
+| AC05 / D0 | `CLIENT_TOKEN` / `HOST_TOKEN` / federated host token は dashboard 認証の代替にならない。 | Explicit Access-only mode; no shared env mutation | Client/host/federated tokens denied on all tested routes | PASS | Security + 80 real workerd tests/subtests | — |
 | AC06 / D0 | Dashboard v1 は read-only。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
 | AC07 / D0 | Existing `/mcp`, `/healthz`, host API, observation ingest の behavior を壊さない。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
 | AC08 / D1 | host/session/task live state と Fabric replica の authority が UI/API で区別される。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
@@ -58,11 +58,11 @@ Results start as NOT RUN and must be updated from direct evidence. Scope and req
 | AC28 / D3 | context freshness / gap / degradation が表示可能。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
 | AC29 / D3 | timeline は sanitized replicated observation の bounded projection のみ。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
 | AC30 / D1 | prompt/stdout/stderr/argv/environment/credential/raw evidence を dashboard data に追加しない。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC31 / D1 | dashboard API は no-store + same-origin + strict security headers。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC32 / D0 | dashboard assets は third-party runtime/CDN に依存しない。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
+| AC31 / D0 | dashboard API は no-store + same-origin + strict security headers。 | `dashboardResponse` on success/error/redirect/unknown/method paths | No CORS; no-store/CSP/nosniff/same-origin headers | PASS | Handler + real workerd response assertions | — |
+| AC32 / D0 | dashboard assets は third-party runtime/CDN に依存しない。 | Plain local ES module/stylesheet assets | Review imports/resources and asset response contents | PASS | `gateway/assets/dash/`; real asset routing | — |
 | AC33 / D1 | `npm test --prefix gateway` PASS。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC34 / D1 | `wrangler deploy --dry-run` PASS。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
-| AC35 / D1 | deployed Zero Trust E2E を記録する。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
+| AC34 / D4 | `wrangler deploy --dry-run` PASS。 | Same Worker assets binding; worker-first; no fallback | `npm run deploy:dry-run --prefix gateway` | PASS (D0 checkpoint) | Pinned Wrangler `4.142.0`; `/tmp/fabric-d0-dryrun2.log` | Final integrated dry-run pending |
+| AC35 / D4 | deployed Zero Trust E2E を記録する。 | Candidate deploy/Host update rerun below | Deployed Zero Trust edge + Worker + Host acceptance | BLOCKED / NOT RUN | Pre-candidate edge 401 is explicitly separate | No approved candidate deploy/Host update; candidate browser session not established |
 | AC36 / D1 | `git diff --check` PASS。 | Pending | Issue §13 regression cases | NOT RUN | Pending | Pending implementation / verification |
 
 ## Gate log
@@ -74,7 +74,7 @@ Results start as NOT RUN and must be updated from direct evidence. Scope and req
 | Baseline fixture dogfood | PASS | Immutable owner-local run above; not live |
 | Local Rust / gateway baseline | PASS | `cargo test`: 151 library + 838 binary + integration suites pass; 9 ignored gates not run. Gateway 102/102 pass. |
 | Candidate local tests | NOT RUN | Pending implementation |
-| Actual Static Assets runtime | NOT RUN | Real workerd routing required |
+| Actual Static Assets runtime | PASS (local) | 80 tests/subtests; real Wrangler/workerd and checked-in assets binding. Synthetic issuer JWKS is the sole network fixture; production JWT verification remains active. No D4 claim. |
 | Deployed D4 | BLOCKED | Candidate deployment and Host update are not approved in this session; authorized browser candidate session not established. Existing target evidence alone is not candidate evidence. |
 | Final-head CI | NOT RUN | PR / final push pending |
 | Independent review | NOT RUN | PR handoff required; local review is separate |
