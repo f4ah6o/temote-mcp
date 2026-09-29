@@ -17,10 +17,7 @@ pub(crate) struct RepositoryId {
 }
 
 impl RepositoryId {
-    pub(crate) fn parse(
-        source: &str,
-        default_host: &str,
-    ) -> Result<Self, RepositorySourceError> {
+    pub(crate) fn parse(source: &str, default_host: &str) -> Result<Self, RepositorySourceError> {
         parse_repository_id(source, default_host)
     }
 }
@@ -358,7 +355,10 @@ mod tests {
             Some("managed_repository")
         );
         for forbidden in ["path", "store", "store_path", "workspace", "branch"] {
-            assert!(!object.contains_key(forbidden), "{forbidden} leaked into start spec");
+            assert!(
+                !object.contains_key(forbidden),
+                "{forbidden} leaked into start spec"
+            );
         }
     }
 }
