@@ -1,15 +1,15 @@
 # Fabric Dashboard: Zero Trust 配下の `/dash` Web dashboard
 
-Status: open / implementation in progress  
-Repository: `f4ah6o/temote-mcp`  
-Priority: P1 operator visibility  
-Created: 2026-09-29 (Asia/Tokyo)  
-Updated: 2026-09-29  
-Model: gpt-6-sol  
-Branch: feat/fabric-web-dashboard  
-Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
-Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`  
-Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`  
+Status: open / implementation in progress
+Repository: `f4ah6o/temote-mcp`
+Priority: P1 operator visibility
+Created: 2026-09-29 (Asia/Tokyo)
+Updated: 2026-09-29
+Model: gpt-6-sol
+Branch: feat/fabric-web-dashboard
+Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`
+Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`
+Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`
 Related local viewer: `issues/done/20260914-local-activity-viewer.md`
 
 ## 1. Decision
