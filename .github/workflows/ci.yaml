@@ -33,6 +33,9 @@ jobs:
       - name: Test D1 schema integrity
         run: python3 gateway/test/cloud_observation_schema_sqlite.py
 
+      - name: Test dashboard projection SQL scope
+        run: python3 gateway/test/dashboard_schema_sqlite.py
+
   rust:
     strategy:
       fail-fast: false
