@@ -202,6 +202,19 @@ function tasksEnvelope() {
   }));
 }
 
+function replicaComponent() {
+  return state.replicaUnavailable
+    ? component("unavailable", "unavailable", "unavailable", undefined, "replica_unavailable")
+    : component("confirmed", "fabric_replica", "current", {
+      last_synced_at: now() - 22,
+      source_head_revision: "42",
+      acked_through_revision: "42",
+      cloud_head_seq: "42",
+      journal_degraded: false,
+      gap_count: 0,
+    });
+}
+
 function contextEnvelope() {
   if (state.contextUnavailable) {
     return response(200, component("confirmed", "fabric", "current", {
@@ -390,7 +403,25 @@ async function handle(request) {
     return tasksEnvelope();
   }
   if (url.pathname === `${selectedSessionPath}/context`) {
-    if (state.hostOffline || state.livenessUnavailable) return response(503, unavailable(state.hostOffline ? "host_offline" : "host_unknown"));
+    if (state.hostOffline || state.livenessUnavailable) {
+      // Match the production context() response: a stale envelope that keeps
+      // the replica component at HTTP 503, not a bare unavailable body.
+      const code = state.hostOffline ? "host_offline" : "host_unknown";
+      const unavailableComponent = component("unavailable", "unavailable", "unavailable", undefined, code);
+      return response(503, {
+        status: "stale",
+        authority: "unavailable",
+        freshness: "stale",
+        error_code: code,
+        data: {
+          host_id: hostId,
+          session_id: sessionId,
+          context_resolve: unavailableComponent,
+          context_status: unavailableComponent,
+          replica: replicaComponent(),
+        },
+      });
+    }
     return contextEnvelope();
   }
   if (url.pathname === `${selectedSessionPath}/timeline`) return timelineEnvelope();

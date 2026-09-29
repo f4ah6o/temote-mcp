@@ -162,6 +162,63 @@ test("loopback fixture can switch from a live host to unknown and partial backen
   }
 });
 
+test("non-2xx responses preserve dashboard envelopes while collapsing auth and malformed bodies", async () => {
+  const staleContext = {
+    status: "stale",
+    authority: "unavailable",
+    freshness: "stale",
+    error_code: "host_offline",
+    data: {
+      host_id: "fabric-local",
+      session_id: "session-demo-01",
+      context_resolve: { status: "unavailable", authority: "unavailable", freshness: "unavailable", error_code: "host_offline" },
+      context_status: { status: "unavailable", authority: "unavailable", freshness: "unavailable", error_code: "host_offline" },
+      replica: { status: "confirmed", authority: "fabric_replica", freshness: "current", data: { cloud_head_seq: "42" } },
+    },
+  };
+  const preserved = new RequestCoordinator(async () => ({ ok: false, status: 503, json: async () => staleContext }));
+  const preservedResult = await preserved.request("/dash/api/v1/hosts/fabric-local/sessions/session-demo-01/context", "context", 1);
+  assert.deepEqual(preservedResult, staleContext);
+  assert.equal(preservedResult.data.replica.data.cloud_head_seq, "42");
+
+  const denied = new RequestCoordinator(async () => ({ ok: false, status: 403, json: async () => staleContext }));
+  assert.deepEqual(await denied.request("/dash/api/v1/hosts", "denied"), {
+    status: "unavailable",
+    authority: "unavailable",
+    freshness: "unavailable",
+    error_code: "access_denied",
+  });
+
+  const malformed = new RequestCoordinator(async () => ({ ok: false, status: 503, json: async () => ({ error: "upstream" }) }));
+  const collapsed = await malformed.request("/dash/api/v1/hosts", "malformed");
+  assert.equal(collapsed.status, "unavailable");
+  assert.equal(collapsed.error_code, "http_503");
+
+  const badBody = new RequestCoordinator(async () => ({ ok: true, status: 200, json: async () => null }));
+  const invalid = await badBody.request("/dash/api/v1/hosts", "invalid");
+  assert.equal(invalid.error_code, "invalid_response");
+});
+
+test("offline context fixture keeps the replica component inside the stale 503 envelope", async () => {
+  const saved = { ...dashboardFixtureState };
+  try {
+    Object.assign(dashboardFixtureState, { hostOffline: true, replicaUnavailable: false });
+    const response = await handleDashboardFixture(new Request("http://fixture/dash/api/v1/hosts/fabric-local/sessions/session-demo-01/context"));
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(body.status, "stale");
+    assert.equal(body.error_code, "host_offline");
+    assert.equal(body.data.context_resolve.status, "unavailable");
+    assert.equal(body.data.replica.status, "confirmed");
+    assert.equal(body.data.replica.data.cloud_head_seq, "42");
+
+    const coordinator = new RequestCoordinator(async () => ({ ok: false, status: response.status, json: async () => body }));
+    assert.deepEqual(await coordinator.request("/dash/api/v1/hosts/fabric-local/sessions/session-demo-01/context", "context", 1), body);
+  } finally {
+    Object.assign(dashboardFixtureState, saved);
+  }
+});
+
 test("changing selection aborts old scoped requests", async () => {
   let signal;
   const coordinator = new RequestCoordinator((_path, options) => {

@@ -390,9 +390,15 @@ class RequestCoordinator {
           body = null;
         }
         if (!response.ok) {
-          return unavailableEnvelope(response.status === 401 || response.status === 403
-            ? "access_denied"
-            : `http_${response.status}`);
+          if (response.status === 401 || response.status === 403) {
+            return unavailableEnvelope("access_denied");
+          }
+          // Degraded dashboard routes answer 503 with a structured stale
+          // envelope (e.g. context keeps its replica component when the host
+          // is offline); keep it instead of collapsing to a bare failure.
+          return body && typeof body === "object" && ENVELOPE_STATUSES.has(body.status)
+            ? body
+            : unavailableEnvelope(`http_${response.status}`);
         }
         if (!body || typeof body !== "object" || !ENVELOPE_STATUSES.has(body.status)) {
           return unavailableEnvelope("invalid_response");
