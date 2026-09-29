@@ -53,21 +53,36 @@ function parseTimestampMs(value) {
 function formatTime(value) {
   const timestamp = parseTimestampMs(value);
   if (!Number.isFinite(timestamp)) return "Unknown";
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return "Unknown";
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(timestamp));
 }
 
-function compareSequence(left, right) {
-  const leftNumber = typeof left === "number" ? left : Number(left);
-  const rightNumber = typeof right === "number" ? right : Number(right);
-  if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
-    return Math.sign(leftNumber - rightNumber);
+function sequenceValue(value) {
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    return BigInt(value);
   }
-  const a = String(left ?? "");
-  const b = String(right ?? "");
-  return a === b ? 0 : a < b ? -1 : 1;
+  if (typeof value === "string" && /^(0|[1-9]\d{0,19})$/.test(value)) {
+    try {
+      const parsed = BigInt(value);
+      return parsed <= 18_446_744_073_709_551_615n ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function compareSequence(left, right) {
+  const leftValue = sequenceValue(left);
+  const rightValue = sequenceValue(right);
+  if (leftValue == null && rightValue == null) return left == null && right == null ? 0 : null;
+  if (leftValue == null || rightValue == null) return null;
+  return leftValue === rightValue ? 0 : leftValue < rightValue ? -1 : 1;
 }
 
 function samePendingContent(left, right) {
@@ -79,26 +94,68 @@ function samePendingContent(left, right) {
     && JSON.stringify(leftTypes) === JSON.stringify(rightTypes);
 }
 
-function mergePendingSummary(previous, incoming) {
+function mergePendingSummary(previous, incoming, taskOrder = 0) {
   if (!previous) return incoming;
   if (!incoming) return previous;
-  if (incoming.state === "unsupported") return incoming;
+  const previousSupported = PENDING_STATES.has(previous.state) && previous.state !== "unsupported";
+  const incomingSupported = PENDING_STATES.has(incoming.state) && incoming.state !== "unsupported";
+  if (incoming.state === "unsupported") {
+    return (taskOrder == null || taskOrder < 0) && previousSupported ? previous : incoming;
+  }
+  if (!previousSupported) return incomingSupported && taskOrder >= 0 ? incoming : previous;
+
+  const previousKind = previous.producer_kind;
+  const incomingKind = incoming.producer_kind;
+  if (previousKind && incomingKind && previousKind !== incomingKind) {
+    return taskOrder > 0 && incomingSupported ? incoming : previous;
+  }
 
   const previousEpoch = previous.producer_epoch;
   const incomingEpoch = incoming.producer_epoch;
   if (previousEpoch != null && incomingEpoch != null) {
     const epochOrder = compareSequence(incomingEpoch, previousEpoch);
+    if (epochOrder == null) return previous;
     if (epochOrder < 0) return previous;
     if (epochOrder > 0) return incoming;
+  } else if (previousEpoch != null && incomingEpoch == null) {
+    return previous;
+  } else if (previousEpoch == null && incomingEpoch != null && taskOrder < 0) {
+    return previous;
   }
 
   const previousRevision = previous.summary_revision;
   const incomingRevision = incoming.summary_revision;
   if (previousRevision != null && incomingRevision != null) {
     const revisionOrder = compareSequence(incomingRevision, previousRevision);
+    if (revisionOrder == null) return previous;
     if (revisionOrder < 0) return previous;
     if (revisionOrder > 0) return incoming;
+  } else if (previousRevision != null && incomingRevision == null) {
+    return previous;
+  } else if (previousRevision == null && incomingRevision != null && taskOrder < 0) {
+    return previous;
   }
+
+  const sameObservedAt = Number.isFinite(parseTimestampMs(previous.observed_at))
+    && parseTimestampMs(previous.observed_at) === parseTimestampMs(incoming.observed_at);
+  const sameExpiresAt = Number.isFinite(parseTimestampMs(previous.expires_at))
+    && parseTimestampMs(previous.expires_at) === parseTimestampMs(incoming.expires_at);
+  const sameProducerEpoch = previousEpoch != null
+    && incomingEpoch != null
+    && compareSequence(incomingEpoch, previousEpoch) === 0;
+  const sameProducerKind = Boolean(previousKind && incomingKind && previousKind === incomingKind);
+  const sameSummaryRevision = previousRevision != null
+    && incomingRevision != null
+    && compareSequence(incomingRevision, previousRevision) === 0;
+  const expiredProjection = incoming.state === "unavailable"
+    && sameProducerKind
+    && sameProducerEpoch
+    && sameSummaryRevision
+    && sameObservedAt
+    && sameExpiresAt
+    && incoming.count == null
+    && (!Array.isArray(incoming.types) || incoming.types.length === 0);
+  if (expiredProjection) return incoming;
 
   if (!samePendingContent(previous, incoming)) return previous;
   const previousObserved = parseTimestampMs(previous.observed_at);
@@ -113,10 +170,11 @@ function mergeTaskProjection(previous, incoming) {
     return { ...incoming, pending_interaction: incoming.pending_interaction ?? { state: "unsupported" } };
   }
   const taskOrder = compareSequence(incoming.revision, previous.revision);
-  const task = taskOrder < 0 ? previous : incoming;
+  const task = taskOrder == null || taskOrder < 0 ? previous : incoming;
   const summary = mergePendingSummary(
     previous.pending_interaction ?? { state: "unsupported" },
     incoming.pending_interaction ?? { state: "unsupported" },
+    taskOrder,
   );
   return { ...task, pending_interaction: summary };
 }
@@ -126,10 +184,96 @@ function pendingForDisplay(summary, nowMs = Date.now()) {
   const state = PENDING_STATES.has(value.state) ? value.state : "unknown";
   if (state === "unsupported") return { ...value, display_state: state };
   const expiresAt = parseTimestampMs(value.expires_at);
-  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) {
+  if (!Number.isFinite(expiresAt) || !Number.isFinite(new Date(expiresAt).getTime()) || expiresAt <= nowMs) {
     return { ...value, display_state: "unavailable", expired: true };
   }
   return { ...value, display_state: state, expired: false };
+}
+
+function nextPendingExpiryMs(tasks, nowMs = Date.now()) {
+  let next = Infinity;
+  if (!Array.isArray(tasks)) return null;
+  for (const task of tasks) {
+    const pending = task?.pending_interaction;
+    if (!pending || pending.state === "unsupported") continue;
+    const expiresAt = parseTimestampMs(pending.expires_at);
+    if (Number.isFinite(expiresAt)
+      && Number.isFinite(new Date(expiresAt).getTime())
+      && expiresAt > nowMs
+      && expiresAt < next) next = expiresAt;
+  }
+  return Number.isFinite(next) ? next : null;
+}
+
+function isSessionProjectionCurrent(envelope, hostAvailability) {
+  return envelope?.status === "confirmed" && hostAvailability === "online";
+}
+
+function isTaskProjectionCurrent(envelopeStatus, backendStatus, hostAvailability) {
+  return envelopeStatus === "confirmed" && backendStatus === "confirmed" && hostAvailability === "online";
+}
+
+function isContextResolverCurrent(envelope, resolver, hostAvailability) {
+  return envelope?.status === "confirmed"
+    && resolver?.status === "confirmed"
+    && Boolean(resolver?.data)
+    && resolver?.authority === "host_live"
+    && hostAvailability === "online";
+}
+
+function effectiveHostAvailability(host, inventoryEnvelope, browserOffline = false) {
+  if (browserOffline) return "unknown";
+  const livenessConfirmed = Array.isArray(inventoryEnvelope?.data?.hosts)
+    && inventoryEnvelope?.data?.components?.liveness?.status === "confirmed";
+  if (!livenessConfirmed) return "unknown";
+  const value = host?.availability;
+  return value === "online" || value === "offline" || value === "unknown" || value === "unavailable"
+    ? value
+    : "unknown";
+}
+
+function membershipRemovalConfirmed(envelope, selectedHostId) {
+  if (!selectedHostId
+    || envelope?.data?.components?.membership?.status !== "confirmed"
+    || !Array.isArray(envelope?.data?.hosts)) return false;
+  return !envelope.data.hosts.some((host) => host?.host_id === selectedHostId);
+}
+
+function hasUnavailableChild(value, depth = 0) {
+  if (depth > 6 || value == null || typeof value !== "object") return false;
+  if (value.status === "unavailable") return true;
+  const children = Array.isArray(value) ? value : Object.values(value);
+  return children.some((child) => hasUnavailableChild(child, depth + 1));
+}
+
+function hasPartialList(value, depth = 0) {
+  if (depth > 6 || value == null || typeof value !== "object") return false;
+  if (value.truncated === true || (Number.isSafeInteger(value.truncated) && value.truncated > 0)
+    || (Number.isSafeInteger(value.skipped) && value.skipped > 0)) return true;
+  const children = Array.isArray(value) ? value : Object.values(value);
+  return children.some((child) => hasPartialList(child, depth + 1));
+}
+
+function responseIsDegraded(envelope) {
+  return envelope?.status === "unavailable"
+    || Boolean(envelope?.stale_error)
+    || hasUnavailableChild(envelope?.data)
+    || hasPartialList(envelope?.data);
+}
+
+function taskBackendPresentation(envelopeStatus, backend, hostAvailability) {
+  const backendStatus = String(backend?.status ?? "unavailable");
+  const tasks = Array.isArray(backend?.tasks) ? backend.tasks : null;
+  const skipped = Number.isSafeInteger(backend?.skipped) && backend.skipped > 0 ? backend.skipped : 0;
+  const truncated = backend?.truncated === true || (Number.isSafeInteger(backend?.truncated) && backend.truncated > 0);
+  const total = Number.isSafeInteger(backend?.total) && backend.total >= 0 ? backend.total : null;
+  const partial = skipped > 0 || truncated || (total != null && tasks != null && total > tasks.length);
+  const current = isTaskProjectionCurrent(envelopeStatus, backendStatus, hostAvailability) && !partial;
+  const available = backendStatus === "confirmed"
+    && tasks !== null
+    && hostAvailability === "online"
+    && envelopeStatus !== "unavailable";
+  return { backendStatus, tasks, skipped, truncated, total, partial, current, available };
 }
 
 class SelectionFence {
@@ -144,6 +288,11 @@ class SelectionFence {
       return this.snapshot();
     }
     this.value = next;
+    this.version += 1;
+    return this.snapshot();
+  }
+
+  invalidate() {
     this.version += 1;
     return this.snapshot();
   }
@@ -279,6 +428,11 @@ function retainLastData(previous, incoming) {
   return incoming;
 }
 
+function markEnvelopeStale(envelope, reason = "stale") {
+  if (!envelope?.data || envelope.status === "unavailable") return envelope;
+  return { ...envelope, status: "stale", freshness: "stale", stale_reason: boundedText(reason, 64) };
+}
+
 function idSegment(value) {
   const id = shortIdentifier(value);
   return id ? encodeURIComponent(id) : "";
@@ -312,24 +466,44 @@ function startDashboard(documentRef = document, windowRef = window) {
     timelineEvents: [],
     timelineCursor: "",
     taskSnapshots: new Map(),
+    backendSnapshots: new Map(),
     degraded: new Map(),
     fence,
     refreshing: false,
     timer: null,
+    pendingTimer: null,
+    browserOffline: windowRef.navigator?.onLine === false,
     lastUpdatedAt: null,
   };
 
   function selectedHost() {
-    return state.hosts.find((host) => host?.host_id === fence.value.hostId) ?? null;
+    const host = state.hosts.find((candidate) => candidate?.host_id === fence.value.hostId);
+    if (!host) return null;
+    const availability = effectiveHostAvailability(host, state.hostsEnvelope, state.browserOffline);
+    return { ...host, availability, stale_liveness: availability === "unknown" };
   }
 
   function updateDegraded(key, label, envelope) {
-    if (envelope?.status === "unavailable") {
-      state.degraded.set(key, `${label}: ${boundedText(String(envelope.error_code ?? "unavailable"), 64)}`);
+    if (responseIsDegraded(envelope)) {
+      const detail = envelope?.error_code
+        ?? findUnavailableError(envelope?.data)
+        ?? (hasPartialList(envelope?.data) ? "partial list" : "component unavailable");
+      state.degraded.set(key, `${label}: ${boundedText(String(detail), 64)}`);
     } else {
       state.degraded.delete(key);
     }
     renderDegraded();
+  }
+
+  function findUnavailableError(value, depth = 0) {
+    if (depth > 6 || value == null || typeof value !== "object") return "";
+    if (value.status === "unavailable") return boundedText(String(value.error_code ?? "component unavailable"), 64);
+    const children = Array.isArray(value) ? value : Object.values(value);
+    for (const child of children) {
+      const found = findUnavailableError(child, depth + 1);
+      if (found) return found;
+    }
+    return "";
   }
 
   function renderDegraded() {
@@ -340,7 +514,7 @@ function startDashboard(documentRef = document, windowRef = window) {
       return;
     }
     banner.hidden = false;
-    setText(banner, `Some dashboard data is unavailable · ${[...state.degraded.values()].join(" · ")}`);
+    setText(banner, `Some dashboard data is degraded or unavailable · ${[...state.degraded.values()].join(" · ")}`);
   }
 
   function setRefreshStatus(label, tone = "quiet") {
@@ -403,11 +577,15 @@ function startDashboard(documentRef = document, windowRef = window) {
       appendText(documentRef, parent, "div", "component-state component-state--quiet", "Loading sessions…");
       return;
     }
-    if (envelope.status === "unavailable" || !Array.isArray(envelope.data?.sessions)) {
+    if (!Array.isArray(envelope.data?.sessions)) {
       appendText(documentRef, parent, "div", "component-state component-state--error", componentMessage(envelope, "Sessions"));
       return;
     }
-    const sessions = envelope.data.sessions.slice(0, MAX_SESSIONS);
+    const allSessions = envelope.data.sessions;
+    const sessions = allSessions.slice(0, MAX_SESSIONS);
+    if (envelope.data.truncated === true || allSessions.length > sessions.length) {
+      appendText(documentRef, parent, "div", "component-state component-state--stale", "Session list capped at the displayed items.");
+    }
     if (sessions.length === 0) {
       appendText(documentRef, parent, "div", "component-state component-state--quiet", "No sessions reported.");
       return;
@@ -420,7 +598,9 @@ function startDashboard(documentRef = document, windowRef = window) {
       button.setAttribute("aria-pressed", String(fence.value.sessionId === sessionId));
       const name = appendText(documentRef, button, "span", "", sessionId);
       if (sessionId.length > 18) name.title = sessionId;
-      appendText(documentRef, button, "span", "", boundedText(String(session.status ?? "unknown"), 32));
+      const host = selectedHost();
+      const lastReported = hostAvailability(host) !== "online" || envelope.status === "stale";
+      appendText(documentRef, button, "span", "", `${lastReported ? "Last · " : ""}${boundedText(String(session.status ?? "unknown"), 32)}`);
       button.addEventListener("click", () => select({ hostId, sessionId }, true));
       parent.append(button);
     }
@@ -432,14 +612,14 @@ function startDashboard(documentRef = document, windowRef = window) {
     const envelope = state.hostsEnvelope;
     const components = envelope?.data?.components;
     const hostDataAvailable = Array.isArray(envelope?.data?.hosts);
-    const snapshotUnavailable = !hostDataAvailable && envelope?.status === "unavailable";
-    const hosts = snapshotUnavailable
+    const snapshotUnavailable = !hostDataAvailable && envelope != null;
+    const hosts = snapshotUnavailable || state.browserOffline
       ? state.hosts.map((host) => ({ ...host, availability: "unknown", stale_liveness: true }))
       : state.hosts;
 
     if (!envelope) {
       setComponentState(byId("inventory-status"), "Loading host inventory…");
-    } else if (envelope.status === "unavailable" && hosts.length === 0) {
+    } else if (snapshotUnavailable && hosts.length === 0) {
       setComponentState(byId("inventory-status"), componentMessage(envelope, "Host inventory"), "error");
     } else if (components && Object.values(components).some((component) => component?.status === "unavailable")) {
       const failed = Object.entries(components)
@@ -481,7 +661,7 @@ function startDashboard(documentRef = document, windowRef = window) {
       card.append(button);
 
       const evidence = Array.isArray(host.evidence)
-        ? host.evidence.slice(0, 4).map((item) => boundedText(String(item), 32)).join(" · ")
+        ? host.evidence.slice(0, 4).map((item) => boundedText(String(item).replaceAll("_", " "), 32)).join(" · ")
         : "Configured membership";
       const subline = createElement(documentRef, "div", "host-subline");
       appendText(documentRef, subline, "span", "", evidence || "Configured membership");
@@ -508,19 +688,32 @@ function startDashboard(documentRef = document, windowRef = window) {
   }
 
   async function loadHosts() {
-    const envelope = await requests.request("/dash/api/v1/hosts", "hosts");
+    let envelope = await requests.request("/dash/api/v1/hosts", "hosts");
+    if (envelope.status !== "unavailable" && !Array.isArray(envelope.data?.hosts)) {
+      envelope = unavailableEnvelope("invalid_response");
+    }
     state.hostsEnvelope = envelope;
     if (Array.isArray(envelope.data?.hosts)) {
       state.hosts = envelope.data.hosts.slice(0, MAX_HOSTS);
       const selectedHostExists = state.hosts.some((host) => host?.host_id === fence.value.hostId);
       if (!fence.value.hostId && state.hosts.length > 0) {
         select({ hostId: shortIdentifier(state.hosts[0]?.host_id), sessionId: "" }, true);
-      } else if (fence.value.hostId && !selectedHostExists && state.hosts.length === 0) {
-        // Keep an explicit URL selection so the scoped API can report its authorization result.
+      } else if (membershipRemovalConfirmed(envelope, fence.value.hostId) && !selectedHostExists) {
+        const current = fence.invalidate();
+        requests.abortSelectionExcept(current.version);
+        state.sessionsEnvelope = null;
+        clearSessionViews();
       }
     }
     updateDegraded("hosts", "Hosts", envelope);
     renderHosts();
+    renderSession(state.sessionEnvelope);
+    renderTasks(state.tasksEnvelope);
+    renderContext(state.contextEnvelope);
+    renderTimeline(state.timelineEnvelope);
+    if (membershipRemovalConfirmed(envelope, fence.value.hostId)) {
+      void loadSessions(fence.snapshot());
+    }
     return envelope;
   }
 
@@ -533,6 +726,8 @@ function startDashboard(documentRef = document, windowRef = window) {
   }
 
   function clearSessionViews() {
+    clearTimeout(state.pendingTimer);
+    state.pendingTimer = null;
     state.sessionEnvelope = null;
     state.tasksEnvelope = null;
     state.contextEnvelope = null;
@@ -540,6 +735,7 @@ function startDashboard(documentRef = document, windowRef = window) {
     state.timelineEvents = [];
     state.timelineCursor = "";
     state.taskSnapshots.clear();
+    state.backendSnapshots.clear();
     state.degraded.delete("session");
     state.degraded.delete("tasks");
     state.degraded.delete("context");
@@ -553,6 +749,8 @@ function startDashboard(documentRef = document, windowRef = window) {
     byId("session-facts").replaceChildren();
     byId("workspace-facts").replaceChildren();
     byId("context-detail").hidden = true;
+    byId("provenance-block").replaceChildren();
+    byId("provenance-block").hidden = true;
     byId("timeline-list").replaceChildren();
     setText(byId("session-lifecycle"), fence.value.sessionId ? "Loading" : "No session selected");
     setText(byId("task-count"), "—");
@@ -576,6 +774,7 @@ function startDashboard(documentRef = document, windowRef = window) {
 
     if (previousHostId !== hostId) {
       state.sessionsEnvelope = null;
+      state.degraded.delete("sessions");
     }
     clearSessionViews();
     renderHosts();
@@ -591,9 +790,12 @@ function startDashboard(documentRef = document, windowRef = window) {
     if (!path) return;
     const envelope = await requests.request(path, `sessions:${snapshot.hostId}`, snapshot.version);
     if (!fence.matches(snapshot)) return;
-    state.sessionsEnvelope = envelope;
+    state.sessionsEnvelope = retainLastData(state.sessionsEnvelope, envelope);
     updateDegraded("sessions", "Sessions", envelope);
     renderHosts();
+    if (!Array.isArray(envelope.data?.sessions)) {
+      setComponentState(byId("session-status"), componentMessage(envelope, "Sessions"), "error");
+    }
     const sessions = envelope.data?.sessions;
     if (Array.isArray(sessions) && sessions.length > 0 && !snapshot.sessionId) {
       const firstSessionId = shortIdentifier(sessions[0]?.session_id);
@@ -610,11 +812,15 @@ function startDashboard(documentRef = document, windowRef = window) {
   function selectedPaths(snapshot) {
     const sessionPath = pathForSession(snapshot.hostId, snapshot.sessionId);
     if (!sessionPath) return null;
+    const after = state.timelineCursor;
+    const timelineQuery = new URLSearchParams({ limit: String(MAX_TIMELINE_EVENTS) });
+    if (after) timelineQuery.set("after", after);
     return {
       session: sessionPath,
       tasks: `${sessionPath}/tasks`,
       context: `${sessionPath}/context`,
-      timeline: `${sessionPath}/timeline?limit=${MAX_TIMELINE_EVENTS}`,
+      timeline: `${sessionPath}/timeline?${timelineQuery.toString()}`,
+      timelineAfter: after,
     };
   }
 
@@ -630,19 +836,36 @@ function startDashboard(documentRef = document, windowRef = window) {
       requests.request(paths.timeline, `timeline:${snapshot.hostId}:${snapshot.sessionId}`, snapshot.version),
     ]);
     if (!fence.matches(snapshot)) return;
-    const [sessionEnvelope, tasksEnvelope, contextEnvelope, timelineEnvelope] = results;
+    const [sessionResponse, tasksResponse, contextResponse, timelineResponse] = results;
+    const sessionEnvelope = retainLastData(state.sessionEnvelope, sessionResponse);
+    const tasksEnvelope = retainLastData(state.tasksEnvelope, tasksResponse);
+    const contextEnvelope = retainLastData(state.contextEnvelope, contextResponse);
+    const timelineEnvelope = retainLastData(state.timelineEnvelope, timelineResponse);
     state.sessionEnvelope = sessionEnvelope;
     state.tasksEnvelope = tasksEnvelope;
     state.contextEnvelope = contextEnvelope;
     state.timelineEnvelope = timelineEnvelope;
-    state.timelineEvents = Array.isArray(timelineEnvelope.data?.events)
-      ? timelineEnvelope.data.events.slice(-MAX_TIMELINE_EVENTS)
-      : [];
-    state.timelineCursor = boundedText(String(timelineEnvelope.data?.next_cursor ?? ""), 512);
-    updateDegraded("session", "Session detail", sessionEnvelope);
-    updateDegraded("tasks", "Tasks", tasksEnvelope);
-    updateDegraded("context", "Context", contextEnvelope);
-    updateDegraded("timeline", "Timeline", timelineEnvelope);
+    if (Array.isArray(timelineEnvelope.data?.events)) {
+      const incomingEvents = timelineEnvelope.data.events.slice(-MAX_TIMELINE_EVENTS);
+      if (paths.timelineAfter) {
+        const combined = [...state.timelineEvents, ...incomingEvents];
+        const unique = new Map();
+        for (const event of combined) {
+          const key = `${event?.cloud_seq ?? event?.source_revision ?? event?.observed_at ?? ""}\u0000${event?.kind ?? ""}\u0000${event?.action ?? ""}\u0000${event?.target_backend ?? ""}`;
+          unique.set(key, event);
+        }
+        state.timelineEvents = [...unique.values()].slice(-MAX_TIMELINE_EVENTS);
+      } else {
+        state.timelineEvents = incomingEvents;
+      }
+    }
+    if (timelineEnvelope.data?.next_cursor) {
+      state.timelineCursor = boundedText(String(timelineEnvelope.data.next_cursor), 512);
+    }
+    updateDegraded("session", "Session detail", sessionResponse);
+    updateDegraded("tasks", "Tasks", tasksResponse);
+    updateDegraded("context", "Context", contextResponse);
+    updateDegraded("timeline", "Timeline", timelineResponse);
     renderSession(sessionEnvelope);
     renderTasks(tasksEnvelope);
     renderContext(contextEnvelope);
@@ -679,7 +902,7 @@ function startDashboard(documentRef = document, windowRef = window) {
       setText(byId("session-lifecycle"), "No session selected");
       return;
     }
-    if (!envelope || envelope.status === "unavailable" || !envelope.data?.session) {
+    if (!envelope || !envelope.data?.session) {
       byId("session-detail").hidden = true;
       setComponentState(byId("session-status"), componentMessage(envelope, "Session detail"), "error");
       setText(byId("session-lifecycle"), "Unavailable");
@@ -696,19 +919,20 @@ function startDashboard(documentRef = document, windowRef = window) {
     const session = data.session;
     const status = boundedText(String(session.status ?? "unknown"), 32);
     const hostOffline = host && hostAvailability(host) !== "online";
+    const sessionStale = !isSessionProjectionCurrent(envelope, hostAvailability(host));
     setComponentState(
       byId("session-status"),
       hostOffline ? `Last reported session projection · host availability ${hostAvailability(host)}.` : componentMessage(envelope, "Session detail"),
-      hostOffline || envelope.status === "stale" ? "stale" : "quiet",
+      sessionStale ? "stale" : "quiet",
     );
     const lifecycle = byId("session-lifecycle");
-    const lifecycleLabel = hostOffline ? `Last reported · ${status}` : status;
+    const lifecycleLabel = sessionStale ? `Last reported · ${status}` : status;
     setText(lifecycle, lifecycleLabel);
-    lifecycle.className = `state-badge state-badge--${hostOffline ? "warning" : sessionLifecycleClass(status)}`;
+    lifecycle.className = `state-badge state-badge--${sessionStale ? "warning" : sessionLifecycleClass(status)}`;
 
     const facts = byId("session-facts");
     facts.replaceChildren();
-    addFact(facts, "Lifecycle", hostOffline ? `Last reported ${status}` : status);
+    addFact(facts, "Lifecycle", sessionStale ? `Last reported ${status}` : status);
     addFact(facts, "Permission mode", session.permission_mode ?? (session.yolo ? "yolo" : "unknown"));
     addFact(facts, "Started", formatTime(session.started_at));
     addFact(facts, "Session ID", sessionId);
@@ -723,21 +947,21 @@ function startDashboard(documentRef = document, windowRef = window) {
     byId("session-detail").hidden = false;
   }
 
-  function renderTaskStatusBadge(parent, value, hostOffline) {
+  function renderTaskStatusBadge(parent, value, staleProjection) {
     const status = boundedText(String(value ?? "unknown"), 32).toLowerCase();
     const knownGood = ["completed", "succeeded", "succeeded_with_warnings"].includes(status);
     const knownBad = ["failed", "cancelled", "canceled", "blocked"].includes(status);
-    const kind = hostOffline ? "warning" : knownGood ? "confirmed" : knownBad ? "error" : "muted";
-    appendText(documentRef, parent, "span", `state-badge state-badge--${kind}`, hostOffline ? `Last retained · ${status}` : status);
+    const kind = staleProjection ? "warning" : knownGood ? "confirmed" : knownBad ? "error" : "muted";
+    appendText(documentRef, parent, "span", `state-badge state-badge--${kind}`, staleProjection ? `Last retained · ${status}` : status);
   }
 
-  function renderPendingSummary(parent, summary) {
+  function renderPendingSummary(parent, summary, staleProjection = false) {
     const pending = pendingForDisplay(summary);
     const stateName = pending.display_state;
     const line = createElement(documentRef, "div", `pending-summary${stateName === "pending" ? " pending-summary--pending" : ["unknown", "unavailable"].includes(stateName) ? ` pending-summary--${stateName}` : ""}`);
     const labels = {
-      none: "No pending interaction",
-      pending: "Interaction pending",
+      none: staleProjection ? "Last observed · no pending interaction" : "No pending interaction",
+      pending: staleProjection ? "Last observed · interaction pending" : "Interaction pending",
       unknown: "Interaction state unknown",
       unsupported: "Unsupported by host",
       unavailable: pending.expired ? "Summary expired · unavailable" : "Interaction summary unavailable",
@@ -768,16 +992,22 @@ function startDashboard(documentRef = document, windowRef = window) {
     const hostId = fence.value.hostId;
     const sessionId = fence.value.sessionId;
     if (!sessionId) {
+      clearTimeout(state.pendingTimer);
+      state.pendingTimer = null;
       setComponentState(byId("task-status"), "Select a session to load retained tasks.", "quiet");
       setText(byId("task-count"), "—");
       return;
     }
-    if (!envelope || envelope.status === "unavailable" || !Array.isArray(envelope.data?.backends)) {
+    if (!envelope || !Array.isArray(envelope.data?.backends)) {
+      clearTimeout(state.pendingTimer);
+      state.pendingTimer = null;
       setComponentState(byId("task-status"), componentMessage(envelope, "Task list"), "error");
       setText(byId("task-count"), "?");
       return;
     }
     if (envelope.data.host_id !== hostId || envelope.data.session_id !== sessionId) {
+      clearTimeout(state.pendingTimer);
+      state.pendingTimer = null;
       setComponentState(byId("task-status"), "Task data did not match the current selection.", "error");
       setText(byId("task-count"), "?");
       return;
@@ -787,23 +1017,65 @@ function startDashboard(documentRef = document, windowRef = window) {
     const backends = envelope.data.backends.slice(0, 16);
     let taskCount = 0;
     let failedBackends = 0;
-    state.taskSnapshots = new Map();
+    let partialBackends = 0;
     const snapshotPrefix = `${hostId}\u0000${sessionId}\u0000`;
     for (const backend of backends) {
       const backendName = boundedText(String(backend?.backend ?? "unknown"), 48);
+      const backendCacheKey = `${snapshotPrefix}${backendName}`;
       const group = createElement(documentRef, "section", "backend-group");
       const heading = createElement(documentRef, "div", "backend-heading");
       appendText(documentRef, heading, "h3", "", backendName);
-      const backendStatus = boundedText(String(backend?.status ?? "unavailable"), 32);
-      appendText(documentRef, heading, "span", `backend-state backend-state--${backendStatus === "confirmed" ? "confirmed" : "unavailable"}`, backendStatus);
+      const backendLiveness = hostAvailability(selectedHost());
+      const presentation = taskBackendPresentation(envelope.status, backend, backendLiveness);
+      const { backendStatus, skipped, truncated: backendTruncated, total: reportedTotal } = presentation;
+      const backendPartial = presentation.partial;
+      const backendAvailable = presentation.available;
+      const backendCurrent = presentation.current;
+      appendText(
+        documentRef,
+        heading,
+        "span",
+        `backend-state backend-state--${backendStatus === "confirmed" ? (backendPartial || !backendCurrent ? "partial" : "confirmed") : "unavailable"}`,
+        backendPartial || !backendCurrent ? "partial" : backendStatus,
+      );
       group.append(heading);
-      if (backendStatus !== "confirmed" || !Array.isArray(backend.tasks)) {
-        failedBackends += 1;
-        appendText(documentRef, group, "div", "component-state component-state--error", `Task store unavailable${backend.error_code ? ` · ${boundedText(String(backend.error_code), 64)}` : ""}`);
+      const priorBackend = state.backendSnapshots.get(backendCacheKey);
+      if (backendAvailable) state.backendSnapshots.set(backendCacheKey, backend);
+      const sourceBackend = backendAvailable ? { ...backend, tasks: presentation.tasks } : priorBackend;
+      const staleProjection = !backendCurrent || backendPartial;
+      if (!backendAvailable) {
+        if (backendStatus !== "confirmed" || !Array.isArray(backend.tasks)) failedBackends += 1;
+        else partialBackends += 1;
+        appendText(
+          documentRef,
+          group,
+          "div",
+          `component-state ${priorBackend ? "component-state--stale" : "component-state--error"}`,
+          priorBackend
+            ? `Showing last backend snapshot${backend.error_code ? ` · ${boundedText(String(backend.error_code), 64)}` : ""}.`
+            : backendStatus !== "confirmed"
+              ? `Task store unavailable${backend.error_code ? ` · ${boundedText(String(backend.error_code), 64)}` : ""}`
+              : `Task status not confirmed · host availability ${backendLiveness}.`,
+        );
+      }
+      if (backendAvailable && backendPartial) {
+        partialBackends += 1;
+        const details = [
+          skipped > 0 && `${skipped} skipped`,
+          backendTruncated && "list capped",
+          reportedTotal != null && reportedTotal > backend.tasks.length && `showing ${backend.tasks.length} of ${reportedTotal}`,
+        ].filter(Boolean).join(" · ");
+        appendText(documentRef, group, "div", "component-state component-state--stale", `Partial backend list${details ? ` · ${details}` : ""}.`);
+      }
+      if (!sourceBackend || !Array.isArray(sourceBackend.tasks)) {
         root.append(group);
         continue;
       }
-      const tasks = backend.tasks.slice(0, MAX_TASKS);
+      const tasks = sourceBackend.tasks.slice(0, MAX_TASKS);
+      if (sourceBackend.tasks.length > MAX_TASKS) {
+        partialBackends += 1;
+        appendText(documentRef, group, "div", "component-state component-state--stale", `Task cards capped at ${MAX_TASKS}.`);
+      }
       if (tasks.length === 0) {
         appendText(documentRef, group, "div", "component-state component-state--quiet", "No retained tasks recorded.");
       }
@@ -822,23 +1094,386 @@ function startDashboard(documentRef = document, windowRef = window) {
         id.title = taskId;
         appendText(documentRef, identity, "span", "task-backend", backendName);
         top.append(identity);
-        renderTaskStatusBadge(top, task.status, hostOffline);
+        renderTaskStatusBadge(top, task.status, staleProjection);
         card.append(top);
         const meta = createElement(documentRef, "div", "task-meta");
         appendText(documentRef, meta, "span", "", `Task revision ${boundedText(String(task.revision ?? "unknown"), 32)}`);
         appendText(documentRef, meta, "span", "", `Updated ${formatTime(task.last_updated_at)}`);
         appendText(documentRef, meta, "span", "", "Retained projection");
         card.append(meta);
-        renderPendingSummary(card, task.pending_interaction);
+        renderPendingSummary(card, task.pending_interaction, staleProjection);
         group.append(card);
       }
       root.append(group);
     }
-    setText(byId("task-count"), failedBackends > 0 ? `${taskCount} + ?` : String(taskCount));
+    setText(byId("task-count"), failedBackends > 0 ? `${taskCount} + ?` : partialBackends > 0 ? `${taskCount} partial` : String(taskCount));
     const message = hostOffline
       ? "Retained task records · host availability is not live, so task states are last known."
-      : failedBackends > 0
-        ? `Partial task list · ${failedBackends} backend store${failedBackends === 1 ? "" : "s"} unavailable.`
-        : "Read-only retained task projection. Pending summaries expire unless refreshed by their producer.";
-    setComponentState(byId("task-status"), message, hostOffline || failedBackends > 0 || envelope.status === "stale" ? "stale" : "quiet");
+      : failedBackends > 0 || partialBackends > 0
+        ? `Partial task list · ${failedBackends} backend store${failedBackends === 1 ? "" : "s"} unavailable · ${partialBackends} incomplete.`
+        : envelope.status === "stale"
+          ? "Showing last confirmed task projection · states and pending summaries are not current."
+          : "Read-only retained task projection. Pending summaries expire unless refreshed by their producer.";
+    setComponentState(byId("task-status"), message, hostOffline || failedBackends > 0 || envelope.status !== "confirmed" ? "stale" : "quiet");
+    schedulePendingExpiry();
   }
+
+  function schedulePendingExpiry() {
+    clearTimeout(state.pendingTimer);
+    state.pendingTimer = null;
+    const nextExpiry = nextPendingExpiryMs([...state.taskSnapshots.values()]);
+    if (nextExpiry == null) return;
+    const delay = Math.min(Math.max(0, nextExpiry - Date.now()), 2_147_000_000);
+    state.pendingTimer = setTimeout(() => {
+      state.pendingTimer = null;
+      renderTasks(state.tasksEnvelope);
+    }, delay);
+  }
+
+  function replicaFreshnessText(replica) {
+    if (!replica || replica.status === "unknown") return "Replica freshness unknown";
+    if (replica.status === "unavailable") return "Replica freshness unavailable";
+    if (replica.status !== "confirmed" && replica.last_synced_at == null
+      && replica.source_head_revision == null && replica.acked_through_revision == null
+      && replica.cloud_head_seq == null) return "Replica freshness unknown";
+    const sync = replica.last_synced_at == null ? "Last synchronized unknown" : `Last synchronized ${formatTime(replica.last_synced_at)}`;
+    const gapCount = Number.isFinite(replica.gap_count) ? Math.max(0, Math.trunc(replica.gap_count)) : null;
+    const gap = gapCount == null ? "" : gapCount > 0 ? ` · ${gapCount} gap${gapCount === 1 ? "" : "s"}` : " · no known gaps";
+    const degraded = replica.journal_degraded ? " · journal degraded" : "";
+    return `${sync}${gap}${degraded}`;
+  }
+
+  function renderContext(envelope) {
+    const hostId = fence.value.hostId;
+    const sessionId = fence.value.sessionId;
+    const detail = byId("context-detail");
+    detail.hidden = true;
+    if (!sessionId) {
+      setComponentState(byId("context-status"), "Select a session to inspect context.", "quiet");
+      setText(byId("context-authority"), "—");
+      return;
+    }
+    if (!envelope || !envelope.data) {
+      setComponentState(byId("context-status"), componentMessage(envelope, "Context"), "error");
+      setText(byId("context-authority"), "Unavailable");
+      return;
+    }
+    const data = envelope.data;
+    if (data.host_id !== hostId || data.session_id !== sessionId) {
+      setComponentState(byId("context-status"), "Context data did not match the current selection.", "error");
+      setText(byId("context-authority"), "Unavailable");
+      return;
+    }
+    const resolve = data.context_resolve;
+    const status = data.context_status;
+    const replicaComponent = data.replica;
+    const replica = replicaComponent?.data
+      ? { ...replicaComponent.data, status: replicaComponent.status }
+      : replicaComponent;
+    const host = selectedHost();
+    const hostLive = hostAvailability(host) === "online";
+    const resolveAvailable = isContextResolverCurrent(envelope, resolve, hostAvailability(host));
+    const contextResolveData = resolveAvailable ? resolve.data : null;
+    const contextStatusData = envelope.status === "confirmed" && status?.status === "confirmed" && status?.data && hostLive ? status.data : null;
+    const currentSummary = contextResolveData?.current_summary ?? {};
+    const liveFreshness = contextResolveData?.freshness ?? {};
+
+    setText(byId("context-authority"), resolveAvailable ? "Host live" : (replica?.status === "confirmed" ? "Fabric replica" : "Unavailable"));
+    byId("context-authority").className = `authority-pill${resolveAvailable ? " authority-pill--live" : replica?.status === "unavailable" ? " authority-pill--unavailable" : ""}`;
+
+    let statusMessage;
+    let statusKind = "quiet";
+    if (!hostLive) {
+      statusMessage = `Current host context is unavailable · live route ${hostAvailability(host)}.`;
+      statusKind = "stale";
+    } else if (envelope.status !== "confirmed") {
+      statusMessage = "Context snapshot is stale · current host state has not been reconfirmed.";
+      statusKind = "stale";
+    } else if (resolveAvailable) {
+      statusMessage = contextResolveData.partial?.journal_degraded
+        ? "Current host context confirmed · local journal reports degraded data."
+        : componentMessage(resolve, "Current context");
+      statusKind = contextResolveData.partial?.journal_degraded || resolve.status === "stale" ? "stale" : "quiet";
+    } else if (resolve?.status === "unavailable") {
+      statusMessage = `Current host context unavailable${resolve.error_code ? ` · ${boundedText(String(resolve.error_code), 64)}` : ""}.`;
+      statusKind = "error";
+    } else {
+      statusMessage = "Current host context has not been confirmed.";
+      statusKind = "stale";
+    }
+    if (envelope.status === "stale" && envelope.error_code) {
+      statusMessage += ` Last refresh failed · ${boundedText(String(envelope.error_code), 64)}.`;
+      statusKind = "stale";
+    }
+    setComponentState(byId("context-status"), statusMessage, statusKind);
+
+    const freshness = byId("freshness-card");
+    freshness.replaceChildren();
+    const freshnessTop = createElement(documentRef, "div", "freshness-top");
+    appendText(documentRef, freshnessTop, "strong", "", replicaFreshnessText(replica));
+    const freshnessLabel = replica?.journal_degraded || (Number(replica?.gap_count) > 0) ? "Needs attention" : replica?.status === "confirmed" ? "Replica" : "Unknown";
+    appendText(documentRef, freshnessTop, "span", "state-badge state-badge--muted", freshnessLabel);
+    freshness.append(freshnessTop);
+    const replicaDetails = createElement(documentRef, "div", "freshness-detail");
+    const revision = replica?.source_head_revision ?? replica?.acked_through_revision ?? replica?.cloud_head_seq;
+    const replicaFacts = [
+      ["Source revision", revision == null ? "Unknown" : boundedText(String(revision), 48)],
+      ["Journal", replica?.journal_degraded ? "Degraded" : replica?.status === "confirmed" ? "Healthy" : "Unknown"],
+      ["Current journal revision", liveFreshness.resolved_revision ?? contextStatusData?.journal?.revision ?? "Unavailable"],
+      ["Memory worker", contextResolveData?.memory?.worker ?? contextStatusData?.memory?.worker ?? "Unavailable"],
+    ];
+    if (contextResolveData?.current_summary) {
+      const summary = contextResolveData.current_summary;
+      replicaFacts.push(["Tasks active / total", `${summary.tasks_active ?? "?"} / ${summary.tasks_total ?? "?"}`]);
+      replicaFacts.push(["Needs attention", summary.tasks_attention ?? "?"]);
+      replicaFacts.push(["Observations", summary.observations ?? "?"]);
+      replicaFacts.push(["Last observed", formatTime(summary.last_observed_at)]);
+    } else if (contextStatusData?.journal) {
+      replicaFacts.push(["Journal observations", contextStatusData.journal.observations ?? "?"]);
+      replicaFacts.push(["Journal revision", contextStatusData.journal.revision ?? "?"]);
+    }
+    for (const [label, value] of replicaFacts) {
+      const fact = createElement(documentRef, "div", "");
+      appendText(documentRef, fact, "span", "", label);
+      appendText(documentRef, fact, "strong", "", value);
+      replicaDetails.append(fact);
+    }
+    freshness.append(replicaDetails);
+
+    const unresolvedRoot = byId("unresolved-list");
+    unresolvedRoot.replaceChildren();
+    const unresolved = contextResolveData?.unresolved;
+    if (!Array.isArray(unresolved)) {
+      appendText(documentRef, unresolvedRoot, "div", "compact-item", resolve?.status === "unavailable" ? "Unresolved items unavailable." : "Current unresolved items are not confirmed.");
+      setText(byId("unresolved-count"), "?");
+    } else if (unresolved.length === 0) {
+      appendText(documentRef, unresolvedRoot, "div", "compact-item", "No unresolved items in the confirmed projection.");
+      setText(byId("unresolved-count"), "0");
+    } else {
+      setText(byId("unresolved-count"), String(unresolved.length));
+      for (const item of unresolved.slice(0, 16)) {
+        const row = createElement(documentRef, "div", "compact-item");
+        const statusName = boundedText(String(item?.status ?? "unknown"), 32);
+        const taskName = shortIdentifier(item?.task_id, 96);
+        appendText(documentRef, row, "strong", "", `${taskName || "Task"} · ${statusName}`);
+        if (item?.reason) appendText(documentRef, row, "span", "compact-item-meta", boundedText(String(item.reason), 180));
+        unresolvedRoot.append(row);
+      }
+    }
+
+    const rollupRoot = byId("rollup-list");
+    rollupRoot.replaceChildren();
+    const rollups = contextResolveData?.recent_related_tasks;
+    if (!Array.isArray(rollups)) {
+      appendText(documentRef, rollupRoot, "div", "compact-item", "Recent context rollups unavailable.");
+    } else if (rollups.length === 0) {
+      appendText(documentRef, rollupRoot, "div", "compact-item", "No recent task rollups in this projection.");
+    } else {
+      for (const task of rollups.slice(0, 8)) {
+        const row = createElement(documentRef, "div", "compact-item");
+        const taskId = shortIdentifier(task?.task_id, 96) || "Task";
+        const backend = boundedText(String(task?.backend ?? "unknown"), 48);
+        const taskStatus = boundedText(String(task?.state?.status ?? "unobserved"), 32);
+        appendText(documentRef, row, "strong", "", `${taskId} · ${taskStatus}`);
+        appendText(documentRef, row, "span", "compact-item-meta", `${backend} · observed ${formatTime(task?.last_observed_at)}`);
+        rollupRoot.append(row);
+      }
+    }
+
+    const provenanceBlock = byId("provenance-block");
+    provenanceBlock.replaceChildren();
+    const refs = Array.isArray(contextResolveData?.refs) ? contextResolveData.refs.slice(0, 8) : [];
+    provenanceBlock.hidden = refs.length === 0;
+    if (refs.length > 0) {
+      appendText(documentRef, provenanceBlock, "h3", "", "Provenance references");
+      const chips = createElement(documentRef, "div", "provenance-list");
+      for (const reference of refs) {
+        const id = shortIdentifier(reference?.observation_id, 64);
+        const kind = boundedText(String(reference?.kind ?? "reference"), 32);
+        const revisionText = reference?.revision == null ? "" : ` · r${boundedText(String(reference.revision), 24)}`;
+        const chip = appendText(documentRef, chips, "span", "provenance-chip", `${kind}${id ? ` · ${id}` : ""}${revisionText}`);
+        chip.title = chip.textContent;
+      }
+      provenanceBlock.append(chips);
+    }
+    detail.hidden = false;
+  }
+
+  function renderTimeline(envelope) {
+    const root = byId("timeline-list");
+    root.replaceChildren();
+    const sessionId = fence.value.sessionId;
+    if (!sessionId) {
+      setComponentState(byId("timeline-status"), "Select a session to load recent observations.", "quiet");
+      return;
+    }
+    const data = envelope?.data;
+    if (!envelope || !data || !Array.isArray(data.events)) {
+      setComponentState(byId("timeline-status"), componentMessage(envelope, "Timeline"), "error");
+      return;
+    }
+    if (data.host_id !== fence.value.hostId || data.session_id !== sessionId) {
+      setComponentState(byId("timeline-status"), "Timeline data did not match the current selection.", "error");
+      return;
+    }
+    const source = data.source ?? {};
+    setText(byId("timeline-authority"), envelope.authority === "fabric_replica" ? "Fabric replica" : "Replica");
+    setComponentState(
+      byId("timeline-status"),
+      `${componentMessage(envelope, "Sanitized timeline")} · ${replicaFreshnessText(source)}`,
+      envelope.status === "stale" || source.journal_degraded || Number(source.gap_count) > 0 ? "stale" : "quiet",
+    );
+    const events = state.timelineEvents.length > 0 ? state.timelineEvents : data.events;
+    if (events.length === 0) {
+      appendText(documentRef, root, "li", "component-state component-state--quiet", "No replicated observations in this window.");
+      return;
+    }
+    for (const event of events.slice(-MAX_TIMELINE_EVENTS)) {
+      const item = createElement(documentRef, "li", "timeline-item");
+      appendText(documentRef, item, "span", "timeline-marker", "").setAttribute("aria-hidden", "true");
+      const parts = [event?.kind, event?.action].filter((part) => typeof part === "string" && part.length > 0).map((part) => boundedText(part, 48));
+      const title = parts.length > 0 ? parts.join(" · ") : "Sanitized observation";
+      appendText(documentRef, item, "strong", "timeline-title", title);
+      const metadata = [
+        event?.target_backend && `Backend ${boundedText(String(event.target_backend), 40)}`,
+        event?.content_kind && `Content ${boundedText(String(event.content_kind), 32)}`,
+        event?.state_status && `State ${boundedText(String(event.state_status), 32)}`,
+      ].filter(Boolean);
+      if (metadata.length > 0) appendText(documentRef, item, "span", "timeline-detail", metadata.join(" · "));
+      appendText(documentRef, item, "span", "timeline-time", formatTime(event?.observed_at));
+      const revision = event?.source_revision ?? event?.state_revision ?? event?.cloud_seq;
+      if (revision != null) appendText(documentRef, item, "span", "timeline-source", `Revision ${boundedText(String(revision), 32)}`);
+      root.append(item);
+    }
+  }
+
+  function scheduleNextRefresh() {
+    clearTimeout(state.timer);
+    const delay = documentRef.hidden ? REFRESH_BACKGROUND_MS : REFRESH_FOREGROUND_MS;
+    state.timer = setTimeout(() => void refreshDashboard(false), delay);
+  }
+
+  function currentRefreshLabel() {
+    if (!state.lastUpdatedAt) return "Connecting";
+    const seconds = Math.max(0, Math.floor((Date.now() - state.lastUpdatedAt) / 1_000));
+    if (state.degraded.size > 0) return `Degraded · updated ${seconds}s ago`;
+    return `Live · updated ${seconds}s ago`;
+  }
+
+  async function refreshDashboard(manual = false) {
+    if (state.refreshing) return;
+    state.refreshing = true;
+    byId("refresh-button").disabled = true;
+    setRefreshStatus(manual ? "Refreshing" : currentRefreshLabel(), manual ? "warning" : state.degraded.size ? "warning" : "live");
+    try {
+      await Promise.all([loadBootstrap(), loadHosts()]);
+      const snapshot = fence.snapshot();
+      if (snapshot.hostId) {
+        if (membershipRemovalConfirmed(state.hostsEnvelope, snapshot.hostId)) {
+          await loadSessions(snapshot);
+        } else if (snapshot.sessionId) {
+          await Promise.all([loadSessions(snapshot), loadSessionDetails(snapshot)]);
+        } else {
+          await loadSessions(snapshot);
+        }
+      }
+      state.lastUpdatedAt = Date.now();
+      setText(byId("last-updated"), `Updated ${formatTime(state.lastUpdatedAt)}`);
+      setRefreshStatus(currentRefreshLabel(), state.degraded.size > 0 ? "warning" : "live");
+    } catch {
+      setRefreshStatus("Refresh failed · showing available components", "error");
+    } finally {
+      state.refreshing = false;
+      byId("refresh-button").disabled = false;
+      scheduleNextRefresh();
+    }
+  }
+
+  function onLocationChange() {
+    const next = parseSelection(windowRef.location);
+    select(next, false);
+  }
+
+  function onVisibilityChange() {
+    clearTimeout(state.timer);
+    renderHosts();
+    renderSession(state.sessionEnvelope);
+    renderTasks(state.tasksEnvelope);
+    renderContext(state.contextEnvelope);
+    renderTimeline(state.timelineEnvelope);
+    if (documentRef.hidden) scheduleNextRefresh();
+    else void refreshDashboard(false);
+  }
+
+  function markLiveRoutesStale() {
+    state.sessionsEnvelope = markEnvelopeStale(state.sessionsEnvelope, "browser_offline");
+    state.sessionEnvelope = markEnvelopeStale(state.sessionEnvelope, "browser_offline");
+    state.tasksEnvelope = markEnvelopeStale(state.tasksEnvelope, "browser_offline");
+    state.contextEnvelope = markEnvelopeStale(state.contextEnvelope, "browser_offline");
+  }
+
+  byId("refresh-button").addEventListener("click", () => void refreshDashboard(true));
+  windowRef.addEventListener("hashchange", onLocationChange);
+  documentRef.addEventListener("visibilitychange", onVisibilityChange);
+  windowRef.addEventListener("online", () => {
+    state.browserOffline = false;
+    renderHosts();
+    renderSession(state.sessionEnvelope);
+    renderTasks(state.tasksEnvelope);
+    renderContext(state.contextEnvelope);
+    renderTimeline(state.timelineEnvelope);
+    void refreshDashboard(false);
+  });
+  windowRef.addEventListener("offline", () => {
+    state.browserOffline = true;
+    markLiveRoutesStale();
+    renderHosts();
+    renderSession(state.sessionEnvelope);
+    renderTasks(state.tasksEnvelope);
+    renderContext(state.contextEnvelope);
+    renderTimeline(state.timelineEnvelope);
+    setRefreshStatus("Browser offline · live routes unknown", "warning");
+    scheduleNextRefresh();
+  });
+
+  renderHosts();
+  renderSession(null);
+  renderTasks(null);
+  renderContext(null);
+  renderTimeline(null);
+  void refreshDashboard(false);
+  return { state, fence, refreshDashboard };
+}
+
+let activeDashboard = null;
+if (typeof document !== "undefined" && typeof window !== "undefined") {
+  activeDashboard = startDashboard(document, window);
+}
+
+export {
+  REFRESH_BACKGROUND_MS,
+  REFRESH_FOREGROUND_MS,
+  SelectionFence,
+  RequestCoordinator,
+  activeDashboard,
+  boundedText,
+  compareSequence,
+  formatTime,
+  mergePendingSummary,
+  mergeTaskProjection,
+  parseSelection,
+  parseTimestampMs,
+  pendingForDisplay,
+  isContextResolverCurrent,
+  effectiveHostAvailability,
+  membershipRemovalConfirmed,
+  nextPendingExpiryMs,
+  isSessionProjectionCurrent,
+  isTaskProjectionCurrent,
+  markEnvelopeStale,
+  responseIsDegraded,
+  retainLastData,
+  setText,
+  taskBackendPresentation,
+  shortIdentifier,
+};

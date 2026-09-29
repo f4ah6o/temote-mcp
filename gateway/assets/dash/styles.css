@@ -2,7 +2,7 @@
   color-scheme: light;
   --ink: #172624;
   --ink-soft: #52635f;
-  --muted: #73827e;
+  --muted: #5e6d68;
   --line: #dce5e0;
   --line-strong: #cbd7d1;
   --surface: #ffffff;
@@ -203,6 +203,7 @@ h3 { margin: 0; font-size: 12px; font-weight: 720; }
 }
 .host-name-row { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .host-name { overflow: hidden; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.host-chevron { color: var(--muted); font-size: 16px; line-height: 1; }
 .availability { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: var(--ink-soft); font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; }
 .availability::before { width: 6px; height: 6px; border-radius: 50%; background: #96a19d; content: ""; }
 .availability--online::before { background: #1a9b78; }
@@ -267,6 +268,12 @@ h3 { margin: 0; font-size: 12px; font-weight: 720; }
 .workspace-card .fact-value { font-size: 10px; }
 .tasks-section { padding-top: 17px; border-top: 1px solid var(--line); }
 .task-list { display: grid; gap: 8px; }
+.backend-group { display: grid; min-width: 0; gap: 8px; }
+.backend-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 1px 1px 0; }
+.backend-state { padding: 2px 6px; border-radius: 999px; color: var(--ink-soft); background: var(--surface-soft); font-size: 8px; font-weight: 720; text-transform: uppercase; }
+.backend-state--confirmed { color: #176c57; background: var(--accent-pale); }
+.backend-state--unavailable { color: #91493f; background: var(--danger-pale); }
+.backend-state--partial { color: #805b1a; background: var(--warning-pale); }
 .task-card { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: white; }
 .task-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .task-identity { display: grid; min-width: 0; gap: 3px; }
@@ -343,6 +350,10 @@ h3 { margin: 0; font-size: 12px; font-weight: 720; }
   .deployment { grid-row: 3; gap: 12px; }
   .deployment { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
   .deployment strong { max-width: 100%; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+  .host-name { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+  .session-choice span:first-child { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+  .task-id { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+  .provenance-chip { white-space: normal; overflow-wrap: anywhere; }
   .facts-grid, .workspace-card { grid-template-columns: minmax(0, 1fr); }
   .panel-heading--session { align-items: flex-start; flex-direction: column; }
   .freshness-detail { grid-template-columns: minmax(0, 1fr); }
