@@ -304,6 +304,7 @@ impl HttpApi {
     fn new(config: &CloudConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("temote-mcp/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -723,7 +724,10 @@ struct CloudObservationBinding {
     owner: SessionInstance,
     scope_cwd: PathBuf,
     org_id: String,
-    devin_session_id: String,
+    // This is a remote resource-routing identifier, not the bearer credential
+    // used to authenticate requests. The persisted/public name remains
+    // `devin_session_id` for compatibility.
+    remote_session_resource_id: String,
     generation: u64,
 }
 
@@ -734,7 +738,7 @@ impl CloudObservationBinding {
             owner: record.owner.clone(),
             scope_cwd: record.scope_cwd.clone(),
             org_id: record.org_id.clone(),
-            devin_session_id: record.devin_session_id.clone()?,
+            remote_session_resource_id: record.devin_session_id.clone()?,
             generation: record.generation,
         })
     }
@@ -744,7 +748,7 @@ impl CloudObservationBinding {
             && record.owner == self.owner
             && record.scope_cwd == self.scope_cwd
             && record.org_id == self.org_id
-            && record.devin_session_id.as_deref() == Some(&self.devin_session_id)
+            && record.devin_session_id.as_deref() == Some(&self.remote_session_resource_id)
             && record.generation == self.generation
     }
 }
@@ -2190,7 +2194,7 @@ async fn read_cloud_status(
     let read_started_at = config::unix_time();
     let result = tokio::time::timeout(
         Duration::from_secs(pending_interaction::SCOPED_READ_TIMEOUT_SECS),
-        api.get_session_status(&binding.org_id, &binding.devin_session_id),
+        api.get_session_status(&binding.org_id, &binding.remote_session_resource_id),
     )
     .await
     .context("Devin Cloud status read timed out")?
@@ -2210,7 +2214,7 @@ fn classify_cloud_pending_status(
         .as_deref()
         .context("Devin Cloud status response omitted its session identity")?;
     anyhow::ensure!(
-        session_id == binding.devin_session_id,
+        session_id == binding.remote_session_resource_id,
         "Devin Cloud status response session identity changed"
     );
     if response
@@ -4382,6 +4386,34 @@ mod tests {
         assert!(validate_base_url("").is_err());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_transport_rejects_internally_constructed_http_config_before_sending_key() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let secret = "devin-secret-must-not-cross-http";
+        let config = CloudConfig {
+            api_key: secret.to_owned(),
+            api_key_source: API_KEY_ENV,
+            org_id: Some("org-test".to_owned()),
+            base_url: format!("http://{address}"),
+            create_as_user_id: None,
+        };
+        // Construct HttpApi directly to cover internal callers that bypass
+        // resolve_config's https-only validation.
+        let api = HttpApi::new(&config).unwrap();
+        let error = api
+            .get_session_status("org-test", "session-test")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Rejected(_)));
+        assert!(!error.message().contains(secret));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn report_extraction_requires_shape() {
         assert!(extract_report("no json here").is_none());
@@ -4860,6 +4892,32 @@ mod tests {
     }
 
     #[test]
+    fn cloud_binding_names_remote_resource_id_without_changing_record_wire_name() {
+        let workspace = tempdir();
+        let owner = session(&workspace, "observer-resource-binding");
+        let task_id = Uuid::new_v4();
+        let record = cloud_observer_record(&owner, task_id, TaskStatus::Running);
+
+        let wire = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            wire["devin_session_id"],
+            record.devin_session_id.as_deref().unwrap()
+        );
+        assert!(wire.get("remote_session_resource_id").is_none());
+
+        let binding = CloudObservationBinding::from_record(&record).unwrap();
+        assert_eq!(
+            binding.remote_session_resource_id,
+            record.devin_session_id.as_deref().unwrap()
+        );
+        assert!(binding.matches(&record));
+
+        let mut rebound = record.clone();
+        rebound.devin_session_id = Some("different-remote-resource".to_owned());
+        assert!(!binding.matches(&rebound));
+    }
+
+    #[test]
     fn cloud_pending_classifier_requires_a_consistent_running_approval_status() {
         let workspace = tempdir();
         let owner = session(&workspace, "observer-classifier");
@@ -4873,7 +4931,11 @@ mod tests {
         };
         assert_eq!(
             classify_cloud_pending_status(
-                &remote(&binding.devin_session_id, "running", "waiting_for_approval"),
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "running",
+                    "waiting_for_approval"
+                ),
                 &binding,
             )
             .unwrap(),
@@ -4881,7 +4943,11 @@ mod tests {
         );
         assert_eq!(
             classify_cloud_pending_status(
-                &remote(&binding.devin_session_id, "running", "waiting_for_user"),
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "running",
+                    "waiting_for_user"
+                ),
                 &binding,
             )
             .unwrap(),
@@ -4891,7 +4957,7 @@ mod tests {
         assert_eq!(
             classify_cloud_pending_status(
                 &remote(
-                    &binding.devin_session_id,
+                    &binding.remote_session_resource_id,
                     "future_status",
                     "waiting_for_approval"
                 ),
@@ -4902,7 +4968,11 @@ mod tests {
         );
         assert_eq!(
             classify_cloud_pending_status(
-                &remote(&binding.devin_session_id, "exit", "waiting_for_approval"),
+                &remote(
+                    &binding.remote_session_resource_id,
+                    "exit",
+                    "waiting_for_approval"
+                ),
                 &binding,
             )
             .unwrap(),
