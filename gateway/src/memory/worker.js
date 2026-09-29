@@ -774,6 +774,7 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
   const items = [];
   const unique = new Map();
   const overlays = new Map();
+  const supersededKnowledgeIds = new Set();
   const sorted = [...extractedItems].sort((left, right) =>
     Number(left.support[0]?.cloud_seq ?? 0) - Number(right.support[0]?.cloud_seq ?? 0));
   for (let index = 0; index < sorted.length; index += 1) {
@@ -792,7 +793,10 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       extracted.text,
     ].join("\u0000");
     const prior = unique.get(semanticIdentity);
-    if (prior) {
+    // Support merges only into a live staged item. A staged item that an
+    // in-batch change already superseded must not absorb the re-occurrence:
+    // that re-occurrence is a new state transition, not extra evidence.
+    if (prior && prior.status !== "superseded") {
       const additions = extracted.support.map(supportToStored).filter((support) =>
         !prior.support.some((existing) => existing.cloudSeq === support.cloudSeq
           && existing.role === support.role));
@@ -827,9 +831,13 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       "AND scope_type = ? AND scope_id = ? AND kind = ? AND semantic_key = ?",
       "AND status IN ('supported', 'current') ORDER BY status DESC, produced_at DESC LIMIT ?",
     ].join(" "), [...keyValues, MAX_SUPERSESSION_CANDIDATES + 1]);
-    const tooManyConflicts = activeRows.length > MAX_SUPERSESSION_CANDIDATES;
-    const matching = activeRows.find((existing) => existing.text === extracted.text) ?? null;
-    const dbConflicts = activeRows.filter((existing) => existing.text !== extracted.text);
+    // Rows superseded earlier in this batch are dead despite still reading
+    // as active in the database snapshot; never reuse or re-target them.
+    const liveRows = activeRows.filter((existing) =>
+      !supersededKnowledgeIds.has(existing.knowledge_id));
+    const tooManyConflicts = liveRows.length > MAX_SUPERSESSION_CANDIDATES;
+    const matching = liveRows.find((existing) => existing.text === extracted.text) ?? null;
+    const dbConflicts = liveRows.filter((existing) => existing.text !== extracted.text);
     const overlayKey = [
       extracted.scopeType,
       extracted.scopeId,
@@ -870,6 +878,7 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
       if (authorizedConflicts.length === conflicts.length) {
         supersedes = authorizedConflicts.map((existing) => existing.knowledge_id ?? existing.knowledgeId);
         status = promotedStatus(extracted);
+        for (const supersededId of supersedes) supersededKnowledgeIds.add(supersededId);
         for (const oldItem of stagedConflicts) oldItem.status = "superseded";
       } else {
         status = "supported";

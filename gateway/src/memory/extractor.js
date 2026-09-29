@@ -222,7 +222,8 @@ function fixtureExtract(observations) {
 }
 
 function canonicalFirstUnion(validatedModelItems, observations) {
-  const groups = new Map();
+  const latestGroups = new Map();
+  const ordered = [];
   const repositoryKey = observations[0]?.repository_key;
   if (typeof repositoryKey !== "string" || !repositoryKey) return validatedModelItems;
   for (const observation of observations) {
@@ -238,7 +239,12 @@ function canonicalFirstUnion(validatedModelItems, observations) {
         "repository",
         observation.repository_key,
       ]);
-      let group = groups.get(identity);
+      // A changed clause is a new policy event and always opens its own
+      // canonical item; an unchanged clause corroborates the latest item
+      // that states the same text. Merging a re-adopted policy into an
+      // earlier group would erase the reinstatement before the worker can
+      // order the transitions.
+      let group = clause.changed ? null : latestGroups.get(identity);
       if (!group) {
         group = {
           kind: clause.kind,
@@ -250,8 +256,9 @@ function canonicalFirstUnion(validatedModelItems, observations) {
           verification_path: null,
           seen: new Set(),
         };
-        groups.set(identity, group);
+        ordered.push(group);
       }
+      latestGroups.set(identity, group);
       const referenceKey = key(Number(observation.cloud_seq), observation.observation_id);
       if (group.seen.has(referenceKey)) continue;
       group.seen.add(referenceKey);
@@ -263,7 +270,7 @@ function canonicalFirstUnion(validatedModelItems, observations) {
     }
   }
 
-  const canonicalItems = [...groups.values()].map(({ seen: _seen, ...item }) => item);
+  const canonicalItems = ordered.map(({ seen: _seen, ...item }) => item);
   if (canonicalItems.length > MAX_EXTRACTED_ITEMS
       || canonicalItems.some((item) => item.support.length > MAX_SUPPORTS)) {
     throw new MemoryError("projection_too_large");
