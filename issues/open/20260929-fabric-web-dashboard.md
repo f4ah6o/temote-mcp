@@ -436,8 +436,8 @@ summary が表現する内容:
 state              = none | pending | unknown | unsupported | unavailable
 count?             bounded integer (source が件数を確定できる場合のみ)
 types?             allow-listed 種別の bounded 配列
-summary_revision   summary 内容 (state / count / types) が変化した
-                   書込みで増加する独立 revision
+summary_revision   summary 内容 (state / count / types / truncated)
+                   が変化した書込みで増加する独立 revision
                    (`observed_at` のみの更新では増やさない)
 observed_at        backend を実際に観測した時刻
 runtime_generation summary を生成した runtime owner の generation
