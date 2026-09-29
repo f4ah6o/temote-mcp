@@ -41,9 +41,9 @@ mod profile;
 #[cfg(feature = "network")]
 mod provider;
 mod repository_clone;
+mod session_control;
 #[allow(dead_code)]
 mod session_source;
-mod session_control;
 mod supervisor;
 #[cfg(test)]
 mod test_support;
