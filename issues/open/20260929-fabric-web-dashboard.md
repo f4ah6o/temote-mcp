@@ -315,10 +315,11 @@ configured_only    configured だが接続履歴も observation もない host
 
 - unknown を offline と断定しない。offline を一覧から消して済ませない。
 - observation がないことを「host が存在しない」と同一視しない。
-- `last seen` は復元できる場合のみ表示する。registry は lease (`expires_at`)
-  しか保持しないため、prune 後の last seen は `observation_sources.last_synced_at`
-  を "last synchronized" として表示し、復元できない場合は `unknown` とする。
-  時刻を捏造しない。
+- `last seen` は復元できる場合のみ表示する。registry entry は
+  `last_seen` / `connected_at` / `expires_at` を保持するが、
+  lease expiry では entry 全体が削除されるため、prune 後は
+  `observation_sources.last_synced_at` を "last synchronized" として表示し、
+  復元できない場合は `unknown` とする。時刻を捏造しない。
 - 認可対象から外れた host は inventory に含めない。
 - D1 が失敗しても live read が成功する host は `online` のまま、
   replica metadata component を `unavailable` として表示する (§12)。
