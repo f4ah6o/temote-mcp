@@ -1,6 +1,6 @@
 # Add instruction-side bare repository provisioning flow
 
-Status: open  
+Status: superseded as caller-flow architecture by `issues/open/20260929-session-first-managed-provisioning.md`; retained as RepositoryStore adapter/provisioning child requirements  
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-27 (Asia/Tokyo)
 
@@ -8,6 +8,32 @@ Related:
 - `issues/done/20260925-f1-repository-store-workspace-contract.md`
 - `issues/done/20260925-v2-vcs-workspace-contract.md`
 - `issues/open/20260926-named-root-workspace-identity.md`
+
+## 0. 2026-09-29 architecture correction
+
+The repository preparation requirements below remain valid, but the top-level ordering changes.
+
+Old framing:
+
+```text
+repository identity
+  -> bare repository store
+  -> managed workspace
+  -> session / task
+```
+
+Session-first framing:
+
+```text
+session request
+  -> repository source normalization
+  -> bare RepositoryStore ensure/fetch
+  -> base pin
+  -> managed VCS workspace allocation
+  -> agent execution
+```
+
+For the Jujutsu normal path, managed workspace allocation means **jj workspace directly from the Git-backed store**. It does not first create a Git branch/worktree. Git branch/worktree remains the explicit Git compatibility backend. See `issues/open/20260929-session-first-managed-provisioning.md`.
 
 ## 1. Problem
 
@@ -49,53 +75,53 @@ The missing piece is therefore not another bare-Git implementation. It is the Te
 
 ## 3. Desired caller flow
 
-A caller should be able to start from repository identity rather than from an already-prepared local checkout.
+This retained child issue now covers the RepositoryStore part of a session-first request.
 
 Conceptually:
 
 ```text
-instruction
-  repo = github.com/f4ah6o/example
+session request
+  source = github.com/f4ah6o/example
   task = implement X
 
 Temote
+  -> create/accept session provisioning operation
   -> resolve allowed repository-store root
   -> ensure bare repository store
   -> fetch according to freshness policy
-  -> ensure task workspace
-  -> acquire reservation / bind task
-  -> start session / delegated agent
+  -> pin base revision
+  -> hand the result to the managed workspace allocator
+  -> start runtime / delegated agent only after workspace readiness
 ```
 
 The caller should not need to know the host's absolute store path or manually run `git clone --bare`, `jj git clone`, or a `gh-git` store command beforehand.
 
 ## 4. API / UX direction
 
-The exact surface can be decided during implementation, but it should support both an explicit provisioning operation and composition with task/session creation.
-
-Possible explicit form:
+The low-level adapter may expose an internal typed repository preparation operation:
 
 ```text
-repository_prepare(
+ensure_repository(
   repository = "github.com/f4ah6o/example"
 )
 ```
 
-Possible composed form:
+The normal caller surface is the session-first composition defined by `20260929-session-first-managed-provisioning.md`:
 
 ```text
 session_start(
-  repository = "github.com/f4ah6o/example",
-  workspace = {
-    id = "task-123",
-    branch = "feat/task-123"
-  }
+  source = {
+    kind = "repository",
+    repository = "github.com/f4ah6o/example",
+    base = "main"
+  },
+  vcs = "auto"
 )
 ```
 
-where Temote internally ensures the repository store before creating the managed workspace.
+No branch or physical workspace path is required from the caller for the Jujutsu normal path. The store adapter returns repository/freshness/base evidence to the session provisioning flow; workspace allocation is a later step owned by Temote.
 
-CLI equivalents may be provided, but the remote/MCP instruction path is the primary requirement.
+CLI equivalents may be provided, but local and remote paths must use the same orchestration contract.
 
 ## 5. Repository identity vs filesystem identity
 
@@ -157,20 +183,20 @@ It should not duplicate or replace the existing F1/V2 contracts.
 - [ ] call the repository-store adapter
 - [ ] return structured repository/store identity and evidence
 
-### P1 — instruction-side surface
+### P1 — session provisioning integration
 
-- [ ] expose repository preparation through the supported MCP/remote instruction path
+- [ ] call repository preparation from the session-first provisioning operation
 - [ ] make the operation idempotent
 - [ ] provide actionable errors for missing root/config/auth/repository conflicts
 - [ ] ensure callers do not need host-local absolute paths
 
-### P2 — compose with managed workspace/session creation
+### P2 — hand off to managed workspace provisioning
 
-- [ ] allow task/session creation from repository identity when the bare store does not yet exist
-- [ ] ensure/fetch store according to freshness policy
-- [ ] create or reuse the managed task workspace
-- [ ] bind repository/workspace/session/task identities
-- [ ] acquire reservations before mutating shared repository/workspace state
+- [ ] allow Session provisioning from repository identity when the bare store does not yet exist
+- [ ] ensure/fetch store according to freshness policy and pin the base revision
+- [ ] pass the normalized RepositoryId/store/base result to the workspace allocator
+- [ ] for Jujutsu, do not create a Git branch/worktree in this packet
+- [ ] bind repository/store observation to the owning session provisioning operation
 
 ### P3 — parity and tests
 
@@ -190,7 +216,7 @@ It should not duplicate or replace the existing F1/V2 contracts.
 - [ ] A compatible existing store is reused idempotently.
 - [ ] Conflicting or unsafe existing state fails closed without modifying the user's normal checkout.
 - [ ] The flow obeys named-root/store-root admission and Temote reservation rules.
-- [ ] Both explicit repository preparation and composed task/session startup have a documented contract.
+- [ ] Internal repository preparation and composed session-first startup have a documented contract.
 - [ ] Tests cover first provisioning, reuse, conflict, and legacy-checkout preservation.
 
 ## 10. Non-goals
