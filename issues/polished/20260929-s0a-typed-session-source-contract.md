@@ -1,10 +1,12 @@
 # S0a: typed session source contract
 
-Status: ready for implementation  
+Status: ready for implementation / revised 2026-09-29 (PR #85 review follow-up: §3 inherits the F1 component grammar)  
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260929-session-first-managed-provisioning.md`  
 Created: 2026-09-29 (Asia/Tokyo)  
 Observed baseline: `main` `3947fc2a6d1e53e0bc85219a176ab4240b5abc16`
+
+Revision note: this packet's contract was strengthened after the PR #85 design review. The S0a implementation merged in PR #86 predates the inherited component grammar and the checked-entry-point requirements below; bring it into conformance in a follow-up change rather than treating the contract as already satisfied by that revision.
 
 ## 1. Goal
 
@@ -76,6 +78,21 @@ Rules:
 - for `github.com`, normalize owner/repository case consistently for identity comparison.
 - do not contact the network.
 - do not infer owner/name from a local checkout.
+
+Component grammar (inherited from F1 §2.2, `issues/done/20260925-f1-repository-store-workspace-contract.md`):
+
+- every `host` / `owner` / `name` component must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`. Do not widen or relax the F1 store grammar in this packet.
+- the supplied default host argument is validated by the same grammar.
+- validate the name again after the terminal `.git` strip: a name that becomes empty or invalid once stripped is rejected.
+- check the raw input's forbidden structures before or while splitting components — `..` / dot segments, encoded separators such as `%2F` / `%5C` / `%2f`, whitespace, and control characters must be rejected even if a URL parser or normalization step would fold them away later.
+- normalization is limited to the forms defined above: host case, `github.com` owner/name case, and one terminal `.git` strip. Do not implicitly repair invalid input — no whitespace trimming to accept, no backslash-to-slash conversion, no percent-decoding into a different identity.
+- dot / dot-dot component rejection and separator rejection remain in force alongside the grammar.
+
+Checked entry points:
+
+- `RepositoryId` may only be produced through the validating parser (or an equivalent checked constructor). Do not add a struct-literal, `Deserialize`, or other entry path that can materialize an identity violating the §3 rules.
+- serde input must enforce the same invariants as parser input: malformed serialized `RepositoryId` data fails closed, and a serde round-trip of a normalized identity preserves value and identity.
+- this is a contract hardening for later packets; it does not assert that an unimplemented `Deserialize` path has a concrete bug today.
 
 The parser should return a typed validation error rather than an arbitrary shell/Git error.
 
@@ -165,6 +182,18 @@ Unit tests must cover at least:
 13. ManagedRepository round-trip serde
 14. ExistingWorkspace round-trip serde
 15. ManagedRepository serialized form contains no path/store/branch field
+16. percent-encoded separators rejected: `github.com/f4ah6o/repo%2Fother`, `github.com/f4ah6o/repo%5Cother`, `github.com/f4ah6o/repo%20name`
+17. literal backslash inside `owner`/`name` rejected
+18. leading / trailing / internal whitespace rejected
+19. tab / newline / NUL / other control characters rejected
+20. dot (`.`) and dot-dot (`..`) path components rejected — including inside URL forms and combined with encoded separators
+21. default host argument containing invalid characters or separators rejected
+22. name that becomes empty after the `.git` strip rejected
+23. malformed `RepositoryId` serde input rejected (an unchecked deserialization path must not materialize an invalid identity)
+24. property: allowed notation variants of the same repository normalize to the same `RepositoryId`
+25. property: every component of a successfully parsed `RepositoryId` satisfies the F1 grammar
+26. property: serde round-trip of a normalized `RepositoryId` preserves value and identity
+27. property: malformed input is never silently converted into a plausible different identity
 
 ## 9. Validation
 
@@ -199,7 +228,10 @@ Do not report unexecuted host/macOS gates as PASS.
 - [ ] core has a typed distinction between ManagedRepository and ExistingWorkspace
 - [ ] RepositoryId is independent of cwd/path
 - [ ] accepted repository spellings normalize deterministically
+- [ ] every host/owner/name component satisfies the inherited F1 grammar `^[A-Za-z0-9][A-Za-z0-9._-]*$`
 - [ ] malformed/path-like inputs fail closed
+- [ ] no unchecked entry point (constructor, serde) can produce a `RepositoryId` that violates §3
+- [ ] invalid input is rejected, never implicitly repaired into a different identity
 - [ ] ManagedRepository cannot carry physical workspace/store path or required delivery branch
 - [ ] no public session behavior changes
 - [ ] existing tests stay green
