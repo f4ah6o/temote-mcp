@@ -12,6 +12,9 @@
 //! projection for a gap.
 
 pub(crate) mod cli;
+#[cfg(feature = "network")]
+pub(crate) mod replicator;
+pub(crate) mod repository;
 pub(crate) mod resolver;
 mod store;
 
@@ -221,6 +224,11 @@ pub(crate) struct Observation {
     /// model supersedes this label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Stable, path-free forge identity resolved from canonical Git metadata.
+    /// Unresolved and unsupported remotes remain `None` and cannot contribute
+    /// to repository-wide cloud knowledge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
     /// Reserved for the V2 per-task workspace identity; unset today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -422,6 +430,7 @@ fn base_observation(
         session_id: session.id.clone(),
         session_instance: instance_of(session),
         repository: repository_label(session),
+        repository_key: repository::repository_key_for_workspace(&session.cwd),
         workspace_id: None,
         task_id: None,
         execution_id: None,

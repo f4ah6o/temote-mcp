@@ -246,12 +246,34 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Project the session-owned observation journal into a deterministic bounded context bundle: current task/execution/workspace state, recent task-scoped instruction references, unresolved items, and provenance refs. Read-only; knowledge/memory synthesis is not implemented yet, so knowledge fields are explicitly empty. Observation bodies stay in the owner-only journal and are never inlined.",
+    "description": "Resolve bounded repository or session context from the authenticated cloud replica: observed tasks and instructions, derived knowledge, support references, and source/worker freshness. Repository requests work with offline execution hosts. Session requests without cloud mapping fall back to the owning host. Replicated observations and derived knowledge are distinct from authoritative live host state. Raw observation bodies are not returned.",
     "inputSchema": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "session_id"
+          ]
+        },
+        {
+          "required": [
+            "repository"
+          ]
+        }
+      ],
       "properties": {
+        "at_least_cloud_seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
         "at_least_revision": {
           "minimum": 0,
+          "type": "integer"
+        },
+        "budget_bytes": {
+          "default": 16384,
+          "maximum": 65536,
+          "minimum": 1024,
           "type": "integer"
         },
         "host_id": {
@@ -270,7 +292,8 @@
           "type": "string"
         },
         "repository": {
-          "maxLength": 256,
+          "description": "Stable repository key, for example github:owner/repository. Resolves from the authenticated cloud replica even when execution hosts are offline.",
+          "maxLength": 512,
           "minLength": 1,
           "type": "string"
         },
@@ -282,15 +305,17 @@
           "maxLength": 256,
           "minLength": 1,
           "type": "string"
+        },
+        "workspace_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "type": "string"
         }
       },
-      "required": [
-        "session_id"
-      ],
       "type": "object"
     },
     "name": "context_resolve",
-    "title": "Resolve the session context bundle"
+    "title": "Resolve repository or session context"
   },
   {
     "annotations": {
@@ -299,12 +324,30 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Report the session observation journal's revision, size, compaction, and degradation counters plus the memory-worker status. Read-only and bounded; raw observation records are never returned.",
+    "description": "Inspect authenticated repository or session source cursors, gaps, synchronization freshness, and memory-worker readiness, errors and lag. Repository requests do not require an online host. Unmapped session requests retain the owning-host fallback.",
     "inputSchema": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "session_id"
+          ]
+        },
+        {
+          "required": [
+            "repository"
+          ]
+        }
+      ],
       "properties": {
         "host_id": {
           "description": "Federated host ID. Omit only for backwards-compatible unqualified session routing.",
+          "type": "string"
+        },
+        "repository": {
+          "description": "Stable repository key, for example github:owner/repository. Resolves from the authenticated cloud replica even when execution hosts are offline.",
+          "maxLength": 512,
+          "minLength": 1,
           "type": "string"
         },
         "session_id": {
@@ -312,13 +355,10 @@
           "type": "string"
         }
       },
-      "required": [
-        "session_id"
-      ],
       "type": "object"
     },
     "name": "context_status",
-    "title": "Inspect the session context plane"
+    "title": "Inspect repository or session context freshness"
   },
   {
     "annotations": {

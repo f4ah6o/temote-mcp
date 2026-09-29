@@ -179,6 +179,15 @@ test("first ingest creates the source, persists repository identity, and returns
   assert.equal(json.complete, true);
   assert.equal(json.authority, FABRIC_AUTHORITY.replicatedObservation);
   assert.equal(database.observations.length, 1);
+  assert.deepEqual(database.memoryOutbox.get("owner-a\n" + REPOSITORY), {
+    owner_id: "owner-a",
+    repository_key: REPOSITORY,
+    through_cloud_seq: 1,
+    queued_at: null,
+    attempt_count: 0,
+    next_attempt_at: 0,
+    last_error_code: null,
+  });
   const source = database.source("owner-a", HOST, SESSION);
   assert.equal(source.repository_key, REPOSITORY);
   assert.equal(source.source_head_revision, 1);
@@ -199,6 +208,55 @@ test("exact replay is idempotent while conflicting revision or observation id is
   result = await sync(body([record(2, 1)], { source_head_revision: 2 }), { db: database });
   assert.equal(result.response.status, 409);
   assert.equal(database.observations.length, 1);
+});
+
+test("committed cursor stays within the replayed page when contiguous ACK exceeds compacted source range", async () => {
+  const database = new FakeD1();
+  database.state.sources.set("owner-a\n" + HOST + "\n" + SESSION, {
+    owner_id: "owner-a",
+    host_id: HOST,
+    session_id: SESSION,
+    repository_key: REPOSITORY,
+    source_base_revision: 0,
+    source_head_revision: 100,
+    acked_through_revision: 100,
+    cloud_head_seq: 100,
+    journal_degraded: 1,
+    gap_count: 68,
+    last_synced_at: "2026-09-28T00:00:00.000Z",
+  });
+  const replayedPage = body(Array.from({ length: 32 }, (_, index) => record(index + 1)), {
+    source_base_revision: 0,
+    source_head_revision: 100,
+    journal_degraded: true,
+    gap_count: 68,
+  });
+
+  let result = await sync(replayedPage, { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.json.acked_through_revision, 100,
+    "the durable contiguous ACK remains unchanged for the host");
+  assert.equal(result.json.committed_through_revision, 32,
+    "the per-request committed cursor must never claim records absent from this page");
+  assert.equal(result.json.complete, false);
+  assert.equal(database.observations.length, 32);
+
+  result = await sync(replayedPage, { db: database });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.json.acked_through_revision, 100);
+  assert.equal(result.json.committed_through_revision, 32);
+  assert.equal(database.observations.length, 32, "replaying the same bounded page is idempotent");
+
+  const empty = await sync(body([], {
+    source_base_revision: 0,
+    source_head_revision: 100,
+    journal_degraded: true,
+    gap_count: 68,
+  }), { db: database });
+  assert.equal(empty.response.status, 200);
+  assert.equal(empty.json.acked_through_revision, 100);
+  assert.equal(empty.json.committed_through_revision, 100,
+    "empty sync confirms only the source's existing contiguous ACK");
 });
 
 test("ack advances only through the committed contiguous prefix and never regresses", async () => {
@@ -263,6 +321,7 @@ test("D1 commit failure returns no ACK and leaves the source uncommitted", async
   assert.equal(Object.hasOwn(result.json, "acked_through_revision"), false);
   assert.equal(Object.hasOwn(result.json, "cloud_head_seq"), false);
   assert.equal(database.observations.length, 0);
+  assert.equal(database.memoryOutbox.size, 0);
   assert.equal(database.source("owner-a", HOST, SESSION), undefined);
 });
 
@@ -441,11 +500,17 @@ test("unknown keys in other nested members are rejected before D1 mutation", asy
 
 class FakeD1 {
   constructor() {
-    this.state = { sources: new Map(), observations: [], nextSeq: 1 };
+    this.state = {
+      sources: new Map(), observations: [], memoryOutbox: new Map(), nextSeq: 1,
+    };
   }
 
   get observations() {
     return this.state.observations;
+  }
+
+  get memoryOutbox() {
+    return this.state.memoryOutbox;
   }
 
   source(owner, host, session) {
@@ -460,6 +525,7 @@ class FakeD1 {
     const next = {
       sources: new Map(Array.from(this.state.sources, ([key, value]) => [key, { ...value }])),
       observations: this.state.observations.map((value) => ({ ...value })),
+      memoryOutbox: new Map(Array.from(this.state.memoryOutbox, ([key, value]) => [key, { ...value }])),
       nextSeq: this.state.nextSeq,
     };
     const results = statements.map((statement) => this.execute(statement, next));
@@ -598,6 +664,37 @@ class FakeD1 {
         0,
       );
       source.last_synced_at = now;
+      return { results: [], meta: { changes: 1 } };
+    }
+
+    if (sql.startsWith("INSERT INTO memory_outbox")) {
+      const [owner, repository, now, observationOwner, observationRepository] = args;
+      const observations = state.observations.filter((item) =>
+        item.owner_id === observationOwner && item.repository_key === observationRepository
+      );
+      if (observations.length === 0) return { results: [], meta: { changes: 0 } };
+      const throughCloudSeq = Math.max(...observations.map((item) => item.cloud_seq));
+      const key = owner + "\n" + repository;
+      const existing = state.memoryOutbox.get(key);
+      if (!existing) {
+        state.memoryOutbox.set(key, {
+          owner_id: owner,
+          repository_key: repository,
+          through_cloud_seq: throughCloudSeq,
+          queued_at: null,
+          attempt_count: 0,
+          next_attempt_at: 0,
+          last_error_code: null,
+        });
+      } else {
+        if (throughCloudSeq > existing.through_cloud_seq) {
+          existing.through_cloud_seq = throughCloudSeq;
+          existing.queued_at = null;
+          existing.next_attempt_at = 0;
+          existing.last_error_code = null;
+        }
+        existing.updated_at = now;
+      }
       return { results: [], meta: { changes: 1 } };
     }
 

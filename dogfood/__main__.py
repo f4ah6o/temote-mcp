@@ -11,6 +11,12 @@ from pathlib import Path
 
 from .protocol import compare, load, save, scenario
 from .runner import FakeAdapter, LiveAdapter, execute
+from .memory_continuity import (
+    compare_runs as compare_memory_runs,
+    load_scenario as load_memory_scenario,
+    main as memory_continuity_main,
+    validate_artifact as validate_memory_artifact,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 SCENARIOS = ROOT / "dogfood" / "scenarios"
@@ -47,14 +53,53 @@ def main() -> None:
     comparison.add_argument("--target-operation", action="append", default=[])
     comparison.add_argument("--target-assertion", action="append", default=[])
     comparison.add_argument("--output", type=Path)
+    memory = commands.add_parser(
+        "memory-continuity",
+        help="run the supported-knowledge/head-switch memory dogfood scenario",
+    )
+    memory.add_argument("memory_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
+    if args.command == "memory-continuity":
+        sys.exit(memory_continuity_main(args.memory_args))
     if args.command == "validate":
-        checked = [scenario(path)["id"] for path in sorted(SCENARIOS.glob("*.json"))]
+        checked = []
+        for path in sorted(SCENARIOS.glob("*.json")):
+            if path.stem == "memory-continuity":
+                checked.append(load_memory_scenario(path)["id"])
+            else:
+                checked.append(scenario(path)["id"])
         print(json.dumps({"validated": checked}))
         return
     if args.command == "compare":
         gates = json.loads(args.gates.read_text()) if args.gates else {}
+        try:
+            baseline_json = json.loads(args.baseline.read_text(encoding="utf-8"))
+            candidate_json = json.loads(args.candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            baseline_json = candidate_json = None
+        if (isinstance(baseline_json, dict) and isinstance(candidate_json, dict)
+                and baseline_json.get("scenario_id") == "memory-continuity"
+                and candidate_json.get("scenario_id") == "memory-continuity"):
+            validate_memory_artifact(baseline_json)
+            validate_memory_artifact(candidate_json)
+            report = compare_memory_runs(
+                baseline_json, candidate_json, independent_gates=gates,
+            )
+            if args.output:
+                if args.output.exists():
+                    raise FileExistsError(args.output)
+                args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
+            qualification = report["qualification"]
+            print(json.dumps({
+                "qualification": qualification,
+                "scenario_id": report["scenario_id"],
+                "report": str(args.output) if args.output else report,
+            }, sort_keys=True))
+            if qualification != "qualified":
+                sys.exit(1)
+            return
         result = compare(load(args.baseline), load(args.candidate), gates=gates,
                          target_metrics=args.target_metric, target_operations=args.target_operation,
                          target_assertions=args.target_assertion)

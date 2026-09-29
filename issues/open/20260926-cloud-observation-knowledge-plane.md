@@ -1,6 +1,7 @@
 # O3C: Temote Fabric shared observation / knowledge plane
 
-Status: implementation in progress / C0-C1 complete  
+Status: C0-C5 locally implemented and qualified; Cloudflare remote NOT RUN; optional C6 remains open
+
 Repository: `f4ah6o/temote-mcp`  
 Parent: `issues/open/20260925-observation-context-memory-plane.md`  
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`  
@@ -830,44 +831,85 @@ remote deployment must replace it with the provisioned `temote-observation` data
 
 ### C2 — host replicator
 
-- [ ] gateway-agent reads local O1 journal
-- [ ] durable per-session ack cursor
-- [ ] bounded batches
-- [ ] retry without duplicate insert
-- [ ] compaction-gap reporting
-- [ ] Fabric offline does not fail task execution
+2026-09-28 implementation packet: the host cursor is namespaced by authenticated
+host and Fabric endpoint, with separate contiguous ACK and delivered cursors.
+The compatible sync response adds optional `committed_through_revision`: the
+highest source revision among records validated and committed/replayed in that
+specific successful batch (an empty batch returns the contiguous ACK). The host
+checks the response session and bounds this value by that batch's last record.
+It persists both cursors atomically and never rolls either back.
+
+`acked_through_revision` retains its contiguous meaning. Pagination after the
+delivered cursor allows later records, including terminal updates, to pass an
+internal journal hole. Recorded gaps and degradation remain sticky and the
+source is never reported complete. Restoring an older missing journal record
+requires an explicit cursor rescan; it is not invented by replication.
+The independent authority review approved this distinction before implementation.
+
+- [x] gateway-agent reads local O1 journal
+- [x] durable per-session ack cursor
+- [x] bounded batches
+- [x] retry without duplicate insert
+- [x] compaction-gap reporting
+- [x] Fabric offline does not fail task execution
 
 ### C3 — Fabric Context Resolver before LLM memory
 
-- [ ] D1 deterministic repository/task projection
-- [ ] cloud `context_status`
-- [ ] Fabric `context_resolve` read path
-- [ ] offline-host acceptance
-- [ ] legacy session fallback
-- [ ] freshness / partial / authority labels
+- [x] D1 deterministic repository/task projection
+- [x] cloud `context_status`
+- [x] Fabric `context_resolve` read path
+- [x] offline-host acceptance
+- [x] legacy session fallback
+- [x] freshness / partial / authority labels
 
 This stage gives multi-host deterministic continuity before O3 model extraction.
 
 ### C4 — O3 Queue Memory Worker
 
-- [ ] Queue producer/consumer binding
-- [ ] `memory_runs` / `memory_checkpoints`
-- [ ] provider-neutral extractor adapter
-- [ ] output schema validation
-- [ ] support refs mandatory
-- [ ] dedupe / semantic key
-- [ ] supersession
-- [ ] stable-run retry idempotency
-- [ ] worker failure does not alter Task / Execution
+- [x] Queue producer/consumer binding
+- [x] `memory_runs` / `memory_checkpoints`
+- [x] provider-neutral extractor adapter
+- [x] output schema validation
+- [x] support refs mandatory
+- [x] dedupe / semantic key
+- [x] supersession
+- [x] stable-run retry idempotency
+- [x] worker failure does not alter Task / Execution
+- [x] policy reinstatement is a state transition, not deduplicated support (policy v6 / adapter v4)
+- [x] tail observations that exceed the remaining input budget defer to the next batch (policy v6 / adapter v4)
+- [x] explicit change directives re-evaluate same-text unconfirmed items instead of merging into support (policy v7 / adapter v5)
+- [x] deterministic canonical item/support bounds shape the admitted observation prefix at admission (policy v7 / adapter v5)
+- [x] migration bootstrap seeds a pending outbox row per repository with retained observations (0004)
 
 ### C5 — O4 knowledge-aware cloud resolver
 
-- [ ] current fact / decision / constraint selection
-- [ ] unresolved / failure pattern retrieval
-- [ ] stale/superseded exclusion by default
-- [ ] provenance/support included
-- [ ] budgeted context
-- [ ] worker lag surfaced
+- [x] current fact / decision / constraint selection
+- [x] unresolved / failure pattern retrieval
+- [x] stale/superseded exclusion by default
+- [x] provenance/support included
+- [x] budgeted context
+- [x] worker lag surfaced
+
+### C2–C5 local qualification evidence
+
+The Policy5 live `memory-continuity` run on source head
+`83a533aa75d9001fa95aa9fcfbef78951123d642` passed all nine scenario
+assertions with a real OpenCode Go `glm-5.3-flash` extractor. Ordinary Task A
+and Task B instructions caused automatic observation, synchronization, and
+knowledge projection without memory-maintenance prompts. A different head
+resolved the repository context while source host A was offline; Task B's
+explicit policy change superseded the prior current constraint; Queue replay
+did not increase knowledge, support, supersession, run, or checkpoint counts;
+and the unrelated-repository assertion passed. Local Gateway, D1/Queue,
+recovery, Rust, and dogfood evidence is recorded in
+`docs/evaluations/memory-continuity-20260928.md`.
+
+This qualifies the local implementation and live-model scenario only. No
+Cloudflare remote migration, binding/Queue provisioning, deployment, or remote
+E2E was run. The read-only inventory found the existing Worker and observation
+D1 but no memory binding, observed extractor secret, or `temote-memory` Queue;
+an approved remote rollout scope and dedicated test client/host credentials
+were not established. Optional C6 remains unimplemented.
 
 ### C6 — optional R2 Tier 2
 
@@ -884,22 +926,22 @@ Implement only after C1-C5 works without it.
 
 ### Fabric tests
 
-- [ ] same observation batch twice -> one D1 observation set
-- [ ] out-of-order/gapped source revision does not advance contiguous ack incorrectly
-- [ ] wrong host token cannot write another host's source
-- [ ] unknown owner/repository cannot read another scope
-- [ ] content body does not appear in ordinary gateway logs
-- [ ] D1 ingest failure does not fabricate ack
-- [ ] Queue send failure after D1 commit leaves recoverable worker lag
+- [x] same observation batch twice -> one D1 observation set
+- [x] out-of-order/gapped source revision does not advance contiguous ack incorrectly
+- [x] wrong host token cannot write another host's source
+- [x] unknown owner/repository cannot read another scope
+- [x] content body does not appear in ordinary gateway logs
+- [x] D1 ingest failure does not fabricate ack
+- [x] Queue send failure after D1 commit leaves recoverable worker lag
 
 ### Worker tests
 
-- [ ] same Queue message twice -> one completed `memory_run`
-- [ ] completed checkpoint is not advanced on failed projection
-- [ ] every current/supported item has support refs
-- [ ] task-scoped temporary state is not promoted repository-wide without policy
-- [ ] superseded item is excluded from current context
-- [ ] provider failure leaves execution state untouched
+- [x] same Queue message twice -> one completed `memory_run`
+- [x] completed checkpoint is not advanced on failed projection
+- [x] every current/supported item has support refs
+- [x] task-scoped temporary state is not promoted repository-wide without policy
+- [x] superseded item is excluded from current context
+- [x] provider failure leaves execution state untouched
 
 ### End-to-end
 

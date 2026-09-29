@@ -505,6 +505,7 @@ mod tests {
                 process_id: 0,
             },
             repository: Some("repo".to_owned()),
+            repository_key: Some("github:owner/repo".to_owned()),
             workspace_id: None,
             task_id: task_id.map(str::to_owned),
             execution_id: None,

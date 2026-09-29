@@ -6,6 +6,7 @@
 
 - Added an Access-protected read-only Fabric dashboard at `/dash/`, with configured host inventory, retained task interaction summaries, scoped context, and replicated timeline metadata. ([Fabric dashboard](issues/open/20260929-fabric-web-dashboard.md))
 - `temote-mcp upgrade --dry-run` now lists each unrestorable session's `session_id` and reason in `blocked_sessions`, and `temote-mcp upgrade --force` stops those sessions before the handoff (they are not restored) instead of aborting; protocol, ingress, and helper compatibility gates still apply. ([upgrade force and blocked session list](issues/open/20260928-upgrade-force-blocked-sessions.md))
+- Fabric now synchronizes eligible host observations automatically and resolves bounded repository context with provenance; a configured Memory Worker can derive supported knowledge from the D1 replica. Instruction and error previews remain opt-in, and their policy must stay unchanged until pending batches are acknowledged. ([cloud observation and knowledge plane](issues/open/20260926-cloud-observation-knowledge-plane.md))
 - Added `repository_clone_bare`, an idempotent public tool that admits an active non-yolo session at an exact supervisor-configured named root, accepts same-root local or credential-free HTTPS sources, rejects existing or escaping destinations, and delegates an atomically claimed bare Git clone through the retained Codex task lifecycle without exposing an absolute host path.
 - `temote-mcp doctor` checks Jujutsu (`jj --version`) for development readiness and warns when jj is missing or unusable without requiring it for normal operation.
 - Added a repository-owned dogfood harness for versioned logical scenarios, bounded call observations, deterministic fault fixtures, live MCP runs, and evidence-linked before/after comparison. ([self-improvement protocol](issues/done/20260928-self-improvement-dogfood-protocol.md))
@@ -49,3 +50,5 @@
 - Kept activity summaries and durable upgrade/task state bounded and free of command output, prompts, session paths, credentials, and raw errors.
 
 ### Migration
+
+- Existing Fabric D1 deployments must inspect and apply pending observation and memory migrations before deploying this Worker update. Migration `0003_memory_worker.sql` rebuilds knowledge tables while copying their existing rows and provenance. Memory extraction remains disabled by default; enable it through Worker variables and the `MEMORY_API_KEY` secret when ready. ([Fabric operations](docs/gateway.md#deploy))

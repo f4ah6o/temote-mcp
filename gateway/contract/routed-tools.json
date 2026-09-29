@@ -228,9 +228,31 @@
       },
       "inputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "session_id"
+            ]
+          },
+          {
+            "required": [
+              "repository"
+            ]
+          }
+        ],
         "properties": {
+          "at_least_cloud_seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
           "at_least_revision": {
             "minimum": 0,
+            "type": "integer"
+          },
+          "budget_bytes": {
+            "default": 16384,
+            "maximum": 65536,
+            "minimum": 1024,
             "type": "integer"
           },
           "host_id": {
@@ -248,7 +270,7 @@
             "type": "string"
           },
           "repository": {
-            "maxLength": 256,
+            "maxLength": 512,
             "minLength": 1,
             "type": "string"
           },
@@ -259,11 +281,13 @@
             "maxLength": 256,
             "minLength": 1,
             "type": "string"
+          },
+          "workspace_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
           }
         },
-        "required": [
-          "session_id"
-        ],
         "type": "object"
       },
       "name": "context_resolve"
@@ -277,17 +301,31 @@
       },
       "inputSchema": {
         "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "session_id"
+            ]
+          },
+          {
+            "required": [
+              "repository"
+            ]
+          }
+        ],
         "properties": {
           "host_id": {
+            "type": "string"
+          },
+          "repository": {
+            "maxLength": 512,
+            "minLength": 1,
             "type": "string"
           },
           "session_id": {
             "type": "string"
           }
         },
-        "required": [
-          "session_id"
-        ],
         "type": "object"
       },
       "name": "context_status"

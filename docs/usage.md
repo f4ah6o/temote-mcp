@@ -125,7 +125,16 @@ The combined stdout/stderr retained for delegated work is capped at 1 MiB and re
 
 Every session-bound delegation call passes through a single orchestration boundary that records observations (instruction, acceptance, delivery, execution state, evidence references, verification, and reconciliation marks) into a per-session owner-only journal under the session state directory. Observation appends are best-effort and never fail the underlying tool call.
 
-`context_resolve({session_id, task_id?, repository?, query?, limit?, at_least_revision?})` projects that journal into a deterministic bounded context bundle: workspace/current state, recent related task rollups, unresolved items that need attention, provenance `refs`, and `freshness` revision counters. `at_least_revision` lets a caller detect when it already holds a newer projection. `context_status({session_id})` reports journal revision, size, compaction and degradation counters. Neither tool returns raw observation bodies, and both are read-only. Memory/knowledge synthesis is not implemented yet, so the bundle's knowledge fields are explicitly empty and `memory.worker` reports `not_implemented`.
+`context_resolve({session_id, task_id?, repository?, query?, limit?, at_least_revision?})` projects the local journal into a deterministic bounded context bundle: workspace/current state, recent task rollups, unresolved items that need attention, provenance `refs`, and `freshness` revision counters. `at_least_revision` lets a caller detect when it already holds a newer projection. `context_status({session_id})` reports journal revision, size, compaction and degradation counters. These local session calls remain read-only and do not run memory synthesis; use Fabric repository context for cloud-derived knowledge. The local `memory.worker` status does not report Fabric worker readiness.
+
+When routed through Fabric, the same `context_resolve` and `context_status` tools can use the authenticated cloud replica. Supply a stable repository key to resolve context without `session_id`, even when execution hosts are offline:
+
+```text
+context_resolve({repository: "github:owner/repository", query: "report", budget_bytes: 16384})
+context_status({repository: "github:owner/repository"})
+```
+
+Fabric derives repository keys from supported Git forge metadata; local paths and directory names are not identities. The authenticated Fabric owner determines the tenant scope. Repository context includes replicated task observations and, when the Worker is enabled and caught up, supported/current knowledge with provenance references. It reports replicated observation state separately from derived knowledge and live host state. `context_status` exposes source cursors, gaps, sync freshness, and worker state (`disabled`, `not_configured`, `lagging`, `failed`, `ready`, or `ready_empty`). A session request uses the cloud mapping only after ownership checks; if no mapping exists, Fabric keeps the existing host fallback. A repository-only request does not weaken the `session_id` requirements of other host-routed tools.
 
 Operators can inspect a session's journal directly with the owner-only `temote-mcp observation list|get|status <session_id>` debug command; `--include-content` is opt-in and raw records never leave the local surface.
 

@@ -43,6 +43,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install gateway dependencies
+        run: npm ci --prefix gateway
+
       - name: Set up Linux sandbox runtime
         shell: bash
         run: |

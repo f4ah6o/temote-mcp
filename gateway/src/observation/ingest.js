@@ -7,6 +7,7 @@ import {
   OBSERVATION_SYNC_CONTRACT,
 } from "./schema.js";
 import { ingestD1Batch } from "./d1.js";
+import { wakeMemory } from "../memory/index.js";
 
 export const MAX_OBSERVATION_SYNC_BODY_BYTES = 1024 * 1024;
 export const MAX_OBSERVATION_SYNC_RECORDS = 256;
@@ -105,19 +106,33 @@ export async function handleObservationSync(request, env, hostId) {
     }
 
     const source = stored.source;
+    if (source.repository_key) {
+      try {
+        await wakeMemory(env, ownerId, source.repository_key);
+      } catch {
+        // D1 has committed; queue recovery is driven by the durable outbox.
+      }
+    }
     const complete = Number(source.journal_degraded) === 0
       && Number(source.gap_count) === 0
       && Number(source.acked_through_revision) >= Number(source.source_head_revision);
+    const committedThroughRevision = checked.value.records.length > 0
+      ? checked.value.records.reduce(
+        (highest, record) => Math.max(highest, record.sourceRevision),
+        0,
+      )
+      : Number(source.acked_through_revision);
     return reply({
       session_id: checked.value.sessionId,
       acked_through_revision: Number(source.acked_through_revision),
+      committed_through_revision: committedThroughRevision,
       cloud_head_seq: Number(source.cloud_head_seq),
       complete,
       authority: FABRIC_AUTHORITY.replicatedObservation,
     });
   } catch (error) {
-    // Never log observation bodies. Bounded error text is enough for operator diagnosis.
-    console.error("observation ingest failed", boundedError(error));
+    // SQL/provider errors may embed caller-provided data; emit only a stable code.
+    console.error("observation ingest failed: internal_error");
     return reply({ error: "observation_ingest_failed" }, 500);
   }
 }
