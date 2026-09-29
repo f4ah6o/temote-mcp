@@ -877,6 +877,9 @@ This stage gives multi-host deterministic continuity before O3 model extraction.
 - [x] worker failure does not alter Task / Execution
 - [x] policy reinstatement is a state transition, not deduplicated support (policy v6 / adapter v4)
 - [x] tail observations that exceed the remaining input budget defer to the next batch (policy v6 / adapter v4)
+- [x] explicit change directives re-evaluate same-text unconfirmed items instead of merging into support (policy v7 / adapter v5)
+- [x] deterministic canonical item/support bounds shape the admitted observation prefix at admission (policy v7 / adapter v5)
+- [x] migration bootstrap seeds a pending outbox row per repository with retained observations (0004)
 
 ### C5 — O4 knowledge-aware cloud resolver
 

@@ -530,6 +530,131 @@ budget), and the re-review fix commit for supersession-edge aliasing:
   supersession-edge aliasing wedge above (fixed in the same head), and
   reported no remaining blocking findings.
 
+### Policy v7 / adapter v5 validation follow-up
+
+A second independent re-review of the v6/v4 head `f90ada6` found two
+remaining defects, both confirmed by new real workerd/D1 regression
+tests before the fix and resolved after it:
+
+- Same-text unconfirmed absorption (R1, P1): an unchanged restatement
+  (`policy is: TOML`) staged as `supported` absorbed a later explicit
+  change directive for the same text (`policy has changed: TOML`,
+  predecessor JSON) — the merge-and-continue gate at
+  `prior.status !== "superseded"` never reached supersession
+  authorization, so the change collapsed into corroborating support
+  and TOML never promoted. When the re-occurrence carries an explicit
+  change directive the staged item is now re-evaluated as a new
+  transition: it is spliced from the commit list, tracked in
+  `replacedStaged`, and re-runs the same-text match so it reuses the
+  staged knowledge id and accumulated support — committed rows still
+  UPDATE in place (`reuseKnowledgeId: Boolean(matching)`), staged
+  reuse INSERTs a fresh row. Integrating this exposed a further
+  pending-support loss: a staged item spliced while a committed row
+  also matched (`matching` path) dropped its uncommitted support rows
+  because the persist capacity counted the item's full support list
+  against already-committed rows. The persist basis now unions the
+  committed row's stored support with the spliced item's accumulated
+  and pending support (deduplicated by cloud_seq/role), and only
+  committed rows count against the persist capacity; without it a
+  batch split at the bound persisted support only up to the batch
+  edge plus the last observation (`[1..6, 12]` instead of `[1..12]`),
+  leaving `support_incomplete` and the same-source ordering veto to
+  reject the later legitimate change. The independent review of this
+  follow-up diff then found two related batch-boundary divergences,
+  both reproduced as a real workerd/D1 regression before fixing:
+  an unauthorized contested directive could demote a staged `current`
+  item to `supported` inside one batch (committed rows keep `current`
+  through the sticky `CASE WHEN status='current'` UPDATE, so split
+  orders converged but same-batch did not), and the re-evaluated item's
+  `valid_from` was taken from the incoming directive support instead of
+  the earliest merged support carried by the spliced item. The
+  unauthorized branch now preserves `current` the same way persisted
+  rows do, and `valid_from` carries the staged item's `validFrom` when
+  reusing its identity; a cross-session contested-neighbor regression
+  test covers both the same-batch and split orders.
+- Deterministic item/support bound at admission (R2, P2):
+  `boundedInput` bounded bytes only, so a byte-fitting backlog whose
+  canonical items exceeded `MAX_EXTRACTED_ITEMS` (13 changed-clause
+  instructions, 11141 bytes inside a 12288-byte window) wedged the
+  provider path on `projection_too_large` through fixed-range retry,
+  while the fixture path silently returned 12 items and the worker
+  advanced the checkpoint past the 13th observation. `boundedInput`
+  now also simulates the deterministic bounds as it grows the
+  selection — canonical group/support counts via
+  `createCanonicalTracker` (changed clauses open new groups exactly
+  as `canonicalFirstUnion` does) and cumulative fixture item count —
+  so the admitted observations are a complete contiguous prefix that
+  both extractor paths consume fully. The deferred tail rides the
+  existing still-pending outbox/`wakeMemory` chain; a single
+  observation that alone exceeds the bound still follows the bounded
+  failure contract, and `fixtureExtract` keeps a loud
+  `projection_too_large` for any unbounded caller.
+
+Producer-version isolation now covers the corrected semantics:
+policy version advances 6 -> 7 and adapter version 4 -> 5, so
+completed and exhausted runs identified under v6/v4 are never reused
+as v7/v5 work. Deploying requires a monotonic
+`MEMORY_PROJECTION_GENERATION` increase to rebuild from retained
+observations — checkpoints already advanced past observations the
+old admission dropped, and queue redelivery alone does not repair
+gaps behind a checkpoint. The previous valid projection remains
+readable and is marked stale until the new projection is published;
+raw observations are unchanged.
+
+Local verification for this follow-up, based on source HEAD `f90ada6`
+(uncommitted fix diff):
+
+- Pre-fix reproduction on the final regression tests failed 3/13
+  reinstatement cases and 6/20 input-budget cases; the same suites
+  pass after the fix, extended by the contested-neighbor regression
+  (15/15 reinstatement, 20/20 input-budget). The 13-observation
+  corpus splits `[12]+[1]`, `[6]+[7]`, one-by-one, bulk-synced
+  multi-run, and batch-size-6 all converge on the same final JSON
+  policy, current summary, and support history through real
+  workerd/D1 and `context_resolve`; queue replay/rebuild stays
+  duplicate-free.
+- `npm test` in `gateway/` passed 286/286 including the existing
+  canonical-cap contract tests, now asserting both admission deferral
+  and fail-closed internal caps; `just check-generated` 10/10, `npm
+  run deploy:dry-run` (bundle dry-run, not a remote deployment),
+  `git diff --check`, Node 20.20.2 focused suites 34/34 (pre-B3 regression set), and Python
+  dogfood 37/37 passed. Rust gates were not re-run this round — the
+  diff touches no Rust or generated sources (NOT RUN).
+- These are local implementation checks, not a v7/v5 live-model or
+  Cloudflare remote qualification. The earlier 9/9 live-model record
+  applies to its own tested head and is not carried over. An
+  independent non-implementer re-review of this uncommitted diff found
+  three blocking findings across two rounds — the contested-neighbor
+  demotion and `valid_from` skew above, plus a sticky-check operand
+  order that consulted the stale committed row before the fresher
+  staged decision — all reproduced pre-fix, fixed, and re-verified;
+  final verdict APPROVE (15/15 reinstatement, 72/72 focused, 286/286
+  `npm test`).
+
+A later P1 review finding covered the worker bootstrap gap: `0003`
+creates `memory_outbox` empty and only ingest writes rows, so a
+database migrated with retained observations never woke the worker —
+the documented "rebuild from retained observations" could not start at
+all once the source host was already offline. The new migration
+`0004_memory_worker_bootstrap.sql` seeds one pending outbox row per
+`(owner_id, repository_key)` at its retained `MAX(cloud_seq)`, using
+the same upsert semantics as ingest so already-wired repositories keep
+their durable queued/attempt state; observations with a NULL or empty
+`repository_key` never produce rows. The regression test stages
+0001+0002, seeds retained observations directly, applies 0003 (empty
+outbox, sweep finds nothing due, no checkpoint — the reported wedge),
+then applies 0004 and observes the real queue/scheduled-sweep path
+consume both repositories to completion (TOML current over superseded
+JSON, YAML current, checkpoints at the retained heads) and stay
+unrequeued on re-application. `npm test` passed 287/287. Bootstrap is
+a scheduling-path fix, not a producer-semantics change: no policy or
+adapter version advance, and no generation bump is required for the
+initial backlog drain itself. Deploying the earlier v7/v5 semantic
+changes still requires the monotonic
+`MEMORY_PROJECTION_GENERATION` rebuild described above; on a database
+that still holds unconsumed retained observations the 0004 backfill is
+what lets that rebuild actually start.
+
 ## Ending state
 
 The live-qualified feature source was HEAD
@@ -540,3 +665,12 @@ follow-up, branch `codex/20260928-memory-plane` was at HEAD
 `origin/codex/20260928-memory-plane`. The v3 source and documentation updates
 were in the working tree for review at this report snapshot. The original
 checkout and its pre-existing change boundary were left intact.
+
+The v7/v5 follow-up described above is staged in the same worktree as an
+uncommitted patch on top of HEAD `f90ada6fe4b705516da6993930a6cdbc7f39c275`
+(`gateway/src/memory/{worker,extractor,config}.js`, three memory test
+files, this document, `docs/gateway.md`, and the tracking issue). The
+later bootstrap fix adds `gateway/migrations/0004_memory_worker_bootstrap.sql`,
+the `DEFAULT_MIGRATIONS`/`MIGRATIONS` enumerations, and the staged-migration
+regression test in `gateway/test/memory-continuity-integrity.test.mjs`.
+Per the task contract, commit and push are deferred pending explicit approval.

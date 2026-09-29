@@ -24,6 +24,7 @@ const MIGRATIONS = [
   "migrations/0001_observation_knowledge.sql",
   "migrations/0002_observation_ingest.sql",
   "migrations/0003_memory_worker.sql",
+  "migrations/0004_memory_worker_bootstrap.sql",
 ];
 
 async function exec(runtime, sql, params = []) {
@@ -157,6 +158,173 @@ test("D1 migration 0003 preserves seeded C0 knowledge, support, and supersession
       'fixture', 'memory-v0', ?)`, [OWNER, REPOSITORY, REPOSITORY, STAMP]);
     assert.equal((await runtime.querySql(
       "SELECT COUNT(*) AS n FROM knowledge_items WHERE semantic_key = 'report-format-json'"))[0].n, 2);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("D1 migration 0004 wakes the memory worker for repositories with only retained observations", async () => {
+  const runtime = await startMemoryRuntime({ applyMigrations: false });
+  try {
+    // A database migrated from the pre-worker releases: observations were
+    // durably retained, but no ingest ever wrote a memory_outbox row because
+    // the worker machinery did not exist yet. The source host may already be
+    // offline, so no future sync can be relied on to wake the worker.
+    for (const migration of MIGRATIONS.slice(0, 2)) {
+      const source = await fs.readFile(new URL("../" + migration, import.meta.url), "utf8");
+      await exec(runtime, source);
+    }
+    const LEGACY_OTHER_REPOSITORY = "github:temote-tests/legacy-other";
+    const policyJson = [
+      "For this repository, the repository-level policy is:",
+      "Report output format must be JSON.",
+    ].join("\n");
+    const policyToml = [
+      "For this repository, the repository-level policy has changed:",
+      "Report output format must be TOML.",
+      "Previous repository-level policy to replace: Report output format must be JSON.",
+    ].join("\n");
+    const policyYaml = [
+      "For this repository, the repository-level policy is:",
+      "Report output format must be YAML.",
+    ].join("\n");
+    await exec(runtime, `INSERT INTO observation_sources (
+      owner_id, host_id, session_id, repository_key, source_base_revision,
+      source_head_revision, acked_through_revision, cloud_head_seq, last_synced_at
+    ) VALUES (?, ?, 'legacy-session', ?, 0, 2, 2, 2, ?),
+             (?, 'legacy-host-b', 'legacy-session-b', ?, 0, 1, 1, 1, ?),
+             (?, 'legacy-host-c', 'legacy-session-c', NULL, 0, 1, 1, 1, ?)`,
+    [MEMORY_TEST_OWNER, MEMORY_TEST_HOST_ID, MEMORY_TEST_REPOSITORY, STAMP,
+      MEMORY_TEST_OWNER, LEGACY_OTHER_REPOSITORY, STAMP,
+      MEMORY_TEST_OWNER, STAMP]);
+    await exec(runtime, `INSERT INTO observations (
+      cloud_seq, owner_id, host_id, session_id, observation_id, source_revision,
+      schema_version, repository_key, kind, action, content_kind, content_preview,
+      evidence_refs, observed_at, ingested_at, payload_digest
+    ) VALUES
+      (1, ?, ?, 'legacy-session', 'legacy-obs-1', 1, 1, ?, 'instruction', 'task_start',
+       'text', ?, '[]', ?, ?, ?),
+      (2, ?, ?, 'legacy-session', 'legacy-obs-2', 2, 1, ?, 'instruction', 'task_start',
+       'text', ?, '[]', ?, ?, ?),
+      (3, ?, 'legacy-host-b', 'legacy-session-b', 'legacy-obs-3', 1, 1, ?, 'instruction',
+       'task_start', 'text', ?, '[]', ?, ?, ?),
+      (4, ?, 'legacy-host-c', 'legacy-session-c', 'legacy-obs-4', 1, 1, NULL, 'instruction',
+       'task_start', 'text', 'unscoped legacy note', '[]', ?, ?, ?),
+      (5, ?, 'legacy-host-c', 'legacy-session-c', 'legacy-obs-5', 2, 1, '', 'instruction',
+       'task_start', 'text', 'empty repository key note', '[]', ?, ?, ?)`,
+    [MEMORY_TEST_OWNER, MEMORY_TEST_HOST_ID, MEMORY_TEST_REPOSITORY, policyJson, STAMP, STAMP, "a".repeat(64),
+      MEMORY_TEST_OWNER, MEMORY_TEST_HOST_ID, MEMORY_TEST_REPOSITORY, policyToml, STAMP, STAMP, "b".repeat(64),
+      MEMORY_TEST_OWNER, LEGACY_OTHER_REPOSITORY, policyYaml, STAMP, STAMP, "c".repeat(64),
+      MEMORY_TEST_OWNER, STAMP, STAMP, "d".repeat(64),
+      MEMORY_TEST_OWNER, STAMP, STAMP, "e".repeat(64)]);
+
+    // 0003 creates the worker tables but leaves the outbox empty, so the
+    // scheduled sweep finds nothing due even though observations are retained.
+    const workerMigration = await fs.readFile(new URL("../" + MIGRATIONS[2], import.meta.url), "utf8");
+    await exec(runtime, workerMigration);
+    assert.deepEqual(await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM memory_outbox"), [{ n: 0 }],
+      "a migrated database must start with an empty worker outbox");
+    await runtime.runScheduled();
+    assert.deepEqual(await runtime.queueDispatches(), [],
+      "without bootstrap, the sweep cannot start the worker from retained observations");
+    assert.deepEqual(await runtime.querySql(
+      "SELECT COUNT(*) AS n FROM memory_checkpoints"), [{ n: 0 }]);
+
+    // The bootstrap migration must seed one pending outbox row per repository
+    // at its retained MAX(cloud_seq), and must not enqueue observations whose
+    // repository_key is NULL or '' (ingest skips both).
+    const bootstrap = await fs.readFile(
+      new URL("../" + MIGRATIONS[3], import.meta.url), "utf8");
+    await exec(runtime, bootstrap);
+    const outbox = await runtime.querySql(
+      `SELECT owner_id, repository_key, through_cloud_seq, queued_at, attempt_count,
+              next_attempt_at, last_error_code, updated_at
+       FROM memory_outbox ORDER BY repository_key`);
+    assert.equal(outbox.length, 2, "exactly one outbox row per retained repository");
+    assert.deepEqual(outbox.map((row) => ({
+      owner_id: row.owner_id,
+      repository_key: row.repository_key,
+      through_cloud_seq: Number(row.through_cloud_seq),
+      queued_at: row.queued_at,
+      attempt_count: Number(row.attempt_count),
+      next_attempt_at: Number(row.next_attempt_at),
+      last_error_code: row.last_error_code,
+    })), [
+      { owner_id: MEMORY_TEST_OWNER, repository_key: LEGACY_OTHER_REPOSITORY,
+        through_cloud_seq: 3, queued_at: null, attempt_count: 0,
+        next_attempt_at: 0, last_error_code: null },
+      { owner_id: MEMORY_TEST_OWNER, repository_key: MEMORY_TEST_REPOSITORY,
+        through_cloud_seq: 2, queued_at: null, attempt_count: 0,
+        next_attempt_at: 0, last_error_code: null },
+    ]);
+    for (const row of outbox) {
+      assert.ok(Number.isFinite(Date.parse(row.updated_at)),
+        "backfilled outbox rows must carry a parseable updated_at");
+    }
+
+    // The scheduled sweep now wakes each repository through the real queue and
+    // the worker consumes the retained backlog from scratch.
+    await runtime.runScheduled();
+    await runtime.waitFor(async () => {
+      const checkpoints = await runtime.querySql(
+        `SELECT repository_key, last_cloud_seq FROM memory_checkpoints
+         WHERE owner_id = ?`, [MEMORY_TEST_OWNER]);
+      return checkpoints.length === 2
+        && checkpoints.every((row) => Number(row.last_cloud_seq) === (
+          row.repository_key === MEMORY_TEST_REPOSITORY ? 2 : 3));
+    }, { timeoutMs: 15_000, intervalMs: 25 });
+    const runs = await runtime.querySql(
+      `SELECT repository_key, status, from_seq, to_seq, input_count, outcome
+       FROM memory_runs WHERE owner_id = ? ORDER BY repository_key`, [MEMORY_TEST_OWNER]);
+    assert.deepEqual(runs.map((run) => ({
+      repository_key: run.repository_key,
+      status: run.status,
+      from_seq: Number(run.from_seq),
+      to_seq: Number(run.to_seq),
+      input_count: Number(run.input_count),
+      outcome: run.outcome,
+    })), [
+      { repository_key: LEGACY_OTHER_REPOSITORY, status: "completed",
+        from_seq: 0, to_seq: 3, input_count: 1, outcome: "projected" },
+      { repository_key: MEMORY_TEST_REPOSITORY, status: "completed",
+        from_seq: 0, to_seq: 2, input_count: 2, outcome: "projected" },
+    ]);
+    const knowledge = await runtime.querySql(
+      `SELECT repository_key, kind, text, status FROM knowledge_items
+       WHERE owner_id = ? ORDER BY repository_key, kind, text`, [MEMORY_TEST_OWNER]);
+    assert.ok(knowledge.some((item) => item.repository_key === MEMORY_TEST_REPOSITORY
+      && item.kind === "constraint" && item.status === "current"
+      && item.text === "Report output format must be TOML."));
+    assert.ok(knowledge.some((item) => item.repository_key === MEMORY_TEST_REPOSITORY
+      && item.kind === "constraint" && item.status === "superseded"
+      && item.text === "Report output format must be JSON."));
+    assert.ok(knowledge.some((item) => item.repository_key === LEGACY_OTHER_REPOSITORY
+      && item.kind === "constraint" && item.status === "current"
+      && item.text === "Report output format must be YAML."));
+    const context = await repositoryContext(runtime);
+    assert.equal(context.memory.stale, false);
+    assert.ok(context.constraints.some((item) => item.status === "current"
+      && item.text === "Report output format must be TOML."));
+
+    // Re-applying the migration keeps the durable outbox state instead of
+    // requeueing repositories whose retained head is already consumed.
+    await exec(runtime, bootstrap);
+    const reApplied = await runtime.querySql(
+      `SELECT repository_key, through_cloud_seq, queued_at FROM memory_outbox
+       ORDER BY repository_key`);
+    assert.equal(reApplied.length, 2);
+    assert.deepEqual(reApplied.map((row) => ({
+      repository_key: row.repository_key,
+      through_cloud_seq: Number(row.through_cloud_seq),
+    })), [
+      { repository_key: LEGACY_OTHER_REPOSITORY, through_cloud_seq: 3 },
+      { repository_key: MEMORY_TEST_REPOSITORY, through_cloud_seq: 2 },
+    ]);
+    for (const row of reApplied) {
+      assert.ok(Number.isFinite(Date.parse(row.queued_at)),
+        "re-application must not requeue a repository already covered by a checkpoint");
+    }
   } finally {
     await runtime.dispose();
   }

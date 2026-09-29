@@ -15,6 +15,7 @@ const DEFAULT_MIGRATIONS = [
   "migrations/0001_observation_knowledge.sql",
   "migrations/0002_observation_ingest.sql",
   "migrations/0003_memory_worker.sql",
+  "migrations/0004_memory_worker_bootstrap.sql",
 ];
 
 async function compileRuntimeEntry(productionEntryPath) {
