@@ -1,6 +1,6 @@
 # S1: session-first managed repository provisioning
 
-Status: design ready / implementation packets defined  
+Status: design ready / S0a polished and ready for implementation  
 Repository: `f4ah6o/temote-mcp`  
 Created: 2026-09-29 (Asia/Tokyo)
 
@@ -11,6 +11,7 @@ Related:
 - `issues/open/20260926-named-root-workspace-identity.md`
 - `issues/open/20260927-instruction-side-bare-repo-provisioning.md`
 - `issues/open/20260926-task-change-orchestration-stacked-pr.md`
+- `issues/polished/20260929-s0a-typed-session-source-contract.md` (first behavior-preserving implementation packet)
 
 ## 1. Problem
 
