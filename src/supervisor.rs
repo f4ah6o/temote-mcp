@@ -219,7 +219,8 @@ pub struct SupervisorUpgradePlan {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpgradeSessionBlocker {
-    pub session_id: String,
+    #[serde(rename = "session_id")]
+    pub id: String,
     pub reason: String,
 }
 
@@ -1367,7 +1368,7 @@ impl SessionSupervisor {
                     Ok(plan) => plans.push(plan),
                     Err(error) if options.collect_blockers => {
                         blocked_sessions.push(UpgradeSessionBlocker {
-                            session_id: id,
+                            id,
                             reason: format!("{error:#}"),
                         })
                     }
@@ -2949,7 +2950,7 @@ mod tests {
         assert_eq!(preview.plan.sessions.len(), 1);
         assert_eq!(preview.plan.sessions[0].session_id, ready_id);
         assert_eq!(preview.blocked_sessions.len(), 1);
-        assert_eq!(preview.blocked_sessions[0].session_id, blocked_id);
+        assert_eq!(preview.blocked_sessions[0].id, blocked_id);
         assert!(
             preview.blocked_sessions[0]
                 .reason
@@ -3011,7 +3012,7 @@ mod tests {
         assert!(preview.plan.sessions.is_empty());
         assert_eq!(preview.blocked_sessions.len(), 1);
         let blocker = &preview.blocked_sessions[0];
-        assert_eq!(blocker.session_id, id);
+        assert_eq!(blocker.id, id);
         assert!(blocker.reason.contains("KINTONE_PASSWORD"));
         assert!(!blocker.reason.contains("original-secret"));
         assert!(!blocker.reason.contains("different-secret"));

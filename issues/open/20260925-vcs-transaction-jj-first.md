@@ -123,6 +123,17 @@ bookmark / Git refs / GitHub PR
 
 **新規 Temote-managed workspace の target architecture は jj-first を優先して検証する。**
 
+2026-09-29 session-first correction:
+
+- Jujutsu backend の normal path は `bare Git RepositoryStore -> jj workspace -> logical jj change` とする。
+- Session start 時に Git branch を先に作らない。
+- Session start 時に Git worktree を先に作らない。
+- Git bookmark/branch は verified revision の delivery boundary で materialize する。
+- `bare store -> branch -> git worktree` は `VcsBackend::Git` compatibility semantics として残す。
+- physical workspace path は Session identity ではなく host-local projection とする。
+
+Top-level provisioning/order は `issues/open/20260929-session-first-managed-provisioning.md` を authoritative target とする。
+
 ただし即座に F1 を破棄しない。
 
 最初に Temote core へ `VcsBackend` / `WorkspaceVcs` boundary を入れ、Git worktree と jj workspace の両方を表現できる contract にする。
