@@ -213,12 +213,23 @@ function isTaskProjectionCurrent(envelopeStatus, backendStatus, hostAvailability
   return envelopeStatus === "confirmed" && backendStatus === "confirmed" && hostAvailability === "online";
 }
 
-function isContextResolverCurrent(envelope, resolver, hostAvailability) {
+function outerContextAllowsComponent(envelope) {
   return envelope?.status === "confirmed"
-    && resolver?.status === "confirmed"
-    && Boolean(resolver?.data)
-    && resolver?.authority === "host_live"
+    || (envelope?.status === "stale" && !envelope.error_code && !envelope.stale_error);
+}
+
+function isContextComponentCurrent(envelope, component, hostAvailability) {
+  return outerContextAllowsComponent(envelope)
+    && component?.status === "confirmed"
+    && component?.authority === "host_live"
+    && component?.freshness === "live"
+    && Boolean(component?.data)
     && hostAvailability === "online";
+}
+
+function isContextResolverCurrent(envelope, resolver, hostAvailability) {
+  return isContextComponentCurrent(envelope, resolver, hostAvailability)
+    && resolver.data?.freshness?.stale !== true;
 }
 
 function effectiveHostAvailability(host, inventoryEnvelope, browserOffline = false) {
@@ -237,6 +248,16 @@ function membershipRemovalConfirmed(envelope, selectedHostId) {
     || envelope?.data?.components?.membership?.status !== "confirmed"
     || !Array.isArray(envelope?.data?.hosts)) return false;
   return !envelope.data.hosts.some((host) => host?.host_id === selectedHostId);
+}
+
+function isConfirmedCompleteSessionMiss(envelope, selectedSessionId) {
+  const sessions = envelope?.data?.sessions;
+  if (!selectedSessionId
+    || envelope?.status !== "confirmed"
+    || !Array.isArray(sessions)
+    || envelope.data.truncated === true
+    || sessions.length > MAX_SESSIONS) return false;
+  return !sessions.some((session) => session?.session_id === selectedSessionId);
 }
 
 function hasUnavailableChild(value, depth = 0) {
@@ -800,8 +821,7 @@ function startDashboard(documentRef = document, windowRef = window) {
     if (Array.isArray(sessions) && sessions.length > 0 && !snapshot.sessionId) {
       const firstSessionId = shortIdentifier(sessions[0]?.session_id);
       if (firstSessionId) select({ hostId: snapshot.hostId, sessionId: firstSessionId }, true);
-    } else if (snapshot.sessionId && Array.isArray(sessions)
-      && !sessions.some((session) => session?.session_id === snapshot.sessionId)) {
+    } else if (isConfirmedCompleteSessionMiss(envelope, snapshot.sessionId)) {
       setComponentState(byId("session-status"), "This session is not in the selected host inventory.", "error");
     } else if (Array.isArray(sessions) && sessions.length === 0 && !snapshot.sessionId) {
       setComponentState(byId("session-status"), "No sessions reported for this host.", "quiet");
@@ -1174,7 +1194,7 @@ function startDashboard(documentRef = document, windowRef = window) {
     const hostLive = hostAvailability(host) === "online";
     const resolveAvailable = isContextResolverCurrent(envelope, resolve, hostAvailability(host));
     const contextResolveData = resolveAvailable ? resolve.data : null;
-    const contextStatusData = envelope.status === "confirmed" && status?.status === "confirmed" && status?.data && hostLive ? status.data : null;
+    const contextStatusData = isContextComponentCurrent(envelope, status, hostAvailability(host)) ? status.data : null;
     const currentSummary = contextResolveData?.current_summary ?? {};
     const liveFreshness = contextResolveData?.freshness ?? {};
 
@@ -1186,14 +1206,16 @@ function startDashboard(documentRef = document, windowRef = window) {
     if (!hostLive) {
       statusMessage = `Current host context is unavailable · live route ${hostAvailability(host)}.`;
       statusKind = "stale";
+    } else if (resolveAvailable) {
+      statusMessage = envelope.status === "stale"
+        ? "Current host context confirmed · another context component is stale or unavailable."
+        : contextResolveData.partial?.journal_degraded
+          ? "Current host context confirmed · local journal reports degraded data."
+          : componentMessage(resolve, "Current context");
+      statusKind = envelope.status === "stale" || contextResolveData.partial?.journal_degraded || resolve.status === "stale" ? "stale" : "quiet";
     } else if (envelope.status !== "confirmed") {
       statusMessage = "Context snapshot is stale · current host state has not been reconfirmed.";
       statusKind = "stale";
-    } else if (resolveAvailable) {
-      statusMessage = contextResolveData.partial?.journal_degraded
-        ? "Current host context confirmed · local journal reports degraded data."
-        : componentMessage(resolve, "Current context");
-      statusKind = contextResolveData.partial?.journal_degraded || resolve.status === "stale" ? "stale" : "quiet";
     } else if (resolve?.status === "unavailable") {
       statusMessage = `Current host context unavailable${resolve.error_code ? ` · ${boundedText(String(resolve.error_code), 64)}` : ""}.`;
       statusKind = "error";
@@ -1465,8 +1487,10 @@ export {
   parseTimestampMs,
   pendingForDisplay,
   isContextResolverCurrent,
+  isContextComponentCurrent,
   effectiveHostAvailability,
   membershipRemovalConfirmed,
+  isConfirmedCompleteSessionMiss,
   nextPendingExpiryMs,
   isSessionProjectionCurrent,
   isTaskProjectionCurrent,

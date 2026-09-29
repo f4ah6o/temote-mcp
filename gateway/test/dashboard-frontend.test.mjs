@@ -7,6 +7,8 @@ import {
   compareSequence,
   effectiveHostAvailability,
   formatTime,
+  isConfirmedCompleteSessionMiss,
+  isContextComponentCurrent,
   isContextResolverCurrent,
   isSessionProjectionCurrent,
   isTaskProjectionCurrent,
@@ -62,6 +64,22 @@ test("selection comes from query/hash without using browser history and identifi
     sessionId: "",
   });
   assert.equal(parseSelection({ search: `?host=${"x".repeat(160)}`, hash: "" }).hostId.length, 128);
+});
+
+test("a capped host session list does not contradict a successful selected-session lookup", () => {
+  const capped = {
+    status: "stale",
+    data: { truncated: true, sessions: Array.from({ length: 256 }, (_, index) => ({ session_id: `session-${index}` })) },
+  };
+  const successfulDetail = {
+    status: "confirmed",
+    data: { session_id: "session-299", session: { status: "active" } },
+  };
+  assert.equal(successfulDetail.status, "confirmed");
+  assert.equal(isConfirmedCompleteSessionMiss(capped, "session-299"), false);
+  assert.equal(isConfirmedCompleteSessionMiss({ status: "confirmed", data: { truncated: true, sessions: capped.data.sessions } }, "session-299"), false);
+  assert.equal(isConfirmedCompleteSessionMiss({ status: "confirmed", data: { sessions: [{ session_id: "session-1" }] } }, "session-299"), true);
+  assert.equal(isConfirmedCompleteSessionMiss({ status: "stale", data: { sessions: [{ session_id: "session-1" }] } }, "session-299"), false);
 });
 
 test("a selection fence prevents an older selection response from applying", () => {
@@ -263,9 +281,41 @@ test("component failures retain only visibly stale data and stale projections ar
   assert.equal(isSessionProjectionCurrent(stale, "online"), false);
   assert.equal(isTaskProjectionCurrent("stale", "confirmed", "online"), false);
   assert.equal(isTaskProjectionCurrent("confirmed", "unavailable", "online"), false);
-  assert.equal(isContextResolverCurrent(stale, { status: "confirmed", authority: "host_live", data: {} }, "online"), false);
-  assert.equal(isContextResolverCurrent(prior, { status: "confirmed", authority: "host_live", data: {} }, "online"), true);
-  assert.equal(isContextResolverCurrent(prior, { status: "confirmed", authority: "fabric_replica", data: {} }, "online"), false);
+  const resolver = { status: "confirmed", authority: "host_live", freshness: "live", data: { freshness: { stale: false } } };
+  assert.equal(isContextResolverCurrent(stale, resolver, "online"), false);
+  assert.equal(isContextResolverCurrent(prior, resolver, "online"), true);
+  assert.equal(isContextResolverCurrent(prior, { ...resolver, authority: "fabric_replica" }, "online"), false);
+});
+
+test("a fresh live context resolver remains visible through unrelated outer partial failure", () => {
+  const outerPartial = {
+    status: "stale",
+    authority: "fabric",
+    freshness: "stale",
+    data: {},
+  };
+  const liveResolver = {
+    status: "confirmed",
+    authority: "host_live",
+    freshness: "live",
+    data: { freshness: { resolved_revision: "42", stale: false } },
+  };
+  const liveStatus = {
+    status: "confirmed",
+    authority: "host_live",
+    freshness: "live",
+    data: { journal: { revision: "42" } },
+  };
+  assert.equal(isContextResolverCurrent(outerPartial, liveResolver, "online"), true);
+  assert.equal(isContextComponentCurrent(outerPartial, liveStatus, "online"), true);
+  assert.equal(isContextResolverCurrent(outerPartial, {
+    ...liveResolver,
+    data: { freshness: { stale: true } },
+  }, "online"), false);
+  const failedCachedPoll = { ...outerPartial, error_code: "context_refresh_failed", stale_error: true };
+  assert.equal(isContextResolverCurrent(failedCachedPoll, liveResolver, "online"), false);
+  assert.equal(isContextComponentCurrent(failedCachedPoll, liveStatus, "online"), false);
+  assert.equal(isContextResolverCurrent(outerPartial, liveResolver, "unknown"), false);
 });
 
 test("offline transitions mark retained live routes stale until a fresh response arrives", () => {
