@@ -403,17 +403,32 @@ D2 prerequisite として、summary の **生成・更新経路** と **読み�
 observer も保存 field も現状は存在しないものとして設計する):
 
 ```text
-既存の、所有権を確認できた runtime owner
-  → Host-side pending metadata observer
-  → scope・generation・鮮度付きの bounded summary
-  → 既存 task_list の additive projection
-  → dashboard
+local runtime を持つ backend (Codex / OpenCode / Devin ACP):
+  既存 local runtime owner
+    → backend event / scoped read
+    → bounded summary
+
+Devin Cloud (local runtime が存在しない):
+  D2 で追加する Host-side read-only metadata observer
+    → 既存 remote session の status read
+    → bounded summary
+
+共通:
+  task_list
+    → 保存済み summary の projection のみ
+    → dashboard
 ```
 
 境界:
 
-- **更新主体**は対象 task の runtime を現在所有している
-  既存 runtime owner のみとする。
+- **更新主体**は producer の種類ごとに定義する
+  (`producer_kind`、後述の新規設計 field):
+  - `runtime_owner` (Codex / OpenCode / Devin ACP):
+    対象 task の runtime を現在所有している既存 owner。
+  - `host_remote_observer` (Devin Cloud):
+    D2 で追加する Host-side read-only metadata observer(後述)。
+    Cloud task に local runtime / runtime owner は存在せず、
+    runtime generation や PID を観測所有権の代用にしない。
 - dashboard の GET、`task_list`、page load を契機に task/runtime の
   新規起動・再開・再接続を行わない。`ensure_runtime*`、full `task_get`、
   task control を metadata 取得の代用にしない。
@@ -440,12 +455,18 @@ summary_revision   summary 内容 (state / count / types / truncated)
                    が変化した書込みで増加する独立 revision
                    (`observed_at` のみの更新では増やさない)
 observed_at        backend を実際に観測した時刻
-runtime_generation summary を生成した runtime owner の generation
+producer_kind      = runtime_owner | host_remote_observer
+producer_epoch     その producer の所有権世代
+                   (runtime_owner は runtime generation、
+                   host_remote_observer は observer owner epoch)
 expires_at         observed_at + TTL
 truncated?         上限に達したことを示す marker
 ```
 
-- `none` は permission と question の対象範囲を正常に読み切れた場合のみ。
+- `none` の根拠は backend ごとに定義する(下表): OpenCode は
+  permission と question の対象範囲を正常に読み切れた場合、
+  Codex / Devin ACP は owner が outstanding request なしを確認した場合、
+  Devin Cloud は status read 成功かつ pending signal なしを検証した場合。
 - 一部 endpoint の取得失敗、上限超過、owner 不明、runtime 再接続中は
   `unavailable` / `unknown` とし、`none` にしない。
 - `expires_at` を過ぎた summary と observer 停止後の値は `unavailable`
@@ -466,14 +487,22 @@ freshness / generation:
   所有中 runtime の in-process 状態による heartbeat)。
   heartbeat が止まった summary は `expires_at` で `unavailable` になるため、
   長時間 pending の request で marker が消えない。
+  なお process restart 後に保存済み summary が残っていても、
+  メモリ上の pending 状態や接続の完全性まで復元できたとは扱わず、
+  現在の owner・接続状態・鮮度が確認できるまで
+  古い値を heartbeat だけで fresh に戻さない。
 - `observed_at` は backend 観測時刻であり、HTTP response 生成時刻や
   host 接続確認時刻で古い summary を fresh にしない。
-- summary は `runtime_generation` を持ち、runtime generation 変更後に
-  古い owner の遅延結果による上書きを受理しない。
+  `host_remote_observer` は remote fetch 成功 + 状態検証時のみ
+  `observed_at` を更新し、observer process の生存だけで
+  remote 状態の鮮度を延長しない (heartbeat 対象外)。
+- summary は `producer_kind` + `producer_epoch` を持ち、
+  その producer の所有権世代が変わった後の遅延結果による
+  上書きを受理しない。
 
 本 issue で確定する bounds:
 
-- observer interval: 5 秒 (runtime を所有している間のみ;
+- observer interval: 5 秒 (producer が対象 task の観測を登録している間のみ;
   dashboard foreground polling と同周期)
 - backend scoped read timeout: 2 秒 / endpoint
 - 同時実行: runtime あたり 1、host 全体で 4 並行まで
@@ -485,13 +514,15 @@ freshness / generation:
 - serialized summary 上限: 4 KiB
 
 backend ごとの support 判定と取得元(実ファイル確認済み):
+表の `supported` は「D2 で実装する v1 対応目標」であり、
+「現在実装済み」の意味ではない。
 
 | backend | v1 support | safe metadata の実際の取得元 | 更新主体・保存先 | freshness / generation | 取得不能・未対応時 | 追加する prerequisite |
 |---|---|---|---|---|---|---|
-| OpenCode | supported | 既存 `pending_interactions()` の scoped read: `session_list` + `permission_list` + `question_list` を対象 OpenCode session と descendant session に絞り込む (`MAX_PENDING_INTERACTIONS` = 64) | 所有中 runtime に対する runtime owner の定期 scoped read → task metadata | `observed_at` + `runtime_generation` | `unavailable` | `task_list` read から分離された observer と summary 保存 field |
-| Codex (app-server) | supported | runtime JSON-RPC channel の approval request event(現行 `mark_waiting_approval` が `waiting_approval` を record に記録する経路) | 既存 approval event path が bounded summary を task metadata に永続化 + interval heartbeat で `observed_at` を更新 | `observed_at` + `runtime_generation` | `unavailable` | status 記録と同じ owner が summary を永続化する field |
-| Devin ACP | supported | `session/request_permission` event と task binding に永続される `pending_permissions` (`mark_task_waiting_approval` 経路) | 既存 permission event path が bounded summary を task metadata に永続化 + interval heartbeat で `observed_at` を更新 | `observed_at` + `runtime_generation` | `unavailable` | binding 永続化と同じ owner が summary を永続化する field |
-| Devin Cloud | supported | remote session の `status_detail` の bounded read(既存 reconcile が `waiting_for_approval` → `WaitingApproval` に導出する値) | runtime owner の定期 remote status read → task metadata | `observed_at` + `runtime_generation` | `unavailable` | `task_get` 外で status のみを読む observer と summary 保存 field |
+| OpenCode | supported | 既存 `pending_interactions()` の scoped read: `session_list` + `permission_list` + `question_list` を対象 OpenCode session と descendant session に絞り込む (`MAX_PENDING_INTERACTIONS` = 64) | `runtime_owner` producer: 所有中 runtime に対する定期 scoped read → task metadata | `observed_at` + `producer_epoch` | `unavailable` | `task_list` read から分離された observer と summary 保存 field |
+| Codex (app-server) | supported | 既存: runtime JSON-RPC channel の approval request event(`mark_waiting_approval` が `waiting_approval` を record に記録する経路) | `runtime_owner` producer: D2 新規に同じ owner が sanitized summary を生成・永続化 + interval heartbeat で `observed_at` を更新 | `observed_at` + `producer_epoch` | `unavailable` | summary field 追加 |
+| Devin ACP | supported | 既存: `session/request_permission` event path と `AcpShared.pending_permissions` のメモリ上カウンタ、`mark_task_waiting_approval` による task status 更新 | `runtime_owner` producer: D2 新規に同じ owner が sanitized summary を生成・永続化 + interval heartbeat で `observed_at` を更新 | `observed_at` + `producer_epoch` | `unavailable` | summary field 追加のみ。`pending_permissions` は永続化済みではない |
+| Devin Cloud | supported | 既存 `CloudApi::get_session` の bounded status read(`status` / `status_detail`; 既存 reconcile が `waiting_for_approval` → `WaitingApproval` に導出する値) | `host_remote_observer` producer: D2 で追加する Host-side read-only metadata observer(後述)の定期 remote status read → task metadata | `observed_at` + `producer_epoch` | `unavailable` / `unknown` | local runtime owner は存在しない。observer 本体、summary field、観測所有権 field を追加 |
 
 - `types` は `permission` / `question` (OpenCode) と `approval`
   (Codex / Devin ACP / Devin Cloud) を v1 で正しく表示する。
@@ -506,6 +537,76 @@ backend ごとの support 判定と取得元(実ファイル確認済み):
   実行しない(ensure / spawn しない)。所有喪失後は取得を止め、
   summary は期限切れで `unavailable` になる。
 - host 側に summary field を持たない旧 Host は `unsupported` とする。
+
+#### Devin Cloud observer (D2 prerequisite)
+
+`devin_cloud.rs` は local に何も実行せず、runtime lease を持たない
+(remote session が authority で、`task_get` ごとに reconcile する構造)。
+したがって Cloud の producer は runtime owner ではなく、
+D2 で追加する Host-side read-only metadata observer とする。
+これは新規 prerequisite であり、現在その coordinator / observer は
+存在しないものとして設計する。Cloud 用に local agent/runtime を作らず、
+backend の実行・承認・制御権限も増やさない。
+
+lifecycle:
+
+- observer は Host/session の長寿命 lifecycle に属する観測主体とし、
+  将来の接続先は `src/supervisor.rs::SessionSupervisor`
+  (session 所有・再起動の長寿命 coordinator)とする。
+- 起動・登録契機は Host/session lifecycle と、retained task record
+  (`TaskStore::list_owned`)からの既存 Cloud task 登録とする。
+  dashboard GET、`task_list`、最初の browser access を契機に起動しない。
+- Host 再起動後は retained record から owned non-terminal task を
+  再発見して観測登録する。session instance の変更・停止、
+  task の保持期限 (`TASK_RETENTION_SECONDS` = 24h) 終了、
+  observer 停止で登録解除する。観測停止は remote task の停止を意味せず、
+  remote task を cancel / resume / recreate しない。
+
+観測所有権と遅延書込みの排除:
+
+- Cloud には runtime generation が存在しないため、task `generation` や
+  PID を観測所有権の代用にしない。observer は観測専用の
+  owner identity + `producer_epoch` を持つ。
+- 同一 task に複数の Host process / observer が競合しても、
+  現在の owner だけが summary を更新できる契約とし、
+  所有権の取得・更新・失効条件、epoch 更新、
+  旧 owner の遅延応答拒否を定義する。
+- remote read 前に取得した task owner・canonical scope・
+  remote session binding (`devin_session_id`)・task generation を
+  保存前に再検証する。network 待機中に保持する global lock ではなく、
+  短い排他区間または比較更新で現在の binding と観測所有権を確認する。
+
+許可する取得と保存:
+
+- 許可する取得は、既に binding された remote session の
+  status read (`status` / `status_detail`) のみとする。
+  full `task_get`、reconciliation、evidence 生成、message 取得を
+  observer の取得経路として流用しない。
+- observer が変更できるのは新しい summary metadata と
+  観測所有権 metadata のみ。task status、operation receipt、
+  backend generation、remote session binding を観測の都合で変更しない。
+- credential は既存 `CloudConfig::resolve_config` の解決経路を使い、
+  API key は呼び出し中だけメモリに保持し、新規 metadata、log、
+  serialize 出力に認証値を保存しない。
+
+state / freshness:
+
+```text
+status_detail = waiting_for_approval を確認
+  → pending (type = approval; count は捏造しない)
+status read 成功 + pending signal なしを検証
+  → none
+未解釈 / 欠落した status 値
+  → unknown
+fetch 失敗 / timeout / rate limit / credential failure
+  → unavailable
+```
+
+- `observed_at` は remote fetch 成功 + 状態検証時のみ更新し、
+  observer process の生存だけで remote 状態の鮮度を延長しない。
+- interval / timeout / concurrency / TTL / serialized bound は
+  共通節の値を使う。失敗時の再試行は同一 interval 内で最大 3 回までとし、
+  observer の lease / epoch と summary TTL は役割を分離する。
 
 安全性:
 
@@ -752,11 +853,15 @@ D1 の将来検証ケース:
 ### D2 — task projection
 
 - `task_list` projection の利用 (retained state の read のみ)
-- Host prerequisite A: runtime owner による pending metadata observer
+- Host prerequisite A: `runtime_owner` producer (Codex / OpenCode /
+  Devin ACP) による pending metadata 生成
   (§8.4: backend 別 safe source、interval 5s / timeout 2s /
   concurrency 4 / TTL 30s / count ≤ 64 / types ≤ 4 / summary ≤ 4KiB)
 - Host prerequisite B: task metadata への bounded summary 保存と
   `task_list` の additive projection
+- Host prerequisite C (Devin Cloud): Host-side read-only metadata observer
+  と観測所有権 (owner identity / `producer_epoch`) / lifecycle 登録契約
+  (§8.4「Devin Cloud observer」)
 - per-backend unavailable semantics
 - pending interaction display
   (`none | pending | unknown | unsupported | unavailable`)
@@ -773,9 +878,21 @@ D2 の将来検証ケース:
   pending summary の変更が UI に反映される
 - observer 停止・期限切れ・一部 endpoint 失敗時、
   古い `none` を現在の「対話待ちなし」として表示しない
-- runtime generation 変更後、古い owner の遅延結果を採用しない
+- producer epoch 変更後、旧 owner の遅延結果を採用しない
 - `task_list` / dashboard GET だけでは
   spawn・resume・reconciliation・answer が発生しない
+- Cloud task 作成後、元の tool call が戻った状態でも、
+  通常の `task_get` を呼ばず Host-side observer が summary を更新できる
+- dashboard を一度も開いていなくても、許可された観測 lifecycle が
+  browser access と無関係に成立する
+- Cloud observer が二つ競合しても、current owner だけが書き込み、
+  所有権交代前の遅延結果を拒否する
+- remote read 中に task binding / session instance が変わっても、
+  古い対象への結果を新しい対象の summary に適用しない
+- Host / observer 停止時、summary は期限切れとして扱うが
+  remote task は停止しない
+- Cloud observer の timeout / rate limit / credential failure は
+  `none` に変換せず `observed_at` も更新しない
 - 質問本文・選択肢本文・permission detail・raw result は
   summary 保存先、Worker response、browser、ログへ流れない
 - field を返さない旧 Host は `unsupported`
@@ -825,10 +942,15 @@ real deployed Fabric hostname で:
 - [ ] host の接続 / 同期履歴は証拠が存在する場合のみ表示され、証拠なしは `unknown`、履歴取得元の失敗は `unavailable`。`configured_only` は情報源属性であり「未接続」の意味を持たない。
 - [ ] configured membership 認可が host 一覧と host 配下の直接参照に一貫して適用され、stale D1 row からの復元表示をしない。
 - [ ] unknown / offline / unavailable と evidence 属性を混同しない。
-- [ ] pending interaction は runtime owner の observer が生成し task metadata に保存された bounded summary を `task_list` が読み取る経路で表示され、欠落 field を「なし」と表示しない。
-- [ ] pending summary は `summary_revision` / `observed_at` / `runtime_generation` / `expires_at` を持ち、期限切れ・一部 endpoint 失敗・observer 停止を「対話待ちなし」と表示しない。
+- [ ] pending interaction は `runtime_owner` producer または `host_remote_observer` が生成し task metadata に保存された bounded summary を `task_list` が読み取る経路で表示され、欠落 field を「なし」と表示しない。
+- [ ] pending summary は `summary_revision` / `observed_at` / `producer_kind` / `producer_epoch` / `expires_at` を持ち、期限切れ・一部 endpoint 失敗・observer 停止を「対話待ちなし」と表示しない。
 - [ ] task status / revision 非依存の summary 変更が UI に反映される。
 - [ ] `task_list` / dashboard GET だけでは task/runtime の spawn・resume・reconciliation・answer が発生しない。
+- [ ] Devin Cloud の summary は D2 の Host-side read-only observer が更新し、dashboard GET / task_list / browser access を契機に起動・取得しない。
+- [ ] 観測所有権 (`producer_kind` / `producer_epoch`) と実行所有権を混同せず、旧 owner の遅延結果を拒否する。
+- [ ] Cloud observer は binding 済み remote session の status read のみを行い、task status / operation receipt / backend generation / remote session binding を観測の都合で変更しない。
+- [ ] Host / observer 停止時、summary は期限切れとして扱うが remote task は停止しない。
+- [ ] process restart 後、保存済み summary を現在の owner・接続状態・鮮度の確認なしに heartbeat だけで fresh に戻さない。
 - [ ] task list の backend-level unavailable が表示可能。
 - [ ] context freshness / gap / degradation が表示可能。
 - [ ] timeline は sanitized replicated observation の bounded projection のみ。
