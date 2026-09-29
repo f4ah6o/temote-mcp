@@ -77,8 +77,8 @@ Results start as NOT RUN and must be updated from direct evidence. Scope and req
 | Candidate local tests | PASS | Integrated `cargo test`: 151 library + 866 binary and ordinary integration suites; 9 explicit Host/CI gates NOT RUN. Gateway 233/233; Python protocol 18/18; schema 10/10 and dashboard SQL 1/1. |
 | Actual Static Assets runtime | PASS (local) | 80 tests/subtests; real Wrangler/workerd and checked-in assets binding. Synthetic issuer JWKS is the sole network fixture; production JWT verification remains active. No D4 claim. |
 | Deployed D4 | BLOCKED | Candidate deployment and Host update are not approved in this session; authorized browser candidate session not established. Existing target evidence alone is not candidate evidence. |
-| Final-head CI | PENDING PR | Results will be maintained on the actual PR for its final pushed HEAD; no previous HEAD is counted. |
-| Independent review | NOT RUN | PR handoff required; local review is separate |
+| Final-head CI | TRACKED ON PR | [Draft PR #88](https://github.com/f4ah6o/temote-mcp/pull/88) maintains exact final pushed HEAD and current CI run/results. Do not substitute a previous HEAD or this documentation snapshot for that check. |
+| Independent review | NOT RUN | [Draft PR #88](https://github.com/f4ah6o/temote-mcp/pull/88) is available for review; no external approval. Local review is separate. |
 
 ## D4 operator rerun
 

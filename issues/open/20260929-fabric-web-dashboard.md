@@ -7,6 +7,7 @@ Created: 2026-09-29 (Asia/Tokyo)
 Updated: 2026-09-29
 Model: gpt-6-sol
 Branch: feat/fabric-web-dashboard
+PR: https://github.com/f4ah6o/temote-mcp/pull/88 (Draft; deployed acceptance blocked)
 Umbrella: `issues/open/20260924-temote-development-harness-restructure.md`
 Fabric boundary: `issues/open/20260926-temote-fabric-product-boundary.md`
 Observation plane: `issues/open/20260926-cloud-observation-knowledge-plane.md`
