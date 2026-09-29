@@ -36,6 +36,7 @@ mod openai_tunnel;
 #[cfg(feature = "network")]
 mod opencode_server;
 mod orchestration;
+mod pending_interaction;
 mod platform_paths;
 mod profile;
 #[cfg(feature = "network")]
