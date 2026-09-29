@@ -69,6 +69,58 @@ Put `codex`/`opencode` on PATH first (`export PATH="$HOME/.nvm/versions/node/*/b
 - Corrupt lines: hand-append a garbage line to the .jsonl; `list` prints a
   `{"warning","corrupt_lines"}` JSON line and `status` reports degraded=true.
 
+## Supervisor upgrade / handoff testing
+
+The `upgrade` flow applies the *installed* binary to a *running* supervisor —
+never point it at the shared repo binary or real state. Mirror
+`tests/cli_session_e2e.rs`:
+
+- Private binary dir: copy `target/debug/temote-mcp` AND
+  `target/debug/temote-linux-sandbox` side by side (helper generation is
+  classified next to the installed locator), chmod 700.
+- Run every spawn under a *clean* environment like `isolate_process()`'s
+  `.env_clear()` — inherited variables defeat the isolation, most notably an
+  ambient `TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR`, which would make `upgrade`
+  re-exec a shared/real binary instead of the private copy. Wrap each
+  invocation as `env -i PATH="$PATH" HOME=<state> XDG_STATE_HOME=<state>
+  XDG_CACHE_HOME=<state>/cache XDG_CONFIG_HOME=<state>/config
+  XDG_RUNTIME_DIR=<state>/xdg-runtime TMPDIR=<state>/tmp
+  CODEX_HOME=<state>/codex TEMOTE_MCP_RUNTIME_DIR=<state>/runtime
+  TEMOTE_MCP_SOCKET_NAMESPACE=<ns> <command>` (all state dirs 0700; `<ns>` is
+  1-12 ASCII alnum/`-`/`_`, identical on supervisor AND every CLI call —
+  the supervisor socket lives at `/tmp/tmcp-<uid>-<ns>/supervisor.sock`).
+- Spawn `temote-mcp supervisor` with `TEMOTE_MCP_ROOTS="src=$project"` (or
+  the JSON-object form `TEMOTE_MCP_ROOTS='{"src":"/absolute/project"}'` —
+  each value must be a quoted string) in the background with null stdio,
+  and SIGINT/kill the child when done — a plain foreground child like the
+  e2e helper's is enough; do not require `setsid` (absent on macOS). Wait
+  for `session list` to exit 0, then `session start --path src/<subdir>
+  <id>` (logical root+relative path).
+- "Installed" binary = `current_exe` unless
+  `TEMOTE_MCP_INTERNAL_INSTALLED_LOCATOR=<path>` overrides it — use a private
+  copy so `upgrade` never re-execs the repo build. Set this variable only on
+  the single `upgrade` invocation when a test deliberately redirects the
+  locator (e.g. to a helperless bundle, which exercises the
+  helper-generation gate rejecting `upgrade --force`); the
+  supervisor/session env must never carry it.
+- `handoff_required = --force || source_version != target_version`: to
+  exercise non-force version-diff paths, patch the version bytes in a binary
+  copy (`python3 -c` replace b"X.Y.Z" with a same-length version — verify via
+  `<copy> supervisor --capabilities`). macOS only: the byte patch invalidates
+  the Mach-O code signature and the kernel SIGKILLs the patched copy — re-sign
+  it ad-hoc and verify before executing:
+  `codesign --force --sign - <copy> && codesign --verify <copy>`.
+- Supervisor PID / boot_generation: unix-socket ping — connect to
+  `/tmp/tmcp-<uid>-<ns>/supervisor.sock`, send `{"command":"ping"}`, read
+  `result.pid` / `result.boot_generation` (same PID + new boot_generation =
+  same-PID handoff).
+- Unrestorable-session fixture: `session start --path src/victim <id>` then
+  `rm -rf <project>/victim` → the workspace-resolve check blocks it.
+- Keep EVERY other CLI invocation's env identical — session restart contexts
+  are captured from the start env and mismatches turn healthy sessions
+  blocked (the deliberate per-invocation locator override above is the only
+  exception).
+
 ## Devin Secrets Needed
 
 - `TEMOTE_MCP_DEVIN_API_KEY` — only for `devin_cloud_*` live calls; not needed for
