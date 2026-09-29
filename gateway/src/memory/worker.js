@@ -876,7 +876,10 @@ async function prepareProjection(db, ownerId, repositoryKey, config, extractedIt
     }
     if (conflicts.length > 0) {
       if (authorizedConflicts.length === conflicts.length) {
-        supersedes = authorizedConflicts.map((existing) => existing.knowledge_id ?? existing.knowledgeId);
+        // A staged reuse aliases its committed row's id; each row gets at
+        // most one supersession edge while every conflict still authorizes.
+        supersedes = [...new Set(authorizedConflicts.map((existing) =>
+          existing.knowledge_id ?? existing.knowledgeId))];
         status = promotedStatus(extracted);
         for (const supersededId of supersedes) supersededKnowledgeIds.add(supersededId);
         for (const oldItem of stagedConflicts) oldItem.status = "superseded";

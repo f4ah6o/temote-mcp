@@ -477,6 +477,18 @@ to 4; prompt version 4 and producer schema version 1 are unchanged.
   policy through the fixture adapter and the real `openai_compatible`
   adapter path, verified on workerd/D1 with the public `context_resolve`
   surface.
+- Supersession edge aliasing: an unchanged restatement inside a batch
+  reuses the committed row (`reuseKnowledgeId`), so the conflict list
+  held both the database row and its staged alias and emitted the same
+  `knowledge_supersession` edge twice — a primary-key rejection that
+  wedged the run with `commit_rejected` and stalled the checkpoint. The
+  supersession id list is now deduplicated so one row yields at most
+  one edge, while every conflict — including the staged reuse alias —
+  still participates in supersession authorization (dropping it would
+  have let a same-source change claim ignore earlier cross-host
+  support). The same path protects the spliced summary channel. This
+  defect predated the fixes above and was found by the independent
+  re-review on both base and head.
 - Input budget deferral: `boundedInput` truncated or emptied an
   observation's sanitized preview to fit the remaining batch window and
   still consumed its `cloud_seq`, so a policy whose metadata fit but
@@ -499,20 +511,24 @@ published.
 
 Local verification for this follow-up, based on source HEAD `bc6fcc6`
 plus the fix commits `008bc3d` (reinstatement) and `62b98b2` (input
-budget):
+budget), and the re-review fix commit for supersession-edge aliasing:
 
 - Pre-fix reproduction captured the findings: the new reinstatement
   suite failed 4/7 cases and the new input-budget suite failed 7/11
-  cases on the reviewed head; the same suites pass 7/7 and 11/11 after
-  the fix.
+  cases on the reviewed head; the same suites pass after the fix. The
+  restate-then-change wedge case added during re-review fails on the
+  reviewed head and on the first fix head, and passes after the
+  conflict dedupe (8/8 reinstatement, 11/11 input-budget cases).
 - `npm test` in `gateway/` passed 269/269 including real workerd/D1
   coverage; `cargo fmt --all -- --check`, `cargo clippy --all-targets --
   -D warnings`, `cargo check --no-default-features --all-targets`, the
   generated-contract check (`just check-generated`), `npm run
   deploy:dry-run`, and `git diff --check` passed.
 - These are local implementation checks, not a v6/v4 live-model or
-  Cloudflare remote qualification. Independent review of this follow-up
-  diff was still pending at this report snapshot.
+  Cloudflare remote qualification. An independent non-implementer
+  re-review of `bc6fcc6..HEAD` verified both fixes, found the
+  supersession-edge aliasing wedge above (fixed in the same head), and
+  reported no remaining blocking findings.
 
 ## Ending state
 

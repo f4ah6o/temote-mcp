@@ -308,6 +308,60 @@ test("provider-path canonical union keeps the reinstatement as an independent ch
   }
 });
 
+test("same-batch restatement then change supersedes a reused committed row once", {
+  timeout: 30_000,
+}, async () => {
+  const runtime = await startMemoryRuntime({
+    memoryExtractor: "fixture",
+    memoryEnabled: true,
+    maxQueueRetries: 0,
+  });
+  try {
+    const sessionId = "restate-change-session";
+    const firstSync = await syncInstructionBatch(runtime, {
+      hostId: MEMORY_TEST_HOST_ID,
+      token: MEMORY_TEST_HOST_TOKEN,
+      sessionId,
+      entries: [{ revision: 1, content: repositoryPolicy(POLICY_JSON) }],
+    });
+    await waitForMemoryHead(runtime, firstSync.cloud_head_seq);
+
+    const secondSync = await syncInstructionBatch(runtime, {
+      hostId: MEMORY_TEST_HOST_ID,
+      token: MEMORY_TEST_HOST_TOKEN,
+      sessionId,
+      entries: [
+        { revision: 2, content: repositoryPolicy(POLICY_JSON) },
+        { revision: 3, content: repositoryPolicy(POLICY_TOML, { changed: true, predecessor: POLICY_JSON }) },
+      ],
+    });
+    await waitForMemoryHead(runtime, secondSync.cloud_head_seq);
+
+    const failedRuns = await runtime.querySql(
+      "SELECT status, error_code FROM memory_runs WHERE owner_id = ? AND repository_key = ? AND status = 'failed'",
+      [MEMORY_TEST_OWNER, MEMORY_TEST_REPOSITORY],
+    );
+    assert.deepEqual(failedRuns, [], "the restate-plus-change batch must not wedge the run");
+
+    const { constraints, edges } = await knowledgeState(runtime);
+    const jsonRow = constraints.find((item) => item.text === POLICY_JSON);
+    const tomlRow = constraints.find((item) => item.text === POLICY_TOML);
+    assert.equal(jsonRow.status, "superseded");
+    assert.equal(tomlRow.status, "current");
+    assert.equal(constraints.length, 2, "the restatement reuses the committed row instead of duplicating it");
+    const supersessionOfJson = edges.filter((edge) => edge.old_knowledge_id === jsonRow.knowledge_id);
+    assert.equal(supersessionOfJson.length, 1,
+      "a row reused inside the batch still yields exactly one supersession edge");
+    assert.equal(supersessionOfJson[0].new_knowledge_id, tomlRow.knowledge_id);
+
+    const context = await repositoryContext(runtime);
+    assert.ok(context.constraints.some((item) => item.text === POLICY_TOML && item.status === "current"),
+      "context_resolve must surface the changed TOML policy as current");
+  } finally {
+    await runtime.dispose();
+  }
+});
+
 test("plain A->A remains ordinary duplicate support", {
   timeout: 30_000,
 }, async () => {
